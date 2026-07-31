@@ -62,6 +62,8 @@ class OidcControllerTests {
     @Test
     void validatesIdTokenAndMintsSpecusTokenForProvisionedUser() {
         Fixture fixture = fixture("expected-nonce", "alice", true);
+        assertThat(fixture.controller.config())
+                .containsEntry("registrationEndpoint", "https://certus.devshuai.com/register");
 
         ResponseEntity<?> response = fixture.controller.exchange(
                 new OidcController.TokenExchangeRequest("code", "verifier", "expected-nonce"));

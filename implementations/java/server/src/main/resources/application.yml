@@ -217,6 +217,7 @@ specus:
     issuer: ${SPECUS_OIDC_ISSUER:https://certus.devshuai.com}
     jwk-set-uri: ${SPECUS_OIDC_JWK_SET_URI:https://certus.devshuai.com/oauth2/jwks}
     authorization-endpoint: ${SPECUS_OIDC_AUTHORIZATION_ENDPOINT:https://certus.devshuai.com/oauth2/authorize}
+    registration-endpoint: ${SPECUS_OIDC_REGISTRATION_ENDPOINT:https://certus.devshuai.com/register}
     token-endpoint: ${SPECUS_OIDC_TOKEN_ENDPOINT:https://certus.devshuai.com/oauth2/token}
     end-session-endpoint: ${SPECUS_OIDC_END_SESSION_ENDPOINT:https://certus.devshuai.com/oauth2/logout}
     client-id: ${SPECUS_OIDC_CLIENT_ID:}

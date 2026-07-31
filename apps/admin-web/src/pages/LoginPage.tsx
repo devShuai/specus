@@ -82,7 +82,7 @@ export function LoginPage() {
 }
 
 function LoginPageContent() {
-  const { oidcConfig, openLogin } = useAuth();
+  const { oidcConfig, openLogin, startOidcRegistration } = useAuth();
 
   usePageSeo({
     title: "specus · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
@@ -107,6 +107,9 @@ function LoginPageContent() {
 
   const registrationEnabled = (oidcConfig?.registrationEnabled ?? false)
     && (oidcConfig?.passwordLoginEnabled ?? true);
+  const certusRegistrationEnabled = Boolean(
+    oidcConfig?.configured && oidcConfig.registrationEndpoint,
+  );
 
   return (
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
@@ -154,9 +157,15 @@ function LoginPageContent() {
                 <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
                   登录管理台
                 </button>
-                {registrationEnabled && (
-                  <button type="button" className="landing-secondary-button" onClick={() => openLogin("register")}>
-                    注册账号
+                {(certusRegistrationEnabled || registrationEnabled) && (
+                  <button
+                    type="button"
+                    className="landing-secondary-button"
+                    onClick={() => certusRegistrationEnabled
+                      ? void startOidcRegistration()
+                      : openLogin("register")}
+                  >
+                    {certusRegistrationEnabled ? "注册 Certus 账号" : "注册账号"}
                   </button>
                 )}
               </div>

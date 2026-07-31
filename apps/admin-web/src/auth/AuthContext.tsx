@@ -21,6 +21,7 @@ import {
 import type { ManagementUser, OidcConfig, RegistrationChallengeResponse } from "../api/types";
 import { codeChallenge, randomToken } from "../lib/pkce";
 import { executeTurnstile } from "../lib/turnstile";
+import { buildOidcRegistrationUrl } from "./oidcUrls";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
 const OIDC_STATE_KEY = "oidc_state";
@@ -46,6 +47,7 @@ interface AuthState {
   register: (username: string, email: string, password: string) => Promise<RegistrationChallengeResponse>;
   verifyRegistration: (registrationId: string, code: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
+  startOidcRegistration: () => Promise<void>;
   openLogin: (initialTab?: "login" | "register") => void;
   closeLogin: () => void;
   logout: () => void;
@@ -177,29 +179,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!oidcConfig?.configured) {
       return;
     }
-    const verifier = randomToken();
-    const state = randomToken();
-    const nonce = randomToken();
-    sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
-    sessionStorage.setItem(OIDC_STATE_KEY, state);
-    sessionStorage.setItem(OIDC_NONCE_KEY, nonce);
-    if (!safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY))) {
-      sessionStorage.setItem(
-        AUTH_RETURN_PATH_KEY,
-        `${window.location.pathname}${window.location.search}${window.location.hash}`,
-      );
+    window.location.href = (await prepareOidcAuthorization(oidcConfig)).toString();
+  }, [oidcConfig]);
+
+  const startOidcRegistration = useCallback(async () => {
+    if (!oidcConfig?.configured || !oidcConfig.registrationEndpoint) {
+      return;
     }
-    const challenge = await codeChallenge(verifier);
-    const url = new URL(oidcConfig.authorizationEndpoint);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("client_id", oidcConfig.clientId);
-    url.searchParams.set("redirect_uri", oidcConfig.redirectUri);
-    url.searchParams.set("scope", oidcConfig.scope || "openid");
-    url.searchParams.set("code_challenge", challenge);
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", state);
-    url.searchParams.set("nonce", nonce);
-    window.location.href = url.toString();
+    const authorizationUrl = await prepareOidcAuthorization(oidcConfig);
+    window.location.href = buildOidcRegistrationUrl(
+      oidcConfig,
+      authorizationUrl,
+    ).toString();
   }, [oidcConfig]);
 
   // onPress={openLogin} 之类的调用会把事件对象当第一个参数传进来，所以只认字面量 "register"。
@@ -265,11 +256,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     register,
     verifyRegistration,
     startOidcLogin,
+    startOidcRegistration,
     openLogin,
     closeLogin,
     logout,
   };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+async function prepareOidcAuthorization(oidcConfig: OidcConfig): Promise<URL> {
+    const verifier = randomToken();
+    const state = randomToken();
+    const nonce = randomToken();
+    sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
+    sessionStorage.setItem(OIDC_STATE_KEY, state);
+    sessionStorage.setItem(OIDC_NONCE_KEY, nonce);
+    if (!safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY))) {
+      sessionStorage.setItem(
+        AUTH_RETURN_PATH_KEY,
+        `${window.location.pathname}${window.location.search}${window.location.hash}`,
+      );
+    }
+    const challenge = await codeChallenge(verifier);
+    const url = new URL(oidcConfig.authorizationEndpoint);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("client_id", oidcConfig.clientId);
+    url.searchParams.set("redirect_uri", oidcConfig.redirectUri);
+    url.searchParams.set("scope", oidcConfig.scope || "openid");
+    url.searchParams.set("code_challenge", challenge);
+    url.searchParams.set("code_challenge_method", "S256");
+    url.searchParams.set("state", state);
+    url.searchParams.set("nonce", nonce);
+    return url;
 }
 
 async function completeOidcRedirect(

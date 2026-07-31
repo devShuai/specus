@@ -34,6 +34,7 @@ export function DiagramAccountDialog({
     loginHint,
     passwordLogin,
     startOidcLogin,
+    startOidcRegistration,
   } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -115,6 +116,11 @@ export function DiagramAccountDialog({
           {oidcEnabled ? (
             <Button size="sm" radius="sm" variant="flat" isDisabled={submitting} onPress={() => void startOidcLogin()}>
               OIDC 登录
+            </Button>
+          ) : null}
+          {oidcEnabled && oidcConfig?.registrationEndpoint ? (
+            <Button size="sm" radius="sm" variant="flat" isDisabled={submitting} onPress={() => void startOidcRegistration()}>
+              注册 Certus
             </Button>
           ) : null}
           {passwordEnabled ? (

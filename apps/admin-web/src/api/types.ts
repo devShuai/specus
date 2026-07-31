@@ -8,6 +8,7 @@ export interface OidcConfig {
   turnstileEnabled?: boolean;
   turnstileSiteKey?: string;
   authorizationEndpoint: string;
+  registrationEndpoint?: string;
   endSessionEndpoint: string;
   clientId: string;
   redirectUri: string;

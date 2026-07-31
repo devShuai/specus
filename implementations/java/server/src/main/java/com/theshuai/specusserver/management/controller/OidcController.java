@@ -75,6 +75,7 @@ public class OidcController {
         Map<String, Object> config = new LinkedHashMap<>();
         config.put("configured", StringUtils.hasText(properties.getClientId()));
         config.put("authorizationEndpoint", properties.getAuthorizationEndpoint());
+        config.put("registrationEndpoint", properties.getRegistrationEndpoint());
         config.put("endSessionEndpoint", properties.getEndSessionEndpoint());
         config.put("clientId", properties.getClientId());
         config.put("redirectUri", properties.getRedirectUri());

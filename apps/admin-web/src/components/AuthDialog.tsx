@@ -25,6 +25,7 @@ export function AuthDialog() {
     register,
     verifyRegistration,
     startOidcLogin,
+    startOidcRegistration,
   } = useAuth();
   const [tab, setTab] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
@@ -45,6 +46,7 @@ export function AuthDialog() {
 
   const passwordEnabled = oidcConfig?.passwordLoginEnabled ?? true;
   const oidcEnabled = oidcConfig?.configured ?? false;
+  const certusRegistrationEnabled = oidcEnabled && Boolean(oidcConfig?.registrationEndpoint);
   const registrationEnabled = (oidcConfig?.registrationEnabled ?? false) && passwordEnabled;
   const isRegister = tab === "register" && registrationEnabled;
   const isVerifyingEmail = isRegister && challenge !== null;
@@ -202,6 +204,18 @@ export function AuthDialog() {
       await startOidcLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "OIDC 登录失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const registerWithCertus = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await startOidcRegistration();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Certus 注册跳转失败");
     } finally {
       setSubmitting(false);
     }
@@ -489,6 +503,18 @@ export function AuthDialog() {
               onClick={() => void loginWithOidc()}
             >
               {submitting ? "正在跳转..." : "使用 OIDC 登录"}
+            </button>
+          )}
+
+          {certusRegistrationEnabled && !isRegister && (
+            <button
+              type="button"
+              className="auth-dialog-secondary"
+              disabled={submitting}
+              aria-busy={submitting}
+              onClick={() => void registerWithCertus()}
+            >
+              {submitting ? "正在跳转..." : "注册 Certus 账号"}
             </button>
           )}
 

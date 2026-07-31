@@ -14,6 +14,7 @@ public class OidcProperties {
     private String issuer = "https://certus.devshuai.com";
     private String jwkSetUri = "https://certus.devshuai.com/oauth2/jwks";
     private String authorizationEndpoint = "https://certus.devshuai.com/oauth2/authorize";
+    private String registrationEndpoint = "https://certus.devshuai.com/register";
     private String tokenEndpoint = "https://certus.devshuai.com/oauth2/token";
     private String endSessionEndpoint = "https://certus.devshuai.com/oauth2/logout";
     private String clientId = "";
@@ -47,6 +48,14 @@ public class OidcProperties {
 
     public void setAuthorizationEndpoint(String authorizationEndpoint) {
         this.authorizationEndpoint = authorizationEndpoint;
+    }
+
+    public String getRegistrationEndpoint() {
+        return registrationEndpoint;
+    }
+
+    public void setRegistrationEndpoint(String registrationEndpoint) {
+        this.registrationEndpoint = registrationEndpoint;
     }
 
     public String getTokenEndpoint() {
