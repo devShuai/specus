@@ -157,18 +157,22 @@ public class OidcController {
                 return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                         .body(Map.of("error", "OIDC ID Token 校验失败"));
             }
-            if (!StringUtils.hasText(idToken.getSubject())
+            if (idToken.getIssuer() == null
+                    || !StringUtils.hasText(idToken.getSubject())
                     || !constantTimeEquals(request.nonce(), claimAsString(idToken, "nonce"))) {
-                log.warn("[oidc] ID Token subject or nonce validation failed");
+                log.warn("[oidc] ID Token issuer, subject or nonce validation failed");
                 return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                         .body(Map.of("error", "OIDC ID Token 身份或 nonce 校验失败"));
             }
             String preferredUsername = claimAsString(idToken, "preferred_username");
-            Optional<LoginUser> loginUser = managementUserService.resolveOidcUser(preferredUsername);
+            Optional<LoginUser> loginUser = managementUserService.resolveOrProvisionOidcUser(
+                    idToken.getIssuer().toString(),
+                    idToken.getSubject(),
+                    preferredUsername);
             if (loginUser.isEmpty()) {
-                log.warn("[oidc] authenticated Certus identity is not provisioned in Specus");
+                log.warn("[oidc] authenticated Certus identity is disabled or conflicts with an existing binding");
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                        .body(Map.of("error", "该 Certus 账号尚未获准访问 Specus"));
+                        .body(Map.of("error", "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突"));
             }
             LoginUser user = loginUser.get();
             Map<String, Object> tokens = new LinkedHashMap<>();

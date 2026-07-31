@@ -14,7 +14,11 @@ import lombok.Setter;
 @Table(name = "specus_management_user",
         indexes = {
                 @Index(name = "idx_management_user_tenant", columnList = "tenant_id"),
-                @Index(name = "idx_management_user_role", columnList = "role")
+                @Index(name = "idx_management_user_role", columnList = "role"),
+                @Index(
+                        name = "uq_management_user_oidc_identity_key",
+                        columnList = "oidc_identity_key",
+                        unique = true)
         })
 @Getter
 @Setter
@@ -28,6 +32,15 @@ public class ManagementUser {
 
     @Column(name = "password_hash", nullable = false, length = 64)
     private String passwordHash;
+
+    @Column(name = "oidc_issuer", length = 255)
+    private String oidcIssuer;
+
+    @Column(name = "oidc_subject", length = 255)
+    private String oidcSubject;
+
+    @Column(name = "oidc_identity_key", length = 64)
+    private String oidcIdentityKey;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)

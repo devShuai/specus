@@ -60,7 +60,7 @@ class OidcControllerTests {
     }
 
     @Test
-    void validatesIdTokenAndMintsSpecusTokenForProvisionedUser() {
+    void validatesIdTokenAndMintsSpecusTokenForResolvedUser() {
         Fixture fixture = fixture("expected-nonce", "alice", true);
         assertThat(fixture.controller.config())
                 .containsEntry("registrationEndpoint", "https://certus.devshuai.com/register");
@@ -92,7 +92,7 @@ class OidcControllerTests {
     }
 
     @Test
-    void rejectsCertusIdentityThatIsNotProvisionedInSpecus() {
+    void rejectsCertusIdentityThatCannotBeProvisioned() {
         Fixture fixture = fixture("expected-nonce", "unknown", false);
 
         ResponseEntity<?> response = fixture.controller.exchange(
@@ -114,7 +114,10 @@ class OidcControllerTests {
         when(localTokenService.issueToken("alice", "default", ManagementRole.USER))
                 .thenReturn("local-specus-token");
         ManagementUserService users = mock(ManagementUserService.class);
-        when(users.resolveOidcUser(username)).thenReturn(provisioned
+        when(users.resolveOrProvisionOidcUser(
+                "https://certus.devshuai.com",
+                "certus-user-id",
+                username)).thenReturn(provisioned
                 ? Optional.of(new LoginUser(username, "default", ManagementRole.USER, false))
                 : Optional.empty());
         RegistrationService registration = mock(RegistrationService.class);
@@ -130,6 +133,7 @@ class OidcControllerTests {
                 now.plusSeconds(300),
                 Map.of("alg", "RS256"),
                 Map.of(
+                        "iss", "https://certus.devshuai.com",
                         "sub", "certus-user-id",
                         "nonce", tokenNonce,
                         "preferred_username", username));

@@ -14,10 +14,13 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
 
@@ -55,15 +58,27 @@ public class ManagementUserService {
     }
 
     /**
-     * Authorizes an identity already authenticated by Certus against Specus' existing user
-     * directory. This intentionally links by the immutable imported username only: an email claim
-     * is profile data and must never silently take over an existing local account.
+     * Resolves a verified Certus identity by its immutable issuer/subject pair. On first login an
+     * enabled local user with the same imported username is linked; otherwise a least-privileged
+     * USER is provisioned in the default tenant. Email and display-name claims are profile data and
+     * never participate in account linking.
      */
-    @Transactional(readOnly = true)
-    public Optional<LoginUser> resolveOidcUser(String preferredUsername) {
-        if (!StringUtils.hasText(preferredUsername)) {
+    @Transactional
+    public Optional<LoginUser> resolveOrProvisionOidcUser(
+            String issuer,
+            String subject,
+            String preferredUsername) {
+        if (!StringUtils.hasText(issuer)
+                || !StringUtils.hasText(subject)
+                || !StringUtils.hasText(preferredUsername)) {
             return Optional.empty();
         }
+        String normalizedIssuer = issuer.trim();
+        String normalizedSubject = subject.trim();
+        if (normalizedIssuer.length() > 255 || normalizedSubject.length() > 255) {
+            return Optional.empty();
+        }
+        String identityKey = oidcIdentityKey(normalizedIssuer, normalizedSubject);
         String normalized;
         try {
             normalized = normalizeUsername(preferredUsername);
@@ -77,9 +92,43 @@ public class ManagementUserService {
                     ManagementRole.ADMIN,
                     true));
         }
-        return repository.findByUsernameIgnoreCase(normalized)
-                .filter(ManagementUser::isEnabled)
-                .map(user -> new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false));
+        Optional<ManagementUser> bound = repository.findByOidcIdentityKey(identityKey);
+        if (bound.isPresent()) {
+            return bound.filter(ManagementUser::isEnabled).map(this::toLoginUser);
+        }
+
+        Optional<ManagementUser> existing = repository.findByUsernameIgnoreCase(normalized);
+        if (existing.isPresent()) {
+            ManagementUser user = existing.get();
+            if (!user.isEnabled()) {
+                return Optional.empty();
+            }
+            if (StringUtils.hasText(user.getOidcIssuer())
+                    || StringUtils.hasText(user.getOidcSubject())) {
+                return sameOidcIdentity(user, normalizedIssuer, normalizedSubject)
+                        ? Optional.of(toLoginUser(user))
+                        : Optional.empty();
+            }
+            user.setOidcIssuer(normalizedIssuer);
+            user.setOidcSubject(normalizedSubject);
+            user.setOidcIdentityKey(identityKey);
+            user.setUpdatedAt(Instant.now().toString());
+            return Optional.of(toLoginUser(repository.save(user)));
+        }
+
+        String now = Instant.now().toString();
+        ManagementUser user = new ManagementUser();
+        user.setUsername(normalized);
+        user.setTenantId(TenantContext.normalize(authProperties.getTenantId()));
+        user.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
+        user.setOidcIssuer(normalizedIssuer);
+        user.setOidcSubject(normalizedSubject);
+        user.setOidcIdentityKey(identityKey);
+        user.setRole(ManagementRole.USER);
+        user.setEnabled(true);
+        user.setCreatedAt(now);
+        user.setUpdatedAt(now);
+        return Optional.of(toLoginUser(repository.save(user)));
     }
 
     @Transactional(readOnly = true)
@@ -239,6 +288,26 @@ public class ManagementUserService {
                 user.isEnabled(),
                 user.getCreatedAt(),
                 user.getUpdatedAt());
+    }
+
+    private LoginUser toLoginUser(ManagementUser user) {
+        return new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false);
+    }
+
+    private boolean sameOidcIdentity(ManagementUser user, String issuer, String subject) {
+        return oidcIdentityKey(issuer, subject).equals(user.getOidcIdentityKey());
+    }
+
+    private String oidcIdentityKey(String issuer, String subject) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(issuer.getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) 0);
+            digest.update(subject.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     String normalizeUsername(String username) {

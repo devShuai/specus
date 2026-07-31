@@ -9,6 +9,8 @@ import java.util.Optional;
 public interface ManagementUserRepository extends JpaRepository<ManagementUser, String> {
     Optional<ManagementUser> findByUsernameIgnoreCase(String username);
 
+    Optional<ManagementUser> findByOidcIdentityKey(String oidcIdentityKey);
+
     boolean existsByUsernameIgnoreCase(String username);
 
     List<ManagementUser> findByTenantIdOrderByUsernameAsc(String tenantId);
