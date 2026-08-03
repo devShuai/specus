@@ -21,6 +21,7 @@ import {
 import type { ManagementUser, OidcConfig, RegistrationChallengeResponse } from "../api/types";
 import { codeChallenge, randomToken } from "../lib/pkce";
 import { executeTurnstile } from "../lib/turnstile";
+import { oidcLaunchReturnPath } from "./oidcLaunch";
 import { buildOidcRegistrationUrl } from "./oidcUrls";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
@@ -212,6 +213,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setOidcConfig(config);
 
       const params = new URLSearchParams(window.location.search);
+      const launchReturnPath = oidcLaunchReturnPath(window.location.href);
       if (params.get("error")) {
         setLoginHint(params.get("error_description") || params.get("error") || "登录失败");
         cleanUrl();
@@ -232,6 +234,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setProfile(null);
           setLoginHint(error instanceof Error ? error.message : "登录已过期，请重新登录");
         }
+      } else if (launchReturnPath !== null) {
+        if (config?.configured) {
+          window.history.replaceState({}, document.title, launchReturnPath);
+          window.location.replace((await prepareOidcAuthorization(config)).toString());
+          return;
+        }
+        setLoginHint("OIDC 登录未配置");
       } else if (config && !config.passwordLoginEnabled && !config.configured) {
         setLoginHint("未配置任何登录方式：请设置用户名/密码或 OIDC");
       }
