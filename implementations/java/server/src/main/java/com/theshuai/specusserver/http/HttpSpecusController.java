@@ -113,7 +113,10 @@ public class HttpSpecusController {
                     response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
                     throw new HttpForwardFailure(401, "需要 HTTP Basic 认证");
                 }
-                case NOT_FOUND -> throw new HttpForwardFailure(404, "HTTP 路由不存在或未启用");
+                case NOT_FOUND -> {
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(404, "HTTP 路由不存在或未启用");
+                }
                 case UNAVAILABLE -> {
                     response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
                     throw new HttpForwardFailure(503, "HTTP 路由认证暂不可用");

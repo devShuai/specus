@@ -61,6 +61,43 @@ class WebSocketSpecusHandshakeInterceptorAuthenticationTests {
     }
 
     @Test
+    void disabledRouteRejectsHandshakeWithoutCaching() {
+        when(authenticationService.authorize("client-a", "private", null))
+                .thenReturn(new HttpRouteAuthenticationService.Decision(
+                        HttpRouteAuthenticationService.Outcome.NOT_FOUND));
+        ServerHttpResponse response = mock(ServerHttpResponse.class);
+        HttpHeaders responseHeaders = new HttpHeaders();
+        when(response.getHeaders()).thenReturn(responseHeaders);
+
+        boolean accepted = interceptor.beforeHandshake(
+                new ServletServerHttpRequest(request()), response, handler, new HashMap<>());
+
+        assertThat(accepted).isFalse();
+        verify(response).setStatusCode(HttpStatus.NOT_FOUND);
+        assertThat(responseHeaders.getFirst(HttpHeaders.CACHE_CONTROL)).isEqualTo("no-store");
+    }
+
+    @Test
+    void encodedIdentitySegmentsAreDecodedButRelativePathStaysRaw() {
+        when(authenticationService.authorize("Demo client", "private route", null))
+                .thenReturn(new HttpRouteAuthenticationService.Decision(
+                        HttpRouteAuthenticationService.Outcome.PUBLIC));
+        MockHttpServletRequest servletRequest = new MockHttpServletRequest(
+                "GET", "/http/Demo%20client/private%20route/socket%2Fraw");
+        Map<String, Object> attributes = new HashMap<>();
+
+        boolean accepted = interceptor.beforeHandshake(
+                new ServletServerHttpRequest(servletRequest), mock(ServerHttpResponse.class),
+                handler, attributes);
+
+        assertThat(accepted).isTrue();
+        verify(authenticationService).authorize("Demo client", "private route", null);
+        assertThat(attributes.get(WebSocketSpecusHandler.ATTR_CLIENT_NAME)).isEqualTo("Demo client");
+        assertThat(attributes.get(WebSocketSpecusHandler.ATTR_ROUTE)).isEqualTo("private route");
+        assertThat(attributes.get(WebSocketSpecusHandler.ATTR_RELATIVE_PATH)).isEqualTo("/socket%2Fraw");
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void protectedHandshakeConsumesAuthorizationBeforeForwardingMetadata() {
         when(authenticationService.authorize("client-a", "private", "Basic valid"))

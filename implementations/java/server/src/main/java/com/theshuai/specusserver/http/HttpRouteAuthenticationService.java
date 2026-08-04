@@ -57,7 +57,7 @@ public class HttpRouteAuthenticationService {
                 return Decision.publicRoute();
             }
             if (!StringUtils.hasText(managedRoute.getAuthUsername())
-                    || !StringUtils.hasText(managedRoute.getAuthPasswordHash())) {
+                    || !isSha256Hex(managedRoute.getAuthPasswordHash())) {
                 log.error("[http-route-auth] protected route is missing credentials clientName={} route={}",
                         clientName, route);
                 return Decision.unavailable();
@@ -114,6 +114,18 @@ public class HttpRouteAuthenticationService {
         } catch (NoSuchAlgorithmException error) {
             throw new IllegalStateException("SHA-256 is unavailable", error);
         }
+    }
+
+    private static boolean isSha256Hex(String value) {
+        if (value == null || value.length() != 64) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            if (Character.digit(value.charAt(index), 16) < 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public enum Outcome {

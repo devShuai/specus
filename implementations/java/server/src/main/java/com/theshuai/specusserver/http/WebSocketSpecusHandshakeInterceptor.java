@@ -7,10 +7,12 @@ import org.springframework.http.server.ServerHttpRequest;
 import org.springframework.http.server.ServerHttpResponse;
 import org.springframework.http.server.ServletServerHttpRequest;
 import org.springframework.stereotype.Component;
+import org.springframework.web.util.UriUtils;
 import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.server.HandshakeInterceptor;
 
 import jakarta.servlet.http.HttpServletRequest;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
@@ -77,6 +79,7 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
             }
             case NOT_FOUND -> {
                 response.setStatusCode(HttpStatus.NOT_FOUND);
+                response.getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-store");
                 return false;
             }
             case UNAVAILABLE -> {
@@ -123,21 +126,28 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         if (clientEnd < 0) {
             return null;
         }
-        String clientName = path.substring(clientStart, clientEnd);
+        String encodedClientName = path.substring(clientStart, clientEnd);
         int routeEnd = path.indexOf('/', clientEnd + 1);
-        String route;
+        String encodedRoute;
         String relativePath;
         if (routeEnd < 0) {
-            route = path.substring(clientEnd + 1);
+            encodedRoute = path.substring(clientEnd + 1);
             relativePath = "/";
         } else {
-            route = path.substring(clientEnd + 1, routeEnd);
+            encodedRoute = path.substring(clientEnd + 1, routeEnd);
             relativePath = path.substring(routeEnd);
         }
-        if (clientName.isEmpty() || route.isEmpty()) {
+        if (encodedClientName.isEmpty() || encodedRoute.isEmpty()) {
             return null;
         }
-        return new PathParts(clientName, route, relativePath);
+        try {
+            return new PathParts(
+                    UriUtils.decode(encodedClientName, StandardCharsets.UTF_8),
+                    UriUtils.decode(encodedRoute, StandardCharsets.UTF_8),
+                    relativePath);
+        } catch (IllegalArgumentException malformedEncoding) {
+            return null;
+        }
     }
 
     private static List<String> collectHeaders(HttpServletRequest request, boolean stripAuthorization) {

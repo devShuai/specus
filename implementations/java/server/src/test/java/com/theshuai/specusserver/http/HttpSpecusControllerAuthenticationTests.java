@@ -82,6 +82,23 @@ class HttpSpecusControllerAuthenticationTests {
     }
 
     @Test
+    void disabledRouteReturnsNonCacheableNotFound() throws Exception {
+        String clientName = "auth-test-" + UUID.randomUUID();
+        when(authenticationService.authorize(clientName, "private", null))
+                .thenReturn(new HttpRouteAuthenticationService.Decision(
+                        HttpRouteAuthenticationService.Outcome.NOT_FOUND));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller.forward(clientName, "private", request(clientName), response);
+
+        assertThat(response.getStatus()).isEqualTo(404);
+        assertThat(response.getHeader(HttpHeaders.CACHE_CONTROL)).isEqualTo("no-store");
+        assertThat(response.getContentAsString(StandardCharsets.UTF_8))
+                .isEqualTo("HTTP 路由不存在或未启用");
+        assertThat(capturedRequestHeaders(clientName, 404)).isEmpty();
+    }
+
+    @Test
     void authenticatedRouteDoesNotForwardOrCaptureConsumedAuthorization() throws Exception {
         String clientName = "auth-test-" + UUID.randomUUID();
         when(authenticationService.authorize(clientName, "private", "Basic valid"))

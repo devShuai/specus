@@ -83,6 +83,10 @@ class HttpRouteAuthenticationServiceTests {
         route.setAuthPasswordHash(null);
         assertThat(service.authorize("client-a", "private", basic("viewer", "secret:tail")).outcome())
                 .isEqualTo(HttpRouteAuthenticationService.Outcome.UNAVAILABLE);
+
+        route.setAuthPasswordHash("not-a-sha256-hash");
+        assertThat(service.authorize("client-a", "private", basic("viewer", "secret:tail")).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.UNAVAILABLE);
     }
 
     @Test
