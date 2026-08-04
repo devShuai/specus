@@ -212,11 +212,20 @@ public sealed class DatabaseInitializer
         CancellationToken cancellationToken)
     {
         var boolType = BooleanColumnType(db.Database.ProviderName);
+        var authBoolType = DatabaseDialect(db.Database.ProviderName) == "postgresql"
+            ? "BOOLEAN NOT NULL DEFAULT FALSE"
+            : boolType;
         await EnsureColumnAsync(db, "specus_mapping", "detail_capture_enabled", boolType, cancellationToken)
             .ConfigureAwait(false);
         await EnsureColumnAsync(db, "http_route_mapping", "detail_capture_enabled", boolType, cancellationToken)
             .ConfigureAwait(false);
         await EnsureColumnAsync(db, "http_route_mapping", "path_rewrite_enabled", boolType, cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "http_route_mapping", "auth_enabled", authBoolType, cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "http_route_mapping", "auth_username", "VARCHAR(120)", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "http_route_mapping", "auth_password_hash", "VARCHAR(64)", cancellationToken)
             .ConfigureAwait(false);
         await EnsureColumnAsync(db, "specus_connection_record", "tenant_id", "VARCHAR(80)", cancellationToken)
             .ConfigureAwait(false);

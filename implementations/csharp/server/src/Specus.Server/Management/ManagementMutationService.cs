@@ -364,6 +364,10 @@ public sealed class ManagementMutationService
         await EnsureRouteAvailableAsync(account.Id, route, existingId: null, cancellationToken).ConfigureAwait(false);
 
         var now = DateTimeOffset.UtcNow;
+        var authEnabled = request.AuthEnabled ?? false;
+        var authUsername = NormalizeAuthUsername(request.AuthUsername);
+        var authPasswordHash = HashAuthPasswordIfPresent(request.AuthPassword);
+        ValidateAuthConfiguration(authEnabled, authUsername, authPasswordHash);
         var row = new HttpRouteMapping
         {
             Id = ClientIdGenerator.NewId(),
@@ -374,6 +378,9 @@ public sealed class ManagementMutationService
             Enabled = request.Enabled ?? true,
             DetailCaptureEnabled = request.DetailCaptureEnabled ?? false,
             PathRewriteEnabled = request.PathRewriteEnabled ?? false,
+            AuthEnabled = authEnabled,
+            AuthUsername = authUsername,
+            AuthPasswordHash = authPasswordHash,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -401,6 +408,17 @@ public sealed class ManagementMutationService
         row.Enabled = request.Enabled ?? row.Enabled;
         row.DetailCaptureEnabled = request.DetailCaptureEnabled ?? row.DetailCaptureEnabled;
         row.PathRewriteEnabled = request.PathRewriteEnabled ?? row.PathRewriteEnabled;
+        row.AuthEnabled = request.AuthEnabled ?? row.AuthEnabled;
+        if (request.AuthUsername is not null)
+        {
+            row.AuthUsername = NormalizeAuthUsername(request.AuthUsername);
+        }
+        var authPasswordHash = HashAuthPasswordIfPresent(request.AuthPassword);
+        if (authPasswordHash is not null)
+        {
+            row.AuthPasswordHash = authPasswordHash;
+        }
+        ValidateAuthConfiguration(row.AuthEnabled, row.AuthUsername, row.AuthPasswordHash);
         row.UpdatedAt = DateTimeOffset.UtcNow;
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(row.ClientId, cancellationToken).ConfigureAwait(false);
@@ -547,8 +565,58 @@ public sealed class ManagementMutationService
         row.Enabled,
         row.DetailCaptureEnabled,
         row.PathRewriteEnabled,
+        row.AuthEnabled,
+        row.AuthUsername ?? string.Empty,
+        !string.IsNullOrWhiteSpace(row.AuthPasswordHash),
         row.CreatedAt.ToString("O"),
         row.UpdatedAt.ToString("O"));
+
+    private static string? NormalizeAuthUsername(string? username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return null;
+        }
+        var normalized = username.Trim();
+        if (normalized.Length > 120)
+        {
+            throw new ArgumentException("authUsername is too long (max 120)");
+        }
+        if (normalized.IndexOfAny([':', '\r', '\n']) >= 0)
+        {
+            throw new ArgumentException("authUsername must not contain ':', CR, or LF");
+        }
+        return normalized;
+    }
+
+    private static string? HashAuthPasswordIfPresent(string? password)
+    {
+        if (string.IsNullOrWhiteSpace(password))
+        {
+            return null;
+        }
+        if (password.Length > 256)
+        {
+            throw new ArgumentException("authPassword is too long (max 256)");
+        }
+        return PasswordHasher.Hash(password);
+    }
+
+    private static void ValidateAuthConfiguration(bool enabled, string? username, string? passwordHash)
+    {
+        if (!enabled)
+        {
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            throw new ArgumentException("authUsername cannot be blank when authentication is enabled");
+        }
+        if (string.IsNullOrWhiteSpace(passwordHash))
+        {
+            throw new ArgumentException("authPassword is required when authentication is enabled");
+        }
+    }
 
     private async Task EnsureListenPortAvailableAsync(int listenPort, long? existingId,
         CancellationToken cancellationToken)

@@ -486,6 +486,104 @@ public sealed class AdminApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task HttpRouteBasicAuthenticationProtectsIngressWithoutExposingPassword()
+    {
+        using var admin = await AuthenticatedClientAsync();
+        var demo = await ReadDemoClientAsync(admin);
+
+        var missingPassword = await admin.PostAsJsonAsync($"/api/admin/clients/{demo.Id}/http-routes", new
+        {
+            route = "secure-missing",
+            targetBaseUrl = "https://example.com",
+            authEnabled = true,
+            authUsername = "viewer",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, missingPassword.StatusCode);
+
+        var create = await admin.PostAsJsonAsync($"/api/admin/clients/{demo.Id}/http-routes", new
+        {
+            route = "secure-api",
+            targetBaseUrl = "https://example.com",
+            enabled = true,
+            detailCaptureEnabled = true,
+            authEnabled = true,
+            authUsername = "viewer",
+            authPassword = "route secret",
+        });
+        Assert.Equal(HttpStatusCode.Created, create.StatusCode);
+        var json = await create.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("authPassword\"", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("authPasswordHash", json, StringComparison.OrdinalIgnoreCase);
+        var route = JsonSerializer.Deserialize<HttpRouteBody>(json, JsonOptions);
+        Assert.NotNull(route);
+        Assert.True(route!.AuthEnabled);
+        Assert.Equal("viewer", route.AuthUsername);
+        Assert.True(route.AuthPasswordConfigured);
+
+        using var ingress = _server!.CreateClient();
+        var missing = await ingress.GetAsync($"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        Assert.Equal(HttpStatusCode.Unauthorized, missing.StatusCode);
+        Assert.Equal("Basic", missing.Headers.WwwAuthenticate.Single().Scheme);
+
+        using var wrong = new HttpRequestMessage(HttpMethod.Get,
+            $"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        wrong.Headers.Authorization = Basic("viewer", "wrong");
+        var rejected = await ingress.SendAsync(wrong);
+        Assert.Equal(HttpStatusCode.Unauthorized, rejected.StatusCode);
+
+        using var valid = new HttpRequestMessage(HttpMethod.Get,
+            $"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        valid.Headers.Authorization = Basic("viewer", "route secret");
+        var forwarded = await ingress.SendAsync(valid);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, forwarded.StatusCode);
+
+        var update = await admin.PutAsJsonAsync($"/api/admin/http-routes/{route.Id}", new
+        {
+            route = route.Route,
+            targetBaseUrl = route.TargetBaseUrl,
+            authEnabled = true,
+            authUsername = "reader",
+            authPassword = "",
+        });
+        update.EnsureSuccessStatusCode();
+        var updated = await update.Content.ReadFromJsonAsync<HttpRouteBody>(JsonOptions);
+        Assert.NotNull(updated);
+        Assert.True(updated!.AuthPasswordConfigured);
+
+        using var preserved = new HttpRequestMessage(HttpMethod.Get,
+            $"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        preserved.Headers.Authorization = Basic("reader", "route secret");
+        var preservedResponse = await ingress.SendAsync(preserved);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, preservedResponse.StatusCode);
+
+        var makePublic = await admin.PutAsJsonAsync($"/api/admin/http-routes/{route.Id}", new
+        {
+            route = route.Route,
+            targetBaseUrl = route.TargetBaseUrl,
+            authEnabled = false,
+        });
+        makePublic.EnsureSuccessStatusCode();
+        var publicRoute = await makePublic.Content.ReadFromJsonAsync<HttpRouteBody>(JsonOptions);
+        Assert.NotNull(publicRoute);
+        Assert.False(publicRoute!.AuthEnabled);
+        Assert.True(publicRoute.AuthPasswordConfigured);
+        var publicResponse = await ingress.GetAsync(
+            $"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, publicResponse.StatusCode);
+
+        var disable = await admin.PutAsJsonAsync($"/api/admin/http-routes/{route.Id}", new
+        {
+            route = route.Route,
+            targetBaseUrl = route.TargetBaseUrl,
+            enabled = false,
+        });
+        disable.EnsureSuccessStatusCode();
+        var disabledResponse = await ingress.GetAsync(
+            $"/http/{Uri.EscapeDataString(demo.ClientName)}/secure-api/ping");
+        Assert.Equal(HttpStatusCode.NotFound, disabledResponse.StatusCode);
+    }
+
+    [Fact]
     public async Task ConnectionTrafficAndStatReadModelsMatchAdminShape()
     {
         using var client = await AuthenticatedClientAsync();
@@ -683,6 +781,17 @@ public sealed class AdminApiTests : IAsyncLifetime
     {
         using var admin = await AuthenticatedClientAsync();
         var demo = await ReadDemoClientAsync(admin);
+        var create = await admin.PostAsJsonAsync($"/api/admin/clients/{demo.Id}/http-routes", new
+        {
+            route = "encoded",
+            targetBaseUrl = "https://example.com",
+            enabled = true,
+            detailCaptureEnabled = true,
+            authEnabled = true,
+            authUsername = "viewer",
+            authPassword = "route secret",
+        });
+        create.EnsureSuccessStatusCode();
         var nat = _server!.HostServices.GetRequiredService<NatServerHandler>();
         var registry = _server.HostServices.GetRequiredService<SessionRegistry>();
         using var lifetime = new CancellationTokenSource();
@@ -703,13 +812,31 @@ public sealed class AdminApiTests : IAsyncLifetime
         try
         {
             using var publicClient = _server.CreateClient();
-            var response = await publicClient.GetAsync(
+            using var request = new HttpRequestMessage(HttpMethod.Get,
                 $"/http/{Uri.EscapeDataString(demo.ClientName)}/encoded/%E4%BD%A0%2Fok?x=%2F");
+            request.Headers.Authorization = Basic("viewer", "route secret");
+            request.Headers.Add("X-Upstream-Test", "kept");
+            var response = await publicClient.SendAsync(request);
 
             response.EnsureSuccessStatusCode();
             Assert.NotNull(writer.Captured);
             Assert.Equal("/%E4%BD%A0%2Fok", writer.Captured!["relativePath"]);
             Assert.Equal("x=%2F", writer.Captured["rawQuery"]);
+            var headers = Assert.IsAssignableFrom<IEnumerable<string>>(writer.Captured["headers"]);
+            Assert.Contains(headers, value => value.Equals("X-Upstream-Test:kept", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(headers,
+                value => value.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase));
+
+            var details = await admin.GetFromJsonAsync<HttpExchangePageBody>(
+                "/api/admin/traffic/http-exchanges?route=encoded&page=0&size=20&flush=true", JsonOptions);
+            Assert.NotNull(details);
+            var summary = Assert.Single(details!.Items, item => item.Route == "encoded");
+            var detail = await admin.GetFromJsonAsync<HttpExchangeBody>(
+                $"/api/admin/traffic/http-exchanges/{summary.Id}", JsonOptions);
+            Assert.NotNull(detail);
+            Assert.NotNull(detail!.RequestHeaders);
+            Assert.Contains("X-Upstream-Test:kept", detail.RequestHeaders!, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Authorization:", detail.RequestHeaders!, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -859,6 +986,9 @@ public sealed class AdminApiTests : IAsyncLifetime
         }
         return output.ToArray();
     }
+
+    private static AuthenticationHeaderValue Basic(string username, string password) =>
+        new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}")));
 
     private static async Task<TokenBody> LoginAsync(HttpClient client, string username = "admin",
         string password = "admin")
@@ -1207,6 +1337,9 @@ public sealed class AdminApiTests : IAsyncLifetime
         bool Enabled,
         bool DetailCaptureEnabled,
         bool PathRewriteEnabled,
+        bool AuthEnabled,
+        string AuthUsername,
+        bool AuthPasswordConfigured,
         string CreatedAt,
         string UpdatedAt);
 
@@ -1262,6 +1395,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         string Method,
         int StatusCode,
         string ResponseBodyType,
+        string? RequestHeaders,
         string? ResponseHeaders,
         string? ResponsePreviewText);
 }

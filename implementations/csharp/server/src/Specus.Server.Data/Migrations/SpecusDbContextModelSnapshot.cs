@@ -602,6 +602,20 @@ namespace Specus.Server.Data.Migrations
                     b.Property<long>("Id")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("AuthEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("auth_enabled");
+
+                    b.Property<string>("AuthPasswordHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("auth_password_hash");
+
+                    b.Property<string>("AuthUsername")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("auth_username");
+
                     b.Property<long>("ClientId")
                         .HasColumnType("INTEGER")
                         .HasColumnName("client_id");
@@ -1400,6 +1414,65 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("specus_resource_traffic_usage", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.SpecusMapping", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<bool>("DetailCaptureEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("detail_capture_enabled");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<int>("ListenPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("listen_port");
+
+                    b.Property<string>("TargetAddress")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("target_address");
+
+                    b.Property<int>("TargetPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("target_port");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClientId");
+
+                    b.HasIndex("ListenPort")
+                        .IsUnique();
+
+                    b.ToTable("specus_mapping", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.TcpTrafficFrame", b =>
                 {
                     b.Property<long>("Id")
@@ -1811,65 +1884,6 @@ namespace Specus.Server.Data.Migrations
                         .HasDatabaseName("idx_attachment_download_usage_account_month");
 
                     b.ToTable("transfer_attachment_download_usage", (string)null);
-                });
-
-            modelBuilder.Entity("Specus.Server.Data.Entities.SpecusMapping", b =>
-                {
-                    b.Property<long>("Id")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("ClientId")
-                        .HasColumnType("INTEGER")
-                        .HasColumnName("client_id");
-
-                    b.Property<string>("ClientName")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT")
-                        .HasColumnName("client_name");
-
-                    b.Property<string>("CreatedAt")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT")
-                        .HasColumnName("created_at");
-
-                    b.Property<bool>("DetailCaptureEnabled")
-                        .HasColumnType("INTEGER")
-                        .HasColumnName("detail_capture_enabled");
-
-                    b.Property<bool>("Enabled")
-                        .HasColumnType("INTEGER")
-                        .HasColumnName("enabled");
-
-                    b.Property<int>("ListenPort")
-                        .HasColumnType("INTEGER")
-                        .HasColumnName("listen_port");
-
-                    b.Property<string>("TargetAddress")
-                        .IsRequired()
-                        .HasMaxLength(255)
-                        .HasColumnType("TEXT")
-                        .HasColumnName("target_address");
-
-                    b.Property<int>("TargetPort")
-                        .HasColumnType("INTEGER")
-                        .HasColumnName("target_port");
-
-                    b.Property<string>("UpdatedAt")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT")
-                        .HasColumnName("updated_at");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ClientId");
-
-                    b.HasIndex("ListenPort")
-                        .IsUnique();
-
-                    b.ToTable("specus_mapping", (string)null);
                 });
 
             modelBuilder.Entity("Specus.Server.Data.Entities.WebSocketTicket", b =>

@@ -29,6 +29,9 @@ public sealed class HttpRouteMapping
     public bool Enabled { get; set; }
     public bool DetailCaptureEnabled { get; set; }
     public bool PathRewriteEnabled { get; set; }
+    public bool AuthEnabled { get; set; }
+    public string? AuthUsername { get; set; }
+    public string? AuthPasswordHash { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }

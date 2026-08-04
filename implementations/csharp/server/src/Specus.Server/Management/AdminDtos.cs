@@ -134,6 +134,9 @@ public sealed record HttpRouteView(
     bool Enabled,
     bool DetailCaptureEnabled,
     bool PathRewriteEnabled,
+    bool AuthEnabled,
+    string AuthUsername,
+    bool AuthPasswordConfigured,
     string CreatedAt,
     string UpdatedAt);
 
@@ -142,7 +145,10 @@ public sealed record HttpRouteMutation(
     string? TargetBaseUrl,
     bool? Enabled,
     bool? DetailCaptureEnabled,
-    bool? PathRewriteEnabled);
+    bool? PathRewriteEnabled,
+    bool? AuthEnabled,
+    string? AuthUsername,
+    string? AuthPassword);
 
 public sealed record NatControlPushResponse(int Pushed, int SpecusMappings, int HttpRoutes);
 

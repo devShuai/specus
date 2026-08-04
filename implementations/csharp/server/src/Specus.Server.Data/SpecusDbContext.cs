@@ -330,6 +330,9 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
             b.Property(x => x.DetailCaptureEnabled).HasColumnName("detail_capture_enabled").IsRequired();
             b.Property(x => x.PathRewriteEnabled).HasColumnName("path_rewrite_enabled").IsRequired();
+            b.Property(x => x.AuthEnabled).HasColumnName("auth_enabled").IsRequired();
+            b.Property(x => x.AuthUsername).HasColumnName("auth_username").HasMaxLength(120);
+            b.Property(x => x.AuthPasswordHash).HasColumnName("auth_password_hash").HasMaxLength(64);
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()

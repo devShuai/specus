@@ -682,6 +682,9 @@ public sealed class ManagementQueryService
         row.Enabled,
         row.DetailCaptureEnabled,
         row.PathRewriteEnabled,
+        row.AuthEnabled,
+        row.AuthUsername ?? string.Empty,
+        !string.IsNullOrWhiteSpace(row.AuthPasswordHash),
         row.CreatedAt.ToString("O"),
         row.UpdatedAt.ToString("O"));
 

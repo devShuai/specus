@@ -49,7 +49,41 @@ public static class DirectHttpEndpoints
     {
         var startedAt = DateTimeOffset.UtcNow;
         var relativePath = RelativePath(context, rest);
-        var requestHeaders = RequestHeaders(context.Request);
+        HttpRouteAccessPolicy accessPolicy;
+        try
+        {
+            accessPolicy = await LoadRouteAccessPolicyAsync(db, clientName, route, context.RequestAborted)
+                .ConfigureAwait(false);
+        }
+        catch (Exception) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            await WriteTextErrorAsync(context.Response, StatusCodes.Status503ServiceUnavailable,
+                "HTTP 路由认证配置暂时不可用").ConfigureAwait(false);
+            return;
+        }
+
+        if (accessPolicy.Managed && !accessPolicy.Enabled)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            await WriteTextErrorAsync(context.Response, StatusCodes.Status404NotFound,
+                "HTTP 路由不存在或未启用").ConfigureAwait(false);
+            return;
+        }
+
+        if (accessPolicy.AuthEnabled
+            && !HttpRouteBasicAuthenticator.IsAuthorized(context.Request.Headers.Authorization.ToString(),
+                accessPolicy.AuthUsername, accessPolicy.AuthPasswordHash))
+        {
+            context.Response.Headers.WWWAuthenticate =
+                "Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"";
+            context.Response.Headers.CacheControl = "no-store";
+            await WriteTextErrorAsync(context.Response, StatusCodes.Status401Unauthorized,
+                "需要 HTTP Basic 认证").ConfigureAwait(false);
+            return;
+        }
+
+        var requestHeaders = RequestHeaders(context.Request, accessPolicy.AuthEnabled);
         var requestCapture = new LimitedCapture(64 * 1024);
         var responseCapture = new LimitedCapture(64 * 1024);
         var requestMetadata = new Dictionary<string, object?>
@@ -64,7 +98,7 @@ public static class DirectHttpEndpoints
                 : null,
             ["headers"] = requestHeaders,
             ["contentLength"] = context.Request.ContentLength ?? -1L,
-            ["trailerNames"] = DeclaredRequestTrailers(context.Request),
+            ["trailerNames"] = DeclaredRequestTrailers(context.Request, accessPolicy.AuthEnabled),
         };
         if (context.Request.ContentLength > options.Value.MaxRequestBodySize)
         {
@@ -87,7 +121,7 @@ public static class DirectHttpEndpoints
                     context.RequestAborted).ConfigureAwait(false);
             using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
             var pumpTask = PumpRequestAsync(context, stream, traffic, clientName, route,
-                requestCapture, options.Value.MaxRequestBodySize, pumpCts.Token);
+                requestCapture, options.Value.MaxRequestBodySize, accessPolicy.AuthEnabled, pumpCts.Token);
 
             using var headCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
             headCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(1, options.Value.TimeoutMs)));
@@ -121,9 +155,7 @@ public static class DirectHttpEndpoints
                 }
             }
 
-            var rewrite = await IsPathRewriteEnabledAsync(db, clientName, route, context.RequestAborted)
-                    .ConfigureAwait(false)
-                && IsRewritable(originalResponseHeaders);
+            var rewrite = accessPolicy.PathRewriteEnabled && IsRewritable(originalResponseHeaders);
             using var rewriteBuffer = new MemoryStream();
             var responseStarted = false;
             long responseBytes = 0;
@@ -227,7 +259,7 @@ public static class DirectHttpEndpoints
 
     private static async Task PumpRequestAsync(HttpContext context, HttpSpecusStream stream,
         TrafficUsageService traffic, string clientName, string route, LimitedCapture capture,
-        int maxBytes, CancellationToken cancellationToken)
+        int maxBytes, bool stripAuthorization, CancellationToken cancellationToken)
     {
         var buffer = new byte[64 * 1024];
         long total = 0;
@@ -238,7 +270,7 @@ public static class DirectHttpEndpoints
                 var read = await context.Request.Body.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
-                    var trailers = RequestTrailers(context);
+                    var trailers = RequestTrailers(context, stripAuthorization);
                     await stream.FinishRequestAsync(trailers.Count == 0
                             ? null
                             : new Dictionary<string, object?> { ["trailers"] = trailers }, cancellationToken)
@@ -350,12 +382,13 @@ public static class DirectHttpEndpoints
             or ':'
             or '@';
 
-    private static List<string> RequestHeaders(HttpRequest request)
+    private static List<string> RequestHeaders(HttpRequest request, bool stripAuthorization)
     {
         var headers = new List<string>();
         foreach (var (name, values) in request.Headers)
         {
-            if (!ShouldForward(name))
+            if (!ShouldForward(name)
+                || (stripAuthorization && name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
@@ -392,7 +425,8 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private static async Task<bool> IsPathRewriteEnabledAsync(SpecusDbContext db, string clientName, string route,
+    private static async Task<HttpRouteAccessPolicy> LoadRouteAccessPolicyAsync(SpecusDbContext db,
+        string clientName, string route,
         CancellationToken cancellationToken)
     {
         var account = await db.ClientAccounts.AsNoTracking()
@@ -400,13 +434,14 @@ public static class DirectHttpEndpoints
             .ConfigureAwait(false);
         if (account is null)
         {
-            return false;
+            return HttpRouteAccessPolicy.Public;
         }
         return await db.HttpRouteMappings.AsNoTracking()
             .Where(r => r.ClientId == account.Id && r.Route == route)
-            .Select(r => r.PathRewriteEnabled)
+            .Select(r => new HttpRouteAccessPolicy(true, r.Enabled, r.PathRewriteEnabled, r.AuthEnabled,
+                r.AuthUsername, r.AuthPasswordHash))
             .FirstOrDefaultAsync(cancellationToken)
-            .ConfigureAwait(false);
+            .ConfigureAwait(false) ?? HttpRouteAccessPolicy.Public;
     }
 
     private static List<string>? StripRewriteHeaders(List<string>? source)
@@ -507,12 +542,15 @@ public static class DirectHttpEndpoints
         };
     }
 
-    private static List<string> DeclaredRequestTrailers(HttpRequest request) =>
+    private static List<string> DeclaredRequestTrailers(HttpRequest request, bool stripAuthorization) =>
         request.Headers["Trailer"].SelectMany(static value =>
                 (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            .Where(IsValidHeaderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            .Where(name => IsValidHeaderName(name)
+                           && (!stripAuthorization
+                               || !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-    private static List<string> RequestTrailers(HttpContext context)
+    private static List<string> RequestTrailers(HttpContext context, bool stripAuthorization)
     {
         var feature = context.Features.Get<IHttpRequestTrailersFeature>();
         if (feature is null || !feature.Available)
@@ -522,7 +560,8 @@ public static class DirectHttpEndpoints
         var result = new List<string>();
         foreach (var (name, values) in feature.Trailers)
         {
-            if (!IsValidHeaderName(name))
+            if (!IsValidHeaderName(name)
+                || (stripAuthorization && name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
@@ -585,5 +624,11 @@ public static class DirectHttpEndpoints
         response.StatusCode = statusCode;
         response.ContentType = "text/plain;charset=UTF-8";
         await response.WriteAsync(message, Encoding.UTF8).ConfigureAwait(false);
+    }
+
+    private sealed record HttpRouteAccessPolicy(bool Managed, bool Enabled, bool PathRewriteEnabled, bool AuthEnabled,
+        string? AuthUsername, string? AuthPasswordHash)
+    {
+        public static readonly HttpRouteAccessPolicy Public = new(false, true, false, false, null, null);
     }
 }
