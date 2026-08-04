@@ -17,6 +17,9 @@ public record HttpRouteView(
         boolean detailCaptureEnabled,
         boolean mediaCaptureEnabled,
         boolean pathRewriteEnabled,
+        boolean authEnabled,
+        String authUsername,
+        boolean authPasswordConfigured,
         String createdAt,
         String updatedAt
 ) {

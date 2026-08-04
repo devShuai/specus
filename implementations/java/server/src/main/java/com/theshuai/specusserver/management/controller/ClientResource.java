@@ -1,7 +1,7 @@
 package com.theshuai.specusserver.management.controller;
 
 import com.theshuai.specusserver.management.model.ClientAccountView;
-import com.theshuai.specusserver.management.model.HttpRouteMapping;
+import com.theshuai.specusserver.management.model.HttpRouteView;
 import com.theshuai.specusserver.management.model.SpecusMapping;
 import com.theshuai.specusserver.management.service.ClientAccountService;
 import com.theshuai.specusserver.management.service.ClientAccountService.ClientMutation;
@@ -11,7 +11,7 @@ import com.theshuai.specusserver.management.service.TrafficUsageService;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
-import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
+import com.theshuai.specusserver.management.service.HttpRouteService;
 import com.theshuai.specusserver.management.service.NatControlService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -33,20 +33,20 @@ public class ClientResource {
     private final TrafficUsageService trafficUsageService;
     private final ManagementContextResolver contextResolver;
     private final SpecusMappingRepository specusMappingRepository;
-    private final HttpRouteMappingRepository httpRouteMappingRepository;
+    private final HttpRouteService httpRouteService;
     private final NatControlService natControlService;
 
     public ClientResource(ClientAccountService clientAccountService,
                           TrafficUsageService trafficUsageService,
                           ManagementContextResolver contextResolver,
                           SpecusMappingRepository specusMappingRepository,
-                          HttpRouteMappingRepository httpRouteMappingRepository,
+                          HttpRouteService httpRouteService,
                           NatControlService natControlService) {
         this.clientAccountService = clientAccountService;
         this.trafficUsageService = trafficUsageService;
         this.contextResolver = contextResolver;
         this.specusMappingRepository = specusMappingRepository;
-        this.httpRouteMappingRepository = httpRouteMappingRepository;
+        this.httpRouteService = httpRouteService;
         this.natControlService = natControlService;
     }
 
@@ -75,7 +75,7 @@ public class ClientResource {
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
         String tenantId = context.tenant().tenantId();
         List<SpecusMapping> specusMappings = specusMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(tenantId, id);
-        List<HttpRouteMapping> routes = httpRouteMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(tenantId, id);
+        List<HttpRouteView> routes = httpRouteService.listRoutes(context, id);
         return Map.of(
                 "client", client,
                 "specusMappings", specusMappings,

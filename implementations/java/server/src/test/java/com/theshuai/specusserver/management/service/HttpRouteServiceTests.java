@@ -1,12 +1,14 @@
 package com.theshuai.specusserver.management.service;
 
 import com.theshuai.specusserver.management.model.HttpRouteView;
+import com.theshuai.specusserver.management.model.HttpRouteMapping;
 import com.theshuai.specusserver.management.model.ClientAccountView;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.service.ClientAccountService.ClientMutation;
 import com.theshuai.specusserver.management.service.HttpRouteService.RouteMutation;
 import com.theshuai.specusserver.management.tenant.TenantContext;
+import com.theshuai.specusserver.security.PasswordService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -198,6 +200,59 @@ class HttpRouteServiceTests {
         assertThat(updated.detailCaptureEnabled()).isTrue();
         assertThat(updated.mediaCaptureEnabled()).isTrue();
         assertThat(updated.pathRewriteEnabled()).isTrue();
+    }
+
+    @Test
+    void createProtectedRouteHashesPasswordAndOnlyExposesConfigurationState() {
+        HttpRouteView created = httpRouteService.createRoute(clientIdA,
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        false, false, false, true, "  viewer  ", "secret:with-spaces "));
+
+        assertThat(created.authEnabled()).isTrue();
+        assertThat(created.authUsername()).isEqualTo("viewer");
+        assertThat(created.authPasswordConfigured()).isTrue();
+
+        HttpRouteMapping stored = httpRouteMappingRepository.findById(created.id()).orElseThrow();
+        assertThat(stored.getAuthPasswordHash()).isNotEqualTo("secret:with-spaces ");
+        assertThat(PasswordService.matches("secret:with-spaces ", stored.getAuthPasswordHash())).isTrue();
+    }
+
+    @Test
+    void firstEnableRequiresUsernameAndPassword() {
+        assertThatThrownBy(() -> httpRouteService.createRoute(clientIdA,
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        false, false, false, true, "viewer", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("authPassword");
+
+        assertThatThrownBy(() -> httpRouteService.createRoute(clientIdA,
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        false, false, false, true, "bad:user", "secret")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not contain");
+    }
+
+    @Test
+    void blankPasswordUpdatePreservesCredentialsAcrossDisableAndReenable() {
+        HttpRouteView created = httpRouteService.createRoute(clientIdA,
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        false, false, false, true, "viewer", "secret"));
+        String passwordHash = httpRouteMappingRepository.findById(created.id()).orElseThrow()
+                .getAuthPasswordHash();
+
+        HttpRouteView disabled = httpRouteService.updateRoute(created.id(),
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        null, null, null, false, null, "   "));
+        assertThat(disabled.authEnabled()).isFalse();
+        assertThat(disabled.authPasswordConfigured()).isTrue();
+
+        HttpRouteView reenabled = httpRouteService.updateRoute(created.id(),
+                new RouteMutation("private", "http://127.0.0.1:8080", true,
+                        null, null, null, true, null, null));
+        assertThat(reenabled.authEnabled()).isTrue();
+        assertThat(reenabled.authUsername()).isEqualTo("viewer");
+        assertThat(httpRouteMappingRepository.findById(created.id()).orElseThrow().getAuthPasswordHash())
+                .isEqualTo(passwordHash);
     }
 
     @Test

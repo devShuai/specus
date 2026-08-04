@@ -10,6 +10,8 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -105,6 +107,59 @@ class SecurityRulesTests {
     }
 
     @Test
+    void clientDetailExposesRouteAuthenticationStateWithoutPasswordOrHash() throws Exception {
+        HttpResponse<String> login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        String token = JsonUtil.readString(login.body()).path("accessToken").asText();
+        String clientName = "route-auth-detail-" + System.nanoTime();
+
+        HttpResponse<String> createdClient = sendJson(
+                "POST",
+                "/api/admin/clients",
+                "{\"clientName\":\"" + clientName + "\",\"enabled\":true}",
+                token
+        );
+        assertThat(createdClient.statusCode()).isEqualTo(201);
+        long clientId = JsonUtil.readString(createdClient.body()).path("client").path("id").asLong();
+
+        HttpResponse<String> createdRoute = sendJson(
+                "POST",
+                "/api/admin/clients/" + clientId + "/http-routes",
+                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                        + "\"authEnabled\":true,\"authUsername\":\"viewer\",\"authPassword\":\"s3cret-value\"}",
+                token
+        );
+        assertThat(createdRoute.statusCode())
+                .as("route creation response: %s", createdRoute.body())
+                .isEqualTo(201);
+
+        HttpResponse<String> detail = get("/api/admin/clients/" + clientId, token);
+        assertThat(detail.statusCode()).isEqualTo(200);
+        JsonNode route = JsonUtil.readString(detail.body()).path("httpRoutes").path(0);
+        assertThat(route.path("authEnabled").asBoolean()).isTrue();
+        assertThat(route.path("authUsername").asText()).isEqualTo("viewer");
+        assertThat(route.path("authPasswordConfigured").asBoolean()).isTrue();
+        assertThat(route.has("authPassword")).isFalse();
+        assertThat(route.has("authPasswordHash")).isFalse();
+        assertThat(detail.body()).doesNotContain("s3cret-value");
+
+        HttpResponse<String> challenge = getWithAuthorization(
+                "/http/" + clientName + "/private/", null);
+        assertThat(challenge.statusCode()).isEqualTo(401);
+        assertThat(challenge.headers().firstValue("WWW-Authenticate"))
+                .contains("Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"");
+        assertThat(challenge.headers().firstValue("Cache-Control")).contains("no-store");
+
+        String basic = Base64.getEncoder().encodeToString(
+                "viewer:s3cret-value".getBytes(StandardCharsets.UTF_8));
+        HttpResponse<String> authorized = getWithAuthorization(
+                "/http/" + clientName + "/private/", "Basic " + basic);
+        assertThat(authorized.statusCode())
+                .as("valid route credentials must pass the auth gate before the offline-client boundary")
+                .isEqualTo(502);
+        assertThat(authorized.body()).contains("客户端不在线");
+    }
+
+    @Test
     void publicHttpProxyIgnoresForeignBearerToken() throws Exception {
         HttpResponse<String> response = get("/http/missing-client/nacos/", "nacos-owned-token");
 
@@ -193,6 +248,14 @@ class SecurityRulesTests {
                 .method(method, HttpRequest.BodyPublishers.ofString(json));
         if (bearer != null) {
             builder.header("Authorization", "Bearer " + bearer);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> getWithAuthorization(String path, String authorization) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).GET();
+        if (authorization != null) {
+            builder.header("Authorization", authorization);
         }
         return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }

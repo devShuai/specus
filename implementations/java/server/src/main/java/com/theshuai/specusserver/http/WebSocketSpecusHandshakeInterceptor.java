@@ -1,6 +1,8 @@
 package com.theshuai.specusserver.http;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.server.ServerHttpRequest;
 import org.springframework.http.server.ServerHttpResponse;
 import org.springframework.http.server.ServletServerHttpRequest;
@@ -41,6 +43,12 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
             "sec-websocket-protocol", "sec-websocket-accept"
     );
 
+    private final HttpRouteAuthenticationService routeAuthenticationService;
+
+    public WebSocketSpecusHandshakeInterceptor(HttpRouteAuthenticationService routeAuthenticationService) {
+        this.routeAuthenticationService = routeAuthenticationService;
+    }
+
     @Override
     public boolean beforeHandshake(ServerHttpRequest request,
                                    ServerHttpResponse response,
@@ -54,13 +62,38 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         PathParts parts = parsePath(http.getRequestURI(), http.getContextPath());
         if (parts == null) {
             log.warn("[ws-specus][handshake] malformed path: {}", http.getRequestURI());
+            response.setStatusCode(HttpStatus.BAD_REQUEST);
             return false;
+        }
+        HttpRouteAuthenticationService.Decision access = routeAuthenticationService.authorize(
+                parts.clientName, parts.route, http.getHeader(HttpHeaders.AUTHORIZATION));
+        switch (access.outcome()) {
+            case UNAUTHORIZED -> {
+                response.setStatusCode(HttpStatus.UNAUTHORIZED);
+                response.getHeaders().set(HttpHeaders.WWW_AUTHENTICATE,
+                        HttpRouteAuthenticationService.BASIC_CHALLENGE);
+                response.getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-store");
+                return false;
+            }
+            case NOT_FOUND -> {
+                response.setStatusCode(HttpStatus.NOT_FOUND);
+                return false;
+            }
+            case UNAVAILABLE -> {
+                response.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
+                response.getHeaders().set(HttpHeaders.CACHE_CONTROL, "no-store");
+                return false;
+            }
+            default -> {
+                // PUBLIC and AUTHENTICATED proceed with the WebSocket upgrade.
+            }
         }
         attributes.put(WebSocketSpecusHandler.ATTR_CLIENT_NAME, parts.clientName);
         attributes.put(WebSocketSpecusHandler.ATTR_ROUTE, parts.route);
         attributes.put(WebSocketSpecusHandler.ATTR_RELATIVE_PATH, parts.relativePath);
         attributes.put(WebSocketSpecusHandler.ATTR_RAW_QUERY, http.getQueryString());
-        attributes.put(WebSocketSpecusHandler.ATTR_HEADERS, collectHeaders(http));
+        attributes.put(WebSocketSpecusHandler.ATTR_HEADERS,
+                collectHeaders(http, access.credentialsConsumed()));
         // WS 升级是 GET，无 body；保留空数组占位，保持 CONNECTED metaData 结构一致
         attributes.put(WebSocketSpecusHandler.ATTR_BODY, new byte[0]);
         return true;
@@ -107,12 +140,13 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         return new PathParts(clientName, route, relativePath);
     }
 
-    private static List<String> collectHeaders(HttpServletRequest request) {
+    private static List<String> collectHeaders(HttpServletRequest request, boolean stripAuthorization) {
         List<String> headers = new ArrayList<>();
         Enumeration<String> names = request.getHeaderNames();
         while (names != null && names.hasMoreElements()) {
             String name = names.nextElement();
-            if (!shouldForward(name)) {
+            if (!shouldForward(name)
+                    || stripAuthorization && HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name)) {
                 continue;
             }
             Enumeration<String> values = request.getHeaders(name);

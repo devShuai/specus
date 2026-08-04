@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
+import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -112,6 +113,7 @@ public class HttpRouteService {
         row.setDetailCaptureEnabled(Boolean.TRUE.equals(request.detailCaptureEnabled()));
         row.setMediaCaptureEnabled(Boolean.TRUE.equals(request.mediaCaptureEnabled()));
         row.setPathRewriteEnabled(Boolean.TRUE.equals(request.pathRewriteEnabled()));
+        applyAuthentication(row, request, true);
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
@@ -168,6 +170,7 @@ public class HttpRouteService {
         if (request.pathRewriteEnabled() != null) {
             row.setPathRewriteEnabled(request.pathRewriteEnabled());
         }
+        applyAuthentication(row, request, false);
         row.setUpdatedAt(Instant.now().toString());
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
 
@@ -286,6 +289,60 @@ public class HttpRouteService {
         return normalized;
     }
 
+    private void applyAuthentication(HttpRouteMapping row, RouteMutation request, boolean creating) {
+        boolean enabled = request.authEnabled() == null
+                ? !creating && Boolean.TRUE.equals(row.getAuthEnabled())
+                : request.authEnabled();
+
+        String username = normalizeAuthUsername(request.authUsername());
+        if (username == null && !creating) {
+            username = normalizeAuthUsername(row.getAuthUsername());
+        }
+
+        String passwordHash = row.getAuthPasswordHash();
+        if (StringUtils.hasText(request.authPassword())) {
+            String password = requireAuthPassword(request.authPassword());
+            passwordHash = PasswordService.hash(password);
+        }
+
+        if (enabled) {
+            if (!StringUtils.hasText(username)) {
+                throw new IllegalArgumentException("authUsername cannot be blank when route authentication is enabled");
+            }
+            if (!StringUtils.hasText(passwordHash)) {
+                throw new IllegalArgumentException("authPassword is required when route authentication is first enabled");
+            }
+        }
+
+        row.setAuthEnabled(enabled);
+        row.setAuthUsername(username);
+        row.setAuthPasswordHash(passwordHash);
+    }
+
+    private String normalizeAuthUsername(String username) {
+        if (!StringUtils.hasText(username)) {
+            return null;
+        }
+        String normalized = username.trim();
+        if (normalized.length() > 120) {
+            throw new IllegalArgumentException("authUsername is too long (max 120)");
+        }
+        if (normalized.indexOf(':') >= 0 || normalized.indexOf('\r') >= 0 || normalized.indexOf('\n') >= 0) {
+            throw new IllegalArgumentException("authUsername must not contain ':', CR, or LF");
+        }
+        return normalized;
+    }
+
+    private String requireAuthPassword(String password) {
+        if (!StringUtils.hasText(password)) {
+            throw new IllegalArgumentException("authPassword cannot be blank");
+        }
+        if (password.length() > 256) {
+            throw new IllegalArgumentException("authPassword is too long (max 256)");
+        }
+        return password;
+    }
+
     private HttpRouteView toView(HttpRouteMapping row) {
         return new HttpRouteView(
                 row.getId(),
@@ -297,6 +354,9 @@ public class HttpRouteService {
                 Boolean.TRUE.equals(row.getDetailCaptureEnabled()),
                 Boolean.TRUE.equals(row.getMediaCaptureEnabled()),
                 Boolean.TRUE.equals(row.getPathRewriteEnabled()),
+                Boolean.TRUE.equals(row.getAuthEnabled()),
+                StringUtils.hasText(row.getAuthUsername()) ? row.getAuthUsername() : "",
+                StringUtils.hasText(row.getAuthPasswordHash()),
                 row.getCreatedAt(),
                 row.getUpdatedAt()
         );
@@ -308,10 +368,23 @@ public class HttpRouteService {
             Boolean enabled,
             Boolean detailCaptureEnabled,
             Boolean mediaCaptureEnabled,
-            Boolean pathRewriteEnabled
+            Boolean pathRewriteEnabled,
+            Boolean authEnabled,
+            String authUsername,
+            String authPassword
     ) {
         public RouteMutation(String route, String targetBaseUrl, Boolean enabled) {
-            this(route, targetBaseUrl, enabled, null, null, null);
+            this(route, targetBaseUrl, enabled, null, null, null, null, null, null);
+        }
+
+        public RouteMutation(String route,
+                             String targetBaseUrl,
+                             Boolean enabled,
+                             Boolean detailCaptureEnabled,
+                             Boolean mediaCaptureEnabled,
+                             Boolean pathRewriteEnabled) {
+            this(route, targetBaseUrl, enabled, detailCaptureEnabled, mediaCaptureEnabled,
+                    pathRewriteEnabled, null, null, null);
         }
     }
 }

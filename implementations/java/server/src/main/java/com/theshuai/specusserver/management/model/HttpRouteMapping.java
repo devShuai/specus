@@ -1,5 +1,6 @@
 package com.theshuai.specusserver.management.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
@@ -85,6 +86,22 @@ public class HttpRouteMapping {
      */
     @Column(name = "path_rewrite_enabled")
     private Boolean pathRewriteEnabled = false;
+
+    /**
+     * Whether the public HTTP/WebSocket ingress requires route-scoped HTTP Basic authentication.
+     * Kept nullable for safe upgrades of existing databases; {@code null} is treated as disabled.
+     */
+    @Column(name = "auth_enabled")
+    private Boolean authEnabled = false;
+
+    /** Route-scoped HTTP Basic username. Never sent to the tunnel client. */
+    @Column(name = "auth_username", length = 120)
+    private String authUsername;
+
+    /** SHA-256 password digest used by the public ingress. Never exposed by management views. */
+    @JsonIgnore
+    @Column(name = "auth_password_hash", length = 64)
+    private String authPasswordHash;
 
     @Column(name = "created_at", nullable = false, length = 40)
     private String createdAt;

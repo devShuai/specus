@@ -55,6 +55,7 @@ public class HttpSpecusController {
     private final ResponseRewriter responseRewriter;
     private final ClientAccountService clientAccountService;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
+    private final HttpRouteAuthenticationService routeAuthenticationService;
     private final long timeoutMillis;
     private final int maxRequestBodySize;
     private final long routeCacheTtlMillis;
@@ -66,6 +67,7 @@ public class HttpSpecusController {
                                 ResponseRewriter responseRewriter,
                                 ClientAccountService clientAccountService,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
+                                HttpRouteAuthenticationService routeAuthenticationService,
                                 @Value("${specus.http.timeout-ms:30000}") long timeoutMillis,
                                 @Value("${specus.http.max-request-body-size:16777216}") int maxRequestBodySize,
                                 @Value("${specus.http.route-cache-ttl-ms:2000}") long routeCacheTtlMillis) {
@@ -75,6 +77,7 @@ public class HttpSpecusController {
         this.responseRewriter = responseRewriter;
         this.clientAccountService = clientAccountService;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
+        this.routeAuthenticationService = routeAuthenticationService;
         this.timeoutMillis = timeoutMillis;
         this.maxRequestBodySize = maxRequestBodySize;
         this.routeCacheTtlMillis = Math.max(0, routeCacheTtlMillis);
@@ -87,10 +90,9 @@ public class HttpSpecusController {
                         HttpServletResponse response) throws IOException {
         long startedAt = System.currentTimeMillis();
         String relativePath = relativePath(request);
-        List<String> forwardedHeaders = requestHeaders(request);
-        boolean detailCaptureEnabled = trafficInspectionService.shouldCaptureHttpExchange(clientName, route);
-        FullCapture requestCapture = new FullCapture(detailCaptureEnabled);
-        FullCapture responseCapture = new FullCapture(detailCaptureEnabled);
+        List<String> forwardedHeaders = List.of();
+        FullCapture requestCapture = new FullCapture(false);
+        FullCapture responseCapture = new FullCapture(false);
         long requestBytes = 0;
         long responseBytes = 0;
         int statusCode = 502;
@@ -102,6 +104,29 @@ public class HttpSpecusController {
         boolean responseBodyExternalized = false;
         boolean opened = false;
         try {
+            HttpRouteAuthenticationService.Decision access = routeAuthenticationService.authorize(
+                    clientName, route, request.getHeader(HttpHeaders.AUTHORIZATION));
+            switch (access.outcome()) {
+                case UNAUTHORIZED -> {
+                    response.setHeader(HttpHeaders.WWW_AUTHENTICATE,
+                            HttpRouteAuthenticationService.BASIC_CHALLENGE);
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(401, "需要 HTTP Basic 认证");
+                }
+                case NOT_FOUND -> throw new HttpForwardFailure(404, "HTTP 路由不存在或未启用");
+                case UNAVAILABLE -> {
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(503, "HTTP 路由认证暂不可用");
+                }
+                default -> {
+                    // PUBLIC and AUTHENTICATED continue into the data plane.
+                }
+            }
+            forwardedHeaders = requestHeaders(request, access.credentialsConsumed());
+            boolean detailCaptureEnabled = trafficInspectionService.shouldCaptureHttpExchange(clientName, route);
+            requestCapture = new FullCapture(detailCaptureEnabled);
+            responseCapture = new FullCapture(detailCaptureEnabled);
+
             Channel control = SessionUtil.getDataChannel(clientName);
             natHandler = control == null ? null : control.pipeline().get(NatServerHandler.class);
             if (natHandler == null || !control.isActive()) {
@@ -139,7 +164,8 @@ public class HttpSpecusController {
                     natHandler.sendHttpData(streamId, payload).get(timeoutMillis, TimeUnit.MILLISECONDS);
                 }
             }
-            natHandler.finishHttpRequest(streamId, flattenTrailers(request.getTrailerFields()))
+            natHandler.finishHttpRequest(streamId, flattenTrailers(
+                    request.getTrailerFields(), access.credentialsConsumed()))
                     .get(timeoutMillis, TimeUnit.MILLISECONDS);
 
             HttpStreamExchange.ResponseHead head = exchange.awaitResponseHead(timeoutMillis);
@@ -269,12 +295,13 @@ public class HttpSpecusController {
         return rawQuery == null || rawQuery.isBlank() ? relativePath : relativePath + "?" + rawQuery;
     }
 
-    private List<String> requestHeaders(HttpServletRequest request) {
+    private List<String> requestHeaders(HttpServletRequest request, boolean stripAuthorization) {
         List<String> headers = new ArrayList<>();
         Enumeration<String> names = request.getHeaderNames();
         while (names != null && names.hasMoreElements()) {
             String name = names.nextElement();
-            if (!shouldForward(name)) {
+            if (!shouldForward(name)
+                    || stripAuthorization && HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name)) {
                 continue;
             }
             Enumeration<String> values = request.getHeaders(name);
@@ -319,12 +346,16 @@ public class HttpSpecusController {
         response.getOutputStream().write(message.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static List<String> flattenTrailers(Map<String, String> trailers) {
+    static List<String> flattenTrailers(Map<String, String> trailers, boolean stripAuthorization) {
         if (trailers == null || trailers.isEmpty()) {
             return List.of();
         }
         List<String> result = new ArrayList<>(trailers.size());
-        trailers.forEach((name, value) -> result.add(name + ":" + value));
+        trailers.forEach((name, value) -> {
+            if (!stripAuthorization || !HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name)) {
+                result.add(name + ":" + value);
+            }
+        });
         return result;
     }
 
