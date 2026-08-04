@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"io"
 	"log"
 	"net"
@@ -66,7 +67,9 @@ func TestHTTPStreamForwardsRequestAndStreamsResponse(t *testing.T) {
 		"relativePath": "/upload", "rawQuery": "x=1", "headers": []any{"X-Test:yes"},
 		"contentLength": 12,
 	})
-	if !specusClient.writeHTTPData(9, []byte("request-body")) || !specusClient.finishHTTPRequest(9, nil) {
+	dataHandled, dataAccepted := specusClient.writeHTTPData(9, []byte("request-body"))
+	finHandled, finAccepted := specusClient.finishHTTPRequest(9, nil)
+	if !dataHandled || !dataAccepted || !finHandled || !finAccepted {
 		t.Fatal("HTTP request stream was not registered")
 	}
 
@@ -137,5 +140,49 @@ func TestRequestBodyReturnsCreditAfterChunkConsumption(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("credit was not returned")
+	}
+}
+
+func TestHTTPDataEndStreamDeliversBodyBeforeFinishingRequest(t *testing.T) {
+	control := &captureConn{}
+	client := New(Config{}, log.New(io.Discard, "", 0))
+	stream := newHTTPRequestStream(client, control, 10, nil)
+	client.httpStreams[10] = stream
+	payload := []byte("final-chunk")
+	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type: protocol.NatData, StreamID: 10, Data: payload,
+		Flags: protocol.NatFlagEndStream,
+	})
+	if err != nil {
+		t.Fatalf("encode DATA|END_STREAM: %v", err)
+	}
+
+	if err := client.handleNatMessage(control, body); err != nil {
+		t.Fatalf("handle DATA|END_STREAM: %v", err)
+	}
+	actual, err := io.ReadAll(stream.body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if !bytes.Equal(actual, payload) {
+		t.Fatalf("request body = %q, want %q", actual, payload)
+	}
+	control.Reset()
+
+	duplicate, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type: protocol.NatFin, StreamID: 10,
+	})
+	if err != nil {
+		t.Fatalf("encode duplicate FIN: %v", err)
+	}
+	if err := client.handleNatMessage(control, duplicate); err != nil {
+		t.Fatalf("duplicate HTTP FIN closed the data connection: %v", err)
+	}
+	assertCapturedRST(t, control, 10)
+	client.httpMu.Lock()
+	remaining := client.httpStreams[10]
+	client.httpMu.Unlock()
+	if remaining != nil {
+		t.Fatal("duplicate HTTP FIN must reset only the affected HTTP stream")
 	}
 }

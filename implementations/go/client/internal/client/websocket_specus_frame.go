@@ -82,7 +82,8 @@ func validateWebSocketSpecusFrame(frame webSocketSpecusFrame) error {
 		if len(frame.payload) > 123 {
 			return fmt.Errorf("websocket close reason exceeds 123 bytes")
 		}
-		if frame.closeCode != 0 && (frame.closeCode < 1000 || frame.closeCode >= 5000) {
+		if frame.closeCode != 0 && (frame.closeCode < 1000 || frame.closeCode >= 5000 ||
+			isWireForbiddenWebSocketCloseCode(frame.closeCode)) {
 			return fmt.Errorf("invalid websocket close code")
 		}
 		if frame.closeCode == 0 && len(frame.payload) != 0 {
@@ -92,4 +93,8 @@ func validateWebSocketSpecusFrame(frame webSocketSpecusFrame) error {
 		return fmt.Errorf("close code is only valid on CLOSE")
 	}
 	return nil
+}
+
+func isWireForbiddenWebSocketCloseCode(closeCode uint16) bool {
+	return closeCode == 1004 || closeCode == 1005 || closeCode == 1006 || closeCode == 1015
 }

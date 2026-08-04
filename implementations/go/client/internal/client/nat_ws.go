@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +32,12 @@ const (
 	maxWebSocketMessageBytes = 16 * 1024 * 1024
 )
 
+var (
+	errWebSocketCloseCreditTimeout = errors.New("websocket close credit timeout")
+	webSocketCloseCreditTimeout    = 5 * time.Second
+	webSocketCloseCleanupTimeout   = 5 * time.Second
+)
+
 var skippedWebSocketHeaders = map[string]struct{}{
 	"connection":               {},
 	"content-length":           {},
@@ -50,9 +57,10 @@ var skippedWebSocketHeaders = map[string]struct{}{
 }
 
 type webSocketLocalConnection struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	writeMu sync.Mutex
+	conn      net.Conn
+	reader    *bufio.Reader
+	writeMu   sync.Mutex
+	closeSent bool
 }
 
 func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint32, metadata map[string]any) {
@@ -279,6 +287,8 @@ func (client *Client) copyWebSocketData(connection net.Conn, streamID uint32, ch
 		if opcode == webSocketOpcodeClose {
 			if len(payload) == 1 {
 				client.sendNatReset(connection, streamID, 7, "invalid websocket close payload")
+				client.removeWebSocketConnection(streamID)
+				client.closeNatFlow(streamID)
 				return
 			}
 			if len(payload) >= 2 {
@@ -287,12 +297,22 @@ func (client *Client) copyWebSocketData(connection net.Conn, streamID uint32, ch
 			}
 		}
 		if err := client.sendWebSocketFrames(connection, streamID, opcode, fin, rsv, closeCode, payload); err != nil {
+			if opcode == webSocketOpcodeClose && errors.Is(err, errWebSocketCloseCreditTimeout) {
+				client.sendNatReset(connection, streamID, 8, "websocket close credit timeout")
+				client.removeWebSocketConnection(streamID)
+				client.closeNatFlow(streamID)
+				return
+			}
 			client.disconnectWebSocketSpecus(connection, streamID)
 			return
 		}
 		if opcode == webSocketOpcodeClose {
 			client.sendNatFin(connection, streamID)
 			client.markNatLocalFinished(streamID)
+			// Keep the local half briefly so an echoed CLOSE can complete the
+			// WebSocket handshake.  Some servers do not return FIN after consuming
+			// CLOSE+FIN, so a bounded fallback owns final cleanup.
+			client.scheduleWebSocketCloseCleanup(streamID, localConnection)
 			return
 		}
 	}
@@ -323,7 +343,16 @@ func (client *Client) sendWebSocketFrames(connection net.Conn, streamID uint32, 
 		if err != nil {
 			return err
 		}
-		if !client.takeNatCredit(streamID, len(encoded)) {
+		if opcode == webSocketOpcodeClose {
+			taken, timedOut := client.takeNatCreditWithin(
+				streamID, len(encoded), webSocketCloseCreditTimeout)
+			if !taken {
+				if timedOut {
+					return errWebSocketCloseCreditTimeout
+				}
+				return io.ErrClosedPipe
+			}
+		} else if !client.takeNatCredit(streamID, len(encoded)) {
 			return io.ErrClosedPipe
 		}
 		body, err := protocol.EncodeNatMessage(protocol.NatMessage{
@@ -386,7 +415,11 @@ func (connection *webSocketLocalConnection) writeFrame(fin bool, rsv byte, opcod
 	}
 	connection.writeMu.Lock()
 	defer connection.writeMu.Unlock()
+	return connection.writeFrameLocked(fin, rsv, opcode, payload)
+}
 
+func (connection *webSocketLocalConnection) writeFrameLocked(
+	fin bool, rsv byte, opcode byte, payload []byte) error {
 	header := make([]byte, 0, 14)
 	first := opcode | ((rsv & 7) << 4)
 	if fin {
@@ -420,11 +453,18 @@ func (connection *webSocketLocalConnection) writeFrame(fin bool, rsv byte, opcod
 		return err
 	}
 	_, err := connection.conn.Write(masked)
+	if err == nil && opcode == webSocketOpcodeClose {
+		connection.closeSent = true
+	}
 	return err
 }
 
 func (connection *webSocketLocalConnection) close() error {
-	_ = connection.writeFrame(true, 0, webSocketOpcodeClose, nil)
+	connection.writeMu.Lock()
+	if !connection.closeSent {
+		_ = connection.writeFrameLocked(true, 0, webSocketOpcodeClose, nil)
+	}
+	connection.writeMu.Unlock()
 	return connection.conn.Close()
 }
 
@@ -456,8 +496,17 @@ func (client *Client) disconnectWebSocketSpecus(connection net.Conn, streamID ui
 }
 
 func (client *Client) removeWebSocketConnection(streamID uint32) bool {
+	return client.removeWebSocketConnectionIf(streamID, nil)
+}
+
+func (client *Client) removeWebSocketConnectionIf(
+	streamID uint32, expected *webSocketLocalConnection) bool {
 	client.wsLocalsMu.Lock()
 	connection := client.wsLocals[streamID]
+	if expected != nil && connection != expected {
+		client.wsLocalsMu.Unlock()
+		return false
+	}
 	delete(client.wsLocals, streamID)
 	client.wsLocalsMu.Unlock()
 	if connection == nil {
@@ -466,6 +515,15 @@ func (client *Client) removeWebSocketConnection(streamID uint32) bool {
 	_ = connection.close()
 	client.logger.Printf("[ws-specus][client] closed local ws stream=%d", streamID)
 	return true
+}
+
+func (client *Client) scheduleWebSocketCloseCleanup(
+	streamID uint32, expected *webSocketLocalConnection) {
+	time.AfterFunc(webSocketCloseCleanupTimeout, func() {
+		if client.removeWebSocketConnectionIf(streamID, expected) {
+			client.closeNatFlow(streamID)
+		}
+	})
 }
 
 func (client *Client) closeWebSocketConnections() {

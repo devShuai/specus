@@ -2,8 +2,10 @@ package client
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,15 +13,16 @@ import (
 
 type applicationProtocolVectors struct {
 	WebSocket struct {
-		Opcode          byte   `json:"opcode"`
-		FinalFragment   bool   `json:"finalFragment"`
-		RSV             byte   `json:"rsv"`
-		CloseCode       uint16 `json:"closeCode"`
-		PayloadUTF8     string `json:"payloadUtf8"`
-		FrameHex        string `json:"frameHex"`
-		InvalidMagicHex string `json:"invalidMagicHex"`
-		TruncatedHex    string `json:"truncatedHex"`
-		TrailingHex     string `json:"trailingHex"`
+		Opcode                  byte     `json:"opcode"`
+		FinalFragment           bool     `json:"finalFragment"`
+		RSV                     byte     `json:"rsv"`
+		CloseCode               uint16   `json:"closeCode"`
+		PayloadUTF8             string   `json:"payloadUtf8"`
+		FrameHex                string   `json:"frameHex"`
+		InvalidMagicHex         string   `json:"invalidMagicHex"`
+		TruncatedHex            string   `json:"truncatedHex"`
+		TrailingHex             string   `json:"trailingHex"`
+		WireForbiddenCloseCodes []uint16 `json:"wireForbiddenCloseCodes"`
 	} `json:"webSocket"`
 	ClientMessage struct {
 		Type            string `json:"type"`
@@ -70,6 +73,26 @@ func TestApplicationProtocolMatchesCentralSWS2Vector(t *testing.T) {
 			}
 		})
 	}
+	for _, closeCode := range vectors.WebSocket.WireForbiddenCloseCodes {
+		t.Run(fmt.Sprintf("wire forbidden close code %d", closeCode), func(t *testing.T) {
+			frame := webSocketSpecusFrame{opcode: webSocketOpcodeClose, fin: true, closeCode: closeCode}
+			if _, err := encodeWebSocketSpecusFrame(frame); err == nil {
+				t.Fatal("wire-forbidden close code was encoded")
+			}
+			if _, err := decodeWebSocketSpecusFrame(rawCloseFrame(closeCode)); err == nil {
+				t.Fatal("wire-forbidden close code was decoded")
+			}
+		})
+	}
+}
+
+func rawCloseFrame(closeCode uint16) []byte {
+	encoded := make([]byte, webSocketSpecusHeaderBytes)
+	copy(encoded[:4], webSocketSpecusMagic[:])
+	encoded[4] = webSocketOpcodeClose
+	encoded[5] = 1
+	binary.BigEndian.PutUint16(encoded[6:8], closeCode)
+	return encoded
 }
 
 func TestApplicationProtocolMatchesCentralSTMSG2Vector(t *testing.T) {

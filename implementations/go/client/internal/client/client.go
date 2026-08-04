@@ -66,20 +66,22 @@ type Client struct {
 
 	specusMappingsMu sync.RWMutex
 	specusMappings   map[int]SpecusConfig
-	runtimeMu sync.RWMutex
-	runtime   RuntimeConfig
+	runtimeMu        sync.RWMutex
+	runtime          RuntimeConfig
 
 	registeredMu sync.Mutex
 	registered   map[int]struct{}
 
-	localsMu    sync.Mutex
-	locals      map[uint32]net.Conn
-	wsLocalsMu  sync.Mutex
-	wsLocals    map[uint32]*webSocketLocalConnection
-	httpMu      sync.Mutex
-	httpStreams map[uint32]*httpRequestStream
-	natFlowsMu  sync.Mutex
-	natFlows    map[uint32]*natFlowState
+	localsMu              sync.Mutex
+	locals                map[uint32]net.Conn
+	localTCPDial          func(context.Context, string, string) (net.Conn, error)
+	wsLocalsMu            sync.Mutex
+	wsLocals              map[uint32]*webSocketLocalConnection
+	httpMu                sync.Mutex
+	httpStreams           map[uint32]*httpRequestStream
+	natFlowsMu            sync.Mutex
+	natFlows              map[uint32]*natFlowState
+	recentlyClosedStreams recentStreamTombstones
 
 	peerMesh *peerMeshClient
 }
@@ -143,16 +145,17 @@ func New(config Config, logger *log.Logger) *Client {
 		logger = log.Default()
 	}
 	return &Client{
-		config:      config,
-		logger:      logger,
-		routes:      make(map[string]string),
-		specusMappings:     make(map[int]SpecusConfig),
-		registered:  make(map[int]struct{}),
-		locals:      make(map[uint32]net.Conn),
-		wsLocals:    make(map[uint32]*webSocketLocalConnection),
-		httpStreams: make(map[uint32]*httpRequestStream),
-		natFlows:    make(map[uint32]*natFlowState),
-		peerMesh:    newPeerMeshClient(config, logger),
+		config:                config,
+		logger:                logger,
+		routes:                make(map[string]string),
+		specusMappings:        make(map[int]SpecusConfig),
+		registered:            make(map[int]struct{}),
+		locals:                make(map[uint32]net.Conn),
+		wsLocals:              make(map[uint32]*webSocketLocalConnection),
+		httpStreams:           make(map[uint32]*httpRequestStream),
+		natFlows:              make(map[uint32]*natFlowState),
+		recentlyClosedStreams: newRecentStreamTombstones(recentStreamTombstoneLimit),
+		peerMesh:              newPeerMeshClient(config, logger),
 	}
 }
 
@@ -256,7 +259,8 @@ func (client *Client) runOnce(ctx context.Context) error {
 	}
 	client.applyRuntime(runtime)
 	address := net.JoinHostPort(runtime.NettyHost, strconv.Itoa(runtime.NettyPort))
-	controlConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	controlConnection, err := client.dialServerConnection(
+		ctx, address, serverConnectionTimeout, runtime.NettyTLS)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", address, err)
 	}
@@ -292,7 +296,8 @@ func (client *Client) runOnce(ctx context.Context) error {
 		return err
 	}
 
-	dataConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	dataConnection, err := client.dialServerConnection(
+		ctx, address, serverConnectionTimeout, runtime.NettyTLS)
 	if err != nil {
 		return fmt.Errorf("connect dedicated data channel %s: %w", address, err)
 	}
@@ -347,7 +352,7 @@ func (client *Client) loginConnection(connection net.Conn, runtime RuntimeConfig
 	if packet.Command != protocol.CommandLoginResponse {
 		return fmt.Errorf("expected %s login response, received command %d", role, packet.Command)
 	}
-	return client.handlePacket(connection, packet, role)
+	return client.handleLoginResponse(connection, packet, role)
 }
 
 func (client *Client) readAuthenticatedLoop(ctx context.Context, connection net.Conn, role string) error {
@@ -497,22 +502,7 @@ func tokenRefreshLead(remaining time.Duration) time.Duration {
 func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet, role string) error {
 	switch packet.Command {
 	case protocol.CommandLoginResponse:
-		response, err := protocol.DecodeLoginResponse(packet.Body)
-		if err != nil {
-			return fmt.Errorf("decode login response: %w", err)
-		}
-		if !response.Success {
-			return newControlLoginRejectedError(response.Reason)
-		}
-		client.logger.Printf("login succeeded as %q", response.ClientName)
-		if role == protocol.ConnectionRoleControl {
-			if previous := client.resetReconnectBackoff(); previous > 0 {
-				client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
-			}
-			client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
-		} else {
-			client.registerConfiguredSpecusMappings(connection)
-		}
+		return errors.New("duplicate LOGIN_RESPONSE on authenticated connection")
 	case protocol.CommandHeartbeatRequest:
 		return client.send(connection, protocol.CommandHeartbeatResponse, protocol.EncodeHeartbeat())
 	case protocol.CommandHeartbeatResponse:
@@ -533,6 +523,26 @@ func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet, 
 		return client.handleNatMessage(connection, packet.Body)
 	default:
 		client.logger.Printf("ignored unsupported command %d", packet.Command)
+	}
+	return nil
+}
+
+func (client *Client) handleLoginResponse(connection net.Conn, packet protocol.Packet, role string) error {
+	response, err := protocol.DecodeLoginResponse(packet.Body)
+	if err != nil {
+		return fmt.Errorf("decode login response: %w", err)
+	}
+	if !response.Success {
+		return newControlLoginRejectedError(response.Reason)
+	}
+	client.logger.Printf("login succeeded as %q", response.ClientName)
+	if role == protocol.ConnectionRoleControl {
+		if previous := client.resetReconnectBackoff(); previous > 0 {
+			client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
+		}
+		client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
+	} else {
+		client.registerConfiguredSpecusMappings(connection)
 	}
 	return nil
 }

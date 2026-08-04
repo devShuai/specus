@@ -10,6 +10,15 @@ import (
 	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
+func TestHandlePacketRejectsDuplicateLoginResponse(t *testing.T) {
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	err := specusClient.handlePacket(nil, protocol.Packet{Command: protocol.CommandLoginResponse},
+		protocol.ConnectionRoleControl)
+	if err == nil || err.Error() != "duplicate LOGIN_RESPONSE on authenticated connection" {
+		t.Fatalf("duplicate LOGIN_RESPONSE error = %v", err)
+	}
+}
+
 func TestHandleLogoutRequestClosesControlConnection(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()

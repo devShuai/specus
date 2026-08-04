@@ -11,12 +11,20 @@ import (
 )
 
 type Config struct {
-	ServerBaseURL   string `json:"serverBaseUrl"`
-	APIKey          string `json:"apiKey"`
-	Secret          string `json:"secret"`
-	PeerMeshDevice  string `json:"peerMeshDevice"`
-	PeerMeshTunName string `json:"peerMeshTunName"`
-	PeerMeshMTU     int    `json:"peerMeshMtu"`
+	ServerBaseURL   string           `json:"serverBaseUrl"`
+	APIKey          string           `json:"apiKey"`
+	Secret          string           `json:"secret"`
+	ControlTLS      ControlTLSConfig `json:"controlTls"`
+	PeerMeshDevice  string           `json:"peerMeshDevice"`
+	PeerMeshTunName string           `json:"peerMeshTunName"`
+	PeerMeshMTU     int              `json:"peerMeshMtu"`
+}
+
+type ControlTLSConfig struct {
+	Enabled            *bool  `json:"enabled"`
+	CACertificatePath  string `json:"caCertificatePath"`
+	ServerName         string `json:"serverName"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify"`
 }
 
 const (
@@ -48,6 +56,7 @@ type RuntimeConfig struct {
 	TokenTTLSeconds      int64              `json:"tokenTtlSeconds"`
 	NettyHost            string             `json:"nettyHost"`
 	NettyPort            int                `json:"nettyPort"`
+	NettyTLS             bool               `json:"nettyTls"`
 	MaxOnlineInstances   int                `json:"maxOnlineInstances"`
 	Policy               ClientPolicy       `json:"policy"`
 	PeerMesh             PeerMeshConfig     `json:"peerMesh"`
@@ -101,6 +110,8 @@ func (config *Config) Validate() error {
 	config.ServerBaseURL = strings.TrimSpace(config.ServerBaseURL)
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.Secret = strings.TrimSpace(config.Secret)
+	config.ControlTLS.CACertificatePath = strings.TrimSpace(config.ControlTLS.CACertificatePath)
+	config.ControlTLS.ServerName = strings.TrimSpace(config.ControlTLS.ServerName)
 	config.PeerMeshDevice = strings.TrimSpace(config.PeerMeshDevice)
 	config.PeerMeshTunName = strings.TrimSpace(config.PeerMeshTunName)
 
@@ -131,6 +142,9 @@ func (config *Config) Validate() error {
 	}
 	if config.Secret == "" {
 		return errors.New("secret is required")
+	}
+	if _, err := config.buildControlTLSConfig(false); err != nil {
+		return err
 	}
 	return nil
 }

@@ -4,6 +4,13 @@
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "replace-with-client-api-key",
   "secret": "replace-with-client-secret",
+  "controlTls": {
+    // null follows serverBaseUrl: HTTPS enables TLS, HTTP disables it.
+    "enabled": null,
+    "caCertificatePath": "",
+    "serverName": "",
+    "insecureSkipVerify": false,
+  },
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,

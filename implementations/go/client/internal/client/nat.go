@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,13 +19,28 @@ const (
 )
 
 type natFlowState struct {
-	mu             sync.Mutex
-	cond           *sync.Cond
-	credit         uint64
-	closed         bool
-	localFinished  bool
-	remoteFinished bool
+	mu               sync.Mutex
+	cond             *sync.Cond
+	tcpWriteMu       sync.Mutex
+	credit           uint64
+	closed           bool
+	localFinished    bool
+	remoteFinished   bool
+	tcpConnecting    bool
+	tcpConnectCancel context.CancelFunc
+	tcpPendingData   [][]byte
+	tcpPendingBytes  int
 }
+
+type tcpDataDisposition uint8
+
+const (
+	tcpDataReady tcpDataDisposition = iota
+	tcpDataQueued
+	tcpDataAfterFin
+	tcpDataOverflow
+	tcpDataClosed
+)
 
 func newNatFlowState() *natFlowState {
 	state := &natFlowState{credit: natInitialWindowBytes}
@@ -49,6 +65,41 @@ func (state *natFlowState) take(size int) bool {
 	return true
 }
 
+// takeWithin is the bounded variant used by terminal WebSocket frames.  A peer
+// is allowed to stop granting credit while a close handshake is in flight; in
+// that case the stream must be released instead of leaving a goroutine parked
+// on the condition variable forever.
+func (state *natFlowState) takeWithin(size int, timeout time.Duration) (taken bool, timedOut bool) {
+	if size <= 0 || size > natMaximumWindowBytes || timeout <= 0 {
+		return false, false
+	}
+	deadline := time.Now().Add(timeout)
+	timer := time.AfterFunc(timeout, func() {
+		state.mu.Lock()
+		state.cond.Broadcast()
+		state.mu.Unlock()
+	})
+	defer timer.Stop()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	needed := uint64(size)
+	for state.credit < needed && !state.closed {
+		if !time.Now().Before(deadline) {
+			return false, true
+		}
+		state.cond.Wait()
+	}
+	if state.closed {
+		return false, false
+	}
+	if state.credit < needed {
+		return false, true
+	}
+	state.credit -= needed
+	return true, false
+}
+
 func (state *natFlowState) add(credit uint32) bool {
 	if credit == 0 || credit > natMaximumWindowBytes {
 		return false
@@ -66,22 +117,85 @@ func (state *natFlowState) add(credit uint32) bool {
 func (state *natFlowState) close() {
 	state.mu.Lock()
 	state.closed = true
+	state.tcpConnecting = false
+	if state.tcpConnectCancel != nil {
+		state.tcpConnectCancel()
+		state.tcpConnectCancel = nil
+	}
+	state.tcpPendingData = nil
+	state.tcpPendingBytes = 0
 	state.cond.Broadcast()
 	state.mu.Unlock()
 }
 
-func (state *natFlowState) markLocalFinished() bool {
+func (state *natFlowState) beginTCPConnect() (context.Context, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.localFinished = true
-	return state.remoteFinished
+	if state.closed || state.tcpConnecting {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	state.tcpConnecting = true
+	state.tcpConnectCancel = cancel
+	return ctx, true
 }
 
-func (state *natFlowState) markRemoteFinished() bool {
+func (state *natFlowState) stageTCPData(data []byte, endStream bool) tcpDataDisposition {
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.closed {
+		return tcpDataClosed
+	}
+	if state.remoteFinished {
+		return tcpDataAfterFin
+	}
+	if !state.tcpConnecting {
+		return tcpDataReady
+	}
+	if len(data) > natInitialWindowBytes-state.tcpPendingBytes {
+		return tcpDataOverflow
+	}
+	if len(data) > 0 {
+		state.tcpPendingData = append(state.tcpPendingData, append([]byte(nil), data...))
+		state.tcpPendingBytes += len(data)
+	}
+	if endStream {
+		state.remoteFinished = true
+	}
+	return tcpDataQueued
+}
+
+func (state *natFlowState) activateTCPConnection() (pending [][]byte, remoteFinished bool, complete bool, ok bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || !state.tcpConnecting {
+		return nil, false, false, false
+	}
+	state.tcpConnecting = false
+	if state.tcpConnectCancel != nil {
+		state.tcpConnectCancel()
+		state.tcpConnectCancel = nil
+	}
+	pending = state.tcpPendingData
+	state.tcpPendingData = nil
+	state.tcpPendingBytes = 0
+	return pending, state.remoteFinished, state.localFinished, true
+}
+
+func (state *natFlowState) receiveRemoteFin() (complete bool, accepted bool, connecting bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || state.remoteFinished {
+		return false, false, false
+	}
 	state.remoteFinished = true
-	return state.localFinished
+	return state.localFinished, true, state.tcpConnecting
+}
+
+func (state *natFlowState) canReceiveRemoteData() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return !state.closed && !state.remoteFinished
 }
 
 func (client *Client) syncSpecusConfigs(connection net.Conn, configs []SpecusConfig) {
@@ -171,29 +285,58 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 	case protocol.NatRegisterResult:
 		client.handleNatRegisterResult(message.Metadata)
 	case protocol.NatOpen:
-		client.openNatFlow(message.StreamID)
+		if !client.openNatFlow(message.StreamID) {
+			client.resetNatStream(connection, message.StreamID, 7, "duplicate NAT OPEN")
+			return nil
+		}
 		if source, _ := metadataStringOptional(message.Metadata, "source"); source == "http" {
 			client.openHTTPStream(connection, message.StreamID, message.Metadata)
 		} else if source == "ws" {
 			go client.connectWebSocketSpecus(connection, message.StreamID, message.Metadata)
 		} else {
-			go client.connectLocalSpecus(connection, message.StreamID, message.Metadata)
+			flow := client.natFlow(message.StreamID)
+			dialContext, started := flow.beginTCPConnect()
+			if !started {
+				return fmt.Errorf("failed to start local TCP connection for stream %d", message.StreamID)
+			}
+			go client.connectLocalSpecus(connection, message.StreamID, message.Metadata, flow, dialContext)
 		}
 	case protocol.NatFin:
-		if client.finishHTTPRequest(message.StreamID, message.Metadata) {
+		if handled, accepted := client.finishHTTPRequest(message.StreamID, message.Metadata); handled {
+			if !accepted {
+				client.resetNatStream(connection, message.StreamID, 8, "duplicate HTTP FIN")
+			}
 			return nil
 		}
-		client.handleRemoteFin(message.StreamID)
+		client.handleRemoteFin(connection, message.StreamID)
 	case protocol.NatRST:
 		if client.resetHTTPStream(message.StreamID, metadataReason(message.Metadata)) {
 			client.closeNatFlow(message.StreamID)
 			return nil
 		}
-		client.removeWebSocketConnection(message.StreamID)
-		client.removeLocalConnection(message.StreamID)
+		removedWebSocket := client.removeWebSocketConnection(message.StreamID)
+		removedLocal := client.removeLocalConnection(message.StreamID)
+		if !removedWebSocket && !removedLocal && !client.hasNatFlow(message.StreamID) {
+			if client.recentlyClosedStreams.contains(message.StreamID) {
+				return nil
+			}
+			return fmt.Errorf("NAT RST for unknown stream %d", message.StreamID)
+		}
 		client.closeNatFlow(message.StreamID)
 	case protocol.NatData:
-		if client.writeHTTPData(message.StreamID, message.Data) {
+		if handled, accepted := client.writeHTTPData(message.StreamID, message.Data); handled {
+			if !accepted {
+				return nil
+			}
+			if message.Flags&protocol.NatFlagEndStream != 0 {
+				endHandled, endAccepted := client.finishHTTPRequest(message.StreamID, message.Metadata)
+				if !endHandled {
+					return fmt.Errorf("HTTP stream %d closed before END_STREAM", message.StreamID)
+				}
+				if !endAccepted {
+					return fmt.Errorf("duplicate HTTP FIN for stream %d", message.StreamID)
+				}
+			}
 			return nil
 		}
 		if handled, err := client.writeWebSocketData(message.StreamID, message.Data); handled {
@@ -203,18 +346,39 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 			} else {
 				client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
 				if message.Flags&protocol.NatFlagEndStream != 0 {
-					client.handleRemoteFin(message.StreamID)
+					client.handleRemoteFin(connection, message.StreamID)
 				}
 			}
 			return nil
 		}
-		if err := client.writeLocalData(message.StreamID, message.Data); err != nil {
+		flow := client.natFlow(message.StreamID)
+		if flow == nil {
+			client.sendNatReset(connection, message.StreamID, 7, "DATA for unknown TCP stream")
+			return nil
+		}
+		endStream := message.Flags&protocol.NatFlagEndStream != 0
+		switch flow.stageTCPData(message.Data, endStream) {
+		case tcpDataQueued:
+			return nil
+		case tcpDataAfterFin:
+			client.resetNatStream(connection, message.StreamID, 7, "remote TCP DATA after FIN")
+			return nil
+		case tcpDataOverflow:
+			client.abortLocalSpecusFlow(connection, message.StreamID, flow, 8,
+				"pending local TCP data exceeds receive window")
+			return nil
+		case tcpDataClosed:
+			client.resetNatStream(connection, message.StreamID, 7, "TCP DATA for closed stream")
+			return nil
+		}
+		if err := client.writeLocalData(message.StreamID, flow, message.Data); err != nil {
 			client.logger.Printf("write local specus stream %d failed: %v", message.StreamID, err)
-			client.disconnectLocalSpecus(connection, message.StreamID)
+			client.abortLocalSpecusFlow(connection, message.StreamID, flow, 9,
+				"write to local TCP stream failed")
 		} else {
 			client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
-			if message.Flags&protocol.NatFlagEndStream != 0 {
-				client.handleRemoteFin(message.StreamID)
+			if endStream {
+				client.handleTCPRemoteFin(connection, message.StreamID, flow)
 			}
 		}
 	case protocol.NatWindowUpdate:
@@ -246,15 +410,18 @@ func (client *Client) handleNatRegisterResult(metadata map[string]any) {
 	client.logger.Printf("registered NAT port %d -> %s:%d", port, config.SpecusAddress, config.SpecusPort)
 }
 
-func (client *Client) connectLocalSpecus(connection net.Conn, streamID uint32, metadata map[string]any) {
+func (client *Client) connectLocalSpecus(connection net.Conn, streamID uint32, metadata map[string]any,
+	flow *natFlowState, dialContext context.Context) {
 	port, err := metadataInt(metadata, "port")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
+		client.abortLocalSpecusFlow(connection, streamID, flow, 7, "invalid TCP OPEN metadata")
 		return
 	}
 	channelID, err := metadataString(metadata, "channelId")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
+		client.abortLocalSpecusFlow(connection, streamID, flow, 7, "invalid TCP OPEN metadata")
 		return
 	}
 	client.specusMappingsMu.RLock()
@@ -262,14 +429,21 @@ func (client *Client) connectLocalSpecus(connection net.Conn, streamID uint32, m
 	client.specusMappingsMu.RUnlock()
 	if !exists {
 		client.logger.Printf("no local specus configured for NAT port %d", port)
+		client.abortLocalSpecusFlow(connection, streamID, flow, 1, "local TCP mapping is not configured")
 		return
 	}
 	address := net.JoinHostPort(config.SpecusAddress, strconv.Itoa(config.SpecusPort))
-	localConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	localConnection, err := client.dialLocalTCP(dialContext, address)
 	if err != nil {
+		if !client.isNatFlow(streamID, flow) {
+			return
+		}
 		client.logger.Printf("connect local specus %s failed: %v", address, err)
-		client.sendNatReset(connection, streamID, 1, "local connect failed")
-		client.closeNatFlow(streamID)
+		client.abortLocalSpecusFlow(connection, streamID, flow, 1, "local connect failed")
+		return
+	}
+	if !client.isNatFlow(streamID, flow) {
+		_ = localConnection.Close()
 		return
 	}
 	client.localsMu.Lock()
@@ -278,8 +452,64 @@ func (client *Client) connectLocalSpecus(connection net.Conn, streamID uint32, m
 	}
 	client.locals[streamID] = localConnection
 	client.localsMu.Unlock()
+
+	flow.tcpWriteMu.Lock()
+	pendingData, remoteFinished, complete, activated := flow.activateTCPConnection()
+	if !activated || !client.isNatFlow(streamID, flow) {
+		flow.tcpWriteMu.Unlock()
+		client.removeLocalConnectionIfSame(streamID, localConnection)
+		return
+	}
+	for _, data := range pendingData {
+		if !client.isNatFlow(streamID, flow) {
+			flow.tcpWriteMu.Unlock()
+			client.removeLocalConnectionIfSame(streamID, localConnection)
+			return
+		}
+		if err := writeAllLocalData(localConnection, data); err != nil {
+			flow.tcpWriteMu.Unlock()
+			client.logger.Printf("flush pending local specus stream %d failed: %v", streamID, err)
+			client.abortLocalSpecusFlow(connection, streamID, flow, 9,
+				"write pending data to local TCP stream failed")
+			return
+		}
+		client.sendNatWindowUpdate(connection, streamID, len(data))
+	}
+	if remoteFinished {
+		tcp, ok := localConnection.(*net.TCPConn)
+		if !ok {
+			flow.tcpWriteMu.Unlock()
+			client.abortLocalSpecusFlow(connection, streamID, flow, 7,
+				"local TCP stream does not support half-close")
+			return
+		}
+		if err := tcp.CloseWrite(); err != nil {
+			flow.tcpWriteMu.Unlock()
+			client.abortLocalSpecusFlow(connection, streamID, flow, 9,
+				"failed to apply pending TCP half-close")
+			return
+		}
+	}
+	flow.tcpWriteMu.Unlock()
+	if complete {
+		client.removeLocalConnectionIfSame(streamID, localConnection)
+		client.closeNatFlowIfSame(streamID, flow)
+		return
+	}
+	if !client.isNatFlow(streamID, flow) {
+		client.removeLocalConnectionIfSame(streamID, localConnection)
+		return
+	}
 	client.logger.Printf("opened local specus channel=%q target=%s", channelID, address)
 	go client.copyLocalData(connection, streamID, channelID, localConnection)
+}
+
+func (client *Client) dialLocalTCP(ctx context.Context, address string) (net.Conn, error) {
+	if client.localTCPDial != nil {
+		return client.localTCPDial(ctx, "tcp", address)
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	return dialer.DialContext(ctx, "tcp", address)
 }
 
 func (client *Client) copyLocalData(connection net.Conn, streamID uint32, channelID string, localConnection net.Conn) {
@@ -294,13 +524,16 @@ func (client *Client) copyLocalData(connection net.Conn, streamID uint32, channe
 				Type: protocol.NatData, StreamID: streamID, Data: append([]byte(nil), buffer[:length]...),
 			})
 			if encodeErr != nil || client.send(connection, protocol.CommandNatMessage, body) != nil {
-				client.disconnectLocalSpecus(connection, streamID)
+				client.removeLocalConnection(streamID)
+				client.closeNatFlow(streamID)
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
 				client.logger.Printf("read local specus %q failed: %v", channelID, err)
+				client.abortLocalSpecus(connection, streamID, 9, "read from local TCP stream failed")
+				return
 			}
 			client.finishLocalDirection(connection, streamID)
 			return
@@ -308,13 +541,22 @@ func (client *Client) copyLocalData(connection net.Conn, streamID uint32, channe
 	}
 }
 
-func (client *Client) writeLocalData(streamID uint32, data []byte) error {
+func (client *Client) writeLocalData(streamID uint32, flow *natFlowState, data []byte) error {
+	flow.tcpWriteMu.Lock()
+	defer flow.tcpWriteMu.Unlock()
+	if !client.isNatFlow(streamID, flow) {
+		return fmt.Errorf("local specus stream %d is closed", streamID)
+	}
 	client.localsMu.Lock()
 	connection := client.locals[streamID]
 	client.localsMu.Unlock()
 	if connection == nil {
 		return fmt.Errorf("local specus stream %d is not connected", streamID)
 	}
+	return writeAllLocalData(connection, data)
+}
+
+func writeAllLocalData(connection net.Conn, data []byte) error {
 	for len(data) > 0 {
 		written, err := connection.Write(data)
 		if err != nil {
@@ -328,14 +570,23 @@ func (client *Client) writeLocalData(streamID uint32, data []byte) error {
 	return nil
 }
 
-func (client *Client) disconnectLocalSpecus(connection net.Conn, streamID uint32) {
-	if client.removeLocalConnection(streamID) {
-		client.sendNatFin(connection, streamID)
+func (client *Client) abortLocalSpecus(connection net.Conn, streamID uint32, code uint32, reason string) {
+	flow := client.natFlow(streamID)
+	if flow != nil {
+		client.abortLocalSpecusFlow(connection, streamID, flow, code, reason)
 	}
-	client.closeNatFlow(streamID)
 }
 
-func (client *Client) sendNatFin(connection net.Conn, streamID uint32) {
+func (client *Client) abortLocalSpecusFlow(connection net.Conn, streamID uint32,
+	flow *natFlowState, code uint32, reason string) {
+	if !client.closeNatFlowIfSame(streamID, flow) {
+		return
+	}
+	client.removeLocalConnection(streamID)
+	client.sendNatReset(connection, streamID, code, reason)
+}
+
+func (client *Client) sendNatFin(connection net.Conn, streamID uint32) error {
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
 		Type: protocol.NatFin, StreamID: streamID,
 	})
@@ -345,9 +596,12 @@ func (client *Client) sendNatFin(connection net.Conn, streamID uint32) {
 	if err != nil {
 		client.logger.Printf("send NAT FIN for stream %d failed: %v", streamID, err)
 	}
+	return err
 }
 
 func (client *Client) sendNatReset(connection net.Conn, streamID uint32, code uint32, reason string) {
+	client.closeNatFlow(streamID)
+	client.recentlyClosedStreams.add(streamID)
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
 		Type: protocol.NatRST, StreamID: streamID, Value: code, Metadata: map[string]any{"reason": reason},
 	})
@@ -357,6 +611,14 @@ func (client *Client) sendNatReset(connection net.Conn, streamID uint32, code ui
 	if err != nil {
 		client.logger.Printf("send NAT RST for stream %d failed: %v", streamID, err)
 	}
+}
+
+func (client *Client) resetNatStream(connection net.Conn, streamID uint32, code uint32, reason string) {
+	client.resetHTTPStream(streamID, reason)
+	client.removeWebSocketConnection(streamID)
+	client.removeLocalConnection(streamID)
+	client.closeNatFlow(streamID)
+	client.sendNatReset(connection, streamID, code, reason)
 }
 
 func (client *Client) sendNatWindowUpdate(connection net.Conn, streamID uint32, credit int) {
@@ -374,14 +636,16 @@ func (client *Client) sendNatWindowUpdate(connection net.Conn, streamID uint32, 
 	}
 }
 
-func (client *Client) openNatFlow(streamID uint32) {
+func (client *Client) openNatFlow(streamID uint32) bool {
 	client.natFlowsMu.Lock()
-	previous := client.natFlows[streamID]
+	if client.natFlows[streamID] != nil {
+		client.natFlowsMu.Unlock()
+		return false
+	}
 	client.natFlows[streamID] = newNatFlowState()
 	client.natFlowsMu.Unlock()
-	if previous != nil {
-		previous.close()
-	}
+	client.recentlyClosedStreams.remove(streamID)
+	return true
 }
 
 func (client *Client) takeNatCredit(streamID uint32, size int) bool {
@@ -391,11 +655,55 @@ func (client *Client) takeNatCredit(streamID uint32, size int) bool {
 	return flow != nil && flow.take(size)
 }
 
+func (client *Client) takeNatCreditWithin(streamID uint32, size int,
+	timeout time.Duration) (taken bool, timedOut bool) {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	if flow == nil {
+		return false, false
+	}
+	return flow.takeWithin(size, timeout)
+}
+
 func (client *Client) addNatCredit(streamID uint32, credit uint32) bool {
 	client.natFlowsMu.Lock()
 	flow := client.natFlows[streamID]
 	client.natFlowsMu.Unlock()
-	return flow == nil || flow.add(credit)
+	return flow != nil && flow.add(credit)
+}
+
+func (client *Client) hasNatFlow(streamID uint32) bool {
+	return client.natFlow(streamID) != nil
+}
+
+func (client *Client) canReceiveNatData(streamID uint32) bool {
+	flow := client.natFlow(streamID)
+	return flow != nil && flow.canReceiveRemoteData()
+}
+
+func (client *Client) natFlow(streamID uint32) *natFlowState {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	return flow
+}
+
+func (client *Client) isNatFlow(streamID uint32, expected *natFlowState) bool {
+	return expected != nil && client.natFlow(streamID) == expected
+}
+
+func (client *Client) closeNatFlowIfSame(streamID uint32, expected *natFlowState) bool {
+	client.natFlowsMu.Lock()
+	if client.natFlows[streamID] != expected || expected == nil {
+		client.natFlowsMu.Unlock()
+		return false
+	}
+	delete(client.natFlows, streamID)
+	client.natFlowsMu.Unlock()
+	client.recentlyClosedStreams.add(streamID)
+	expected.close()
+	return true
 }
 
 func (client *Client) closeNatFlow(streamID uint32) {
@@ -404,54 +712,94 @@ func (client *Client) closeNatFlow(streamID uint32) {
 	delete(client.natFlows, streamID)
 	client.natFlowsMu.Unlock()
 	if flow != nil {
+		client.recentlyClosedStreams.add(streamID)
 		flow.close()
 	}
 }
 
 func (client *Client) finishLocalDirection(connection net.Conn, streamID uint32) {
-	client.sendNatFin(connection, streamID)
+	complete, accepted := client.markNatLocalFinished(streamID)
+	if !accepted {
+		return
+	}
+	if err := client.sendNatFin(connection, streamID); err != nil {
+		client.removeLocalConnection(streamID)
+		client.closeNatFlow(streamID)
+		return
+	}
 	client.localsMu.Lock()
 	local := client.locals[streamID]
 	client.localsMu.Unlock()
 	if tcp, ok := local.(*net.TCPConn); ok {
 		_ = tcp.CloseRead()
 	}
-	if client.markNatLocalFinished(streamID) {
+	if complete {
 		client.removeLocalConnection(streamID)
 		client.closeNatFlow(streamID)
 	}
 }
 
-func (client *Client) markNatLocalFinished(streamID uint32) bool {
+func (client *Client) markNatLocalFinished(streamID uint32) (complete bool, accepted bool) {
 	client.natFlowsMu.Lock()
 	flow := client.natFlows[streamID]
 	client.natFlowsMu.Unlock()
-	return flow != nil && flow.markLocalFinished()
+	if flow == nil {
+		return false, false
+	}
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	if flow.closed || flow.localFinished {
+		return false, false
+	}
+	flow.localFinished = true
+	return flow.remoteFinished, true
 }
 
-func (client *Client) handleRemoteFin(streamID uint32) {
+func (client *Client) handleRemoteFin(connection net.Conn, streamID uint32) {
 	if client.removeWebSocketConnection(streamID) {
 		client.closeNatFlow(streamID)
+		return
+	}
+	flow := client.natFlow(streamID)
+	if flow == nil {
+		client.sendNatReset(connection, streamID, 7, "FIN for unknown TCP stream")
+		return
+	}
+	client.handleTCPRemoteFin(connection, streamID, flow)
+}
+
+func (client *Client) handleTCPRemoteFin(connection net.Conn, streamID uint32, flow *natFlowState) {
+	complete, accepted, connecting := flow.receiveRemoteFin()
+	if !accepted {
+		client.resetNatStream(connection, streamID, 7, "duplicate remote TCP FIN")
+		return
+	}
+	if connecting {
+		return
+	}
+	flow.tcpWriteMu.Lock()
+	defer flow.tcpWriteMu.Unlock()
+	if !client.isNatFlow(streamID, flow) {
 		return
 	}
 	client.localsMu.Lock()
 	local := client.locals[streamID]
 	client.localsMu.Unlock()
 	if local == nil {
-		client.closeNatFlow(streamID)
 		return
 	}
 	if tcp, ok := local.(*net.TCPConn); ok {
-		_ = tcp.CloseWrite()
+		if err := tcp.CloseWrite(); err != nil {
+			client.resetNatStream(connection, streamID, 9, "failed to half-close local TCP output")
+			return
+		}
 	} else {
-		_ = local.Close()
+		client.resetNatStream(connection, streamID, 7, "local TCP channel does not support half-close")
+		return
 	}
-	client.natFlowsMu.Lock()
-	flow := client.natFlows[streamID]
-	client.natFlowsMu.Unlock()
-	if flow != nil && flow.markRemoteFinished() {
-		client.removeLocalConnection(streamID)
-		client.closeNatFlow(streamID)
+	if complete {
+		client.removeLocalConnectionIfSame(streamID, local)
+		client.closeNatFlowIfSame(streamID, flow)
 	}
 }
 
@@ -459,6 +807,23 @@ func (client *Client) removeLocalConnection(streamID uint32) bool {
 	client.localsMu.Lock()
 	connection := client.locals[streamID]
 	delete(client.locals, streamID)
+	client.localsMu.Unlock()
+	if connection == nil {
+		return false
+	}
+	_ = connection.Close()
+	client.logger.Printf("closed local specus stream=%d", streamID)
+	return true
+}
+
+func (client *Client) removeLocalConnectionIfSame(streamID uint32, expected net.Conn) bool {
+	client.localsMu.Lock()
+	connection := client.locals[streamID]
+	if connection == expected && expected != nil {
+		delete(client.locals, streamID)
+	} else {
+		connection = nil
+	}
 	client.localsMu.Unlock()
 	if connection == nil {
 		return false
@@ -485,6 +850,7 @@ func (client *Client) closeLocalConnections() {
 	}
 	client.closeHTTPStreams()
 	client.closeWebSocketConnections()
+	client.recentlyClosedStreams.clear()
 }
 
 func metadataReason(metadata map[string]any) string {

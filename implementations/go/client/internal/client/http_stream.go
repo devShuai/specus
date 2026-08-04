@@ -78,28 +78,28 @@ func (client *Client) openHTTPStream(connection net.Conn, streamID uint32, metad
 	go stream.forward()
 }
 
-func (client *Client) writeHTTPData(streamID uint32, data []byte) bool {
+func (client *Client) writeHTTPData(streamID uint32, data []byte) (handled bool, accepted bool) {
 	client.httpMu.Lock()
 	stream := client.httpStreams[streamID]
 	client.httpMu.Unlock()
 	if stream == nil {
-		return false
+		return false, false
 	}
 	if !stream.body.offer(data) {
 		stream.fail(22, "HTTP request queue or size limit exceeded")
+		return true, false
 	}
-	return true
+	return true, true
 }
 
-func (client *Client) finishHTTPRequest(streamID uint32, metadata map[string]any) bool {
+func (client *Client) finishHTTPRequest(streamID uint32, metadata map[string]any) (handled bool, accepted bool) {
 	client.httpMu.Lock()
 	stream := client.httpStreams[streamID]
 	client.httpMu.Unlock()
 	if stream == nil {
-		return false
+		return false, false
 	}
-	stream.body.finish(metadataStrings(metadata, "trailers"))
-	return true
+	return true, stream.body.finish(metadataStrings(metadata, "trailers"))
 }
 
 func (client *Client) resetHTTPStream(streamID uint32, reason string) bool {
@@ -310,18 +310,20 @@ func (body *httpRequestBody) offer(data []byte) bool {
 	}
 }
 
-func (body *httpRequestBody) finish(trailers []string) {
+func (body *httpRequestBody) finish(trailers []string) bool {
 	body.mu.Lock()
 	if !body.accepting {
 		body.mu.Unlock()
-		return
+		return false
 	}
 	body.accepting = false
 	body.mu.Unlock()
 	select {
 	case body.queue <- httpBodyChunk{trailers: trailers, end: true}:
+		return true
 	default:
 		body.abort("HTTP request queue full on FIN")
+		return false
 	}
 }
 

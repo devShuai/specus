@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -207,6 +208,100 @@ func TestConnectWebSocketSpecusForwardsLocalTextFrame(t *testing.T) {
 	}
 }
 
+func TestLocalWebSocketCloseCleansStreamWithoutServerFin(t *testing.T) {
+	previousCleanupTimeout := webSocketCloseCleanupTimeout
+	webSocketCloseCleanupTimeout = 25 * time.Millisecond
+	defer func() { webSocketCloseCleanupTimeout = previousCleanupTimeout }()
+
+	control := &captureConn{}
+	localTransport := &captureConn{}
+	local := &webSocketLocalConnection{
+		conn:   localTransport,
+		reader: bufio.NewReader(bytes.NewReader(serverWebSocketCloseFrame(1000, "done"))),
+	}
+	client := New(Config{}, log.New(io.Discard, "", 0))
+	client.openNatFlow(41)
+	client.wsLocals[41] = local
+
+	client.copyWebSocketData(control, 41, "local-close", local)
+
+	deadline := time.Now().Add(time.Second)
+	var hasLocal, hasFlow bool
+	for {
+		client.wsLocalsMu.Lock()
+		_, hasLocal = client.wsLocals[41]
+		client.wsLocalsMu.Unlock()
+		client.natFlowsMu.Lock()
+		_, hasFlow = client.natFlows[41]
+		client.natFlowsMu.Unlock()
+		if !hasLocal && !hasFlow || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hasLocal || hasFlow {
+		t.Fatalf("closed websocket retained state: wsLocal=%v natFlow=%v", hasLocal, hasFlow)
+	}
+
+	messages := decodeCapturedNatMessages(t, control.Bytes())
+	if len(messages) != 2 {
+		t.Fatalf("captured %d NAT messages, want CLOSE DATA + FIN", len(messages))
+	}
+	if messages[0].Type != protocol.NatData || messages[0].StreamID != 41 {
+		t.Fatalf("first NAT message = %#v, want stream CLOSE DATA", messages[0])
+	}
+	closeFrame, err := decodeWebSocketSpecusFrame(messages[0].Data)
+	if err != nil {
+		t.Fatalf("decode close SWS2: %v", err)
+	}
+	if closeFrame.opcode != webSocketOpcodeClose || closeFrame.closeCode != 1000 ||
+		string(closeFrame.payload) != "done" {
+		t.Fatalf("close SWS2 = %#v", closeFrame)
+	}
+	if messages[1].Type != protocol.NatFin || messages[1].StreamID != 41 {
+		t.Fatalf("second NAT message = %#v, want stream FIN", messages[1])
+	}
+}
+
+func TestLocalWebSocketCloseCreditTimeoutResetsAndCleansStream(t *testing.T) {
+	previousTimeout := webSocketCloseCreditTimeout
+	webSocketCloseCreditTimeout = 25 * time.Millisecond
+	defer func() { webSocketCloseCreditTimeout = previousTimeout }()
+
+	control := &captureConn{}
+	localTransport := &captureConn{}
+	local := &webSocketLocalConnection{
+		conn:   localTransport,
+		reader: bufio.NewReader(bytes.NewReader(serverWebSocketCloseFrame(1000, "done"))),
+	}
+	client := New(Config{}, log.New(io.Discard, "", 0))
+	client.openNatFlow(42)
+	client.wsLocals[42] = local
+	if !client.takeNatCredit(42, natInitialWindowBytes) {
+		t.Fatal("failed to exhaust initial stream credit")
+	}
+
+	client.copyWebSocketData(control, 42, "close-timeout", local)
+
+	client.wsLocalsMu.Lock()
+	_, hasLocal := client.wsLocals[42]
+	client.wsLocalsMu.Unlock()
+	client.natFlowsMu.Lock()
+	_, hasFlow := client.natFlows[42]
+	client.natFlowsMu.Unlock()
+	if hasLocal || hasFlow {
+		t.Fatalf("timed-out websocket retained state: wsLocal=%v natFlow=%v", hasLocal, hasFlow)
+	}
+
+	messages := decodeCapturedNatMessages(t, control.Bytes())
+	if len(messages) != 1 || messages[0].Type != protocol.NatRST || messages[0].StreamID != 42 {
+		t.Fatalf("captured NAT messages = %#v, want one stream RST", messages)
+	}
+	if messages[0].Value != 8 || messages[0].Metadata["reason"] != "websocket close credit timeout" {
+		t.Fatalf("timeout RST = %#v", messages[0])
+	}
+}
+
 func TestWebSocketSpecusFrameRejectsLegacyPrefix(t *testing.T) {
 	if _, err := decodeWebSocketSpecusFrame([]byte{0x01, 'o', 'l', 'd'}); err == nil {
 		t.Fatal("legacy websocket prefix was accepted")
@@ -265,4 +360,32 @@ func writeServerWebSocketFrame(conn net.Conn, opcode byte, payload []byte) error
 	}
 	_, err := conn.Write(payload)
 	return err
+}
+
+func serverWebSocketCloseFrame(code uint16, reason string) []byte {
+	payload := make([]byte, 2+len(reason))
+	binary.BigEndian.PutUint16(payload, code)
+	copy(payload[2:], reason)
+	return append([]byte{0x80 | webSocketOpcodeClose, byte(len(payload))}, payload...)
+}
+
+func decodeCapturedNatMessages(t *testing.T, captured []byte) []protocol.NatMessage {
+	t.Helper()
+	reader := bytes.NewReader(captured)
+	var messages []protocol.NatMessage
+	for reader.Len() > 0 {
+		packet, err := protocol.ReadPacket(reader)
+		if err != nil {
+			t.Fatalf("read captured packet: %v", err)
+		}
+		if packet.Command != protocol.CommandNatMessage {
+			t.Fatalf("captured command = %d, want NAT_MESSAGE", packet.Command)
+		}
+		message, err := protocol.DecodeNatMessage(packet.Body)
+		if err != nil {
+			t.Fatalf("decode captured NAT message: %v", err)
+		}
+		messages = append(messages, message)
+	}
+	return messages
 }
