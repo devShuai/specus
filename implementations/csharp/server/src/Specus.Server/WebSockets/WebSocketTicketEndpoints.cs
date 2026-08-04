@@ -57,7 +57,7 @@ public static class WebSocketTicketEndpoints
                 cancellationToken).ConfigureAwait(false));
         });
 
-        app.MapGet("/api/public/transfer/name-availability", async (
+        app.MapGet("/api/public/transfer/clients/name-availability", async (
             string clientName, string? excludePeerId, PublicTransferDiscoveryHub hub,
             CancellationToken cancellationToken) => Results.Ok(
                 await hub.CheckClientNameAvailabilityAsync(clientName, excludePeerId,

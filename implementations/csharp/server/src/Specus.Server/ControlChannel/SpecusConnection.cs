@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
+using Specus.Protocol;
 using Specus.Protocol.Codec;
 using Specus.Protocol.Packets;
 using Specus.Server.Configuration;
@@ -13,7 +14,8 @@ namespace Specus.Server.ControlChannel;
 
 /// <summary>
 /// One control connection. Owns a background read loop and serializes writes through a
-/// per-connection <see cref="SemaphoreSlim"/>. The lifecycle:
+/// per-connection <see cref="SemaphoreSlim"/>. NAT DATA/FIN frames are additionally scheduled
+/// one frame per ready stream turn, matching Java's connection-local fairness. The lifecycle:
 /// <list type="number">
 /// <item>Listener accepts → constructs <see cref="SpecusConnection"/> and immediately
 /// awaits <see cref="RunAsync"/>.</item>
@@ -35,14 +37,19 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
     private static readonly TimeSpan ReaderIdle = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan WriterIdle = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan IdleTickInterval = TimeSpan.FromSeconds(1);
+    private const int MaximumPendingBytesPerStream = 4 * 1024 * 1024;
 
     private readonly Socket _socket;
     private readonly Stream _stream;
     private readonly PipeReader _reader;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SemaphoreSlim _streamWriteSignal = new(0);
+    private readonly ConnectionStreamRoundRobinQueue<QueuedStreamFrame> _streamWrites = new(
+        MaximumPendingBytesPerStream, static frame => frame.Bytes.Length);
     private readonly Channel<QueuedFrame> _priorityWrites = Channel.CreateBounded<QueuedFrame>(
         new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
     private readonly Task _priorityWriterTask;
+    private readonly Task _streamWriterTask;
     private readonly CancellationTokenSource _lifetimeCts;
     private readonly ILogger _logger;
     private readonly int _maxFrameSize;
@@ -76,6 +83,7 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
             writeBackpressure: writeBackpressure);
 
         _priorityWriterTask = Task.Run(PriorityWriterLoopAsync);
+        _streamWriterTask = Task.Run(StreamWriterLoopAsync);
 
         var now = Environment.TickCount64;
         _lastReadTicks = now;
@@ -215,9 +223,22 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         }
     }
 
-    public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+    public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
     {
         var bytes = PacketCodec.Encode(packet);
+        if (packet is NatMessagePacket
+            {
+                NatMessageType: NatMessageType.Data or NatMessageType.Fin,
+                StreamId: not 0,
+            } streamPacket)
+        {
+            return QueueStreamWriteAsync(streamPacket.StreamId, bytes, cancellationToken);
+        }
+        return WriteDirectAsync(bytes, cancellationToken);
+    }
+
+    private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken)
+    {
         var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
         try
         {
@@ -227,6 +248,30 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         {
             Context.WriteBackpressure.ReleasePending(trackedBytes);
         }
+    }
+
+    private ValueTask QueueStreamWriteAsync(
+        uint streamId, byte[] bytes, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return ValueTask.FromCanceled(cancellationToken);
+        }
+        var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
+        var queued = new QueuedStreamFrame(bytes, trackedBytes, cancellationToken);
+        queued.RegisterCancellation();
+        var result = _streamWrites.TryEnqueue(streamId, queued);
+        if (result != ConnectionStreamQueueEnqueueResult.Enqueued)
+        {
+            queued.DisposeRegistration();
+            Context.WriteBackpressure.ReleasePending(trackedBytes);
+            return result == ConnectionStreamQueueEnqueueResult.Completed
+                ? ValueTask.FromException(new ObjectDisposedException(nameof(SpecusConnection)))
+                : ValueTask.FromException(new InvalidOperationException(
+                    $"stream {streamId} send queue exceeded {MaximumPendingBytesPerStream} bytes"));
+        }
+        _streamWriteSignal.Release();
+        return new ValueTask(queued.Completion.Task);
     }
 
     public async ValueTask WritePriorityAsync(Packet packet, CancellationToken cancellationToken = default)
@@ -295,6 +340,69 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         }
     }
 
+    private async Task StreamWriterLoopAsync()
+    {
+        try
+        {
+            while (true)
+            {
+                await _streamWriteSignal.WaitAsync(_lifetimeCts.Token).ConfigureAwait(false);
+                if (!_streamWrites.TryDequeue(out var queued) || queued is null)
+                {
+                    continue;
+                }
+                try
+                {
+                    if (queued.CancellationToken.IsCancellationRequested)
+                    {
+                        queued.Completion.TrySetCanceled(queued.CancellationToken);
+                        continue;
+                    }
+                    using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(
+                        queued.CancellationToken, _lifetimeCts.Token);
+                    await WriteEncodedAsync(queued.Bytes, writeCts.Token).ConfigureAwait(false);
+                    queued.Completion.TrySetResult();
+                }
+                catch (OperationCanceledException) when (queued.CancellationToken.IsCancellationRequested)
+                {
+                    queued.Completion.TrySetCanceled(queued.CancellationToken);
+                }
+                catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+                {
+                    queued.Completion.TrySetException(
+                        new ObjectDisposedException(nameof(SpecusConnection)));
+                    break;
+                }
+                catch (Exception error) when (error is IOException or SocketException or ObjectDisposedException)
+                {
+                    queued.Completion.TrySetException(error);
+                    Context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+                    _logger.LogDebug(error, "[{ChannelId}] stream write failed", Context.ChannelId);
+                    CloseTransport();
+                    break;
+                }
+                finally
+                {
+                    queued.DisposeRegistration();
+                    Context.WriteBackpressure.ReleasePending(queued.TrackedBytes);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            foreach (var queued in _streamWrites.CompleteAndDrain())
+            {
+                queued.Completion.TrySetException(
+                    new ObjectDisposedException(nameof(SpecusConnection)));
+                queued.DisposeRegistration();
+                Context.WriteBackpressure.ReleasePending(queued.TrackedBytes);
+            }
+        }
+    }
+
     private void CloseTransport()
     {
         _lifetimeCts.Cancel();
@@ -303,16 +411,159 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _streamWrites.Complete();
         _priorityWrites.Writer.TryComplete();
         CloseTransport();
         try { await _priorityWriterTask.ConfigureAwait(false); } catch { }
+        try { await _streamWriterTask.ConfigureAwait(false); } catch { }
         _writeLock.Dispose();
+        _streamWriteSignal.Dispose();
         try { _stream.Dispose(); } catch { /* swallow — already gone */ }
         try { _socket.Close(); } catch { /* same */ }
         _lifetimeCts.Dispose();
     }
 
     private readonly record struct QueuedFrame(byte[] Bytes, long TrackedBytes);
+
+    private sealed class QueuedStreamFrame(
+        byte[] bytes, long trackedBytes, CancellationToken cancellationToken)
+    {
+        private CancellationTokenRegistration _registration;
+
+        public byte[] Bytes { get; } = bytes;
+        public long TrackedBytes { get; } = trackedBytes;
+        public CancellationToken CancellationToken { get; } = cancellationToken;
+        public TaskCompletionSource Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void RegisterCancellation()
+        {
+            if (!CancellationToken.CanBeCanceled)
+            {
+                return;
+            }
+            _registration = CancellationToken.Register(static state =>
+            {
+                var frame = (QueuedStreamFrame)state!;
+                frame.Completion.TrySetCanceled(frame.CancellationToken);
+            }, this);
+        }
+
+        public void DisposeRegistration() => _registration.Dispose();
+    }
+}
+
+internal enum ConnectionStreamQueueEnqueueResult
+{
+    Enqueued,
+    CapacityExceeded,
+    Completed,
+}
+
+internal sealed class ConnectionStreamRoundRobinQueue<T>(
+    int maximumBytesPerStream, Func<T, int> sizeOf)
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<uint, StreamState> _streams = new();
+    private readonly Queue<uint> _readyStreams = new();
+    private bool _completed;
+
+    public ConnectionStreamQueueEnqueueResult TryEnqueue(uint streamId, T item)
+    {
+        var size = sizeOf(item);
+        if (size < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(item), "queued item size cannot be negative");
+        }
+        lock (_gate)
+        {
+            if (_completed)
+            {
+                return ConnectionStreamQueueEnqueueResult.Completed;
+            }
+            if (!_streams.TryGetValue(streamId, out var state))
+            {
+                state = new StreamState();
+                _streams.Add(streamId, state);
+                _readyStreams.Enqueue(streamId);
+            }
+            if (state.PendingBytes > maximumBytesPerStream - size)
+            {
+                if (state.Items.Count == 0)
+                {
+                    _streams.Remove(streamId);
+                }
+                return ConnectionStreamQueueEnqueueResult.CapacityExceeded;
+            }
+            state.Items.Enqueue(item);
+            state.PendingBytes += size;
+            return ConnectionStreamQueueEnqueueResult.Enqueued;
+        }
+    }
+
+    public bool TryDequeue(out T? item)
+    {
+        lock (_gate)
+        {
+            while (_readyStreams.TryDequeue(out var streamId))
+            {
+                if (!_streams.TryGetValue(streamId, out var state) || state.Items.Count == 0)
+                {
+                    _streams.Remove(streamId);
+                    continue;
+                }
+                item = state.Items.Dequeue();
+                state.PendingBytes -= sizeOf(item);
+                if (state.Items.Count == 0)
+                {
+                    _streams.Remove(streamId);
+                }
+                else
+                {
+                    _readyStreams.Enqueue(streamId);
+                }
+                return true;
+            }
+        }
+        item = default;
+        return false;
+    }
+
+    public void Complete()
+    {
+        lock (_gate)
+        {
+            _completed = true;
+        }
+    }
+
+    public IReadOnlyList<T> CompleteAndDrain()
+    {
+        var drained = new List<T>();
+        lock (_gate)
+        {
+            _completed = true;
+            while (_readyStreams.TryDequeue(out var streamId))
+            {
+                if (!_streams.TryGetValue(streamId, out var state))
+                {
+                    continue;
+                }
+                while (state.Items.TryDequeue(out var queued))
+                {
+                    drained.Add(queued);
+                }
+            }
+            _streams.Clear();
+        }
+        return drained;
+    }
+
+    private sealed class StreamState
+    {
+        public Queue<T> Items { get; } = new();
+        public int PendingBytes { get; set; }
+    }
 }
 
 /// <summary>

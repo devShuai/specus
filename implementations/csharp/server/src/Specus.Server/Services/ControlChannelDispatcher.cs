@@ -114,11 +114,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         }
     }
 
-    private static bool PacketAllowedForRole(string? role, Packet packet)
+    internal static bool PacketAllowedForRole(string? role, Packet packet)
     {
         if (role == ConnectionRole.Control)
         {
-            return packet is not NatMessagePacket;
+            return packet is MessageRequestPacket or HeartbeatRequestPacket
+                or HeartbeatResponsePacket or LogoutRequestPacket;
         }
         return role == ConnectionRole.Data
                && packet is NatMessagePacket or HeartbeatRequestPacket

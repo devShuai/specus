@@ -103,6 +103,9 @@ public sealed class ClientAuthLoginResponse
     [JsonPropertyName("nettyPort")]
     public int NettyPort { get; set; }
 
+    [JsonPropertyName("nettyTls")]
+    public bool NettyTls { get; set; }
+
     [JsonPropertyName("maxOnlineInstances")]
     public int MaxOnlineInstances { get; set; } = 2;
 

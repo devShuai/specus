@@ -15,7 +15,7 @@ namespace Specus.Server.Nat;
 
 internal sealed class NatClientSession : IAsyncDisposable
 {
-    private const int MaximumClosedWebSocketStreamIds = 1024;
+    private const int MaximumClosedStreamIds = 1024;
 
     private readonly SpecusConnectionContext _context;
     private readonly RemotePortServerManager _remotePorts;
@@ -28,8 +28,8 @@ internal sealed class NatClientSession : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ExternalConnection> _externalChannels = new();
     private readonly ConcurrentDictionary<uint, HttpSpecusStream> _httpStreams = new();
     private readonly ConcurrentDictionary<uint, WebSocketSpecusStream> _webSocketStreams = new();
-    private readonly ConcurrentDictionary<uint, byte> _closedWebSocketStreamIds = new();
-    private readonly ConcurrentQueue<uint> _closedWebSocketStreamOrder = new();
+    private readonly ConcurrentDictionary<uint, byte> _closedStreamIds = new();
+    private readonly ConcurrentQueue<uint> _closedStreamOrder = new();
     private readonly object _admissionLock = new();
     private readonly Dictionary<int, int> _portExternalCounts = new();
 
@@ -79,6 +79,12 @@ internal sealed class NatClientSession : IAsyncDisposable
                     if (!httpData.OnResponseData(packet.Data))
                     {
                         ProtocolViolation("invalid HTTP DATA");
+                        return;
+                    }
+                    if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0
+                        && !httpData.OnResponseEnd(packet.MetaData))
+                    {
+                        ProtocolViolation("invalid HTTP terminal frame");
                     }
                     return;
                 }
@@ -96,8 +102,10 @@ internal sealed class NatClientSession : IAsyncDisposable
                     }
                     return;
                 }
-                if (IsClosedWebSocketStream(packet.StreamId))
+                if (IsClosedStream(packet.StreamId))
                 {
+                    await RejectTcpStreamAsync(packet.StreamId, 7, "DATA for closed stream")
+                        .ConfigureAwait(false);
                     return;
                 }
                 if (_registered)
@@ -131,8 +139,14 @@ internal sealed class NatClientSession : IAsyncDisposable
                     }
                     return;
                 }
-                if (IsClosedWebSocketStream(packet.StreamId))
+                if (IsClosedStream(packet.StreamId))
                 {
+                    if (packet.NatMessageType == NatMessageType.Rst)
+                    {
+                        return;
+                    }
+                    await RejectTcpStreamAsync(packet.StreamId, 7, "FIN for closed stream")
+                        .ConfigureAwait(false);
                     return;
                 }
                 if (_registered)
@@ -158,7 +172,7 @@ internal sealed class NatClientSession : IAsyncDisposable
                     }
                     return;
                 }
-                if (IsClosedWebSocketStream(packet.StreamId))
+                if (IsClosedStream(packet.StreamId))
                 {
                     return;
                 }
@@ -265,8 +279,8 @@ internal sealed class NatClientSession : IAsyncDisposable
             stream.OnReset("control channel closed");
         }
         _webSocketStreams.Clear();
-        _closedWebSocketStreamIds.Clear();
-        while (_closedWebSocketStreamOrder.TryDequeue(out _))
+        _closedStreamIds.Clear();
+        while (_closedStreamOrder.TryDequeue(out _))
         {
         }
     }
@@ -356,22 +370,36 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private async Task ProcessDataAsync(NatMessagePacket packet)
     {
-        if (packet.Data is not { Length: > 0 } data)
-        {
-            return;
-        }
         if (!_externalChannels.TryGetValue(packet.StreamId, out var external))
         {
+            await RejectTcpStreamAsync(packet.StreamId, 7, "DATA for unknown TCP stream")
+                .ConfigureAwait(false);
             return;
         }
 
-        await external.WriteFromClientAsync(data, _context.Lifetime).ConfigureAwait(false);
-        await _context.Writer.WritePriorityAsync(new NatMessagePacket
+        var data = packet.Data ?? [];
+        var result = await external.WriteFromClientAsync(data, _context.Lifetime).ConfigureAwait(false);
+        if (result == ExternalWriteResult.DataAfterFin)
         {
-            NatMessageType = NatMessageType.WindowUpdate,
-            StreamId = packet.StreamId,
-            Value = checked((uint)data.Length),
-        }, _context.Lifetime).ConfigureAwait(false);
+            await external.SendResetAsync(7, "TCP DATA after FIN", CancellationToken.None)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (result == ExternalWriteResult.Reset)
+        {
+            await external.SendResetAsync(41, "public TCP write failed", CancellationToken.None)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (data.Length > 0)
+        {
+            await _context.Writer.WritePriorityAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.WindowUpdate,
+                StreamId = packet.StreamId,
+                Value = checked((uint)data.Length),
+            }, _context.Lifetime).ConfigureAwait(false);
+        }
         if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
         {
             await ProcessClosedAsync(new NatMessagePacket
@@ -384,14 +412,41 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private async Task ProcessClosedAsync(NatMessagePacket packet)
     {
-        if (!_externalChannels.TryRemove(packet.StreamId, out var external))
+        if (!_externalChannels.TryGetValue(packet.StreamId, out var external))
         {
+            if (packet.NatMessageType == NatMessageType.Rst)
+            {
+                if (IsClosedStream(packet.StreamId))
+                {
+                    return;
+                }
+                ProtocolViolation($"TCP RST for never-opened stream {packet.StreamId}");
+                return;
+            }
+            await RejectTcpStreamAsync(packet.StreamId, 7, "FIN for unknown TCP stream")
+                .ConfigureAwait(false);
             return;
         }
 
-        external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
-        await external.DisposeAsync().ConfigureAwait(false);
-        _inspection.ReleaseTcpStream(external.ChannelId);
+        if (packet.NatMessageType == NatMessageType.Rst)
+        {
+            RememberClosedStream(packet.StreamId);
+            external.ResetFromClient();
+            return;
+        }
+
+        var result = external.FinishClientDirection();
+        if (result == ExternalFinResult.Invalid)
+        {
+            await external.SendResetAsync(7, "duplicate TCP FIN", CancellationToken.None)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (result == ExternalFinResult.Reset)
+        {
+            await external.SendResetAsync(42, "public TCP shutdown failed", CancellationToken.None)
+                .ConfigureAwait(false);
+        }
         UpdateControlReadForWritability();
     }
 
@@ -429,6 +484,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             {
                 external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
                 _externalChannels.TryRemove(external.StreamId, out _);
+                RememberClosedStream(external.StreamId);
                 _inspection.ReleaseTcpStream(external.ChannelId);
                 UpdateControlReadForWritability();
             }
@@ -543,7 +599,7 @@ internal sealed class NatClientSession : IAsyncDisposable
                               && !_httpStreams.ContainsKey(streamId)
                               && !_webSocketStreams.ContainsKey(streamId))
             {
-                _closedWebSocketStreamIds.TryRemove(streamId, out _);
+                _closedStreamIds.TryRemove(streamId, out _);
                 return streamId;
             }
         }
@@ -564,8 +620,13 @@ internal sealed class NatClientSession : IAsyncDisposable
         return true;
     }
 
-    private void RemoveHttpStream(uint streamId, HttpSpecusStream expected) =>
-        _httpStreams.TryRemove(new KeyValuePair<uint, HttpSpecusStream>(streamId, expected));
+    private void RemoveHttpStream(uint streamId, HttpSpecusStream expected)
+    {
+        if (_httpStreams.TryRemove(new KeyValuePair<uint, HttpSpecusStream>(streamId, expected)))
+        {
+            RememberClosedStream(streamId);
+        }
+    }
 
     private void RemoveWebSocketStream(uint streamId, WebSocketSpecusStream expected)
     {
@@ -574,19 +635,38 @@ internal sealed class NatClientSession : IAsyncDisposable
         {
             return;
         }
-        if (_closedWebSocketStreamIds.TryAdd(streamId, 0))
+        RememberClosedStream(streamId);
+    }
+
+    private void RememberClosedStream(uint streamId)
+    {
+        if (!_closedStreamIds.TryAdd(streamId, 0))
         {
-            _closedWebSocketStreamOrder.Enqueue(streamId);
+            return;
         }
-        while (_closedWebSocketStreamIds.Count > MaximumClosedWebSocketStreamIds
-               && _closedWebSocketStreamOrder.TryDequeue(out var expired))
+        _closedStreamOrder.Enqueue(streamId);
+        while (_closedStreamIds.Count > MaximumClosedStreamIds
+               && _closedStreamOrder.TryDequeue(out var expired))
         {
-            _closedWebSocketStreamIds.TryRemove(expired, out _);
+            _closedStreamIds.TryRemove(expired, out _);
         }
     }
 
-    private bool IsClosedWebSocketStream(uint streamId) =>
-        _closedWebSocketStreamIds.ContainsKey(streamId);
+    internal bool IsClosedStream(uint streamId) => _closedStreamIds.ContainsKey(streamId);
+
+    internal bool HasExternalStream(uint streamId) => _externalChannels.ContainsKey(streamId);
+
+    private async Task RejectTcpStreamAsync(uint streamId, uint errorCode, string reason)
+    {
+        RememberClosedStream(streamId);
+        await _context.Writer.WritePriorityAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Rst,
+            StreamId = streamId,
+            Value = errorCode,
+            MetaData = new Dictionary<string, object?> { ["reason"] = reason },
+        }, _context.Lifetime).ConfigureAwait(false);
+    }
 
     private void ProtocolViolation(string reason)
     {

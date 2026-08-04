@@ -217,7 +217,10 @@ internal sealed class WebSocketSpecusStream : IAsyncDisposable
             _responseEnded = true;
         }
         Interlocked.Exchange(ref _peerTerminal, 1);
-        Close();
+        // Complete after already queued SWS2 frames have been drained.  In
+        // particular, client CLOSE followed immediately by FIN must still let
+        // the browser pump observe CLOSE and return the close handshake.
+        _events.Writer.TryComplete();
     }
 
     public void OnReset(string? reason)

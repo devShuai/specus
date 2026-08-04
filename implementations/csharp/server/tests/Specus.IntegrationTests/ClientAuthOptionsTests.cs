@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Specus.Server.Authentication;
@@ -77,7 +78,11 @@ public sealed class ClientAuthOptionsTests
             },
         });
         response.EnsureSuccessStatusCode();
-        var body = await response.Content.ReadFromJsonAsync<ClientAuthLoginBody>();
+        var json = await response.Content.ReadAsStringAsync();
+        using var document = JsonDocument.Parse(json);
+        Assert.False(document.RootElement.GetProperty("nettyTls").GetBoolean());
+        var body = JsonSerializer.Deserialize<ClientAuthLoginBody>(json,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
 
         Assert.NotNull(body);
         Assert.Equal(1234, body.TokenTtlSeconds);

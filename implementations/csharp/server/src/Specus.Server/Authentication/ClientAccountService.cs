@@ -32,17 +32,19 @@ public sealed class ClientAccountService
     private readonly NettyServerOptions _netty;
     private readonly ClientAuthOptions _clientAuth;
     private readonly SpecusOptions _specus;
+    private readonly TlsOptions _tls;
     private readonly PeerMeshService _peerMesh;
 
     public ClientAccountService(SpecusDbContext db, ClientAuthSessionStore sessionStore,
         IOptions<NettyServerOptions> netty, IOptions<ClientAuthOptions> clientAuth, IOptions<SpecusOptions> specus,
-        PeerMeshService peerMesh)
+        IOptions<TlsOptions> tls, PeerMeshService peerMesh)
     {
         _db = db;
         _sessionStore = sessionStore;
         _netty = netty.Value;
         _clientAuth = clientAuth.Value;
         _specus = specus.Value;
+        _tls = tls.Value;
         _peerMesh = peerMesh;
     }
 
@@ -84,6 +86,7 @@ public sealed class ClientAccountService
             TokenTtlSeconds = ttlSeconds,
             NettyHost = ResolveNettyHost(requestServerName),
             NettyPort = _netty.Port,
+            NettyTls = _tls.ResolveMode() != TlsMode.Disabled,
             MaxOnlineInstances = credential.MaxOnlineInstances,
             SpecusConfigList = await _db.SpecusMappings
                 .AsNoTracking()
