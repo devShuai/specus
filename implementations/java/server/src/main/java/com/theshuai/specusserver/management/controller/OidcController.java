@@ -10,6 +10,7 @@ import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.oauth2.jwt.Jwt;
@@ -61,6 +62,7 @@ public class OidcController {
                           ManagementUserService managementUserService,
                           RegistrationService registrationService,
                           TurnstileVerifier turnstileVerifier,
+                          @Qualifier("oidcIdTokenDecoder")
                           ObjectProvider<JwtDecoder> jwtDecoderProvider) {
         this.properties = properties;
         this.localTokenService = localTokenService;
@@ -159,8 +161,9 @@ public class OidcController {
             }
             if (idToken.getIssuer() == null
                     || !StringUtils.hasText(idToken.getSubject())
+                    || !validIdTokenAudience(idToken, properties.getClientId())
                     || !constantTimeEquals(request.nonce(), claimAsString(idToken, "nonce"))) {
-                log.warn("[oidc] ID Token issuer, subject or nonce validation failed");
+                log.warn("[oidc] ID Token issuer, subject, audience, azp or nonce validation failed");
                 return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                         .body(Map.of("error", "OIDC ID Token 身份或 nonce 校验失败"));
             }
@@ -214,6 +217,18 @@ public class OidcController {
         return MessageDigest.isEqual(
                 expected.getBytes(StandardCharsets.UTF_8),
                 actual.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static boolean validIdTokenAudience(Jwt idToken, String clientId) {
+        if (!StringUtils.hasText(clientId)
+                || idToken.getAudience() == null
+                || !idToken.getAudience().contains(clientId)) {
+            return false;
+        }
+        String azp = claimAsString(idToken, "azp");
+        return idToken.getAudience().size() <= 1
+                ? !StringUtils.hasText(azp) || constantTimeEquals(clientId, azp)
+                : constantTimeEquals(clientId, azp);
     }
 
     public record TokenExchangeRequest(String code, String codeVerifier, String nonce) {

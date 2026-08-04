@@ -86,11 +86,9 @@ public class ManagementUserService {
             return Optional.empty();
         }
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
-            return Optional.of(new LoginUser(
-                    authProperties.getUsername(),
-                    TenantContext.normalize(authProperties.getTenantId()),
-                    ManagementRole.ADMIN,
-                    true));
+            // preferred_username is mutable profile data. It must never be sufficient to claim
+            // the configured built-in administrator, which has no persistent OIDC binding row.
+            return Optional.empty();
         }
         Optional<ManagementUser> bound = repository.findByOidcIdentityKey(identityKey);
         if (bound.isPresent()) {
@@ -109,11 +107,18 @@ public class ManagementUserService {
                         ? Optional.of(toLoginUser(user))
                         : Optional.empty();
             }
-            user.setOidcIssuer(normalizedIssuer);
-            user.setOidcSubject(normalizedSubject);
-            user.setOidcIdentityKey(identityKey);
-            user.setUpdatedAt(Instant.now().toString());
-            return Optional.of(toLoginUser(repository.save(user)));
+            repository.bindOidcIdentityIfUnbound(
+                    normalized,
+                    normalizedIssuer,
+                    normalizedSubject,
+                    identityKey,
+                    Instant.now().toString());
+            // Whether this request won the conditional update or another request got there first,
+            // re-read the committed binding and accept only the exact immutable identity.
+            return repository.findByUsernameIgnoreCase(normalized)
+                    .filter(ManagementUser::isEnabled)
+                    .filter(current -> sameOidcIdentity(current, normalizedIssuer, normalizedSubject))
+                    .map(this::toLoginUser);
         }
 
         String now = Instant.now().toString();
@@ -129,6 +134,54 @@ public class ManagementUserService {
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
         return Optional.of(toLoginUser(repository.save(user)));
+    }
+
+    /** Resolves an already-bound external identity for direct OIDC bearer authentication. */
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> resolveBoundOidcUser(String issuer, String subject) {
+        if (!StringUtils.hasText(issuer) || !StringUtils.hasText(subject)) {
+            return Optional.empty();
+        }
+        String normalizedIssuer = issuer.trim();
+        String normalizedSubject = subject.trim();
+        if (normalizedIssuer.length() > 255 || normalizedSubject.length() > 255) {
+            return Optional.empty();
+        }
+        return repository.findByOidcIdentityKey(oidcIdentityKey(normalizedIssuer, normalizedSubject))
+                .filter(ManagementUser::isEnabled)
+                .filter(user -> sameOidcIdentity(user, normalizedIssuer, normalizedSubject))
+                .map(this::toLoginUser);
+    }
+
+    /**
+     * Re-resolves a locally minted token subject against current configuration/database state.
+     * Refresh and request authorization use the current enabled flag, tenant and role rather than
+     * copying stale claims from an older token.
+     */
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> resolveLocalTokenUser(String username) {
+        if (!StringUtils.hasText(username)) {
+            return Optional.empty();
+        }
+        String normalized;
+        try {
+            normalized = normalizeUsername(username);
+        } catch (IllegalArgumentException ignored) {
+            return Optional.empty();
+        }
+        if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
+            if (!isAdminPasswordLoginEnabled()) {
+                return Optional.empty();
+            }
+            return Optional.of(new LoginUser(
+                    authProperties.getUsername(),
+                    TenantContext.normalize(authProperties.getTenantId()),
+                    ManagementRole.ADMIN,
+                    true));
+        }
+        return repository.findByUsernameIgnoreCase(normalized)
+                .filter(ManagementUser::isEnabled)
+                .map(this::toLoginUser);
     }
 
     @Transactional(readOnly = true)

@@ -12,6 +12,8 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -88,6 +90,15 @@ class ManagementUserServiceTests {
                 .thenReturn(Optional.empty());
         when(repository.findByUsernameIgnoreCase("alice"))
                 .thenReturn(Optional.of(existing));
+        when(repository.bindOidcIdentityIfUnbound(
+                eq("alice"), eq(ISSUER), eq("subject-alice"), anyString(), anyString()))
+                .thenAnswer(invocation -> {
+                    existing.setOidcIssuer(invocation.getArgument(1));
+                    existing.setOidcSubject(invocation.getArgument(2));
+                    existing.setOidcIdentityKey(invocation.getArgument(3));
+                    existing.setUpdatedAt(invocation.getArgument(4));
+                    return 1;
+                });
 
         ManagementUserService.LoginUser login = service.resolveOrProvisionOidcUser(
                 ISSUER,
@@ -98,7 +109,9 @@ class ManagementUserServiceTests {
         assertThat(existing.getOidcIssuer()).isEqualTo(ISSUER);
         assertThat(existing.getOidcSubject()).isEqualTo("subject-alice");
         assertThat(existing.getOidcIdentityKey()).matches("[0-9a-f]{64}");
-        verify(repository).save(existing);
+        verify(repository).bindOidcIdentityIfUnbound(
+                eq("alice"), eq(ISSUER), eq("subject-alice"), anyString(), anyString());
+        verify(repository, never()).save(existing);
     }
 
     @Test
@@ -129,15 +142,59 @@ class ManagementUserServiceTests {
     }
 
     @Test
-    void retainsConfiguredBuiltInAdministratorMapping() {
-        ManagementUserService.LoginUser login = service.resolveOrProvisionOidcUser(
+    void rejectsPreferredUsernameThatMatchesConfiguredBuiltInAdministrator() {
+        assertThat(service.resolveOrProvisionOidcUser(
                 ISSUER,
                 "subject-dungouji",
-                "dungouji").orElseThrow();
-
-        assertThat(login.role()).isEqualTo(ManagementRole.ADMIN);
-        assertThat(login.builtInAdmin()).isTrue();
+                "dungouji")).isEmpty();
         verify(repository, never()).save(any());
+    }
+
+    @Test
+    void conditionalBindingRejectsConcurrentDifferentIdentityWinner() {
+        ManagementUser initiallyUnbound = user("alice", ManagementRole.ADMIN, true);
+        ManagementUser winner = user("alice", ManagementRole.ADMIN, true);
+        winner.setOidcIssuer(ISSUER);
+        winner.setOidcSubject("other-subject");
+        winner.setOidcIdentityKey(identityKey(ISSUER, "other-subject"));
+        when(repository.findByOidcIdentityKey(identityKey(ISSUER, "subject-alice")))
+                .thenReturn(Optional.empty());
+        when(repository.findByUsernameIgnoreCase("alice"))
+                .thenReturn(Optional.of(initiallyUnbound), Optional.of(winner));
+        when(repository.bindOidcIdentityIfUnbound(
+                eq("alice"), eq(ISSUER), eq("subject-alice"), anyString(), anyString()))
+                .thenReturn(0);
+
+        assertThat(service.resolveOrProvisionOidcUser(
+                ISSUER,
+                "subject-alice",
+                "alice")).isEmpty();
+    }
+
+    @Test
+    void resolvesOnlyEnabledExactBoundIdentityAndCurrentLocalRole() {
+        ManagementUser bound = user("alice", ManagementRole.ADMIN, true);
+        bound.setOidcIssuer(ISSUER);
+        bound.setOidcSubject("subject-alice");
+        bound.setOidcIdentityKey(identityKey(ISSUER, "subject-alice"));
+        when(repository.findByOidcIdentityKey(bound.getOidcIdentityKey()))
+                .thenReturn(Optional.of(bound));
+        when(repository.findByUsernameIgnoreCase("alice"))
+                .thenReturn(Optional.of(bound));
+
+        assertThat(service.resolveBoundOidcUser(ISSUER, "subject-alice"))
+                .get()
+                .extracting(ManagementUserService.LoginUser::role)
+                .isEqualTo(ManagementRole.ADMIN);
+        assertThat(service.resolveBoundOidcUser(ISSUER, "different-subject")).isEmpty();
+        assertThat(service.resolveLocalTokenUser("alice"))
+                .get()
+                .extracting(ManagementUserService.LoginUser::role)
+                .isEqualTo(ManagementRole.ADMIN);
+
+        bound.setEnabled(false);
+        assertThat(service.resolveBoundOidcUser(ISSUER, "subject-alice")).isEmpty();
+        assertThat(service.resolveLocalTokenUser("alice")).isEmpty();
     }
 
     private ManagementUser user(String username, ManagementRole role, boolean enabled) {

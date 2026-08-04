@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -103,7 +104,23 @@ class OidcControllerTests {
                 .issueToken("unknown", "default", ManagementRole.USER);
     }
 
+    @Test
+    void rejectsIdTokenForAnotherOidcClientAudience() {
+        Fixture fixture = fixture("expected-nonce", "alice", true, "another-client");
+
+        ResponseEntity<?> response = fixture.controller.exchange(
+                new OidcController.TokenExchangeRequest("code", "verifier", "expected-nonce"));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
+        verify(fixture.localTokenService, never())
+                .issueToken("alice", "default", ManagementRole.USER);
+    }
+
     private Fixture fixture(String tokenNonce, String username, boolean provisioned) {
+        return fixture(tokenNonce, username, provisioned, "specus");
+    }
+
+    private Fixture fixture(String tokenNonce, String username, boolean provisioned, String audience) {
         OidcProperties properties = new OidcProperties();
         properties.setClientId("specus");
         properties.setClientSecret("client-secret");
@@ -135,6 +152,7 @@ class OidcControllerTests {
                 Map.of(
                         "iss", "https://certus.devshuai.com",
                         "sub", "certus-user-id",
+                        "aud", List.of(audience),
                         "nonce", tokenNonce,
                         "preferred_username", username));
         when(jwtDecoder.decode("signed-id-token")).thenReturn(idToken);

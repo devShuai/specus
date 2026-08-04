@@ -1,10 +1,8 @@
 package com.theshuai.specusserver.management.controller;
 
-import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
-import com.theshuai.specusserver.management.tenant.TenantResolver;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
 import org.springframework.http.HttpStatus;
@@ -87,12 +85,10 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", "OIDC 令牌不能通过该端点续期"));
         }
-        LoginUser user = new LoginUser(
-                jwt.getSubject(),
-                claimAsString(jwt, TenantResolver.LOCAL_TENANT_CLAIM),
-                ManagementRole.parse(claimAsString(jwt, "role")),
-                "ADMIN".equalsIgnoreCase(claimAsString(jwt, "role")));
-        return ResponseEntity.ok(buildTokenBody(user));
+        return managementUserService.resolveLocalTokenUser(jwt.getSubject())
+                .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("error", "账号已禁用、不存在或不再允许本地登录")));
     }
 
     private Map<String, Object> buildTokenBody(LoginUser user) {

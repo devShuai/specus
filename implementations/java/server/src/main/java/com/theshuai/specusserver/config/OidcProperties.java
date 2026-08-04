@@ -4,9 +4,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * OIDC settings for the management UI login (Authorization Code + PKCE) and for validating the
- * resulting JWT on the admin API. Defaults point at the project's gateway; only {@code clientId}
- * (and the registered {@code redirectUri}) must be supplied per deployment.
+ * OIDC settings for the management UI login (Authorization Code + PKCE) and optional direct
+ * external bearer validation on the admin API. Defaults point at the project's gateway; only
+ * {@code clientId} (and the registered {@code redirectUri}) must be supplied for browser login,
+ * while direct bearer validation additionally requires a non-blank resource {@code audience}.
  */
 @Component
 @ConfigurationProperties(prefix = "specus.oidc")
@@ -21,7 +22,7 @@ public class OidcProperties {
     private String clientSecret = "";
     private String redirectUri = "http://127.0.0.1:8088/";
     private String scope = "openid profile email";
-    /** Optional expected audience; when blank, audience is not enforced. */
+    /** Required resource audience for direct OIDC bearer tokens; blank disables that path. */
     private String audience = "";
     /** Claim name used to scope admin API data per tenant. Blank falls back to the default tenant. */
     private String tenantClaim = "tenant_id";

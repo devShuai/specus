@@ -5,6 +5,7 @@ import com.theshuai.specusserver.security.LocalTokenService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -144,23 +145,59 @@ public class SecurityConfig {
     }
 
     @Bean
+    @Primary
     public JwtDecoder jwtDecoder(OidcProperties oidc, LocalTokenService localTokenService) {
-        return new AlgorithmRoutingJwtDecoder(oidcDecoder(oidc), localDecoder(localTokenService));
+        return new AlgorithmRoutingJwtDecoder(oidcAccessTokenDecoder(oidc), localDecoder(localTokenService));
     }
 
-    /** Lazy JWKS-backed decoder for the gateway's RS256 tokens (keys fetched on first use). */
-    private JwtDecoder oidcDecoder(OidcProperties oidc) {
-        NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(oidc.getJwkSetUri()).build();
+    /**
+     * Dedicated ID-token decoder for the Authorization Code flow. OIDC ID tokens are always
+     * audience-bound to this RP's client id; the resource-server audience is a separate setting.
+     */
+    @Bean("oidcIdTokenDecoder")
+    public JwtDecoder oidcIdTokenDecoder(OidcProperties oidc) {
+        NimbusJwtDecoder decoder = oidcBaseDecoder(oidc);
+        List<OAuth2TokenValidator<Jwt>> validators = baseOidcValidators(oidc);
+        if (StringUtils.hasText(oidc.getClientId())) {
+            validators.add(audienceValidator(oidc.getClientId()));
+            validators.add(authorizedPartyValidator(oidc.getClientId()));
+        } else {
+            validators.add(configurationRequiredValidator("OIDC clientId is required for ID tokens"));
+        }
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(validators));
+        return decoder;
+    }
+
+    /** Lazy JWKS-backed decoder for direct RS256 API access tokens (keys fetched on first use). */
+    private JwtDecoder oidcAccessTokenDecoder(OidcProperties oidc) {
+        NimbusJwtDecoder decoder = oidcBaseDecoder(oidc);
+        List<OAuth2TokenValidator<Jwt>> validators = baseOidcValidators(oidc);
+        if (StringUtils.hasText(oidc.getAudience())) {
+            validators.add(audienceValidator(oidc.getAudience()));
+        } else {
+            // Fail closed. Authorization-code login still uses oidcIdTokenDecoder above and mints
+            // a local token; only direct external bearer use is disabled without a resource aud.
+            validators.add(configurationRequiredValidator(
+                    "specus.oidc.audience is required for direct OIDC bearer tokens"));
+        }
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(validators));
+        return decoder;
+    }
+
+    private NimbusJwtDecoder oidcBaseDecoder(OidcProperties oidc) {
+        return NimbusJwtDecoder.withJwkSetUri(oidc.getJwkSetUri()).build();
+    }
+
+    private List<OAuth2TokenValidator<Jwt>> baseOidcValidators(OidcProperties oidc) {
         List<OAuth2TokenValidator<Jwt>> validators = new ArrayList<>();
         validators.add(new JwtTimestampValidator());
         if (StringUtils.hasText(oidc.getIssuer())) {
             validators.add(new JwtIssuerValidator(oidc.getIssuer()));
+        } else {
+            validators.add(configurationRequiredValidator(
+                    "specus.oidc.issuer is required for OIDC tokens"));
         }
-        if (StringUtils.hasText(oidc.getAudience())) {
-            validators.add(audienceValidator(oidc.getAudience()));
-        }
-        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(validators));
-        return decoder;
+        return validators;
     }
 
     /** HS256 decoder for the locally-minted password-login tokens. */
@@ -179,6 +216,24 @@ public class SecurityConfig {
         return jwt -> jwt.getAudience() != null && jwt.getAudience().contains(audience)
                 ? OAuth2TokenValidatorResult.success()
                 : OAuth2TokenValidatorResult.failure(error);
+    }
+
+    private OAuth2TokenValidator<Jwt> authorizedPartyValidator(String clientId) {
+        OAuth2Error error = new OAuth2Error("invalid_token", "OIDC azp does not match clientId", null);
+        return jwt -> {
+            String azp = jwt.getClaimAsString("azp");
+            boolean multipleAudiences = jwt.getAudience() != null && jwt.getAudience().size() > 1;
+            if ((multipleAudiences && !clientId.equals(azp))
+                    || (StringUtils.hasText(azp) && !clientId.equals(azp))) {
+                return OAuth2TokenValidatorResult.failure(error);
+            }
+            return OAuth2TokenValidatorResult.success();
+        };
+    }
+
+    private OAuth2TokenValidator<Jwt> configurationRequiredValidator(String message) {
+        OAuth2Error error = new OAuth2Error("invalid_token", message, null);
+        return jwt -> OAuth2TokenValidatorResult.failure(error);
     }
 
     /** Picks the decoder by the JWT header {@code alg}: HS* → local, otherwise → OIDC/JWKS. */
