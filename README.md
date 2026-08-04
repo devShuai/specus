@@ -392,7 +392,9 @@ HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，�
 curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=specus
 ```
 
-该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=specus`。`/http/**` 默认作为公开流量入口，不需要管理令牌；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `SPECUS_HTTP_TIMEOUT_MS` 调整。HTTP 路由开启路径改写时，单次可改写响应体默认上限是 `10 MiB`，可通过 `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` 调整。
+该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=specus`。`/http/**` 默认作为公开流量入口，不需要管理令牌；管理页可为每条 route 单独开启 HTTP Basic 认证。开启后使用 `curl -u '用户名:密码' URL` 访问，缺失或错误凭据返回 `401`。入口密码只以哈希保存且不会通过管理 API 回显，也不会下发给客户端；校验成功后的外层 Basic `Authorization` 不会透传给内网服务或写入流量明细。公开 route 仍会保留调用方的 Authorization，以兼容 upstream 自身认证。
+
+只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `SPECUS_HTTP_TIMEOUT_MS` 调整。HTTP 路由开启路径改写时，单次可改写响应体默认上限是 `10 MiB`，可通过 `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` 调整。
 
 ## 私有组网（Peer Mesh）
 
@@ -602,7 +604,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 免登录房间互传：匿名用户可使用 WebRTC Direct 和认证 TURN，登录用户额外支持 OSS 预签名兜底、云端下载与分享链接；Token 房间支持 OWNER/EDITOR/VIEWER 角色邀请、撤销和只读限制；专业流程图基于 maxGraph + Yjs，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标和服务端版本历史；支持 `.stdg`、多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg`、`.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
 - 使用统一 v2 线协议的 Go 客户端，支持 control/data 双连接、登录、心跳、自动重连、TCP 映射和 HTTP/WebSocket 流式直转
-- Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
+- Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled`、HTTP 路由 `pathRewriteEnabled` 与逐 route Basic 入口认证；C server 的 SQLite 管理路由也使用同一认证字段与数据面校验语义
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
 - Go/.NET server 已对齐 Java 公共互传与客户端消息主路径：`/ws/public-transfer/discovery`、6 个公共/管理附件接口、Aliyun OSS 预签名与 HEAD 完成校验、过期清理、来源 IP/房间限流、`/ws/client-messages`、消息能力持久化和 client/admin fallback；TURN 临时 credential、MESSAGE-INTEGRITY 及 401/438 challenge 也已补齐，Java/Go/.NET/Android 客户端会更新 challenge、换新 transaction 并最多重试一次
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 提供明确列出的轻量子集

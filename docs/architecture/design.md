@@ -223,6 +223,8 @@ HTTP 主路径：
 
 ```text
 /http/{clientName}/{route}/**
+  → server 读取 route access policy；可选 Basic 认证在读取 body / Upgrade 前完成
+  → 受保护 route 剥离入口 Authorization
   → HttpSpecusController 构造 DirectHttpRequestPacket
   → DirectHttpDispatcher 注册 SyncFuture、写控制 Channel 并等待
   → client DirectHttpRequestHandler 在线程池执行 DirectHttpForwarder
@@ -240,10 +242,16 @@ HTTP 主路径：
   `16 MiB` 解压上限约束。因此 `64 MiB` 不是可保证传输的响应上限，稳定使用应把完整序列化 payload
   控制在 `16 MiB` 以下并预留字段开销。
 - route 不存在时由 client 拒绝，当前响应是 `502` 和“未配置 HTTP route”，不是 controller 预先返回 `404`。
+- 服务端持久化 route 默认公开；可按 route 开启 Basic 认证。凭据错误返回 `401`，配置查询故障 fail-closed 返回
+  `503`；未被服务端接管的 legacy 本地 route 继续公开以保持兼容。
+- 入口 Basic Authorization 只在 server 校验，不下发客户端；校验成功后也不透传 upstream、不进入 HTTP 明细。
+  公开 route 的 Authorization 保持原样，支持 upstream 自身鉴权。
 - client 校验 target scheme 为 HTTP/HTTPS、目标 origin 不变，且相对路径不能逃逸 base path。
 - HTTP 路由开启路径改写后，server 可改写可识别响应中的绝对路径；默认单体上限 `10 MiB`。
 
-WebSocket 升级同样挂在 `/http/**`，由 `WebSocketSpecusHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以 `source="ws"` 和 `channelId` 区分。
+WebSocket 升级同样挂在 `/http/**`，在返回 `101` 前复用同一 route Basic gate；通过后由
+`WebSocketSpecusHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以
+`source="ws"` 和 `channelId` 区分。
 
 ### 6.3 Peer Mesh
 
@@ -278,7 +286,9 @@ Java client 入口默认仍以明文连接；启用 TLS 需要构造 `SslContext
 
 Spring Security 当前只要求 `/api/admin/**` 与 `/auth/refresh` 必须携带认证；`/api/public/**`、`/ws/**` 和其它请求在 filter chain 层 permitAll。`/ws/**` 中需要保护的端点由握手拦截器单独校验 JWT。
 
-`/http/**` 是有意公开的业务入口，不要求管理 JWT。它的访问边界是在线客户端和该客户端当前生效的 route；公网 TCP 入口则受已登录客户端成功 `REGISTER` 的端口集合约束。
+`/http/**` 不要求管理 JWT，默认是公开业务入口；每条服务端持久化 route 可独立启用 HTTP Basic。Basic 密码只
+保存哈希且不在 API 中回显，HTTP 与 WebSocket 在进入隧道前使用同一校验规则。它的其它访问边界是在线客户端和
+该客户端当前生效的 route；公网 TCP 入口则受已登录客户端成功 `REGISTER` 的端口集合约束。
 
 ## 8. 持久化
 
@@ -304,7 +314,8 @@ ClientCredential
 ### 8.2 路由、连接与流量
 
 - **`SpecusMapping`**：全局唯一 `listen_port`、目标地址/端口、启用状态和明细采集开关。
-- **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集和路径改写开关。
+- **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集、路径改写开关，以及
+  可选的 Basic 用户名和密码哈希；展示模型只暴露 `authPasswordConfigured`，不返回哈希。
 - **`ConnectionRecord`**：client、channel、remote address、连接/断开时间、成功状态、失败原因和断开原因；不保存登录耗时或流量字节。
 - **`ConnectionStat`**：按 tenant、clientName、自然月累加 total/success/failure，长期保留。
 - **`TrafficUsage`**：按 `(client_id, usage_date)` 聚合上下行字节。

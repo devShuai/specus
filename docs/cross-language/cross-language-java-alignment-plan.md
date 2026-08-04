@@ -89,6 +89,10 @@
   - 新库 schema 默认关闭这些开关；Go server 与 .NET server 启动初始化会给老库幂等补列。
 - Go server 的 TCP 转发背压已补齐 Java/.NET high/low watermark 语义：控制通道写入与外部 socket 写入都会按 `SPECUS_NETTY_WRITE_BUFFER_LOW_WATER_MARK` / `SPECUS_NETTY_WRITE_BUFFER_HIGH_WATER_MARK` 统计待写字节；超过高水位暂停对应读循环，回落到低水位后恢复，不再仅依赖同步写的自然 TCP 回压。
 - Go server、.NET server 与 C server 已接入 HTTP 响应路径改写行为：当 `pathRewriteEnabled=true` 时，服务端会在回写浏览器前尝试改写 `text/html` / `text/css` 中的绝对路径，并在 HTML 中注入 Java 对齐的运行时 polyfill，覆盖 `fetch`、`XMLHttpRequest`、`history.pushState/replaceState`、动态元素属性、`EventSource` 和 `WebSocket` 的绝对路径；改写后返回给浏览器的响应会剥离失效的 `Content-Encoding` / `Content-Length`，但 HTTP 明细采集仍保留客户端原始响应头，便于排查上游真实行为；C server 当前支持 `gzip`、zlib `deflate` 与 raw `deflate` 解码后改写。
+- Java、Go、.NET 与 C server 的持久化 HTTP route 已对齐可选 Basic 入口认证：管理 API 使用
+  `authEnabled/authUsername/authPassword` 写入，只返回 `authPasswordConfigured`；密码只保存哈希。HTTP 与支持
+  WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细，
+  未持久化的 legacy 客户端本地 route 仍保持公开兼容。
 - Go server 与 .NET server 已补齐数据库版 HTTP/TCP 明细采集链路：
   - 新增 `specus_resource_traffic_usage`，并按 TCP 映射 / HTTP route 聚合资源级每日流量。
   - 资源级流量和每日总流量均带 `tenant_id`，管理查询按当前租户和可见客户端收敛。
