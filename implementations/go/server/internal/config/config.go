@@ -23,6 +23,7 @@ type Config struct {
 	Traffic          TrafficConfig          `json:"traffic"`
 	Elasticsearch    ElasticsearchConfig    `json:"elasticsearch"`
 	HTTP             DirectHTTPConfig       `json:"http"`
+	MediaCapture     MediaCaptureConfig     `json:"mediaCapture"`
 	PeerMesh         PeerMeshConfig         `json:"peerMesh"`
 	ObjectStorage    ObjectStorageConfig    `json:"objectStorage"`
 	PublicTransfer   PublicTransferConfig   `json:"publicTransfer"`
@@ -190,6 +191,57 @@ type DirectHTTPConfig struct {
 	TimeoutMs           int `json:"timeoutMs"`
 	MaxRequestBodySize  int `json:"maxRequestBodySize"`
 	RewriteMaxBodyBytes int `json:"rewriteMaxBodyBytes"`
+}
+
+// MediaCaptureConfig mirrors specus.media-capture in the Java server. Media capture is
+// deliberately independent from attachment object storage because captured responses are
+// streamed into a RustFS/S3-compatible private bucket by the server itself.
+type MediaCaptureConfig struct {
+	Enabled                  bool   `json:"enabled"`
+	Endpoint                 string `json:"endpoint"`
+	Region                   string `json:"region"`
+	Bucket                   string `json:"bucket"`
+	AccessKeyID              string `json:"accessKeyId"`
+	AccessKeySecret          string `json:"accessKeySecret"`
+	ObjectPrefix             string `json:"objectPrefix"`
+	PathStyle                bool   `json:"pathStyle"`
+	CreateBucketIfMissing    bool   `json:"createBucketIfMissing"`
+	PartSizeBytes            int64  `json:"partSizeBytes"`
+	MaxInflightParts         int    `json:"maxInflightParts"`
+	UploadThreads            int    `json:"uploadThreads"`
+	RetentionSeconds         int64  `json:"retentionSeconds"`
+	LiveWindowSeconds        int64  `json:"liveWindowSeconds"`
+	ManifestMaxBytes         int64  `json:"manifestMaxBytes"`
+	PlaybackTicketTTLSeconds int64  `json:"playbackTicketTtlSeconds"`
+	CleanupIntervalMs        int64  `json:"cleanupIntervalMs"`
+}
+
+// Ready reports whether capture was explicitly enabled and every credential needed for
+// server-side S3 access is present. Incomplete configuration is treated as disabled.
+func (c MediaCaptureConfig) Ready() bool {
+	return c.Enabled && strings.TrimSpace(c.Endpoint) != "" && strings.TrimSpace(c.Bucket) != "" &&
+		strings.TrimSpace(c.AccessKeyID) != "" && strings.TrimSpace(c.AccessKeySecret) != ""
+}
+
+func (c MediaCaptureConfig) NormalizedPartSizeBytes() int64 {
+	if c.PartSizeBytes < 5*1024*1024 {
+		return 5 * 1024 * 1024
+	}
+	return c.PartSizeBytes
+}
+
+func (c MediaCaptureConfig) NormalizedMaxInflightParts() int {
+	if c.MaxInflightParts < 1 {
+		return 1
+	}
+	return c.MaxInflightParts
+}
+
+func (c MediaCaptureConfig) NormalizedUploadThreads() int {
+	if c.UploadThreads < 1 {
+		return 1
+	}
+	return c.UploadThreads
 }
 
 // PeerMeshConfig mirrors specus.peer-mesh in the Java server.
@@ -361,6 +413,19 @@ func Default() Config {
 			TimeoutMs:           30000,
 			MaxRequestBodySize:  16 * 1024 * 1024,
 			RewriteMaxBodyBytes: 10 * 1024 * 1024,
+		},
+		MediaCapture: MediaCaptureConfig{
+			Region:                   "us-east-1",
+			ObjectPrefix:             "specus/http-media",
+			PathStyle:                true,
+			PartSizeBytes:            8 * 1024 * 1024,
+			MaxInflightParts:         4,
+			UploadThreads:            4,
+			RetentionSeconds:         7 * 24 * 60 * 60,
+			LiveWindowSeconds:        5 * 60,
+			ManifestMaxBytes:         16 * 1024 * 1024,
+			PlaybackTicketTTLSeconds: 15 * 60,
+			CleanupIntervalMs:        60 * 1000,
 		},
 		PeerMesh: PeerMeshConfig{
 			Enabled:                     false,
@@ -585,6 +650,27 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("SPECUS_HTTP_TIMEOUT_MS", &cfg.HTTP.TimeoutMs)
 	setInt("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", &cfg.HTTP.MaxRequestBodySize)
 	setInt("SPECUS_HTTP_REWRITE_MAX_BODY_BYTES", &cfg.HTTP.RewriteMaxBodyBytes)
+
+	setBool("SPECUS_MEDIA_CAPTURE_ENABLED", &cfg.MediaCapture.Enabled)
+	setStr("SPECUS_MEDIA_CAPTURE_ENDPOINT", &cfg.MediaCapture.Endpoint)
+	setStr("SPECUS_MEDIA_CAPTURE_REGION", &cfg.MediaCapture.Region)
+	setStr("SPECUS_MEDIA_CAPTURE_BUCKET", &cfg.MediaCapture.Bucket)
+	setStr("SPECUS_MEDIA_CAPTURE_ACCESS_KEY_ID", &cfg.MediaCapture.AccessKeyID)
+	// Legacy aliases are applied first; the Java-canonical names win when both exist.
+	setStr("SPECUS_MEDIA_CAPTURE_SECRET_ACCESS_KEY", &cfg.MediaCapture.AccessKeySecret)
+	setStr("SPECUS_MEDIA_CAPTURE_OBJECT_PREFIX", &cfg.MediaCapture.ObjectPrefix)
+	setStr("SPECUS_MEDIA_CAPTURE_ACCESS_KEY_SECRET", &cfg.MediaCapture.AccessKeySecret)
+	setStr("SPECUS_MEDIA_CAPTURE_PREFIX", &cfg.MediaCapture.ObjectPrefix)
+	setBool("SPECUS_MEDIA_CAPTURE_PATH_STYLE", &cfg.MediaCapture.PathStyle)
+	setBool("SPECUS_MEDIA_CAPTURE_CREATE_BUCKET_IF_MISSING", &cfg.MediaCapture.CreateBucketIfMissing)
+	setInt64("SPECUS_MEDIA_CAPTURE_PART_SIZE_BYTES", &cfg.MediaCapture.PartSizeBytes)
+	setInt("SPECUS_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS", &cfg.MediaCapture.MaxInflightParts)
+	setInt("SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS", &cfg.MediaCapture.UploadThreads)
+	setInt64("SPECUS_MEDIA_CAPTURE_RETENTION_SECONDS", &cfg.MediaCapture.RetentionSeconds)
+	setInt64("SPECUS_MEDIA_CAPTURE_LIVE_WINDOW_SECONDS", &cfg.MediaCapture.LiveWindowSeconds)
+	setInt64("SPECUS_MEDIA_CAPTURE_MANIFEST_MAX_BYTES", &cfg.MediaCapture.ManifestMaxBytes)
+	setInt64("SPECUS_MEDIA_CAPTURE_PLAYBACK_TICKET_TTL_SECONDS", &cfg.MediaCapture.PlaybackTicketTTLSeconds)
+	setInt64("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", &cfg.MediaCapture.CleanupIntervalMs)
 
 	setBool("SPECUS_PEER_MESH_ENABLED", &cfg.PeerMesh.Enabled)
 	setStr("SPECUS_PEER_MESH_CIDR", &cfg.PeerMesh.CIDR)

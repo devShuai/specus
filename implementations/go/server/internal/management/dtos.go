@@ -111,6 +111,7 @@ type HTTPRouteView struct {
 	TargetBaseURL          string `json:"targetBaseUrl"`
 	Enabled                bool   `json:"enabled"`
 	DetailCaptureEnabled   bool   `json:"detailCaptureEnabled"`
+	MediaCaptureEnabled    bool   `json:"mediaCaptureEnabled"`
 	PathRewriteEnabled     bool   `json:"pathRewriteEnabled"`
 	AuthEnabled            bool   `json:"authEnabled"`
 	AuthUsername           string `json:"authUsername"`
@@ -299,6 +300,7 @@ type httpRouteMutation struct {
 	TargetBaseURL        string  `json:"targetBaseUrl"`
 	Enabled              *bool   `json:"enabled"`
 	DetailCaptureEnabled *bool   `json:"detailCaptureEnabled"`
+	MediaCaptureEnabled  *bool   `json:"mediaCaptureEnabled"`
 	PathRewriteEnabled   *bool   `json:"pathRewriteEnabled"`
 	AuthEnabled          *bool   `json:"authEnabled"`
 	AuthUsername         *string `json:"authUsername"`

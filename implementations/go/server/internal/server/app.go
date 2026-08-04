@@ -19,6 +19,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/control"
 	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"
 	"github.com/devShuai/specus/implementations/go/server/internal/management"
+	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
@@ -62,6 +63,7 @@ type App struct {
 	publicTransferDiscovery *publicTransferDiscoveryHub
 	attachments             *transfer.Service
 	rooms                   *transfer.RoomService
+	mediaCapture            *media.Service
 	webSocketTickets        *security.WebSocketTicketService
 }
 
@@ -185,6 +187,18 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			}
 			return publicTransferDiscovery.coordination.allowRate(ctx, bucket, identity, limit, window)
 		}))
+	mediaStorage := media.NewRustFSStorage(cfg.MediaCapture)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := mediaStorage.Initialize(ctx)
+		cancel()
+		if err != nil {
+			_ = publicTransferDiscovery.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("configure RustFS media capture: %w", err)
+		}
+	}
+	mediaCapture := media.NewService(db, cfg.MediaCapture, mediaStorage, logger)
 	directHTTP := directhttp.NewService(sessions,
 		func(clientName string, metadata map[string]any) (directhttp.Stream, error) {
 			return coordinator.OpenHTTPStream(clientName, metadata)
@@ -194,11 +208,16 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		},
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
+	directHTTP.SetMediaCapture(func(ctx context.Context, clientName, route, method, sourceURL string,
+		statusCode int, responseHeaders []string) directhttp.MediaCaptureSession {
+		return mediaCapture.Open(ctx, clientName, route, method, sourceURL, statusCode, responseHeaders)
+	})
 	directHTTP.SetReconnectGrace(3 * time.Second)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, logger)
+	api.SetMediaCapture(mediaCapture)
 	wsHub := wsevents.NewHub(webSocketTickets, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
@@ -293,6 +312,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		publicTransferDiscovery: publicTransferDiscovery,
 		attachments:             attachments,
 		rooms:                   rooms,
+		mediaCapture:            mediaCapture,
 		webSocketTickets:        webSocketTickets,
 	}, nil
 }
@@ -317,8 +337,14 @@ func (a *App) Tokens() *security.LocalTokenService { return a.tokens }
 
 // Close releases resources.
 func (a *App) Close() error {
+	mediaCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	mediaErr := a.mediaCapture.Close(mediaCtx)
+	cancel()
 	coordinationErr := a.publicTransferDiscovery.Close()
 	databaseErr := a.db.Close()
+	if mediaErr != nil {
+		return mediaErr
+	}
 	if coordinationErr != nil {
 		return coordinationErr
 	}
@@ -333,6 +359,7 @@ func (a *App) Run(ctx context.Context) error {
 	go a.peerMesh.Run(ctx)
 	go a.peerMesh.RunStunTurn(ctx)
 	go a.attachments.RunExpiration(ctx)
+	go a.mediaCapture.Run(ctx)
 	go a.api.RunRegistrationCleanup(ctx)
 	go a.db.RunTrafficDetailFlush(ctx,
 		time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,

@@ -192,6 +192,47 @@ func TestDefaultTrafficCaptureDetailDisabledLikeJava(t *testing.T) {
 	}
 }
 
+func TestMediaCaptureDefaultsAndIncompleteConfigurationAreSafe(t *testing.T) {
+	cfg := Default().MediaCapture
+	if cfg.Enabled || cfg.Ready() {
+		t.Fatal("media capture must default to disabled")
+	}
+	if cfg.Region != "us-east-1" || cfg.ObjectPrefix != "specus/http-media" || !cfg.PathStyle ||
+		cfg.PartSizeBytes != 8*1024*1024 || cfg.PlaybackTicketTTLSeconds != 900 {
+		t.Fatalf("media capture defaults mismatch: %+v", cfg)
+	}
+	cfg.Enabled = true
+	if cfg.Ready() {
+		t.Fatal("enabled but incomplete media capture config must remain disabled")
+	}
+}
+
+func TestLoadMapsJavaMediaCaptureOptions(t *testing.T) {
+	t.Setenv("SPECUS_MEDIA_CAPTURE_ENABLED", "true")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_ENDPOINT", "https://rustfs.internal")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_REGION", "us-test-1")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_BUCKET", "media")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_ACCESS_KEY_ID", "access")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_SECRET_ACCESS_KEY", "legacy-secret")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_ACCESS_KEY_SECRET", "secret")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_OBJECT_PREFIX", "legacy-prefix")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_PREFIX", "captures")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_PATH_STYLE", "false")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_PART_SIZE_BYTES", "10485760")
+	t.Setenv("SPECUS_MEDIA_CAPTURE_RETENTION_SECONDS", "3600")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MediaCapture.Ready() || cfg.MediaCapture.Region != "us-test-1" ||
+		cfg.MediaCapture.PathStyle || cfg.MediaCapture.PartSizeBytes != 10485760 ||
+		cfg.MediaCapture.RetentionSeconds != 3600 || cfg.MediaCapture.ObjectPrefix != "captures" ||
+		cfg.MediaCapture.AccessKeySecret != "secret" {
+		t.Fatalf("media capture env mapping mismatch: %+v", cfg.MediaCapture)
+	}
+}
+
 func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 	t.Setenv("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", "false")
 	t.Setenv("SPECUS_PEER_MESH_TURN_REALM", "example.org")

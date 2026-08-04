@@ -18,6 +18,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
@@ -44,10 +45,15 @@ type API struct {
 	peerMesh     *peermesh.Service
 	attachments  *transfer.Service
 	rooms        *transfer.RoomService
+	mediaCapture *media.Service
 	turnstile    *security.TurnstileVerifier
 	registration *registrationService
 	logger       *slog.Logger
 }
+
+// SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
+// long-standing NewAPI constructor used by integration tests.
+func (a *API) SetMediaCapture(service *media.Service) { a.mediaCapture = service }
 
 // NewAPI builds the admin API.
 func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalTokenService,
@@ -151,6 +157,19 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/traffic/tcp-frames/{id}", a.requireAuth(a.handleGetTCPFrame))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-streams", a.requireAuth(a.handleGetTCPStream))
 	mux.HandleFunc("GET /api/admin/traffic/inspection-status", a.requireAuth(a.handleTrafficInspectionStatus))
+	mux.HandleFunc("GET /api/admin/traffic/media-captures", a.requireAuth(a.handleListMediaCaptures))
+	mux.HandleFunc("POST /api/admin/traffic/media-captures/{id}/playback-ticket", a.requireAuth(a.handleCreateMediaPlaybackTicket))
+	mux.HandleFunc("GET /api/admin/traffic/media-captures/{id}/play", a.requireAuth(a.handleAdminMediaPlay))
+	mux.HandleFunc("HEAD /api/admin/traffic/media-captures/{id}/play", a.requireAuth(a.handleAdminMediaPlay))
+	mux.HandleFunc("GET /api/admin/traffic/media-captures/{id}/manifest", a.requireAuth(a.handleAdminMediaManifest))
+	mux.HandleFunc("GET /api/admin/traffic/media-captures/{id}/asset", a.requireAuth(a.handleAdminMediaAsset))
+	mux.HandleFunc("HEAD /api/admin/traffic/media-captures/{id}/asset", a.requireAuth(a.handleAdminMediaAsset))
+	mux.HandleFunc("GET /api/public/media-playback/{ticket}/play", a.handlePublicMediaPlay)
+	mux.HandleFunc("HEAD /api/public/media-playback/{ticket}/play", a.handlePublicMediaPlay)
+	mux.HandleFunc("GET /api/public/media-playback/{ticket}/manifest", a.handlePublicMediaManifest)
+	mux.HandleFunc("HEAD /api/public/media-playback/{ticket}/manifest", a.handlePublicMediaManifest)
+	mux.HandleFunc("GET /api/public/media-playback/{ticket}/asset", a.handlePublicMediaAsset)
+	mux.HandleFunc("HEAD /api/public/media-playback/{ticket}/asset", a.handlePublicMediaAsset)
 	mux.HandleFunc("GET /api/admin/connection-stats", a.requireAuth(a.handleListConnectionStats))
 
 	mux.HandleFunc("GET /api/admin/peer-mesh/status", a.requireAuth(a.handlePeerMeshStatus))
@@ -1443,6 +1462,7 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		TargetBaseURL:        strings.TrimSpace(req.TargetBaseURL),
 		Enabled:              boolOr(req.Enabled, true),
 		DetailCaptureEnabled: boolOr(req.DetailCaptureEnabled, false),
+		MediaCaptureEnabled:  boolOr(req.MediaCaptureEnabled, false),
 		PathRewriteEnabled:   boolOr(req.PathRewriteEnabled, false),
 		CreatedAt:            now,
 		UpdatedAt:            now,
@@ -1500,6 +1520,7 @@ func (a *API) handleUpdateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 	mapping.TargetBaseURL = strings.TrimSpace(req.TargetBaseURL)
 	mapping.Enabled = boolOr(req.Enabled, mapping.Enabled)
 	mapping.DetailCaptureEnabled = boolOr(req.DetailCaptureEnabled, mapping.DetailCaptureEnabled)
+	mapping.MediaCaptureEnabled = boolOr(req.MediaCaptureEnabled, mapping.MediaCaptureEnabled)
 	mapping.PathRewriteEnabled = boolOr(req.PathRewriteEnabled, mapping.PathRewriteEnabled)
 	if err := applyHTTPRouteAuthMutation(mapping, req); err != nil {
 		a.fail(w, err)
@@ -2722,7 +2743,8 @@ func httpRouteView(r store.HTTPRouteMapping) HTTPRouteView {
 		ID: r.ID, ClientID: r.ClientID, ClientName: r.ClientName, Route: r.Route,
 		TargetBaseURL: r.TargetBaseURL, Enabled: r.Enabled,
 		DetailCaptureEnabled: r.DetailCaptureEnabled, PathRewriteEnabled: r.PathRewriteEnabled,
-		AuthEnabled: r.AuthEnabled, AuthUsername: r.AuthUsername,
+		MediaCaptureEnabled: r.MediaCaptureEnabled,
+		AuthEnabled:         r.AuthEnabled, AuthUsername: r.AuthUsername,
 		AuthPasswordConfigured: strings.TrimSpace(r.AuthPasswordHash) != "",
 		CreatedAt:              r.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: r.UpdatedAt.Format(time.RFC3339Nano),
 	}

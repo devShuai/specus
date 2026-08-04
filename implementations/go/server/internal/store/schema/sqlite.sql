@@ -268,6 +268,7 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
   target_base_url TEXT NOT NULL,
   enabled INTEGER NOT NULL,
   detail_capture_enabled INTEGER NOT NULL DEFAULT 0,
+  media_capture_enabled INTEGER NOT NULL DEFAULT 0,
   path_rewrite_enabled INTEGER NOT NULL DEFAULT 0,
   auth_enabled INTEGER NOT NULL DEFAULT 0,
   auth_username TEXT NOT NULL DEFAULT '',
@@ -278,6 +279,61 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
 );
 
 CREATE INDEX IF NOT EXISTS idx_http_route_client_id ON http_route_mapping (client_id);
+
+CREATE TABLE IF NOT EXISTS specus_http_media_capture (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL,
+  client_id INTEGER NOT NULL,
+  client_name TEXT NOT NULL,
+  route TEXT NOT NULL,
+  resource_id INTEGER,
+  source_url TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  deduplication_key TEXT UNIQUE,
+  method TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  content_type TEXT,
+  content_encoding TEXT,
+  media_kind TEXT NOT NULL,
+  entity_tag TEXT,
+  last_modified TEXT,
+  content_range_start INTEGER,
+  content_range_end INTEGER,
+  total_bytes INTEGER,
+  captured_bytes INTEGER NOT NULL,
+  segment_sequence INTEGER,
+  initialization_segment INTEGER NOT NULL DEFAULT 0,
+  live_stream INTEGER NOT NULL DEFAULT 0,
+  object_key TEXT NOT NULL,
+  upload_id TEXT,
+  object_etag TEXT,
+  state TEXT NOT NULL,
+  failure_reason TEXT,
+  response_headers TEXT,
+  captured_at TEXT NOT NULL,
+  completed_at TEXT,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_http_media_tenant_id ON specus_http_media_capture (tenant_id, id);
+CREATE INDEX IF NOT EXISTS idx_http_media_tenant_client_id ON specus_http_media_capture (tenant_id, client_id, id);
+CREATE INDEX IF NOT EXISTS idx_http_media_resource ON specus_http_media_capture (tenant_id, resource_key, id);
+CREATE INDEX IF NOT EXISTS idx_http_media_source ON specus_http_media_capture (tenant_id, client_id, route, id);
+CREATE INDEX IF NOT EXISTS idx_http_media_expiry ON specus_http_media_capture (state, expires_at);
+
+CREATE TABLE IF NOT EXISTS specus_http_media_reference (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL,
+  manifest_capture_id INTEGER NOT NULL,
+  relation_type TEXT NOT NULL,
+  sequence_index INTEGER,
+  original_uri TEXT NOT NULL,
+  resolved_source_url TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_http_media_ref_manifest ON specus_http_media_reference (tenant_id, manifest_capture_id, sequence_index);
+CREATE INDEX IF NOT EXISTS idx_http_media_ref_source ON specus_http_media_reference (tenant_id, manifest_capture_id);
 
 CREATE TABLE IF NOT EXISTS specus_traffic_usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

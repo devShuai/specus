@@ -167,6 +167,92 @@ func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	}
 }
 
+func TestServeHTTPCapturesOriginalMediaResponseAndExternalizesDetailBody(t *testing.T) {
+	recorder := &capturingDetailRecorder{}
+	stream := newFakeStream()
+	stream.head = map[string]any{
+		"statusCode": 206,
+		"headers":    []string{"Content-Type:video/mp4", "Content-Range:bytes 0-5/6"},
+	}
+	stream.responses = []fakeResponse{{data: []byte("abc")}, {data: []byte("def")}, {end: true}}
+	capture := &capturingMediaSession{externalized: true}
+	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
+		return stream, nil
+	}, nil, time.Second, 1024, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	var openedSource string
+	service.SetMediaCapture(func(_ context.Context, clientName, route, method, sourceURL string,
+		status int, headers []string) MediaCaptureSession {
+		if clientName != "Demo client" || route != "api" || method != http.MethodGet || status != 206 || len(headers) != 2 {
+			t.Fatalf("unexpected media open: %s %s %s %d %#v", clientName, route, method, status, headers)
+		}
+		openedSource = sourceURL
+		return capture
+	})
+	response := httptest.NewRecorder()
+
+	service.ServeHTTP(response, specusRequest(http.MethodGet,
+		"/http/Demo%20client/api/movie.mp4?token=secret", ""))
+
+	if response.Code != http.StatusPartialContent || response.Body.String() != "abcdef" {
+		t.Fatalf("response=%d/%q", response.Code, response.Body.String())
+	}
+	if openedSource != "/movie.mp4?token=secret" || capture.body.String() != "abcdef" ||
+		!capture.completed || capture.failed {
+		t.Fatalf("capture source=%q body=%q complete=%t failed=%t",
+			openedSource, capture.body.String(), capture.completed, capture.failed)
+	}
+	if len(recorder.record.ResponseBody) != 0 {
+		t.Fatalf("externalized media leaked into HTTP detail body: %q", recorder.record.ResponseBody)
+	}
+}
+
+func TestServeHTTPFiltersUndeclaredAndUnsafePeerResponseTrailers(t *testing.T) {
+	stream := newFakeStream()
+	stream.head = map[string]any{
+		"statusCode":   200,
+		"trailerNames": []string{"Digest", "Content-Length", "X-Injected", "digest"},
+	}
+	stream.responses = []fakeResponse{{end: true, metadata: map[string]any{"trailers": []string{
+		"Digest:sha-256=valid",
+		"X-Undeclared:must-not-cross",
+		"Content-Length:999",
+		"X-Injected:ok\r\nX-Evil: yes",
+	}}}}
+	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
+		return stream, nil
+	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	recorder := httptest.NewRecorder()
+
+	service.ServeHTTP(recorder, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+	response := recorder.Result()
+
+	if response.Trailer.Get("Digest") != "sha-256=valid" {
+		t.Fatalf("Digest trailer = %q, want valid value", response.Trailer.Get("Digest"))
+	}
+	for _, name := range []string{"X-Undeclared", "Content-Length", "X-Injected", "X-Evil"} {
+		if response.Trailer.Get(name) != "" || response.Header.Get(name) != "" {
+			t.Fatalf("unsafe trailer %q escaped: header=%q trailer=%q", name,
+				response.Header.Get(name), response.Trailer.Get(name))
+		}
+	}
+}
+
+func TestCollectDeclaredTrailersUsesOpenDeclarationIntersection(t *testing.T) {
+	header := http.Header{
+		"Digest":            {"sha-256=valid"},
+		"X-Undeclared":      {"must-not-cross"},
+		"Content-Length":    {"999"},
+		"X-Injected":        {"ok\r\nX-Evil: yes"},
+		"Transfer-Encoding": {"chunked"},
+	}
+
+	got := collectDeclaredTrailers(header,
+		[]string{"Digest", "Content-Length", "X-Injected", "Transfer-Encoding"}, false)
+	if len(got) != 1 || got[0] != "Digest:sha-256=valid" {
+		t.Fatalf("trailers = %#v, want only declared safe Digest", got)
+	}
+}
+
 func TestServeHTTPOmitsUnknownContentLengthFromOpen(t *testing.T) {
 	registry := onlineRegistry("Demo client")
 	stream := newFakeStream()
@@ -561,6 +647,19 @@ func (s *fakeStream) finishedMetadata() map[string]any {
 	defer s.mu.Unlock()
 	return s.finishMetadata
 }
+
+type capturingMediaSession struct {
+	body         bytes.Buffer
+	externalized bool
+	completed    bool
+	failed       bool
+}
+
+func (s *capturingMediaSession) Append(data []byte) { _, _ = s.body.Write(data) }
+func (s *capturingMediaSession) Complete()          { s.completed = true }
+func (s *capturingMediaSession) Fail(string)        { s.failed = true }
+func (s *capturingMediaSession) Active() bool       { return !s.completed && !s.failed }
+func (s *capturingMediaSession) Externalized() bool { return s.externalized }
 
 type capturingDetailRecorder struct{ record store.HTTPExchangeRecord }
 

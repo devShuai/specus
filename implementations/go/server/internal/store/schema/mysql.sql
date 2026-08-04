@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
   target_base_url VARCHAR(512) NOT NULL,
   enabled TINYINT(1) NOT NULL,
   detail_capture_enabled TINYINT(1) NOT NULL DEFAULT 0,
+  media_capture_enabled TINYINT(1) NOT NULL DEFAULT 0,
   path_rewrite_enabled TINYINT(1) NOT NULL DEFAULT 0,
   auth_enabled TINYINT(1) NOT NULL DEFAULT 0,
   auth_username VARCHAR(120) NOT NULL DEFAULT '',
@@ -263,6 +264,60 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
   updated_at VARCHAR(40) NOT NULL,
   UNIQUE KEY uq_http_route_client_route (client_id, route),
   KEY idx_http_route_client_id (client_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS specus_http_media_capture (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  client_id BIGINT NOT NULL,
+  client_name VARCHAR(120) NOT NULL,
+  route VARCHAR(128) NOT NULL,
+  resource_id BIGINT,
+  source_url VARCHAR(3072) NOT NULL,
+  resource_key VARCHAR(64) NOT NULL,
+  deduplication_key VARCHAR(64),
+  method VARCHAR(16) NOT NULL,
+  status_code INT NOT NULL,
+  content_type VARCHAR(255),
+  content_encoding VARCHAR(128),
+  media_kind VARCHAR(32) NOT NULL,
+  entity_tag VARCHAR(512),
+  last_modified VARCHAR(128),
+  content_range_start BIGINT,
+  content_range_end BIGINT,
+  total_bytes BIGINT,
+  captured_bytes BIGINT NOT NULL,
+  segment_sequence BIGINT,
+  initialization_segment TINYINT(1) NOT NULL DEFAULT 0,
+  live_stream TINYINT(1) NOT NULL DEFAULT 0,
+  object_key VARCHAR(1024) NOT NULL,
+  upload_id VARCHAR(1024),
+  object_etag VARCHAR(512),
+  state VARCHAR(24) NOT NULL,
+  failure_reason VARCHAR(2048),
+  response_headers LONGTEXT,
+  captured_at VARCHAR(40) NOT NULL,
+  completed_at VARCHAR(40),
+  expires_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_http_media_deduplication (deduplication_key),
+  KEY idx_http_media_tenant_id (tenant_id, id),
+  KEY idx_http_media_tenant_client_id (tenant_id, client_id, id),
+  KEY idx_http_media_resource (tenant_id, resource_key, id),
+  KEY idx_http_media_source (tenant_id, client_id, route, id),
+  KEY idx_http_media_expiry (state, expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS specus_http_media_reference (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  manifest_capture_id BIGINT NOT NULL,
+  relation_type VARCHAR(24) NOT NULL,
+  sequence_index BIGINT,
+  original_uri VARCHAR(2048) NOT NULL,
+  resolved_source_url VARCHAR(3072) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  KEY idx_http_media_ref_manifest (tenant_id, manifest_capture_id, sequence_index),
+  KEY idx_http_media_ref_source (tenant_id, manifest_capture_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS specus_traffic_usage (

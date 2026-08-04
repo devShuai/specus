@@ -337,6 +337,7 @@ type HTTPRouteMapping struct {
 	TargetBaseURL        string
 	Enabled              bool
 	DetailCaptureEnabled bool
+	MediaCaptureEnabled  bool
 	PathRewriteEnabled   bool
 	AuthEnabled          bool
 	AuthUsername         string
@@ -349,11 +350,73 @@ type HTTPRouteMapping struct {
 // HTTP/WS request is allowed into a client's tunnel. A nil policy means the route is not
 // managed by the server and therefore retains the legacy public-access behaviour.
 type HTTPRouteAccessPolicy struct {
-	Enabled            bool
-	PathRewriteEnabled bool
-	AuthEnabled        bool
-	AuthUsername       string
-	AuthPasswordHash   string
+	TenantID            string
+	ClientID            int64
+	ResourceID          int64
+	Enabled             bool
+	PathRewriteEnabled  bool
+	MediaCaptureEnabled bool
+	AuthEnabled         bool
+	AuthUsername        string
+	AuthPasswordHash    string
+}
+
+// HTTPMediaCapture mirrors specus_http_media_capture. Nullable HTTP metadata remains
+// pointer-valued so a missing Content-Range/Content-Length is distinct from zero.
+type HTTPMediaCapture struct {
+	ID                    int64
+	TenantID              string
+	ClientID              int64
+	ClientName            string
+	Route                 string
+	ResourceID            *int64
+	SourceURL             string
+	ResourceKey           string
+	DeduplicationKey      *string
+	Method                string
+	StatusCode            int
+	ContentType           *string
+	ContentEncoding       *string
+	MediaKind             string
+	EntityTag             *string
+	LastModified          *string
+	ContentRangeStart     *int64
+	ContentRangeEnd       *int64
+	TotalBytes            *int64
+	CapturedBytes         int64
+	SegmentSequence       *int64
+	InitializationSegment bool
+	LiveStream            bool
+	ObjectKey             string
+	UploadID              *string
+	ObjectETag            *string
+	State                 string
+	FailureReason         *string
+	ResponseHeaders       string
+	CapturedAt            time.Time
+	CompletedAt           *time.Time
+	ExpiresAt             time.Time
+}
+
+// HTTPMediaReference mirrors specus_http_media_reference.
+type HTTPMediaReference struct {
+	ID                int64
+	TenantID          string
+	ManifestCaptureID int64
+	RelationType      string
+	SequenceIndex     *int64
+	OriginalURI       string
+	ResolvedSourceURL string
+	CreatedAt         time.Time
+}
+
+type HTTPMediaCaptureFilter struct {
+	TenantID  string
+	ClientID  *int64
+	ClientIDs []int64
+	Route     string
+	Page      int
+	Size      int
 }
 
 // TrafficUsage mirrors specus_traffic_usage.

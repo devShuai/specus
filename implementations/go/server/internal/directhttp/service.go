@@ -74,6 +74,18 @@ type DetailRecorder interface {
 	RecordHTTPExchange(ctx context.Context, record store.HTTPExchangeRecord) error
 }
 
+// MediaCaptureSession receives the original upstream response bytes before optional path
+// rewriting. Externalized sessions suppress duplicate HTTP-detail body storage.
+type MediaCaptureSession interface {
+	Append([]byte)
+	Complete()
+	Fail(string)
+	Active() bool
+	Externalized() bool
+}
+
+type OpenMediaCaptureFunc func(context.Context, string, string, string, string, int, []string) MediaCaptureSession
+
 // Service streams public HTTP requests through mandatory NAT stream v2 frames.
 type Service struct {
 	sessions       *session.Registry
@@ -85,9 +97,12 @@ type Service struct {
 	routes         RouteSettings
 	detail         DetailRecorder
 	detailOpts     store.TrafficDetailOptions
+	openMedia      OpenMediaCaptureFunc
 	rewriter       responseRewriter
 	reconnectGrace time.Duration
 }
+
+func (s *Service) SetMediaCapture(opener OpenMediaCaptureFunc) { s.openMedia = opener }
 
 func NewService(sessions *session.Registry, openStream OpenStreamFunc, openWS OpenWSStreamFunc,
 	timeout time.Duration, maxBodySize int, rewriteMaxBodyBytes int, traffic TrafficRecorder,
@@ -172,10 +187,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestTrailerNames := headerNames(r.Trailer, protected)
 	metadata := map[string]any{
 		"source": "http", "phase": "request", "method": r.Method, "route": route,
 		"relativePath": path, "rawQuery": r.URL.RawQuery, "headers": requestHeaders,
-		"trailerNames": headerNames(r.Trailer, protected),
+		"trailerNames": requestTrailerNames,
 	}
 	if r.ContentLength >= 0 {
 		metadata["contentLength"] = r.ContentLength
@@ -190,7 +206,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pumpResult := make(chan error, 1)
 	go func() {
 		pumpResult <- s.pumpRequest(r.Context(), r.Body, r.Trailer, stream, clientName, route, requestCapture,
-			protected)
+			protected, requestTrailerNames)
 	}()
 
 	headerCtx := r.Context()
@@ -223,11 +239,30 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responseHeaders := metadataStrings(head, "headers")
-	declareTrailers(w, metadataStrings(head, "trailerNames"))
+	responseTrailerNames := validTrailerNames(metadataStrings(head, "trailerNames"), false)
+	declareTrailers(w, responseTrailerNames)
 
 	rewrite := policy != nil && policy.PathRewriteEnabled &&
 		isRewritableContentType(responseHeaders)
-	responseCapture := &limitedCapture{limit: detailCaptureBytes}
+	var mediaCapture MediaCaptureSession
+	if s.openMedia != nil {
+		sourceURL := path
+		if r.URL.RawQuery != "" {
+			sourceURL += "?" + r.URL.RawQuery
+		}
+		mediaCapture = s.openMedia(r.Context(), clientName, route, r.Method, sourceURL, status, responseHeaders)
+	}
+	mediaCompleted := false
+	defer func() {
+		if mediaCapture != nil && !mediaCompleted {
+			mediaCapture.Fail("HTTP 媒体响应中断")
+		}
+	}()
+	responseCaptureLimit := detailCaptureBytes
+	if mediaCapture != nil && mediaCapture.Externalized() {
+		responseCaptureLimit = 0
+	}
+	responseCapture := &limitedCapture{limit: responseCaptureLimit}
 	var rewriteBuffer bytes.Buffer
 	responseStarted := false
 	totalResponse := 0
@@ -277,8 +312,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			trailers = metadataStrings(endMetadata, "trailers")
 			break
 		}
+		if mediaCapture != nil {
+			mediaCapture.Append(data)
+		}
 		totalResponse += len(data)
-		if totalResponse > maxHTTPResponseBytes {
+		if totalResponse > maxHTTPResponseBytes && (mediaCapture == nil || !mediaCapture.Externalized()) {
 			stream.Reset(4, "HTTP response body exceeds limit")
 			if !responseStarted {
 				fail(http.StatusBadGateway, "HTTP 响应体超过限制")
@@ -324,8 +362,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if !responseStarted {
 		startResponse(responseHeaders)
 	}
-	applyTrailers(w, trailers)
+	applyTrailers(w, trailers, responseTrailerNames)
 	_ = r.Body.Close()
+	if mediaCapture != nil {
+		mediaCapture.Complete()
+		mediaCompleted = true
+	}
 
 	s.recordHTTPDetail(r.Context(), clientName, route, r.Method, path, r.URL.RawQuery,
 		requestHeaders, requestCapture.Bytes(), status, responseHeaders, responseCapture.Bytes(), "",
@@ -381,7 +423,7 @@ func (s *Service) clientOnline(ctx context.Context, clientName string) bool {
 }
 
 func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers http.Header, stream Stream,
-	clientName, route string, capture *limitedCapture, stripAuthorization bool) error {
+	clientName, route string, capture *limitedCapture, stripAuthorization bool, declaredTrailerNames []string) error {
 	defer body.Close()
 	buffer := make([]byte, httpChunkBytes)
 	total := 0
@@ -405,7 +447,7 @@ func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				metadata := map[string]any(nil)
-				if values := collectHeaders(trailers, skippedHeaders, stripAuthorization); len(values) > 0 {
+				if values := collectDeclaredTrailers(trailers, declaredTrailerNames, stripAuthorization); len(values) > 0 {
 					metadata = map[string]any{"trailers": values}
 				}
 				return stream.FinishRequest(metadata)
@@ -503,12 +545,46 @@ func collectHeaders(header http.Header, skipped map[string]struct{}, stripAuthor
 func headerNames(header http.Header, stripAuthorization bool) []string {
 	names := make([]string, 0, len(header))
 	for name := range header {
-		if httpgutsValidHeaderName(name) &&
-			!(stripAuthorization && strings.EqualFold(name, "Authorization")) {
-			names = append(names, name)
+		names = append(names, name)
+	}
+	return validTrailerNames(names, stripAuthorization)
+}
+
+func validTrailerNames(names []string, stripAuthorization bool) []string {
+	result := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, candidate := range names {
+		name := strings.TrimSpace(candidate)
+		lower := strings.ToLower(name)
+		if !httpgutsValidHeaderName(name) {
+			continue
+		}
+		if _, skipped := skippedHeaders[lower]; skipped || stripAuthorization && lower == "authorization" {
+			continue
+		}
+		if _, duplicate := seen[lower]; duplicate {
+			continue
+		}
+		seen[lower] = struct{}{}
+		result = append(result, name)
+	}
+	return result
+}
+
+func collectDeclaredTrailers(header http.Header, declaredNames []string, stripAuthorization bool) []string {
+	allowed := trailerNameSet(validTrailerNames(declaredNames, stripAuthorization))
+	var result []string
+	for name, values := range header {
+		if _, ok := allowed[strings.ToLower(name)]; !ok {
+			continue
+		}
+		for _, value := range values {
+			if validHeaderValue(value) {
+				result = append(result, name+":"+value)
+			}
 		}
 	}
-	return names
+	return result
 }
 
 func applyResponseHeaders(w http.ResponseWriter, headers []string) {
@@ -608,17 +684,31 @@ func declareTrailers(w http.ResponseWriter, names []string) {
 	}
 }
 
-func applyTrailers(w http.ResponseWriter, trailers []string) {
+func applyTrailers(w http.ResponseWriter, trailers []string, declaredNames []string) {
+	allowed := trailerNameSet(validTrailerNames(declaredNames, false))
 	for _, trailer := range trailers {
 		idx := strings.IndexByte(trailer, ':')
 		if idx <= 0 {
 			continue
 		}
 		name := strings.TrimSpace(trailer[:idx])
-		if httpgutsValidHeaderName(name) {
-			w.Header().Add(name, strings.TrimSpace(trailer[idx+1:]))
+		value := strings.TrimSpace(trailer[idx+1:])
+		if _, ok := allowed[strings.ToLower(name)]; ok && validHeaderValue(value) {
+			w.Header().Add(name, value)
 		}
 	}
+}
+
+func trailerNameSet(names []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		result[strings.ToLower(name)] = struct{}{}
+	}
+	return result
+}
+
+func validHeaderValue(value string) bool {
+	return !strings.ContainsAny(value, "\r\n")
 }
 
 func httpgutsValidHeaderName(name string) bool {

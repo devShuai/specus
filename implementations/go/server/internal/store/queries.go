@@ -360,7 +360,7 @@ func (db *DB) CountHTTPRoutes(ctx context.Context, clientID int64) (int, error) 
 // ListEnabledHTTPRoutes returns enabled HTTP route mappings for a client, ordered by id.
 func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTPRouteMapping, error) {
 	query := db.rebind(`SELECT id, client_id, client_name, route, target_base_url, enabled,
-		detail_capture_enabled, path_rewrite_enabled, auth_enabled, COALESCE(auth_username, ''),
+		detail_capture_enabled, media_capture_enabled, path_rewrite_enabled, auth_enabled, COALESCE(auth_username, ''),
 		COALESCE(auth_password_hash, ''), created_at, updated_at FROM http_route_mapping
 		WHERE client_id = ? AND enabled = 1 ORDER BY id`)
 	rows, err := db.sql.QueryContext(ctx, query, clientID)
@@ -374,17 +374,19 @@ func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTP
 			route              HTTPRouteMapping
 			enabled            databaseBoolean
 			detailCapture      databaseBoolean
+			mediaCapture       databaseBoolean
 			pathRewrite        databaseBoolean
 			authEnabled        databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&route.ID, &route.ClientID, &route.ClientName, &route.Route,
-			&route.TargetBaseURL, &enabled, &detailCapture, &pathRewrite, &authEnabled,
+			&route.TargetBaseURL, &enabled, &detailCapture, &mediaCapture, &pathRewrite, &authEnabled,
 			&route.AuthUsername, &route.AuthPasswordHash, &createdAt, &updated); err != nil {
 			return nil, err
 		}
 		route.Enabled = bool(enabled)
 		route.DetailCaptureEnabled = bool(detailCapture)
+		route.MediaCaptureEnabled = bool(mediaCapture)
 		route.PathRewriteEnabled = bool(pathRewrite)
 		route.AuthEnabled = bool(authEnabled)
 		route.CreatedAt = parseTime(createdAt)
@@ -408,19 +410,22 @@ func (db *DB) HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route
 // result is intentional: clients may still own routes in their local configuration when the
 // server has no corresponding row, and those legacy routes remain public.
 func (db *DB) HTTPRouteAccessPolicy(ctx context.Context, clientName, route string) (*HTTPRouteAccessPolicy, error) {
-	query := db.rebind(`SELECT r.enabled, r.path_rewrite_enabled, r.auth_enabled,
+	query := db.rebind(`SELECT COALESCE(c.tenant_id, 'default'), r.client_id, r.id,
+		r.enabled, r.path_rewrite_enabled, r.media_capture_enabled, r.auth_enabled,
 		COALESCE(r.auth_username, ''), COALESCE(r.auth_password_hash, '')
 		FROM http_route_mapping r
 		JOIN specus_client_account c ON c.id = r.client_id
 		WHERE c.client_name = ? AND r.route = ?`)
 	var (
-		policy      HTTPRouteAccessPolicy
-		enabled     databaseBoolean
-		pathRewrite databaseBoolean
-		authEnabled databaseBoolean
+		policy       HTTPRouteAccessPolicy
+		enabled      databaseBoolean
+		pathRewrite  databaseBoolean
+		mediaCapture databaseBoolean
+		authEnabled  databaseBoolean
 	)
 	err := db.sql.QueryRowContext(ctx, query, clientName, route).Scan(
-		&enabled, &pathRewrite, &authEnabled, &policy.AuthUsername, &policy.AuthPasswordHash)
+		&policy.TenantID, &policy.ClientID, &policy.ResourceID, &enabled, &pathRewrite,
+		&mediaCapture, &authEnabled, &policy.AuthUsername, &policy.AuthPasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -429,6 +434,7 @@ func (db *DB) HTTPRouteAccessPolicy(ctx context.Context, clientName, route strin
 	}
 	policy.Enabled = bool(enabled)
 	policy.PathRewriteEnabled = bool(pathRewrite)
+	policy.MediaCaptureEnabled = bool(mediaCapture)
 	policy.AuthEnabled = bool(authEnabled)
 	return &policy, nil
 }

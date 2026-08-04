@@ -189,6 +189,7 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_mapping", "detail_capture_enabled", boolType},
 		{"specus_mapping", "tenant_id", "VARCHAR(80)"},
 		{"http_route_mapping", "detail_capture_enabled", boolType},
+		{"http_route_mapping", "media_capture_enabled", boolType},
 		{"http_route_mapping", "path_rewrite_enabled", boolType},
 		{"http_route_mapping", "auth_enabled", boolType},
 		{"http_route_mapping", "auth_username", "VARCHAR(120) NOT NULL DEFAULT ''"},

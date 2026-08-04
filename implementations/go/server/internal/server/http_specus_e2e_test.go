@@ -17,7 +17,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
-func TestHTTPDataChannelSurvivesUnknownFrameAndStreamsFragmentedResponse(t *testing.T) {
+func TestHTTPDataChannelStreamsFragmentedResponse(t *testing.T) {
 	app, port := startTestApp(t)
 	account, err := app.db.FindClientByName(context.Background(), DemoClientName)
 	if err != nil || account == nil {
@@ -35,28 +35,6 @@ func TestHTTPDataChannelSurvivesUnknownFrameAndStreamsFragmentedResponse(t *test
 	controlConn, dataConn, dataReader := loginHTTPTestChannels(t, app, port)
 	defer controlConn.Close()
 	defer dataConn.Close()
-
-	// A cancelled HTTP/WS stream can leave an in-flight tail frame. Java ignores it,
-	// and a following heartbeat proves Go keeps the authenticated data channel alive.
-	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
-		Type: protocol.NatData, StreamID: 0x7ffffff0, Data: []byte("late"),
-	}); err != nil {
-		t.Fatalf("write unknown DATA: %v", err)
-	}
-	if err := protocol.WritePacket(dataConn, protocol.HeartbeatRequest{}); err != nil {
-		t.Fatalf("write data heartbeat: %v", err)
-	}
-	_ = dataConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	for {
-		packet, err := readProtocolPacket(dataReader)
-		if err != nil {
-			t.Fatalf("read data heartbeat: %v", err)
-		}
-		if _, ok := packet.(protocol.HeartbeatResponse); ok {
-			break
-		}
-	}
-	_ = dataConn.SetReadDeadline(time.Time{})
 
 	const responseSize = 1024 * 1024
 	wantBody := bytes.Repeat([]byte("0123456789abcdef"), responseSize/16)
@@ -135,6 +113,73 @@ func TestHTTPDataChannelSurvivesUnknownFrameAndStreamsFragmentedResponse(t *test
 	}
 	if err := <-clientErr; err != nil {
 		t.Fatalf("HTTP data client: %v", err)
+	}
+}
+
+func TestDataChannelResetsUnknownDataAndFinAndIgnoresLateRST(t *testing.T) {
+	app, port := startTestApp(t)
+	controlConn, dataConn, dataReader := loginHTTPTestChannels(t, app, port)
+	defer controlConn.Close()
+	defer dataConn.Close()
+
+	const dataStreamID = uint32(0x7ffffff0)
+	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
+		Type: protocol.NatData, StreamID: dataStreamID, Data: []byte("unknown"),
+	}); err != nil {
+		t.Fatalf("write unknown DATA: %v", err)
+	}
+	_ = dataConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	assertDataChannelRST(t, dataReader, dataStreamID)
+
+	const finStreamID = dataStreamID + 1
+	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
+		Type: protocol.NatFin, StreamID: finStreamID,
+	}); err != nil {
+		t.Fatalf("write unknown FIN: %v", err)
+	}
+	assertDataChannelRST(t, dataReader, finStreamID)
+
+	// The RST acknowledges the reset triggered above and must be idempotent.
+	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: dataStreamID,
+	}); err != nil {
+		t.Fatalf("write late RST: %v", err)
+	}
+	const probeStreamID = dataStreamID + 2
+	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
+		Type: protocol.NatFin, StreamID: probeStreamID,
+	}); err != nil {
+		t.Fatalf("write post-RST probe FIN: %v", err)
+	}
+	assertDataChannelRST(t, dataReader, probeStreamID)
+}
+
+func TestDataChannelClosesForRSTOnNeverOpenedStream(t *testing.T) {
+	app, port := startTestApp(t)
+	controlConn, dataConn, dataReader := loginHTTPTestChannels(t, app, port)
+	defer controlConn.Close()
+	defer dataConn.Close()
+
+	if err := protocol.WritePacket(dataConn, protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: 0x7fffffe0,
+	}); err != nil {
+		t.Fatalf("write never-opened RST: %v", err)
+	}
+	_ = dataConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := readProtocolPacket(dataReader); err == nil {
+		t.Fatal("data channel remained open after RST for a never-opened stream")
+	}
+}
+
+func assertDataChannelRST(t *testing.T, reader *bufio.Reader, streamID uint32) {
+	t.Helper()
+	packet, err := readProtocolPacket(reader)
+	if err != nil {
+		t.Fatalf("read RST for stream %d: %v", streamID, err)
+	}
+	message, ok := packet.(protocol.NatMessage)
+	if !ok || message.Type != protocol.NatRST || message.StreamID != streamID {
+		t.Fatalf("response = %#v, want NAT RST for stream %d", packet, streamID)
 	}
 }
 

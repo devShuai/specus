@@ -27,7 +27,7 @@ func TestHTTPRouteAuthenticationCRUDAndAccessPolicy(t *testing.T) {
 	route := HTTPRouteMapping{
 		ID: 201, TenantID: account.TenantID, ClientID: account.ID, ClientName: account.ClientName,
 		Route: "private", TargetBaseURL: "http://127.0.0.1:8080", Enabled: true,
-		PathRewriteEnabled: true, AuthEnabled: true, AuthUsername: "route-user",
+		PathRewriteEnabled: true, MediaCaptureEnabled: true, AuthEnabled: true, AuthUsername: "route-user",
 		AuthPasswordHash: "password-hash", CreatedAt: now, UpdatedAt: now,
 	}
 	if err := db.InsertHTTPRoute(ctx, route); err != nil {
@@ -38,7 +38,7 @@ func TestHTTPRouteAuthenticationCRUDAndAccessPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get route: %v", err)
 	}
-	if !loaded.AuthEnabled || loaded.AuthUsername != route.AuthUsername ||
+	if !loaded.AuthEnabled || !loaded.MediaCaptureEnabled || loaded.AuthUsername != route.AuthUsername ||
 		loaded.AuthPasswordHash != route.AuthPasswordHash {
 		t.Fatalf("loaded auth fields = %+v", loaded)
 	}
@@ -46,7 +46,8 @@ func TestHTTPRouteAuthenticationCRUDAndAccessPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load access policy: %v", err)
 	}
-	if policy == nil || !policy.AuthEnabled || !policy.PathRewriteEnabled ||
+	if policy == nil || !policy.AuthEnabled || !policy.PathRewriteEnabled || !policy.MediaCaptureEnabled ||
+		policy.TenantID != account.TenantID || policy.ClientID != account.ID || policy.ResourceID != route.ID ||
 		policy.AuthUsername != route.AuthUsername || policy.AuthPasswordHash != route.AuthPasswordHash {
 		t.Fatalf("access policy = %+v", policy)
 	}
