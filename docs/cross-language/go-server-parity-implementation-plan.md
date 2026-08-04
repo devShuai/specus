@@ -1,5 +1,7 @@
 # Go Server 全量对齐 Java Server 实施计划
 
+> 历史实施记录：本文的完成状态和测试结果对应 2026-07-22 批次，不覆盖后续 Java 基准变化。当前源码能力、验证结果和剩余环境差异以 [`cross-language-java-alignment-plan.md`](cross-language-java-alignment-plan.md) 为准。
+
 创建：2026-07-22
 状态：已完成（Batch 1-6 及收尾项均已实施，Go `go build ./... && go test ./...` 全绿）
 

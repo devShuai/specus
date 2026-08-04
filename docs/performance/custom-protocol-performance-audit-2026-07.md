@@ -85,7 +85,9 @@ WebSocket 在 NAT DATA 内使用 12 字节 SWS2 envelope：
 SWS2 | opcode(1) | flags(1) | closeCode(2) | payloadLength(4) | payload
 ```
 
-该协议保留 frame 语义并拒绝未知 opcode、非法控制帧、错误 close code、截断和尾随字节。
+该协议保留逻辑 frame 语义并拒绝未知 opcode、非法控制帧、错误 close code、截断和尾随字节。单个 SWS2 envelope
+不得超过 NAT DATA 上限；最多 16 MiB 的原始 data frame 可按 Java 规则拆成连续的 continuation envelopes，
+控制帧 payload 仍限制为 125 字节且不得拆分。
 
 ### 3.4 Peer Mesh
 
@@ -169,7 +171,7 @@ SWS2 和 STMSG2；管理前端验证 STAP2/STWR2/STCLIP2；Java 独立 STUN 服�
 | 控制协议 | v1/错误 serializer/未知 command/截断/尾随/超限拒绝，control/data 角色与重连 |
 | NAT stream | OPEN/DATA/FIN/RST/WINDOW_UPDATE、慢消费者、窗口溢出和半关闭 |
 | HTTP | 首字节流式返回、SSE、trailers、16 MiB 以上响应和中途取消 |
-| WebSocket | text/binary/continuation/ping/pong/close、非法控制帧和 64 KiB 边界 |
+| WebSocket | text/binary/continuation/ping/pong/close、非法控制帧、单 envelope 64 KiB 边界和 16 MiB data frame 规范化拆分 |
 | Peer | 双向首包、4096 窗口乱序/重放、sequence 上限、direct/relay 与 PLPMTUD |
 | 浏览器 | interactive 不被 bulk 阻塞、chunk/hash/ACK、断线重组清理和二进制 WS fallback |
 | 安全 | 生产明文门禁、nonce 重放、ticket 重用、TURN 越权与 STFWD2 key 轮换 |

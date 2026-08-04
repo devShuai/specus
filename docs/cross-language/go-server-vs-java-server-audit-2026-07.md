@@ -1,5 +1,7 @@
 # Go Server vs Java Server 实现比对审计（2026-07-22）
 
+> 历史快照：本文只记录 2026-07-22 当时的审计批次、测试数量和取舍，不再作为当前能力或剩余差异清单。2026-08 之后的 OIDC 本地身份绑定、Direct HTTP WebSocket、TLS/数据库兼容与最终验证结果，以 [`cross-language-java-alignment-plan.md`](cross-language-java-alignment-plan.md) 的“当前验证”和“当前仍存在的不一致”为准。
+
 最后复核：2026-07-22（含本轮 Go/Java 对齐改动，全部计划批次已实施）
 
 本文记录 Go server（`implementations/go/server`）与 Java server（`implementations/java/server`）在全部 6 个阶段、
@@ -72,7 +74,7 @@ Go server 替代 Java server。
   SERVER_BUSY 队满、pre-auth 16KiB 帧限、未认证即断、连接审计落库、断开原因 first-wins。
 - **写背压**：高低水位默认 32KB/64KB、`SPECUS_NETTY_WRITE_BUFFER_*`、控制/外部读写联动暂停恢复、
   WINDOW_UPDATE 优先写旁路。
-- **NAT TCP 转发**：per-port listener、REGISTER/UNREGISTER/DATA/DISCONNECTED、FIN/RST 处理、
+- **NAT TCP 转发**：per-port listener、REGISTER/REGISTER_RESULT/OPEN/DATA/FIN/RST/WINDOW_UPDATE/UNREGISTER、
   WINDOW_UPDATE 信用门控、NAT_CONTROL 登录后推送 + CRUD 变更推送、流量 5s 刷盘 + 失败回补。
 - **Direct HTTP**：`/http/{client}/{route}/{**rest}` 原始路径编码保留（`%2F` 不折叠、UTF-8 保留）、
   hop-by-hop 头过滤、timeout 30s、请求体 16MB、响应体 64MB。

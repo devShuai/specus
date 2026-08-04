@@ -90,7 +90,8 @@ v2 只登记 `LOGIN_* (±1)`、`MESSAGE_* (±2)`、`LOGOUT_* (±3)`、`HEARTBEAT
 2. control/data 分别发送 `clientName`、`clientSessionId`、`accessToken` 和 `connectionRole`。服务端验证过期、
    账号/凭证状态、频率、实例上限与角色绑定，再推送 `NAT_CONTROL` / `PEER_CONTROL`。
 
-secret 明文不发送到服务端。当前没有共享 nonce 去重存储，同一 HTTP 登录请求在 60 秒窗口内仍可能重放。
+secret 明文不发送到服务端。服务端按 `(apiKey, nonce)` 数据库唯一键原子消费登录 nonce，并按 TTL 清理历史项；
+因此同一签名请求即使仍在 60 秒时间窗内也不能被第二次接受，多实例部署共享同一去重状态。
 
 ## 5. 连接处理
 
@@ -113,9 +114,11 @@ server 下发快照后，client 对每个映射发送 `REGISTER(port, specusAddr
 双方 FIN → 正常释放；取消或 I/O 错误 → RST 立即释放
 ```
 
-收到 FIN 后仍继续反向传输；重复 FIN、同方向 DATA-after-FIN 和未知 stream 帧是协议违规。每流初始窗口 `1 MiB`、
-累计上限 `16 MiB`、待发送队列上限 `4 MiB`，按流公平轮转并结合 socket 可写性实施背压。`listenPort` 是整台
-server 的全局资源，不能跨租户复用。
+收到 FIN 后仍继续反向传输。重复 OPEN、重复 FIN、同方向 DATA-after-FIN、未知 DATA/FIN 或其它无效的单流状态转换
+只向受影响 stream 返回 RST，不关闭同一 data 连接上的其它 stream；迟到 RST 命中最近关闭 tombstone 时幂等忽略，
+只有针对从未打开 stream 的 RST 才视为 data-connection 协议违规并关闭连接。每流初始窗口 `1 MiB`、累计上限
+`16 MiB`、待发送队列上限 `4 MiB`，按流公平轮转并结合 socket 可写性实施背压。`listenPort` 是整台 server 的
+全局资源，不能跨租户复用。
 
 ### 6.2 HTTP 与 WebSocket 直转
 
@@ -128,9 +131,11 @@ RST 传播。request/response trailers 在 OPEN 的 `trailerNames` 声明，在 
 其它 Range 由 upstream 决定。route 不存在由 client 拒绝；路径必须留在 base URL 内。路径改写只作用于可安全缓冲的
 HTML/CSS 等响应。
 
-WebSocket Upgrade 复用相同入口和 Basic gate，成功后使用 `OPEN(source=ws)` 建立 NAT stream；每个 WebSocket frame
-封装为 SWS2 后放入 DATA，FIN/RST 管理 stream 生命周期。SWS2 保留 opcode、FIN/RSV、close code 与 payload，禁止
-旧的一字节 text/binary 前缀。
+WebSocket Upgrade 复用相同入口和 Basic gate，成功后使用 `OPEN(source=ws)` 建立 NAT stream；WebSocket frame
+封装为 SWS2 后放入 DATA，FIN/RST 管理 stream 生命周期。单个 SWS2 envelope 必须落在 NAT DATA 上限内；最多
+16 MiB 的原始 data frame 若超过该上限，会保留首段 opcode/RSV 与末段 FIN，并规范化拆成 continuation envelopes。
+控制帧必须保持单帧且 payload 不超过 125 字节。SWS2 保留逻辑 frame 语义、close code 与 payload，禁止旧的一字节
+text/binary 前缀。
 
 ### 6.3 Peer Mesh
 
@@ -183,7 +188,9 @@ HTTP 登录响应通过 `nettyTls` 明确声明 control/data 原始 TCP 端点�
 - 客户端 HTTP 登录使用 `ClientCredential` 的 apiKey/secret HMAC；Netty 控制连接只使用 `ClientSession` runtime token。
 - client token 默认 TTL 为 `28800s`。Java client 会在到期前主动重新执行 HTTP 登录；收到“访问令牌已过期”也会刷新后重连。
 - 控制连接频率限制按 `ClientAccount` 统计最近一分钟连接记录，默认 `30/min`，`0` 表示不限。
-- 管理本地登录由 `/auth/login` 签发 HS256 JWT；OIDC token 通过 JWKS 验签。`SecurityConfig` 根据 JWT 算法路由 decoder。
+- 管理本地登录由 `/auth/login` 签发 HS256 JWT；每次请求和刷新都重新解析当前本地账号状态。OIDC 授权码流程用
+  独立 ID-token decoder 校验 issuer、`client_id` audience、`azp` 与 nonce 后签发本地 token；直接 OIDC bearer 还要求
+  资源 audience，并必须按已验证的 `issuer + subject` 命中已绑定且启用的本地账号。外部 tenant/role 不直接授予权限。
 
 ### 7.3 HTTP 安全边界
 
@@ -323,8 +330,8 @@ Admin REST mutation
 
 ## 13. 已知限制与后续工作
 
-- **真实 TLS 部署矩阵待验收**：Java、Go、.NET、Android 客户端 TLS 已配置化；Java、Go、.NET 已有本地证书握手测试，Android 当前覆盖配置、超时、取消与 socket protect，仍需补真实证书握手并覆盖生产 CA、L4 终止和多平台证书存储。
-- **HTTP 登录 nonce 未去重**：签名有 60 秒时间窗，但窗口内可重放；单节点可加有界 nonce cache，多节点需共享存储。
+- **真实 TLS 部署矩阵待验收**：Java、Go、.NET、Android 客户端 TLS 已配置化并具备本地测试证书握手覆盖；仍需在目标环境验证生产 CA、L4 TLS 终止和各平台证书存储。
+- **HTTP 登录 nonce 去重已落地**：签名保留 60 秒时间窗，同时用数据库唯一键原子消费 `(apiKey, nonce)` 并按 TTL 清理；多实例共享同一数据库去重状态，仍需在目标数据库上做并发与故障恢复压测。
 - **公网 UDP 映射缺失**：如要实现，需要新增协议子类型、server `DatagramChannel` 和按来源端点维护的映射；这与已实现 Peer Mesh UDP 不同。
 - **E2E 覆盖有限**：已有 `EndToEndSpecusIT` 覆盖 SQLite 进程内 HTTP HMAC、Netty token、真实 TCP 隧道和 route 热更新，但 `*IT` 尚未接入 Maven Failsafe；仍缺真实 MySQL/PostgreSQL、跨进程和 TLS 矩阵。
 - **水平扩展**：`SessionUtil`、`NatServerHandler` 和动态监听仍是进程内状态；需要控制/连接端拆分、粘性路由、共享状态和 drain。详见 `server-control-edge-ha-plan.md`。

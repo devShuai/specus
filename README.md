@@ -161,7 +161,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 ### 多租户
 
-Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `SPECUS_AUTH_TENANT_ID=default`。OIDC 登录可通过 `SPECUS_OIDC_TENANT_CLAIM` 指定租户 claim，默认读取 `tenant_id`；缺失时回退到默认租户。Go server 与 .NET server 已同步管理用户表、`/api/admin/me`、`/api/admin/users`、本地 JWT 的 `tenant_id` / `role` claims，以及客户端、凭证、映射、连接、流量列表的 owner 可见性过滤。
+Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `SPECUS_AUTH_TENANT_ID=default`。OIDC 授权码登录按不可变的 `issuer + subject` 绑定本地管理用户，新建用户落在本地默认租户；直接 OIDC Bearer 也必须命中已绑定且启用的本地用户。每次请求和刷新都重新读取当前本地账号的租户、角色与启用状态，不把外部 token 或旧本地 token 中的 tenant/role 当作最终权限。Go server 与 .NET server 已同步管理用户表、`/api/admin/me`、`/api/admin/users`、本地 JWT 的 `tenant_id` / `role` claims，以及客户端、凭证、映射、连接、流量列表的 owner 可见性过滤。
 
 旧库升级时，启动初始化会把历史数据的空 `tenant_id` 回填为默认租户。需要注意的是，公网 TCP `listen_port` 仍是整台 server 的全局资源，不能被不同租户重复绑定。
 
@@ -206,7 +206,7 @@ Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不�
 
 Go / .NET CLI 客户端使用同一份配置结构。
 
-Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。其 control/data 通道支持登录响应驱动的 TLS，TCP 数据面使用 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE`、严格半关闭、有界建连缓存与最近关闭流 tombstone，HTTP/WebSocket route 使用同一流状态和 SWS2 envelope。配置非 `noop` 虚拟设备时 Android 会先申请 VPN 权限；只有服务端也开启 Peer Mesh 才会创建系统 VPN 接口。`noop` 不申请权限、不阻塞 TCP/HTTP，同时仍可运行 Peer Mesh 控制面和 UDP 探测。Android 还接入 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新、direct-stale fallback 以及基础链路/流量/设备上报；端口预测和完整真机矩阵仍以 Java/Go/.NET 客户端为准。
+Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。其 control/data 通道支持登录响应驱动的 TLS，TCP 数据面使用 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE`、严格半关闭、有界建连缓存与最近关闭流 tombstone；HTTP route 使用支持 request/response trailers、带 body 任意 method 和 early response 的 Netty 流。WebSocket route 按 Java 规则保留 continuation/FIN/RSV/close/ping/pong 语义；单个上游 data frame 可达 16 MiB，超过单个 NAT DATA 容量时规范化拆成连续的 SWS2 continuation envelopes，控制帧不拆分。配置非 `noop` 虚拟设备时 Android 会先申请 VPN 权限；只有服务端也开启 Peer Mesh 才会创建系统 VPN 接口。`noop` 不申请权限、不阻塞 TCP/HTTP，同时仍可运行 Peer Mesh 控制面和 UDP 探测。Peer Mesh 已接入 direct UDP、全 A/AAAA STUN、TURN relay、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP 显式映射、session 刷新、direct-stale fallback 以及链路/流量/设备上报；真实跨 NAT 真机矩阵仍需部署环境验收。
 
 Go 客户端：
 
@@ -351,23 +351,23 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 ### OIDC 登录（授权码 + PKCE）
 
 1. 浏览器从 `GET /oidc-config` 读取登录参数，跳转到网关的授权端点（带 `code_challenge`）。
-2. 授权完成后带 `code` 回到管理页；页面把 `code` 发给同源的 `POST /oidc/token`，由服务端代理换取令牌（避免浏览器直接调用网关令牌端点的 CORS 问题，也让可选的 client-secret 留在服务端）。
-3. 页面用拿到的 access token 作为 `Authorization: Bearer` 调用管理 API；返回 `401` 时回到登录页。
+2. 授权完成后带 `code` 回到管理页；页面把 `code`、PKCE verifier 和 nonce 发给同源的 `POST /oidc/token`。服务端用固定回调地址换取令牌，校验 ID Token 的 RS256/JWKS、issuer、`client_id` audience、`azp`、有效期和 nonce，再按不可变的 `issuer + subject` 绑定本地管理用户。
+3. 服务端为已绑定且启用的本地用户签发短期 Specus access token；页面用它作为 `Authorization: Bearer` 调用管理 API。刷新和每次授权都会采用数据库中的当前 tenant/role/启用状态，不复制外部 token 的权限 claim。
 
-默认配置指向项目网关 `https://gateway.toys.theshuai.com/auth`，发现到的端点已写入默认值。**每个部署必须设置 `SPECUS_OIDC_CLIENT_ID`，并在网关为该客户端注册回调地址 `SPECUS_OIDC_REDIRECT_URI`（默认 `http://127.0.0.1:8088/`）。** 公共 PKCE 客户端无需 secret；若是机密客户端，再设置 `SPECUS_OIDC_CLIENT_SECRET`。
+默认配置指向 Certus `https://certus.devshuai.com`，授权、注册、令牌、JWKS 和登出端点已写入默认值。**每个部署必须设置 `SPECUS_OIDC_CLIENT_ID`，并为该客户端注册回调地址 `SPECUS_OIDC_REDIRECT_URI`（默认 `http://127.0.0.1:8088/`）。** 公共 PKCE 客户端无需 secret；若是机密客户端，再设置 `SPECUS_OIDC_CLIENT_SECRET`。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `SPECUS_OIDC_CLIENT_ID` | （空） | OIDC 客户端 ID，**必填**；未设置时登录页会提示未配置 |
 | `SPECUS_OIDC_REDIRECT_URI` | `http://127.0.0.1:8088/` | 回调地址，需与网关注册的一致，并指向管理页地址 |
 | `SPECUS_OIDC_CLIENT_SECRET` | （空） | 机密客户端的密钥；公共 PKCE 客户端留空 |
-| `SPECUS_OIDC_SCOPE` | `openid` | 授权请求的 scope |
-| `SPECUS_OIDC_AUDIENCE` | （空） | 设置后额外校验 JWT 的 audience |
-| `SPECUS_OIDC_ISSUER` / `SPECUS_OIDC_JWK_SET_URI` | 指向网关 | JWT 验签与 issuer 校验；JWKS 在首次校验令牌时按需拉取，不在启动时联网 |
-| `SPECUS_OIDC_AUTHORIZATION_ENDPOINT` / `SPECUS_OIDC_TOKEN_ENDPOINT` / `SPECUS_OIDC_END_SESSION_ENDPOINT` | 指向网关 | 授权 / 令牌 / 登出端点 |
-| `SPECUS_OIDC_TENANT_CLAIM` | `tenant_id` | 从 OIDC JWT 读取租户的 claim 名称；缺失时回退默认租户 |
+| `SPECUS_OIDC_SCOPE` | `openid profile email` | 授权请求的 scope |
+| `SPECUS_OIDC_AUDIENCE` | （空） | 管理 API 的资源 audience；留空会禁用外部 OIDC token 直传 Bearer，但不影响授权码登录后换取本地 token |
+| `SPECUS_OIDC_ISSUER` / `SPECUS_OIDC_JWK_SET_URI` | 指向 Certus | JWT 验签与 issuer 校验；issuer 缺失时 OIDC token 验证 fail closed；JWKS 在首次校验令牌时按需拉取，不在启动时联网 |
+| `SPECUS_OIDC_AUTHORIZATION_ENDPOINT` / `SPECUS_OIDC_REGISTRATION_ENDPOINT` / `SPECUS_OIDC_TOKEN_ENDPOINT` / `SPECUS_OIDC_END_SESSION_ENDPOINT` | 指向 Certus | 授权 / 注册 / 令牌 / 登出端点 |
+| `SPECUS_OIDC_TENANT_CLAIM` | `tenant_id` | 跨版本兼容的外部资料 claim 名；不会直接授予租户权限，管理权限采用 `issuer + subject` 已绑定本地用户的当前 tenant/role |
 
-> OIDC 令牌会先完成签名、issuer 和可选 audience 校验；Java、Go 和 .NET server 均可通过 `SPECUS_OIDC_TENANT_CLAIM` 解析 OIDC 租户，claim 缺失时回退默认租户。本地密码登录令牌包含明确的 `tenant_id` / `role`。
+> `preferred_username` 只用于首次匹配或创建普通本地用户，不能映射配置中的内置管理员。直接提交外部 OIDC Bearer 时必须配置并匹配 issuer 与资源 audience，且只有已绑定、启用的本地用户可以访问；外部 `role`/tenant claim 不会授予本地权限。Go/.NET 的 JWKS 缓存还对下载体积、键数量、并发刷新、未知 kid 和旧 key 重叠窗口做了有界保护，并保持 Java/Nimbus 的缺失、空值和重复 kid 选键语义。
 
 ## HTTP 直转通道
 
@@ -628,14 +628,14 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - Go/.NET server 已对齐 Java 的持久化互传房间角色、配对码、WebSocket room role/discoverable、附件角色授权、公共流程图版本和登录用户云端流程图；.NET 的 SQLite/MySQL/PostgreSQL migration 同步覆盖这些实体与媒体采集实体
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 提供明确列出的轻量子集
 - .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
-- Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、control/data TLS、严格 TCP 半关闭、HTTP/HTTP route WebSocket 流式直转、SWS2、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 基础数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、STUN/TURN、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 协议/状态机测试已覆盖帧边界、登录、重连、流状态和数据面 codec
+- Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、control/data TLS、严格 TCP 半关闭、全双工 HTTP/trailers、Java 兼容的 WebSocket SWS2 frame 规范化、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、全地址 STUN、TURN、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 测试覆盖帧边界、登录、重连、流状态、真实测试证书 TLS、HTTP early response/trailers、probe 防护和端口映射 wire
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
 - Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 只实现 v2 控制/NAT stream 与管理面的轻量子集，不包含 TLS 控制连接、HTTPS OIDC token exchange、ES 明细、live client-message/公共发现、对象存储或 Peer Mesh 数据面。C 的附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，公共 ICE 仅描述显式配置的外部 STUN/TURN 服务。
-- Android Peer Mesh 已覆盖 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新和基础链路/流量/设备上报；端口预测、本地 ACL 镜像和完整真机端到端矩阵仍待补齐。Android 基于 `HttpURLConnection` 的 Direct HTTP upstream 不支持发送合法 request trailers，因此遇到 `OPEN.trailerNames` 或 FIN trailers 会显式 RST，不能静默丢弃；response trailers 仅在平台 API 实际暴露时转发。该 API 也无法可靠保留带 body 的 `GET/HEAD`，且不能在请求体仍上传时并行暴露 early response；Android 会显式拒绝前者并在请求结束后读取响应。
+- Android Peer Mesh 的源码能力已覆盖 direct UDP、全地址 STUN、TURN relay、session 刷新、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP 显式映射和链路/流量/设备上报；Peer 授权与 Java client 一样由服务端 roster/session grant 执行，不存在需要复制的客户端本地 ACL 镜像。完整真机端到端矩阵仍待环境验收。Direct HTTP 已改用受保护的 Netty transport，不再存在 `HttpURLConnection` 的 request trailer、带 body GET/HEAD 或 early response 能力差异。
 - Java、Go、.NET、Android 客户端已支持登录响应驱动的 control/data TLS 与显式 CA/主机名覆盖；真实生产证书和 L4 TLS 终止仍需在目标部署环境验收。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 
