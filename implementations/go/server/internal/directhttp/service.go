@@ -175,7 +175,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metadata := map[string]any{
 		"source": "http", "phase": "request", "method": r.Method, "route": route,
 		"relativePath": path, "rawQuery": r.URL.RawQuery, "headers": requestHeaders,
-		"contentLength": r.ContentLength, "trailerNames": headerNames(r.Trailer, protected),
+		"trailerNames": headerNames(r.Trailer, protected),
+	}
+	if r.ContentLength >= 0 {
+		metadata["contentLength"] = r.ContentLength
 	}
 	stream, err := s.openStream(clientName, metadata)
 	if err != nil {

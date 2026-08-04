@@ -105,52 +105,35 @@ func buildWebSocketTarget(targetBaseURL, relativePath, rawQuery string) (*url.UR
 	if strings.TrimSpace(targetBaseURL) == "" {
 		return nil, fmt.Errorf("未配置 HTTP route")
 	}
-	wsURL := strings.TrimSpace(targetBaseURL)
-	lower := strings.ToLower(wsURL)
+	baseURL := strings.TrimSpace(targetBaseURL)
+	lower := strings.ToLower(baseURL)
+	var httpBaseURL string
+	var targetScheme string
 	switch {
 	case strings.HasPrefix(lower, "http://"):
-		wsURL = "ws://" + wsURL[len("http://"):]
+		httpBaseURL = "http://" + baseURL[len("http://"):]
+		targetScheme = "ws"
 	case strings.HasPrefix(lower, "https://"):
-		wsURL = "wss://" + wsURL[len("https://"):]
-	case strings.HasPrefix(lower, "ws://") || strings.HasPrefix(lower, "wss://"):
+		httpBaseURL = "https://" + baseURL[len("https://"):]
+		targetScheme = "wss"
+	case strings.HasPrefix(lower, "ws://"):
+		httpBaseURL = "http://" + baseURL[len("ws://"):]
+		targetScheme = "ws"
+	case strings.HasPrefix(lower, "wss://"):
+		httpBaseURL = "https://" + baseURL[len("wss://"):]
+		targetScheme = "wss"
 	default:
 		return nil, fmt.Errorf("HTTP route 仅支持 http/https/ws/wss")
 	}
-
-	base, err := url.Parse(wsURL)
-	if err != nil || base.Hostname() == "" || base.RawQuery != "" || base.Fragment != "" {
-		return nil, fmt.Errorf("HTTP route 地址无效")
-	}
-	tail := relativePath
-	if strings.TrimSpace(tail) == "" {
-		tail = "/"
-	}
-	if strings.ContainsAny(tail, "\r\n") {
+	if strings.ContainsAny(relativePath, "\r\n") {
 		return nil, fmt.Errorf("relativePath 含有非法控制字符")
 	}
-
-	basePath := base.EscapedPath()
-	if basePath == "/" {
-		basePath = ""
+	target, err := buildTarget(httpBaseURL, relativePath, rawQuery)
+	if err != nil {
+		return nil, err
 	}
-	var path string
-	switch {
-	case strings.HasSuffix(basePath, "/") && strings.HasPrefix(tail, "/"):
-		path = basePath + tail[1:]
-	case basePath != "" && !strings.HasSuffix(basePath, "/") && !strings.HasPrefix(tail, "/"):
-		path = basePath + "/" + tail
-	default:
-		path = basePath + tail
-	}
-	if path == "" {
-		path = "/"
-	}
-
-	target := *base
-	target.Path = path
-	target.RawPath = ""
-	target.RawQuery = rawQuery
-	return &target, nil
+	target.Scheme = targetScheme
+	return target, nil
 }
 
 func webSocketHandshakeHeaders(metadata map[string]any) []string {

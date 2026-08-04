@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -14,6 +15,8 @@ const (
 	wsMaximumWindowBytes = 16 * 1024 * 1024
 	// wsMaxMessageBytes 是客户端->浏览器方向重组分片消息的上限，与 Go client 的读取上限一致。
 	wsMaxMessageBytes = 16 * 1024 * 1024
+	// Browser close must not hold the HTTP handler forever while the client withholds credit.
+	wsCloseSendTimeout = 5 * time.Second
 )
 
 var errWSSpecusClosed = errors.New("WS 隧道已关闭")
@@ -143,6 +146,10 @@ func (t *WebSocketSpecus) WriteFrame(ctx context.Context, data []byte) {
 	var writeErr error
 	switch frame.opcode {
 	case sws2OpcodeText, sws2OpcodeBinary:
+		if t.fragmentOpcode >= 0 {
+			t.CloseFromClient()
+			return
+		}
 		if frame.fin {
 			writeErr = t.writeMessage(ctx, frame.opcode, frame.payload)
 		} else {
@@ -199,13 +206,19 @@ func (t *WebSocketSpecus) CloseFromClient() {
 // closeFromBrowser 浏览器侧关闭或写失败：向客户端发 SWS2 CLOSE + FIN 后关闭会话
 // （对齐 Java detachBrowser；close reason 截断到 123 字节）。
 func (t *WebSocketSpecus) closeFromBrowser(code websocket.StatusCode, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), wsCloseSendTimeout)
+	defer cancel()
+	t.closeFromBrowserContext(ctx, code, reason)
+}
+
+func (t *WebSocketSpecus) closeFromBrowserContext(ctx context.Context, code websocket.StatusCode, reason string) {
 	t.notifyOnce.Do(func() {
 		reasonBytes := []byte(reason)
 		if len(reasonBytes) > sws2MaxCloseReasonBytes {
 			reasonBytes = reasonBytes[:sws2MaxCloseReasonBytes]
 		}
 		if frame, err := encodeSWS2(sws2OpcodeClose, true, 0, uint16(code), reasonBytes); err == nil {
-			if t.takeSendCredit(context.Background(), len(frame)) {
+			if t.takeSendCredit(ctx, len(frame)) {
 				_ = t.sendData(frame)
 			}
 		}

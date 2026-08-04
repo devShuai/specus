@@ -167,6 +167,34 @@ func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	}
 }
 
+func TestServeHTTPOmitsUnknownContentLengthFromOpen(t *testing.T) {
+	registry := onlineRegistry("Demo client")
+	stream := newFakeStream()
+	stream.head = map[string]any{"statusCode": 200}
+	stream.responses = []fakeResponse{{end: true}}
+	var opened map[string]any
+	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
+		opened = metadata
+		return stream, nil
+	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	request := specusRequest("PROPFIND", "/http/Demo%20client/api/items", "payload")
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	response := httptest.NewRecorder()
+
+	service.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d, want 200", response.Code)
+	}
+	if opened["method"] != "PROPFIND" {
+		t.Fatalf("method = %v, want PROPFIND", opened["method"])
+	}
+	if _, exists := opened["contentLength"]; exists {
+		t.Fatalf("unknown contentLength must be omitted: %+v", opened)
+	}
+}
+
 func TestServeHTTPPreservesEncodedRelativePath(t *testing.T) {
 	registry := onlineRegistry("Demo client")
 	stream := newFakeStream()

@@ -367,6 +367,35 @@ func TestWSSpecusOrphanContinuationClosesSpecus(t *testing.T) {
 	}
 }
 
+// TestWSSpecusRejectsNewMessageDuringFragmentation prevents a second data opcode from
+// silently replacing an unfinished fragmented message.
+func TestWSSpecusRejectsNewMessageDuringFragmentation(t *testing.T) {
+	h := newWSHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	first, err := encodeSWS2(sws2OpcodeBinary, false, 0, 0, []byte("unfinished"))
+	if err != nil {
+		t.Fatalf("encode first SWS2 failed: %v", err)
+	}
+	replacement, err := encodeSWS2(sws2OpcodeText, true, 0, 0, []byte("replacement"))
+	if err != nil {
+		t.Fatalf("encode replacement SWS2 failed: %v", err)
+	}
+	readResult := h.readAsync(ctx)
+	h.specus.WriteFrame(ctx, first)
+	h.specus.WriteFrame(ctx, replacement)
+
+	if readErr := <-readResult; readErr == nil {
+		t.Fatal("browser read should fail after overlapping fragmented messages")
+	}
+	select {
+	case <-h.closed:
+	case <-ctx.Done():
+		t.Fatal("specus did not deregister after overlapping fragmented messages")
+	}
+}
+
 // TestWSSpecusSendCredit 验证与 HTTPStream 一致的窗口语义：
 // 发送消耗 credit，WINDOW_UPDATE 按 outstanding 返还，非法增量被拒绝。
 func TestWSSpecusSendCredit(t *testing.T) {
@@ -391,5 +420,30 @@ func TestWSSpecusSendCredit(t *testing.T) {
 	}
 	if !h.specus.AddSendCredit(uint32(frameBytes)) {
 		t.Fatal("credit matching outstanding bytes must be accepted")
+	}
+}
+
+func TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit(t *testing.T) {
+	h := newWSHarness(t)
+	if !h.specus.takeSendCredit(context.Background(), wsInitialWindowBytes) {
+		t.Fatal("failed to exhaust initial WebSocket send credit")
+	}
+	h.browser.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	h.specus.closeFromBrowserContext(ctx, websocket.StatusNormalClosure, "done")
+
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("browser close waited too long for withheld credit: %s", elapsed)
+	}
+	if h.finishes.Load() != 1 {
+		t.Fatalf("FIN count = %d, want 1", h.finishes.Load())
+	}
+	select {
+	case <-h.closed:
+	case <-time.After(time.Second):
+		t.Fatal("specus did not close after credit timeout")
 	}
 }

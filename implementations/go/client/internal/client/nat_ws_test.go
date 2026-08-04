@@ -43,6 +43,29 @@ func TestBuildWebSocketTargetPreservesDoubleSlashPathLikeJava(t *testing.T) {
 	}
 }
 
+func TestBuildWebSocketTargetPreservesEncodedPath(t *testing.T) {
+	target, err := buildWebSocketTarget(
+		"http://example.test/base%2Froot", "/%E4%BD%A0%2F%252F", "next=%2Fraw",
+	)
+	if err != nil {
+		t.Fatalf("buildWebSocketTarget() error = %v", err)
+	}
+	if got, want := target.String(), "ws://example.test/base%2Froot/%E4%BD%A0%2F%252F?next=%2Fraw"; got != want {
+		t.Fatalf("target = %q, want %q", got, want)
+	}
+}
+
+func TestBuildWebSocketTargetRejectsDotSegments(t *testing.T) {
+	for _, relativePath := range []string{"/../admin", "/%2e%2e/admin"} {
+		t.Run(relativePath, func(t *testing.T) {
+			_, err := buildWebSocketTarget("http://example.test/base", relativePath, "")
+			if err == nil || err.Error() != "HTTP 转发路径越界" {
+				t.Fatalf("error = %v, want HTTP 转发路径越界", err)
+			}
+		})
+	}
+}
+
 func TestBuildWebSocketTargetErrorsUseJavaMessages(t *testing.T) {
 	cases := []struct {
 		name          string
