@@ -128,6 +128,13 @@ traffic arrives. The management listener only forwards `/http/{clientName}/{rout
 `route` exists in this configured snapshot; unknown routes return `404` instead of being sent to
 the data connection.
 
+SQLite-backed routes can independently enable HTTP Basic ingress authentication through the
+management API fields `authEnabled`, `authUsername`, and write-only `authPassword`. Passwords are
+stored only as SHA-256 digests; management responses expose `authPasswordConfigured` instead of the
+password or digest. Authentication runs before HTTP request bodies and WebSocket upgrades, and a
+successful protected request has its outer `Authorization` header removed before tunnel forwarding
+and traffic-detail capture. Environment-only routes remain public for compatibility.
+
 When `SPECUS_DATABASE_PATH` is set, the server initializes a small SQLite schema and checks that the
 selected `SPECUS_CLIENT_NAME` is enabled in `client_account`; enabled rows in `specus_mapping`
 become the initial `NAT_CONTROL` TCP mappings. `SPECUS_TCP_MAPPINGS` can still be used to append

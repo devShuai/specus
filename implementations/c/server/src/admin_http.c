@@ -111,6 +111,10 @@ static st_admin_ws_ticket *admin_ws_tickets = NULL;
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
 static int admin_can_access_client(const st_admin_context *context, const st_storage_client *client);
+static char *admin_join_headers(char **headers, size_t headers_len);
+static char *admin_header_array_value(char **headers, size_t headers_len, const char *name);
+static int password_hash_hex(const char *password, char out[ST_SHA256_HEX_LEN + 1]);
+static int password_hash_matches(const char *password, const char *expected_hash);
 
 static int write_response(char *out, size_t out_len, int status, const char *reason, const char *body)
 {
@@ -677,12 +681,16 @@ static int load_database_tcp_mappings(const char *client_name,
         return 0;
     }
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
-        || !st_storage_client_enabled(database_path, client_name)) {
+        || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
     st_storage_mapping stored[ST_ADMIN_MAX_TCP_MAPPINGS];
     size_t stored_count = 0;
-    if (st_storage_load_mappings(database_path, client_name, stored, ST_ADMIN_MAX_TCP_MAPPINGS, &stored_count) != 0) {
+    if (st_storage_load_mappings(database_path,
+                                 client_name,
+                                 stored,
+                                 ST_ADMIN_MAX_TCP_MAPPINGS,
+                                 &stored_count) != 0) {
         return -1;
     }
     for (size_t i = 0; i < stored_count; ++i) {
@@ -711,7 +719,6 @@ static int load_current_tcp_mappings(const char *client_name,
 
 static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count)
 {
-    *route_count = 0;
     const char *raw = getenv("SPECUS_HTTP_ROUTES");
     if (raw == NULL || *raw == '\0') {
         return 0;
@@ -759,12 +766,16 @@ static int load_database_http_routes(const char *client_name, st_admin_http_rout
         return 0;
     }
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
-        || !st_storage_client_enabled(database_path, client_name)) {
+        || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
     st_storage_http_route stored[ST_ADMIN_MAX_TCP_MAPPINGS];
     size_t stored_count = 0;
-    if (st_storage_load_http_routes(database_path, client_name, stored, ST_ADMIN_MAX_TCP_MAPPINGS, &stored_count) != 0) {
+    if (st_storage_load_http_routes(database_path,
+                                    client_name,
+                                    stored,
+                                    ST_ADMIN_MAX_TCP_MAPPINGS,
+                                    &stored_count) != 0) {
         return -1;
     }
     for (size_t i = 0; i < stored_count; ++i) {
@@ -1622,6 +1633,9 @@ static int build_database_client_auth_login_response(const char *database_path,
                                                      char *out,
                                                      size_t out_len)
 {
+    if (body == NULL) {
+        return 0;
+    }
     char *api_key = st_json_get_string(body, "apiKey");
     if (api_key == NULL || *api_key == '\0') {
         free(api_key);
@@ -2475,12 +2489,15 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
     char *client_name = st_json_escape(route->client_name);
     char *route_name = st_json_escape(route->route);
     char *target = st_json_escape(route->target_base_url);
+    char *auth_username = st_json_escape(route->auth_username);
     char *created = st_json_escape(route->created_at);
     char *updated = st_json_escape(route->updated_at);
-    if (client_name == NULL || route_name == NULL || target == NULL || created == NULL || updated == NULL) {
+    if (client_name == NULL || route_name == NULL || target == NULL || auth_username == NULL
+        || created == NULL || updated == NULL) {
         free(client_name);
         free(route_name);
         free(target);
+        free(auth_username);
         free(created);
         free(updated);
         return -1;
@@ -2489,6 +2506,7 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
                               "{\"id\":%lld,\"clientId\":%lld,\"clientName\":\"%s\","
                               "\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"enabled\":%s,"
                               "\"detailCaptureEnabled\":%s,\"pathRewriteEnabled\":%s,"
+                              "\"authEnabled\":%s,\"authUsername\":\"%s\",\"authPasswordConfigured\":%s,"
                               "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
                               route->id,
                               route->client_id,
@@ -2498,11 +2516,15 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
                               route->enabled ? "true" : "false",
                               route->detail_capture_enabled ? "true" : "false",
                               route->path_rewrite_enabled ? "true" : "false",
+                              route->auth_enabled ? "true" : "false",
+                              auth_username,
+                              route->auth_password_hash[0] != '\0' ? "true" : "false",
                               created,
                               updated);
     free(client_name);
     free(route_name);
     free(target);
+    free(auth_username);
     free(created);
     free(updated);
     return rc;
@@ -4680,6 +4702,50 @@ static int handle_specus_delete(const st_admin_context *context, long long id, c
     return write_response(out, out_len, 204, "No Content", "");
 }
 
+static int http_route_auth_text_present(const char *value)
+{
+    if (value == NULL) {
+        return 0;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isspace(*cursor)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int normalize_http_route_auth_username(char *username)
+{
+    if (username == NULL) {
+        return 0;
+    }
+    char *trimmed = admin_trim(username);
+    size_t len = strlen(trimmed);
+    if (len > 120U || strchr(trimmed, ':') != NULL
+        || strchr(trimmed, '\r') != NULL || strchr(trimmed, '\n') != NULL) {
+        return -1;
+    }
+    if (trimmed != username) {
+        memmove(username, trimmed, len + 1U);
+    }
+    return 0;
+}
+
+static int http_route_auth_password_hash(const char *password,
+                                         const char *existing_hash,
+                                         char out[ST_SHA256_HEX_LEN + 1])
+{
+    snprintf(out, ST_SHA256_HEX_LEN + 1U, "%s", existing_hash == NULL ? "" : existing_hash);
+    if (!http_route_auth_text_present(password)) {
+        return 0;
+    }
+    if (strlen(password) > 256U) {
+        return -1;
+    }
+    return password_hash_hex(password, out);
+}
+
 static int handle_http_route_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -4707,6 +4773,26 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
     int path_rewrite_enabled = 0;
     (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    int auth_enabled = 0;
+    (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
+    char *auth_username = st_json_get_string(body, "authUsername");
+    char *auth_password = st_json_get_string(body, "authPassword");
+    char auth_password_hash[ST_SHA256_HEX_LEN + 1] = {0};
+    if (normalize_http_route_auth_username(auth_username) != 0
+        || http_route_auth_password_hash(auth_password, NULL, auth_password_hash) != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid HTTP route authentication credentials\"}");
+    }
+    if (auth_enabled && (auth_username == NULL || *auth_username == '\0' || auth_password_hash[0] == '\0')) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and authPassword are required when authentication is enabled\"}");
+    }
     st_storage_http_route route;
     int rc = st_storage_create_http_route_for_client(database_path,
                                                      client_id,
@@ -4715,9 +4801,14 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                      enabled,
                                                      detail_capture_enabled,
                                                      path_rewrite_enabled,
+                                                     auth_enabled,
+                                                     auth_username,
+                                                     auth_password_hash,
                                                      &route);
     free(route_name);
     free(target_base_url);
+    free(auth_username);
+    free(auth_password);
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
@@ -4752,6 +4843,27 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
     int path_rewrite_enabled = existing.path_rewrite_enabled;
     (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    int auth_enabled = existing.auth_enabled;
+    (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
+    char *auth_username = st_json_get_string(body, "authUsername");
+    const char *next_auth_username = auth_username == NULL ? existing.auth_username : auth_username;
+    char *auth_password = st_json_get_string(body, "authPassword");
+    char auth_password_hash[ST_SHA256_HEX_LEN + 1];
+    if (normalize_http_route_auth_username(auth_username) != 0
+        || http_route_auth_password_hash(auth_password, existing.auth_password_hash, auth_password_hash) != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid HTTP route authentication credentials\"}");
+    }
+    if (auth_enabled && (*next_auth_username == '\0' || auth_password_hash[0] == '\0')) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and a configured authPassword are required when authentication is enabled\"}");
+    }
     st_storage_http_route route;
     int rc = st_storage_update_http_route_by_id(database_path,
                                                 id,
@@ -4760,9 +4872,14 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                 enabled,
                                                 detail_capture_enabled,
                                                 path_rewrite_enabled,
+                                                auth_enabled,
+                                                next_auth_username,
+                                                auth_password_hash,
                                                 &route);
     free(route_name);
     free(target_base_url);
+    free(auth_username);
+    free(auth_password);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
@@ -6369,7 +6486,10 @@ static void admin_generate_request_id(char out[37])
              ((unsigned long)tv.tv_usec << 20U) ^ local_counter);
 }
 
-static int admin_collect_headers(const char *request, char ***headers, size_t *headers_len)
+static int admin_collect_headers(const char *request,
+                                 int strip_authorization,
+                                 char ***headers,
+                                 size_t *headers_len)
 {
     *headers = NULL;
     *headers_len = 0;
@@ -6390,7 +6510,8 @@ static int admin_collect_headers(const char *request, char ***headers, size_t *h
         }
         size_t len = (size_t)(next - line);
         if (len > 0 && count < ST_ADMIN_MAX_HTTP_HEADERS
-            && !admin_skip_direct_request_header(line)) {
+            && !admin_skip_direct_request_header(line)
+            && !(strip_authorization && admin_header_name_equals(line, "Authorization"))) {
             items[count] = (char *)malloc(len + 1U);
             if (items[count] == NULL) {
                 for (size_t i = 0; i < count; ++i) {
@@ -7258,6 +7379,224 @@ static int send_text_http_error(int fd, int status, const char *message)
     return header_len > 0 && (size_t)header_len < sizeof(header)
         && send_all(fd, header, (size_t)header_len) == 0
         && send_all(fd, body, (size_t)body_len) == 0;
+}
+
+static int send_http_route_auth_challenge(int fd)
+{
+    static const char body[] = "{\"error\":\"HTTP route authentication required\"}";
+    char header[384];
+    int header_len = snprintf(header,
+                              sizeof(header),
+                              "HTTP/1.1 401 Unauthorized\r\n"
+                              "WWW-Authenticate: Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Cache-Control: no-store\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              sizeof(body) - 1U);
+    return header_len > 0 && (size_t)header_len < sizeof(header)
+        && send_all(fd, header, (size_t)header_len) == 0
+        && send_all(fd, body, sizeof(body) - 1U) == 0
+        ? 0
+        : -1;
+}
+
+static int send_http_route_policy_unavailable(int fd)
+{
+    static const char body[] = "{\"error\":\"HTTP route authentication is temporarily unavailable\"}";
+    char header[384];
+    int header_len = snprintf(header,
+                              sizeof(header),
+                              "HTTP/1.1 503 Service Unavailable\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Cache-Control: no-store\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              sizeof(body) - 1U);
+    return header_len > 0 && (size_t)header_len < sizeof(header)
+        && send_all(fd, header, (size_t)header_len) == 0
+        && send_all(fd, body, sizeof(body) - 1U) == 0
+        ? 0
+        : -1;
+}
+
+static int admin_basic_base64_value(unsigned char value)
+{
+    if (value >= 'A' && value <= 'Z') return value - 'A';
+    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+    if (value >= '0' && value <= '9') return value - '0' + 52;
+    if (value == '+') return 62;
+    if (value == '/') return 63;
+    return -1;
+}
+
+static int admin_decode_basic_credentials(const char *encoded,
+                                          uint8_t *out,
+                                          size_t out_cap,
+                                          size_t *out_len)
+{
+    size_t len = encoded == NULL ? 0U : strlen(encoded);
+    *out_len = 0U;
+    if (len == 0U || len > 1024U || len % 4U != 0U) {
+        return -1;
+    }
+    for (size_t i = 0; i < len; i += 4U) {
+        int a = admin_basic_base64_value((unsigned char)encoded[i]);
+        int b = admin_basic_base64_value((unsigned char)encoded[i + 1U]);
+        int c = encoded[i + 2U] == '=' ? -2 : admin_basic_base64_value((unsigned char)encoded[i + 2U]);
+        int d = encoded[i + 3U] == '=' ? -2 : admin_basic_base64_value((unsigned char)encoded[i + 3U]);
+        if (a < 0 || b < 0 || c == -1 || d == -1
+            || (c == -2 && d != -2) || ((c == -2 || d == -2) && i + 4U != len)) {
+            return -1;
+        }
+        uint32_t value = (uint32_t)a << 18U | (uint32_t)b << 12U;
+        if (c >= 0) value |= (uint32_t)c << 6U;
+        if (d >= 0) value |= (uint32_t)d;
+        size_t bytes = c == -2 ? 1U : d == -2 ? 2U : 3U;
+        if (*out_len + bytes >= out_cap) {
+            return -1;
+        }
+        out[(*out_len)++] = (uint8_t)(value >> 16U);
+        if (bytes > 1U) out[(*out_len)++] = (uint8_t)(value >> 8U);
+        if (bytes > 2U) out[(*out_len)++] = (uint8_t)value;
+    }
+    out[*out_len] = '\0';
+    return 0;
+}
+
+static int admin_parse_direct_route_identity(const char *path, char **client_name, char **route)
+{
+    *client_name = NULL;
+    *route = NULL;
+    if (path == NULL || strncmp(path, "/http/", 6) != 0) {
+        return -1;
+    }
+    const char *query = strchr(path, '?');
+    size_t path_len = query == NULL ? strlen(path) : (size_t)(query - path);
+    const char *cursor = path + 6;
+    const char *client_end = path_len > 6U ? memchr(cursor, '/', path_len - 6U) : NULL;
+    if (client_end == NULL || client_end == cursor) {
+        return -1;
+    }
+    const char *route_start = client_end + 1;
+    const char *route_end = memchr(route_start, '/', path + path_len - route_start);
+    if (route_end == NULL) {
+        route_end = path + path_len;
+    }
+    if (route_end == route_start) {
+        return -1;
+    }
+    *client_name = admin_url_decode(cursor, (size_t)(client_end - cursor));
+    *route = admin_url_decode(route_start, (size_t)(route_end - route_start));
+    if (*client_name == NULL || *route == NULL) {
+        free(*client_name);
+        free(*route);
+        *client_name = NULL;
+        *route = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int admin_constant_time_text_equals(const char *left, const char *right)
+{
+    uint8_t left_hash[ST_SHA256_LEN];
+    uint8_t right_hash[ST_SHA256_LEN];
+    st_sha256((const uint8_t *)(left == NULL ? "" : left),
+              strlen(left == NULL ? "" : left),
+              left_hash);
+    st_sha256((const uint8_t *)(right == NULL ? "" : right),
+              strlen(right == NULL ? "" : right),
+              right_hash);
+    return st_constant_time_eq(left_hash, right_hash, sizeof(left_hash));
+}
+
+/* Returns 1 when Basic credentials were consumed, 0 for a public/env-only route, and -1 after an error response. */
+static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
+{
+    char *client_name = NULL;
+    char *route_name = NULL;
+    if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
+        return 0;
+    }
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        free(client_name);
+        free(route_name);
+        return 0;
+    }
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        free(client_name);
+        free(route_name);
+        send_http_route_policy_unavailable(fd);
+        return -1;
+    }
+    st_storage_http_route route;
+    int found = 0;
+    int lookup_rc = st_storage_find_http_route_by_client_route(database_path,
+                                                               client_name,
+                                                               route_name,
+                                                               &route,
+                                                               &found);
+    free(client_name);
+    free(route_name);
+    if (lookup_rc != 0) {
+        send_http_route_policy_unavailable(fd);
+        return -1;
+    }
+    if (!found) {
+        return 0;
+    }
+    if (!route.enabled) {
+        send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
+        return -1;
+    }
+    if (!route.auth_enabled) {
+        return 0;
+    }
+    if (route.auth_username[0] == '\0' || route.auth_password_hash[0] == '\0') {
+        send_http_route_policy_unavailable(fd);
+        return -1;
+    }
+
+    char *authorization = admin_extract_header_value(raw_request, "Authorization");
+    const char *encoded = authorization;
+    while (encoded != NULL && isspace((unsigned char)*encoded)) ++encoded;
+    int scheme_ok = encoded != NULL
+        && admin_ascii_ncasecmp(encoded, "Basic", 5U) == 0
+        && isspace((unsigned char)encoded[5]);
+    if (scheme_ok) {
+        encoded += 5;
+        while (isspace((unsigned char)*encoded)) ++encoded;
+    }
+    uint8_t decoded[512];
+    size_t decoded_len = 0;
+    int valid = scheme_ok
+        && admin_decode_basic_credentials(encoded, decoded, sizeof(decoded), &decoded_len) == 0
+        && memchr(decoded, '\0', decoded_len) == NULL;
+    uint8_t *colon = valid ? memchr(decoded, ':', decoded_len) : NULL;
+    if (colon == NULL) {
+        valid = 0;
+    } else {
+        *colon = '\0';
+        const char *password = (const char *)(colon + 1);
+        int username_matches = admin_constant_time_text_equals((const char *)decoded,
+                                                               route.auth_username);
+        int password_matches = strlen(password) <= 256U
+            && password_hash_matches(password, route.auth_password_hash);
+        valid = username_matches & password_matches;
+    }
+    memset(decoded, 0, sizeof(decoded));
+    free(authorization);
+    if (!valid) {
+        send_http_route_auth_challenge(fd);
+        return -1;
+    }
+    return 1;
 }
 
 typedef struct {
@@ -8310,10 +8649,11 @@ static void admin_drain_direct_websocket(st_admin_server *server,
 }
 
 static int handle_direct_http_websocket_request(st_admin_server *server,
-                                                int fd,
-                                                const char *method,
-                                                const char *path,
-                                                const char *raw_request)
+                                                 int fd,
+                                                 const char *method,
+                                                 const char *path,
+                                                 const char *raw_request,
+                                                 int strip_authorization)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -8380,7 +8720,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
         free(accept_key);
         free(client_name);
         free(route);
@@ -8484,7 +8824,8 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *path,
                                       const char *raw_request,
                                       const uint8_t *body,
-                                      size_t body_len)
+                                      size_t body_len,
+                                      int strip_authorization)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -8532,7 +8873,7 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
         free(client_name);
         free(route);
         free(relative_path);
@@ -8649,11 +8990,38 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     request[len] = '\0';
+    while (strstr(request, "\r\n\r\n") == NULL) {
+        if ((size_t)len >= sizeof(request) - 1U) {
+            send_text_http_error(fd, 400, "HTTP request headers are too large");
+            close(fd);
+            return;
+        }
+        ssize_t more = recv(fd,
+                            request + len,
+                            sizeof(request) - 1U - (size_t)len,
+                            0);
+        if (more <= 0) {
+            send_text_http_error(fd, 400, "HTTP request headers are incomplete");
+            close(fd);
+            return;
+        }
+        len += more;
+        request[len] = '\0';
+    }
     char method[16] = {0};
     char path[1024] = {0};
     if (sscanf(request, "%15s %1023s", method, path) != 2) {
         strcpy(method, "");
         strcpy(path, "");
+    }
+    int strip_direct_authorization = 0;
+    if (strncmp(path, "/http/", 6) == 0) {
+        int auth_result = authorize_direct_http_route(fd, path, request);
+        if (auth_result < 0) {
+            close(fd);
+            return;
+        }
+        strip_direct_authorization = auth_result > 0;
     }
     const char *body = strstr(request, "\r\n\r\n");
     size_t available_body_len = 0;
@@ -8708,7 +9076,12 @@ static void handle_client(st_admin_server *server, int fd)
         close(fd);
         return;
     }
-    if (handle_direct_http_websocket_request(server, fd, method, path, request)) {
+    if (handle_direct_http_websocket_request(server,
+                                             fd,
+                                             method,
+                                             path,
+                                             request,
+                                             strip_direct_authorization)) {
         free(body_buffer);
         close(fd);
         return;
@@ -8719,7 +9092,8 @@ static void handle_client(st_admin_server *server, int fd)
                                    path,
                                    request,
                                    (const uint8_t *)body,
-                                   available_body_len)) {
+                                   available_body_len,
+                                   strip_direct_authorization)) {
         free(body_buffer);
         close(fd);
         return;

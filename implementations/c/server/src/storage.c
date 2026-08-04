@@ -78,8 +78,11 @@ static int open_db(const char *path, sqlite3 **db)
 {
     int rc = sqlite3_open(path, db);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "failed to open sqlite database %s: %s\n", path, sqlite3_errmsg(*db));
-        sqlite3_close(*db);
+        const char *error = *db == NULL ? "sqlite handle allocation failed" : sqlite3_errmsg(*db);
+        fprintf(stderr, "failed to open sqlite database %s: %s\n", path, error);
+        if (*db != NULL) {
+            sqlite3_close(*db);
+        }
         *db = NULL;
         return -1;
     }
@@ -201,6 +204,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         "enabled INTEGER NOT NULL DEFAULT 1,"
         "detail_capture_enabled INTEGER NOT NULL DEFAULT 0,"
         "path_rewrite_enabled INTEGER NOT NULL DEFAULT 0,"
+        "auth_enabled INTEGER NOT NULL DEFAULT 0,"
+        "auth_username TEXT NOT NULL DEFAULT '',"
+        "auth_password_hash TEXT NOT NULL DEFAULT '',"
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "UNIQUE(client_name, route)"
@@ -395,6 +401,15 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "http_route_mapping", "path_rewrite_enabled", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "http_route_mapping", "auth_enabled", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "http_route_mapping", "auth_username", "TEXT NOT NULL DEFAULT ''");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "http_route_mapping", "auth_password_hash", "TEXT NOT NULL DEFAULT ''");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "specus_client_session", "message_send_capable", "INTEGER NOT NULL DEFAULT 0");
@@ -704,13 +719,16 @@ static int scan_http_route(sqlite3_stmt *stmt, st_storage_http_route *route)
     if (copy_text_column(stmt, 2, route->client_name, sizeof(route->client_name)) != 0
         || copy_text_column(stmt, 3, route->route, sizeof(route->route)) != 0
         || copy_text_column(stmt, 4, route->target_base_url, sizeof(route->target_base_url)) != 0
-        || copy_text_column(stmt, 8, route->created_at, sizeof(route->created_at)) != 0
-        || copy_text_column(stmt, 9, route->updated_at, sizeof(route->updated_at)) != 0) {
+        || copy_text_column(stmt, 9, route->auth_username, sizeof(route->auth_username)) != 0
+        || copy_text_column(stmt, 10, route->auth_password_hash, sizeof(route->auth_password_hash)) != 0
+        || copy_text_column(stmt, 11, route->created_at, sizeof(route->created_at)) != 0
+        || copy_text_column(stmt, 12, route->updated_at, sizeof(route->updated_at)) != 0) {
         return -1;
     }
     route->enabled = sqlite3_column_int(stmt, 5) != 0;
     route->detail_capture_enabled = sqlite3_column_int(stmt, 6) != 0;
     route->path_rewrite_enabled = sqlite3_column_int(stmt, 7) != 0;
+    route->auth_enabled = sqlite3_column_int(stmt, 8) != 0;
     return 0;
 }
 
@@ -2590,7 +2608,8 @@ int st_storage_load_http_routes(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT r.id, c.rowid, r.client_name, r.route, r.target_base_url, "
-        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.created_at, r.updated_at "
+        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.auth_enabled, "
+        "r.auth_username, r.auth_password_hash, r.created_at, r.updated_at "
         "FROM http_route_mapping r JOIN client_account c ON c.client_name = r.client_name "
         "WHERE r.client_name = ? AND r.enabled = 1 ORDER BY r.route",
         -1,
@@ -2627,12 +2646,14 @@ int st_storage_list_http_routes(const char *path,
     }
     const char *sql_all =
         "SELECT r.id, c.rowid, r.client_name, r.route, r.target_base_url, "
-        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.created_at, r.updated_at "
+        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.auth_enabled, "
+        "r.auth_username, r.auth_password_hash, r.created_at, r.updated_at "
         "FROM http_route_mapping r JOIN client_account c ON c.client_name = r.client_name "
         "ORDER BY r.id DESC";
     const char *sql_filtered =
         "SELECT r.id, c.rowid, r.client_name, r.route, r.target_base_url, "
-        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.created_at, r.updated_at "
+        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.auth_enabled, "
+        "r.auth_username, r.auth_password_hash, r.created_at, r.updated_at "
         "FROM http_route_mapping r JOIN client_account c ON c.client_name = r.client_name "
         "WHERE c.rowid = ? ORDER BY r.id DESC";
     sqlite3_stmt *stmt = NULL;
@@ -2666,7 +2687,8 @@ static int load_http_route_by_id(const char *path, long long id, st_storage_http
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT r.id, c.rowid, r.client_name, r.route, r.target_base_url, "
-        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.created_at, r.updated_at "
+        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.auth_enabled, "
+        "r.auth_username, r.auth_password_hash, r.created_at, r.updated_at "
         "FROM http_route_mapping r JOIN client_account c ON c.client_name = r.client_name "
         "WHERE r.id = ?",
         -1,
@@ -2689,11 +2711,16 @@ int st_storage_get_http_route(const char *path, long long id, st_storage_http_ro
     return load_http_route_by_id(path, id, route);
 }
 
-static int load_http_route_by_client_route(const char *path,
-                                           const char *client_name,
-                                           const char *route_name,
-                                           st_storage_http_route *route)
+int st_storage_find_http_route_by_client_route(const char *path,
+                                               const char *client_name,
+                                               const char *route_name,
+                                               st_storage_http_route *route,
+                                               int *found)
 {
+    if (route == NULL || found == NULL) {
+        return -1;
+    }
+    *found = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -2701,7 +2728,8 @@ static int load_http_route_by_client_route(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT r.id, c.rowid, r.client_name, r.route, r.target_base_url, "
-        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.created_at, r.updated_at "
+        "r.enabled, r.detail_capture_enabled, r.path_rewrite_enabled, r.auth_enabled, "
+        "r.auth_username, r.auth_password_hash, r.created_at, r.updated_at "
         "FROM http_route_mapping r JOIN client_account c ON c.client_name = r.client_name "
         "WHERE r.client_name = ? AND r.route = ?",
         -1,
@@ -2714,10 +2742,16 @@ static int load_http_route_by_client_route(const char *path,
     sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, route_name, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_http_route(stmt, route) == 0;
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        result = scan_http_route(stmt, route);
+        *found = result == 0;
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result;
 }
 
 int st_storage_get_http_route_by_client_route(const char *path,
@@ -2725,7 +2759,14 @@ int st_storage_get_http_route_by_client_route(const char *path,
                                               const char *route_name,
                                               st_storage_http_route *route)
 {
-    return load_http_route_by_client_route(path, client_name, route_name, route);
+    int found = 0;
+    return st_storage_find_http_route_by_client_route(path,
+                                                      client_name,
+                                                      route_name,
+                                                      route,
+                                                      &found) == 0 && found
+        ? 0
+        : -1;
 }
 
 int st_storage_create_http_route_for_client(const char *path,
@@ -2735,6 +2776,9 @@ int st_storage_create_http_route_for_client(const char *path,
                                             int enabled,
                                             int detail_capture_enabled,
                                             int path_rewrite_enabled,
+                                            int auth_enabled,
+                                            const char *auth_username,
+                                            const char *auth_password_hash,
                                             st_storage_http_route *out_route)
 {
     st_storage_client client;
@@ -2747,13 +2791,17 @@ int st_storage_create_http_route_for_client(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO http_route_mapping(client_name, route, target_base_url, enabled, detail_capture_enabled, path_rewrite_enabled) "
-        "VALUES(?,?,?,?,?,?) "
+        "INSERT INTO http_route_mapping(client_name, route, target_base_url, enabled, detail_capture_enabled, "
+        "path_rewrite_enabled, auth_enabled, auth_username, auth_password_hash) "
+        "VALUES(?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(client_name, route) DO UPDATE SET "
         "target_base_url = excluded.target_base_url,"
         "enabled = excluded.enabled,"
         "detail_capture_enabled = excluded.detail_capture_enabled,"
         "path_rewrite_enabled = excluded.path_rewrite_enabled,"
+        "auth_enabled = excluded.auth_enabled,"
+        "auth_username = excluded.auth_username,"
+        "auth_password_hash = excluded.auth_password_hash,"
         "updated_at = CURRENT_TIMESTAMP",
         -1,
         &stmt,
@@ -2765,6 +2813,9 @@ int st_storage_create_http_route_for_client(const char *path,
         sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
         sqlite3_bind_int(stmt, 5, detail_capture_enabled ? 1 : 0);
         sqlite3_bind_int(stmt, 6, path_rewrite_enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 7, auth_enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 8, auth_username == NULL ? "" : auth_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 9, auth_password_hash == NULL ? "" : auth_password_hash, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -2774,7 +2825,9 @@ int st_storage_create_http_route_for_client(const char *path,
     if (rc != 0) {
         return -1;
     }
-    return out_route == NULL ? 0 : load_http_route_by_client_route(path, client.client_name, route, out_route);
+    return out_route == NULL
+        ? 0
+        : st_storage_get_http_route_by_client_route(path, client.client_name, route, out_route);
 }
 
 int st_storage_update_http_route_by_id(const char *path,
@@ -2784,6 +2837,9 @@ int st_storage_update_http_route_by_id(const char *path,
                                        int enabled,
                                        int detail_capture_enabled,
                                        int path_rewrite_enabled,
+                                       int auth_enabled,
+                                       const char *auth_username,
+                                       const char *auth_password_hash,
                                        st_storage_http_route *out_route)
 {
     sqlite3 *db = NULL;
@@ -2793,7 +2849,8 @@ int st_storage_update_http_route_by_id(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE http_route_mapping SET route = ?, target_base_url = ?, enabled = ?, "
-        "detail_capture_enabled = ?, path_rewrite_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "detail_capture_enabled = ?, path_rewrite_enabled = ?, auth_enabled = ?, auth_username = ?, "
+        "auth_password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         -1,
         &stmt,
         NULL);
@@ -2803,7 +2860,10 @@ int st_storage_update_http_route_by_id(const char *path,
         sqlite3_bind_int(stmt, 3, enabled ? 1 : 0);
         sqlite3_bind_int(stmt, 4, detail_capture_enabled ? 1 : 0);
         sqlite3_bind_int(stmt, 5, path_rewrite_enabled ? 1 : 0);
-        sqlite3_bind_int64(stmt, 6, id);
+        sqlite3_bind_int(stmt, 6, auth_enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 7, auth_username == NULL ? "" : auth_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 8, auth_password_hash == NULL ? "" : auth_password_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 9, id);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;

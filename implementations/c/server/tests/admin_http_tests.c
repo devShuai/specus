@@ -113,6 +113,432 @@ static int test_exec_sql(const char *path, const char *sql)
 }
 
 typedef struct {
+    pthread_mutex_t lock;
+    int http_calls;
+    int ws_calls;
+    int authorization_headers;
+} route_auth_test_context;
+
+static void route_auth_test_context_reset(route_auth_test_context *context)
+{
+    pthread_mutex_lock(&context->lock);
+    context->http_calls = 0;
+    context->ws_calls = 0;
+    context->authorization_headers = 0;
+    pthread_mutex_unlock(&context->lock);
+}
+
+static int route_auth_test_context_matches(route_auth_test_context *context,
+                                           int http_calls,
+                                           int ws_calls,
+                                           int authorization_headers)
+{
+    pthread_mutex_lock(&context->lock);
+    int matches = context->http_calls == http_calls
+        && context->ws_calls == ws_calls
+        && context->authorization_headers == authorization_headers;
+    pthread_mutex_unlock(&context->lock);
+    return matches;
+}
+
+static int route_auth_test_has_authorization(char *const *headers, size_t headers_len)
+{
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] != NULL && strncmp(headers[i], "Authorization:", 14U) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int route_auth_http_forwarder(void *ctx,
+                                     const char *client_name,
+                                     const st_direct_http_request *request,
+                                     const st_admin_direct_http_sink *sink)
+{
+    (void)client_name;
+    route_auth_test_context *context = (route_auth_test_context *)ctx;
+    pthread_mutex_lock(&context->lock);
+    ++context->http_calls;
+    context->authorization_headers += route_auth_test_has_authorization(request->headers,
+                                                                        request->headers_len);
+    pthread_mutex_unlock(&context->lock);
+    char *headers[] = {"Content-Type: text/plain; charset=UTF-8"};
+    static const uint8_t response_body[] = "forwarded";
+    return sink->on_headers(sink->ctx, 200, headers, 1U, NULL, 0U) == 0
+        && sink->on_data(sink->ctx, response_body, sizeof(response_body) - 1U) == 0
+        && sink->on_end(sink->ctx, NULL, 0U) == 0
+        ? 0
+        : -1;
+}
+
+static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *request)
+{
+    route_auth_test_context *context = (route_auth_test_context *)ctx;
+    pthread_mutex_lock(&context->lock);
+    ++context->ws_calls;
+    context->authorization_headers += route_auth_test_has_authorization(request->headers,
+                                                                        request->headers_len);
+    pthread_mutex_unlock(&context->lock);
+    return -3;
+}
+
+static int route_auth_ws_data(void *ctx,
+                              const char *channel_id,
+                              const uint8_t *payload,
+                              size_t payload_len)
+{
+    (void)ctx;
+    (void)channel_id;
+    (void)payload;
+    (void)payload_len;
+    return 0;
+}
+
+static void route_auth_ws_close(void *ctx, const char *channel_id)
+{
+    (void)ctx;
+    (void)channel_id;
+}
+
+static int route_auth_http_roundtrip(int port,
+                                     const char *request,
+                                     char *response,
+                                     size_t response_len)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    size_t request_len = strlen(request);
+    size_t sent = 0;
+    while (sent < request_len) {
+        ssize_t written = send(fd, request + sent, request_len - sent, 0);
+        if (written <= 0) {
+            close(fd);
+            return -1;
+        }
+        sent += (size_t)written;
+    }
+    (void)shutdown(fd, SHUT_WR);
+    size_t received = 0;
+    while (received + 1U < response_len) {
+        ssize_t got = recv(fd, response + received, response_len - 1U - received, 0);
+        if (got == 0) {
+            break;
+        }
+        if (got < 0) {
+            close(fd);
+            return -1;
+        }
+        received += (size_t)got;
+    }
+    response[received] = '\0';
+    close(fd);
+    return received > 0U ? 0 : -1;
+}
+
+static int route_auth_start_server(st_admin_server *server,
+                                   route_auth_test_context *context,
+                                   int *port)
+{
+    if (st_admin_server_start_with_handlers(server,
+                                            0,
+                                            "",
+                                            route_auth_http_forwarder,
+                                            context,
+                                            route_auth_ws_open,
+                                            route_auth_ws_data,
+                                            route_auth_ws_close,
+                                            context) != 0) {
+        return -1;
+    }
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    memset(&address, 0, sizeof(address));
+    if (getsockname(server->fd, (struct sockaddr *)&address, &address_len) != 0) {
+        shutdown(server->fd, SHUT_RDWR);
+        close(server->fd);
+        server->fd = -1;
+        return -1;
+    }
+    *port = ntohs(address.sin_port);
+    return 0;
+}
+
+static void route_auth_stop_server(st_admin_server *server)
+{
+    if (server->fd >= 0) {
+        (void)shutdown(server->fd, SHUT_RDWR);
+        close(server->fd);
+        server->fd = -1;
+    }
+}
+
+static int route_auth_detail_is_sanitized(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int result = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+                              "SELECT request_headers FROM specus_http_traffic_exchange "
+                              "WHERE route = 'api' ORDER BY id DESC LIMIT 1",
+                              -1,
+                              &stmt,
+                              NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *headers = (const char *)sqlite3_column_text(stmt, 0);
+        result = headers == NULL || strstr(headers, "Authorization:") == NULL ? 0 : -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
+static int test_direct_http_route_authentication(const char *database_path)
+{
+    route_auth_test_context context;
+    memset(&context, 0, sizeof(context));
+    if (pthread_mutex_init(&context.lock, NULL) != 0) {
+        return 1;
+    }
+    static st_admin_server server;
+    int port = 0;
+    if (route_auth_start_server(&server, &context, &port) != 0) {
+        fprintf(stderr, "route auth test server start failed\n");
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    char response[8192];
+    const char *protected_path = "/http/C%20managed%202/api/items";
+    char request[2048];
+    snprintf(request,
+             sizeof(request),
+             "POST %s HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "401 Unauthorized")
+        || !contains(response,
+                     "WWW-Authenticate: Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "protected route missing basic credentials mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjp3cm9uZw==\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "401 Unauthorized")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "protected route invalid basic credentials mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !contains(response, "forwarded")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || route_auth_detail_is_sanitized(database_path) != 0) {
+        fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+             "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "401 Unauthorized")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "protected websocket missing basic credentials mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+             "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "404 Not Found")
+        || !route_auth_test_context_matches(&context, 0, 1, 0)) {
+        fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    st_storage_http_route route;
+    st_storage_http_route changed;
+    if (st_storage_get_http_route_by_client_route(database_path, "C managed 2", "api", &route) != 0
+        || st_storage_update_http_route_by_id(database_path,
+                                              route.id,
+                                              route.route,
+                                              route.target_base_url,
+                                              0,
+                                              route.detail_capture_enabled,
+                                              route.path_rewrite_enabled,
+                                              route.auth_enabled,
+                                              route.auth_username,
+                                              route.auth_password_hash,
+                                              &changed) != 0) {
+        fprintf(stderr, "protected route disable fixture failed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "404 Not Found")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "disabled database route should fail before websocket dispatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    if (st_storage_update_http_route_by_id(database_path,
+                                           route.id,
+                                           route.route,
+                                           route.target_base_url,
+                                           route.enabled,
+                                           route.detail_capture_enabled,
+                                           route.path_rewrite_enabled,
+                                           route.auth_enabled,
+                                           route.auth_username,
+                                           route.auth_password_hash,
+                                           &changed) != 0
+        || st_storage_update_http_route_by_id(database_path,
+                                              route.id,
+                                              route.route,
+                                              route.target_base_url,
+                                              route.enabled,
+                                              route.detail_capture_enabled,
+                                              route.path_rewrite_enabled,
+                                              1,
+                                              route.auth_username,
+                                              "",
+                                              &changed) != 0) {
+        fprintf(stderr, "protected route malformed policy fixture failed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "503 Service Unavailable")
+        || !contains(response, "Cache-Control: no-store")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "malformed protected route policy should fail closed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    if (st_storage_update_http_route_by_id(database_path,
+                                           route.id,
+                                           route.route,
+                                           route.target_base_url,
+                                           route.enabled,
+                                           route.detail_capture_enabled,
+                                           route.path_rewrite_enabled,
+                                           route.auth_enabled,
+                                           route.auth_username,
+                                           route.auth_password_hash,
+                                           &changed) != 0) {
+        fprintf(stderr, "protected route policy restore failed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    setenv("SPECUS_DATABASE_PATH", "/tmp", 1);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "503 Service Unavailable")
+        || !contains(response, "Cache-Control: no-store")
+        || !route_auth_test_context_matches(&context, 0, 0, 0)) {
+        fprintf(stderr, "route auth database failure should fail closed\n");
+        setenv("SPECUS_DATABASE_PATH", database_path, 1);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    setenv("SPECUS_DATABASE_PATH", database_path, 1);
+    setenv("SPECUS_HTTP_ROUTES", "api=http://127.0.0.1:8080", 1);
+    snprintf(request,
+             sizeof(request),
+             "GET /http/Env/api/items HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n");
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
+        fprintf(stderr, "database-unmanaged environment route compatibility mismatch\n");
+        unsetenv("SPECUS_HTTP_ROUTES");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    unsetenv("SPECUS_DATABASE_PATH");
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
+        fprintf(stderr, "database-free environment route compatibility mismatch\n");
+        setenv("SPECUS_DATABASE_PATH", database_path, 1);
+        unsetenv("SPECUS_HTTP_ROUTES");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    setenv("SPECUS_DATABASE_PATH", database_path, 1);
+    unsetenv("SPECUS_HTTP_ROUTES");
+    route_auth_stop_server(&server);
+    pthread_mutex_destroy(&context.lock);
+    return 0;
+}
+
+typedef struct {
     int fd;
     int port;
     char request[4096];
@@ -1158,6 +1584,17 @@ int main(void)
         fprintf(stderr, "client update response mismatch\n");
         return 1;
     }
+    len = st_admin_build_response_with_body("PUT",
+                                            request_path,
+                                            "{\"enabled\":true}",
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"clientName\":\"C managed 2\"")
+        || !contains(response, "\"enabled\":true")) {
+        fprintf(stderr, "client re-enable response mismatch\n");
+        return 1;
+    }
     snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d/specus-mappings", created_client_id);
     len = st_admin_build_response_with_body("POST",
                                             request_path,
@@ -1208,9 +1645,53 @@ int main(void)
     snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d/http-routes", created_client_id);
     len = st_admin_build_response_with_body("POST",
                                             request_path,
+                                            "{\"route\":\"missing-auth\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                            "\"authEnabled\":true,\"authUsername\":\"visitor\"}",
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "http route missing authentication password was not rejected\n");
+        return 1;
+    }
+    memset(body, 'u', 121U);
+    body[121] = '\0';
+    char invalid_route_auth[1024];
+    snprintf(invalid_route_auth,
+             sizeof(invalid_route_auth),
+             "{\"route\":\"long-user\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+             "\"authEnabled\":true,\"authUsername\":\"%.121s\",\"authPassword\":\"secret\"}",
+             body);
+    len = st_admin_build_response_with_body("POST",
+                                            request_path,
+                                            invalid_route_auth,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "http route authentication username length was not enforced\n");
+        return 1;
+    }
+    memset(body, 'p', 257U);
+    body[257] = '\0';
+    snprintf(invalid_route_auth,
+             sizeof(invalid_route_auth),
+             "{\"route\":\"long-password\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+             "\"authEnabled\":true,\"authUsername\":\"visitor\",\"authPassword\":\"%.257s\"}",
+             body);
+    len = st_admin_build_response_with_body("POST",
+                                            request_path,
+                                            invalid_route_auth,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "http route authentication password length was not enforced\n");
+        return 1;
+    }
+    len = st_admin_build_response_with_body("POST",
+                                            request_path,
                                             "{\"route\":\"api\",\"targetBaseUrl\":\"https://example.com/base\","
                                             "\"enabled\":true,\"detailCaptureEnabled\":true,"
-                                            "\"pathRewriteEnabled\":true}",
+                                            "\"pathRewriteEnabled\":true,\"authEnabled\":true,"
+                                            "\"authUsername\":\"visitor\",\"authPassword\":\"secret\"}",
                                             response,
                                             sizeof(response));
     int created_route_id = 0;
@@ -1219,6 +1700,12 @@ int main(void)
         || !contains(response, "\"targetBaseUrl\":\"https://example.com/base\"")
         || !contains(response, "\"detailCaptureEnabled\":true")
         || !contains(response, "\"pathRewriteEnabled\":true")
+        || !contains(response, "\"authEnabled\":true")
+        || !contains(response, "\"authUsername\":\"visitor\"")
+        || !contains(response, "\"authPasswordConfigured\":true")
+        || contains(response, "\"authPasswordHash\"")
+        || contains(response, "\"authPassword\":")
+        || contains(response, "secret")
         || st_json_get_int(response, "id", &created_route_id) != 0
         || created_route_id <= 0) {
         fprintf(stderr, "http route create response mismatch\n");
@@ -1228,8 +1715,35 @@ int main(void)
     len = st_admin_build_response("GET", request_path, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"route\":\"api\"")
-        || !contains(response, "\"targetBaseUrl\":\"https://example.com/base\"")) {
+        || !contains(response, "\"targetBaseUrl\":\"https://example.com/base\"")
+        || !contains(response, "\"authEnabled\":true")
+        || !contains(response, "\"authUsername\":\"visitor\"")
+        || !contains(response, "\"authPasswordConfigured\":true")
+        || contains(response, "\"authPasswordHash\"")
+        || contains(response, "\"authPassword\":")
+        || contains(response, "secret")) {
         fprintf(stderr, "http route filtered list response mismatch\n");
+        return 1;
+    }
+    uint8_t expected_route_password_digest[ST_SHA256_LEN];
+    char expected_route_password_hash[ST_SHA256_HEX_LEN + 1];
+    st_sha256((const uint8_t *)"secret", strlen("secret"), expected_route_password_digest);
+    st_hex_encode(expected_route_password_digest,
+                  sizeof(expected_route_password_digest),
+                  expected_route_password_hash);
+    st_storage_http_route stored_auth_route;
+    if (st_storage_get_http_route_by_client_route(db_path,
+                                                  "C managed 2",
+                                                  "api",
+                                                  &stored_auth_route) != 0
+        || stored_auth_route.auth_enabled != 1
+        || strcmp(stored_auth_route.auth_username, "visitor") != 0
+        || strcmp(stored_auth_route.auth_password_hash, expected_route_password_hash) != 0
+        || strcmp(stored_auth_route.auth_password_hash, "secret") == 0) {
+        fprintf(stderr, "http route authentication storage mismatch\n");
+        return 1;
+    }
+    if (test_direct_http_route_authentication(db_path) != 0) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -1275,21 +1789,42 @@ int main(void)
                                             request_path,
                                             "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8088\","
                                             "\"enabled\":false,\"detailCaptureEnabled\":false,"
-                                            "\"pathRewriteEnabled\":false}",
+                                            "\"pathRewriteEnabled\":false,\"authEnabled\":false,"
+                                            "\"authUsername\":\"visitor\",\"authPassword\":\"   \"}",
                                             response,
                                             sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"route\":\"web\"")
         || !contains(response, "\"targetBaseUrl\":\"http://127.0.0.1:8088\"")
         || !contains(response, "\"enabled\":false")
-        || !contains(response, "\"pathRewriteEnabled\":false")) {
+        || !contains(response, "\"pathRewriteEnabled\":false")
+        || !contains(response, "\"authEnabled\":false")
+        || !contains(response, "\"authUsername\":\"visitor\"")
+        || !contains(response, "\"authPasswordConfigured\":true")
+        || contains(response, "\"authPasswordHash\"")
+        || contains(response, "\"authPassword\":")) {
         fprintf(stderr, "http route update response mismatch\n");
+        return 1;
+    }
+    if (st_storage_get_http_route_by_client_route(db_path,
+                                                  "C managed 2",
+                                                  "web",
+                                                  &stored_auth_route) != 0
+        || strcmp(stored_auth_route.auth_password_hash, expected_route_password_hash) != 0) {
+        fprintf(stderr, "blank http route auth password should retain the configured digest\n");
         return 1;
     }
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
     if (len <= 0 || !contains(response, "204 No Content")) {
         fprintf(stderr, "http route delete response mismatch\n");
         return 1;
+    }
+    if (getenv("SPECUS_C_ADMIN_HTTP_AUTH_TEST_ONLY") != NULL) {
+        unsetenv("SPECUS_DATABASE_PATH");
+        unsetenv("SPECUS_AUTH_TENANT_ID");
+        unsetenv("SPECUS_AUTH_USERNAME");
+        unlink(db_path);
+        return 0;
     }
     if (st_storage_record_connection_detail_with_tenant_and_id(db_path,
                                                                "tenant-admin",

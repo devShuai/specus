@@ -122,6 +122,9 @@ typedef struct {
     int enabled;
     int detail_capture_enabled;
     int path_rewrite_enabled;
+    int auth_enabled;
+    char auth_username[121];
+    char auth_password_hash[65];
     char created_at[64];
     char updated_at[64];
 } st_storage_http_route;
@@ -517,6 +520,11 @@ int st_storage_get_http_route_by_client_route(const char *path,
                                               const char *client_name,
                                               const char *route_name,
                                               st_storage_http_route *route);
+int st_storage_find_http_route_by_client_route(const char *path,
+                                               const char *client_name,
+                                               const char *route_name,
+                                               st_storage_http_route *route,
+                                               int *found);
 int st_storage_create_http_route_for_client(const char *path,
                                             long long client_id,
                                             const char *route,
@@ -524,6 +532,9 @@ int st_storage_create_http_route_for_client(const char *path,
                                             int enabled,
                                             int detail_capture_enabled,
                                             int path_rewrite_enabled,
+                                            int auth_enabled,
+                                            const char *auth_username,
+                                            const char *auth_password_hash,
                                             st_storage_http_route *out_route);
 int st_storage_update_http_route_by_id(const char *path,
                                        long long id,
@@ -532,6 +543,9 @@ int st_storage_update_http_route_by_id(const char *path,
                                        int enabled,
                                        int detail_capture_enabled,
                                        int path_rewrite_enabled,
+                                       int auth_enabled,
+                                       const char *auth_username,
+                                       const char *auth_password_hash,
                                        st_storage_http_route *out_route);
 int st_storage_delete_http_route_by_id(const char *path, long long id);
 int st_storage_record_connection(const char *path,

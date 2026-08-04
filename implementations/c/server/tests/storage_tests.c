@@ -54,9 +54,72 @@ static int test_peer_mesh_acl_direction_migration(void)
     return 0;
 }
 
+static int test_http_route_auth_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-http-route-auth-migration-%ld.db", (long)getpid());
+    unlink(path);
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy_schema =
+        "CREATE TABLE http_route_mapping ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "client_name TEXT NOT NULL,"
+        "route TEXT NOT NULL,"
+        "target_base_url TEXT NOT NULL,"
+        "enabled INTEGER NOT NULL DEFAULT 1,"
+        "detail_capture_enabled INTEGER NOT NULL DEFAULT 0,"
+        "path_rewrite_enabled INTEGER NOT NULL DEFAULT 0,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE(client_name, route));"
+        "INSERT INTO http_route_mapping(client_name, route, target_base_url) "
+        "VALUES('legacy-client','legacy','http://127.0.0.1:8080');";
+    if (sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_exec(db, legacy_schema, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "http route auth legacy schema setup failed: %s\n",
+                error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "http route auth migration failed\n");
+        unlink(path);
+        return 1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_prepare_v2(db,
+                              "SELECT auth_enabled, auth_username, auth_password_hash "
+                              "FROM http_route_mapping WHERE route = 'legacy'",
+                              -1,
+                              &stmt,
+                              NULL) != SQLITE_OK
+        || sqlite3_step(stmt) != SQLITE_ROW
+        || sqlite3_column_int(stmt, 0) != 0
+        || strcmp((const char *)sqlite3_column_text(stmt, 1), "") != 0
+        || strcmp((const char *)sqlite3_column_text(stmt, 2), "") != 0) {
+        fprintf(stderr, "http route auth migrated defaults mismatch\n");
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    unlink(path);
+    return 0;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
+    if (test_http_route_auth_migration() != 0) {
         return 1;
     }
     char path[256];
@@ -609,6 +672,10 @@ int main(void)
         return 1;
     }
     st_storage_http_route created_route;
+    const char *route_password_hash =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const char *updated_route_password_hash =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     if (st_storage_create_http_route_for_client(path,
                                                 clients[0].id,
                                                 "api",
@@ -616,13 +683,19 @@ int main(void)
                                                 1,
                                                 1,
                                                 1,
+                                                1,
+                                                "visitor",
+                                                route_password_hash,
                                                 &created_route) != 0
         || created_route.id <= 0
         || created_route.client_id != clients[0].id
         || strcmp(created_route.route, "api") != 0
         || strcmp(created_route.target_base_url, "https://example.com/base") != 0
         || created_route.detail_capture_enabled != 1
-        || created_route.path_rewrite_enabled != 1) {
+        || created_route.path_rewrite_enabled != 1
+        || created_route.auth_enabled != 1
+        || strcmp(created_route.auth_username, "visitor") != 0
+        || strcmp(created_route.auth_password_hash, route_password_hash) != 0) {
         fprintf(stderr, "http route create mismatch\n");
         unlink(path);
         return 1;
@@ -634,12 +707,18 @@ int main(void)
                                            0,
                                            0,
                                            0,
+                                           0,
+                                           "viewer",
+                                           updated_route_password_hash,
                                            &created_route) != 0
         || strcmp(created_route.route, "web") != 0
         || strcmp(created_route.target_base_url, "http://127.0.0.1:8088") != 0
         || created_route.enabled != 0
         || created_route.detail_capture_enabled != 0
-        || created_route.path_rewrite_enabled != 0) {
+        || created_route.path_rewrite_enabled != 0
+        || created_route.auth_enabled != 0
+        || strcmp(created_route.auth_username, "viewer") != 0
+        || strcmp(created_route.auth_password_hash, updated_route_password_hash) != 0) {
         fprintf(stderr, "http route update mismatch\n");
         unlink(path);
         return 1;
@@ -647,14 +726,36 @@ int main(void)
     st_storage_http_route route_by_name;
     if (st_storage_get_http_route_by_client_route(path, "Demo client", "web", &route_by_name) != 0
         || route_by_name.id != created_route.id
-        || strcmp(route_by_name.target_base_url, "http://127.0.0.1:8088") != 0) {
+        || strcmp(route_by_name.target_base_url, "http://127.0.0.1:8088") != 0
+        || strcmp(route_by_name.auth_username, "viewer") != 0
+        || strcmp(route_by_name.auth_password_hash, updated_route_password_hash) != 0) {
         fprintf(stderr, "http route lookup by client/route mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    int route_found = 0;
+    if (st_storage_find_http_route_by_client_route(path,
+                                                   "Demo client",
+                                                   "web",
+                                                   &route_by_name,
+                                                   &route_found) != 0
+        || !route_found
+        || st_storage_find_http_route_by_client_route(path,
+                                                      "Demo client",
+                                                      "missing",
+                                                      &route_by_name,
+                                                      &route_found) != 0
+        || route_found) {
+        fprintf(stderr, "http route presence-aware lookup mismatch\n");
         unlink(path);
         return 1;
     }
     st_storage_http_route routes[4];
     size_t route_count = 0;
-    if (st_storage_list_http_routes(path, clients[0].id, routes, 4, &route_count) != 0 || route_count != 1U) {
+    if (st_storage_list_http_routes(path, clients[0].id, routes, 4, &route_count) != 0
+        || route_count != 1U
+        || strcmp(routes[0].auth_username, "viewer") != 0
+        || strcmp(routes[0].auth_password_hash, updated_route_password_hash) != 0) {
         fprintf(stderr, "http route list mismatch\n");
         unlink(path);
         return 1;
