@@ -4,6 +4,7 @@ import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import com.theshuai.common.handler.StreamFlowController;
+import com.theshuai.specusserver.handler.NatServerHandler;
 import com.theshuai.specusserver.handler.SpecusStreamIds;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
@@ -26,7 +27,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * HTTP 直转通道的 WebSocket 隧道（浏览器侧）。
@@ -52,9 +57,10 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** WS 流在 CONNECTED metaData 里的 source 标记。 */
     static final String SOURCE_WS = "ws";
     private static final int MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+    private static final long DEFAULT_CLOSE_CREDIT_TIMEOUT_MILLIS = 5_000;
 
     private final WebSocketStreamRegistry registry;
-    private final long timeoutMillis;
+    private final long closeCreditTimeoutMillis;
     /** channelId → clientName，用于关闭时定位要发 DISCONNECTED 的控制连接。 */
     private final Map<String, String> channelClientNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> channelStreamIds = new ConcurrentHashMap<>();
@@ -62,9 +68,11 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     private final Map<Integer, ByteArrayOutputStream> fragmentPayloads = new ConcurrentHashMap<>();
 
     public WebSocketSpecusHandler(WebSocketStreamRegistry registry,
-                                  @Value("${specus.http.timeout-ms:30000}") long timeoutMillis) {
+                                  @Value("${specus.http.websocket-close-timeout-ms:5000}")
+                                  long closeCreditTimeoutMillis) {
         this.registry = registry;
-        this.timeoutMillis = timeoutMillis;
+        this.closeCreditTimeoutMillis = closeCreditTimeoutMillis > 0
+                ? closeCreditTimeoutMillis : DEFAULT_CLOSE_CREDIT_TIMEOUT_MILLIS;
     }
 
     @Override
@@ -84,6 +92,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
 
         registry.register(streamId, channelId, session, clientName);
+        markStreamOpened(controlChannel, streamId);
         StreamFlowController.get(controlChannel).open(streamId, null);
         channelClientNames.put(channelId, clientName);
         channelStreamIds.put(channelId, streamId);
@@ -282,6 +291,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         if (clientName != null) {
             Channel controlChannel = SessionUtil.getDataChannel(clientName);
             if (controlChannel != null) {
+                markStreamClosed(controlChannel, streamId);
                 StreamFlowController.get(controlChannel).remove(streamId);
             }
         }
@@ -304,6 +314,11 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     private void detachBrowser(String channelId, CloseStatus status, boolean closeSession) {
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
+        Channel controlChannel = clientName == null || streamId == null
+                ? null : SessionUtil.getDataChannel(clientName);
+        if (controlChannel != null && controlChannel.isActive()) {
+            markStreamClosed(controlChannel, streamId);
+        }
         WebSocketSession session = registry.remove(channelId);
         if (streamId != null) clearFragmentState(streamId);
         if (closeSession && session != null && session.isOpen()) {
@@ -314,7 +329,6 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             }
         }
         if (clientName == null || streamId == null) return;
-        Channel controlChannel = SessionUtil.getDataChannel(clientName);
         if (controlChannel == null || !controlChannel.isActive()) return;
         byte[] reason = status.getReason() == null
                 ? new byte[0] : status.getReason().getBytes(StandardCharsets.UTF_8);
@@ -324,8 +338,45 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         byte[] close = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0,
                 status.getCode(), reason).encode();
         StreamFlowController flow = StreamFlowController.get(controlChannel);
-        flow.sendAtomic(streamId, close, null, null);
-        flow.finish(streamId);
+        CompletableFuture<Void> sequence = flow.sendAtomicAsync(streamId, close, null, null)
+                .thenCompose(ignored -> flow.finishAsync(streamId, null));
+        var timeout = controlChannel.eventLoop().schedule(
+                () -> sequence.completeExceptionally(
+                        new TimeoutException("websocket close credit timeout")),
+                closeCreditTimeoutMillis, TimeUnit.MILLISECONDS);
+        sequence.whenComplete((ignored, error) -> {
+            timeout.cancel(false);
+            if (error == null) {
+                return;
+            }
+            Throwable cause = unwrap(error);
+            String resetReason = cause instanceof TimeoutException
+                    ? "websocket close credit timeout"
+                    : "websocket close send failed";
+            flow.reset(streamId, 8, resetReason);
+        });
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
+    }
+
+    private static void markStreamOpened(Channel controlChannel, int streamId) {
+        NatServerHandler handler = controlChannel.pipeline().get(NatServerHandler.class);
+        if (handler != null) {
+            handler.markStreamOpened(streamId);
+        }
+    }
+
+    private static void markStreamClosed(Channel controlChannel, int streamId) {
+        NatServerHandler handler = controlChannel.pipeline().get(NatServerHandler.class);
+        if (handler != null) {
+            handler.markStreamClosed(streamId);
+        }
     }
 
     /** 控制连接断开时由 {@code NatServerHandler.channelInactive} 调用：关闭所有挂起的浏览器会话。 */

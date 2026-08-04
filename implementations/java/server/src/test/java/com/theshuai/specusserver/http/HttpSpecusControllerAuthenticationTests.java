@@ -12,6 +12,7 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +45,17 @@ class HttpSpecusControllerAuthenticationTests {
             1_000,
             1_024,
             0);
+
+    @Test
+    void declaredTrailerNamesAreValidatedAndProtectedAuthorizationIsRemoved() {
+        List<String> names = HttpSpecusController.declaredTrailerNames(
+                Collections.enumeration(List.of(
+                        "Digest, Authorization, Content-Length",
+                        "X-Trace, bad name, digest")),
+                true);
+
+        assertThat(names).containsExactly("Digest", "X-Trace");
+    }
 
     @Test
     void missingCredentialsReturnBasicChallengeBeforeOpeningTunnel() throws Exception {
@@ -128,6 +140,30 @@ class HttpSpecusControllerAuthenticationTests {
                 .containsExactly("X-Checksum:kept");
         assertThat(HttpSpecusController.flattenTrailers(trailers, false))
                 .containsExactly("X-Checksum:kept", "aUtHoRiZaTiOn:Basic consumed");
+    }
+
+    @Test
+    void requestTrailersAreLimitedToSafeDeclaredNames() {
+        Map<String, String> trailers = new LinkedHashMap<>();
+        trailers.put("Digest", "sha-256=valid");
+        trailers.put("X-Undeclared", "must-not-cross");
+        trailers.put("Content-Length", "999");
+        trailers.put("X-Injected", "ok\r\nX-Evil: yes");
+
+        assertThat(HttpSpecusController.flattenTrailers(
+                trailers, false, List.of("Digest", "Content-Length", "X-Injected")))
+                .containsExactly("Digest:sha-256=valid");
+    }
+
+    @Test
+    void responseTrailersAreLimitedToSafeDeclaredNames() {
+        assertThat(HttpSpecusController.trailerMap(List.of(
+                        "Digest:sha-256=valid",
+                        "X-Undeclared:must-not-cross",
+                        "Transfer-Encoding:chunked",
+                        "X-Injected:ok\r\nX-Evil: yes"),
+                List.of("Digest", "Transfer-Encoding", "X-Injected")))
+                .containsExactly(Map.entry("Digest", "sha-256=valid"));
     }
 
     @SuppressWarnings("unchecked")

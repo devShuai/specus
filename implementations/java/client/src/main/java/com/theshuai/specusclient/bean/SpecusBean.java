@@ -23,5 +23,6 @@ public class SpecusBean {
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;
     private String remoteAddress;
     private int remotePort;
+    private boolean nettyTls;
     private transient ClientAuthRefresher authRefresher;
 }

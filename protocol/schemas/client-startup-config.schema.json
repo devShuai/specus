@@ -32,6 +32,34 @@
       "minLength": 1,
       "description": "客户端凭证明文，只在创建或重置时展示一次。"
     },
+    "controlTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "control/data 原始 TCP 连接的 TLS 配置。enabled 省略或为 null 时跟随登录响应 nettyTls；任一 TLS 附加选项也会启用 TLS。",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "显式覆盖服务端 nettyTls；false 时不得同时配置其它 TLS 选项。"
+        },
+        "caCertificatePath": {
+          "type": "string",
+          "description": "可选 PEM CA 证书路径；配置后仅信任该证书池。"
+        },
+        "serverName": {
+          "type": "string",
+          "description": "可选证书主机名覆盖，不含 scheme、路径或端口。"
+        },
+        "insecureSkipVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅开发调试使用；跳过证书链和主机名校验，不能与 caCertificatePath 同时配置。"
+        }
+      }
+    },
     "peerMeshDevice": {
       "type": "string",
       "default": "noop",
@@ -61,5 +89,43 @@
       "maximum": 1280,
       "description": "Peer Mesh 虚拟网卡 MTU。大于 1280 会被客户端归一化，以避免 UDP 封装后公网路径分片丢包。"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["controlTls"],
+        "properties": {
+          "controlTls": {
+            "required": ["enabled"],
+            "properties": {"enabled": {"const": false}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "controlTls": {
+            "properties": {
+              "caCertificatePath": {"maxLength": 0},
+              "serverName": {"maxLength": 0},
+              "insecureSkipVerify": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    {
+      "not": {
+        "required": ["controlTls"],
+        "properties": {
+          "controlTls": {
+            "required": ["caCertificatePath", "insecureSkipVerify"],
+            "properties": {
+              "caCertificatePath": {"minLength": 1},
+              "insecureSkipVerify": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ]
 }

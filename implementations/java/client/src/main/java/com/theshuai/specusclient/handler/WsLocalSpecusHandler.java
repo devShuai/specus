@@ -1,16 +1,19 @@
 package com.theshuai.specusclient.handler;
 
-import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.StreamFlowController;
-import com.theshuai.common.protocol.NatMessagePacket;
-import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.websocketx.*;
+import io.netty.util.ReferenceCountUtil;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 客户端侧本地 WebSocket 隧道 handler：把本地 WS 服务的入站帧封装成 NAT {@code DATA} 帧写回
@@ -27,15 +30,25 @@ import java.nio.charset.StandardCharsets;
  * 事件感知，完成后把自己注册进 {@link NatClientHandler} 的 wsLocalChannels，让后续 DATA 帧能路由进来。
  */
 public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
+    static final long CLOSE_CREDIT_TIMEOUT_MILLIS = 5_000;
+
     private final NatClientHandler specusHandler;
     private final int streamId;
     private final String remoteChannelId;
+    private final long closeCreditTimeoutMillis;
+    private final AtomicBoolean terminationStarted = new AtomicBoolean();
     private volatile boolean registered;
 
     public WsLocalSpecusHandler(NatClientHandler specusHandler, int streamId, String remoteChannelId) {
+        this(specusHandler, streamId, remoteChannelId, CLOSE_CREDIT_TIMEOUT_MILLIS);
+    }
+
+    WsLocalSpecusHandler(NatClientHandler specusHandler, int streamId, String remoteChannelId,
+                         long closeCreditTimeoutMillis) {
         this.specusHandler = specusHandler;
         this.streamId = streamId;
         this.remoteChannelId = remoteChannelId;
+        this.closeCreditTimeoutMillis = Math.max(1, closeCreditTimeoutMillis);
     }
 
     @Override
@@ -61,23 +74,31 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
             super.channelRead(ctx, msg);
             return;
         }
-        ChannelHandlerContext controlCtx = specusHandler.getCtx();
-        if (controlCtx == null || !controlCtx.channel().isActive()) {
-            ctx.close();
-            return;
+        try {
+            ChannelHandlerContext controlCtx = specusHandler.getCtx();
+            if (controlCtx == null || !controlCtx.channel().isActive()) {
+                ctx.close();
+                return;
+            }
+            int opcode = opcode(frame);
+            ByteBuf payload = frame.content();
+            byte[] data;
+            int closeCode = 0;
+            if (frame instanceof CloseWebSocketFrame close) {
+                closeCode = Math.max(0, close.statusCode());
+                data = close.reasonText().getBytes(StandardCharsets.UTF_8);
+            } else {
+                data = new byte[payload.readableBytes()];
+                payload.getBytes(payload.readerIndex(), data);
+            }
+            if (opcode == WebSocketSpecusFrame.OPCODE_CLOSE) {
+                sendClose(controlCtx, ctx, frame.isFinalFragment(), frame.rsv(), closeCode, data);
+            } else {
+                sendChunked(controlCtx, ctx, opcode, frame.isFinalFragment(), frame.rsv(), closeCode, data);
+            }
+        } finally {
+            ReferenceCountUtil.release(frame);
         }
-        int opcode = opcode(frame);
-        ByteBuf payload = frame.content();
-        byte[] data;
-        int closeCode = 0;
-        if (frame instanceof CloseWebSocketFrame close) {
-            closeCode = Math.max(0, close.statusCode());
-            data = close.reasonText().getBytes(StandardCharsets.UTF_8);
-        } else {
-            data = new byte[payload.readableBytes()];
-            payload.getBytes(payload.readerIndex(), data);
-        }
-        sendChunked(controlCtx, ctx, opcode, frame.isFinalFragment(), frame.rsv(), closeCode, data);
     }
 
     @Override
@@ -87,9 +108,12 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
         if (registered) {
             specusHandler.removeWsLocalHandler(streamId, this);
             ChannelHandlerContext controlCtx = specusHandler.getCtx();
-            if (controlCtx != null && controlCtx.channel().isActive()) {
+            if (terminationStarted.compareAndSet(false, true)
+                    && controlCtx != null && controlCtx.channel().isActive()) {
                 StreamFlowController.get(controlCtx.channel()).finish(streamId);
             }
+        } else {
+            specusHandler.failPendingWsStream(streamId, "websocket handshake failed");
         }
     }
 
@@ -149,6 +173,43 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
                     streamId, encoded.encode(), localCtx.channel(), localCtx::close);
             first = false;
         } while (offset < payload.length);
+    }
+
+    private void sendClose(ChannelHandlerContext controlCtx, ChannelHandlerContext localCtx,
+                           boolean finalFragment, int rsv, int closeCode, byte[] payload) {
+        if (!terminationStarted.compareAndSet(false, true)) {
+            return;
+        }
+        byte[] close = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE,
+                finalFragment, rsv, closeCode, payload).encode();
+        StreamFlowController flow = StreamFlowController.get(controlCtx.channel());
+        CompletableFuture<Void> sequence = flow.sendAtomicAsync(
+                        streamId, close, localCtx.channel(), null)
+                .thenCompose(ignored -> flow.finishAsync(streamId, null));
+        var timeout = controlCtx.executor().schedule(
+                () -> sequence.completeExceptionally(
+                        new TimeoutException("websocket close credit timeout")),
+                closeCreditTimeoutMillis, TimeUnit.MILLISECONDS);
+        sequence.whenComplete((ignored, error) -> {
+            timeout.cancel(false);
+            if (error != null) {
+                Throwable cause = unwrap(error);
+                String reason = cause instanceof TimeoutException
+                        ? "websocket close credit timeout"
+                        : "websocket close send failed";
+                flow.reset(streamId, 8, reason);
+            }
+            specusHandler.removeWsLocalHandler(streamId, this);
+            localCtx.close();
+        });
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     private static int opcode(WebSocketFrame frame) {

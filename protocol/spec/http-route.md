@@ -32,7 +32,7 @@ ANY /http/{clientName}/{route}/**
 | --- | --- |
 | `clientId` | 所属客户端 |
 | `route` | URL 中稳定的 route 名 |
-| `targetBaseUrl` | 客户端实际访问的 `http/https/ws/wss` 基础地址 |
+| `targetBaseUrl` | 客户端实际访问的绝对 `http/https` 基础地址；WebSocket Upgrade 时客户端按 scheme 映射为 `ws/wss` |
 | `enabled` | 是否允许公网访问 |
 | `pathRewriteEnabled` | 是否对可安全缓冲的小型 HTML/CSS 响应执行路径改写 |
 | `authEnabled` | 是否要求公网调用方通过 HTTP Basic 认证；默认 `false` |
@@ -63,12 +63,19 @@ ANY /http/{clientName}/{route}/**
   "relativePath": "/items/%E4%BD%A0",
   "rawQuery": "x=%2F",
   "headers": ["Content-Type:application/json"],
-  "contentLength": 12
+  "contentLength": 12,
+  "trailerNames": ["Digest"]
 }
 ```
 
-`contentLength` 仅在公网请求已知长度时出现。随后发送零到多个 NAT `DATA`，每个 payload 最大 64 KiB；请求
-结束发送 NAT `FIN`，请求 trailers 放在 `FIN.metadata.trailers` 的 `name:value` 字符串数组中。
+`contentLength` 仅在公网请求已知长度时出现；`trailerNames` 仅在公网请求通过 `Trailer` header 声明尾部字段时
+出现。随后发送零到多个 NAT `DATA`，每个 payload 最大 64 KiB；请求结束发送 NAT `FIN`，请求 trailers 放在
+`FIN.metadata.trailers` 的 `name:value` 字符串数组中。接收端只转发 OPEN 已声明且名称合法的 trailer；未声明字段、
+禁止字段和 CR/LF 注入必须丢弃或拒绝。没有 trailers 且长度已知时应保留定长请求，不得无条件改为 chunked。
+
+Android 当前使用的 `HttpURLConnection` 不提供发送 request trailers 的 API。Android client 收到非空
+`trailerNames` 或 FIN trailers 时必须显式 `RST`，不得把 trailer 静默丢弃后继续请求；这是平台能力边界，Java、
+Go、.NET client 仍按上述规范转发。response trailers 仅在 Android 平台 API 实际暴露时按声明交集转发。
 
 客户端必须在读取 request DATA 后按实际消费字节发送 `WINDOW_UPDATE`。如果 upstream 无法建立、请求格式无效、
 本地队列超限或服务端取消，任一端发送 `RST(value=errorCode, metadata.reason)` 并释放 stream。
@@ -82,7 +89,8 @@ ANY /http/{clientName}/{route}/**
   "source": "http",
   "phase": "response",
   "statusCode": 200,
-  "headers": ["Content-Type:text/event-stream"]
+  "headers": ["Content-Type:text/event-stream"],
+  "trailerNames": ["Digest"]
 }
 ```
 
@@ -92,8 +100,9 @@ ANY /http/{clientName}/{route}/**
 {"trailers":["Digest:sha-256=..."]}
 ```
 
-服务端收到响应 OPEN 后即可提交公网响应头，DATA 到达后立即写出并 flush。因此 SSE、流式下载和大响应不需要等待
-完整 body。服务端消费响应 DATA 后回送 WINDOW_UPDATE，客户端必须在 credit 不足时暂停 upstream 读取。
+响应 OPEN 的 `trailerNames` 声明规则与请求相同，服务端据此生成公网响应的 `Trailer` 声明，并只接受 FIN 中对应
+字段。服务端收到响应 OPEN 后即可提交公网响应头，DATA 到达后立即写出并 flush。因此 SSE、流式下载和大响应不需要
+等待完整 body。服务端消费响应 DATA 后回送 WINDOW_UPDATE，客户端必须在 credit 不足时暂停 upstream 读取。
 
 Java 基准实现的请求体上限为 16 MiB，响应体上限为 64 MiB。上限针对完整流，不是单帧；跨语言实现不得通过发送
 多个 DATA 绕过累计限制。
@@ -125,14 +134,14 @@ Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade
 其他 header 按 `name:value` 数组保留重复值。受保护 route 的入口 `Authorization: Basic ...` 在校验成功后必须
 从转发 metadata 和流量明细中移除，防止公网凭据泄露给 upstream 或持久化；公开 route 的 Authorization 仍原样
 透传，以支持 upstream 自身的 Bearer/Basic 认证。公网响应的 Content-Length 由实际输出决定；经过路径改写或
-解压后必须移除旧 Content-Length/Content-Encoding。`Range` 只接受有界的单范围表达式，非法或无界范围不得直接
-传给 upstream。
+解压后必须移除旧 Content-Length/Content-Encoding。可解析的单范围 `Range` 会裁剪到最多 8 MiB；multi-range、
+suffix range 或其它未识别表达式原样交给 upstream 处理，最终响应仍受累计大小上限约束。
 
 ## 7. WebSocket SWS2
 
-Java、Go、.NET 与 C server 支持的 WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`，并与普通 HTTP
-共用 route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝，且不得创建 NAT stream。建立后，
-WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
+Java、Go、.NET server 的完整对齐实现与 C server 的兼容子集都使用 `/http/{clientName}/{route}/**` 接收
+WebSocket Upgrade，并与普通 HTTP 共用 route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝，
+且不得创建 NAT stream。建立后，WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
 
 | 字段 | 长度 | 说明 |
 | --- | ---: | --- |
@@ -143,9 +152,10 @@ WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
 | payloadLength | 4 | 后续 payload 长度 |
 | payload | N | 原始 frame payload |
 
-固定头为 12 字节。控制帧必须 FIN、payload 不超过 125 字节；close reason 最大 123 字节。未知 opcode、非法 RSV、
-错误 close code、截断、尾随字节和超过 NAT chunk 上限的 frame 必须拒绝。SWS2 保留 WebSocket frame 语义，不把
-未知类型当 binary，也不使用旧的一字节 text/binary 前缀。
+固定头为 12 字节。控制帧必须 FIN、payload 不超过 125 字节；close reason 最大 123 字节。非 CLOSE 的 closeCode
+必须为 0；CLOSE 可使用 0（仅无 reason）或 `1000..4999` 中除 `1004`、`1005`、`1006`、`1015` 外的值。未知 opcode、
+非法 RSV、错误 close code、截断、尾随字节和超过 NAT chunk 上限的 frame 必须拒绝。SWS2 保留 WebSocket frame
+语义，不把未知类型当 binary，也不使用旧的一字节 text/binary 前缀。
 
 ## 8. 响应路径改写
 
@@ -169,6 +179,7 @@ WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
 | Java | `HttpSpecusController`、`HttpStreamExchange` | `HttpStreamForwarder` |
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
 | .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
-| C server | `admin_http.c`、`main.c` NAT stream bridge | 使用 Java/Go/.NET v2 客户端 |
+| Android | — | `SpecusCore.HttpStreamForwarder`、`SpecusCore.LocalWebSocketSpecus` |
+| C server | `admin_http.c`、`main.c` v2 NAT + SWS2 兼容子集；未通过完整 SWS2 向量与严格状态机门禁 | 使用 Java/Go/.NET/Android v2 客户端 |
 
 中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。

@@ -103,7 +103,7 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 | 字段 | 长度 | 说明 |
 | --- | ---: | --- |
 | `type` | 1 | `NatMessageType` wire ID |
-| `flags` | 1 | 当前仅 bit 0 `END_STREAM` |
+| `flags` | 1 | 仅 DATA 可使用 bit 0 `END_STREAM`；其它 bit 或其它帧携带 flags 必须拒绝 |
 | `metadataLength` | 2 | unsigned，最大 `65,535` |
 | `streamId` | 4 | unsigned，连接内唯一；`0` 保留给连接级帧 |
 | `value` | 4 | unsigned，WINDOW_UPDATE credit 或 RST error code |
@@ -128,15 +128,21 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 DATA 后按实际字节数回送 `WINDOW_UPDATE`。窗口溢出、队列溢出、DATA-after-FIN 或非法状态转换使用
 `RST` 或关闭违规连接。
 
+`DATA|END_STREAM` 等价于先消费该 DATA、再收到同方向 FIN；接收端必须先交付 payload，再执行 half-close。
+
+普通 TCP stream 的两个方向独立结束：收到 `FIN` 只对本地 socket 对应的写方向执行 half-close，仍须继续读取并转发
+反向数据；本地读到 EOF 时只发送一次 `FIN`。双方 FIN 后才能正常释放 stream，`RST` 或 I/O 错误则立即关闭双方。
+重复 FIN、FIN 后同方向 DATA，以及从未 OPEN 的 stream 上出现 DATA/FIN/RST 都属于协议违规。
+
 ## HTTP streaming
 
 HTTP route 不使用独立 command。服务端在数据连接上发送：
 
 1. `OPEN`，metadata 含 `source=http`、`phase=request`、`method`、`route`、`relativePath`、
-   `rawQuery`、`headers` 和可选 `contentLength`。
+   `rawQuery`、`headers`、可选 `contentLength` 和可选 `trailerNames`。
 2. 零到多个请求 `DATA`。
 3. 请求 `FIN`。
-4. 客户端以 `OPEN(source=http, phase=response, statusCode, headers)` 返回响应头。
+4. 客户端以 `OPEN(source=http, phase=response, statusCode, headers, trailerNames?)` 返回响应头。
 5. 零到多个响应 `DATA`，随后 `FIN(trailers?)`。
 
 浏览器断开、超时或任一端失败必须发送 `RST`，并取消 upstream 请求。SSE 和大响应按 DATA 到达即向
@@ -155,8 +161,9 @@ WebSocket payload 在 NAT DATA 内使用 `SWS2` 二进制 envelope：
 | payloadLength | 4 | 后续 payload 长度 |
 | payload | N | 最大 `64 KiB - 12` |
 
-控制帧必须 FIN、不得携带 RSV、payload 不超过 125 字节；CLOSE reason 最大 123 字节。未知 opcode、错误
-长度、非法 close code 和尾随字节必须拒绝。
+控制帧必须 FIN、不得携带 RSV、payload 不超过 125 字节；CLOSE reason 最大 123 字节。
+wire close code `1004`、`1005`、`1006`、`1015` 禁止发送；未知 opcode、错误长度、其它非法 close code、截断和
+尾随字节必须拒绝。
 
 ## 测试向量
 

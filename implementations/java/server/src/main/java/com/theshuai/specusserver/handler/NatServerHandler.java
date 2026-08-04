@@ -2,6 +2,7 @@ package com.theshuai.specusserver.handler;
 
 import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
+import com.theshuai.common.handler.RecentStreamTombstones;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
@@ -21,7 +22,6 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.DuplexChannel;
 import io.netty.handler.codec.bytes.ByteArrayDecoder;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 import lombok.extern.slf4j.Slf4j;
@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class NatServerHandler extends NatCommonHandler {
+    static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
     // Pinned by client control connection: listenPort -> bound TcpServer.
     // Concurrent because the channel pipeline reads from arbitrary event loops.
     private final Map<Integer, TcpServer> remoteConnectionServerMap = new ConcurrentHashMap<>();
@@ -48,6 +49,8 @@ public class NatServerHandler extends NatCommonHandler {
     private final Map<Integer, Integer> externalChannelPorts = new ConcurrentHashMap<>();
     private final Map<Integer, String> externalChannelIds = new ConcurrentHashMap<>();
     private final Map<Integer, HttpStreamExchange> httpStreams = new ConcurrentHashMap<>();
+    private final RecentStreamTombstones recentlyClosedStreams =
+            new RecentStreamTombstones(RECENTLY_CLOSED_STREAM_LIMIT);
 
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
@@ -102,8 +105,8 @@ public class NatServerHandler extends NatCommonHandler {
             } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
                 processWsData(natMessagePacket);
             } else {
-                // HTTP/WS 流取消后仍可能有已经在网络中的尾帧。流 ID 在当前已认证的
-                // DATA 连接内隔离，未知流只需忽略，不能把整条控制会话判为协议违规。
+                // An unclassified DATA frame must belong to an active ordinary TCP stream.
+                // processData resets unknown IDs instead of silently accepting an illegal state.
                 processData(natMessagePacket);
             }
         } else if (type == NatMessageType.FIN || type == NatMessageType.RST) {
@@ -147,6 +150,7 @@ public class NatServerHandler extends NatCommonHandler {
                 || httpStreams.putIfAbsent(exchange.streamId(), exchange) != null) {
             return false;
         }
+        markStreamOpened(exchange.streamId());
         StreamFlowController.get(ctx.channel()).open(exchange.streamId(), null);
         NatMessagePacket open = new NatMessagePacket();
         open.setNatMessageType(NatMessageType.OPEN);
@@ -154,6 +158,7 @@ public class NatServerHandler extends NatCommonHandler {
         open.setMetaData(metadata);
         ctx.writeAndFlush(open).addListener(result -> {
             if (!result.isSuccess()) {
+                markStreamClosed(exchange.streamId());
                 HttpStreamExchange removed = httpStreams.remove(exchange.streamId());
                 if (removed != null) {
                     removed.onReset(7, Map.of("reason", "HTTP OPEN write failed"));
@@ -168,7 +173,10 @@ public class NatServerHandler extends NatCommonHandler {
             return CompletableFuture.failedFuture(new IllegalStateException("HTTP stream is not active"));
         }
         return StreamFlowController.get(ctx.channel()).sendAsync(streamId, data, null,
-                () -> httpStreams.remove(streamId));
+                () -> {
+                    markStreamClosed(streamId);
+                    httpStreams.remove(streamId);
+                });
     }
 
     public CompletableFuture<Void> finishHttpRequest(int streamId, List<String> trailers) {
@@ -185,6 +193,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     public void cancelHttpStream(int streamId, String reason) {
+        markStreamClosed(streamId);
         HttpStreamExchange exchange = httpStreams.remove(streamId);
         if (ctx != null) {
             StreamFlowController.get(ctx.channel()).reset(streamId, 8, reason);
@@ -195,6 +204,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     public void unregisterHttpStream(int streamId) {
+        markStreamClosed(streamId);
         httpStreams.remove(streamId);
         if (ctx != null) {
             StreamFlowController.get(ctx.channel()).remove(streamId);
@@ -214,6 +224,11 @@ public class NatServerHandler extends NatCommonHandler {
         HttpStreamExchange exchange = httpStreams.get(packet.getStreamId());
         if (exchange == null || !exchange.onData(packet.getData())) {
             cancelHttpStream(packet.getStreamId(), "HTTP response queue exceeded");
+            return;
+        }
+        if ((packet.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0
+                && !exchange.onFin(packet.getMetaData())) {
+            cancelHttpStream(packet.getStreamId(), "duplicate HTTP FIN");
         }
     }
 
@@ -224,75 +239,71 @@ public class NatServerHandler extends NatCommonHandler {
         }
         if (packet.getNatMessageType() == NatMessageType.RST) {
             httpStreams.remove(packet.getStreamId());
+            markStreamClosed(packet.getStreamId());
             exchange.onReset(packet.getValue(), packet.getMetaData());
-        } else {
-            exchange.onFin(packet.getMetaData());
+        } else if (!exchange.onFin(packet.getMetaData())) {
+            cancelHttpStream(packet.getStreamId(), "duplicate HTTP FIN");
         }
     }
 
     private void processWsClosed(NatMessagePacket natMessagePacket) {
+        markStreamClosed(natMessagePacket.getStreamId());
         webSocketSpecusHandler.closeFromClient(natMessagePacket.getStreamId());
     }
 
     private void processData(NatMessagePacket natMessagePacket) {
         byte[] data = natMessagePacket.getData();
+        int streamId = natMessagePacket.getStreamId();
         if (data == null) {
             log.warn("DATA frame with no payload from {}", clientName);
+            resetTcpStream(streamId, 7, "TCP DATA frame has no payload");
             return;
         }
-        int streamId = natMessagePacket.getStreamId();
         Channel target = externalChannels.get(streamId);
         if (target == null) {
+            resetTcpStream(streamId, 7, "DATA for unknown TCP stream");
             return;
         }
-        int listenPort = externalChannelPorts.getOrDefault(streamId, 0);
-        String channelId = externalChannelIds.getOrDefault(streamId, Integer.toUnsignedString(streamId));
-        trafficUsageService.recordTcpUpload(clientName, listenPort, data.length);
-        // S1.1 endpoint 字符串走 target channel 上 RemoteSpecusHandler.channelActive 缓存的 attr，
-        // 替代每帧 endpointAddress() 里的 instanceof + getHostAddress() 分配。
-        ChannelAttributes.EndpointSnapshot localEp = ChannelAttributes.localEndpoint(target);
-        ChannelAttributes.EndpointSnapshot remoteEp = ChannelAttributes.remoteEndpoint(target);
-        trafficInspectionService.recordTcpFrame(clientName, listenPort, channelId,
-                TrafficInspectionService.DIRECTION_CLIENT_TO_PUBLIC,
-                localEp.address(),
-                localEp.port(),
-                remoteEp.address(),
-                remoteEp.port(),
-                data);
-        target.writeAndFlush(data).addListener(future -> {
-            if (!future.isSuccess()) {
-                log.warn("write DATA to external channel {} failed [{}]",
-                        ChannelAttributes.channelId(target), clientName, future.cause());
-                target.close();
-            } else {
-                sendWindowUpdate(streamId, data.length);
-                if ((natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0) {
-                    shutdownOutput(target);
-                }
-            }
-        });
-        if (!target.isWritable()) {
-            pauseControlReads();
+        RemoteSpecusHandler handler = target.pipeline().get(RemoteSpecusHandler.class);
+        if (handler == null) {
+            log.warn("TCP stream {} has no RemoteSpecusHandler [{}]",
+                    Integer.toUnsignedString(streamId), clientName);
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+            ctx.close();
+            return;
         }
+        handler.writeFromClient(data,
+                (natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0);
     }
 
     private void processClosed(NatMessagePacket natMessagePacket) {
-        Channel target = externalChannels.get(natMessagePacket.getStreamId());
-        if (target != null) {
+        int streamId = natMessagePacket.getStreamId();
+        Channel target = externalChannels.get(streamId);
+        if (target == null) {
             if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
-                StreamFlowController.get(ctx.channel()).remove(natMessagePacket.getStreamId());
-                target.close();
-            } else {
-                shutdownOutput(target);
+                if (recentlyClosedStreams.contains(streamId)) {
+                    return;
+                }
+                log.warn("RST for never-opened stream {} from {}",
+                        Integer.toUnsignedString(streamId), clientName);
+                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+                ctx.close();
+                return;
             }
+            resetTcpStream(streamId, 7, "FIN for unknown TCP stream");
+            return;
         }
-    }
-
-    private static void shutdownOutput(Channel channel) {
-        if (channel instanceof DuplexChannel duplexChannel) {
-            duplexChannel.shutdownOutput();
+        RemoteSpecusHandler handler = target.pipeline().get(RemoteSpecusHandler.class);
+        if (handler == null) {
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+            ctx.close();
+            return;
+        }
+        if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
+            markStreamClosed(streamId);
+            handler.receiveClientReset();
         } else {
-            channel.close();
+            handler.receiveClientFin();
         }
     }
 
@@ -309,6 +320,33 @@ public class NatServerHandler extends NatCommonHandler {
         update.setStreamId(streamId);
         update.setValue(Integer.toUnsignedLong(credit));
         ctx.writeAndFlush(update);
+    }
+
+    void sendTcpWindowUpdate(int streamId, int credit) {
+        sendWindowUpdate(streamId, credit);
+    }
+
+    void resetTcpStream(int streamId, long errorCode, String reason) {
+        if (ctx == null) {
+            return;
+        }
+        markStreamClosed(streamId);
+        if (ctx.channel().isActive()) {
+            StreamFlowController.get(ctx.channel()).reset(streamId, errorCode, reason);
+        } else {
+            StreamFlowController.get(ctx.channel()).remove(streamId);
+        }
+    }
+
+    void abortTcpStream(int streamId) {
+        markStreamClosed(streamId);
+        if (ctx != null) {
+            StreamFlowController.get(ctx.channel()).remove(streamId);
+        }
+    }
+
+    void pauseTcpControlReads() {
+        pauseControlReads();
     }
 
     private void processUnregister(NatMessagePacket natMessagePacket) {
@@ -396,10 +434,12 @@ public class NatServerHandler extends NatCommonHandler {
                                 new RemoteSpecusHandler(thisHandler, streamId, port, clientName, trafficUsageService,
                                         trafficInspectionService));
                         externalChannels.put(streamId, channel);
+                        markStreamOpened(streamId);
                         externalChannelPorts.put(streamId, port);
                         externalChannelIds.put(streamId, channelId);
                         syncExternalReadWithControl(channel);
                         channel.closeFuture().addListener(future -> {
+                            markStreamClosed(streamId);
                             if (externalChannels.remove(streamId) != null) {
                                 externalChannelPorts.remove(streamId);
                                 externalChannelIds.remove(streamId);
@@ -408,6 +448,7 @@ public class NatServerHandler extends NatCommonHandler {
                             }
                         });
                     } catch (RuntimeException e) {
+                        markStreamClosed(streamId);
                         externalChannels.remove(streamId);
                         externalChannelPorts.remove(streamId);
                         externalChannelIds.remove(streamId);
@@ -553,6 +594,16 @@ public class NatServerHandler extends NatCommonHandler {
 
     private static int decrement(AtomicInteger counter) {
         return counter.updateAndGet(current -> current > 0 ? current - 1 : 0);
+    }
+
+    /** Register a stream created outside this handler, such as a tunneled WebSocket. */
+    public void markStreamOpened(int streamId) {
+        recentlyClosedStreams.remove(streamId);
+    }
+
+    /** Register a completed stream so a late peer RST remains idempotent. */
+    public void markStreamClosed(int streamId) {
+        recentlyClosedStreams.add(streamId);
     }
 
     private static String asString(Map<String, Object> meta, String key) {

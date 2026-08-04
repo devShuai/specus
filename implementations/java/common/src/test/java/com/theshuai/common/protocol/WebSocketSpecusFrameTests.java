@@ -5,6 +5,8 @@ import com.theshuai.common.util.JsonUtil;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
@@ -35,6 +37,15 @@ class WebSocketSpecusFrameTests {
                 HexFormat.of().parseHex(vector.path("truncatedHex").asText())));
         assertThrows(IllegalArgumentException.class, () -> WebSocketSpecusFrame.decode(
                 HexFormat.of().parseHex(vector.path("trailingHex").asText())));
+
+        for (JsonNode code : vector.path("wireForbiddenCloseCodes")) {
+            int closeCode = code.asInt();
+            assertThrows(IllegalArgumentException.class, () -> new WebSocketSpecusFrame(
+                    WebSocketSpecusFrame.OPCODE_CLOSE, true, 0, closeCode, new byte[0]));
+
+            byte[] wireFrame = closeFrame(closeCode);
+            assertThrows(IllegalArgumentException.class, () -> WebSocketSpecusFrame.decode(wireFrame));
+        }
     }
 
     @Test
@@ -57,6 +68,17 @@ class WebSocketSpecusFrameTests {
                 WebSocketSpecusFrame.OPCODE_BINARY, true, 0, 0, new byte[]{1, 2}).encode();
         byte[] trailing = java.util.Arrays.copyOf(valid, valid.length + 1);
         assertThrows(IllegalArgumentException.class, () -> WebSocketSpecusFrame.decode(trailing));
+    }
+
+    private static byte[] closeFrame(int closeCode) {
+        return ByteBuffer.allocate(WebSocketSpecusFrame.HEADER_BYTES)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putInt(WebSocketSpecusFrame.MAGIC)
+                .put((byte) WebSocketSpecusFrame.OPCODE_CLOSE)
+                .put((byte) 1)
+                .putShort((short) closeCode)
+                .putInt(0)
+                .array();
     }
 
     private static Path findVector() {

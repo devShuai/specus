@@ -9,7 +9,8 @@
     "frameHex": "53575332010100000000000568656c6c6f",
     "invalidMagicHex": "00575332010100000000000568656c6c6f",
     "truncatedHex": "5357533201010000000000",
-    "trailingHex": "53575332010100000000000568656c6c6f00"
+    "trailingHex": "53575332010100000000000568656c6c6f00",
+    "wireForbiddenCloseCodes": [1004, 1005, 1006, 1015]
   },
   "clientMessage": {
     "name": "stmsg2-text",

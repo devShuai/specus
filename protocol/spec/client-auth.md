@@ -17,6 +17,9 @@
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",
+  "controlTls": {
+    "enabled": null
+  },
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280
@@ -28,6 +31,7 @@
 | `serverBaseUrl` | 是 | 服务端管理 HTTP 地址 |
 | `apiKey` | 是 | 管理后台创建的客户端凭证 key |
 | `secret` | 是 | 客户端凭证明文，只在创建或重置时展示一次 |
+| `controlTls` | 否 | control/data 原始 TCP TLS 配置；`enabled` 省略或为 `null` 时跟随服务端 `nettyTls` |
 | `peerMeshDevice` | 否 | Peer Mesh 虚拟网卡模式，默认 `noop` |
 | `peerMeshTunName` | 否 | 虚拟网卡名称，默认 `specus0` |
 | `peerMeshMtu` | 否 | 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化 |
@@ -135,6 +139,7 @@ signature = HEX(HMAC_SHA256(key, message))
   "tokenTtlSeconds": 28800,
   "nettyHost": "127.0.0.1",
   "nettyPort": 7010,
+  "nettyTls": false,
   "maxOnlineInstances": 2,
   "policy": {
     "enabled": true,
@@ -173,7 +178,8 @@ signature = HEX(HMAC_SHA256(key, message))
 | `clientSessionId` | 本次登录 session ID |
 | `accessToken` | 控制连接登录 token，只保存 hash |
 | `tokenTtlSeconds` | token 有效期，默认 `28800` 秒 |
-| `nettyHost` / `nettyPort` | 控制连接地址 |
+| `nettyHost` / `nettyPort` | control/data 原始 TCP 连接地址 |
+| `nettyTls` | 该原始 TCP 端点是否要求 TLS；与管理登录 URL 是否为 HTTPS 无关 |
 | `maxOnlineInstances` | 当前凭证允许同时在线实例数，默认 `2` |
 | `policy` | 预留策略字段，目前主要表示启用状态 |
 | `specusConfigList` | 已启用 TCP 映射初始快照 |
@@ -181,6 +187,10 @@ signature = HEX(HMAC_SHA256(key, message))
 | `peerMesh` | Peer Mesh 运行时配置 |
 
 `nettyHost` 优先使用 `SPECUS_PUBLIC_ADDRESS`，否则使用 HTTP 请求的 server name。公网部署建议显式设置 `SPECUS_PUBLIC_ADDRESS`。
+Java、Go、.NET、Android 客户端在 `controlTls.enabled` 未设置时跟随 `nettyTls`；旧服务端没有该字段时按 `false`
+处理。自定义 CA、证书主机名或 `insecureSkipVerify` 等 TLS 附加选项也会显式启用 TLS。管理 HTTPS 可能由
+OpenResty 等 HTTP 反向代理终止，不能据此推断 `7010/TCP` 已启用 TLS。显式设置 `enabled=false` 只适用于
+确认原始 TCP 端点为明文的兼容场景；若服务端实际要求 TLS，连接会失败。
 
 ## 控制连接登录
 
@@ -223,7 +233,7 @@ control 登录成功后，客户端使用相同的 `clientName/clientSessionId/a
 服务端仍会校验 session 过期、客户端/凭证启用状态、同机用户实例数和凭证最大在线实例数，但截获 token 的
 一方在这些约束和 TTL 内仍可能尝试重放。
 
-因此生产部署必须为 HTTP 登录和控制连接启用 TLS，并避免把 token 写入日志、命令行或可被其他用户读取的
+因此生产部署必须为 HTTP 登录以及 control/data 连接启用 TLS，并避免把 token 写入日志、命令行或可被其他用户读取的
 配置。文档中的 `http://127.0.0.1` 只用于本机开发示例；它不是公网安全部署方式。
 
 ## token 刷新

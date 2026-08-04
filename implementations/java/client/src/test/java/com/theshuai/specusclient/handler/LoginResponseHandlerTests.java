@@ -3,6 +3,7 @@ package com.theshuai.specusclient.handler;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.client.NettyClient;
+import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
@@ -57,11 +58,35 @@ class LoginResponseHandlerTests {
         }
     }
 
+    @Test
+    void duplicateLoginResponseClosesAuthenticatedConnection() {
+        LoginRecordingNettyClient client = new LoginRecordingNettyClient();
+        EmbeddedChannel channel = new EmbeddedChannel(new LoginResponseHandler(client));
+        try {
+            channel.writeInbound(success());
+            assertTrue(channel.isActive());
+            channel.writeInbound(success());
+            channel.runPendingTasks();
+
+            assertFalse(channel.isActive());
+            org.junit.jupiter.api.Assertions.assertEquals(1, client.successCount);
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
     private static LoginResponsePacket failure(String reason) {
         LoginResponsePacket response = new LoginResponsePacket();
         response.setClientName("unit-client");
         response.setSuccess(false);
         response.setReason(reason);
+        return response;
+    }
+
+    private static LoginResponsePacket success() {
+        LoginResponsePacket response = new LoginResponsePacket();
+        response.setClientName("unit-client");
+        response.setSuccess(true);
         return response;
     }
 
@@ -95,6 +120,19 @@ class LoginResponseHandlerTests {
             bean.setRemoteAddress("127.0.0.1");
             bean.setRemotePort(7010);
             return bean;
+        }
+    }
+
+    private static final class LoginRecordingNettyClient extends NettyClient {
+        private int successCount;
+
+        private LoginRecordingNettyClient() {
+            super(RefreshRecordingNettyClient.bean());
+        }
+
+        @Override
+        public void onLoginSuccess(String connectionRole, Channel channel) {
+            successCount++;
         }
     }
 }

@@ -15,6 +15,7 @@ public class ClientAuthLoginResponse {
     private long tokenTtlSeconds;
     private String nettyHost;
     private int nettyPort;
+    private boolean nettyTls;
     private int maxOnlineInstances = 2;
     private ClientPolicy policy = new ClientPolicy();
     private PeerMeshConfig peerMesh = new PeerMeshConfig();

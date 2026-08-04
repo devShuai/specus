@@ -22,6 +22,8 @@ import com.theshuai.specusserver.management.repository.ConnectionRecordRepositor
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
 import com.theshuai.specusserver.security.PasswordService;
+import com.theshuai.specusserver.security.TlsContextFactory;
+import com.theshuai.specusserver.security.TlsProperties;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
@@ -61,6 +63,7 @@ public class ClientAuthService {
     private final ClientAuthNonceService nonceService;
     private final ClientAuthProperties properties;
     private final NettyServerProperties nettyProperties;
+    private final TlsProperties tlsProperties;
     private final String publicAddress;
     private final TransactionTemplate transactionTemplate;
 
@@ -75,6 +78,7 @@ public class ClientAuthService {
                              ClientAuthNonceService nonceService,
                              ClientAuthProperties properties,
                              NettyServerProperties nettyProperties,
+                             TlsProperties tlsProperties,
                              PlatformTransactionManager transactionManager,
                              @Value("${specus.public-address:}") String publicAddress) {
         this.credentialRepository = credentialRepository;
@@ -88,6 +92,7 @@ public class ClientAuthService {
         this.nonceService = nonceService;
         this.properties = properties;
         this.nettyProperties = nettyProperties;
+        this.tlsProperties = tlsProperties;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : "";
     }
@@ -152,6 +157,8 @@ public class ClientAuthService {
         response.setTokenTtlSeconds(properties.getTokenTtlSeconds());
         response.setNettyHost(resolveNettyHost(requestServerName));
         response.setNettyPort(nettyProperties.getPort());
+        response.setNettyTls(tlsProperties.resolveMode() != TlsContextFactory.Mode.DISABLED
+                || tlsProperties.isTerminatedUpstream());
         response.setMaxOnlineInstances(credential.getMaxOnlineInstances());
         response.setSpecusConfigList(loadTcpMappings(account));
         response.setHttpSpecusConfigList(loadHttpRoutes(account));

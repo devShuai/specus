@@ -18,8 +18,10 @@ public final class HttpStreamExchange {
     private final CompletableFuture<ResponseHead> responseHead = new CompletableFuture<>();
     private final LinkedBlockingQueue<Event> events = new LinkedBlockingQueue<>();
     private volatile List<String> trailers = List.of();
+    private volatile List<String> responseTrailerNames = List.of();
     private int queuedDataEvents;
     private long queuedDataBytes;
+    private boolean responseOpened;
     private boolean terminalQueued;
 
     public HttpStreamExchange(int streamId) {
@@ -30,7 +32,7 @@ public final class HttpStreamExchange {
         return streamId;
     }
 
-    public boolean onResponseHead(Map<String, Object> metadata) {
+    public synchronized boolean onResponseHead(Map<String, Object> metadata) {
         if (metadata == null || !"http".equals(text(metadata.get("source")))
                 || !"response".equals(text(metadata.get("phase")))) {
             return false;
@@ -40,11 +42,20 @@ public final class HttpStreamExchange {
         if (statusCode < 100 || statusCode > 599) {
             return false;
         }
-        return responseHead.complete(new ResponseHead(statusCode, stringList(metadata.get("headers"))));
+        if (responseOpened || terminalQueued) {
+            return false;
+        }
+        responseTrailerNames = HttpSpecusController.validTrailerNames(
+                stringList(metadata.get("trailerNames")), false);
+        responseOpened = true;
+        return responseHead.complete(new ResponseHead(
+                statusCode,
+                stringList(metadata.get("headers")),
+                responseTrailerNames));
     }
 
     public synchronized boolean onData(byte[] data) {
-        if (data == null || data.length == 0 || terminalQueued
+        if (data == null || data.length == 0 || !responseOpened || terminalQueued
                 || queuedDataEvents >= MAX_QUEUED_DATA_EVENTS
                 || queuedDataBytes > MAX_QUEUED_DATA_BYTES - data.length) {
             return false;
@@ -55,13 +66,15 @@ public final class HttpStreamExchange {
         return true;
     }
 
-    public synchronized void onFin(Map<String, Object> metadata) {
-        if (terminalQueued) {
-            return;
+    public synchronized boolean onFin(Map<String, Object> metadata) {
+        if (!responseOpened || terminalQueued) {
+            return false;
         }
         terminalQueued = true;
-        trailers = stringList(metadata == null ? null : metadata.get("trailers"));
+        trailers = HttpSpecusController.validTrailerLines(
+                stringList(metadata == null ? null : metadata.get("trailers")), responseTrailerNames);
         events.offer(new End(trailers));
+        return true;
     }
 
     public synchronized void onReset(long errorCode, Map<String, Object> metadata) {
@@ -106,7 +119,7 @@ public final class HttpStreamExchange {
     public record Reset(long errorCode, String reason) implements Event {
     }
 
-    public record ResponseHead(int statusCode, List<String> headers) {
+    public record ResponseHead(int statusCode, List<String> headers, List<String> trailerNames) {
     }
 
     public static final class HttpStreamException extends Exception {

@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.handler;
 
 import com.theshuai.common.handler.ChannelBackpressure;
+import com.theshuai.common.handler.RecentStreamTombstones;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
@@ -21,7 +22,6 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.DuplexChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpObjectAggregator;
@@ -55,6 +55,9 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 public class NatClientHandler extends NatCommonHandler {
 
+    static final int LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES = 16 * 1024 * 1024;
+    static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
+    static final int PENDING_STREAM_LIMIT = 1024;
     private static final SslContext LOCAL_WS_SSL_CONTEXT = buildLocalWsSslContext();
 
     private String remoteHost;
@@ -71,6 +74,10 @@ public class NatClientHandler extends NatCommonHandler {
     /** WS 隧道流的本地 Channel，key = 服务端分配的 streamId。 */
     private final ConcurrentHashMap<Integer, ChannelHandlerContext> wsLocalChannels = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, HttpStreamForwarder> httpStreams = new ConcurrentHashMap<>();
+    /** TCP/WS OPEN frames whose local connection or handshake is still being established. */
+    private final Set<Integer> pendingStreamIds = ConcurrentHashMap.newKeySet();
+    private final RecentStreamTombstones recentlyClosedStreams =
+            new RecentStreamTombstones(RECENTLY_CLOSED_STREAM_LIMIT);
     private ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
     private final Set<Integer> registeredPorts = new HashSet<>();
@@ -254,6 +261,11 @@ public class NatClientHandler extends NatCommonHandler {
         if (http != null) {
             if (!http.onData(data)) {
                 failHttpStream(streamId, "HTTP request queue or size limit exceeded");
+                return;
+            }
+            if ((natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0
+                    && !http.onRequestFin(natMessagePacket.getMetaData())) {
+                failHttpStream(streamId, "duplicate HTTP FIN");
             }
             return;
         }
@@ -272,24 +284,11 @@ public class NatClientHandler extends NatCommonHandler {
         }
         LocalSpecusHandler handler = channelHandlerMap.get(streamId);
         if (handler != null) {
-            ChannelHandlerContext localCtx = handler.getCtx();
-            if (localCtx == null) {
-                return;
-            }
-            localCtx.writeAndFlush(data).addListener(future -> {
-                if (!future.isSuccess()) {
-                    localCtx.close();
-                } else {
-                    sendWindowUpdate(streamId, data.length);
-                    if ((natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0) {
-                        shutdownOutput(localCtx.channel());
-                    }
-                }
-            });
-            if (!localCtx.channel().isWritable()) {
-                pauseControlReads();
-            }
+            handler.writeFromRemote(data,
+                    (natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0);
+            return;
         }
+        sendReset(streamId, 7, "DATA for unknown TCP stream");
     }
 
     private void processClosed(NatMessagePacket natMessagePacket) {
@@ -298,38 +297,62 @@ public class NatClientHandler extends NatCommonHandler {
         if (http != null) {
             if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
                 httpStreams.remove(streamId, http);
+                markStreamClosed(streamId);
                 http.cancel(asString(natMessagePacket.getMetaData(), "reason"));
                 StreamFlowController.get(ctx.channel()).remove(streamId);
-            } else {
-                http.onRequestFin(natMessagePacket.getMetaData());
+            } else if (!http.onRequestFin(natMessagePacket.getMetaData())) {
+                failHttpStream(streamId, "duplicate HTTP FIN");
             }
             return;
         }
         ChannelHandlerContext wsCtx = wsLocalChannels.remove(streamId);
         if (wsCtx != null) {
+            markStreamClosed(streamId);
             StreamFlowController.get(ctx.channel()).remove(streamId);
             wsCtx.close();
             return;
         }
         LocalSpecusHandler handler = channelHandlerMap.get(streamId);
         if (handler != null) {
-            ChannelHandlerContext localCtx = handler.getCtx();
-            if (localCtx != null) {
-                if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
-                    StreamFlowController.get(ctx.channel()).remove(streamId);
-                    localCtx.close();
-                } else {
-                    shutdownOutput(localCtx.channel());
-                }
+            if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
+                channelHandlerMap.remove(streamId, handler);
+                markStreamClosed(streamId);
+                handler.receiveRemoteReset();
+            } else {
+                handler.receiveRemoteFin();
             }
+            return;
         }
+        if (natMessagePacket.getNatMessageType() == NatMessageType.RST) {
+            if (removePendingStream(streamId)) {
+                // OPEN was accepted but the asynchronous TCP/WS connection has not registered yet.
+                recentlyClosedStreams.add(streamId);
+                StreamFlowController.get(ctx.channel()).remove(streamId);
+                return;
+            }
+            if (recentlyClosedStreams.contains(streamId)) {
+                return;
+            }
+            log.warn("RST for never-opened stream {} from {}",
+                    Integer.toUnsignedString(streamId), clientName);
+            ctx.close();
+            return;
+        }
+        sendReset(streamId, 7, "FIN for unknown TCP stream");
     }
 
     private void processOpen(NatMessagePacket natMessagePacket) throws Exception {
         String source = asString(natMessagePacket.getMetaData(), "source");
         if ("http".equals(source)) {
+            markStreamOpened(natMessagePacket.getStreamId());
             processHttpOpen(natMessagePacket);
-        } else if ("ws".equals(source)) {
+            return;
+        }
+        if (!beginPendingStream(natMessagePacket.getStreamId())) {
+            sendReset(natMessagePacket.getStreamId(), 7, "duplicate or excessive pending stream");
+            return;
+        }
+        if ("ws".equals(source)) {
             processWsConnected(natMessagePacket);
         } else {
             processTcpConnected(natMessagePacket);
@@ -342,25 +365,37 @@ public class NatClientHandler extends NatCommonHandler {
             Integer port = asInt(natMessagePacket.getMetaData(), "port");
             if (port == null) {
                 log.warn("CONNECTED frame missing port from {}", clientName);
+                sendReset(natMessagePacket.getStreamId(), 2, "TCP OPEN missing port");
                 return;
             }
             String channelId = asString(natMessagePacket.getMetaData(), "channelId");
             if (channelId == null) {
                 log.warn("CONNECTED frame missing channelId from {}", clientName);
+                sendReset(natMessagePacket.getStreamId(), 2, "TCP OPEN missing channelId");
                 return;
             }
             SpecusConfig specusConfig = specusConfigMap.get(port);
             if (specusConfig == null) {
                 log.warn("CONNECTED for unknown port {} from {}", port, clientName);
+                sendReset(natMessagePacket.getStreamId(), 3, "TCP OPEN for unknown port");
                 return;
             }
             localConnection.connect(specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) throws Exception {
                     int streamId = natMessagePacket.getStreamId();
+                    if (!removePendingStream(streamId)) {
+                        channel.close();
+                        return;
+                    }
                     LocalSpecusHandler localSpecusHandler = new LocalSpecusHandler(thisHandler, streamId);
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localSpecusHandler);
-                    channelHandlerMap.put(streamId, localSpecusHandler);
+                    LocalSpecusHandler existing = channelHandlerMap.putIfAbsent(streamId, localSpecusHandler);
+                    if (existing != null) {
+                        sendReset(streamId, 7, "duplicate TCP stream");
+                        channel.close();
+                        return;
+                    }
                     channelGroup.add(channel);
                     syncLocalReadWithControl(channel);
                     channel.closeFuture().addListener(future -> {
@@ -422,7 +457,7 @@ public class NatClientHandler extends NatCommonHandler {
                     protected void initChannel(SocketChannel ch) throws Exception {
                         WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                                 target, WebSocketVersion.V13, null, true,
-                                buildWsHandshakeHeaders(natMessagePacket), 65536);
+                                buildWsHandshakeHeaders(natMessagePacket), LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES);
                         if ("wss".equalsIgnoreCase(target.getScheme())) {
                             ch.pipeline().addLast(LOCAL_WS_SSL_CONTEXT.newHandler(
                                     ch.alloc(), target.getHost(),
@@ -439,7 +474,7 @@ public class NatClientHandler extends NatCommonHandler {
                     if (!connectFuture.isSuccess()) {
                         log.warn("[ws-specus][client] connect local ws failed channelId={} route={} error={}",
                                 channelId, route, connectFuture.cause() == null ? "unknown" : connectFuture.cause().toString());
-                        sendReset(streamId, 5, "websocket connect failed");
+                        failPendingWsStream(streamId, "websocket connect failed");
                         return;
                     }
                     Channel channel = connectFuture.channel();
@@ -447,6 +482,9 @@ public class NatClientHandler extends NatCommonHandler {
                     // 成功后自动注册进 wsLocalChannels；失败则由握手超时/异常关闭触发 channelInactive，
                     // 此时 registered=false，不会重复发 DISCONNECTED。
                     channel.closeFuture().addListener(closeFuture -> {
+                        if (wsLocalChannels.containsKey(streamId)) {
+                            markStreamClosed(streamId);
+                        }
                         ChannelHandlerContext removed = wsLocalChannels.remove(streamId);
                         if (removed != null) {
                             updateControlAutoReadForLocalWritability();
@@ -460,19 +498,30 @@ public class NatClientHandler extends NatCommonHandler {
      * wsLocalChannels。返回 false 表示控制连接已断开，调用方应关闭本地 Channel。
      */
     boolean registerWsLocalChannel(int streamId, ChannelHandlerContext localCtx) {
-        if (ctx == null || !ctx.channel().isActive()) {
+        if (ctx == null || !ctx.channel().isActive() || !removePendingStream(streamId)) {
             return false;
         }
-        wsLocalChannels.put(streamId, localCtx);
+        if (wsLocalChannels.putIfAbsent(streamId, localCtx) != null) {
+            sendReset(streamId, 7, "duplicate WebSocket stream");
+            return false;
+        }
         log.info("[ws-specus][client] ws handshake ok streamId={} registered", Integer.toUnsignedString(streamId));
         return true;
+    }
+
+    void failPendingWsStream(int streamId, String reason) {
+        if (removePendingStream(streamId)) {
+            sendReset(streamId, 5, reason);
+        }
     }
 
     void removeWsLocalHandler(int streamId, WsLocalSpecusHandler handler) {
         ChannelHandlerContext ctx = wsLocalChannels.get(streamId);
         if (ctx != null && ctx.pipeline().get(WsLocalSpecusHandler.class) == handler) {
-            wsLocalChannels.remove(streamId);
-            updateControlAutoReadForLocalWritability();
+            markStreamClosed(streamId);
+            if (wsLocalChannels.remove(streamId, ctx)) {
+                updateControlAutoReadForLocalWritability();
+            }
         }
     }
 
@@ -573,7 +622,7 @@ public class NatClientHandler extends NatCommonHandler {
         }
         int streamId = packet.getStreamId();
         HttpStreamForwarder forwarder = new HttpStreamForwarder(
-                this, streamId, packet.getMetaData(), httpRoutes);
+                this, streamId, packet.getMetaData(), httpRoutes, ensureWsWorkerGroup());
         if (httpStreams.putIfAbsent(streamId, forwarder) != null) {
             sendReset(streamId, 7, "duplicate HTTP stream");
             return;
@@ -582,7 +631,8 @@ public class NatClientHandler extends NatCommonHandler {
         forwarder.start();
     }
 
-    CompletableFuture<Void> sendHttpResponseHead(int streamId, int statusCode, List<String> headers) {
+    CompletableFuture<Void> sendHttpResponseHead(int streamId, int statusCode, List<String> headers,
+                                                 List<String> trailerNames) {
         if (!httpStreams.containsKey(streamId) || ctx == null || !ctx.channel().isActive()) {
             return CompletableFuture.failedFuture(new IllegalStateException("HTTP stream is closed"));
         }
@@ -593,7 +643,8 @@ public class NatClientHandler extends NatCommonHandler {
                 "source", "http",
                 "phase", "response",
                 "statusCode", statusCode,
-                "headers", headers == null ? List.of() : List.copyOf(headers)));
+                "headers", headers == null ? List.of() : List.copyOf(headers),
+                "trailerNames", trailerNames == null ? List.of() : List.copyOf(trailerNames)));
         CompletableFuture<Void> completion = new CompletableFuture<>();
         ctx.writeAndFlush(open).addListener(result -> {
             if (result.isSuccess()) completion.complete(null);
@@ -607,7 +658,10 @@ public class NatClientHandler extends NatCommonHandler {
             return CompletableFuture.failedFuture(new IllegalStateException("HTTP stream is closed"));
         }
         return StreamFlowController.get(ctx.channel()).sendAsync(streamId, data, null,
-                () -> httpStreams.remove(streamId));
+                () -> {
+                    markStreamClosed(streamId);
+                    httpStreams.remove(streamId);
+                });
     }
 
     CompletableFuture<Void> finishHttpResponse(int streamId, List<String> trailers) {
@@ -632,10 +686,14 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     void httpForwarderDone(int streamId, HttpStreamForwarder forwarder) {
-        httpStreams.remove(streamId, forwarder);
+        if (httpStreams.get(streamId) == forwarder) {
+            markStreamClosed(streamId);
+            httpStreams.remove(streamId, forwarder);
+        }
     }
 
     private void sendReset(int streamId, long errorCode, String reason) {
+        markStreamClosed(streamId);
         StreamFlowController.get(ctx.channel()).reset(streamId, errorCode, reason);
     }
 
@@ -669,9 +727,62 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     void removeLocalHandler(int streamId, LocalSpecusHandler handler) {
+        if (channelHandlerMap.get(streamId) == handler) {
+            markStreamClosed(streamId);
+        }
         if (channelHandlerMap.remove(streamId, handler)) {
             updateControlAutoReadForLocalWritability();
         }
+    }
+
+    private void markStreamOpened(int streamId) {
+        recentlyClosedStreams.remove(streamId);
+    }
+
+    private void markStreamClosed(int streamId) {
+        removePendingStream(streamId);
+        recentlyClosedStreams.add(streamId);
+    }
+
+    private boolean beginPendingStream(int streamId) {
+        recentlyClosedStreams.remove(streamId);
+        synchronized (pendingStreamIds) {
+            if (pendingStreamIds.contains(streamId)
+                    || pendingStreamIds.size() >= PENDING_STREAM_LIMIT) {
+                return false;
+            }
+            pendingStreamIds.add(streamId);
+            return true;
+        }
+    }
+
+    private boolean removePendingStream(int streamId) {
+        synchronized (pendingStreamIds) {
+            return pendingStreamIds.remove(streamId);
+        }
+    }
+
+    void sendTcpWindowUpdate(int streamId, int credit) {
+        sendWindowUpdate(streamId, credit);
+    }
+
+    void resetTcpStream(int streamId, long errorCode, String reason) {
+        if (ctx == null) {
+            return;
+        }
+        if (ctx.channel().isActive()) {
+            sendReset(streamId, errorCode, reason);
+        } else {
+            StreamFlowController.get(ctx.channel()).remove(streamId);
+        }
+    }
+
+    void pauseTcpControlReads() {
+        pauseControlReads();
+    }
+
+    boolean hasLocalTcpStream(int streamId) {
+        return channelHandlerMap.containsKey(streamId);
     }
 
     private void pauseControlReads() {
@@ -693,14 +804,6 @@ public class NatClientHandler extends NatCommonHandler {
     void syncLocalReadWithControl(Channel channel) {
         if (ctx != null) {
             ChannelBackpressure.setAutoRead(channel, ctx.channel().isWritable());
-        }
-    }
-
-    private static void shutdownOutput(Channel channel) {
-        if (channel instanceof DuplexChannel duplexChannel) {
-            duplexChannel.shutdownOutput();
-        } else {
-            channel.close();
         }
     }
 

@@ -44,6 +44,7 @@ public class TcpConnection implements AutoCloseable {
             b.option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
             b.option(ChannelOption.SO_KEEPALIVE, true);
             b.option(ChannelOption.TCP_NODELAY, true);
+            b.option(ChannelOption.ALLOW_HALF_CLOSURE, true);
             b.option(ChannelOption.WRITE_BUFFER_WATER_MARK, DEFAULT_WRITE_BUFFER_WATER_MARK);
             b.handler(channelInitializer);
 

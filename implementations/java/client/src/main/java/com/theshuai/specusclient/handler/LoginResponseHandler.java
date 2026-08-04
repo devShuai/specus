@@ -12,6 +12,7 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
 
     private final NettyClient nettyClient;
     private final String connectionRole;
+    private boolean loginResponseReceived;
 
     public LoginResponseHandler(NettyClient nettyClient) {
         this(nettyClient, ConnectionRole.CONTROL);
@@ -24,6 +25,13 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, LoginResponsePacket loginResponsePacket) throws Exception {
+        if (loginResponseReceived) {
+            log.warn("[{}] authenticated {} connection received duplicate LOGIN_RESPONSE",
+                    loginResponsePacket.getClientName(), connectionRole);
+            ctx.close();
+            return;
+        }
+        loginResponseReceived = true;
         String clientName = loginResponsePacket.getClientName();
         if (loginResponsePacket.isSuccess()) {
             log.info("[{}]登录成功", clientName);

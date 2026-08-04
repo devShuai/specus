@@ -1,11 +1,39 @@
 package com.theshuai.specusclient.handler;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.WebSocket13FrameDecoder;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class NatClientHandlerWebSocketTargetTests {
+
+    @Test
+    void acceptsLocalWebSocketFramesUpToProtocolMessageLimit() {
+        assertThat(NatClientHandler.LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES)
+                .isEqualTo(16 * 1024 * 1024);
+
+        int payloadBytes = 64 * 1024 + 1;
+        EmbeddedChannel decoder = new EmbeddedChannel(new WebSocket13FrameDecoder(
+                false, false, NatClientHandler.LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES));
+        ByteBuf wireFrame = Unpooled.buffer(10 + payloadBytes)
+                .writeByte(0x82)
+                .writeByte(127)
+                .writeLong(payloadBytes)
+                .writeZero(payloadBytes);
+        assertThat(decoder.writeInbound(wireFrame)).isTrue();
+        BinaryWebSocketFrame decoded = decoder.readInbound();
+        try {
+            assertThat(decoded.content().readableBytes()).isEqualTo(payloadBytes);
+        } finally {
+            decoded.release();
+            decoder.finishAndReleaseAll();
+        }
+    }
 
     @Test
     void mapsHttpSchemesAndPreservesEncodedPathAndRawQuery() {

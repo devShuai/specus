@@ -51,7 +51,7 @@ public class SpecusClientApplication {
     }
 
     @Bean
-    public SpecusBean specusBean() {
+    public ClientStartupConfig clientStartupConfig() {
         String configString = loadConfigString();
         if (!StringUtils.hasLength(configString)) {
             throw new IllegalStateException("未找到 " + CONFIG_FILE + " 配置，无法启动 specus client");
@@ -60,6 +60,15 @@ public class SpecusClientApplication {
         if (startupConfig == null || !StringUtils.hasText(startupConfig.getServerBaseUrl())) {
             throw new IllegalStateException(CONFIG_FILE + " 必须使用 HTTP 登录配置，至少包含 serverBaseUrl");
         }
+        if (startupConfig.getControlTls() == null) {
+            startupConfig.setControlTls(new com.theshuai.specusclient.bean.ControlTlsConfig());
+        }
+        startupConfig.getControlTls().validate(startupConfig.getServerBaseUrl());
+        return startupConfig;
+    }
+
+    @Bean
+    public SpecusBean specusBean(ClientStartupConfig startupConfig) {
         return loginAndBuildSpecus(startupConfig);
     }
 
@@ -94,6 +103,7 @@ public class SpecusClientApplication {
         }
         specusBean.setRemoteAddress(response.getNettyHost());
         specusBean.setRemotePort(response.getNettyPort());
+        specusBean.setNettyTls(response.isNettyTls());
         specusBean.setMaxOnlineInstances(response.getMaxOnlineInstances());
         specusBean.setSpecusConfigList(toSpecusConfigs(response.getSpecusConfigList()));
         specusBean.setHttpSpecusConfigList(toHttpSpecusConfigs(response.getHttpSpecusConfigList()));

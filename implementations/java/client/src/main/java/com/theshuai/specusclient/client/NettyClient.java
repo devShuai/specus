@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -70,6 +71,8 @@ public class NettyClient {
     private volatile EventLoopGroup localWorkerGroup;
     private volatile TcpConnection localConnection;
     private final SslContext sslContext;
+    private final String tlsServerNameOverride;
+    private final boolean verifyTlsHostname;
     private final AtomicReference<Channel> controlChannel = new AtomicReference<>();
     private final AtomicReference<Channel> dataChannel = new AtomicReference<>();
     private final PeerMeshClient peerMeshClient;
@@ -83,10 +86,17 @@ public class NettyClient {
     private static final long PROACTIVE_REFRESH_RETRY_DELAY_SECONDS = 60L;
 
     public NettyClient(SpecusBean specusBean) {
-        this(specusBean, null);
+        this(specusBean, null, null, false);
     }
 
     public NettyClient(SpecusBean specusBean, SslContext sslContext) {
+        this(specusBean, sslContext, null, sslContext != null);
+    }
+
+    public NettyClient(SpecusBean specusBean,
+                       SslContext sslContext,
+                       String tlsServerName,
+                       boolean verifyTlsHostname) {
         this.specusBean = specusBean;
         this.clientName = specusBean.getClientName();
         this.accessToken = specusBean.getAccessToken();
@@ -99,6 +109,8 @@ public class NettyClient {
         this.host = specusBean.getRemoteAddress();
         this.port = specusBean.getRemotePort();
         this.sslContext = sslContext;
+        this.tlsServerNameOverride = StringUtils.hasText(tlsServerName) ? tlsServerName.trim() : null;
+        this.verifyTlsHostname = verifyTlsHostname;
         PeerVirtualDeviceOptions peerOptions = new PeerVirtualDeviceOptions(
                 specusBean.getPeerMeshDevice(),
                 specusBean.getPeerMeshTunName(),
@@ -133,8 +145,7 @@ public class NettyClient {
                     @Override
                     public void initChannel(SocketChannel ch) {
                         if (sslContext != null) {
-                            SslHandler sslHandler = sslContext.newHandler(ch.alloc(), host, port);
-                            ch.pipeline().addFirst(sslHandler);
+                            ch.pipeline().addFirst(newControlSslHandler(ch));
                         }
                         ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this, ConnectionRole.CONTROL));
                         ch.pipeline().addLast(new Spliter());
@@ -158,7 +169,7 @@ public class NettyClient {
                     @Override
                     public void initChannel(SocketChannel ch) {
                         if (sslContext != null) {
-                            ch.pipeline().addFirst(sslContext.newHandler(ch.alloc(), host, port));
+                            ch.pipeline().addFirst(newControlSslHandler(ch));
                         }
                         ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this, ConnectionRole.DATA));
                         ch.pipeline().addLast(new Spliter());
@@ -172,14 +183,31 @@ public class NettyClient {
     }
 
     /**
-     * Build a client-side {@link SslContext} that trusts the server certificate
-     * stored in {@code truststorePath}. Pass the result to
-     * {@link #NettyClient(SpecusBean, SslContext)} to enable TLS.
+     * Compatibility overload for the original client TLS API. The path is a
+     * PEM CA certificate; the historic password argument was never consumed.
      */
     public static SslContext buildClientSslContext(String truststorePath, String truststorePassword) {
+        return buildClientSslContextFromCaCertificate(truststorePath);
+    }
+
+    /** Build a client TLS context using the platform trust store. */
+    public static SslContext buildClientSslContext() {
+        try {
+            return io.netty.handler.ssl.SslContextBuilder.forClient().build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("Failed to build client SslContext: " + e.getMessage(), e);
+        }
+    }
+
+    /** Build a client TLS context trusting a PEM CA certificate file. */
+    public static SslContext buildClientSslContextFromCaCertificate(String certificatePath) {
+        File certificate = new File(certificatePath == null ? "" : certificatePath.trim());
+        if (!certificate.isFile()) {
+            throw new IllegalStateException("control TLS CA certificate not found: " + certificate.getAbsolutePath());
+        }
         try {
             return io.netty.handler.ssl.SslContextBuilder.forClient()
-                    .trustManager(new File(truststorePath))
+                    .trustManager(certificate)
                     .build();
         } catch (SSLException e) {
             throw new IllegalStateException("Failed to build client SslContext: " + e.getMessage(), e);
@@ -252,6 +280,15 @@ public class NettyClient {
         loginRequestPacket.setAccessToken(accessToken);
         loginRequestPacket.setConnectionRole(connectionRole);
         channel.writeAndFlush(loginRequestPacket);
+    }
+
+    SslHandler newControlSslHandler(SocketChannel channel) {
+        String peerHost = tlsServerNameOverride == null ? host : tlsServerNameOverride;
+        SslHandler handler = sslContext.newHandler(channel.alloc(), peerHost, port);
+        SSLParameters parameters = handler.engine().getSSLParameters();
+        parameters.setEndpointIdentificationAlgorithm(verifyTlsHostname ? "HTTPS" : "");
+        handler.engine().setSSLParameters(parameters);
+        return handler;
     }
 
     private void sendPeerControl(String toClientName, String message) {

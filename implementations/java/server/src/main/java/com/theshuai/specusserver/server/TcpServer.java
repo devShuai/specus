@@ -11,6 +11,8 @@ import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 
+import java.net.InetSocketAddress;
+
 public class TcpServer {
 
     private final EventLoopGroup bossGroup;
@@ -35,6 +37,7 @@ public class TcpServer {
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .childOption(ChannelOption.SO_KEEPALIVE, properties.isKeepAlive())
                 .childOption(ChannelOption.TCP_NODELAY, properties.isTcpNoDelay())
+                .childOption(ChannelOption.ALLOW_HALF_CLOSURE, true)
                 .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, waterMark);
         channel = bootstrap.bind(port).sync().channel();
     }
@@ -43,5 +46,12 @@ public class TcpServer {
         if (channel != null) {
             channel.close();
         }
+    }
+
+    synchronized int localPort() {
+        if (channel == null || !(channel.localAddress() instanceof InetSocketAddress address)) {
+            throw new IllegalStateException("TCP server is not bound");
+        }
+        return address.getPort();
     }
 }

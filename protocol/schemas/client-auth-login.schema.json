@@ -376,6 +376,11 @@
         "nettyPort": {
           "$ref": "#/$defs/Port"
         },
+        "nettyTls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the advertised raw TCP control/data endpoint requires TLS. Missing on legacy servers means false."
+        },
         "maxOnlineInstances": {
           "type": "integer",
           "minimum": 1,

@@ -146,6 +146,11 @@ public class HttpSpecusController {
             metadata.put("relativePath", relativePath);
             metadata.put("rawQuery", request.getQueryString());
             metadata.put("headers", forwardedHeaders);
+            List<String> requestTrailerNames = declaredTrailerNames(
+                    request.getHeaders("Trailer"), access.credentialsConsumed());
+            if (!requestTrailerNames.isEmpty()) {
+                metadata.put("trailerNames", requestTrailerNames);
+            }
             if (request.getContentLengthLong() >= 0) {
                 metadata.put("contentLength", request.getContentLengthLong());
             }
@@ -168,7 +173,7 @@ public class HttpSpecusController {
                 }
             }
             natHandler.finishHttpRequest(streamId, flattenTrailers(
-                    request.getTrailerFields(), access.credentialsConsumed()))
+                    request.getTrailerFields(), access.credentialsConsumed(), requestTrailerNames))
                     .get(timeoutMillis, TimeUnit.MILLISECONDS);
 
             HttpStreamExchange.ResponseHead head = exchange.awaitResponseHead(timeoutMillis);
@@ -183,8 +188,12 @@ public class HttpSpecusController {
                     responseHeaders);
             responseBodyExternalized = mediaCapture.externalized();
             response.setStatus(statusCode);
+            List<String> responseTrailerNames = validTrailerNames(head.trailerNames(), false);
             HttpStreamExchange finalExchange = exchange;
-            response.setTrailerFields(() -> trailerMap(finalExchange.trailers()));
+            response.setTrailerFields(() -> trailerMap(finalExchange.trailers(), responseTrailerNames));
+            if (!responseTrailerNames.isEmpty()) {
+                response.setHeader("Trailer", String.join(", ", responseTrailerNames));
+            }
 
             boolean rewriteBuffered = responseRewriter.isRewritableContentType(responseHeaders)
                     && isPathRewriteEnabled(clientName, route)
@@ -350,31 +359,120 @@ public class HttpSpecusController {
     }
 
     static List<String> flattenTrailers(Map<String, String> trailers, boolean stripAuthorization) {
+        return flattenTrailers(trailers, stripAuthorization,
+                trailers == null ? List.of() : List.copyOf(trailers.keySet()));
+    }
+
+    static List<String> flattenTrailers(Map<String, String> trailers, boolean stripAuthorization,
+                                        List<String> declaredNames) {
         if (trailers == null || trailers.isEmpty()) {
             return List.of();
         }
+        Set<String> declared = lowerCaseNames(validTrailerNames(declaredNames, stripAuthorization));
         List<String> result = new ArrayList<>(trailers.size());
         trailers.forEach((name, value) -> {
-            if (!stripAuthorization || !HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name)) {
+            if (name != null && value != null
+                    && declared.contains(name.toLowerCase(Locale.ROOT))
+                    && isHeaderValue(value)) {
                 result.add(name + ":" + value);
             }
         });
+        return List.copyOf(result);
+    }
+
+    static List<String> declaredTrailerNames(Enumeration<String> declarations,
+                                             boolean stripAuthorization) {
+        List<String> names = new ArrayList<>();
+        while (declarations != null && declarations.hasMoreElements()) {
+            String declaration = declarations.nextElement();
+            if (declaration == null) {
+                continue;
+            }
+            for (String name : declaration.split(",")) {
+                names.add(name);
+            }
+        }
+        return validTrailerNames(names, stripAuthorization);
+    }
+
+    static List<String> validTrailerNames(List<String> names, boolean stripAuthorization) {
+        if (names == null || names.isEmpty()) {
+            return List.of();
+        }
+        Set<String> seen = new java.util.HashSet<>();
+        List<String> result = new ArrayList<>();
+        for (String candidate : names) {
+            String name = candidate == null ? "" : candidate.trim();
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (isHeaderName(name) && !SKIPPED_HEADERS.contains(lower)
+                    && !(stripAuthorization && HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name))
+                    && seen.add(lower)) {
+                result.add(name);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private static boolean isHeaderName(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        for (int index = 0; index < name.length(); index++) {
+            char ch = name.charAt(index);
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9') || "!#$%&'*+-.^_`|~".indexOf(ch) >= 0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static Map<String, String> trailerMap(List<String> trailers, List<String> declaredNames) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (String trailer : validTrailerLines(trailers, declaredNames)) {
+            int separator = trailer.indexOf(':');
+            String name = trailer.substring(0, separator).trim();
+            String value = trailer.substring(separator + 1).trim();
+            result.merge(name, value, (left, right) -> left + "," + right);
+        }
         return result;
     }
 
-    private Map<String, String> trailerMap(List<String> trailers) {
-        Map<String, String> result = new LinkedHashMap<>();
-        if (trailers == null) {
-            return result;
+    static List<String> validTrailerLines(List<String> trailers, List<String> declaredNames) {
+        if (trailers == null || trailers.isEmpty()) {
+            return List.of();
         }
+        Set<String> declared = lowerCaseNames(validTrailerNames(declaredNames, false));
+        List<String> result = new ArrayList<>();
         for (String trailer : trailers) {
+            if (trailer == null) {
+                continue;
+            }
             int separator = trailer.indexOf(':');
-            if (separator > 0 && shouldForward(trailer.substring(0, separator))) {
-                result.merge(trailer.substring(0, separator), trailer.substring(separator + 1),
-                        (left, right) -> left + "," + right);
+            if (separator <= 0) {
+                continue;
+            }
+            String name = trailer.substring(0, separator).trim();
+            String value = trailer.substring(separator + 1).trim();
+            if (declared.contains(name.toLowerCase(Locale.ROOT))
+                    && isHeaderName(name) && !SKIPPED_HEADERS.contains(name.toLowerCase(Locale.ROOT))
+                    && isHeaderValue(value)) {
+                result.add(name + ":" + value);
             }
         }
+        return List.copyOf(result);
+    }
+
+    private static Set<String> lowerCaseNames(List<String> names) {
+        Set<String> result = new java.util.HashSet<>();
+        for (String name : names) {
+            result.add(name.toLowerCase(Locale.ROOT));
+        }
         return result;
+    }
+
+    private static boolean isHeaderValue(String value) {
+        return value != null && value.indexOf('\r') < 0 && value.indexOf('\n') < 0;
     }
 
     private static Throwable unwrap(Throwable error) {

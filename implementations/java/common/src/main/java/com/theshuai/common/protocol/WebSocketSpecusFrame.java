@@ -85,7 +85,8 @@ public record WebSocketSpecusFrame(int opcode, boolean finalFragment, int rsv,
             if (payloadLength > 123) {
                 throw new IllegalArgumentException("WebSocket close reason exceeds 123 bytes");
             }
-            if (closeCode != 0 && (closeCode < 1000 || closeCode >= 5000)) {
+            if (closeCode != 0 && (closeCode < 1000 || closeCode >= 5000
+                    || isWireForbiddenCloseCode(closeCode))) {
                 throw new IllegalArgumentException("invalid WebSocket close code");
             }
             if (closeCode == 0 && payloadLength != 0) {
@@ -94,5 +95,9 @@ public record WebSocketSpecusFrame(int opcode, boolean finalFragment, int rsv,
         } else if (closeCode != 0) {
             throw new IllegalArgumentException("close code is only valid on CLOSE");
         }
+    }
+
+    private static boolean isWireForbiddenCloseCode(int closeCode) {
+        return closeCode == 1004 || closeCode == 1005 || closeCode == 1006 || closeCode == 1015;
     }
 }
