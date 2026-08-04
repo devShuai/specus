@@ -14,11 +14,14 @@ ANY /http/{clientName}/{route}/**
 
 - `clientName` 必须对应已启用且在线的客户端；
 - `route` 必须存在、启用并属于该客户端；
+- 服务端持久化 route 可选择启用 HTTP Basic 入口认证；未启用时保持公开访问；
 - 后续相对路径保留原始百分号编码；
 - query 使用原始 query string，不执行 decode/re-encode；
-- 普通请求使用 HTTP stream，WebSocket Upgrade 使用同一 NAT stream 上的 SWS2。
+- 普通请求使用 HTTP stream；支持 HTTP-route WebSocket 的实现使用同一 NAT stream 上的 SWS2。
 
-找不到客户端或活动 `data` 连接时返回 `502`；route 不存在时返回 `404`。请求超时返回 `504`，请求体超过
+认证已启用但凭据缺失或错误时返回 `401`，并携带 `WWW-Authenticate: Basic`；认证配置读取失败时返回
+`503`。认证在读取请求体、创建 NAT stream，以及受支持实现执行 WebSocket Upgrade 之前完成。找不到客户端或活动 `data`
+连接时返回 `502/503`（以实现的离线语义为准）；route 不存在由客户端拒绝。请求超时返回 `504`，请求体超过
 配置上限返回 `413`。
 
 ## 2. route 配置
@@ -32,6 +35,16 @@ ANY /http/{clientName}/{route}/**
 | `targetBaseUrl` | 客户端实际访问的 `http/https/ws/wss` 基础地址 |
 | `enabled` | 是否允许公网访问 |
 | `pathRewriteEnabled` | 是否对可安全缓冲的小型 HTML/CSS 响应执行路径改写 |
+| `authEnabled` | 是否要求公网调用方通过 HTTP Basic 认证；默认 `false` |
+| `authUsername` | Basic 用户名，trim 后最多 120 字符且不得含 `:`、CR 或 LF |
+
+管理 API 的 mutation 使用可选 `authPassword` 接收密码，最长 256 字符；服务端只保存其哈希。响应仅返回
+`authEnabled`、`authUsername` 与 `authPasswordConfigured`，不会返回明文或哈希。更新时省略密码、传 `null`
+或传全空白字符串表示保留原密码；首次启用认证必须同时具备用户名和密码。关闭认证保留已有凭据，便于之后
+重新启用。
+
+入口认证仅属于 server 公网边界，不进入 `httpSpecusConfigList`，客户端也不持有访问密码。没有服务端持久化
+记录的 legacy 本地 route 继续按公开入口处理，以兼容客户端本地配置。
 
 目标 URI 由 `targetBaseUrl + relativePath + ?rawQuery` 构造。base URL 不能包含 query/fragment，相对路径不能
 含控制字符。HTTP 客户端不自动跟随 redirect，响应原样返回给公网调用方。
@@ -109,13 +122,18 @@ Connection, Content-Length, Host, Keep-Alive, Proxy-Authenticate,
 Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade
 ```
 
-其他 header 按 `name:value` 数组保留重复值。公网响应的 Content-Length 由实际输出决定；经过路径改写或解压后必须
-移除旧 Content-Length/Content-Encoding。`Range` 只接受有界的单范围表达式，非法或无界范围不得直接传给 upstream。
+其他 header 按 `name:value` 数组保留重复值。受保护 route 的入口 `Authorization: Basic ...` 在校验成功后必须
+从转发 metadata 和流量明细中移除，防止公网凭据泄露给 upstream 或持久化；公开 route 的 Authorization 仍原样
+透传，以支持 upstream 自身的 Bearer/Basic 认证。公网响应的 Content-Length 由实际输出决定；经过路径改写或
+解压后必须移除旧 Content-Length/Content-Encoding。`Range` 只接受有界的单范围表达式，非法或无界范围不得直接
+传给 upstream。
 
 ## 7. WebSocket SWS2
 
-WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`。建立后，WebSocket frame 放入 NAT DATA 的 SWS2
-二进制 envelope：
+Java、Go 与 C server 支持的 WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`，并与普通 HTTP 共用
+route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝。建立后，WebSocket frame 放入 NAT
+DATA 的 SWS2 二进制 envelope。当前 .NET server 的 `/http/**` 只实现普通 HTTP stream，不接受该路径的
+WebSocket Upgrade：
 
 | 字段 | 长度 | 说明 |
 | --- | ---: | --- |
@@ -143,7 +161,7 @@ WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`。建立后，WebSoc
 每个请求记录 route/client、method、relativePath、rawQuery、status、耗时、请求/响应字节和失败原因。正文预览按
 配置截断，采集队列有界，不能反向阻塞数据面。流量计数按实际 DATA 字节累计，不包含控制 framing。
 
-日志和指标不得把 streamId、完整 URL、token 或正文作为常驻标签。
+日志和指标不得把 streamId、完整 URL、token、Basic Authorization 或正文作为常驻标签。
 
 ## 10. 实现入口
 
@@ -151,7 +169,7 @@ WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`。建立后，WebSoc
 | --- | --- | --- |
 | Java | `HttpSpecusController`、`HttpStreamExchange` | `HttpStreamForwarder` |
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
-| .NET | `DirectHttpDispatcher`、`HttpSpecusStream` | `HttpStreamChannel` |
+| .NET（当前仅普通 HTTP） | `DirectHttpDispatcher`、`HttpSpecusStream` | `HttpStreamChannel` |
 | C server | `admin_http.c`、`main.c` NAT stream bridge | 使用 Java/Go/.NET v2 客户端 |
 
 中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。
