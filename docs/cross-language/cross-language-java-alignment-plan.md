@@ -79,7 +79,8 @@
 状态：Go / .NET 已推进到 DB / Elasticsearch 双后端；前端预览体验仍可继续细化。
 
 - Go client 与 .NET client 已补齐 Java `DirectHttpForwarder` 语义：内网 HTTPS upstream 允许使用自签证书；请求体上限 16 MiB、响应体上限 64 MiB；单段 `Range` 会按 8 MiB 窗口收窄，复杂 multi-range 保持原样交由 upstream 处理；默认不自动重定向、不自动解压；`relativePath` 中的 `//` 按 Java 一样作为同 host 下的普通双斜线路径保留；请求体超限、响应体超限、未配置 route、非法 route 目标、非法/越界转发路径等用户可见错误文案已收敛为 Java 中文消息。
-- Go client 与 .NET client 已补齐 Java HTTP route WebSocket 隧道语义：识别 NAT `CONNECTED source=ws`，按当前 HTTP route 快照构造 `ws://` / `wss://` 上游地址，`relativePath` 中的 `//` 作为同 host 下普通双斜线路径保留；过滤 hop-by-hop 与 WebSocket 握手头；WebSocket target 构造失败时的未配置 route、非法 scheme、非法 route 地址和非法 `relativePath` 等错误文案已收敛为 Java 中文消息；内网 `wss` upstream 按 Direct HTTP 的运维场景信任自签证书；本地 WebSocket text/binary frame 会封装为首字节 `0x01/0x02` 的 NAT `DATA source=ws`，服务端回传的 `DATA` 也会按同一前缀还原为 text/binary frame，任一侧断开都会清理 channel 并回发 `DISCONNECTED source=ws`。
+- Go client 与 .NET client 已补齐 Java HTTP route WebSocket 隧道语义：识别 NAT `OPEN source=ws`，按当前 HTTP route 快照构造 `ws://` / `wss://` 上游地址，`relativePath` 中的 `//` 作为同 host 下普通双斜线路径保留；过滤 hop-by-hop 与 WebSocket 握手头；WebSocket target 构造失败时的未配置 route、非法 scheme、非法 route 地址和非法 `relativePath` 等错误文案已收敛为 Java 中文消息；内网 `wss` upstream 按 Direct HTTP 的运维场景信任自签证书；本地 WebSocket frame 使用 SWS2 envelope 封装进 NAT `DATA`，服务端回传的 `DATA` 按同一 envelope 还原，任一侧断开都会通过 `FIN/RST` 清理 stream。
+- .NET server 的 `/http/{clientName}/{route}/**` 已补齐 Java/Go WebSocket Upgrade 分流：逐 route Basic 在 `101` 前校验，受保护 route 消费并移除入口 Authorization；Upgrade 后发送 `OPEN source=ws`，双向使用 SWS2 `DATA`，按实际写入返还 `WINDOW_UPDATE`，浏览器关闭传播 `CLOSE + FIN`，客户端 `FIN/RST` 只关闭浏览器侧并幂等释放 stream。
 - Go server 与 .NET server 的 Direct HTTP 入口已按 Java `request.getRequestURI()` 语义保留原始路径编码：服务端从 raw path 截取 `/http/{clientName}/{route}` 后的部分，`%2F` 不会变成真实斜线，中文等非 ASCII 字符会保持/恢复为 UTF-8 percent-encoding，`rawQuery` 仍保留原始查询字符串。
 - Go server 与 .NET server 已对齐管理契约：
   - `specus_mapping.detail_capture_enabled`。

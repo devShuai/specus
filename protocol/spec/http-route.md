@@ -130,10 +130,9 @@ Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade
 
 ## 7. WebSocket SWS2
 
-Java、Go 与 C server 支持的 WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`，并与普通 HTTP 共用
-route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝。建立后，WebSocket frame 放入 NAT
-DATA 的 SWS2 二进制 envelope。当前 .NET server 的 `/http/**` 只实现普通 HTTP stream，不接受该路径的
-WebSocket Upgrade：
+Java、Go、.NET 与 C server 支持的 WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`，并与普通 HTTP
+共用 route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝，且不得创建 NAT stream。建立后，
+WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
 
 | 字段 | 长度 | 说明 |
 | --- | ---: | --- |
@@ -169,7 +168,7 @@ WebSocket Upgrade：
 | --- | --- | --- |
 | Java | `HttpSpecusController`、`HttpStreamExchange` | `HttpStreamForwarder` |
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
-| .NET（当前仅普通 HTTP） | `DirectHttpDispatcher`、`HttpSpecusStream` | `HttpStreamChannel` |
+| .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
 | C server | `admin_http.c`、`main.c` NAT stream bridge | 使用 Java/Go/.NET v2 客户端 |
 
 中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。
