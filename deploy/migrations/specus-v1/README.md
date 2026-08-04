@@ -92,6 +92,25 @@ the source prefix for rollback. A non-empty destination is rejected unless
 `--resume` is explicitly supplied. `mc diff` validates object names and sizes;
 retain the source prefix until application-level download/playback checks pass.
 
+When `mc` is not installed but the host has `python3-boto3`, use the native
+S3-compatible migrator. It reads the existing media credentials from
+`SPECUS_MEDIA_CAPTURE_*`, performs server-side copies, verifies every
+destination key and size, and retains the source:
+
+```bash
+python ./deploy/migrations/specus-v1/migrate_s3_prefix.py \
+  --from shuai-tunnel/http-media \
+  --to specus/http-media
+
+python ./deploy/migrations/specus-v1/migrate_s3_prefix.py \
+  --from shuai-tunnel/http-media \
+  --to specus/http-media \
+  --apply
+```
+
+Use `--resume` only after inspecting a partial destination left by an
+interrupted migration.
+
 ## Elasticsearch
 
 When traffic detail storage is enabled, clone both legacy indices while the
@@ -104,12 +123,29 @@ python ./deploy/migrations/specus-v1/migrate_elasticsearch.py
 python ./deploy/migrations/specus-v1/migrate_elasticsearch.py --apply
 ```
 
+Production installations often prepend an environment name. Pass the actual
+index pairs explicitly. If the new server already auto-created empty
+destination indices, `--replace-empty-destination` may remove only those
+zero-document indices before cloning:
+
+```bash
+python ./deploy/migrations/specus-v1/migrate_elasticsearch.py \
+  --index-rename \
+    prod-shuai-tunnel-http-traffic=prod-specus-http-traffic \
+  --index-rename \
+    prod-shuai-tunnel-tcp-traffic=prod-specus-tcp-traffic \
+  --replace-empty-destination
+```
+
+Stop every index writer, inspect the plan, then append `--apply`.
+
 Basic authentication is also supported through
 `SPECUS_ELASTICSEARCH_USERNAME` and `SPECUS_ELASTICSEARCH_PASSWORD`.
 `--ca-file` selects a private CA; `--insecure` is an explicit last-resort
 option. The script adds a write block, uses Elasticsearch's clone API, waits
-for the destination, compares document counts, restores the source write
-state, and keeps the source index for rollback.
+for the destination, rewrites Spring Data `_class` values from the legacy Java
+package to the Specus package, compares document counts, restores the source
+write state, and keeps the source index for rollback.
 
 Redis coordination contains only leased presence, revision and rate-limit
 windows. It is intentionally not copied: stop every old instance, start every
@@ -236,7 +272,7 @@ Run the migration unit tests:
 
 ```powershell
 cd .\deploy\migrations\specus-v1
-python -m unittest -v test_migrate_env.py test_migrate_elasticsearch.py database/test_migrate_sqlite.py database/test_database_scripts.py
+python -m unittest -v test_migrate_env.py test_migrate_elasticsearch.py test_migrate_s3_prefix.py database/test_migrate_sqlite.py database/test_database_scripts.py
 ```
 
 For SQLite, verify there are no old schema objects:

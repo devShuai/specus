@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from migrate_elasticsearch import INDEX_RENAMES, migrate_indices
+from migrate_elasticsearch import (
+    INDEX_RENAMES,
+    migrate_indices,
+    parse_index_renames,
+)
 
 
 class FakeElasticsearchClient:
@@ -37,6 +41,14 @@ class FakeElasticsearchClient:
     def refresh(self, index: str) -> None:
         self.operations.append(("refresh", index))
 
+    def delete(self, index: str) -> None:
+        self.operations.append(("delete", index))
+        del self.counts[index]
+
+    def rewrite_document_types(self, index: str) -> int:
+        self.operations.append(("rewrite_document_types", index))
+        return self.counts[index]
+
 
 class ElasticsearchMigrationTests(unittest.TestCase):
     def test_plan_is_read_only(self) -> None:
@@ -54,6 +66,7 @@ class ElasticsearchMigrationTests(unittest.TestCase):
         self.assertEqual(12, client.counts[destination])
         self.assertIn(("add_write_block", source), client.operations)
         self.assertIn(("clone", source, destination), client.operations)
+        self.assertIn(("rewrite_document_types", destination), client.operations)
         self.assertIn(("remove_write_block", source), client.operations)
 
     def test_apply_preserves_an_existing_write_block(self) -> None:
@@ -75,6 +88,55 @@ class ElasticsearchMigrationTests(unittest.TestCase):
         client = FakeElasticsearchClient({source: 3, destination: 2})
         with self.assertRaisesRegex(RuntimeError, "destination"):
             migrate_indices(client, apply=True, emit=lambda _: None)
+
+    def test_apply_can_replace_only_an_empty_destination(self) -> None:
+        source, destination = INDEX_RENAMES[0]
+        client = FakeElasticsearchClient({source: 3, destination: 0})
+        migrate_indices(
+            client,
+            apply=True,
+            replace_empty_destination=True,
+            emit=lambda _: None,
+        )
+        self.assertEqual(3, client.counts[destination])
+        self.assertIn(("delete", destination), client.operations)
+        self.assertIn(("clone", source, destination), client.operations)
+
+    def test_custom_production_index_names(self) -> None:
+        pairs = parse_index_renames(
+            [
+                "prod-shuai-tunnel-http-traffic=prod-specus-http-traffic",
+                "prod-shuai-tunnel-tcp-traffic=prod-specus-tcp-traffic",
+            ]
+        )
+        self.assertEqual(
+            (
+                (
+                    "prod-shuai-tunnel-http-traffic",
+                    "prod-specus-http-traffic",
+                ),
+                (
+                    "prod-shuai-tunnel-tcp-traffic",
+                    "prod-specus-tcp-traffic",
+                ),
+            ),
+            pairs,
+        )
+
+    def test_existing_clone_rewrites_legacy_document_types(self) -> None:
+        source, destination = INDEX_RENAMES[0]
+        client = FakeElasticsearchClient({source: 3, destination: 3})
+        migrate_indices(client, apply=True, emit=lambda _: None)
+        self.assertIn(("rewrite_document_types", destination), client.operations)
+        self.assertFalse(
+            any(operation[0] == "clone" for operation in client.operations)
+        )
+
+    def test_rejects_unsafe_or_identical_custom_index_names(self) -> None:
+        for value in ("source", "../source=dest", "same=same"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_index_renames([value])
 
 
 if __name__ == "__main__":

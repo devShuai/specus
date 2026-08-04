@@ -22,6 +22,22 @@ INDEX_RENAMES = (
     ("shuai-tunnel-http-traffic", "specus-http-traffic"),
     ("shuai-tunnel-tcp-traffic", "specus-tcp-traffic"),
 )
+DOCUMENT_TYPE_RENAMES = {
+    (
+        "com.theshuai.tunnelserver.management.storage."
+        "HttpTrafficExchangeDocument"
+    ): (
+        "com.theshuai.specusserver.management.storage."
+        "HttpTrafficExchangeDocument"
+    ),
+    (
+        "com.theshuai.tunnelserver.management.storage."
+        "TcpTrafficFrameDocument"
+    ): (
+        "com.theshuai.specusserver.management.storage."
+        "TcpTrafficFrameDocument"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -181,6 +197,44 @@ class ElasticsearchClient:
     def refresh(self, index: str) -> None:
         self.request("POST", self.index_path(index) + "/_refresh")
 
+    def delete(self, index: str) -> None:
+        self.request("DELETE", self.index_path(index))
+
+    def rewrite_document_types(self, index: str) -> int:
+        _, payload = self.request(
+            "POST",
+            self.index_path(index)
+            + "/_update_by_query?conflicts=abort&refresh=true",
+            {
+                # Spring Data stores _class as an unindexed keyword, so the
+                # script must inspect each document and explicitly mark
+                # unrelated documents as no-ops.
+                "query": {"match_all": {}},
+                "script": {
+                    "lang": "painless",
+                    "source": (
+                        "def replacement = params.renames.get("
+                        "ctx._source._class); "
+                        "if (replacement != null) { "
+                        "ctx._source._class = replacement; "
+                        "} else { ctx.op = 'noop'; }"
+                    ),
+                    "params": {"renames": DOCUMENT_TYPE_RENAMES},
+                },
+            },
+        )
+        if payload.get("timed_out") is True or payload.get("failures"):
+            raise RuntimeError(
+                f"Failed to rewrite document types in {index}: "
+                f"{payload.get('failures')}"
+            )
+        updated = payload.get("updated")
+        if not isinstance(updated, int) or updated < 0:
+            raise RuntimeError(
+                f"Invalid update count while rewriting document types in {index}"
+            )
+        return updated
+
 
 def inspect_index(
     client: ElasticsearchClient,
@@ -203,9 +257,11 @@ def migrate_indices(
     client: ElasticsearchClient,
     *,
     apply: bool,
+    index_renames: tuple[tuple[str, str], ...] = INDEX_RENAMES,
+    replace_empty_destination: bool = False,
     emit: Callable[[str], None] = print,
 ) -> None:
-    for source, destination in INDEX_RENAMES:
+    for source, destination in index_renames:
         state = inspect_index(client, source, destination)
         if not state.source_exists and not state.destination_exists:
             emit(f"skip {source}: source index does not exist")
@@ -222,12 +278,35 @@ def migrate_indices(
                     f"already cloned {source} -> {destination}: "
                     f"documents={state.source_count}"
                 )
+                if apply:
+                    before_count = client.count(destination)
+                    updated = client.rewrite_document_types(destination)
+                    client.refresh(destination)
+                    after_count = client.count(destination)
+                    if after_count != before_count:
+                        raise RuntimeError(
+                            f"Document count changed while rewriting types in "
+                            f"{destination}: before={before_count}, "
+                            f"after={after_count}"
+                        )
+                    emit(
+                        f"rewrote legacy document types in {destination}: "
+                        f"documents={updated}"
+                    )
                 continue
-            raise RuntimeError(
-                f"Cannot migrate {source}: destination {destination} exists "
-                f"with {state.destination_count} documents; "
-                f"source has {state.source_count}"
-            )
+            if replace_empty_destination and state.destination_count == 0:
+                emit(
+                    f"{'apply' if apply else 'plan'} replace empty "
+                    f"{destination} before cloning {source}"
+                )
+                if apply:
+                    client.delete(destination)
+            else:
+                raise RuntimeError(
+                    f"Cannot migrate {source}: destination {destination} exists "
+                    f"with {state.destination_count} documents; "
+                    f"source has {state.source_count}"
+                )
 
         emit(
             f"{'apply' if apply else 'plan'} {source} -> {destination}: "
@@ -242,6 +321,7 @@ def migrate_indices(
         try:
             client.clone(source, destination)
             client.wait_until_available(destination)
+            updated = client.rewrite_document_types(destination)
             client.refresh(destination)
             destination_count = client.count(destination)
             if destination_count != state.source_count:
@@ -255,7 +335,7 @@ def migrate_indices(
                 client.remove_write_block(source)
         emit(
             f"verified {destination}: documents={state.source_count}; "
-            f"source retained for rollback"
+            f"types_rewritten={updated}; source retained for rollback"
         )
 
     if not apply:
@@ -296,7 +376,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="clone and verify indices; otherwise only inspect and plan",
     )
+    parser.add_argument(
+        "--index-rename",
+        action="append",
+        default=[],
+        metavar="SOURCE=DESTINATION",
+        help=(
+            "clone an explicit index pair; repeat for HTTP and TCP. "
+            "Defaults to the unprefixed legacy names"
+        ),
+    )
+    parser.add_argument(
+        "--replace-empty-destination",
+        action="store_true",
+        help=(
+            "delete a destination only when it contains zero documents, then "
+            "clone the source; useful when the new server auto-created it"
+        ),
+    )
     return parser.parse_args()
+
+
+def parse_index_renames(values: list[str]) -> tuple[tuple[str, str], ...]:
+    if not values:
+        return INDEX_RENAMES
+    result: list[tuple[str, str]] = []
+    for value in values:
+        source, separator, destination = value.partition("=")
+        source = source.strip()
+        destination = destination.strip()
+        if (
+            not separator
+            or not INDEX_NAME.fullmatch(source)
+            or not INDEX_NAME.fullmatch(destination)
+            or source == destination
+        ):
+            raise ValueError(
+                "Index rename must be SOURCE=DESTINATION using safe, "
+                f"different index names: {value!r}"
+            )
+        result.append((source, destination))
+    if len(set(result)) != len(result):
+        raise ValueError("Duplicate Elasticsearch index rename")
+    return tuple(result)
 
 
 def main() -> int:
@@ -322,7 +444,12 @@ def main() -> int:
         ca_file=args.ca_file,
         insecure=args.insecure,
     )
-    migrate_indices(client, apply=args.apply)
+    migrate_indices(
+        client,
+        apply=args.apply,
+        index_renames=parse_index_renames(args.index_rename),
+        replace_empty_destination=args.replace_empty_destination,
+    )
     return 0
 
 
