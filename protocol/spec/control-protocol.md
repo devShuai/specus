@@ -125,14 +125,16 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 
 每流初始发送窗口为 `1 MiB`，窗口累计上限 `16 MiB`，单流待发送队列上限 `4 MiB`。发送端按流轮转，
 每轮最多发送一个不超过 `64 KiB` 的 DATA 分片；credit 不足或数据连接不可写时暂停对应上游读取。消费
-DATA 后按实际字节数回送 `WINDOW_UPDATE`。窗口溢出、队列溢出、DATA-after-FIN 或非法状态转换使用
-`RST` 或关闭违规连接。
+DATA 后按实际字节数回送 `WINDOW_UPDATE`。窗口/队列溢出和非法状态转换必须按下面的 stream 生命周期规则
+发送 `RST` 或在确属 data-connection 协议违规时关闭连接。
 
 `DATA|END_STREAM` 等价于先消费该 DATA、再收到同方向 FIN；接收端必须先交付 payload，再执行 half-close。
 
 普通 TCP stream 的两个方向独立结束：收到 `FIN` 只对本地 socket 对应的写方向执行 half-close，仍须继续读取并转发
 反向数据；本地读到 EOF 时只发送一次 `FIN`。双方 FIN 后才能正常释放 stream，`RST` 或 I/O 错误则立即关闭双方。
-重复 FIN、FIN 后同方向 DATA，以及从未 OPEN 的 stream 上出现 DATA/FIN/RST 都属于协议违规。
+重复 OPEN、重复 FIN、FIN 后同方向 DATA、未知 stream 的 DATA/FIN 或其它无效单流转换，只对该 stream 回复 `RST`，
+不能关闭同一 data connection 上的其它 stream。迟到 `RST` 命中最近关闭 stream 的 tombstone 时幂等忽略；只有针对
+从未打开 stream 的 `RST` 才是 data-connection 协议违规，接收端必须关闭该数据连接。
 
 ## HTTP streaming
 
@@ -163,7 +165,8 @@ WebSocket payload 在 NAT DATA 内使用 `SWS2` 二进制 envelope：
 
 控制帧必须 FIN、不得携带 RSV、payload 不超过 125 字节；CLOSE reason 最大 123 字节。
 wire close code `1004`、`1005`、`1006`、`1015` 禁止发送；未知 opcode、错误长度、其它非法 close code、截断和
-尾随字节必须拒绝。
+尾随字节必须拒绝。原始 WebSocket data frame 可在 16 MiB 上限内拆成多个 SWS2：首段保留 opcode/RSV，后续
+使用 continuation，仅末段继承原始 FIN；控制帧不得拆分。
 
 ## 测试向量
 

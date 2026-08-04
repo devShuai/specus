@@ -73,9 +73,9 @@ ANY /http/{clientName}/{route}/**
 `FIN.metadata.trailers` 的 `name:value` 字符串数组中。接收端只转发 OPEN 已声明且名称合法的 trailer；未声明字段、
 禁止字段和 CR/LF 注入必须丢弃或拒绝。没有 trailers 且长度已知时应保留定长请求，不得无条件改为 chunked。
 
-Android 当前使用的 `HttpURLConnection` 不提供发送 request trailers 的 API。Android client 收到非空
-`trailerNames` 或 FIN trailers 时必须显式 `RST`，不得把 trailer 静默丢弃后继续请求；这是平台能力边界，Java、
-Go、.NET client 仍按上述规范转发。response trailers 仅在 Android 平台 API 实际暴露时按声明交集转发。
+Java、Go、.NET 与 Android client 都必须按上述规范流式转发 request trailers；任何实现都不得因平台 HTTP API
+限制而静默丢弃 trailer、改写带 body 的 method，或把 early response 延迟到上传结束。Android 使用受 VPN protect 的
+Netty HTTP/1.1 transport 满足该契约。
 
 客户端必须在读取 request DATA 后按实际消费字节发送 `WINDOW_UPDATE`。如果 upstream 无法建立、请求格式无效、
 本地队列超限或服务端取消，任一端发送 `RST(value=errorCode, metadata.reason)` 并释放 stream。
@@ -117,7 +117,8 @@ HTTP 使用控制协议定义的统一流控：
 - 活动流公平轮转，每轮最多发送一个 64 KiB DATA；
 - `WINDOW_UPDATE.value` 必须大于 0，且不能导致窗口溢出；
 - FIN 只关闭当前发送方向；双方 FIN 后 stream 才正常结束；
-- DATA-after-FIN、重复 OPEN、未知 stream 或非法状态转换必须 RST 或关闭违规连接。
+- DATA-after-FIN、重复 OPEN、未知 stream 或非法状态转换按控制协议的 stream 生命周期规则处理：单流错误只 RST
+  受影响 stream，只有针对从未打开 stream 的 RST 才关闭 data connection。
 
 公网调用方断开、Servlet/ASP.NET/Go context 取消或超时必须发送 RST。客户端收到 RST 后立即取消 upstream 请求并
 关闭 response body，不继续后台下载。
@@ -154,8 +155,10 @@ WebSocket Upgrade，并与普通 HTTP 共用 route Basic gate；认证失败必�
 
 固定头为 12 字节。控制帧必须 FIN、payload 不超过 125 字节；close reason 最大 123 字节。非 CLOSE 的 closeCode
 必须为 0；CLOSE 可使用 0（仅无 reason）或 `1000..4999` 中除 `1004`、`1005`、`1006`、`1015` 外的值。未知 opcode、
-非法 RSV、错误 close code、截断、尾随字节和超过 NAT chunk 上限的 frame 必须拒绝。SWS2 保留 WebSocket frame
-语义，不把未知类型当 binary，也不使用旧的一字节 text/binary 前缀。
+非法 RSV、错误 close code、截断、尾随字节和超过 NAT chunk 上限的单个 SWS2 envelope 必须拒绝。原始 WebSocket
+data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/RSV，后续段使用 continuation，只有末段继承
+原始 FIN；ping/pong/close 等控制帧必须保持单帧且不得拆分。该规范化保留 WebSocket 消息与扩展语义，不把未知类型
+当 binary，也不使用旧的一字节 text/binary 前缀。
 
 ## 8. 响应路径改写
 
