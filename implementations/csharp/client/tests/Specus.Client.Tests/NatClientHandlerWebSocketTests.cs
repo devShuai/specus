@@ -189,16 +189,28 @@ public class NatClientHandlerWebSocketTests
     }
 
     [Fact]
-    public void BuildLocalWebSocket_TrustsOperatorConfiguredLanCertificates()
+    public void RawWebSocketTransportTrustsOperatorConfiguredLanCertificates()
     {
-        using var socket = NatClientHandler.BuildLocalWebSocket();
-
-        Assert.NotNull(socket.Options.RemoteCertificateValidationCallback);
-        Assert.True(socket.Options.RemoteCertificateValidationCallback!(
+        Assert.True(RawWebSocketConnection.AcceptLocalCertificate(
             sender: new object(),
             certificate: null,
             chain: null,
             sslPolicyErrors: SslPolicyErrors.RemoteCertificateChainErrors));
+    }
+
+    [Fact]
+    public async Task RawWebSocketTransportRejectsInvalidHandshakeAccept()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var serverTask = RunInvalidAcceptWebSocketServerAsync(listener, cts.Token);
+
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+            await RawWebSocketConnection.ConnectAsync(
+                new Uri($"ws://127.0.0.1:{port}/invalid"), [], cts.Token));
+        await serverTask;
     }
 
     [Fact]
@@ -303,8 +315,8 @@ public class NatClientHandlerWebSocketTests
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var wsTask = RunClosingWebSocketServerAsync(wsListener, cts.Token);
 
-        using var socket = NatClientHandler.BuildLocalWebSocket();
-        await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{wsPort}/close"), cts.Token);
+        await using var socket = await NatClientHandler.ConnectLocalWebSocketAsync(
+            new Uri($"ws://127.0.0.1:{wsPort}/close"), [], cts.Token);
 
         var sendWindow = new StreamSendWindow();
         Assert.True(await sendWindow.ConsumeAsync(
@@ -331,38 +343,130 @@ public class NatClientHandlerWebSocketTests
     }
 
     [Fact]
-    public async Task TunnelPingReturnsMatchingPongAndTunnelPongIsConsumed()
+    public async Task TunnelFramesKeepFinContinuationPingPongAndCloseOnLocalWire()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var serverTask = RunHoldingWebSocketServerAsync(listener, cts.Token);
+        var serverTask = RunCapturingWebSocketServerAsync(listener, frameCount: 5, cts.Token);
 
-        var socket = NatClientHandler.BuildLocalWebSocket();
-        await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/hold"), cts.Token);
+        await using var socket = await NatClientHandler.ConnectLocalWebSocketAsync(
+            new Uri($"ws://127.0.0.1:{port}/hold"), [], cts.Token);
         await using var control = new MemoryStream();
         await using var writer = new FrameWriter(control);
         await using var channel = new WebSocketSpecusChannel(
             18, "control-frame", socket, writer,
             NullLogger<WebSocketSpecusChannel>.Instance, static _ => { });
-        var payload = "alive"u8.ToArray();
-
         await channel.WriteAsync(new WebSocketSpecusFrame(
-            WebSocketSpecusFrame.OpcodePing, true, 0, 0, payload).Encode(), cts.Token);
-        var packet = Assert.IsType<NatMessagePacket>(PacketCodec.DecodeExact(control.ToArray()));
-        var pong = WebSocketSpecusFrame.Decode(packet.Data!);
-        Assert.Equal(WebSocketSpecusFrame.OpcodePong, pong.Opcode);
-        Assert.Equal(payload, pong.Payload);
-
-        var lengthAfterPing = control.Length;
+            WebSocketSpecusFrame.OpcodeText, false, 0, 0, "hel"u8.ToArray()).Encode(), cts.Token);
         await channel.WriteAsync(new WebSocketSpecusFrame(
-            WebSocketSpecusFrame.OpcodePong, true, 0, 0, payload).Encode(), cts.Token);
-        Assert.Equal(lengthAfterPing, control.Length);
+            WebSocketSpecusFrame.OpcodePing, true, 0, 0, "ping"u8.ToArray()).Encode(), cts.Token);
+        await channel.WriteAsync(new WebSocketSpecusFrame(
+            WebSocketSpecusFrame.OpcodeContinuation, true, 0, 0, "lo"u8.ToArray()).Encode(), cts.Token);
+        await channel.WriteAsync(new WebSocketSpecusFrame(
+            WebSocketSpecusFrame.OpcodePong, true, 0, 0, "pong"u8.ToArray()).Encode(), cts.Token);
+        await channel.WriteAsync(new WebSocketSpecusFrame(
+            WebSocketSpecusFrame.OpcodeClose, true, 0, 1000, "done"u8.ToArray()).Encode(), cts.Token);
 
-        cts.Cancel();
-        listener.Stop();
-        try { await serverTask; } catch (OperationCanceledException) { }
+        var frames = await serverTask;
+        Assert.Collection(frames,
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeText, frame.Opcode);
+                Assert.False(frame.FinalFragment);
+                Assert.Equal(0, frame.Rsv);
+                Assert.Equal("hel", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodePing, frame.Opcode);
+                Assert.Equal("ping", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeContinuation, frame.Opcode);
+                Assert.True(frame.FinalFragment);
+                Assert.Equal("lo", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodePong, frame.Opcode);
+                Assert.Equal("pong", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeClose, frame.Opcode);
+                Assert.Equal(new byte[] { 0x03, 0xE8, (byte)'d', (byte)'o', (byte)'n', (byte)'e' },
+                    frame.Payload);
+            });
+        Assert.Equal(0, control.Length);
+    }
+
+    [Fact]
+    public async Task LocalRawFramesKeepFinContinuationPingPongAndCloseInSws2()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var serverTask = RunRawFrameSequenceServerAsync(listener, cts.Token);
+
+        await using var socket = await NatClientHandler.ConnectLocalWebSocketAsync(
+            new Uri($"ws://127.0.0.1:{port}/frames"), [], cts.Token);
+        await using var control = new MemoryStream();
+        await using var writer = new FrameWriter(control);
+        var closed = 0;
+        var channel = new WebSocketSpecusChannel(
+            19, "raw-frames", socket, writer,
+            NullLogger<WebSocketSpecusChannel>.Instance, _ => Interlocked.Increment(ref closed));
+
+        var completion = await channel.PumpAsync(cts.Token);
+        Assert.Equal(WebSocketPumpResult.Completed, completion);
+        Assert.Equal(1, Volatile.Read(ref closed));
+        await serverTask;
+
+        control.Position = 0;
+        var reader = PipeReader.Create(control, new StreamPipeReaderOptions(leaveOpen: true));
+        var frames = new List<WebSocketSpecusFrame>();
+        for (var index = 0; index < 5; index++)
+        {
+            var packet = Assert.IsType<NatMessagePacket>(await FrameReaderProxy.ReadFrameAsync(
+                reader, 32 * 1024 * 1024, cts.Token));
+            frames.Add(WebSocketSpecusFrame.Decode(packet.Data!));
+        }
+        await reader.CompleteAsync();
+
+        Assert.Collection(frames,
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeText, frame.Opcode);
+                Assert.False(frame.FinalFragment);
+                Assert.Equal(0, frame.Rsv);
+                Assert.Equal("hel", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodePing, frame.Opcode);
+                Assert.Equal("ping", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeContinuation, frame.Opcode);
+                Assert.True(frame.FinalFragment);
+                Assert.Equal("lo", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodePong, frame.Opcode);
+                Assert.Equal("pong", Encoding.UTF8.GetString(frame.Payload));
+            },
+            frame =>
+            {
+                Assert.Equal(WebSocketSpecusFrame.OpcodeClose, frame.Opcode);
+                Assert.Equal((ushort)1000, frame.CloseCode);
+                Assert.Equal("done", Encoding.UTF8.GetString(frame.Payload));
+            });
     }
 
     [Fact]
@@ -405,6 +509,20 @@ public class NatClientHandlerWebSocketTests
         await stream.FlushAsync(ct);
     }
 
+    private static async Task RunInvalidAcceptWebSocketServerAsync(
+        TcpListener listener, CancellationToken ct)
+    {
+        using var tcp = await listener.AcceptTcpClientAsync(ct);
+        await using var stream = tcp.GetStream();
+        await ReadHttpHeaderAsync(stream, ct);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Accept: invalid\r\n\r\n"), ct);
+        await stream.FlushAsync(ct);
+    }
+
     private static async Task RunClosingWebSocketServerAsync(TcpListener listener, CancellationToken ct)
     {
         using var tcp = await listener.AcceptTcpClientAsync(ct);
@@ -426,7 +544,8 @@ public class NatClientHandlerWebSocketTests
         await stream.FlushAsync(ct);
     }
 
-    private static async Task RunHoldingWebSocketServerAsync(TcpListener listener, CancellationToken ct)
+    private static async Task<IReadOnlyList<CapturedWebSocketFrame>> RunCapturingWebSocketServerAsync(
+        TcpListener listener, int frameCount, CancellationToken ct)
     {
         using var tcp = await listener.AcceptTcpClientAsync(ct);
         await using var stream = tcp.GetStream();
@@ -441,7 +560,47 @@ public class NatClientHandlerWebSocketTests
             "Connection: Upgrade\r\n" +
             $"Sec-WebSocket-Accept: {accept}\r\n\r\n"), ct);
         await stream.FlushAsync(ct);
-        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+
+        var frames = new List<CapturedWebSocketFrame>(frameCount);
+        for (var index = 0; index < frameCount; index++)
+        {
+            frames.Add(await ReadClientWebSocketFrameAsync(stream, ct));
+        }
+        return frames;
+    }
+
+    private static async Task RunRawFrameSequenceServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        using var tcp = await listener.AcceptTcpClientAsync(ct);
+        await using var stream = tcp.GetStream();
+        var header = await ReadHttpHeaderAsync(stream, ct);
+        var key = ExtractHeader(header, "Sec-WebSocket-Key");
+        Assert.False(string.IsNullOrWhiteSpace(key));
+        var accept = Convert.ToBase64String(
+            SHA1.HashData(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {accept}\r\n\r\n"), ct);
+        await WriteServerWebSocketFrameAsync(stream, WebSocketSpecusFrame.OpcodeText,
+            "hel"u8.ToArray(), ct, finalFragment: false, rsv: 0);
+        await WriteServerWebSocketFrameAsync(stream, WebSocketSpecusFrame.OpcodePing,
+            "ping"u8.ToArray(), ct);
+        await WriteServerWebSocketFrameAsync(stream, WebSocketSpecusFrame.OpcodeContinuation,
+            "lo"u8.ToArray(), ct);
+        await WriteServerWebSocketFrameAsync(stream, WebSocketSpecusFrame.OpcodePong,
+            "pong"u8.ToArray(), ct);
+        await WriteServerWebSocketFrameAsync(stream, WebSocketSpecusFrame.OpcodeClose,
+            [0x03, 0xE8, (byte)'d', (byte)'o', (byte)'n', (byte)'e'], ct);
+        await stream.FlushAsync(ct);
+
+        var closeReply = await ReadClientWebSocketFrameAsync(stream, ct);
+        Assert.Equal(WebSocketSpecusFrame.OpcodeClose, closeReply.Opcode);
+        Assert.True(closeReply.FinalFragment);
+        Assert.Equal(0, closeReply.Rsv);
+        Assert.Equal(new byte[] { 0x03, 0xE8, (byte)'d', (byte)'o', (byte)'n', (byte)'e' },
+            closeReply.Payload);
     }
 
     private static async Task<string> ReadHttpHeaderAsync(NetworkStream stream, CancellationToken ct)
@@ -482,9 +641,13 @@ public class NatClientHandlerWebSocketTests
     }
 
     private static async Task WriteServerWebSocketFrameAsync(
-        NetworkStream stream, byte opcode, byte[] payload, CancellationToken ct)
+        NetworkStream stream, byte opcode, byte[] payload, CancellationToken ct,
+        bool finalFragment = true, byte rsv = 0)
     {
-        var header = new List<byte> { (byte)(0x80 | opcode) };
+        var header = new List<byte>
+        {
+            (byte)((finalFragment ? 0x80 : 0) | ((rsv & 7) << 4) | opcode),
+        };
         if (payload.Length < 126)
         {
             header.Add((byte)payload.Length);
@@ -502,4 +665,67 @@ public class NatClientHandlerWebSocketTests
         await stream.WriteAsync(header.ToArray(), ct);
         await stream.WriteAsync(payload, ct);
     }
+
+    private static async Task<CapturedWebSocketFrame> ReadClientWebSocketFrameAsync(
+        NetworkStream stream, CancellationToken ct)
+    {
+        var header = new byte[2];
+        await ReadExactlyAsync(stream, header, ct);
+        var masked = (header[1] & 0x80) != 0;
+        Assert.True(masked);
+
+        ulong payloadLength = (uint)(header[1] & 0x7f);
+        if (payloadLength == 126)
+        {
+            var extended = new byte[2];
+            await ReadExactlyAsync(stream, extended, ct);
+            payloadLength = ((ulong)extended[0] << 8) | extended[1];
+        }
+        else if (payloadLength == 127)
+        {
+            var extended = new byte[8];
+            await ReadExactlyAsync(stream, extended, ct);
+            payloadLength = 0;
+            foreach (var current in extended)
+            {
+                payloadLength = (payloadLength << 8) | current;
+            }
+        }
+        Assert.True(payloadLength <= int.MaxValue);
+
+        var mask = new byte[4];
+        await ReadExactlyAsync(stream, mask, ct);
+        var payload = new byte[(int)payloadLength];
+        await ReadExactlyAsync(stream, payload, ct);
+        for (var index = 0; index < payload.Length; index++)
+        {
+            payload[index] ^= mask[index & 3];
+        }
+        return new CapturedWebSocketFrame(
+            (byte)(header[0] & 0x0f),
+            (header[0] & 0x80) != 0,
+            (byte)((header[0] >> 4) & 7),
+            payload);
+    }
+
+    private static async Task ReadExactlyAsync(
+        NetworkStream stream, Memory<byte> destination, CancellationToken ct)
+    {
+        var offset = 0;
+        while (offset < destination.Length)
+        {
+            var read = await stream.ReadAsync(destination[offset..], ct);
+            if (read == 0)
+            {
+                throw new EndOfStreamException("truncated test WebSocket frame");
+            }
+            offset += read;
+        }
+    }
+
+    private sealed record CapturedWebSocketFrame(
+        byte Opcode,
+        bool FinalFragment,
+        byte Rsv,
+        byte[] Payload);
 }

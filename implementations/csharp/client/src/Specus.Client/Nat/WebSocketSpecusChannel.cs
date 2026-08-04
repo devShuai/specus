@@ -1,5 +1,4 @@
-using System.Net.WebSockets;
-using System.Text;
+using System.Buffers.Binary;
 using Microsoft.Extensions.Logging;
 using Specus.Client.Control;
 using Specus.Protocol;
@@ -19,11 +18,10 @@ internal enum WebSocketPumpResult
 /// </summary>
 internal sealed class WebSocketSpecusChannel : IAsyncDisposable
 {
-    private const int BufferSize = 16 * 1024;
     private const int MaxMessageBytes = 16 * 1024 * 1024;
     private static readonly TimeSpan DefaultCloseSendTimeout = TimeSpan.FromSeconds(5);
 
-    private readonly ClientWebSocket _socket;
+    private readonly RawWebSocketConnection _socket;
     private readonly FrameWriter _controlWriter;
     private readonly ILogger _logger;
     private readonly Action<WebSocketSpecusChannel> _onClosed;
@@ -32,12 +30,15 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
     private readonly ManualResetEventSlim _writableGate = new(initialState: true);
     private readonly StreamSendWindow _sendWindow;
     private readonly TimeSpan _closeSendTimeout;
-    private WebSocketMessageType? _incomingFragmentType;
+    private bool _localFragmentOpen;
+    private bool _tunnelFragmentOpen;
+    private int _localMessageBytes;
+    private int _disposeState;
 
     public WebSocketSpecusChannel(
         uint streamId,
         string channelId,
-        ClientWebSocket socket,
+        RawWebSocketConnection socket,
         FrameWriter controlWriter,
         ILogger logger,
         Action<WebSocketSpecusChannel> onClosed,
@@ -73,13 +74,10 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
         var token = linked.Token;
-        var buffer = new byte[BufferSize];
-        var messageBytes = 0;
-        var continuation = false;
         var completion = WebSocketPumpResult.Completed;
         try
         {
-            while (!token.IsCancellationRequested && _socket.State == WebSocketState.Open)
+            while (!token.IsCancellationRequested && _socket.IsOpen)
             {
                 if (!_writableGate.IsSet)
                 {
@@ -87,18 +85,22 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
                     continue;
                 }
 
-                var result = await _socket.ReceiveAsync(buffer.AsMemory(), token).ConfigureAwait(false);
-                if (result.MessageType == WebSocketMessageType.Close)
+                var rawFrame = await _socket.ReadFrameAsync(token).ConfigureAwait(false);
+                if (rawFrame is null)
                 {
-                    var reason = EncodeCloseReason(_socket.CloseStatusDescription);
-                    var closeCode = _socket.CloseStatus is null ? (ushort)0 : (ushort)_socket.CloseStatus.Value;
+                    break;
+                }
+                ValidateLocalFragmentSequence(rawFrame);
+                var (closeCode, payload) = SplitClosePayload(rawFrame);
+                if (rawFrame.Opcode == WebSocketSpecusFrame.OpcodeClose)
+                {
                     using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(token);
                     closeCts.CancelAfter(_closeSendTimeout);
                     try
                     {
-                        await SendFrameAsync(new WebSocketSpecusFrame(
-                            WebSocketSpecusFrame.OpcodeClose, true, 0, closeCode, reason), closeCts.Token)
+                        await SendRawFrameAsync(rawFrame, closeCode, payload, closeCts.Token)
                             .ConfigureAwait(false);
+                        await _socket.ReplyToCloseAsync(rawFrame, closeCts.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (!token.IsCancellationRequested
                                                              && closeCts.IsCancellationRequested)
@@ -109,37 +111,14 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
                     }
                     break;
                 }
-                if (result.MessageType is not WebSocketMessageType.Text and not WebSocketMessageType.Binary)
-                {
-                    continue;
-                }
-
-                messageBytes += result.Count;
-                if (messageBytes > MaxMessageBytes)
-                {
-                    _logger.LogDebug("ws channel {channel}: local message exceeds limit", ChannelId);
-                    break;
-                }
-                var opcode = continuation
-                    ? WebSocketSpecusFrame.OpcodeContinuation
-                    : result.MessageType == WebSocketMessageType.Text
-                        ? WebSocketSpecusFrame.OpcodeText
-                        : WebSocketSpecusFrame.OpcodeBinary;
                 try
                 {
-                    await SendFrameAsync(new WebSocketSpecusFrame(
-                        opcode, result.EndOfMessage, 0, 0, buffer.AsSpan(0, result.Count).ToArray()), token)
-                        .ConfigureAwait(false);
+                    await SendRawFrameAsync(rawFrame, closeCode, payload, token).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _logger.LogDebug(ex, "ws channel {channel}: write to control failed", ChannelId);
                     break;
-                }
-                continuation = !result.EndOfMessage;
-                if (result.EndOfMessage)
-                {
-                    messageBytes = 0;
                 }
             }
         }
@@ -157,53 +136,31 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
 
     public async ValueTask WriteAsync(byte[] data, CancellationToken cancellationToken)
     {
-        if (_socket.State != WebSocketState.Open)
+        if (!_socket.IsOpen)
         {
             return;
         }
         try
         {
             var frame = WebSocketSpecusFrame.Decode(data);
-            if (frame.Rsv != 0)
-            {
-                throw new InvalidDataException("ClientWebSocket endpoint did not negotiate RSV extensions");
-            }
-            if (frame.Opcode == WebSocketSpecusFrame.OpcodePing)
-            {
-                // ClientWebSocket cannot emit a native ping to the local upstream.  Preserve
-                // remote liveness at the tunnel boundary by returning the matching pong.
-                await SendFrameAsync(new WebSocketSpecusFrame(
-                    WebSocketSpecusFrame.OpcodePong, true, 0, 0, frame.Payload), cancellationToken)
-                    .ConfigureAwait(false);
-                return;
-            }
-            if (frame.Opcode == WebSocketSpecusFrame.OpcodePong)
-            {
-                // ClientWebSocket consumes local control frames internally; a remote pong is
-                // therefore safely consumed at this boundary as well.
-                return;
-            }
             await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                ValidateTunnelFragmentSequence(frame);
+                var payload = frame.Payload;
                 if (frame.Opcode == WebSocketSpecusFrame.OpcodeClose)
                 {
-                    var status = frame.CloseCode == 0
-                        ? WebSocketCloseStatus.Empty
-                        : (WebSocketCloseStatus)frame.CloseCode;
-                    var description = frame.CloseCode == 0
-                        ? null
-                        : Encoding.UTF8.GetString(frame.Payload);
-                    await _socket.CloseOutputAsync(
-                        status, description, cancellationToken).ConfigureAwait(false);
-                    return;
+                    payload = frame.CloseCode == 0
+                        ? []
+                        : [
+                            (byte)(frame.CloseCode >> 8),
+                            (byte)frame.CloseCode,
+                            .. payload,
+                        ];
                 }
-                var messageType = ResolveIncomingMessageType(frame);
-                await _socket.SendAsync(
-                    frame.Payload,
-                    messageType,
-                    frame.FinalFragment,
-                    cancellationToken).ConfigureAwait(false);
+                await _socket.WriteFrameAsync(new RawWebSocketFrame(
+                    frame.Opcode, frame.FinalFragment, frame.Rsv, payload), cancellationToken)
+                    .ConfigureAwait(false);
             }
             finally
             {
@@ -243,58 +200,99 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
         }, token).ConfigureAwait(false);
     }
 
-    private WebSocketMessageType ResolveIncomingMessageType(WebSocketSpecusFrame frame)
+    private async Task SendRawFrameAsync(RawWebSocketFrame rawFrame, ushort closeCode,
+        byte[] payload, CancellationToken token)
     {
+        var offset = 0;
+        var first = true;
+        do
+        {
+            var length = Math.Min(WebSocketSpecusFrame.MaxPayloadBytes, payload.Length - offset);
+            var last = offset + length == payload.Length;
+            await SendFrameAsync(new WebSocketSpecusFrame(
+                first ? rawFrame.Opcode : WebSocketSpecusFrame.OpcodeContinuation,
+                rawFrame.FinalFragment && last,
+                first ? rawFrame.Rsv : (byte)0,
+                first ? closeCode : (ushort)0,
+                payload.AsSpan(offset, length).ToArray()), token).ConfigureAwait(false);
+            offset += length;
+            first = false;
+        }
+        while (offset < payload.Length);
+    }
+
+    private void ValidateLocalFragmentSequence(RawWebSocketFrame frame)
+    {
+        if (frame.Opcode >= WebSocketSpecusFrame.OpcodeClose)
+        {
+            return;
+        }
         if (frame.Opcode == WebSocketSpecusFrame.OpcodeContinuation)
         {
-            if (_incomingFragmentType is null)
+            if (!_localFragmentOpen)
+            {
+                throw new InvalidDataException("orphan local WebSocket continuation frame");
+            }
+        }
+        else if (_localFragmentOpen)
+        {
+            throw new InvalidDataException("new local WebSocket message before fragmented message completed");
+        }
+        _localMessageBytes = checked(_localMessageBytes + frame.Payload.Length);
+        if (_localMessageBytes > MaxMessageBytes)
+        {
+            throw new InvalidDataException("local WebSocket message exceeds limit");
+        }
+        _localFragmentOpen = !frame.FinalFragment;
+        if (frame.FinalFragment)
+        {
+            _localMessageBytes = 0;
+        }
+    }
+
+    private void ValidateTunnelFragmentSequence(WebSocketSpecusFrame frame)
+    {
+        if (frame.Opcode >= WebSocketSpecusFrame.OpcodeClose)
+        {
+            return;
+        }
+        if (frame.Opcode == WebSocketSpecusFrame.OpcodeContinuation)
+        {
+            if (!_tunnelFragmentOpen)
             {
                 throw new InvalidDataException("orphan SWS2 continuation frame");
             }
-            var continuedType = _incomingFragmentType.Value;
-            if (frame.FinalFragment)
-            {
-                _incomingFragmentType = null;
-            }
-            return continuedType;
         }
-
-        var type = frame.Opcode switch
-        {
-            WebSocketSpecusFrame.OpcodeText => WebSocketMessageType.Text,
-            WebSocketSpecusFrame.OpcodeBinary => WebSocketMessageType.Binary,
-            _ => throw new InvalidDataException($"unsupported SWS2 data opcode {frame.Opcode}"),
-        };
-        if (_incomingFragmentType is not null)
+        else if (_tunnelFragmentOpen)
         {
             throw new InvalidDataException("new SWS2 message before fragmented message completed");
         }
-        if (!frame.FinalFragment)
-        {
-            _incomingFragmentType = type;
-        }
-        return type;
+        _tunnelFragmentOpen = !frame.FinalFragment;
     }
 
-    private static byte[] EncodeCloseReason(string? reason)
+    private static (ushort CloseCode, byte[] Payload) SplitClosePayload(RawWebSocketFrame frame)
     {
-        if (string.IsNullOrEmpty(reason))
+        if (frame.Opcode != WebSocketSpecusFrame.OpcodeClose || frame.Payload.Length == 0)
         {
-            return [];
+            return (0, frame.Payload);
         }
-        var bytes = new byte[123];
-        Encoding.UTF8.GetEncoder().Convert(
-            reason.AsSpan(), bytes, true, out _, out var bytesUsed, out _);
-        return bytes.AsSpan(0, bytesUsed).ToArray();
+        if (frame.Payload.Length == 1)
+        {
+            throw new InvalidDataException("invalid WebSocket close payload");
+        }
+        return (BinaryPrimitives.ReadUInt16BigEndian(frame.Payload), frame.Payload[2..]);
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+        {
+            return;
+        }
         Close();
-        _socket.Dispose();
+        await _socket.DisposeAsync().ConfigureAwait(false);
         _writeLock.Dispose();
         _writableGate.Dispose();
         _cts.Dispose();
-        return ValueTask.CompletedTask;
     }
 }

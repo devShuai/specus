@@ -81,10 +81,11 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 - **HTTP route WebSocket**:识别 NAT `OPEN source=ws`，按当前 HTTP route 快照构造
   `ws://` / `wss://` 上游地址，过滤 hop-by-hop 与 WebSocket 握手头后发起本地 WebSocket 握手；
   `//` 按 Java 一样作为同 host 下普通双斜线路径保留；对运维配置的内网 `wss` upstream 证书按
-  HTTP stream 策略信任；每个 `DATA` payload 使用固定 12 字节 `SWS2` envelope 保留 opcode、FIN、RSV、
-  close code/reason，任一侧断开都会回发 `FIN` 或 `RST`。受 `.NET ClientWebSocket` API 限制，原生
-  ping/pong 不会暴露给应用层：远端 `PING` 在隧道边界原样回 `PONG`，远端 `PONG` 被安全消费；文本、
-  二进制、分片和 CLOSE（含 no-status close）仍保持 SWS2 语义，控制帧不会导致 stream 被关闭。
+  HTTP stream 策略信任；客户端使用原始 RFC 6455 TCP/TLS transport 完成握手、校验
+  `Sec-WebSocket-Accept` 并按规范 mask 写帧。每个 `DATA` payload 使用固定 12 字节 `SWS2` envelope，
+  双向保留 continuation、FIN、RSV、ping/pong payload 以及 close code/reason；原始 data frame 最大 16 MiB，
+  超过单个 SWS2 payload 上限时按 Java 规则规范化拆成 continuation envelopes，控制帧保持单帧。任一侧断开
+  都会回发 `FIN` 或 `RST`，并发 CLOSE 只发送一次。
 - **Peer Mesh**:读取与 Java 相同的 `peerMeshDevice/peerMeshTunName/peerMeshMtu` 启动配置，
   登录环境会上报 v2 X25519 public key；已识别 HTTP 登录响应里的 `peerMesh` 配置和控制通道
   `PEER_CONTROL` 消息，支持 roster/session/candidates、标准 STUN/TURN Binding，以及带临时 credential、realm/nonce、MESSAGE-INTEGRITY 的 Allocate/Refresh/CreatePermission、Send/Data Indication；
@@ -122,5 +123,6 @@ dotnet run -c Release --project implementations/csharp/client/benchmarks/Specus.
 
 ## TLS
 
-当前默认明文 TCP(与 Java 客户端默认一致)。后续可在 `SpecusControlClient.RunOnceAsync` 包一层
-`SslStream`(PEM + 可选信任所有),协议字节流不变。
+`controlTls.enabled` 未显式设置时，control/data 原始 TCP 通道跟随登录响应的 `nettyTls`；配置 PEM CA、
+`serverName` 或 `insecureSkipVerify` 也会启用 TLS。显式 `false` 优先且不能与 TLS 专用选项并用。默认使用
+系统信任和主机名校验，PEM CA 替换信任根，`insecureSkipVerify` 仅用于开发；连接和握手均有超时与取消。

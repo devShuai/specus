@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
-using System.Net.WebSockets;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
@@ -456,23 +455,11 @@ internal sealed class NatClientHandler : IAsyncDisposable
             return;
         }
 
-        ClientWebSocket? socket = null;
+        RawWebSocketConnection? socket = null;
         try
         {
-            socket = BuildLocalWebSocket();
-            foreach (var header in WebSocketHandshakeHeaders(packet.MetaData))
-            {
-                try
-                {
-                    socket.Options.SetRequestHeader(header.Key, header.Value);
-                }
-                catch (ArgumentException ex)
-                {
-                    _logger.LogDebug(ex, "[ws-specus][client] skip unsupported handshake header {header}", header.Key);
-                }
-            }
-
-            await socket.ConnectAsync(target, pending.Token).ConfigureAwait(false);
+            socket = await ConnectLocalWebSocketAsync(target,
+                WebSocketHandshakeHeaders(packet.MetaData), pending.Token).ConfigureAwait(false);
             var channel = new WebSocketSpecusChannel(
                 packet.StreamId,
                 channelId,
@@ -533,7 +520,10 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
         finally
         {
-            socket?.Dispose();
+            if (socket is not null)
+            {
+                await socket.DisposeAsync().ConfigureAwait(false);
+            }
             pending.Dispose();
         }
     }
@@ -1080,12 +1070,9 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
     }
 
-    internal static ClientWebSocket BuildLocalWebSocket()
-    {
-        var socket = new ClientWebSocket();
-        socket.Options.RemoteCertificateValidationCallback = static (_, _, _, _) => true;
-        return socket;
-    }
+    internal static Task<RawWebSocketConnection> ConnectLocalWebSocketAsync(Uri target,
+        IReadOnlyList<KeyValuePair<string, string>> headers, CancellationToken cancellationToken) =>
+        RawWebSocketConnection.ConnectAsync(target, headers, cancellationToken);
 
     internal static List<KeyValuePair<string, string>> WebSocketHandshakeHeaders(Dictionary<string, object?>? meta)
     {
