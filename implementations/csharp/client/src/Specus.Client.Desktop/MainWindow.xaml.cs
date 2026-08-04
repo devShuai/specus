@@ -37,7 +37,8 @@ public partial class MainWindow : Window
     private SpecusControlClient? _client;
     private Task? _clientTask;
     private ILoggerFactory? _loggerFactory;
-    private HttpClient? _httpClient;
+    private HttpClient? _authHttpClient;
+    private HttpClient? _routeHttpClient;
     private string _themeMode = ThemeModeSystem;
     private bool _effectiveDarkTheme = true;
     private bool _peerMeshEnabled;
@@ -363,12 +364,13 @@ public partial class MainWindow : Window
             builder.SetMinimumLevel(LogLevel.Information);
             builder.AddProvider(new UiLoggerProvider(AppendLog));
         });
-        _httpClient = DirectHttpForwarder.BuildDefaultClient();
+        _authHttpClient = ClientAuthService.BuildDefaultClient();
+        _routeHttpClient = DirectHttpForwarder.BuildDefaultClient();
         var auth = new ClientAuthService(
             config,
-            _httpClient,
+            _authHttpClient,
             _loggerFactory.CreateLogger<ClientAuthService>());
-        var forwarder = new DirectHttpForwarder(_httpClient);
+        var forwarder = new DirectHttpForwarder(_routeHttpClient);
         _client = new SpecusControlClient(config, auth, forwarder, _loggerFactory, _observer);
         _running = true;
         _stopping = false;
@@ -444,8 +446,10 @@ public partial class MainWindow : Window
             _clientCts = null;
             _client = null;
             _clientTask = null;
-            _httpClient?.Dispose();
-            _httpClient = null;
+            _authHttpClient?.Dispose();
+            _authHttpClient = null;
+            _routeHttpClient?.Dispose();
+            _routeHttpClient = null;
             _loggerFactory?.Dispose();
             _loggerFactory = null;
 

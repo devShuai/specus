@@ -27,9 +27,15 @@ builder.Logging.AddSimpleConsole(options =>
     options.TimestampFormat = "HH:mm:ss ";
 });
 builder.Services.AddSingleton(config);
-builder.Services.AddSingleton(_ => DirectHttpForwarder.BuildDefaultClient());
-builder.Services.AddSingleton<ClientAuthService>();
-builder.Services.AddSingleton(sp => new DirectHttpForwarder(sp.GetRequiredService<HttpClient>()));
+builder.Services.AddSingleton(_ => new ClientHttpTransports(
+    ClientAuthService.BuildDefaultClient(),
+    DirectHttpForwarder.BuildDefaultClient()));
+builder.Services.AddSingleton(sp => new ClientAuthService(
+    sp.GetRequiredService<SpecusClientConfig>(),
+    sp.GetRequiredService<ClientHttpTransports>().Authentication,
+    sp.GetRequiredService<ILogger<ClientAuthService>>()));
+builder.Services.AddSingleton(sp => new DirectHttpForwarder(
+    sp.GetRequiredService<ClientHttpTransports>().RouteForwarding));
 builder.Services.AddSingleton(sp => new SpecusControlClient(
     sp.GetRequiredService<SpecusClientConfig>(),
     sp.GetRequiredService<ClientAuthService>(),
@@ -53,4 +59,18 @@ internal sealed class SpecusClientHostedService : BackgroundService
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => _client.RunAsync(stoppingToken);
+}
+
+internal sealed class ClientHttpTransports(HttpClient authentication, HttpClient routeForwarding)
+    : IDisposable
+{
+    public HttpClient Authentication { get; } = authentication;
+
+    public HttpClient RouteForwarding { get; } = routeForwarding;
+
+    public void Dispose()
+    {
+        Authentication.Dispose();
+        RouteForwarding.Dispose();
+    }
 }

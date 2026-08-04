@@ -4,12 +4,15 @@ using System.Net.Sockets;
 using System.Net.Security;
 using System.Security.Cryptography;
 using System.Text;
+using System.Net.WebSockets;
 using Microsoft.Extensions.Logging.Abstractions;
 using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.DirectHttp;
 using Specus.Client.Nat;
 using Specus.Protocol;
+using Specus.Protocol.Codec;
+using Specus.Protocol.Flow;
 using Specus.Protocol.Packets;
 
 namespace Specus.Client.Tests;
@@ -59,7 +62,7 @@ public class NatClientHandlerWebSocketTests
 
     [Theory]
     [MemberData(nameof(InvalidTcpOpenMetadata))]
-    public async Task HandleOpenAsync_ForInvalidTcpMapping_IgnoresLikeJava(Dictionary<string, object?> metadata)
+    public async Task HandleOpenAsync_ForInvalidTcpMapping_SendsStreamReset(Dictionary<string, object?> metadata)
     {
         await using var stream = new MemoryStream();
         await using var writer = new FrameWriter(stream);
@@ -83,7 +86,9 @@ public class NatClientHandlerWebSocketTests
             MetaData = metadata,
         });
 
-        Assert.Equal(0, stream.Length);
+        var reset = Assert.IsType<NatMessagePacket>(PacketCodec.DecodeExact(stream.ToArray()));
+        Assert.Equal(NatMessageType.Rst, reset.NatMessageType);
+        Assert.Equal(1U, reset.StreamId);
     }
 
     public static IEnumerable<object[]> InvalidTcpOpenMetadata()
@@ -290,6 +295,77 @@ public class NatClientHandlerWebSocketTests
     }
 
     [Fact]
+    public async Task WebSocketCloseStopsWaitingForSendCreditAndReleasesChannel()
+    {
+        using var wsListener = new TcpListener(IPAddress.Loopback, 0);
+        wsListener.Start();
+        var wsPort = ((IPEndPoint)wsListener.LocalEndpoint).Port;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var wsTask = RunClosingWebSocketServerAsync(wsListener, cts.Token);
+
+        using var socket = NatClientHandler.BuildLocalWebSocket();
+        await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{wsPort}/close"), cts.Token);
+
+        var sendWindow = new StreamSendWindow();
+        Assert.True(await sendWindow.ConsumeAsync(
+            checked((int)StreamSendWindow.InitialBytes), cts.Token));
+        await using var control = new MemoryStream();
+        await using var writer = new FrameWriter(control);
+        var closed = 0;
+        var channel = new WebSocketSpecusChannel(
+            17,
+            "close-timeout",
+            socket,
+            writer,
+            NullLogger<WebSocketSpecusChannel>.Instance,
+            _ => Interlocked.Increment(ref closed),
+            sendWindow,
+            TimeSpan.FromMilliseconds(50));
+
+        var completion = await channel.PumpAsync(cts.Token);
+
+        Assert.Equal(WebSocketPumpResult.CloseCreditTimedOut, completion);
+        Assert.Equal(1, Volatile.Read(ref closed));
+        Assert.Equal(0, control.Length);
+        await wsTask;
+    }
+
+    [Fact]
+    public async Task TunnelPingReturnsMatchingPongAndTunnelPongIsConsumed()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var serverTask = RunHoldingWebSocketServerAsync(listener, cts.Token);
+
+        var socket = NatClientHandler.BuildLocalWebSocket();
+        await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/hold"), cts.Token);
+        await using var control = new MemoryStream();
+        await using var writer = new FrameWriter(control);
+        await using var channel = new WebSocketSpecusChannel(
+            18, "control-frame", socket, writer,
+            NullLogger<WebSocketSpecusChannel>.Instance, static _ => { });
+        var payload = "alive"u8.ToArray();
+
+        await channel.WriteAsync(new WebSocketSpecusFrame(
+            WebSocketSpecusFrame.OpcodePing, true, 0, 0, payload).Encode(), cts.Token);
+        var packet = Assert.IsType<NatMessagePacket>(PacketCodec.DecodeExact(control.ToArray()));
+        var pong = WebSocketSpecusFrame.Decode(packet.Data!);
+        Assert.Equal(WebSocketSpecusFrame.OpcodePong, pong.Opcode);
+        Assert.Equal(payload, pong.Payload);
+
+        var lengthAfterPing = control.Length;
+        await channel.WriteAsync(new WebSocketSpecusFrame(
+            WebSocketSpecusFrame.OpcodePong, true, 0, 0, payload).Encode(), cts.Token);
+        Assert.Equal(lengthAfterPing, control.Length);
+
+        cts.Cancel();
+        listener.Stop();
+        try { await serverTask; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
     public void WebSocketSpecusFrame_RejectsLegacyPrefix()
     {
         Assert.Throws<InvalidDataException>(() =>
@@ -327,6 +403,45 @@ public class NatClientHandlerWebSocketTests
         await stream.WriteAsync(response, ct);
         await WriteServerWebSocketFrameAsync(stream, 0x1, Encoding.UTF8.GetBytes("hello"), ct);
         await stream.FlushAsync(ct);
+    }
+
+    private static async Task RunClosingWebSocketServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        using var tcp = await listener.AcceptTcpClientAsync(ct);
+        await using var stream = tcp.GetStream();
+        var header = await ReadHttpHeaderAsync(stream, ct);
+        var key = ExtractHeader(header, "Sec-WebSocket-Key");
+        Assert.False(string.IsNullOrWhiteSpace(key));
+        var accept = Convert.ToBase64String(
+            SHA1.HashData(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+        var response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {accept}\r\n\r\n");
+        await stream.WriteAsync(response, ct);
+        var closeCode = (int)WebSocketCloseStatus.NormalClosure;
+        await WriteServerWebSocketFrameAsync(stream, 0x8,
+            [(byte)(closeCode >> 8), (byte)(closeCode & 0xff), .. Encoding.UTF8.GetBytes("done")], ct);
+        await stream.FlushAsync(ct);
+    }
+
+    private static async Task RunHoldingWebSocketServerAsync(TcpListener listener, CancellationToken ct)
+    {
+        using var tcp = await listener.AcceptTcpClientAsync(ct);
+        await using var stream = tcp.GetStream();
+        var header = await ReadHttpHeaderAsync(stream, ct);
+        var key = ExtractHeader(header, "Sec-WebSocket-Key");
+        Assert.False(string.IsNullOrWhiteSpace(key));
+        var accept = Convert.ToBase64String(
+            SHA1.HashData(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {accept}\r\n\r\n"), ct);
+        await stream.FlushAsync(ct);
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
     }
 
     private static async Task<string> ReadHttpHeaderAsync(NetworkStream stream, CancellationToken ct)

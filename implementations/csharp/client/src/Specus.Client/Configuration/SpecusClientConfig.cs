@@ -25,6 +25,9 @@ public sealed class SpecusClientConfig
     [JsonPropertyName("secret")]
     public string? Secret { get; set; }
 
+    [JsonPropertyName("controlTls")]
+    public ControlTlsConfig ControlTls { get; set; } = new();
+
     [JsonPropertyName("peerMeshDevice")]
     public string PeerMeshDevice { get; set; } = DefaultPeerMeshDevice;
 
@@ -39,6 +42,8 @@ public sealed class SpecusClientConfig
         ServerBaseUrl = ServerBaseUrl.Trim();
         ApiKey = ApiKey?.Trim();
         Secret = Secret?.Trim();
+        ControlTls ??= new ControlTlsConfig();
+        ControlTls.Normalize();
         PeerMeshDevice = string.IsNullOrWhiteSpace(PeerMeshDevice)
             ? DefaultPeerMeshDevice
             : PeerMeshDevice.Trim();
@@ -48,6 +53,52 @@ public sealed class SpecusClientConfig
         PeerMeshMtu = PeerMeshMtu <= 0
             ? DefaultPeerMeshMtu
             : Math.Clamp(PeerMeshMtu, MinPeerMeshMtu, MaxPeerMeshMtu);
+    }
+}
+
+/// <summary>TLS settings shared by the control and data TCP connections.</summary>
+public sealed class ControlTlsConfig
+{
+    /// <summary>
+    /// Explicit TLS switch. When omitted, the login response's <c>nettyTls</c> flag is used;
+    /// configuring any TLS-specific option also opts the control connections into TLS.
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool? Enabled { get; set; }
+
+    /// <summary>PEM file containing the explicit trust roots for the control server.</summary>
+    [JsonPropertyName("caCertificatePath")]
+    public string? CaCertificatePath { get; set; }
+
+    /// <summary>Optional TLS hostname override; defaults to the login response host.</summary>
+    [JsonPropertyName("serverName")]
+    public string? ServerName { get; set; }
+
+    [JsonPropertyName("insecureSkipVerify")]
+    public bool InsecureSkipVerify { get; set; }
+
+    internal void Normalize()
+    {
+        CaCertificatePath = NullIfEmpty(CaCertificatePath);
+        ServerName = NullIfEmpty(ServerName);
+    }
+
+    internal bool ResolveEnabled(bool runtimeNettyTls)
+    {
+        if (Enabled is { } enabled)
+        {
+            return enabled;
+        }
+        return runtimeNettyTls || HasTlsOptions;
+    }
+
+    internal bool HasTlsOptions
+        => CaCertificatePath is not null || ServerName is not null || InsecureSkipVerify;
+
+    private static string? NullIfEmpty(string? value)
+    {
+        var normalized = value?.Trim();
+        return string.IsNullOrEmpty(normalized) ? null : normalized;
     }
 }
 
@@ -76,6 +127,9 @@ public sealed class SpecusRuntimeState
 
     [JsonPropertyName("nettyPort")]
     public int NettyPort { get; set; }
+
+    [JsonPropertyName("nettyTls")]
+    public bool NettyTls { get; set; }
 
     [JsonPropertyName("maxOnlineInstances")]
     public int MaxOnlineInstances { get; set; } = 2;

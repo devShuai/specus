@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using Specus.Client.PeerMesh;
 using Specus.Protocol;
@@ -32,6 +33,19 @@ public sealed class ApplicationProtocolVectorTests
             WebSocketSpecusFrame.Decode(Convert.FromHexString(vector.TruncatedHex)));
         Assert.Throws<InvalidDataException>(() =>
             WebSocketSpecusFrame.Decode(Convert.FromHexString(vector.TrailingHex)));
+
+        foreach (var closeCode in vector.WireForbiddenCloseCodes)
+        {
+            Assert.Throws<ArgumentException>(() => new WebSocketSpecusFrame(
+                WebSocketSpecusFrame.OpcodeClose, true, 0, closeCode, []));
+
+            var wireFrame = new byte[WebSocketSpecusFrame.HeaderBytes];
+            "SWS2"u8.CopyTo(wireFrame);
+            wireFrame[4] = WebSocketSpecusFrame.OpcodeClose;
+            wireFrame[5] = 1;
+            BinaryPrimitives.WriteUInt16BigEndian(wireFrame.AsSpan(6, 2), closeCode);
+            Assert.Throws<InvalidDataException>(() => WebSocketSpecusFrame.Decode(wireFrame));
+        }
     }
 
     [Fact]
@@ -86,6 +100,7 @@ public sealed class ApplicationProtocolVectorTests
         public required string InvalidMagicHex { get; init; }
         public required string TruncatedHex { get; init; }
         public required string TrailingHex { get; init; }
+        public required ushort[] WireForbiddenCloseCodes { get; init; }
     }
 
     private sealed class ClientMessageVector

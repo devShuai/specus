@@ -4,6 +4,13 @@
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "replace-with-client-api-key",
   "secret": "replace-with-client-secret",
+  "controlTls": {
+    // Omit enabled to follow nettyTls from login. Any option below also enables TLS.
+    // "enabled": true,
+    // "caCertificatePath": "./ca.pem",
+    // "serverName": "control.example.com",
+    "insecureSkipVerify": false,
+  },
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,

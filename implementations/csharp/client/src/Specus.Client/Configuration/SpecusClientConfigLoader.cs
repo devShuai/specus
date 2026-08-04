@@ -75,5 +75,7 @@ public static class SpecusClientConfigLoader
         {
             throw new InvalidDataException($"{path}: 必须配置 secret");
         }
+
+        ControlTlsSettings.Validate(config, path);
     }
 }

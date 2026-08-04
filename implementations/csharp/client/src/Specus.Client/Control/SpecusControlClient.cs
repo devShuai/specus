@@ -1,5 +1,4 @@
 using System.IO.Pipelines;
-using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Specus.Client.Configuration;
@@ -22,7 +21,6 @@ namespace Specus.Client.Control;
 public sealed class SpecusControlClient : IAsyncDisposable
 {
     private const int MaxFrameSize = 32 * 1024 * 1024;
-    private const int ConnectTimeoutMs = 5000;
     private const int BaseBackoffSeconds = 2;
     private const int MaxBackoffSeconds = 60;
     private static readonly TimeSpan TokenRefreshMaxLead = TimeSpan.FromMinutes(5);
@@ -37,6 +35,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<SpecusControlClient> _logger;
     private readonly ISpecusClientObserver? _observer;
+    private readonly ControlConnectionFactory _connectionFactory;
     private int _backoffAttempts;
     private bool _resetBackoffOnNextHttpLogin;
     private CancellationTokenSource? _sessionCts;
@@ -55,6 +54,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _auth = auth;
         _httpForwarder = httpForwarder;
         _observer = observer;
+        _connectionFactory = new ControlConnectionFactory(config);
         _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>(), observer);
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<SpecusControlClient>();
@@ -248,8 +248,9 @@ public sealed class SpecusControlClient : IAsyncDisposable
         var session = sessionCts.Token;
         try
         {
-        using var controlTcp = await ConnectAsync(runtime, ConnectionRole.Control, session).ConfigureAwait(false);
-        await using var controlStream = controlTcp.GetStream();
+        await using var controlConnection = await ConnectAsync(runtime, ConnectionRole.Control, session)
+            .ConfigureAwait(false);
+        var controlStream = controlConnection.Stream;
         await using var controlWriter = new FrameWriter(controlStream);
         var controlReader = PipeReader.Create(controlStream);
         await using var controlWatchdog = CreateWatchdog(controlWriter, ConnectionRole.Control, session);
@@ -260,8 +261,9 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _activeWriter = controlWriter;
         await _peerMesh.StartAsync(runtime, controlWriter, session).ConfigureAwait(false);
 
-        using var dataTcp = await ConnectAsync(runtime, ConnectionRole.Data, session).ConfigureAwait(false);
-        await using var dataStream = dataTcp.GetStream();
+        await using var dataConnection = await ConnectAsync(runtime, ConnectionRole.Data, session)
+            .ConfigureAwait(false);
+        var dataStream = dataConnection.Stream;
         await using var dataWriter = new FrameWriter(dataStream);
         var dataReader = PipeReader.Create(dataStream);
         await using var dataWatchdog = CreateWatchdog(dataWriter, ConnectionRole.Data, session);
@@ -327,29 +329,12 @@ public sealed class SpecusControlClient : IAsyncDisposable
         }
     }
 
-    private async Task<TcpClient> ConnectAsync(
+    private async Task<ControlConnection> ConnectAsync(
         SpecusRuntimeState runtime, string role, CancellationToken cancellationToken)
     {
-        var tcp = new TcpClient { NoDelay = true };
-        tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        connectCts.CancelAfter(ConnectTimeoutMs);
-        try
-        {
-            await tcp.ConnectAsync(runtime.NettyHost, runtime.NettyPort, connectCts.Token)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            tcp.Dispose();
-            throw new TimeoutException(
-                $"connect {role} to {runtime.NettyHost}:{runtime.NettyPort} timed out after {ConnectTimeoutMs} ms");
-        }
-        catch
-        {
-            tcp.Dispose();
-            throw;
-        }
+        var connection = await _connectionFactory.ConnectAsync(
+            runtime.NettyHost, runtime.NettyPort, role, runtime.NettyTls, cancellationToken)
+            .ConfigureAwait(false);
         _logger.LogInformation("{role} connection established to {addr}:{port}",
             role, runtime.NettyHost, runtime.NettyPort);
         if (role == ConnectionRole.Control)
@@ -357,7 +342,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
             PublishStatus("CONTROL_CONNECTED", $"已连接控制端 {runtime.NettyHost}:{runtime.NettyPort}",
                 running: true, controlConnected: true, loggedIn: false);
         }
-        return tcp;
+        return connection;
     }
 
     private HeartbeatWatchdog CreateWatchdog(
@@ -657,6 +642,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
     {
         _sessionCts?.Cancel();
         _sessionCts?.Dispose();
+        _connectionFactory.Dispose();
         return _peerMesh.DisposeAsync();
     }
 

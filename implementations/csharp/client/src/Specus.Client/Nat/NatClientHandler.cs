@@ -19,17 +19,27 @@ namespace Specus.Client.Nat;
 /// </summary>
 internal sealed class NatClientHandler : IAsyncDisposable
 {
+    private const int MaximumClosedStreams = 1024;
+    private const int MaximumPendingStreams = 1024;
+    private const int MaximumPendingStreamBytes = 4 * 1024 * 1024;
+    private static readonly TimeSpan LocalConnectTimeout = TimeSpan.FromSeconds(5);
+
     private readonly FrameWriter _writer;
     private readonly DirectHttpHandler _directHttp;
     private readonly ILogger _logger;
     private readonly string _clientName;
+    private readonly Func<string, int, CancellationToken, Task<TcpClient>> _tcpConnector;
 
     private readonly object _stateLock = new();
     private readonly Dictionary<int, SpecusConfigEntry> _specusMappings = new();
     private readonly HashSet<int> _registered = new();
+    private readonly HashSet<uint> _openStreamIds = new();
+    private readonly Dictionary<uint, PendingOpen> _pendingStreams = new();
     private readonly ConcurrentDictionary<uint, LocalSpecusChannel> _channels = new();
     private readonly ConcurrentDictionary<uint, WebSocketSpecusChannel> _wsChannels = new();
     private readonly ConcurrentDictionary<uint, HttpStreamChannel> _httpChannels = new();
+    private readonly ConcurrentDictionary<uint, byte> _closedStreams = new();
+    private readonly ConcurrentQueue<uint> _closedStreamOrder = new();
     private bool _controlWritable = true;
     private CancellationToken _cancellationToken;
 
@@ -38,12 +48,14 @@ internal sealed class NatClientHandler : IAsyncDisposable
         string clientName,
         FrameWriter writer,
         DirectHttpHandler directHttp,
-        ILogger logger)
+        ILogger logger,
+        Func<string, int, CancellationToken, Task<TcpClient>>? tcpConnector = null)
     {
         _writer = writer;
         _directHttp = directHttp;
         _logger = logger;
         _clientName = clientName;
+        _tcpConnector = tcpConnector ?? ConnectLocalTcpAsync;
         foreach (var entry in specusMappings)
         {
             _specusMappings[entry.Port] = entry;
@@ -130,22 +142,35 @@ internal sealed class NatClientHandler : IAsyncDisposable
             case NatMessageType.Fin:
                 if (_httpChannels.TryGetValue(packet.StreamId, out var httpRequest))
                 {
-                    await httpRequest.FinishRequestAsync(packet.MetaData, _cancellationToken)
-                        .ConfigureAwait(false);
+                    try
+                    {
+                        await httpRequest.FinishRequestAsync(packet.MetaData, _cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        await RejectHttpStreamAsync(packet.StreamId, httpRequest, ex.Message)
+                            .ConfigureAwait(false);
+                    }
                 }
                 else
                 {
-                    HandleClosed(packet);
+                    await HandleRemoteFinAsync(packet.StreamId).ConfigureAwait(false);
                 }
                 break;
             case NatMessageType.Rst:
                 if (_httpChannels.TryRemove(packet.StreamId, out var resetHttp))
                 {
+                    MarkStreamClosed(packet.StreamId);
                     resetHttp.Abort(AsString(packet.MetaData, "reason"));
+                }
+                else if (IsClosedStream(packet.StreamId))
+                {
+                    // A reset may race with the response pump completing locally.
                 }
                 else
                 {
-                    HandleClosed(packet);
+                    HandleReset(packet.StreamId);
                 }
                 break;
             case NatMessageType.Keepalive:
@@ -167,6 +192,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 {
                     throw new InvalidDataException("invalid websocket WINDOW_UPDATE");
                 }
+                // WINDOW_UPDATE can race a terminal frame.  Credit for a recently closed
+                // stream is consumed without resurrecting that stream.
                 break;
             default:
                 _logger.LogDebug("NAT: unhandled message type {type}", packet.NatMessageType);
@@ -237,12 +264,25 @@ internal sealed class NatClientHandler : IAsyncDisposable
         var source = AsString(packet.MetaData, "source");
         if (string.Equals(source, "http", StringComparison.Ordinal))
         {
+            var reservation = TryReserveStream(packet.StreamId, pending: false, out _);
+            if (reservation != StreamReservationResult.Reserved)
+            {
+                await RejectDuplicateOpenAsync(packet.StreamId, reservation).ConfigureAwait(false);
+                return;
+            }
             await HandleHttpOpenAsync(packet).ConfigureAwait(false);
+            return;
+        }
+
+        var pendingResult = TryReserveStream(packet.StreamId, pending: true, out var pending);
+        if (pendingResult != StreamReservationResult.Reserved || pending is null)
+        {
+            await RejectDuplicateOpenAsync(packet.StreamId, pendingResult).ConfigureAwait(false);
             return;
         }
         if (string.Equals(source, "ws", StringComparison.Ordinal))
         {
-            await HandleWebSocketConnectedAsync(packet).ConfigureAwait(false);
+            _ = HandleWebSocketConnectedAsync(packet, pending);
             return;
         }
 
@@ -250,38 +290,90 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (port is null)
         {
             _logger.LogWarning("CONNECTED missing port");
+            FailPendingStream(packet.StreamId, pending);
+            await WriteResetPacketAsync(packet.StreamId, 2, "TCP OPEN missing port").ConfigureAwait(false);
             return;
         }
         var channelId = AsString(packet.MetaData, "channelId");
         if (string.IsNullOrEmpty(channelId))
         {
             _logger.LogWarning("CONNECTED missing channelId");
+            FailPendingStream(packet.StreamId, pending);
+            await WriteResetPacketAsync(packet.StreamId, 2, "TCP OPEN missing channelId").ConfigureAwait(false);
             return;
         }
         if (!_specusMappings.TryGetValue(port.Value, out var entry))
         {
             _logger.LogWarning("CONNECTED for unknown port {port}", port);
+            FailPendingStream(packet.StreamId, pending);
+            await WriteResetPacketAsync(packet.StreamId, 3, "TCP OPEN for unknown port").ConfigureAwait(false);
             return;
         }
+
+        _ = ConnectTcpAsync(packet.StreamId, channelId, port.Value, entry, pending);
+    }
+
+    private async Task ConnectTcpAsync(uint streamId, string channelId, int publicPort,
+        SpecusConfigEntry entry, PendingOpen pending)
+    {
+        TcpClient? tcp = null;
         try
         {
-            var tcp = new TcpClient { NoDelay = true };
-            await tcp.ConnectAsync(entry.SpecusAddress, entry.SpecusPort, _cancellationToken).ConfigureAwait(false);
+            tcp = await _tcpConnector(entry.SpecusAddress, entry.SpecusPort, pending.Token)
+                .ConfigureAwait(false);
             var channel = new LocalSpecusChannel(
-                packet.StreamId, channelId, port.Value, tcp, _writer, _logger,
-                c => _channels.TryRemove(c.StreamId, out _));
+                streamId, channelId, publicPort, tcp, _writer, _logger,
+                c =>
+                {
+                    if (_channels.TryRemove(
+                            new KeyValuePair<uint, LocalSpecusChannel>(c.StreamId, c)))
+                    {
+                        MarkStreamClosed(c.StreamId);
+                    }
+                });
             channel.SetControlWritable(_controlWritable);
-            _channels[packet.StreamId] = channel;
+            if (!TryActivateTcpStream(streamId, pending, channel, out var bufferedPackets))
+            {
+                await channel.DisposeAsync().ConfigureAwait(false);
+                return;
+            }
+            tcp = null; // ownership transferred to LocalSpecusChannel
+            foreach (var buffered in bufferedPackets)
+            {
+                await HandleBufferedPacketAsync(buffered).ConfigureAwait(false);
+            }
             _ = Task.Run(async () =>
             {
-                await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
-                await SendFinAsync(packet.StreamId).ConfigureAwait(false);
-            }, _cancellationToken);
+                var completion = await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
+                if (completion == LocalSpecusPumpResult.LocalFin)
+                {
+                    await SendFinAsync(streamId).ConfigureAwait(false);
+                }
+                else if (completion == LocalSpecusPumpResult.Reset)
+                {
+                    await SendResetAsync(streamId, 6, "local TCP read failed").ConfigureAwait(false);
+                }
+            }, CancellationToken.None);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (pending.Token.IsCancellationRequested)
+        {
+            if (FailPendingStream(streamId, pending) && !_cancellationToken.IsCancellationRequested)
+            {
+                await WriteResetPacketAsync(streamId, 1, "local connect timed out").ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
         {
             _logger.LogWarning(ex, "local dial {addr}:{port} failed", entry.SpecusAddress, entry.SpecusPort);
-            await SendResetAsync(packet.StreamId, 1, "local connect failed").ConfigureAwait(false);
+            if (FailPendingStream(streamId, pending))
+            {
+                await WriteResetPacketAsync(streamId, 1, "local connect failed").ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            tcp?.Dispose();
+            pending.Dispose();
         }
     }
 
@@ -290,12 +382,12 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (!string.Equals(AsString(packet.MetaData, "phase"), "request", StringComparison.Ordinal)
             || packet.MetaData is null)
         {
-            return SendResetAsync(packet.StreamId, 20, "invalid HTTP OPEN");
+            return RejectNewHttpStreamAsync(packet.StreamId, 20, "invalid HTTP OPEN");
         }
         var route = AsString(packet.MetaData, "route");
         if (string.IsNullOrWhiteSpace(route))
         {
-            return SendResetAsync(packet.StreamId, 20, "invalid HTTP OPEN");
+            return RejectNewHttpStreamAsync(packet.StreamId, 20, "invalid HTTP OPEN");
         }
         if (!_directHttp.TryResolveRoute(route, out var targetBaseUrl)
             || string.IsNullOrWhiteSpace(targetBaseUrl))
@@ -305,31 +397,38 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 packet.StreamId,
                 route,
                 _directHttp.DescribeRoutes());
-            return SendResetAsync(packet.StreamId, 22, "unknown HTTP route");
+            return RejectNewHttpStreamAsync(packet.StreamId, 22, "unknown HTTP route");
         }
         var channel = new HttpStreamChannel(packet.StreamId, packet.MetaData, _directHttp,
             targetBaseUrl, _writer, _logger, _cancellationToken,
-            closed => _httpChannels.TryRemove(
-                new KeyValuePair<uint, HttpStreamChannel>(closed.StreamId, closed)));
+            closed =>
+            {
+                if (_httpChannels.TryRemove(
+                        new KeyValuePair<uint, HttpStreamChannel>(closed.StreamId, closed)))
+                {
+                    MarkStreamClosed(closed.StreamId);
+                }
+            });
         if (!_httpChannels.TryAdd(packet.StreamId, channel))
         {
             channel.Abort("duplicate HTTP stream");
-            return SendResetAsync(packet.StreamId, 21, "duplicate HTTP stream");
+            MarkStreamClosed(packet.StreamId);
+            return WriteResetPacketAsync(packet.StreamId, 21, "duplicate HTTP stream");
         }
         _ = Task.Run(channel.RunAsync, _cancellationToken);
         return Task.CompletedTask;
     }
 
-    private async Task HandleWebSocketConnectedAsync(NatMessagePacket packet)
+    private async Task HandleWebSocketConnectedAsync(NatMessagePacket packet, PendingOpen pending)
     {
         var channelId = AsString(packet.MetaData, "channelId");
         var route = AsString(packet.MetaData, "route");
         if (string.IsNullOrWhiteSpace(channelId) || string.IsNullOrWhiteSpace(route))
         {
             _logger.LogWarning("[ws-specus][client] CONNECTED missing channelId/route");
-            if (!string.IsNullOrWhiteSpace(channelId))
+            if (FailPendingStream(packet.StreamId, pending))
             {
-                await SendResetAsync(packet.StreamId, 2, "invalid websocket open").ConfigureAwait(false);
+                await WriteResetPacketAsync(packet.StreamId, 2, "invalid websocket open").ConfigureAwait(false);
             }
             return;
         }
@@ -338,7 +437,10 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (!routes.TryGetValue(route, out var targetBaseUrl) || string.IsNullOrWhiteSpace(targetBaseUrl))
         {
             _logger.LogWarning("[ws-specus][client] CONNECTED for unknown route {route}", route);
-            await SendResetAsync(packet.StreamId, 3, "unknown websocket route").ConfigureAwait(false);
+            if (FailPendingStream(packet.StreamId, pending))
+            {
+                await WriteResetPacketAsync(packet.StreamId, 3, "unknown websocket route").ConfigureAwait(false);
+            }
             return;
         }
 
@@ -347,15 +449,17 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (!TryBuildWebSocketTarget(targetBaseUrl, relativePath, rawQuery, out var target, out var error))
         {
             _logger.LogWarning("[ws-specus][client] CONNECTED route={route} build-target-failed error={error}", route, error);
-            await SendResetAsync(packet.StreamId, 4, "invalid websocket target").ConfigureAwait(false);
+            if (FailPendingStream(packet.StreamId, pending))
+            {
+                await WriteResetPacketAsync(packet.StreamId, 4, "invalid websocket target").ConfigureAwait(false);
+            }
             return;
         }
 
+        ClientWebSocket? socket = null;
         try
         {
-            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
-            connectCts.CancelAfter(TimeSpan.FromSeconds(5));
-            var socket = BuildLocalWebSocket();
+            socket = BuildLocalWebSocket();
             foreach (var header in WebSocketHandshakeHeaders(packet.MetaData))
             {
                 try
@@ -368,71 +472,221 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 }
             }
 
-            await socket.ConnectAsync(target, connectCts.Token).ConfigureAwait(false);
-            if (_wsChannels.TryRemove(packet.StreamId, out var previous))
-            {
-                await previous.DisposeAsync().ConfigureAwait(false);
-            }
+            await socket.ConnectAsync(target, pending.Token).ConfigureAwait(false);
             var channel = new WebSocketSpecusChannel(
                 packet.StreamId,
                 channelId,
                 socket,
                 _writer,
                 _logger,
-                c => _wsChannels.TryRemove(c.StreamId, out _));
+                c =>
+                {
+                    if (_wsChannels.TryRemove(
+                            new KeyValuePair<uint, WebSocketSpecusChannel>(c.StreamId, c)))
+                    {
+                        MarkStreamClosed(c.StreamId);
+                    }
+                });
             channel.SetControlWritable(_controlWritable);
-            _wsChannels[packet.StreamId] = channel;
+            if (!TryActivateWebSocketStream(
+                    packet.StreamId, pending, channel, out var bufferedPackets))
+            {
+                await channel.DisposeAsync().ConfigureAwait(false);
+                return;
+            }
+            socket = null; // ownership transferred to WebSocketSpecusChannel
+            foreach (var buffered in bufferedPackets)
+            {
+                await HandleBufferedPacketAsync(buffered).ConfigureAwait(false);
+            }
             _logger.LogInformation("[ws-specus][client] ws handshake ok channelId={channelId} route={route} target={target}",
                 channelId, route, target.GetLeftPart(UriPartial.Path));
             _ = Task.Run(async () =>
             {
-                await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
-                await SendFinAsync(packet.StreamId).ConfigureAwait(false);
-            }, _cancellationToken);
+                var completion = await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
+                if (completion == WebSocketPumpResult.CloseCreditTimedOut)
+                {
+                    await SendResetAsync(packet.StreamId, 8, "websocket close credit timeout")
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await SendFinAsync(packet.StreamId).ConfigureAwait(false);
+                }
+            }, CancellationToken.None);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (pending.Token.IsCancellationRequested)
+        {
+            if (FailPendingStream(packet.StreamId, pending) && !_cancellationToken.IsCancellationRequested)
+            {
+                await WriteResetPacketAsync(packet.StreamId, 5, "websocket connect timed out")
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
         {
             _logger.LogWarning(ex, "[ws-specus][client] connect local ws failed channelId={channelId} route={route}", channelId, route);
-            await SendResetAsync(packet.StreamId, 5, "websocket connect failed").ConfigureAwait(false);
+            if (FailPendingStream(packet.StreamId, pending))
+            {
+                await WriteResetPacketAsync(packet.StreamId, 5, "websocket connect failed").ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            socket?.Dispose();
+            pending.Dispose();
         }
     }
 
     private async Task HandleDataAsync(NatMessagePacket packet)
     {
-        if (packet.Data is null || packet.Data.Length == 0)
-        {
-            return;
-        }
         if (_httpChannels.TryGetValue(packet.StreamId, out var httpChannel))
         {
-            await httpChannel.OfferRequestDataAsync(packet.Data, _cancellationToken)
-                .ConfigureAwait(false);
+            if (packet.Data is null || packet.Data.Length == 0)
+            {
+                return;
+            }
+            try
+            {
+                await httpChannel.OfferRequestDataAsync(packet.Data, _cancellationToken)
+                    .ConfigureAwait(false);
+                if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
+                {
+                    await httpChannel.FinishRequestAsync(packet.MetaData, _cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (InvalidDataException ex)
+            {
+                await RejectHttpStreamAsync(packet.StreamId, httpChannel, ex.Message)
+                    .ConfigureAwait(false);
+            }
             return;
         }
         if (_wsChannels.TryGetValue(packet.StreamId, out var wsChannel))
         {
+            if (packet.Data is null || packet.Data.Length == 0)
+            {
+                return;
+            }
             await wsChannel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
             await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
             return;
         }
+        if (IsClosedStream(packet.StreamId))
+        {
+            await WriteResetPacketAsync(packet.StreamId, 7, "DATA for closed stream")
+                .ConfigureAwait(false);
+            return;
+        }
         if (_channels.TryGetValue(packet.StreamId, out var channel))
         {
-            await channel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
-            await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
+            var data = packet.Data ?? [];
+            if (data.Length > 0)
+            {
+                var result = await channel.WriteAsync(data, _cancellationToken).ConfigureAwait(false);
+                if (result == LocalSpecusWriteResult.DataAfterFin)
+                {
+                    channel.Reset();
+                    await SendResetAsync(packet.StreamId, 7, "TCP DATA after FIN")
+                        .ConfigureAwait(false);
+                    return;
+                }
+                if (result == LocalSpecusWriteResult.Reset)
+                {
+                    await SendResetAsync(packet.StreamId, 7, "local TCP write failed").ConfigureAwait(false);
+                    return;
+                }
+                await SendWindowUpdateAsync(packet.StreamId, data.Length).ConfigureAwait(false);
+            }
+            if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
+            {
+                await HandleRemoteFinAsync(packet.StreamId).ConfigureAwait(false);
+            }
+            return;
         }
+        var pendingResult = TryBufferPendingPacket(packet);
+        if (pendingResult == PendingBufferResult.Buffered)
+        {
+            return;
+        }
+        if (pendingResult == PendingBufferResult.Overflow)
+        {
+            CancelPendingStream(packet.StreamId);
+            await WriteResetPacketAsync(packet.StreamId, 7, "DATA before local stream opened")
+                .ConfigureAwait(false);
+            return;
+        }
+        RememberClosedStream(packet.StreamId);
+        await WriteResetPacketAsync(packet.StreamId, 7, "DATA for unknown TCP stream")
+            .ConfigureAwait(false);
     }
 
-    private void HandleClosed(NatMessagePacket packet)
+    private async Task HandleRemoteFinAsync(uint streamId)
     {
-        if (_wsChannels.TryRemove(packet.StreamId, out var wsChannel))
+        if (_wsChannels.TryRemove(streamId, out var wsChannel))
         {
+            MarkStreamClosed(streamId);
             wsChannel.Close();
             return;
         }
-        if (_channels.TryRemove(packet.StreamId, out var channel))
+        if (IsClosedStream(streamId))
         {
-            channel.Close();
+            await WriteResetPacketAsync(streamId, 7, "FIN for closed stream").ConfigureAwait(false);
+            return;
         }
+        if (!_channels.TryGetValue(streamId, out var channel))
+        {
+            var pendingResult = TryBufferPendingPacket(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Fin,
+                StreamId = streamId,
+            });
+            if (pendingResult == PendingBufferResult.Buffered)
+            {
+                return;
+            }
+            CancelPendingStream(streamId);
+            RememberClosedStream(streamId);
+            await WriteResetPacketAsync(streamId, 7, "FIN for unknown TCP stream").ConfigureAwait(false);
+            return;
+        }
+
+        var result = channel.FinishRemoteDirection();
+        if (result == LocalSpecusRemoteFinResult.Invalid)
+        {
+            channel.Reset();
+            await SendResetAsync(streamId, 7, "duplicate TCP FIN").ConfigureAwait(false);
+            return;
+        }
+        if (result == LocalSpecusRemoteFinResult.Reset)
+        {
+            await SendResetAsync(streamId, 8, "local TCP shutdown failed").ConfigureAwait(false);
+        }
+    }
+
+    private void HandleReset(uint streamId)
+    {
+        if (CancelPendingStream(streamId))
+        {
+            return;
+        }
+        if (_wsChannels.TryRemove(streamId, out var wsChannel))
+        {
+            MarkStreamClosed(streamId);
+            wsChannel.Close();
+            return;
+        }
+        if (IsClosedStream(streamId))
+        {
+            return;
+        }
+        if (_channels.TryGetValue(streamId, out var channel))
+        {
+            channel.Reset();
+            return;
+        }
+        throw new InvalidDataException($"TCP RST for unknown stream {streamId}");
     }
 
     private async Task SendFinAsync(uint streamId)
@@ -453,6 +707,12 @@ internal sealed class NatClientHandler : IAsyncDisposable
     }
 
     private async Task SendResetAsync(uint streamId, uint errorCode, string reason)
+    {
+        MarkStreamClosed(streamId);
+        await WriteResetPacketAsync(streamId, errorCode, reason).ConfigureAwait(false);
+    }
+
+    private async Task WriteResetPacketAsync(uint streamId, uint errorCode, string reason)
     {
         try
         {
@@ -573,6 +833,253 @@ internal sealed class NatClientHandler : IAsyncDisposable
         return true;
     }
 
+    private async Task RejectHttpStreamAsync(uint streamId, HttpStreamChannel channel, string reason)
+    {
+        if (_httpChannels.TryRemove(
+                new KeyValuePair<uint, HttpStreamChannel>(streamId, channel)))
+        {
+            MarkStreamClosed(streamId);
+            channel.Abort(reason);
+            await WriteResetPacketAsync(streamId, 27, reason).ConfigureAwait(false);
+        }
+    }
+
+    private Task RejectNewHttpStreamAsync(uint streamId, uint errorCode, string reason)
+    {
+        MarkStreamClosed(streamId);
+        return WriteResetPacketAsync(streamId, errorCode, reason);
+    }
+
+    private async Task RejectDuplicateOpenAsync(uint streamId, StreamReservationResult result)
+    {
+        var reason = result == StreamReservationResult.Reused
+            ? "reused stream id"
+            : result == StreamReservationResult.Excessive
+                ? "too many pending streams"
+                : "duplicate stream id";
+
+        if (result == StreamReservationResult.Duplicate)
+        {
+            if (_httpChannels.TryRemove(streamId, out var http))
+            {
+                http.Abort(reason);
+            }
+            if (_wsChannels.TryRemove(streamId, out var ws))
+            {
+                ws.Close();
+            }
+            if (_channels.TryGetValue(streamId, out var tcp))
+            {
+                tcp.Reset();
+            }
+            CancelPendingStream(streamId);
+        }
+        MarkStreamClosed(streamId);
+        await WriteResetPacketAsync(streamId, 7, reason).ConfigureAwait(false);
+    }
+
+    private StreamReservationResult TryReserveStream(uint streamId, bool pending,
+        out PendingOpen? pendingOpen)
+    {
+        pendingOpen = null;
+        lock (_stateLock)
+        {
+            if (_closedStreams.ContainsKey(streamId))
+            {
+                return StreamReservationResult.Reused;
+            }
+            if (!_openStreamIds.Add(streamId))
+            {
+                return StreamReservationResult.Duplicate;
+            }
+            if (!pending)
+            {
+                return StreamReservationResult.Reserved;
+            }
+            if (_pendingStreams.Count >= MaximumPendingStreams)
+            {
+                _openStreamIds.Remove(streamId);
+                return StreamReservationResult.Excessive;
+            }
+            pendingOpen = new PendingOpen(_cancellationToken, LocalConnectTimeout);
+            _pendingStreams.Add(streamId, pendingOpen);
+            return StreamReservationResult.Reserved;
+        }
+    }
+
+    private bool TryActivateTcpStream(uint streamId, PendingOpen pending,
+        LocalSpecusChannel channel, out IReadOnlyList<NatMessagePacket> bufferedPackets)
+    {
+        bufferedPackets = [];
+        lock (_stateLock)
+        {
+            if (!_pendingStreams.TryGetValue(streamId, out var current)
+                || !ReferenceEquals(current, pending)
+                || !_openStreamIds.Contains(streamId))
+            {
+                return false;
+            }
+            _pendingStreams.Remove(streamId);
+            if (!_channels.TryAdd(streamId, channel))
+            {
+                _openStreamIds.Remove(streamId);
+                RememberClosedStream(streamId);
+                return false;
+            }
+            bufferedPackets = pending.TakeBufferedPackets();
+        }
+        pending.Dispose();
+        return true;
+    }
+
+    private bool TryActivateWebSocketStream(uint streamId, PendingOpen pending,
+        WebSocketSpecusChannel channel, out IReadOnlyList<NatMessagePacket> bufferedPackets)
+    {
+        bufferedPackets = [];
+        lock (_stateLock)
+        {
+            if (!_pendingStreams.TryGetValue(streamId, out var current)
+                || !ReferenceEquals(current, pending)
+                || !_openStreamIds.Contains(streamId))
+            {
+                return false;
+            }
+            _pendingStreams.Remove(streamId);
+            if (!_wsChannels.TryAdd(streamId, channel))
+            {
+                _openStreamIds.Remove(streamId);
+                RememberClosedStream(streamId);
+                return false;
+            }
+            bufferedPackets = pending.TakeBufferedPackets();
+        }
+        pending.Dispose();
+        return true;
+    }
+
+    private bool FailPendingStream(uint streamId, PendingOpen expected)
+    {
+        var removed = false;
+        lock (_stateLock)
+        {
+            if (_pendingStreams.TryGetValue(streamId, out var current)
+                && ReferenceEquals(current, expected))
+            {
+                _pendingStreams.Remove(streamId);
+                _openStreamIds.Remove(streamId);
+                removed = true;
+            }
+        }
+        if (removed)
+        {
+            expected.Cancel();
+            expected.Dispose();
+            RememberClosedStream(streamId);
+        }
+        return removed;
+    }
+
+    private PendingBufferResult TryBufferPendingPacket(NatMessagePacket packet)
+    {
+        lock (_stateLock)
+        {
+            if (!_pendingStreams.TryGetValue(packet.StreamId, out var pending))
+            {
+                return PendingBufferResult.NotPending;
+            }
+            return pending.TryBufferPacket(packet, MaximumPendingStreamBytes)
+                ? PendingBufferResult.Buffered
+                : PendingBufferResult.Overflow;
+        }
+    }
+
+    private async Task HandleBufferedPacketAsync(NatMessagePacket packet)
+    {
+        if (packet.NatMessageType == NatMessageType.Data)
+        {
+            await HandleDataAsync(packet).ConfigureAwait(false);
+        }
+        else if (packet.NatMessageType == NatMessageType.Fin)
+        {
+            await HandleRemoteFinAsync(packet.StreamId).ConfigureAwait(false);
+        }
+    }
+
+    private bool CancelPendingStream(uint streamId)
+    {
+        PendingOpen? pending = null;
+        lock (_stateLock)
+        {
+            if (_pendingStreams.Remove(streamId, out pending))
+            {
+                _openStreamIds.Remove(streamId);
+            }
+        }
+        if (pending is null)
+        {
+            return false;
+        }
+        pending.Cancel();
+        pending.Dispose();
+        RememberClosedStream(streamId);
+        return true;
+    }
+
+    private void MarkStreamClosed(uint streamId)
+    {
+        PendingOpen? pending = null;
+        lock (_stateLock)
+        {
+            _openStreamIds.Remove(streamId);
+            _pendingStreams.Remove(streamId, out pending);
+        }
+        pending?.Cancel();
+        pending?.Dispose();
+        RememberClosedStream(streamId);
+    }
+
+    private void RememberClosedStream(uint streamId)
+    {
+        if (!_closedStreams.TryAdd(streamId, 0))
+        {
+            return;
+        }
+        _closedStreamOrder.Enqueue(streamId);
+        while (_closedStreams.Count > MaximumClosedStreams
+               && _closedStreamOrder.TryDequeue(out var expired))
+        {
+            _closedStreams.TryRemove(expired, out _);
+        }
+    }
+
+    private bool IsClosedStream(uint streamId) => _closedStreams.ContainsKey(streamId);
+
+    internal bool HasPendingStream(uint streamId)
+    {
+        lock (_stateLock)
+        {
+            return _pendingStreams.ContainsKey(streamId);
+        }
+    }
+
+    internal bool HasTcpStream(uint streamId) => _channels.ContainsKey(streamId);
+
+    private static async Task<TcpClient> ConnectLocalTcpAsync(
+        string address, int port, CancellationToken cancellationToken)
+    {
+        var tcp = new TcpClient { NoDelay = true };
+        try
+        {
+            await tcp.ConnectAsync(address, port, cancellationToken).ConfigureAwait(false);
+            return tcp;
+        }
+        catch
+        {
+            tcp.Dispose();
+            throw;
+        }
+    }
+
     internal static ClientWebSocket BuildLocalWebSocket()
     {
         var socket = new ClientWebSocket();
@@ -656,6 +1163,18 @@ internal sealed class NatClientHandler : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        PendingOpen[] pending;
+        lock (_stateLock)
+        {
+            pending = _pendingStreams.Values.ToArray();
+            _pendingStreams.Clear();
+            _openStreamIds.Clear();
+        }
+        foreach (var open in pending)
+        {
+            open.Cancel();
+            open.Dispose();
+        }
         foreach (var channel in _channels.Values)
         {
             await channel.DisposeAsync().ConfigureAwait(false);
@@ -671,5 +1190,79 @@ internal sealed class NatClientHandler : IAsyncDisposable
             await channel.DisposeAsync().ConfigureAwait(false);
         }
         _httpChannels.Clear();
+        _closedStreams.Clear();
+        while (_closedStreamOrder.TryDequeue(out _))
+        {
+        }
+    }
+
+    private enum StreamReservationResult
+    {
+        Reserved,
+        Duplicate,
+        Reused,
+        Excessive,
+    }
+
+    private enum PendingBufferResult
+    {
+        NotPending,
+        Buffered,
+        Overflow,
+    }
+
+    private sealed class PendingOpen : IDisposable
+    {
+        private readonly CancellationTokenSource _source;
+        private readonly List<NatMessagePacket> _bufferedPackets = new();
+        private int _bufferedBytes;
+        private int _disposed;
+
+        public PendingOpen(CancellationToken session, TimeSpan timeout)
+        {
+            _source = CancellationTokenSource.CreateLinkedTokenSource(session);
+            _source.CancelAfter(timeout);
+            Token = _source.Token;
+        }
+
+        public CancellationToken Token { get; }
+
+        public bool TryBufferPacket(NatMessagePacket packet, int maximumBytes)
+        {
+            var bytes = packet.Data?.Length ?? 0;
+            if (bytes > maximumBytes - _bufferedBytes)
+            {
+                return false;
+            }
+            _bufferedBytes += bytes;
+            _bufferedPackets.Add(packet);
+            return true;
+        }
+
+        public IReadOnlyList<NatMessagePacket> TakeBufferedPackets()
+        {
+            if (_bufferedPackets.Count == 0)
+            {
+                return [];
+            }
+            var packets = _bufferedPackets.ToArray();
+            _bufferedPackets.Clear();
+            _bufferedBytes = 0;
+            return packets;
+        }
+
+        public void Cancel()
+        {
+            try { _source.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _source.Dispose();
+            }
+        }
     }
 }

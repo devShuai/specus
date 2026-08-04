@@ -82,7 +82,9 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
   `ws://` / `wss://` 上游地址，过滤 hop-by-hop 与 WebSocket 握手头后发起本地 WebSocket 握手；
   `//` 按 Java 一样作为同 host 下普通双斜线路径保留；对运维配置的内网 `wss` upstream 证书按
   HTTP stream 策略信任；每个 `DATA` payload 使用固定 12 字节 `SWS2` envelope 保留 opcode、FIN、RSV、
-  close code/reason，任一侧断开都会回发 `FIN` 或 `RST`。
+  close code/reason，任一侧断开都会回发 `FIN` 或 `RST`。受 `.NET ClientWebSocket` API 限制，原生
+  ping/pong 不会暴露给应用层：远端 `PING` 在隧道边界原样回 `PONG`，远端 `PONG` 被安全消费；文本、
+  二进制、分片和 CLOSE（含 no-status close）仍保持 SWS2 语义，控制帧不会导致 stream 被关闭。
 - **Peer Mesh**:读取与 Java 相同的 `peerMeshDevice/peerMeshTunName/peerMeshMtu` 启动配置，
   登录环境会上报 v2 X25519 public key；已识别 HTTP 登录响应里的 `peerMesh` 配置和控制通道
   `PEER_CONTROL` 消息，支持 roster/session/candidates、标准 STUN/TURN Binding，以及带临时 credential、realm/nonce、MESSAGE-INTEGRITY 的 Allocate/Refresh/CreatePermission、Send/Data Indication；

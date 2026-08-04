@@ -14,6 +14,8 @@ namespace Specus.Client.Configuration;
 
 public sealed class ClientAuthService
 {
+    public static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(20);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
@@ -31,6 +33,27 @@ public sealed class ClientAuthService
         _http = http;
         _logger = logger;
     }
+
+    /// <summary>
+    /// Builds the management-plane HTTP client.  Unlike the route forwarder, this client keeps
+    /// the platform certificate validator because it carries the startup credential signature.
+    /// </summary>
+    public static HttpClient BuildDefaultClient()
+    {
+        var handler = BuildDefaultHandler();
+        return new HttpClient(handler) { Timeout = DefaultRequestTimeout };
+    }
+
+    internal static SocketsHttpHandler BuildDefaultHandler() => new()
+    {
+        AllowAutoRedirect = false,
+        AutomaticDecompression = DecompressionMethods.None,
+        ConnectTimeout = TimeSpan.FromSeconds(10),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+        UseProxy = true,
+        // Deliberately leave SslOptions.RemoteCertificateValidationCallback unset.  The
+        // management login must use the operating-system trust store and hostname validation.
+    };
 
     public async Task<SpecusRuntimeState> LoginAsync(CancellationToken cancellationToken)
     {

@@ -8,6 +8,12 @@ using Specus.Protocol.Flow;
 
 namespace Specus.Client.Nat;
 
+internal enum WebSocketPumpResult
+{
+    Completed,
+    CloseCreditTimedOut,
+}
+
 /// <summary>
 /// One local WebSocket connection bridged through NAT <c>DATA</c> frames using mandatory SWS2.
 /// </summary>
@@ -15,6 +21,7 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
 {
     private const int BufferSize = 16 * 1024;
     private const int MaxMessageBytes = 16 * 1024 * 1024;
+    private static readonly TimeSpan DefaultCloseSendTimeout = TimeSpan.FromSeconds(5);
 
     private readonly ClientWebSocket _socket;
     private readonly FrameWriter _controlWriter;
@@ -23,7 +30,8 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ManualResetEventSlim _writableGate = new(initialState: true);
-    private readonly StreamSendWindow _sendWindow = new();
+    private readonly StreamSendWindow _sendWindow;
+    private readonly TimeSpan _closeSendTimeout;
     private WebSocketMessageType? _incomingFragmentType;
 
     public WebSocketSpecusChannel(
@@ -32,7 +40,9 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
         ClientWebSocket socket,
         FrameWriter controlWriter,
         ILogger logger,
-        Action<WebSocketSpecusChannel> onClosed)
+        Action<WebSocketSpecusChannel> onClosed,
+        StreamSendWindow? sendWindow = null,
+        TimeSpan? closeSendTimeout = null)
     {
         StreamId = streamId;
         ChannelId = channelId;
@@ -40,6 +50,8 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
         _controlWriter = controlWriter;
         _logger = logger;
         _onClosed = onClosed;
+        _sendWindow = sendWindow ?? new StreamSendWindow();
+        _closeSendTimeout = closeSendTimeout ?? DefaultCloseSendTimeout;
     }
 
     public string ChannelId { get; }
@@ -57,13 +69,14 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
         }
     }
 
-    public async Task PumpAsync(CancellationToken cancellationToken)
+    public async Task<WebSocketPumpResult> PumpAsync(CancellationToken cancellationToken)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
         var token = linked.Token;
         var buffer = new byte[BufferSize];
         var messageBytes = 0;
         var continuation = false;
+        var completion = WebSocketPumpResult.Completed;
         try
         {
             while (!token.IsCancellationRequested && _socket.State == WebSocketState.Open)
@@ -79,8 +92,21 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
                 {
                     var reason = EncodeCloseReason(_socket.CloseStatusDescription);
                     var closeCode = _socket.CloseStatus is null ? (ushort)0 : (ushort)_socket.CloseStatus.Value;
-                    await SendFrameAsync(new WebSocketSpecusFrame(
-                        WebSocketSpecusFrame.OpcodeClose, true, 0, closeCode, reason), token).ConfigureAwait(false);
+                    using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    closeCts.CancelAfter(_closeSendTimeout);
+                    try
+                    {
+                        await SendFrameAsync(new WebSocketSpecusFrame(
+                            WebSocketSpecusFrame.OpcodeClose, true, 0, closeCode, reason), closeCts.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested
+                                                             && closeCts.IsCancellationRequested)
+                    {
+                        completion = WebSocketPumpResult.CloseCreditTimedOut;
+                        _logger.LogDebug(
+                            "ws channel {channel}: timed out waiting for CLOSE send credit", ChannelId);
+                    }
                     break;
                 }
                 if (result.MessageType is not WebSocketMessageType.Text and not WebSocketMessageType.Binary)
@@ -126,6 +152,7 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
             _onClosed(this);
             await DisposeAsync().ConfigureAwait(false);
         }
+        return completion;
     }
 
     public async ValueTask WriteAsync(byte[] data, CancellationToken cancellationToken)
@@ -141,21 +168,35 @@ internal sealed class WebSocketSpecusChannel : IAsyncDisposable
             {
                 throw new InvalidDataException("ClientWebSocket endpoint did not negotiate RSV extensions");
             }
+            if (frame.Opcode == WebSocketSpecusFrame.OpcodePing)
+            {
+                // ClientWebSocket cannot emit a native ping to the local upstream.  Preserve
+                // remote liveness at the tunnel boundary by returning the matching pong.
+                await SendFrameAsync(new WebSocketSpecusFrame(
+                    WebSocketSpecusFrame.OpcodePong, true, 0, 0, frame.Payload), cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
+            if (frame.Opcode == WebSocketSpecusFrame.OpcodePong)
+            {
+                // ClientWebSocket consumes local control frames internally; a remote pong is
+                // therefore safely consumed at this boundary as well.
+                return;
+            }
             await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 if (frame.Opcode == WebSocketSpecusFrame.OpcodeClose)
                 {
                     var status = frame.CloseCode == 0
-                        ? WebSocketCloseStatus.NormalClosure
+                        ? WebSocketCloseStatus.Empty
                         : (WebSocketCloseStatus)frame.CloseCode;
+                    var description = frame.CloseCode == 0
+                        ? null
+                        : Encoding.UTF8.GetString(frame.Payload);
                     await _socket.CloseOutputAsync(
-                        status, Encoding.UTF8.GetString(frame.Payload), cancellationToken).ConfigureAwait(false);
+                        status, description, cancellationToken).ConfigureAwait(false);
                     return;
-                }
-                if (frame.Opcode is WebSocketSpecusFrame.OpcodePing or WebSocketSpecusFrame.OpcodePong)
-                {
-                    throw new InvalidDataException("ClientWebSocket cannot emit explicit ping/pong frames");
                 }
                 var messageType = ResolveIncomingMessageType(frame);
                 await _socket.SendAsync(

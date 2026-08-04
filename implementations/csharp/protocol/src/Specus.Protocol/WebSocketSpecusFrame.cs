@@ -100,7 +100,7 @@ public sealed class WebSocketSpecusFrame
             {
                 throw new ArgumentException("WebSocket close reason exceeds 123 bytes");
             }
-            if (CloseCode != 0 && (CloseCode < 1000 || CloseCode >= 5000))
+            if (CloseCode != 0 && (CloseCode < 1000 || CloseCode >= 5000 || IsWireForbiddenCloseCode(CloseCode)))
             {
                 throw new ArgumentException("invalid WebSocket close code");
             }
@@ -114,4 +114,7 @@ public sealed class WebSocketSpecusFrame
             throw new ArgumentException("close code is only valid on CLOSE");
         }
     }
+
+    private static bool IsWireForbiddenCloseCode(ushort closeCode) =>
+        closeCode is 1004 or 1005 or 1006 or 1015;
 }
