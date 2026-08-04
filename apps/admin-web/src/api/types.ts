@@ -117,6 +117,9 @@ export interface HttpRoute {
   clientName: string;
   route: string;
   targetBaseUrl: string;
+  authEnabled: boolean;
+  authUsername: string;
+  authPasswordConfigured: boolean;
   enabled: boolean;
   detailCaptureEnabled: boolean;
   mediaCaptureEnabled: boolean;
@@ -716,6 +719,9 @@ export interface SpecusMutation {
 export interface HttpRouteMutation {
   route: string;
   targetBaseUrl: string;
+  authEnabled?: boolean;
+  authUsername?: string;
+  authPassword?: string;
   enabled?: boolean;
   detailCaptureEnabled?: boolean;
   mediaCaptureEnabled?: boolean;

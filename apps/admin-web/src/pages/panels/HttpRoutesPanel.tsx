@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Button,
+  Chip,
   Dropdown,
   DropdownItem,
   DropdownMenu,
@@ -32,6 +33,13 @@ import { useClients } from "../../hooks/useClients";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
+import {
+  buildHttpRouteAuthMutation,
+  HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH,
+  HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH,
+  validateHttpRouteAuth,
+  type HttpRouteAuthDraft,
+} from "./httpRouteAuth";
 
 const PAGE_SIZE = 10;
 type RouteToggleField = "enabled" | "detailCaptureEnabled" | "mediaCaptureEnabled" | "pathRewriteEnabled";
@@ -48,6 +56,10 @@ export function HttpRoutesPanel() {
   const [createClientId, setCreateClientId] = useState("");
   const [route, setRoute] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authValidationVisible, setAuthValidationVisible] = useState(false);
   const [lastCreatedAccessUrl, setLastCreatedAccessUrl] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<HttpRoute | null>(null);
@@ -78,6 +90,18 @@ export function HttpRoutesPanel() {
       notify("请先选择客户端", "error");
       return;
     }
+    const authDraft: HttpRouteAuthDraft = {
+      enabled: authEnabled,
+      username: authUsername,
+      password: authPassword,
+      passwordConfigured: false,
+    };
+    const authError = validateHttpRouteAuth(authDraft);
+    if (authError) {
+      setAuthValidationVisible(true);
+      notify(authError, "error");
+      return;
+    }
     setCreating(true);
     try {
       const created = await adminApi.createHttpRoute(Number(createClientId), {
@@ -87,9 +111,14 @@ export function HttpRoutesPanel() {
         detailCaptureEnabled: false,
         mediaCaptureEnabled: false,
         pathRewriteEnabled: false,
+        ...buildHttpRouteAuthMutation(authDraft),
       });
       setRoute("");
       setTargetBaseUrl("");
+      setAuthEnabled(false);
+      setAuthUsername("");
+      setAuthPassword("");
+      setAuthValidationVisible(false);
       setLastCreatedAccessUrl(httpRouteAccessUrl(created));
       notify("HTTP 路由已创建");
       await load();
@@ -162,6 +191,13 @@ export function HttpRoutesPanel() {
   const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pagedRoutes = routes.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const createAuthDraft: HttpRouteAuthDraft = {
+    enabled: authEnabled,
+    username: authUsername,
+    password: authPassword,
+    passwordConfigured: false,
+  };
+  const createAuthError = authValidationVisible ? validateHttpRouteAuth(createAuthDraft) : "";
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
@@ -185,6 +221,49 @@ export function HttpRoutesPanel() {
         <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
           刷新
         </Button>
+        <div className="w-full rounded-medium border border-default-200 bg-default-50/70 p-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <Switch
+              size="sm"
+              isSelected={authEnabled}
+              onValueChange={(enabled) => {
+                setAuthEnabled(enabled);
+                setAuthValidationVisible(false);
+              }}
+            >
+              访问认证
+            </Switch>
+            <HttpRouteAuthChip enabled={authEnabled} />
+            <span className="text-tiny text-default-500">
+              {authEnabled ? "访问链接时由浏览器验证用户名和密码" : "拥有链接的访问者可直接打开"}
+            </span>
+          </div>
+          {authEnabled ? (
+            <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
+              <Input
+                autoComplete="off"
+                label="访问用户名"
+                maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}
+                value={authUsername}
+                onValueChange={setAuthUsername}
+                isInvalid={Boolean(createAuthError && createAuthError.includes("用户名"))}
+                errorMessage={createAuthError.includes("用户名") ? createAuthError : ""}
+                isRequired
+              />
+              <Input
+                autoComplete="new-password"
+                label="访问密码"
+                maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}
+                type="password"
+                value={authPassword}
+                onValueChange={setAuthPassword}
+                isInvalid={Boolean(createAuthError && createAuthError.includes("密码"))}
+                errorMessage={createAuthError.includes("密码") ? createAuthError : ""}
+                isRequired
+              />
+            </div>
+          ) : null}
+        </div>
       </form>
 
       {lastCreatedAccessUrl && (
@@ -289,6 +368,7 @@ export function HttpRoutesPanel() {
                     >
                       媒体采集
                     </Switch>
+                    <HttpRouteAuthChip enabled={Boolean(item.authEnabled)} />
                   </>
                 }
                 fields={[
@@ -343,16 +423,17 @@ export function HttpRoutesPanel() {
         >
         <TableHeader>
           <TableColumn className="w-[5%]">ID</TableColumn>
-          <TableColumn className="w-[11%]">
+          <TableColumn className="w-[10%]">
             <ClientFilterHeader
               clients={clients}
               selectedClientId={filterClientId}
               onSelect={setFilterClientId}
             />
           </TableColumn>
-          <TableColumn className="w-[8%]">路由名</TableColumn>
-          <TableColumn className="w-[13%]">目标地址</TableColumn>
-          <TableColumn className="w-[15%]">访问链接</TableColumn>
+          <TableColumn className="w-[7%]">路由名</TableColumn>
+          <TableColumn className="w-[12%]">目标地址</TableColumn>
+          <TableColumn className="w-[14%]">访问链接</TableColumn>
+          <TableColumn className="w-[8%]">认证</TableColumn>
           <TableColumn className="w-[6%]">启用</TableColumn>
           <TableColumn className="w-[6%]">明细</TableColumn>
           <TableColumn className="w-[6%]">媒体</TableColumn>
@@ -386,6 +467,9 @@ export function HttpRoutesPanel() {
               </TableCell>
               <TableCell>
                 <HttpRouteAccessLink route={item} />
+              </TableCell>
+              <TableCell>
+                <HttpRouteAuthChip enabled={Boolean(item.authEnabled)} />
               </TableCell>
               <TableCell>
                 <Switch
@@ -488,6 +572,34 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
   );
 }
 
+function HttpRouteAuthChip({ enabled }: { enabled: boolean }) {
+  return (
+    <Chip
+      color={enabled ? "primary" : "default"}
+      size="sm"
+      startContent={<RouteAuthIcon locked={enabled} />}
+      title={enabled ? "访问者需要通过 HTTP Basic 认证" : "无需认证即可访问"}
+      variant="flat"
+    >
+      {enabled ? "Basic" : "公开"}
+    </Chip>
+  );
+}
+
+function RouteAuthIcon({ locked }: { locked: boolean }) {
+  return locked ? (
+    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+      <rect height="10" rx="2" width="14" x="5" y="10" />
+      <path strokeLinecap="round" d="M8 10V7a4 4 0 018 0v3" />
+    </svg>
+  ) : (
+    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8" />
+      <path strokeLinecap="round" d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8z" />
+    </svg>
+  );
+}
+
 function ClientFilterHeader({
   clients,
   onSelect,
@@ -567,6 +679,11 @@ interface EditHttpRouteModalProps {
 function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalProps) {
   const [name, setName] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authPasswordConfigured, setAuthPasswordConfigured] = useState(false);
+  const [authValidationVisible, setAuthValidationVisible] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
   const [mediaCaptureEnabled, setMediaCaptureEnabled] = useState(false);
@@ -577,6 +694,11 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
     if (route) {
       setName(route.route);
       setTargetBaseUrl(route.targetBaseUrl);
+      setAuthEnabled(Boolean(route.authEnabled));
+      setAuthUsername(route.authUsername || "");
+      setAuthPassword("");
+      setAuthPasswordConfigured(Boolean(route.authPasswordConfigured));
+      setAuthValidationVisible(false);
       setEnabled(route.enabled);
       setDetailCaptureEnabled(Boolean(route.detailCaptureEnabled));
       setMediaCaptureEnabled(Boolean(route.mediaCaptureEnabled));
@@ -584,8 +706,22 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
     }
   }, [route]);
 
+  const authDraft: HttpRouteAuthDraft = {
+    enabled: authEnabled,
+    username: authUsername,
+    password: authPassword,
+    passwordConfigured: authPasswordConfigured,
+  };
+  const authError = authValidationVisible ? validateHttpRouteAuth(authDraft) : "";
+
   const save = async () => {
     if (!route) {
+      return;
+    }
+    const nextAuthError = validateHttpRouteAuth(authDraft);
+    if (nextAuthError) {
+      setAuthValidationVisible(true);
+      notify(nextAuthError, "error");
       return;
     }
     setSaving(true);
@@ -597,6 +733,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         detailCaptureEnabled,
         mediaCaptureEnabled,
         pathRewriteEnabled,
+        ...buildHttpRouteAuthMutation(authDraft),
       });
       notify("HTTP 路由已更新");
       disclosure.onClose();
@@ -617,6 +754,54 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
             <ModalBody className="gap-3">
               <Input label="路由名" value={name} onValueChange={setName} maxLength={60} isRequired />
               <Input label="目标地址" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
+              <div className="rounded-medium border border-default-200 bg-default-50/70 p-3">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                  <Switch
+                    size="sm"
+                    isSelected={authEnabled}
+                    onValueChange={(nextEnabled) => {
+                      setAuthEnabled(nextEnabled);
+                      setAuthValidationVisible(false);
+                    }}
+                  >
+                    访问认证
+                  </Switch>
+                  <HttpRouteAuthChip enabled={authEnabled} />
+                </div>
+                <p className="mt-2 text-tiny text-default-500">
+                  {authEnabled
+                    ? "浏览器访问该路由时需要输入 HTTP Basic 用户名和密码。"
+                    : authPasswordConfigured
+                      ? "当前公开访问；已保存的凭据会保留，重新开启后可继续使用。"
+                      : "当前公开访问，拥有链接的访问者可直接打开。"}
+                </p>
+                {authEnabled ? (
+                  <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
+                    <Input
+                      autoComplete="off"
+                      label="访问用户名"
+                      maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}
+                      value={authUsername}
+                      onValueChange={setAuthUsername}
+                      isInvalid={Boolean(authError && authError.includes("用户名"))}
+                      errorMessage={authError.includes("用户名") ? authError : ""}
+                      isRequired
+                    />
+                    <Input
+                      autoComplete="new-password"
+                      description={authPasswordConfigured ? "留空表示保留当前密码" : "首次开启时必须设置密码"}
+                      label={authPasswordConfigured ? "更换访问密码" : "访问密码"}
+                      maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}
+                      type="password"
+                      value={authPassword}
+                      onValueChange={setAuthPassword}
+                      isInvalid={Boolean(authError && authError.includes("密码"))}
+                      errorMessage={authError.includes("密码") ? authError : ""}
+                      isRequired={!authPasswordConfigured}
+                    />
+                  </div>
+                ) : null}
+              </div>
               <Switch isSelected={enabled} onValueChange={setEnabled}>
                 启用
               </Switch>
@@ -634,7 +819,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               <Button variant="flat" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isLoading={saving} onPress={() => void save()}>
+              <Button color="primary" isDisabled={Boolean(authError)} isLoading={saving} onPress={() => void save()}>
                 保存
               </Button>
             </ModalFooter>
