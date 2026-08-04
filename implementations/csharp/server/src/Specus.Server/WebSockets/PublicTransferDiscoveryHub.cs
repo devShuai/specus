@@ -15,6 +15,8 @@ public sealed class PublicTransferDiscoveryHub
     private const int MaxMessageChars = 64 * 1024;
     private const int MaxMessageUtf8Bytes = MaxMessageChars * 3;
     private const string DuplicatePeerIdError = "peer id is already connected";
+    private static readonly HashSet<string> ViewerWriteMessageTypes =
+        new(StringComparer.Ordinal) { "attachment", "clipboard", "whiteboard" };
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
@@ -89,6 +91,7 @@ public sealed class PublicTransferDiscoveryHub
             {
                 type = "hello",
                 peerId = participant.PeerId,
+                displayName = participant.DisplayName,
                 roomId = participant.RoomId,
                 publicAddress = participant.PublicAddress,
                 sharedRoom = participant.SharedRoom,
@@ -185,6 +188,11 @@ public sealed class PublicTransferDiscoveryHub
     private async Task<PublicTransferClusterRegistration> RegisterAsync(Participant participant,
         CancellationToken cancellationToken)
     {
+        if (!participant.Discoverable)
+        {
+            _participants[participant.Id] = participant;
+            return new PublicTransferClusterRegistration(null, 0);
+        }
         if (_coordination.Enabled)
         {
             var registration = await _coordination.RegisterAsync(participant.ToCluster(),
@@ -231,7 +239,7 @@ public sealed class PublicTransferDiscoveryHub
         {
             return 0;
         }
-        if (_coordination.Enabled)
+        if (_coordination.Enabled && participant.Discoverable)
         {
             try
             {
@@ -244,6 +252,10 @@ public sealed class PublicTransferDiscoveryHub
                     "public transfer cluster unregister failed: peer={Peer}", participant.PeerId);
                 return 0;
             }
+        }
+        if (_coordination.Enabled)
+        {
+            return 0;
         }
         return NextLocalRosterRevision(participant.GroupId);
     }
@@ -271,6 +283,13 @@ public sealed class PublicTransferDiscoveryHub
                 cancellationToken).ConfigureAwait(false);
             return;
         }
+        if (string.Equals(source.RoomRole, "VIEWER", StringComparison.Ordinal)
+            && ViewerWriteMessageTypes.Contains(type))
+        {
+            await source.SendAsync(new { type = "error", error = "viewer is read-only" },
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
         var targetPeerId = Text(root, "targetPeerId", string.Empty);
         JsonElement? payload = root.ValueKind == JsonValueKind.Object
             && root.TryGetProperty("payload", out var payloadValue)
@@ -279,6 +298,7 @@ public sealed class PublicTransferDiscoveryHub
         var envelope = new SignalEnvelope(
             type,
             source.PeerId,
+            source.RoomRole,
             string.IsNullOrWhiteSpace(targetPeerId) ? null : targetPeerId,
             source.RoomId,
             source.PublicAddress,
@@ -314,6 +334,13 @@ public sealed class PublicTransferDiscoveryHub
     private async Task HandleBinaryMessageAsync(Participant source,
         PublicTransferRelayClientFrame frame, CancellationToken cancellationToken)
     {
+        if (string.Equals(source.RoomRole, "VIEWER", StringComparison.Ordinal)
+            && frame.AppType != PublicTransferRelayFrame.AppTypeAck)
+        {
+            await source.SendAsync(new { type = "error", error = "viewer is read-only" },
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
         var envelope = PublicTransferRelayFrame.EncodeServer(
             frame.TargetPeerId, source.PeerId, frame.AppFrame);
         if (_coordination.Enabled)
@@ -368,6 +395,7 @@ public sealed class PublicTransferDiscoveryHub
         {
             peers = _participants.Values
                 .Where(peer => peer.SameGroup(group))
+                .Where(peer => peer.Discoverable)
                 .OrderBy(peer => peer.ConnectedAt, StringComparer.Ordinal)
                 .Select(ParticipantView)
                 .ToList();
@@ -423,6 +451,10 @@ public sealed class PublicTransferDiscoveryHub
             foreach (var participant in _participants.Values.ToArray())
             {
                 groups.Add(participant.GroupId);
+                if (!participant.Discoverable)
+                {
+                    continue;
+                }
                 if (!await _coordination.RefreshAsync(participant.ToCluster(), cancellationToken)
                         .ConfigureAwait(false))
                 {
@@ -698,7 +730,8 @@ public sealed class PublicTransferDiscoveryHub
     private sealed class Participant : IDisposable
     {
         private Participant(WebSocket socket, string peerId, string displayName, string roomId,
-            string publicAddress, string roomKey, bool sharedRoom)
+            string publicAddress, string roomKey, string roomRole, bool sharedRoom,
+            bool discoverable)
         {
             Id = Guid.NewGuid();
             LeaseId = Guid.NewGuid().ToString("N");
@@ -708,7 +741,9 @@ public sealed class PublicTransferDiscoveryHub
             RoomId = roomId;
             PublicAddress = publicAddress;
             RoomKey = roomKey;
+            RoomRole = roomRole;
             SharedRoom = sharedRoom;
+            Discoverable = discoverable;
             ConnectedAt = DateTimeOffset.UtcNow.ToString("O");
         }
 
@@ -721,7 +756,8 @@ public sealed class PublicTransferDiscoveryHub
         public string PublicAddress { get; }
         public string RoomKey { get; }
         public bool SharedRoom { get; }
-        public string RoomRole { get; } = "EDITOR";
+        public string RoomRole { get; }
+        public bool Discoverable { get; }
         public string ConnectedAt { get; }
         public string GroupId => PublicTransferCoordinationService.GroupId(RoomId, RoomKey);
         public FixedRateWindow RateWindow { get; } = new();
@@ -779,9 +815,14 @@ public sealed class PublicTransferDiscoveryHub
             WebSocketTicketClaims claims)
         {
             var publicAddress = ResolvePublicAddress(context);
-            var roomKey = claims.SharedRoom ? claims.RoomKey! : "public:" + publicAddress;
+            var roomKey = claims.SharedRoom && !string.IsNullOrWhiteSpace(claims.RoomKey)
+                ? claims.RoomKey
+                : "public:" + publicAddress;
+            var roomRole = string.IsNullOrWhiteSpace(claims.RoomRole)
+                ? "EDITOR"
+                : claims.RoomRole.Trim().ToUpperInvariant();
             return new Participant(socket, claims.PeerId!, claims.DisplayName ?? "web", claims.RoomId!,
-                publicAddress, roomKey, claims.SharedRoom);
+                publicAddress, roomKey, roomRole, claims.SharedRoom, claims.Discoverable);
         }
 
         public PublicTransferClusterParticipant ToCluster() => new(LeaseId, PeerId, DisplayName,
@@ -830,8 +871,8 @@ public sealed class PublicTransferDiscoveryHub
         }
     }
 
-    private sealed record SignalEnvelope(string Type, string SourcePeerId, string? TargetPeerId,
-        string RoomId, string PublicAddress, JsonElement? Payload);
+    private sealed record SignalEnvelope(string Type, string SourcePeerId, string SourceRole,
+        string? TargetPeerId, string RoomId, string PublicAddress, JsonElement? Payload);
 
     private sealed record ReceivedMessage(WebSocketMessageType MessageType, byte[] Payload);
 

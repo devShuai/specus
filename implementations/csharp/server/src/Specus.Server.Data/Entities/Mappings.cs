@@ -28,6 +28,7 @@ public sealed class HttpRouteMapping
     public string TargetBaseUrl { get; set; } = string.Empty;
     public bool Enabled { get; set; }
     public bool DetailCaptureEnabled { get; set; }
+    public bool MediaCaptureEnabled { get; set; }
     public bool PathRewriteEnabled { get; set; }
     public bool AuthEnabled { get; set; }
     public string? AuthUsername { get; set; }

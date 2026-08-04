@@ -681,6 +681,7 @@ public sealed class ManagementQueryService
         row.TargetBaseUrl,
         row.Enabled,
         row.DetailCaptureEnabled,
+        row.MediaCaptureEnabled,
         row.PathRewriteEnabled,
         row.AuthEnabled,
         row.AuthUsername ?? string.Empty,

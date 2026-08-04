@@ -150,6 +150,7 @@ public sealed class AdminApiTests : IAsyncLifetime
             targetBaseUrl = "https://example.com/base",
             enabled = true,
             detailCaptureEnabled = true,
+            mediaCaptureEnabled = true,
         });
         Assert.Equal(HttpStatusCode.Created, createRoute.StatusCode);
 
@@ -160,6 +161,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         Assert.Single(detail.SpecusMappings);
         Assert.Single(detail.HttpRoutes);
         Assert.Equal("phase4-detail", detail.HttpRoutes[0].Route);
+        Assert.True(detail.HttpRoutes[0].MediaCaptureEnabled);
 
         var delete = await client.DeleteAsync($"/api/admin/clients/{created.Client.Id}");
         Assert.Equal(HttpStatusCode.NoContent, delete.StatusCode);
@@ -1353,6 +1355,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         string TargetBaseUrl,
         bool Enabled,
         bool DetailCaptureEnabled,
+        bool MediaCaptureEnabled,
         bool PathRewriteEnabled,
         bool AuthEnabled,
         string AuthUsername,

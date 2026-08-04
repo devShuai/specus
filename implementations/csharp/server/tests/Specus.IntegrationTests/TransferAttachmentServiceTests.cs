@@ -6,6 +6,7 @@ using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
+using Specus.Server.Security;
 
 namespace Specus.IntegrationTests;
 
@@ -40,7 +41,7 @@ public sealed class TransferAttachmentServiceTests
         Assert.Equal("photo.png", upload.Attachment.FileName);
         Assert.Equal(TransferAttachmentService.StatusPending, upload.Attachment.Status);
 
-        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.CompletePublicAsync(
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => fixture.Service.CompletePublicAsync(
             Account, upload.AttachmentId, new CompleteAttachmentRequest("wrong"), CancellationToken.None));
 
         fixture.Storage.Stat = new ObjectStat(true, 42);
@@ -57,6 +58,48 @@ public sealed class TransferAttachmentServiceTests
         Assert.Equal("https://storage.test/download", await fixture.Service
             .ConsumeDownloadGrantAsync(token, CancellationToken.None));
         Assert.Null(await fixture.Service.ConsumeDownloadGrantAsync(token, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PublicAttachmentAcceptsRoomInvitesAndEnforcesViewerReadOnlyRole()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 1024);
+        const string roomId = "shared-room";
+        const string ownerToken = "shared-owner-secret";
+        var editor = await fixture.Rooms.CreateAccessTokenAsync(new CreateAccessTokenRequest(
+            roomId, ownerToken, "owner-peer", "EDITOR", "Editor", null),
+            CancellationToken.None);
+        var viewer = await fixture.Rooms.CreateAccessTokenAsync(new CreateAccessTokenRequest(
+            roomId, ownerToken, "owner-peer", "VIEWER", "Viewer", null),
+            CancellationToken.None);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
+                "viewer.bin", null, 10, null, roomId, viewer.Token, null),
+                CancellationToken.None));
+
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account,
+            new PresignUploadRequest("editor.bin", null, 10, null, roomId, editor.Token, null),
+            CancellationToken.None);
+        var stored = await fixture.Db.TransferAttachments.AsNoTracking()
+            .SingleAsync(row => row.Id == upload.AttachmentId);
+        Assert.NotNull(stored.PublicTransferRoomId);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
+                new CompleteAttachmentRequest(viewer.Token), CancellationToken.None));
+        fixture.Storage.Stat = new ObjectStat(true, 10);
+        _ = await fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
+            new CompleteAttachmentRequest(editor.Token), CancellationToken.None);
+
+        var download = await fixture.Service.CreatePublicDownloadAsync(Account,
+            upload.AttachmentId, new PresignDownloadRequest(viewer.Token), CancellationToken.None);
+        Assert.StartsWith("/api/public/transfer/downloads/", download.DownloadUrl,
+            StringComparison.Ordinal);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
+                new PresignDownloadRequest("different-owner-token"), CancellationToken.None));
     }
 
     [Fact]
@@ -225,16 +268,19 @@ public sealed class TransferAttachmentServiceTests
         private readonly SqliteConnection _connection;
 
         private AttachmentFixture(SqliteConnection connection, SpecusDbContext db,
-            FakeObjectStorage storage, TransferAttachmentService service)
+            FakeObjectStorage storage, PublicTransferRoomService rooms,
+            TransferAttachmentService service)
         {
             _connection = connection;
             Db = db;
             Storage = storage;
+            Rooms = rooms;
             Service = service;
         }
 
         public SpecusDbContext Db { get; }
         public FakeObjectStorage Storage { get; }
+        public PublicTransferRoomService Rooms { get; }
         public TransferAttachmentService Service { get; }
 
         public static async Task<AttachmentFixture> CreateAsync(long maxBytes,
@@ -263,9 +309,15 @@ public sealed class TransferAttachmentServiceTests
                 DownloadUrlTtlSeconds = downloadTtlSeconds,
                 DownloadObjectUrlTtlSeconds = 30,
             });
+            var publicOptions = Options.Create(new PublicTransferOptions());
+            var rooms = new PublicTransferRoomService(db, publicOptions,
+                new LocalTokenService(Options.Create(new AuthOptions
+                {
+                    JwtSecret = "attachment-test-secret",
+                })));
             var service = new TransferAttachmentService(db, storage, objectOptions,
-                Options.Create(new PublicTransferOptions()));
-            return new AttachmentFixture(connection, db, storage, service);
+                publicOptions, rooms);
+            return new AttachmentFixture(connection, db, storage, rooms, service);
         }
 
         public async ValueTask DisposeAsync()

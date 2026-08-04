@@ -20,6 +20,7 @@ public sealed class PublicTransferRateLimiter
 {
     private const int MaxTrackedSources = 100_000;
     private readonly ConcurrentDictionary<string, Window> _windows = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Window> _pairingRedeemWindows = new(StringComparer.Ordinal);
     private readonly PublicTransferOptions _options;
     private readonly PublicTransferCoordinationService? _coordination;
 
@@ -75,15 +76,55 @@ public sealed class PublicTransferRateLimiter
         CheckLocal(key);
     }
 
+    public async Task CheckPairingCodeRedeemAsync(string? clientIp,
+        CancellationToken cancellationToken = default)
+    {
+        var key = string.IsNullOrWhiteSpace(clientIp) ? "unknown" : clientIp.Trim();
+        if (_options.ClusterEnabled)
+        {
+            try
+            {
+                if (_coordination is null || !await _coordination.AllowRateAsync(
+                        "pairing-code-redeem", key,
+                        Math.Max(1, _options.PairingCodeRedeemRateLimitPerIp),
+                        Math.Max(1L, _options.PairingCodeRedeemRateLimitWindowSeconds),
+                        cancellationToken).ConfigureAwait(false))
+                {
+                    throw new RateLimitedException("请求过于频繁,请稍后再试");
+                }
+                return;
+            }
+            catch (RateLimitedException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException)
+            {
+                throw new RateLimitedException("服务暂时不可用,请稍后再试");
+            }
+        }
+
+        CheckLocal(key, _pairingRedeemWindows,
+            _options.PairingCodeRedeemRateLimitPerIp,
+            _options.PairingCodeRedeemRateLimitWindowSeconds);
+    }
+
     private void CheckLocal(string key)
     {
+        CheckLocal(key, _windows, _options.PresignRateLimitPerIp,
+            _options.PresignRateLimitWindowSeconds);
+    }
+
+    private static void CheckLocal(string key, ConcurrentDictionary<string, Window> windows,
+        int limit, long windowSeconds)
+    {
         var now = DateTimeOffset.UtcNow;
-        var duration = TimeSpan.FromSeconds(Math.Max(1L, _options.PresignRateLimitWindowSeconds));
-        if (_windows.Count >= MaxTrackedSources && !_windows.ContainsKey(key))
+        var duration = TimeSpan.FromSeconds(Math.Max(1L, windowSeconds));
+        if (windows.Count >= MaxTrackedSources && !windows.ContainsKey(key))
         {
             throw new RateLimitedException("请求过于频繁,请稍后再试");
         }
-        var window = _windows.AddOrUpdate(key, _ => new Window(now, 1), (_, current) =>
+        var window = windows.AddOrUpdate(key, _ => new Window(now, 1), (_, current) =>
         {
             lock (current)
             {
@@ -95,7 +136,7 @@ public sealed class PublicTransferRateLimiter
                 return current;
             }
         });
-        if (window.Count > Math.Max(1, _options.PresignRateLimitPerIp))
+        if (window.Count > Math.Max(1, limit))
         {
             throw new RateLimitedException("请求过于频繁,请稍后再试");
         }
@@ -106,12 +147,20 @@ public sealed class PublicTransferRateLimiter
     internal void PurgeExpired(DateTimeOffset? currentTime = null)
     {
         var now = currentTime ?? DateTimeOffset.UtcNow;
-        var duration = TimeSpan.FromSeconds(Math.Max(1L, _options.PresignRateLimitWindowSeconds));
-        foreach (var entry in _windows)
+        PurgeExpired(_windows, now, _options.PresignRateLimitWindowSeconds);
+        PurgeExpired(_pairingRedeemWindows, now,
+            _options.PairingCodeRedeemRateLimitWindowSeconds);
+    }
+
+    private static void PurgeExpired(ConcurrentDictionary<string, Window> windows,
+        DateTimeOffset now, long windowSeconds)
+    {
+        var duration = TimeSpan.FromSeconds(Math.Max(1L, windowSeconds));
+        foreach (var entry in windows)
         {
             if (now - entry.Value.StartedAt >= duration)
             {
-                _windows.TryRemove(entry.Key, out _);
+                windows.TryRemove(entry.Key, out _);
             }
         }
     }
@@ -169,23 +218,33 @@ public sealed class TransferAttachmentService
     private readonly IObjectStorageService _storage;
     private readonly ObjectStorageOptions _options;
     private readonly PublicTransferOptions _publicOptions;
+    private readonly PublicTransferRoomService _rooms;
 
     public TransferAttachmentService(SpecusDbContext db, IObjectStorageService storage,
-        IOptions<ObjectStorageOptions> options, IOptions<PublicTransferOptions> publicOptions)
+        IOptions<ObjectStorageOptions> options, IOptions<PublicTransferOptions> publicOptions,
+        PublicTransferRoomService rooms)
     {
         _db = db;
         _storage = storage;
         _options = options.Value;
         _publicOptions = publicOptions.Value;
+        _rooms = rooms;
     }
 
     public async Task<PresignUploadResponse> CreatePublicUploadAsync(ManagementContext context,
         PresignUploadRequest request, CancellationToken cancellationToken)
     {
+        var roomId = NormalizeRoomId(request.RoomId);
+        var access = await _rooms.ResolveAsync(roomId, request.RoomToken, "attachment-upload",
+            cancellationToken).ConfigureAwait(false);
+        if (!access.CanEdit)
+        {
+            throw new UnauthorizedAccessException("访客不能上传文件");
+        }
         var roomTokenHash = RoomTokenHash(RequireText(request.RoomToken, "roomToken"));
         var pending = await _db.TransferAttachments.AsNoTracking()
             .CountAsync(attachment => attachment.Scope == ScopePublicTransfer
-                && attachment.RoomTokenHash == roomTokenHash
+                && attachment.PublicTransferRoomId == access.RoomId
                 && attachment.Status == StatusPending, cancellationToken)
             .ConfigureAwait(false);
         if (pending >= Math.Max(1, _publicOptions.MaxPendingUploadsPerRoom))
@@ -197,7 +256,7 @@ public sealed class TransferAttachmentService
         try
         {
             return await CreateUploadAsync(ScopePublicTransfer, context.TenantId,
-                NormalizeRoomId(request.RoomId), roomTokenHash, context.Username, null, request,
+                roomId, roomTokenHash, access.RoomId, context.Username, null, request,
                 cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -219,7 +278,8 @@ public sealed class TransferAttachmentService
         try
         {
             return await CreateUploadAsync(ScopeAdminClientMessage, context.TenantId, null, null,
-                context.Username, targetClientId, request, cancellationToken).ConfigureAwait(false);
+                null, context.Username, targetClientId, request, cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -232,7 +292,8 @@ public sealed class TransferAttachmentService
     {
         var attachment = await FindAsync(attachmentId, ScopePublicTransfer, null, cancellationToken)
             .ConfigureAwait(false);
-        RequireMatchingRoomToken(attachment, request.RoomToken);
+        await RequireRoomAccessAsync(attachment, request.RoomToken, true, cancellationToken)
+            .ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(attachment.TenantId))
         {
             attachment.TenantId = context.TenantId;
@@ -267,7 +328,8 @@ public sealed class TransferAttachmentService
     {
         var attachment = await FindAsync(attachmentId, ScopePublicTransfer, null, cancellationToken)
             .ConfigureAwait(false);
-        RequireMatchingRoomToken(attachment, request.RoomToken);
+        await RequireRoomAccessAsync(attachment, request.RoomToken, false, cancellationToken)
+            .ConfigureAwait(false);
         return await CreateDownloadAsync(context, attachment, cancellationToken).ConfigureAwait(false);
     }
 
@@ -313,8 +375,8 @@ public sealed class TransferAttachmentService
     }
 
     private async Task<PresignUploadResponse> CreateUploadAsync(string scope, string? tenantId,
-        string? roomId, string? roomTokenHash, string? ownerUsername, long? targetClientId,
-        PresignUploadRequest request, CancellationToken cancellationToken)
+        string? roomId, string? roomTokenHash, long? publicTransferRoomId, string? ownerUsername,
+        long? targetClientId, PresignUploadRequest request, CancellationToken cancellationToken)
     {
         if (!_storage.Enabled)
         {
@@ -343,6 +405,7 @@ public sealed class TransferAttachmentService
                 Scope = scope,
                 RoomId = roomId,
                 RoomTokenHash = roomTokenHash,
+                PublicTransferRoomId = publicTransferRoomId,
                 OwnerUsername = ownerUsername,
                 TargetClientId = targetClientId,
                 FileName = fileName,
@@ -764,6 +827,22 @@ public sealed class TransferAttachmentService
             || !CryptographicOperations.FixedTimeEquals(actualBytes, expectedBytes))
         {
             throw new ArgumentException("roomToken is invalid");
+        }
+    }
+
+    private async Task RequireRoomAccessAsync(TransferAttachment attachment, string? roomToken,
+        bool requireEdit, CancellationToken cancellationToken)
+    {
+        if (attachment.PublicTransferRoomId is null)
+        {
+            RequireMatchingRoomToken(attachment, roomToken);
+            return;
+        }
+        var access = await _rooms.AuthenticateAsync(attachment.RoomId, roomToken,
+            "attachment-access", cancellationToken).ConfigureAwait(false);
+        if (access.RoomId != attachment.PublicTransferRoomId || requireEdit && !access.CanEdit)
+        {
+            throw new UnauthorizedAccessException("房间凭证无效");
         }
     }
 

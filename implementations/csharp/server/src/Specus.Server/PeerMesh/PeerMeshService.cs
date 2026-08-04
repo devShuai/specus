@@ -268,6 +268,47 @@ public sealed class PeerMeshService
             _options.StunTurnPort);
     }
 
+    public PublicNatProbeConfig PublicNatProbeConfig(string? requestHost)
+    {
+        var primaryHost = ResolveStunHost(requestHost);
+        var primaryPort = StunPort();
+        var alternateHost = NormalizeHost(
+            string.IsNullOrWhiteSpace(_options.StandaloneStunAlternateAddress)
+                ? _options.StunAlternatePublicAddress
+                : _options.StandaloneStunAlternateAddress);
+        var alternatePort = _options.StandaloneStunAlternatePort > 0
+            ? _options.StandaloneStunAlternatePort
+            : _options.NatProbeAlternatePort;
+        var rfc5780 = !string.IsNullOrWhiteSpace(primaryHost)
+            && !string.IsNullOrWhiteSpace(alternateHost)
+            && !string.Equals(primaryHost, alternateHost, StringComparison.OrdinalIgnoreCase)
+            && primaryPort > 0 && alternatePort > 0 && primaryPort != alternatePort;
+
+        var endpoints = new List<NatProbeEndpoint>();
+        if (!string.IsNullOrWhiteSpace(primaryHost) && primaryPort > 0)
+        {
+            endpoints.Add(NatProbe("A1P1", primaryHost, primaryPort, "PRIMARY", "PRIMARY"));
+        }
+        if (rfc5780)
+        {
+            endpoints.Add(NatProbe("A1P2", primaryHost, alternatePort, "PRIMARY", "ALTERNATE"));
+            endpoints.Add(NatProbe("A2P1", alternateHost, primaryPort, "ALTERNATE", "PRIMARY"));
+            endpoints.Add(NatProbe("A2P2", alternateHost, alternatePort, "ALTERNATE", "ALTERNATE"));
+        }
+
+        return new PublicNatProbeConfig(
+            endpoints.Count > 0,
+            "RFC8489",
+            rfc5780 ? "RFC5780" : "BASIC_STUN",
+            endpoints,
+            new NatProbeCapabilities(true, rfc5780, rfc5780, rfc5780,
+                rfc5780, rfc5780, true, false));
+    }
+
+    private static NatProbeEndpoint NatProbe(string id, string host, int port,
+        string addressSlot, string portSlot) => new(
+        id, $"stun:{BracketIpv6(host)}:{port}", host, port, addressSlot, portSlot);
+
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
         CancellationToken cancellationToken)
     {
@@ -1709,6 +1750,31 @@ public sealed record PublicIceConfig(
     int StunTurnPort);
 
 public sealed record IceServer(string Urls, string Username, string Credential);
+
+public sealed record PublicNatProbeConfig(
+    bool Available,
+    string Protocol,
+    string DiscoveryMethod,
+    List<NatProbeEndpoint> Endpoints,
+    NatProbeCapabilities Capabilities);
+
+public sealed record NatProbeEndpoint(
+    string Id,
+    string Url,
+    string Host,
+    int Port,
+    string AddressSlot,
+    string PortSlot);
+
+public sealed record NatProbeCapabilities(
+    bool Binding,
+    bool ChangeRequest,
+    bool ResponseOrigin,
+    bool OtherAddress,
+    bool ResponsePort,
+    bool Padding,
+    bool BrowserMappingObservation,
+    bool BrowserFilteringObservation);
 
 public sealed record PeerMeshDeviceView(
     long Id,

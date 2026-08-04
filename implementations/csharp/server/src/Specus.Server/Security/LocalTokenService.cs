@@ -79,6 +79,12 @@ public sealed class LocalTokenService
         return Convert.ToHexString(HMACSHA256.HashData(_key, input)).ToLowerInvariant();
     }
 
+    public string PairingCodeHash(string code)
+    {
+        var input = Encoding.UTF8.GetBytes($"public-transfer-pairing:v1:{code}");
+        return Convert.ToHexString(HMACSHA256.HashData(_key, input)).ToLowerInvariant();
+    }
+
     public ClaimsPrincipal? Validate(string? token)
     {
         if (string.IsNullOrWhiteSpace(token))

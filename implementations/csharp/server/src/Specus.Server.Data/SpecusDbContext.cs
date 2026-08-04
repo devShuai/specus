@@ -29,6 +29,8 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<ConnectionRecord> ConnectionRecords => Set<ConnectionRecord>();
     public DbSet<SpecusMapping> SpecusMappings => Set<SpecusMapping>();
     public DbSet<HttpRouteMapping> HttpRouteMappings => Set<HttpRouteMapping>();
+    public DbSet<HttpMediaCapture> HttpMediaCaptures => Set<HttpMediaCapture>();
+    public DbSet<HttpMediaReference> HttpMediaReferences => Set<HttpMediaReference>();
     public DbSet<TrafficUsage> TrafficUsages => Set<TrafficUsage>();
     public DbSet<ResourceTrafficUsage> ResourceTrafficUsages => Set<ResourceTrafficUsage>();
     public DbSet<HttpTrafficExchange> HttpTrafficExchanges => Set<HttpTrafficExchange>();
@@ -42,6 +44,13 @@ public sealed class SpecusDbContext : DbContext
         Set<TransferAttachmentDownloadUsage>();
     public DbSet<TransferAttachmentDownloadGrant> TransferAttachmentDownloadGrants =>
         Set<TransferAttachmentDownloadGrant>();
+    public DbSet<UserDiagramDocument> UserDiagramDocuments => Set<UserDiagramDocument>();
+    public DbSet<PublicTransferRoom> PublicTransferRooms => Set<PublicTransferRoom>();
+    public DbSet<PublicTransferRoomAccess> PublicTransferRoomAccesses => Set<PublicTransferRoomAccess>();
+    public DbSet<PublicTransferRoomPairingCode> PublicTransferRoomPairingCodes =>
+        Set<PublicTransferRoomPairingCode>();
+    public DbSet<PublicTransferDiagramVersion> PublicTransferDiagramVersions =>
+        Set<PublicTransferDiagramVersion>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -116,9 +125,12 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.IsAdmin).HasColumnName("is_admin").IsRequired();
             b.Property(x => x.RoomId).HasColumnName("room_id").HasMaxLength(120);
             b.Property(x => x.RoomKey).HasColumnName("room_key").HasMaxLength(80);
+            b.Property(x => x.RoomRole).HasColumnName("room_role").HasMaxLength(16);
             b.Property(x => x.PeerId).HasColumnName("peer_id").HasMaxLength(120);
             b.Property(x => x.DisplayName).HasColumnName("display_name").HasMaxLength(120);
             b.Property(x => x.SharedRoom).HasColumnName("shared_room").IsRequired();
+            b.Property(x => x.Discoverable).HasColumnName("discoverable").HasDefaultValue(true)
+                .IsRequired();
             b.Property(x => x.RemoteAddressHash).HasColumnName("remote_address_hash").HasMaxLength(64)
                 .IsRequired();
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
@@ -329,6 +341,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.TargetBaseUrl).HasColumnName("target_base_url").HasMaxLength(512).IsRequired();
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
             b.Property(x => x.DetailCaptureEnabled).HasColumnName("detail_capture_enabled").IsRequired();
+            b.Property(x => x.MediaCaptureEnabled).HasColumnName("media_capture_enabled").IsRequired();
             b.Property(x => x.PathRewriteEnabled).HasColumnName("path_rewrite_enabled").IsRequired();
             b.Property(x => x.AuthEnabled).HasColumnName("auth_enabled").IsRequired();
             b.Property(x => x.AuthUsername).HasColumnName("auth_username").HasMaxLength(120);
@@ -339,6 +352,78 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => new { x.ClientId, x.Route }).IsUnique();
             b.HasIndex(x => x.ClientId);
+        });
+
+        modelBuilder.Entity<HttpMediaCapture>(b =>
+        {
+            b.ToTable("specus_http_media_capture");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.Route).HasColumnName("route").HasMaxLength(128).IsRequired();
+            b.Property(x => x.ResourceId).HasColumnName("resource_id");
+            b.Property(x => x.SourceUrl).HasColumnName("source_url").HasMaxLength(3072).IsRequired();
+            b.Property(x => x.ResourceKey).HasColumnName("resource_key").HasMaxLength(64).IsRequired();
+            b.Property(x => x.DeduplicationKey).HasColumnName("deduplication_key").HasMaxLength(64);
+            b.Property(x => x.Method).HasColumnName("method").HasMaxLength(16).IsRequired();
+            b.Property(x => x.StatusCode).HasColumnName("status_code").IsRequired();
+            b.Property(x => x.ContentType).HasColumnName("content_type").HasMaxLength(255);
+            b.Property(x => x.ContentEncoding).HasColumnName("content_encoding").HasMaxLength(128);
+            b.Property(x => x.MediaKind).HasColumnName("media_kind").HasMaxLength(32).IsRequired();
+            b.Property(x => x.EntityTag).HasColumnName("entity_tag").HasMaxLength(512);
+            b.Property(x => x.LastModified).HasColumnName("last_modified").HasMaxLength(128);
+            b.Property(x => x.ContentRangeStart).HasColumnName("content_range_start");
+            b.Property(x => x.ContentRangeEnd).HasColumnName("content_range_end");
+            b.Property(x => x.TotalBytes).HasColumnName("total_bytes");
+            b.Property(x => x.CapturedBytes).HasColumnName("captured_bytes").IsRequired();
+            b.Property(x => x.SegmentSequence).HasColumnName("segment_sequence");
+            b.Property(x => x.InitializationSegment).HasColumnName("initialization_segment").IsRequired();
+            b.Property(x => x.LiveStream).HasColumnName("live_stream").IsRequired();
+            b.Property(x => x.ObjectKey).HasColumnName("object_key").HasMaxLength(1024).IsRequired();
+            b.Property(x => x.UploadId).HasColumnName("upload_id").HasMaxLength(1024);
+            b.Property(x => x.ObjectEtag).HasColumnName("object_etag").HasMaxLength(512);
+            b.Property(x => x.State).HasColumnName("state").HasMaxLength(24).IsRequired();
+            b.Property(x => x.FailureReason).HasColumnName("failure_reason").HasMaxLength(2048);
+            b.Property(x => x.ResponseHeaders).HasColumnName("response_headers");
+            b.Property(x => x.CapturedAt).HasColumnName("captured_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.CompletedAt).HasColumnName("completed_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.Id }).HasDatabaseName("idx_http_media_tenant_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Id })
+                .HasDatabaseName("idx_http_media_tenant_client_id");
+            b.HasIndex(x => new { x.TenantId, x.ResourceKey, x.Id })
+                .HasDatabaseName("idx_http_media_tenant_resource_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Route, x.Id })
+                .HasDatabaseName("idx_http_media_tenant_client_route_id");
+            b.HasIndex(x => new { x.State, x.ExpiresAt })
+                .HasDatabaseName("idx_http_media_state_expires");
+            b.HasIndex(x => x.DeduplicationKey).IsUnique()
+                .HasDatabaseName("uk_http_media_deduplication_key");
+        });
+
+        modelBuilder.Entity<HttpMediaReference>(b =>
+        {
+            b.ToTable("specus_http_media_reference");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ManifestCaptureId).HasColumnName("manifest_capture_id").IsRequired();
+            b.Property(x => x.RelationType).HasColumnName("relation_type").HasMaxLength(24).IsRequired();
+            b.Property(x => x.SequenceIndex).HasColumnName("sequence_index");
+            b.Property(x => x.OriginalUri).HasColumnName("original_uri").HasMaxLength(2048).IsRequired();
+            b.Property(x => x.ResolvedSourceUrl).HasColumnName("resolved_source_url").HasMaxLength(3072)
+                .IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.ManifestCaptureId, x.SequenceIndex })
+                .HasDatabaseName("idx_http_media_reference_manifest_sequence");
+            b.HasIndex(x => new { x.TenantId, x.ManifestCaptureId })
+                .HasDatabaseName("idx_http_media_reference_manifest");
         });
 
         modelBuilder.Entity<TrafficUsage>(b =>
@@ -588,6 +673,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(40).IsRequired();
             b.Property(x => x.RoomId).HasColumnName("room_id").HasMaxLength(120);
             b.Property(x => x.RoomTokenHash).HasColumnName("room_token_hash").HasMaxLength(64);
+            b.Property(x => x.PublicTransferRoomId).HasColumnName("public_transfer_room_id");
             b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(80);
             b.Property(x => x.TargetClientId).HasColumnName("target_client_id");
             b.Property(x => x.ObjectKey).HasColumnName("object_key").HasMaxLength(512).IsRequired();
@@ -610,6 +696,8 @@ public sealed class SpecusDbContext : DbContext
                 .HasDatabaseName("idx_transfer_attachment_tenant");
             b.HasIndex(x => new { x.Scope, x.RoomId, x.Id })
                 .HasDatabaseName("idx_transfer_attachment_room");
+            b.HasIndex(x => new { x.Scope, x.PublicTransferRoomId, x.Id })
+                .HasDatabaseName("idx_transfer_attachment_public_room");
             b.HasIndex(x => new { x.TenantId, x.OwnerUsername, x.Status, x.ExpiresAt })
                 .HasDatabaseName("idx_transfer_attachment_owner_status");
             b.HasIndex(x => new { x.ExpiresAt, x.Status })
@@ -654,6 +742,102 @@ public sealed class SpecusDbContext : DbContext
                 .HasDatabaseName("idx_attachment_download_grant_attachment");
             b.HasIndex(x => new { x.ExpiresAt, x.ConsumedAt })
                 .HasDatabaseName("idx_attachment_download_grant_expiry");
+        });
+
+        modelBuilder.Entity<UserDiagramDocument>(b =>
+        {
+            b.ToTable("user_diagram_document");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(160).IsRequired();
+            b.Property(x => x.Name).HasColumnName("name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.SnapshotData).HasColumnName("snapshot_data").IsRequired();
+            b.Property(x => x.SizeBytes).HasColumnName("size_bytes").IsRequired();
+            b.Property(x => x.Revision).HasColumnName("revision").HasDefaultValue(0L)
+                .IsConcurrencyToken().IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.OwnerUsername })
+                .HasDatabaseName("idx_user_diagram_owner");
+            b.HasIndex(x => x.UpdatedAt).HasDatabaseName("idx_user_diagram_updated");
+        });
+
+        modelBuilder.Entity<PublicTransferRoom>(b =>
+        {
+            b.ToTable("public_transfer_room");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.RoomName).HasColumnName("room_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.OwnerTokenHash).HasColumnName("owner_token_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.CreatedByPeerId).HasColumnName("created_by_peer_id").HasMaxLength(120).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.RoomName, x.OwnerTokenHash }).IsUnique()
+                .HasDatabaseName("uk_public_transfer_room_key");
+            b.HasIndex(x => x.RoomName).HasDatabaseName("idx_public_transfer_room_name");
+        });
+
+        modelBuilder.Entity<PublicTransferRoomAccess>(b =>
+        {
+            b.ToTable("public_transfer_room_access");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.RoomId).HasColumnName("room_id").IsRequired();
+            b.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Role).HasColumnName("role").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Label).HasColumnName("label").HasMaxLength(80).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.RevokedAt).HasColumnName("revoked_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.HasIndex(x => x.TokenHash).IsUnique()
+                .HasDatabaseName("uk_public_transfer_access_token");
+            b.HasIndex(x => x.RoomId).HasDatabaseName("idx_public_transfer_access_room");
+        });
+
+        modelBuilder.Entity<PublicTransferRoomPairingCode>(b =>
+        {
+            b.ToTable("public_transfer_room_pairing_code");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.RoomId).HasColumnName("room_id").IsRequired();
+            b.Property(x => x.CodeHash).HasColumnName("code_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Role).HasColumnName("role").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Label).HasColumnName("label").HasMaxLength(80).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.MaxUses).HasColumnName("max_uses").IsRequired();
+            b.Property(x => x.UsedCount).HasColumnName("used_count").IsRequired();
+            b.Property(x => x.RevokedAt).HasColumnName("revoked_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.HasIndex(x => x.CodeHash).IsUnique()
+                .HasDatabaseName("uk_public_transfer_pairing_code_hash");
+            b.HasIndex(x => x.RoomId).HasDatabaseName("idx_public_transfer_pairing_room");
+        });
+
+        modelBuilder.Entity<PublicTransferDiagramVersion>(b =>
+        {
+            b.ToTable("public_transfer_diagram_version");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.RoomId).HasColumnName("room_id").IsRequired();
+            b.Property(x => x.Name).HasColumnName("name").HasMaxLength(80).IsRequired();
+            b.Property(x => x.AuthorPeerId).HasColumnName("author_peer_id").HasMaxLength(120).IsRequired();
+            b.Property(x => x.SnapshotData).HasColumnName("snapshot_data").IsRequired();
+            b.Property(x => x.SizeBytes).HasColumnName("size_bytes").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.RoomId).HasDatabaseName("idx_public_transfer_version_room");
+            b.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_public_transfer_version_created");
         });
     }
 }

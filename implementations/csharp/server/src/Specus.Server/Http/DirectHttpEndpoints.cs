@@ -49,7 +49,8 @@ public static class DirectHttpEndpoints
 
     private static async Task ForwardAsync(HttpContext context, string clientName, string route,
         string? rest, DirectHttpDispatcher dispatcher, TrafficUsageService traffic,
-        IOptions<DirectHttpOptions> options, SpecusDbContext db, TrafficInspectionService inspection)
+        IOptions<DirectHttpOptions> options, SpecusDbContext db, TrafficInspectionService inspection,
+        HttpMediaCaptureService mediaCaptures)
     {
         var startedAt = DateTimeOffset.UtcNow;
         var relativePath = RelativePath(context, rest);
@@ -107,6 +108,8 @@ public static class DirectHttpEndpoints
         var requestHeaders = RequestHeaders(context.Request, accessPolicy.AuthEnabled, false);
         var requestCapture = new LimitedCapture(64 * 1024);
         var responseCapture = new LimitedCapture(64 * 1024);
+        IHttpMediaCaptureSession? mediaCapture = null;
+        var requestTrailerNames = DeclaredRequestTrailers(context.Request, accessPolicy.AuthEnabled);
         var requestMetadata = new Dictionary<string, object?>
         {
             ["source"] = "http",
@@ -116,7 +119,7 @@ public static class DirectHttpEndpoints
             ["relativePath"] = relativePath,
             ["rawQuery"] = RawQuery(context.Request.QueryString),
             ["headers"] = requestHeaders,
-            ["trailerNames"] = DeclaredRequestTrailers(context.Request, accessPolicy.AuthEnabled),
+            ["trailerNames"] = requestTrailerNames,
         };
         if (context.Request.ContentLength is { } contentLength)
         {
@@ -143,7 +146,8 @@ public static class DirectHttpEndpoints
                     context.RequestAborted).ConfigureAwait(false);
             using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
             var pumpTask = PumpRequestAsync(context, stream, traffic, clientName, route,
-                requestCapture, options.Value.MaxRequestBodySize, accessPolicy.AuthEnabled, pumpCts.Token);
+                requestCapture, options.Value.MaxRequestBodySize, accessPolicy.AuthEnabled,
+                requestTrailerNames, pumpCts.Token);
 
             using var headCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
             headCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(1, options.Value.TimeoutMs)));
@@ -169,12 +173,18 @@ public static class DirectHttpEndpoints
             }
             var originalResponseHeaders = AsStrings(head, "headers");
             var responseHeaders = originalResponseHeaders;
-            foreach (var trailerName in AsStrings(head, "trailerNames"))
+            var rawQuery = RawQuery(context.Request.QueryString);
+            mediaCapture = await mediaCaptures.OpenAsync(clientName, route, context.Request.Method,
+                string.IsNullOrWhiteSpace(rawQuery) ? relativePath : relativePath + "?" + rawQuery,
+                validStatusCode, originalResponseHeaders, context.RequestAborted).ConfigureAwait(false);
+            if (mediaCapture.Externalized)
             {
-                if (IsValidHeaderName(trailerName))
-                {
-                    context.Response.DeclareTrailer(trailerName);
-                }
+                responseCapture = new LimitedCapture(0);
+            }
+            var responseTrailerNames = ValidTrailerNames(AsStrings(head, "trailerNames"), false);
+            foreach (var trailerName in responseTrailerNames)
+            {
+                context.Response.DeclareTrailer(trailerName);
             }
 
             var rewrite = accessPolicy.PathRewriteEnabled && IsRewritable(originalResponseHeaders);
@@ -204,12 +214,8 @@ public static class DirectHttpEndpoints
                 }
                 var data = item.Data ?? Array.Empty<byte>();
                 responseBytes += data.Length;
-                if (responseBytes > DirectHttpOptionsMaxResponseBytes)
-                {
-                    await stream.ResetAsync(3, "HTTP response body exceeds limit", CancellationToken.None)
-                        .ConfigureAwait(false);
-                    throw new DirectHttpSpecusException(StatusCodes.Status502BadGateway, "HTTP 响应体超过限制");
-                }
+
+                await mediaCapture.AppendAsync(data, context.RequestAborted).ConfigureAwait(false);
 
                 if (rewrite && rewriteBuffer.Length + data.Length <= options.Value.RewriteMaxBodyBytes)
                 {
@@ -231,6 +237,8 @@ public static class DirectHttpEndpoints
                 await stream.ConsumeResponseAsync(data.Length, context.RequestAborted).ConfigureAwait(false);
             }
 
+            await mediaCapture.CompleteAsync(CancellationToken.None).ConfigureAwait(false);
+
             if (rewrite)
             {
                 var body = rewriteBuffer.ToArray();
@@ -251,7 +259,7 @@ public static class DirectHttpEndpoints
 
             foreach (var trailer in responseTrailers ?? [])
             {
-                AppendResponseTrailer(context.Response, trailer);
+                AppendResponseTrailer(context.Response, trailer, responseTrailerNames);
             }
             if (!pumpTask.IsCompleted)
             {
@@ -266,6 +274,10 @@ public static class DirectHttpEndpoints
         }
         catch (DirectHttpSpecusException ex)
         {
+            if (mediaCapture is not null)
+            {
+                await mediaCapture.FailAsync(ex.Message, CancellationToken.None).ConfigureAwait(false);
+            }
             var responseBody = Encoding.UTF8.GetBytes(ex.Message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
                     context.Request.Method, relativePath, RawQuery(context.Request.QueryString),
@@ -275,13 +287,20 @@ public static class DirectHttpEndpoints
                 .ConfigureAwait(false);
             await WriteTextErrorAsync(context.Response, ex.StatusCode, ex.Message).ConfigureAwait(false);
         }
+        finally
+        {
+            if (mediaCapture is { Active: true })
+            {
+                await mediaCapture.FailAsync("媒体响应中断", CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+        }
     }
-
-    private const int DirectHttpOptionsMaxResponseBytes = 64 * 1024 * 1024;
 
     private static async Task PumpRequestAsync(HttpContext context, HttpSpecusStream stream,
         TrafficUsageService traffic, string clientName, string route, LimitedCapture capture,
-        int maxBytes, bool stripAuthorization, CancellationToken cancellationToken)
+        int maxBytes, bool stripAuthorization, IReadOnlyCollection<string> declaredTrailerNames,
+        CancellationToken cancellationToken)
     {
         var buffer = new byte[64 * 1024];
         long total = 0;
@@ -292,7 +311,7 @@ public static class DirectHttpEndpoints
                 var read = await context.Request.Body.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
-                    var trailers = RequestTrailers(context, stripAuthorization);
+                    var trailers = RequestTrailers(context, stripAuthorization, declaredTrailerNames);
                     await stream.FinishRequestAsync(trailers.Count == 0
                             ? null
                             : new Dictionary<string, object?> { ["trailers"] = trailers }, cancellationToken)
@@ -567,6 +586,8 @@ public static class DirectHttpEndpoints
         WebSocketTunnelCloseState closeState, CancellationToken cancellationToken)
     {
         WebSocketMessageType? fragmentType = null;
+        WebSocketCloseStatus? clientCloseStatus = null;
+        var clientCloseReason = string.Empty;
         long messageBytes = 0;
         try
         {
@@ -576,9 +597,17 @@ public static class DirectHttpEndpoints
                 if (item.End)
                 {
                     closeState.MarkClientInitiated();
-                    await SafeCloseOutputAsync(socket, browserWriteLock,
-                            WebSocketCloseStatus.EndpointUnavailable, string.Empty)
-                        .ConfigureAwait(false);
+                    if (clientCloseStatus is { } closeStatus)
+                    {
+                        await SendWebSocketCloseToClientAsync(stream, closeStatus,
+                            clientCloseReason, cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await SafeCloseOutputAsync(socket, browserWriteLock,
+                                WebSocketCloseStatus.EndpointUnavailable, string.Empty)
+                            .ConfigureAwait(false);
+                    }
                     return;
                 }
 
@@ -638,11 +667,10 @@ public static class DirectHttpEndpoints
                             ? null
                             : (WebSocketCloseStatus)frame.CloseCode);
                         var reason = Encoding.UTF8.GetString(frame.Payload);
-                        if (!await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
-                                .ConfigureAwait(false))
-                        {
-                            return;
-                        }
+                        clientCloseStatus = status;
+                        clientCloseReason = reason;
+                        await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
+                            .ConfigureAwait(false);
                         break;
                 }
                 await stream.ConsumeAsync(encoded.Length, CancellationToken.None).ConfigureAwait(false);
@@ -958,34 +986,34 @@ public static class DirectHttpEndpoints
     }
 
     private static List<string> DeclaredRequestTrailers(HttpRequest request, bool stripAuthorization) =>
-        request.Headers["Trailer"].SelectMany(static value =>
-                (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            .Where(name => IsValidHeaderName(name)
-                           && (!stripAuthorization
-                               || !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        ValidTrailerNames(request.Headers["Trailer"].SelectMany(static value =>
+            (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+            stripAuthorization);
 
-    private static List<string> RequestTrailers(HttpContext context, bool stripAuthorization)
+    private static List<string> RequestTrailers(HttpContext context, bool stripAuthorization,
+        IReadOnlyCollection<string> declaredTrailerNames)
     {
         var feature = context.Features.Get<IHttpRequestTrailersFeature>();
         if (feature is null || !feature.Available)
         {
             return [];
         }
+        var allowed = ValidTrailerNames(declaredTrailerNames, stripAuthorization)
+            .ToFrozenSet(StringComparer.OrdinalIgnoreCase);
         var result = new List<string>();
         foreach (var (name, values) in feature.Trailers)
         {
-            if (!IsValidHeaderName(name)
-                || (stripAuthorization && name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
+            if (!allowed.Contains(name))
             {
                 continue;
             }
-            result.AddRange(values.Select(value => $"{name}:{value}"));
+            result.AddRange(values.Where(IsValidHeaderValue).Select(value => $"{name}:{value}"));
         }
         return result;
     }
 
-    private static void AppendResponseTrailer(HttpResponse response, string line)
+    private static void AppendResponseTrailer(HttpResponse response, string line,
+        IReadOnlyCollection<string> declaredTrailerNames)
     {
         var separator = line.IndexOf(':');
         if (separator <= 0)
@@ -993,11 +1021,27 @@ public static class DirectHttpEndpoints
             return;
         }
         var name = line[..separator].Trim();
-        if (IsValidHeaderName(name))
+        var value = line[(separator + 1)..].Trim();
+        if (declaredTrailerNames.Contains(name, StringComparer.OrdinalIgnoreCase)
+            && IsSafeTrailerName(name) && IsValidHeaderValue(value))
         {
-            response.AppendTrailer(name, line[(separator + 1)..].Trim());
+            response.AppendTrailer(name, value);
         }
     }
+
+    private static List<string> ValidTrailerNames(IEnumerable<string> names, bool stripAuthorization) =>
+        names.Select(static name => name.Trim())
+            .Where(name => IsSafeTrailerName(name)
+                           && (!stripAuthorization
+                               || !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static bool IsSafeTrailerName(string name) =>
+        IsValidHeaderName(name) && !SkippedHeaders.Contains(name);
+
+    private static bool IsValidHeaderValue(string? value) =>
+        value is not null && value.IndexOfAny(['\r', '\n']) < 0;
 
     private static bool IsValidHeaderName(string name) =>
         !string.IsNullOrWhiteSpace(name) && name.All(static ch =>

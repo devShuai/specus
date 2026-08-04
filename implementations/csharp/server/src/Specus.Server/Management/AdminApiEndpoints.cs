@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 using Specus.Server.Configuration;
 using Specus.Server.Hosting;
@@ -12,6 +13,12 @@ public static class AdminApiEndpoints
     {
         app.Use(async (context, next) =>
         {
+            if (context.Request.Path.StartsWithSegments("/api/public/transfer/rooms",
+                    StringComparison.OrdinalIgnoreCase)
+                && context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } bodySize)
+            {
+                bodySize.MaxRequestBodySize = 5 * 1024 * 1024;
+            }
             try
             {
                 await next().ConfigureAwait(false);
@@ -24,6 +31,11 @@ public static class AdminApiEndpoints
             catch (AuthenticationDependencyUnavailableException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
+            }
+            catch (ResourceNotFoundException ex) when (IsAdminSurface(context.Request.Path))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
                 await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
             }
             catch (ArgumentException ex) when (IsAdminSurface(context.Request.Path))
@@ -184,9 +196,82 @@ public static class AdminApiEndpoints
             (HttpContext context, PeerMeshService service) =>
                 Results.Ok(service.PublicStunConfig(ForwardedHost(context))));
 
+        app.MapGet("/api/public/peer-mesh/nat-probe-config",
+            (HttpContext context, PeerMeshService service) =>
+                Results.Ok(service.PublicNatProbeConfig(ForwardedHost(context))));
+
         app.MapGet("/api/public/transfer/ice-config",
             (HttpContext context, PeerMeshService service) =>
                 Results.Ok(service.PublicIceConfig(ForwardedHost(context))));
+
+        app.MapPost("/api/public/transfer/rooms/access-tokens/list",
+            async (RoomCredential request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.ListAccessTokensAsync(request, cancellationToken)
+                    .ConfigureAwait(false)));
+
+        app.MapPost("/api/public/transfer/rooms/access-tokens",
+            async (HttpContext context, CreateAccessTokenRequest request,
+                PublicTransferRoomService service, CancellationToken cancellationToken) =>
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                return Results.Ok(await service.CreateAccessTokenAsync(request, cancellationToken)
+                    .ConfigureAwait(false));
+            });
+
+        app.MapPost("/api/public/transfer/rooms/access-tokens/{accessId}/revoke",
+            async (long accessId, RoomCredential request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.RevokeAccessTokenAsync(accessId, request, cancellationToken)
+                    .ConfigureAwait(false)));
+
+        app.MapPost("/api/public/transfer/rooms/pairing-codes",
+            async (HttpContext context, CreatePairingCodeRequest request,
+                PublicTransferRoomService service, CancellationToken cancellationToken) =>
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                return Results.Ok(await service.CreatePairingCodeAsync(request, cancellationToken)
+                    .ConfigureAwait(false));
+            });
+
+        app.MapPost("/api/public/transfer/rooms/pairing-codes/redeem",
+            async (HttpContext context, RedeemPairingCodeRequest request,
+                PublicTransferRateLimiter rateLimiter, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+            {
+                await rateLimiter.CheckPairingCodeRedeemAsync(ClientIp(context), cancellationToken)
+                    .ConfigureAwait(false);
+                context.Response.Headers.CacheControl = "no-store";
+                return Results.Ok(await service.RedeemPairingCodeAsync(request, cancellationToken)
+                    .ConfigureAwait(false));
+            });
+
+        app.MapPost("/api/public/transfer/rooms/diagram/versions/list",
+            async (RoomCredential request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.ListVersionsAsync(request, cancellationToken)
+                    .ConfigureAwait(false)));
+
+        app.MapPost("/api/public/transfer/rooms/diagram/versions",
+            async (CreateDiagramVersionRequest request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.CreateVersionAsync(request, cancellationToken)
+                    .ConfigureAwait(false)));
+
+        app.MapPost("/api/public/transfer/rooms/diagram/versions/{versionId}",
+            async (long versionId, RoomCredential request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.GetVersionAsync(versionId, request, cancellationToken)
+                    .ConfigureAwait(false)));
+
+        app.MapPost("/api/public/transfer/rooms/diagram/versions/{versionId}/delete",
+            async (long versionId, RoomCredential request, PublicTransferRoomService service,
+                CancellationToken cancellationToken) =>
+            {
+                await service.DeleteVersionAsync(versionId, request, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.NoContent();
+            });
 
         app.MapGet("/api/admin/me",
             (HttpContext context, IOptions<AuthOptions> authOptions, ManagementUserService service,
@@ -243,6 +328,51 @@ public static class AdminApiEndpoints
             (HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,
                 CancellationToken cancellationToken) =>
                 service.ListClientsAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapGet("/api/admin/clients/name-availability",
+            (HttpContext context, string? clientName, long? excludeClientId,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+                service.ClientNameAvailabilityAsync(ManagementContext.From(context, authOptions.Value),
+                    clientName, excludeClientId, cancellationToken));
+
+        app.MapGet("/api/admin/diagrams",
+            (HttpContext context, IOptions<AuthOptions> authOptions,
+                UserDiagramDocumentService service, CancellationToken cancellationToken) =>
+                service.ListAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapGet("/api/admin/diagrams/{id}",
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                UserDiagramDocumentService service, CancellationToken cancellationToken) =>
+                service.GetAsync(ManagementContext.From(context, authOptions.Value), id,
+                    cancellationToken));
+
+        app.MapPost("/api/admin/diagrams",
+            async (HttpContext context, DiagramDocumentMutation request,
+                IOptions<AuthOptions> authOptions, UserDiagramDocumentService service,
+                CancellationToken cancellationToken) =>
+            {
+                var created = await service.CreateAsync(
+                        ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            });
+
+        app.MapPut("/api/admin/diagrams/{id}",
+            (HttpContext context, long id, DiagramDocumentMutation request,
+                IOptions<AuthOptions> authOptions, UserDiagramDocumentService service,
+                CancellationToken cancellationToken) =>
+                service.UpdateAsync(ManagementContext.From(context, authOptions.Value), id,
+                    request, cancellationToken));
+
+        app.MapDelete("/api/admin/diagrams/{id}",
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                UserDiagramDocumentService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteAsync(ManagementContext.From(context, authOptions.Value), id,
+                    cancellationToken).ConfigureAwait(false);
+                return Results.NoContent();
+            });
 
         app.MapGet("/api/admin/clients/{id:long}",
             (HttpContext context, long id, IOptions<AuthOptions> authOptions, ManagementQueryService service,
@@ -580,6 +710,25 @@ public static class AdminApiEndpoints
         return string.IsNullOrWhiteSpace(forwarded) ? context.Request.Host.ToString() : forwarded.Split(',', 2)[0].Trim();
     }
 
+    private static string ClientIp(HttpContext context)
+    {
+        var realIp = context.Request.Headers["X-Real-IP"].FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(realIp))
+        {
+            return realIp.Trim();
+        }
+        var forwarded = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(forwarded))
+        {
+            var last = forwarded.Split(',').LastOrDefault()?.Trim();
+            if (!string.IsNullOrWhiteSpace(last))
+            {
+                return last;
+            }
+        }
+        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    }
+
     private static bool RequiresBearerAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)
         || path.StartsWithSegments("/api/public/transfer/attachments",
@@ -589,6 +738,8 @@ public static class AdminApiEndpoints
     private static bool IsAdminSurface(PathString path) =>
         RequiresBearerAuth(path)
         || path.StartsWithSegments("/api/public/transfer/downloads",
+            StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/api/public/transfer/rooms",
             StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/ws-tickets", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/oss-callback", StringComparison.OrdinalIgnoreCase)

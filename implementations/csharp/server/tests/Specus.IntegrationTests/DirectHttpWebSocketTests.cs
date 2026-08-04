@@ -64,6 +64,61 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task HttpResponseOnlyPublishesSafeDeclaredPeerTrailers()
+    {
+        await using var session = BoundNatSession.Bind(_server!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var http = _server!.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, HttpPath("trailers"));
+        request.Headers.Authorization = System.Net.Http.Headers.AuthenticationHeaderValue.Parse(
+            BasicAuthorization());
+
+        var responseTask = http.SendAsync(request, cancellation.Token);
+        var opened = await session.Writer.ReadAsync(
+            packet => packet.NatMessageType == NatMessageType.Open
+                      && Equals(packet.MetaData?["source"], "http"), cancellation.Token);
+        await session.Writer.InjectAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Open,
+            StreamId = opened.StreamId,
+            MetaData = new Dictionary<string, object?>
+            {
+                ["source"] = "http",
+                ["phase"] = "response",
+                ["statusCode"] = 200,
+                ["trailerNames"] = new[]
+                {
+                    "Digest", "Content-Length", "X-Injected", "digest",
+                },
+            },
+        });
+        await session.Writer.InjectAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Fin,
+            StreamId = opened.StreamId,
+            MetaData = new Dictionary<string, object?>
+            {
+                ["trailers"] = new[]
+                {
+                    "Digest:sha-256=valid",
+                    "X-Undeclared:must-not-cross",
+                    "Content-Length:999",
+                    "X-Injected:ok\r\nX-Evil: yes",
+                },
+            },
+        });
+
+        using var response = await responseTask;
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("sha-256=valid", Assert.Single(response.TrailingHeaders.GetValues("Digest")));
+        foreach (var name in new[] { "X-Undeclared", "Content-Length", "X-Injected", "X-Evil" })
+        {
+            Assert.False(response.TrailingHeaders.Contains(name));
+        }
+    }
+
+    [Fact]
     public async Task ProtectedUpgradeOpensWsMetadataAndFiltersHandshakeCredentials()
     {
         await using var session = BoundNatSession.Bind(_server!);
@@ -212,7 +267,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ClientCloseAndFinReachBrowserWithoutReturningFin()
+    public async Task ClientCloseAndFinReachBrowserAndReturnCloseAndFin()
     {
         await using var session = BoundNatSession.Bind(_server!);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -238,8 +293,18 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         await AssertWindowCreditAsync(session.Writer, opened.StreamId, encodedClose.Length,
             cancellation.Token);
 
+        var returnedClose = await session.Writer.ReadAsync(
+            packet => IsCloseData(packet, opened.StreamId), cancellation.Token);
+        var returnedFrame = WebSocketSpecusFrame.Decode(returnedClose.Data!);
+        Assert.Equal((ushort)WebSocketCloseStatus.EndpointUnavailable, returnedFrame.CloseCode);
+        Assert.Equal("upstream gone", Encoding.UTF8.GetString(returnedFrame.Payload));
+        await session.Writer.ReadAsync(packet => packet.NatMessageType == NatMessageType.Fin
+                                                 && packet.StreamId == opened.StreamId,
+            cancellation.Token);
+
         await Task.Delay(100, cancellation.Token);
-        Assert.DoesNotContain(session.Writer.Snapshot(), packet =>
+        Assert.Single(session.Writer.Snapshot(), packet => IsCloseData(packet, opened.StreamId));
+        Assert.Single(session.Writer.Snapshot(), packet =>
             packet.NatMessageType == NatMessageType.Fin && packet.StreamId == opened.StreamId);
     }
 

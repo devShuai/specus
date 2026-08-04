@@ -606,6 +606,252 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.ToTable("specus_connection_stat", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpMediaCapture", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("CapturedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("captured_at");
+
+                    b.Property<long>("CapturedBytes")
+                        .HasColumnType("bigint")
+                        .HasColumnName("captured_bytes");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("CompletedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("completed_at");
+
+                    b.Property<string>("ContentEncoding")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("content_encoding");
+
+                    b.Property<long?>("ContentRangeEnd")
+                        .HasColumnType("bigint")
+                        .HasColumnName("content_range_end");
+
+                    b.Property<long?>("ContentRangeStart")
+                        .HasColumnType("bigint")
+                        .HasColumnName("content_range_start");
+
+                    b.Property<string>("ContentType")
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)")
+                        .HasColumnName("content_type");
+
+                    b.Property<string>("DeduplicationKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("deduplication_key");
+
+                    b.Property<string>("EntityTag")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("entity_tag");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("FailureReason")
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)")
+                        .HasColumnName("failure_reason");
+
+                    b.Property<bool>("InitializationSegment")
+                        .HasColumnType("boolean")
+                        .HasColumnName("initialization_segment");
+
+                    b.Property<string>("LastModified")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("last_modified");
+
+                    b.Property<bool>("LiveStream")
+                        .HasColumnType("boolean")
+                        .HasColumnName("live_stream");
+
+                    b.Property<string>("MediaKind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("media_kind");
+
+                    b.Property<string>("Method")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("method");
+
+                    b.Property<string>("ObjectEtag")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("object_etag");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("object_key");
+
+                    b.Property<long?>("ResourceId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("resource_id");
+
+                    b.Property<string>("ResourceKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("resource_key");
+
+                    b.Property<string>("ResponseHeaders")
+                        .HasColumnType("text")
+                        .HasColumnName("response_headers");
+
+                    b.Property<string>("Route")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("route");
+
+                    b.Property<long?>("SegmentSequence")
+                        .HasColumnType("bigint")
+                        .HasColumnName("segment_sequence");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(3072)
+                        .HasColumnType("character varying(3072)")
+                        .HasColumnName("source_url");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("character varying(24)")
+                        .HasColumnName("state");
+
+                    b.Property<int>("StatusCode")
+                        .HasColumnType("integer")
+                        .HasColumnName("status_code");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<long?>("TotalBytes")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_bytes");
+
+                    b.Property<string>("UploadId")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("upload_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DeduplicationKey")
+                        .IsUnique()
+                        .HasDatabaseName("uk_http_media_deduplication_key");
+
+                    b.HasIndex("State", "ExpiresAt")
+                        .HasDatabaseName("idx_http_media_state_expires");
+
+                    b.HasIndex("TenantId", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_client_id");
+
+                    b.HasIndex("TenantId", "ResourceKey", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_resource_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Route", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_client_route_id");
+
+                    b.ToTable("specus_http_media_capture", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpMediaReference", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<long>("ManifestCaptureId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("manifest_capture_id");
+
+                    b.Property<string>("OriginalUri")
+                        .IsRequired()
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)")
+                        .HasColumnName("original_uri");
+
+                    b.Property<string>("RelationType")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("character varying(24)")
+                        .HasColumnName("relation_type");
+
+                    b.Property<string>("ResolvedSourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(3072)
+                        .HasColumnType("character varying(3072)")
+                        .HasColumnName("resolved_source_url");
+
+                    b.Property<long?>("SequenceIndex")
+                        .HasColumnType("bigint")
+                        .HasColumnName("sequence_index");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "ManifestCaptureId")
+                        .HasDatabaseName("idx_http_media_reference_manifest");
+
+                    b.HasIndex("TenantId", "ManifestCaptureId", "SequenceIndex")
+                        .HasDatabaseName("idx_http_media_reference_manifest_sequence");
+
+                    b.ToTable("specus_http_media_reference", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.HttpRouteMapping", b =>
                 {
                     b.Property<long>("Id")
@@ -648,6 +894,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.Property<bool>("Enabled")
                         .HasColumnType("boolean")
                         .HasColumnName("enabled");
+
+                    b.Property<bool>("MediaCaptureEnabled")
+                        .HasColumnType("boolean")
+                        .HasColumnName("media_capture_enabled");
 
                     b.Property<bool>("PathRewriteEnabled")
                         .HasColumnType("boolean")
@@ -1340,6 +1590,223 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.ToTable("peer_mesh_session", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferDiagramVersion", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("AuthorPeerId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)")
+                        .HasColumnName("author_peer_id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("name");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("room_id");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint")
+                        .HasColumnName("size_bytes");
+
+                    b.Property<byte[]>("SnapshotData")
+                        .IsRequired()
+                        .HasColumnType("bytea")
+                        .HasColumnName("snapshot_data");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CreatedAt")
+                        .HasDatabaseName("idx_public_transfer_version_created");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_version_room");
+
+                    b.ToTable("public_transfer_diagram_version", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoom", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedByPeerId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)")
+                        .HasColumnName("created_by_peer_id");
+
+                    b.Property<string>("OwnerTokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("owner_token_hash");
+
+                    b.Property<string>("RoomName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)")
+                        .HasColumnName("room_name");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoomName")
+                        .HasDatabaseName("idx_public_transfer_room_name");
+
+                    b.HasIndex("RoomName", "OwnerTokenHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_room_key");
+
+                    b.ToTable("public_transfer_room", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoomAccess", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("Label")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("label");
+
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("role");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("room_id");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("token_hash");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_access_room");
+
+                    b.HasIndex("TokenHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_access_token");
+
+                    b.ToTable("public_transfer_room_access", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoomPairingCode", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CodeHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("code_hash");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("Label")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("label");
+
+                    b.Property<int>("MaxUses")
+                        .HasColumnType("integer")
+                        .HasColumnName("max_uses");
+
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("role");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("room_id");
+
+                    b.Property<int>("UsedCount")
+                        .HasColumnType("integer")
+                        .HasColumnName("used_count");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CodeHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_pairing_code_hash");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_pairing_room");
+
+                    b.ToTable("public_transfer_room_pairing_code", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.ResourceTrafficUsage", b =>
                 {
                     b.Property<long>("Id")
@@ -1721,6 +2188,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(80)")
                         .HasColumnName("owner_username");
 
+                    b.Property<long?>("PublicTransferRoomId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("public_transfer_room_id");
+
                     b.Property<string>("RoomId")
                         .HasMaxLength(120)
                         .HasColumnType("character varying(120)")
@@ -1782,6 +2253,9 @@ namespace Specus.Server.Data.Postgres.Migrations
 
                     b.HasIndex("ExpiresAt", "Status")
                         .HasDatabaseName("idx_transfer_attachment_expires");
+
+                    b.HasIndex("Scope", "PublicTransferRoomId", "Id")
+                        .HasDatabaseName("idx_transfer_attachment_public_room");
 
                     b.HasIndex("Scope", "RoomId", "Id")
                         .HasDatabaseName("idx_transfer_attachment_room");
@@ -1903,6 +2377,69 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.ToTable("transfer_attachment_download_usage", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.UserDiagramDocument", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)")
+                        .HasColumnName("name");
+
+                    b.Property<string>("OwnerUsername")
+                        .IsRequired()
+                        .HasMaxLength(160)
+                        .HasColumnType("character varying(160)")
+                        .HasColumnName("owner_username");
+
+                    b.Property<long>("Revision")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasDefaultValue(0L)
+                        .HasColumnName("revision");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint")
+                        .HasColumnName("size_bytes");
+
+                    b.Property<byte[]>("SnapshotData")
+                        .IsRequired()
+                        .HasColumnType("bytea")
+                        .HasColumnName("snapshot_data");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UpdatedAt")
+                        .HasDatabaseName("idx_user_diagram_updated");
+
+                    b.HasIndex("TenantId", "OwnerUsername")
+                        .HasDatabaseName("idx_user_diagram_owner");
+
+                    b.ToTable("user_diagram_document", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.WebSocketTicket", b =>
                 {
                     b.Property<string>("TokenHash")
@@ -1915,6 +2452,12 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)")
                         .HasColumnName("created_at");
+
+                    b.Property<bool>("Discoverable")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(true)
+                        .HasColumnName("discoverable");
 
                     b.Property<string>("DisplayName")
                         .HasMaxLength(120)
@@ -1951,6 +2494,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasMaxLength(80)
                         .HasColumnType("character varying(80)")
                         .HasColumnName("room_key");
+
+                    b.Property<string>("RoomRole")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("room_role");
 
                     b.Property<string>("Scope")
                         .IsRequired()

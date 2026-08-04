@@ -17,9 +17,11 @@ public sealed class WebSocketTicket
     public bool IsAdmin { get; set; }
     public string? RoomId { get; set; }
     public string? RoomKey { get; set; }
+    public string? RoomRole { get; set; }
     public string? PeerId { get; set; }
     public string? DisplayName { get; set; }
     public bool SharedRoom { get; set; }
+    public bool Discoverable { get; set; } = true;
     public string RemoteAddressHash { get; set; } = string.Empty;
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ExpiresAt { get; set; }

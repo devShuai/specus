@@ -55,6 +55,66 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PublicDiscoveryHidesNonDiscoverablePeerFromRoster()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var visible = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "hidden-room", "hidden-secret", "visible-peer", "Visible");
+        _ = await ReceiveTextAsync(visible, cts.Token);
+        _ = await ReceiveTextAsync(visible, cts.Token);
+
+        using var hidden = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "hidden-room", "hidden-secret", "hidden-peer", "Hidden", discoverable: false);
+        using var hello = JsonDocument.Parse(await ReceiveTextAsync(hidden, cts.Token));
+        Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
+        using var hiddenRoster = JsonDocument.Parse(await ReceiveTextAsync(hidden, cts.Token));
+        var hiddenPeers = hiddenRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        var onlyVisible = Assert.Single(hiddenPeers);
+        Assert.Equal("visible-peer", onlyVisible.GetProperty("peerId").GetString());
+
+        using var visibleRoster = JsonDocument.Parse(await ReceiveTextAsync(visible, cts.Token));
+        var visiblePeers = visibleRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.DoesNotContain(visiblePeers,
+            peer => peer.GetProperty("peerId").GetString() == "hidden-peer");
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryViewerCannotPublishWritableRoomMessages()
+    {
+        var roomId = $"viewer-room-{Guid.NewGuid():N}";
+        var ownerToken = $"owner-{Guid.NewGuid():N}";
+        using var http = _server!.CreateClient();
+        using var createViewer = await http.PostAsJsonAsync(
+            "/api/public/transfer/rooms/access-tokens", new
+            {
+                roomId,
+                roomToken = ownerToken,
+                peerId = "owner-peer",
+                role = "VIEWER",
+            });
+        createViewer.EnsureSuccessStatusCode();
+        using var tokenBody = JsonDocument.Parse(await createViewer.Content.ReadAsStringAsync());
+        var viewerToken = tokenBody.RootElement.GetProperty("token").GetString();
+        Assert.NotNull(viewerToken);
+
+        var webSockets = _server.Server.CreateWebSocketClient();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var viewer = await ConnectPublicDiscoveryAsync(webSockets, timeout.Token,
+            roomId, viewerToken!, "viewer-peer", "Viewer");
+        using var hello = JsonDocument.Parse(await ReceiveTextAsync(viewer, timeout.Token));
+        Assert.Equal("VIEWER", hello.RootElement.GetProperty("roomRole").GetString());
+        _ = await ReceiveTextAsync(viewer, timeout.Token);
+
+        await viewer.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"clipboard\",\"payload\":{\"text\":\"blocked\"}}"),
+            WebSocketMessageType.Text, true, timeout.Token);
+        using var error = JsonDocument.Parse(await ReceiveTextAsync(viewer, timeout.Token));
+        Assert.Equal("error", error.RootElement.GetProperty("type").GetString());
+        Assert.Equal("viewer is read-only", error.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
     public async Task PublicDiscoveryRejectsDuplicatePeerIdInSameGroup()
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
@@ -546,7 +606,7 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
 
     private async Task<WebSocket> ConnectPublicDiscoveryAsync(WebSocketClient webSockets,
         CancellationToken cancellationToken, string roomId, string roomToken, string peerId,
-        string? displayName = null)
+        string? displayName = null, bool? discoverable = null)
     {
         using var http = _server!.CreateClient();
         using var response = await http.PostAsJsonAsync("/api/public/transfer/ws-tickets", new
@@ -555,6 +615,7 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
             roomToken,
             peerId,
             displayName = displayName ?? peerId,
+            discoverable,
         }, cancellationToken);
         response.EnsureSuccessStatusCode();
         var ticket = await response.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(

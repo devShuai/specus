@@ -55,6 +55,10 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_OBJECT_STORAGE_PREFIX"] = "files",
             ["SPECUS_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES"] = "1073741824",
             ["SPECUS_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES"] = "1073741824",
+            ["SPECUS_MEDIA_CAPTURE_ENABLED"] = "true",
+            ["SPECUS_MEDIA_CAPTURE_ENDPOINT"] = "http://rustfs:9000",
+            ["SPECUS_MEDIA_CAPTURE_PREFIX"] = "media-cache",
+            ["SPECUS_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS"] = "3",
             ["SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM"] = "12",
             ["SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED"] = "true",
             ["SPECUS_PUBLIC_TRANSFER_REDIS_URI"] = "redis://redis.internal:6379/4",
@@ -116,6 +120,10 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("files", mapped["Specus:ObjectStorage:ObjectPrefix"]);
         Assert.Equal("1073741824", mapped["Specus:ObjectStorage:PerUserStorageQuotaBytes"]);
         Assert.Equal("1073741824", mapped["Specus:ObjectStorage:PerUserMonthlyDownloadQuotaBytes"]);
+        Assert.Equal("true", mapped["Specus:MediaCapture:Enabled"]);
+        Assert.Equal("http://rustfs:9000", mapped["Specus:MediaCapture:Endpoint"]);
+        Assert.Equal("media-cache", mapped["Specus:MediaCapture:ObjectPrefix"]);
+        Assert.Equal("3", mapped["Specus:MediaCapture:MaxInflightParts"]);
         Assert.Equal("12", mapped["Specus:PublicTransfer:MaxDiscoveryPeersPerRoom"]);
         Assert.Equal("true", mapped["Specus:PublicTransfer:ClusterEnabled"]);
         Assert.Equal("redis://redis.internal:6379/4", mapped["Specus:PublicTransfer:RedisUri"]);

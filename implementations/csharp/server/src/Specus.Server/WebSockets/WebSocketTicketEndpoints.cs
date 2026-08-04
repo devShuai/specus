@@ -35,25 +35,36 @@ public static class WebSocketTicketEndpoints
 
         app.MapPost("/api/public/transfer/ws-tickets", async (HttpContext context,
             PublicWebSocketTicketRequest? request, WebSocketTicketService tickets,
+            PublicTransferRoomService rooms,
             CancellationToken cancellationToken) =>
         {
-            request ??= new PublicWebSocketTicketRequest();
+            if (request is null)
+            {
+                throw new ArgumentException("ticket request is required");
+            }
             var roomId = Truncate(request.RoomId, 120, "nearby");
             var peerId = Truncate(request.PeerId, 120,
                 "web-" + Guid.NewGuid().ToString("N")[..8]);
             var displayName = Truncate(request.DisplayName, 120, "web");
-            var roomToken = request.RoomToken?.Trim() ?? string.Empty;
-            if (roomToken.Length > 512)
-            {
-                throw new ArgumentException("room token is too long");
-            }
+            var roomToken = Truncate(request.RoomToken, 512, string.Empty);
             var sharedRoom = roomToken.Length > 0;
+            var requestAddress = WebSocketTicketService.RequestAddress(context);
+            var roomKey = "public:" + requestAddress;
+            var roomRole = PublicTransferRoomService.RoomRole.Editor;
+            if (sharedRoom)
+            {
+                var access = await rooms.ResolveAsync(roomId, roomToken, peerId, cancellationToken)
+                    .ConfigureAwait(false);
+                roomKey = "room:" + access.RoomId;
+                roomRole = access.Role;
+            }
             context.Response.Headers.CacheControl = "no-store";
             return Results.Ok(await tickets.IssueAsync(WebSocketTicketService.PublicTransferScope,
-                WebSocketTicketService.RequestAddress(context),
+                requestAddress,
                 new WebSocketTicketClaims(RoomId: roomId,
-                    RoomKey: sharedRoom ? WebSocketTicketService.RoomKey(roomToken) : null,
-                    PeerId: peerId, DisplayName: displayName, SharedRoom: sharedRoom),
+                    RoomKey: roomKey, PeerId: peerId, DisplayName: displayName,
+                    SharedRoom: sharedRoom, RoomRole: roomRole.ToString().ToUpperInvariant(),
+                    Discoverable: request.Discoverable ?? true),
                 cancellationToken).ConfigureAwait(false));
         });
 
@@ -93,4 +104,5 @@ public sealed class PublicWebSocketTicketRequest
     public string? RoomToken { get; init; }
     public string? PeerId { get; init; }
     public string? DisplayName { get; init; }
+    public bool? Discoverable { get; init; }
 }

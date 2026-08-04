@@ -44,6 +44,8 @@ builder.Services.Configure<PublicTransferOptions>(
     builder.Configuration.GetSection(PublicTransferOptions.SectionName));
 builder.Services.Configure<ObjectStorageOptions>(
     builder.Configuration.GetSection(ObjectStorageOptions.SectionName));
+builder.Services.Configure<MediaCaptureOptions>(
+    builder.Configuration.GetSection(MediaCaptureOptions.SectionName));
 builder.Services.Configure<PeerMeshOptions>(
     builder.Configuration.GetSection(PeerMeshOptions.SectionName));
 builder.Services.Configure<OidcOptions>(
@@ -96,6 +98,8 @@ builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ManagementUserService>();
+builder.Services.AddScoped<UserDiagramDocumentService>();
+builder.Services.AddScoped<PublicTransferRoomService>();
 builder.Services.AddScoped<RegistrationService>();
 builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSender>();
 builder.Services.AddSingleton<ITurnstileVerifier, TurnstileVerifier>();
@@ -106,6 +110,16 @@ builder.Services.AddHostedService<StunTurnServer>();
 builder.Services.AddHostedService<PeerMeshRelayTrafficFlushService>();
 builder.Services.AddSingleton<ElasticsearchTrafficDetailClient>();
 builder.Services.AddSingleton<IObjectStorageService, AliyunOssObjectStorageService>();
+builder.Services.AddSingleton<IHttpMediaStorage, RustFsMediaStorage>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHostedService<HttpMediaStorageInitializer>();
+builder.Services.AddSingleton<HttpMediaUploadScheduler>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<HttpMediaUploadScheduler>());
+builder.Services.AddScoped<HttpMediaCaptureService>();
+builder.Services.AddScoped<HttpMediaPlaybackService>();
+builder.Services.AddSingleton<HttpMediaPlaybackTicketService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<HttpMediaPlaybackTicketService>());
+builder.Services.AddHostedService<HttpMediaCaptureCleanupService>();
 builder.Services.AddSingleton<PublicTransferCoordinationService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PublicTransferCoordinationService>());
 builder.Services.AddSingleton<PublicTransferRateLimiter>();
@@ -119,6 +133,9 @@ builder.Services.AddHttpClient(nameof(TurnstileVerifier), client =>
     client.Timeout = TimeSpan.FromSeconds(8));
 builder.Services.AddHttpClient(nameof(AliyunOssObjectStorageService))
     .ConfigurePrimaryHttpMessageHandler(AliyunOssObjectStorageService.CreateNoRedirectHandler);
+builder.Services.AddHttpClient(nameof(RustFsMediaStorage), client =>
+        client.Timeout = Timeout.InfiniteTimeSpan)
+    .ConfigurePrimaryHttpMessageHandler(RustFsMediaStorage.CreateNoRedirectHandler);
 
 builder.Services.AddSingleton<ClientAuthSessionStore>();
 builder.Services.AddSingleton<LocalTokenService>();
@@ -174,6 +191,7 @@ app.MapStaticAssets();
 app.MapAdminApi();
 app.MapClientAuthApi();
 app.MapTransferAttachmentApi();
+app.MapHttpMediaApi();
 app.MapWebSocketTicketApi();
 app.MapDirectHttpSpecus();
 app.MapConnectionEventsWebSocket();

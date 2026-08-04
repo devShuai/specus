@@ -7,6 +7,7 @@ public sealed class TransferAttachment
     public string Scope { get; set; } = string.Empty;
     public string? RoomId { get; set; }
     public string? RoomTokenHash { get; set; }
+    public long? PublicTransferRoomId { get; set; }
     public string? OwnerUsername { get; set; }
     public long? TargetClientId { get; set; }
     public string ObjectKey { get; set; } = string.Empty;

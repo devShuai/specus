@@ -31,6 +31,8 @@ public sealed record ClientMutation(
     bool? Enabled,
     int? ConnectionRateLimitPerMinute);
 
+public sealed record ClientNameAvailability(string ClientName, bool Available);
+
 public sealed record ClientResult(ClientAccountView Client);
 
 public sealed record ClientDetailView(
@@ -133,6 +135,7 @@ public sealed record HttpRouteView(
     string TargetBaseUrl,
     bool Enabled,
     bool DetailCaptureEnabled,
+    bool MediaCaptureEnabled,
     bool PathRewriteEnabled,
     bool AuthEnabled,
     string AuthUsername,
@@ -148,7 +151,8 @@ public sealed record HttpRouteMutation(
     bool? PathRewriteEnabled,
     bool? AuthEnabled,
     string? AuthUsername,
-    string? AuthPassword);
+    string? AuthPassword,
+    bool? MediaCaptureEnabled = null);
 
 public sealed record NatControlPushResponse(int Pushed, int SpecusMappings, int HttpRoutes);
 

@@ -163,6 +163,19 @@ public static class SpecusEnvironmentVariables
         }
 
         if (parts.Length >= 2
+            && parts[0].Equals("MEDIA", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("CAPTURE", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parts.Length == 3 && parts[2].Equals("PREFIX", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Specus:MediaCapture:ObjectPrefix";
+            }
+            return parts.Length == 2
+                ? "Specus:MediaCapture"
+                : $"Specus:MediaCapture:{ToPascal(parts[2..])}";
+        }
+
+        if (parts.Length >= 2
             && parts[0].Equals("PUBLIC", StringComparison.OrdinalIgnoreCase)
             && parts[1].Equals("TRANSFER", StringComparison.OrdinalIgnoreCase))
         {

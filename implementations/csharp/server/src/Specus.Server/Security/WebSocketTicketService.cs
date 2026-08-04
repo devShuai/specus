@@ -37,9 +37,11 @@ public sealed class WebSocketTicketService
             IsAdmin = claims.Admin,
             RoomId = NullIfEmpty(claims.RoomId),
             RoomKey = NullIfEmpty(claims.RoomKey),
+            RoomRole = NullIfEmpty(claims.RoomRole),
             PeerId = NullIfEmpty(claims.PeerId),
             DisplayName = NullIfEmpty(claims.DisplayName),
             SharedRoom = claims.SharedRoom,
+            Discoverable = claims.Discoverable,
             RemoteAddressHash = Digest(remoteAddress),
             CreatedAt = now,
             ExpiresAt = now.Add(TicketLifetime),
@@ -83,7 +85,8 @@ public sealed class WebSocketTicketService
             return null;
         }
         return new WebSocketTicketClaims(row.Username, row.TenantId, row.IsAdmin, row.RoomId,
-            row.RoomKey, row.PeerId, row.DisplayName, row.SharedRoom);
+            row.RoomKey, row.PeerId, row.DisplayName, row.SharedRoom, row.RoomRole,
+            row.Discoverable);
     }
 
     public static string? ExtractTicket(HttpRequest request)
@@ -139,7 +142,8 @@ public sealed class WebSocketTicketService
 
 public sealed record WebSocketTicketClaims(string? Username = null, string? TenantId = null,
     bool Admin = false, string? RoomId = null, string? RoomKey = null, string? PeerId = null,
-    string? DisplayName = null, bool SharedRoom = false)
+    string? DisplayName = null, bool SharedRoom = false, string? RoomRole = null,
+    bool Discoverable = true)
 {
     public ClaimsPrincipal ToPrincipal()
     {

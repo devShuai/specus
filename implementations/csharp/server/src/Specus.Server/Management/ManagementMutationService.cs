@@ -91,6 +91,30 @@ public sealed class ManagementMutationService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<ClientNameAvailability> ClientNameAvailabilityAsync(ManagementContext context,
+        string? clientNameValue, long? excludeClientId, CancellationToken cancellationToken)
+    {
+        var clientName = RequireClientName(clientNameValue);
+        if (excludeClientId is not null)
+        {
+            var excluded = await _db.ClientAccounts.AsNoTracking()
+                .FirstOrDefaultAsync(row => row.Id == excludeClientId.Value, cancellationToken)
+                .ConfigureAwait(false);
+            if (excluded is null || !context.CanAccess(excluded))
+            {
+                throw new ArgumentException($"client not found: {excludeClientId.Value}");
+            }
+        }
+
+        var existingId = await _db.ClientAccounts.AsNoTracking()
+            .Where(row => row.ClientName == clientName)
+            .Select(row => (long?)row.Id)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return new ClientNameAvailability(clientName,
+            existingId is null || existingId == excludeClientId);
+    }
+
     public async Task<IReadOnlyList<ClientCredentialView>> ListCredentialsAsync(ManagementContext context,
         CancellationToken cancellationToken)
     {
@@ -377,6 +401,7 @@ public sealed class ManagementMutationService
             TargetBaseUrl = RequireTargetBaseUrl(request.TargetBaseUrl),
             Enabled = request.Enabled ?? true,
             DetailCaptureEnabled = request.DetailCaptureEnabled ?? false,
+            MediaCaptureEnabled = request.MediaCaptureEnabled ?? false,
             PathRewriteEnabled = request.PathRewriteEnabled ?? false,
             AuthEnabled = authEnabled,
             AuthUsername = authUsername,
@@ -407,6 +432,7 @@ public sealed class ManagementMutationService
         row.TargetBaseUrl = RequireTargetBaseUrl(request.TargetBaseUrl);
         row.Enabled = request.Enabled ?? row.Enabled;
         row.DetailCaptureEnabled = request.DetailCaptureEnabled ?? row.DetailCaptureEnabled;
+        row.MediaCaptureEnabled = request.MediaCaptureEnabled ?? row.MediaCaptureEnabled;
         row.PathRewriteEnabled = request.PathRewriteEnabled ?? row.PathRewriteEnabled;
         row.AuthEnabled = request.AuthEnabled ?? row.AuthEnabled;
         if (request.AuthUsername is not null)
@@ -564,6 +590,7 @@ public sealed class ManagementMutationService
         row.TargetBaseUrl,
         row.Enabled,
         row.DetailCaptureEnabled,
+        row.MediaCaptureEnabled,
         row.PathRewriteEnabled,
         row.AuthEnabled,
         row.AuthUsername ?? string.Empty,

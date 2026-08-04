@@ -221,6 +221,9 @@ public sealed class PublicTransferOptions
     public long PresenceLeaseSeconds { get; set; } = 30;
     public long PresenceRefreshIntervalMs { get; set; } = 10_000;
     public long RedisCommandTimeoutMs { get; set; } = 2_000;
+    public long PairingCodeTtlSeconds { get; set; } = 300;
+    public int PairingCodeRedeemRateLimitPerIp { get; set; } = 10;
+    public long PairingCodeRedeemRateLimitWindowSeconds { get; set; } = 300;
 }
 
 public sealed class ObjectStorageOptions
@@ -255,6 +258,9 @@ public sealed class PeerMeshOptions
     public int StunTurnPort { get; set; } = 3478;
     public string StandaloneStunAddress { get; set; } = string.Empty;
     public int StandaloneStunPort { get; set; } = 3478;
+    public string StandaloneStunAlternateAddress { get; set; } = string.Empty;
+    public int StandaloneStunAlternatePort { get; set; }
+    public string StunAlternatePublicAddress { get; set; } = string.Empty;
     public int NatProbeAlternatePort { get; set; } = 3479;
     public List<string> PublicStunServers { get; set; } = [];
     public long SessionTtlSeconds { get; set; } = 3600;

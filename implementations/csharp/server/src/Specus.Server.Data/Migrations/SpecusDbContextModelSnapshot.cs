@@ -597,6 +597,248 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("specus_connection_stat", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpMediaCapture", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CapturedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("captured_at");
+
+                    b.Property<long>("CapturedBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("captured_bytes");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("CompletedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("completed_at");
+
+                    b.Property<string>("ContentEncoding")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("content_encoding");
+
+                    b.Property<long?>("ContentRangeEnd")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("content_range_end");
+
+                    b.Property<long?>("ContentRangeStart")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("content_range_start");
+
+                    b.Property<string>("ContentType")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("content_type");
+
+                    b.Property<string>("DeduplicationKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("deduplication_key");
+
+                    b.Property<string>("EntityTag")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("entity_tag");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("FailureReason")
+                        .HasMaxLength(2048)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("failure_reason");
+
+                    b.Property<bool>("InitializationSegment")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("initialization_segment");
+
+                    b.Property<string>("LastModified")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("last_modified");
+
+                    b.Property<bool>("LiveStream")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("live_stream");
+
+                    b.Property<string>("MediaKind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("media_kind");
+
+                    b.Property<string>("Method")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("method");
+
+                    b.Property<string>("ObjectEtag")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("object_etag");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("object_key");
+
+                    b.Property<long?>("ResourceId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("resource_id");
+
+                    b.Property<string>("ResourceKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_key");
+
+                    b.Property<string>("ResponseHeaders")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_headers");
+
+                    b.Property<string>("Route")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("route");
+
+                    b.Property<long?>("SegmentSequence")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("segment_sequence");
+
+                    b.Property<string>("SourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(3072)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("source_url");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("state");
+
+                    b.Property<int>("StatusCode")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("status_code");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<long?>("TotalBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("total_bytes");
+
+                    b.Property<string>("UploadId")
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("upload_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DeduplicationKey")
+                        .IsUnique()
+                        .HasDatabaseName("uk_http_media_deduplication_key");
+
+                    b.HasIndex("State", "ExpiresAt")
+                        .HasDatabaseName("idx_http_media_state_expires");
+
+                    b.HasIndex("TenantId", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_client_id");
+
+                    b.HasIndex("TenantId", "ResourceKey", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_resource_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Route", "Id")
+                        .HasDatabaseName("idx_http_media_tenant_client_route_id");
+
+                    b.ToTable("specus_http_media_capture", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpMediaReference", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<long>("ManifestCaptureId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("manifest_capture_id");
+
+                    b.Property<string>("OriginalUri")
+                        .IsRequired()
+                        .HasMaxLength(2048)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("original_uri");
+
+                    b.Property<string>("RelationType")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("relation_type");
+
+                    b.Property<string>("ResolvedSourceUrl")
+                        .IsRequired()
+                        .HasMaxLength(3072)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resolved_source_url");
+
+                    b.Property<long?>("SequenceIndex")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("sequence_index");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "ManifestCaptureId")
+                        .HasDatabaseName("idx_http_media_reference_manifest");
+
+                    b.HasIndex("TenantId", "ManifestCaptureId", "SequenceIndex")
+                        .HasDatabaseName("idx_http_media_reference_manifest_sequence");
+
+                    b.ToTable("specus_http_media_reference", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.HttpRouteMapping", b =>
                 {
                     b.Property<long>("Id")
@@ -639,6 +881,10 @@ namespace Specus.Server.Data.Migrations
                     b.Property<bool>("Enabled")
                         .HasColumnType("INTEGER")
                         .HasColumnName("enabled");
+
+                    b.Property<bool>("MediaCaptureEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("media_capture_enabled");
 
                     b.Property<bool>("PathRewriteEnabled")
                         .HasColumnType("INTEGER")
@@ -1329,6 +1575,223 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("peer_mesh_session", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferDiagramVersion", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("AuthorPeerId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("author_peer_id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("name");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("room_id");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("size_bytes");
+
+                    b.Property<byte[]>("SnapshotData")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("snapshot_data");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CreatedAt")
+                        .HasDatabaseName("idx_public_transfer_version_created");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_version_room");
+
+                    b.ToTable("public_transfer_diagram_version", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoom", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedByPeerId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_by_peer_id");
+
+                    b.Property<string>("OwnerTokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("owner_token_hash");
+
+                    b.Property<string>("RoomName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("room_name");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoomName")
+                        .HasDatabaseName("idx_public_transfer_room_name");
+
+                    b.HasIndex("RoomName", "OwnerTokenHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_room_key");
+
+                    b.ToTable("public_transfer_room", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoomAccess", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("Label")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("label");
+
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("role");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("room_id");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("token_hash");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_access_room");
+
+                    b.HasIndex("TokenHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_access_token");
+
+                    b.ToTable("public_transfer_room_access", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferRoomPairingCode", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CodeHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("code_hash");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("Label")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("label");
+
+                    b.Property<int>("MaxUses")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("max_uses");
+
+                    b.Property<string>("RevokedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("role");
+
+                    b.Property<long>("RoomId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("room_id");
+
+                    b.Property<int>("UsedCount")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("used_count");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CodeHash")
+                        .IsUnique()
+                        .HasDatabaseName("uk_public_transfer_pairing_code_hash");
+
+                    b.HasIndex("RoomId")
+                        .HasDatabaseName("idx_public_transfer_pairing_room");
+
+                    b.ToTable("public_transfer_room_pairing_code", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.ResourceTrafficUsage", b =>
                 {
                     b.Property<long>("Id")
@@ -1704,6 +2167,10 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("owner_username");
 
+                    b.Property<long?>("PublicTransferRoomId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("public_transfer_room_id");
+
                     b.Property<string>("RoomId")
                         .HasMaxLength(120)
                         .HasColumnType("TEXT")
@@ -1765,6 +2232,9 @@ namespace Specus.Server.Data.Migrations
 
                     b.HasIndex("ExpiresAt", "Status")
                         .HasDatabaseName("idx_transfer_attachment_expires");
+
+                    b.HasIndex("Scope", "PublicTransferRoomId", "Id")
+                        .HasDatabaseName("idx_transfer_attachment_public_room");
 
                     b.HasIndex("Scope", "RoomId", "Id")
                         .HasDatabaseName("idx_transfer_attachment_room");
@@ -1886,6 +2356,69 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("transfer_attachment_download_usage", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.UserDiagramDocument", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("name");
+
+                    b.Property<string>("OwnerUsername")
+                        .IsRequired()
+                        .HasMaxLength(160)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("owner_username");
+
+                    b.Property<long>("Revision")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(0L)
+                        .HasColumnName("revision");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("size_bytes");
+
+                    b.Property<byte[]>("SnapshotData")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("snapshot_data");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UpdatedAt")
+                        .HasDatabaseName("idx_user_diagram_updated");
+
+                    b.HasIndex("TenantId", "OwnerUsername")
+                        .HasDatabaseName("idx_user_diagram_owner");
+
+                    b.ToTable("user_diagram_document", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.WebSocketTicket", b =>
                 {
                     b.Property<string>("TokenHash")
@@ -1898,6 +2431,12 @@ namespace Specus.Server.Data.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("TEXT")
                         .HasColumnName("created_at");
+
+                    b.Property<bool>("Discoverable")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(true)
+                        .HasColumnName("discoverable");
 
                     b.Property<string>("DisplayName")
                         .HasMaxLength(120)
@@ -1934,6 +2473,11 @@ namespace Specus.Server.Data.Migrations
                         .HasMaxLength(80)
                         .HasColumnType("TEXT")
                         .HasColumnName("room_key");
+
+                    b.Property<string>("RoomRole")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("room_role");
 
                     b.Property<string>("Scope")
                         .IsRequired()
