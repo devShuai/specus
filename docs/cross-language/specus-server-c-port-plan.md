@@ -20,17 +20,19 @@ implementations/c/server/
 当前 C server 冻结在“轻量兼容实现”阶段，用于协议联调和最小可用管理面，不继续扩展 Peer Mesh 数据面：
 
 - C11 + POSIX socket + pthread + zlib + SQLite3 构建。
-- Java 协议帧头：`0x14353565`、`version=1`、`serializer`、`command`、body length；32 MiB 按 11 字节 header + body 的完整帧计算，CompactBinary deflate 恰好 16 MiB 允许、超 1 字节拒绝。
-- Java compact payload 的 raw/deflate 编解码，使用 raw deflate 参数对齐 Java `Deflater(..., true)` / `Inflater(true)`。
+- Java v2 协议帧头：`0x14353565`、`version=2`、`serializer=4`、固定 command registry 与 body length；32 MiB 按 11 字节 header + body 的完整帧计算，错误 version/serializer/command、截断、尾随和超限长度均拒绝。
+- CompactBinary 直接编码固定 schema，不含旧 `payloadType` 或 raw/deflate envelope；NAT stream 使用固定 16 字节头、JSON metadata 与原始 data，v1 和旧压缩 fixture 只作为拒绝用例。
 - HMAC-SHA256 启动鉴权，支持 SQLite `specus_client_credential` 校验，创建/复用机器用户绑定的客户端身份，写入 `specus_client_session`，并签发 Java-shaped `cs_` runtime token。
-- Netty 控制通道按 `clientSessionId + accessToken` 登录，校验 token 过期、客户端/凭证启用状态、同机单实例和最大在线实例数，登录成功后进入 `NETTY_ONLINE`，断开后标记 `DISCONNECTED`。
-- `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`CONNECTED`、`DATA`、`DISCONNECTED`、`UNREGISTER` 核心流程可用。
+- control/data 两类连接按 `clientSessionId + accessToken` 登录并绑定角色，校验 token 过期、客户端/凭证启用状态、同机单实例和最大在线实例数；control 关闭时同步清理匹配 data，管理会话状态仍使用 `NETTY_ONLINE` / `DISCONNECTED`。
+- `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`REGISTER_RESULT`、`OPEN`、`DATA`、`FIN`、`RST`、`WINDOW_UPDATE`、`UNREGISTER`、`KEEPALIVE` 核心流程可用。
 - 轻量管理 HTTP listener 已覆盖本地密码登录、HS256 管理 JWT、管理用户、客户端凭证、客户端、TCP 映射、HTTP route、连接记录、连接归档统计、日流量、资源流量和 SQLite HTTP/TCP 明细查询。
 - Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge，并接入 Java-compatible 响应路径改写，覆盖 HTML/CSS、runtime polyfill、gzip/deflate 解码。
 - OIDC 浏览器配置接口已对齐 Java；`/oidc/token` 支持 HTTP token endpoint 的 Authorization Code + PKCE 代理交换，`https://` token endpoint 明确返回 `502`。
 - Peer Mesh 管理契约已覆盖 status、device list、device enabled 持久化、带 `OUTBOUND/INBOUND/BOTH` direction 的 ACL list/create/delete、session list/close/close-open；tenant/owner 可见性比较区分大小写。C 数据面不会主动创建真实 peer session，虚拟网卡状态固定为 `UNSUPPORTED`。
 - 公共 `/api/public/peer-mesh/stun-config` 与 `/api/public/transfer/ice-config` 可描述显式配置的外部 STUN/TURN，并用 HMAC-SHA1 生成临时 credential；C 进程本身不绑定 STUN/TURN UDP。
 - 启动登录按真实 `sendMessages/receiveMessages/attachments/mediaPreview/maxAttachmentBytes` wire 字段持久化能力；离线管理 view 按 Java 归零。6 个附件路径精确匹配 Java，但因无对象存储抽象统一返回 `409 OBJECT_STORAGE_DISABLED`。
+
+> 下方 Phase 0–10 保留最初迁移过程和验收设想，出现的 v1、`CONNECTED` / `DISCONNECTED`、旧独立 HTTP command 或 wire deflate 仅代表历史阶段，不是当前协议。当前行为以本节、`protocol/spec/` 和 `cross-language-java-alignment-plan.md` 为准。
 
 仍未实现或暂不推进：
 

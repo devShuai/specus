@@ -1,6 +1,6 @@
 # 多语言实现对齐 Java 计划
 
-本文以 `implementations/java/server` 和 `implementations/java/client` 为参考实现，记录 Go、.NET、C 以及 Android client 的对齐阶段和剩余缺口。
+本文以 `implementations/java/server` 和 `implementations/java/client` 为参考实现，记录 Go、.NET、C 以及 Android client 的对齐阶段和剩余缺口。当前“全量对齐”门禁覆盖 Go、.NET 与 Android client；C server 冻结为轻量兼容子集，不纳入 v2/SWS2 完整对齐结论，所有差异必须在本文和根 README 中显式列出。
 
 ## 阶段 1：协议与启动登录兼容
 
@@ -21,7 +21,7 @@
 - Go / .NET 客户端已补齐 Java 服务端踢线语义：收到 `LOGOUT_REQUEST` 后关闭当前控制连接，由外层 reconnect loop 重新 HTTP 登录并获取最新运行时策略。
 - Go / .NET 客户端控制连接重连策略已对齐 Java：失败后按 `2s -> 4s -> 8s -> 16s -> 32s -> 60s` 指数退避，且只在服务端 `LOGIN_RESPONSE.success=true` 后重置退避计数，TCP 连接建立本身不算登录成功；`访问令牌已过期` 会立即重新 HTTP 登录并重连，`服务器繁忙` / `连接频率超过限制` 走退避，其它认证或策略拒绝会停止重连。
 - Go / .NET 客户端控制连接心跳空闲策略已对齐 Java：普通业务写出会刷新写空闲时间，5 秒没有任何写出才发送 `HEARTBEAT_REQUEST`，60 秒读空闲关闭当前连接并进入重连状态机。
-- Go / .NET 客户端普通 TCP 映射的 `CONNECTED` 异常分支已对齐 Java：缺少 `port`、缺少 `channelId` 或端口不在当前配置中时只记录并忽略，不额外回发 `DISCONNECTED`；只有本地真实拨号失败或已建立通道断开时才通知服务端断开。
+- Go / .NET 客户端普通 TCP 映射的 `OPEN` 异常分支已对齐 Java：缺少 `port`、缺少 `channelId` 或端口不在当前配置中时拒绝该 stream；本地真实拨号失败发送 `RST`，已建立通道按双向 `FIN` 半关闭，I/O 错误立即 `RST`。
 - Go / .NET 客户端与服务端 NAT metadata 读取已对齐 Java 容错语义：字符串字段对非空值使用 `toString` / `fmt.Sprint`，布尔值按 Java 小写 `true/false` 保留，整数字段接受数字值和数字字符串，`float64` / `double` 等 JSON 数字按 Java `Number.intValue()` 风格截断。
 - C server 的 `/api/client/auth/login` 已支持两条路径：SQLite 模式下读取 `specus_client_credential`、按 Java canonical HMAC 校验、创建/复用机器用户身份、写入 `specus_client_session=HTTP_AUTHENTICATED` 并签发 `cs_` token；无匹配 DB 凭证时保留环境变量 smoke-test token 模式。响应保持 Java 当前客户端可解析的 `peerMesh.enabled=false`、`specusConfigList` 和 `httpSpecusConfigList` 结构。
 
@@ -109,7 +109,10 @@
 - Go server 与 .NET server 已补齐 Java 风格 Elasticsearch 可选存储：配置 `SPECUS_ELASTICSEARCH_URIS` 后，HTTP/TCP 明细写入 ES，管理查询从 ES 读取，并按 HTTP 100GB / TCP 10GB 默认体积上限清理最旧记录；未配置时仍使用数据库。
 - Go server 与 .NET server 的 HTTP/TCP 明细采集热路径已对齐 Java 队列模型：转发线程只做通道开关判定与入队，后台按 `SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` 周期批量 flush，单类队列由 `SPECUS_TRAFFIC_CAPTURE_MAX_PENDING` 限制，单次 flush 由 `SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` 限制；管理明细查询默认不强制 flush，需要追最新数据时可显式传 `flush=true`。
 - Go server 与 .NET server 已对齐 `gzip`、`deflate` 的 zlib / raw deflate 兼容解码；两者均已支持 `br` 预览解码。后续仍可继续细化更复杂内容类型的前端预览体验。
-- C server 已补 Direct HTTP bridge：管理监听的 `/http/{clientName}/{route}/...` 会把普通 HTTP 请求封装为 `DIRECT_HTTP_REQUEST` 发给匹配 `clientName` 的在线控制连接，并等待 `DIRECT_HTTP_RESPONSE` 回写浏览器。WebSocket upgrade 请求会走 Java 兼容的 `source=ws` NAT 通道：server 发送 `CONNECTED`，浏览器 text/binary frame 被封装为带 1 字节类型前缀的 `DATA`，客户端回传同样前缀后由 C server 写回浏览器，任一侧断开都会清理对应 channel。`SPECUS_HTTP_ROUTES` 会同时出现在 `/api/client/auth/login` 和 `NAT_CONTROL` 的 `httpSpecusConfigList`，让 Java / Go / .NET 客户端能建立 HTTP route 表；服务端转发前也会校验当前在线 session 的 route 必须存在，未配置 route 返回 `404`。当前已具备 Java-shaped 流量汇总查询、SQLite 汇总表，以及 TCP/Direct HTTP 成功传输的热路径汇总记账；SQLite 模式下也已补 `specus_http_traffic_exchange` 和 `specus_tcp_traffic_frame` 明细表、分页查询、HTTP 字段搜索、TCP frame 详情和 TCP 串流查询；HTTP 字段搜索已按 Java 规则支持空白分词、method/status 精确匹配和常用字段别名；当 SQLite HTTP route 开启 `pathRewriteEnabled` 时，也会对 HTML/CSS 响应做路径改写和 HTML runtime polyfill 注入；在线控制连接已由单个全局指针改为按 clientName 查询的链表，避免后登录客户端覆盖其他在线客户端的 Direct HTTP 分发；管理事件 WebSocket 已支持 Upgrade / token 鉴权 / ping-pong / close，并能广播连接 created/updated 事件。仍不包含 Java 的 ES 明细存储。
+- Go server 与 .NET server 已补齐 Java 的逐 HTTP route 媒体采集：`mediaCaptureEnabled` 默认关闭，原始响应通过有界并发 multipart 上传到专用 RustFS/S3 兼容存储；支持 HLS/DASH/渐进式媒体分类、清单引用和改写、Range 去重、中断区间保留、跨对象连续区间回放、短期 tenant 绑定播放票据、可选缺失区间回源，以及对象和数据库过期清理。完整 RustFS 配置初始化失败会阻止启动；配置关闭或不完整时安全禁用。
+- Go server 与 .NET server 的媒体管理/公开端点已按 Java 对齐：管理列表、播放、manifest、asset 和播放票据先做 tenant/owner 可见性过滤；公开 `play/manifest/asset` 只接受内存短期票据并支持 GET/HEAD，Range 空洞返回 `416`，无效或过期票据返回 `404`。
+- C server 已补 Direct HTTP 的 v2 NAT bridge：管理监听的 `/http/{clientName}/{route}/...` 使用 `OPEN/DATA/FIN/RST/WINDOW_UPDATE` 与在线 data 连接交换请求/响应，WebSocket 双向使用 SWS2 envelope，不再使用 `DIRECT_HTTP_REQUEST/RESPONSE`、`CONNECTED` 或 1 字节 frame 前缀。它仍是兼容子集：SWS2 close-code 校验尚未拒绝 `1004/1005/1006/1015`，也未直接读取中央 `application-protocol-v2.json`，因此不纳入完整 SWS2/严格状态机门禁。
+- C server 的 `SPECUS_HTTP_ROUTES` 会同时出现在 `/api/client/auth/login` 和 `NAT_CONTROL.httpSpecusConfigList`；转发前校验在线 session 的 route，未配置返回 `404`。当前已具备 Java-shaped 流量汇总、SQLite HTTP/TCP 明细与分页搜索、TCP frame/串流查询、HTML/CSS 路径改写、runtime polyfill、按 clientName 分发的多在线连接，以及带鉴权和连接事件广播的管理 WebSocket；仍不包含 Java 的 ES 明细存储。
 
 ## 阶段 4：Peer Mesh 控制面与数据面
 
@@ -172,11 +175,11 @@
   - 当虚拟设备为 `noop` 时，收到目标为本机虚拟 IP 的 ICMP echo request 会和 Java 一样在应用层构造 echo reply 并加密发回；真实 TUN / Wintun / utun 路径仍交给系统协议栈处理。
   - 当前 .NET 数据面已经接通协议和虚拟设备，仍需要真实 Windows / Linux / macOS 双机环境做 ping、HTTP、relay fallback 手工验收。
 - Android client：
-  - 已实现 HTTP API-key 登录、runtime token 控制通道登录、按写空闲触发的 5 秒心跳、60 秒读空闲和 Java 分类语义的指数退避重连；token 过期会立即重新 HTTP 登录，busy/rate-limit 退避，其它认证或策略拒绝停止重连，`LOGOUT_REQUEST` 会关闭当前控制连接并立即重新登录。
-  - 已实现 TCP NAT 注册/双向 `DATA` 转发和 Direct HTTP route 转发；`CONNECTED` 缺字段或指向未知 TCP port 时只记录并忽略，只有真实本地拨号失败或已建立通道断开才回 `DISCONNECTED`。HTTP route WebSocket 已支持 ws/wss、本地握手 header 过滤、text/binary `0x01/0x02` 前缀、64 KiB 帧上限、VPN socket bypass 和双向关闭去重。
-  - 已接入 Android `VpnService` 权限与 TUN 生命周期，使用登录/运行时 `peerMesh.virtualIp`、`peerMesh.cidr` 配置 VPN 地址和路由，并保护控制、本地与 Peer Mesh UDP socket 避免流量回灌。
+  - 已实现 HTTP API-key 登录、runtime token 控制通道登录、按写空闲触发的 5 秒心跳、60 秒读空闲和 Java 分类语义的指数退避重连；普通断线复用当前 `clientSessionId + accessToken`，只有 token 过期或 `LOGOUT_REQUEST` 才立即重新 HTTP 登录，busy/rate-limit 退避，其它认证或策略拒绝停止重连；重复 `LOGIN_RESPONSE` 会关闭 control，不能二次创建 data 连接。
+  - 已实现 TCP NAT 注册与 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE` 双向转发；OPEN 到本地建连期间按序缓存且每流限制为 1 MiB，TCP/WebSocket 全局 pending 建连上限为 1024，最近关闭流 tombstone 使迟到 RST 幂等，双方严格半关闭；重复 OPEN、未知 DATA/FIN 与无效半关闭只复位对应 stream，从未打开过的 RST 才按 data-connection 协议违规拒绝。Direct HTTP route 支持流式 body、响应 trailers 交集过滤和 `DATA|END_STREAM`；Android `HttpURLConnection` 不能发送 request trailers、可靠保留带 body 的 GET/HEAD 或并发读取 early response，对应请求会显式拒绝或等待请求结束。HTTP route WebSocket 已支持 ws/wss、本地握手 header 过滤、SWS2 text/binary/close；隧道 PING 本地回复等 payload PONG、PONG 幂等消费，OkHttp upstream 心跳由平台内部管理。
+  - 已接入 Android `VpnService` 权限与 TUN 生命周期，使用登录/运行时 `peerMesh.virtualIp`、`peerMesh.cidr` 配置 VPN 地址和路由，并保护控制、本地与 Peer Mesh UDP socket 避免流量回灌；`peerMeshDevice=noop` 不申请或建立 VPN，不阻塞 TCP/HTTP，同时保留控制面和 UDP 探测。
   - 已实现 roster/session/candidates/close 信令、X25519/HKDF/AES-GCM `SPM2` frame、4096 包 replay protection、host/srflx/relay candidates、标准 TURN allocation/permission/send/data indication/ChannelData、direct UDP 与 relay fallback，以及设备/路径/direct-only 流量上报；relay 字节只由服务端 TURN 热路径计量。
-  - 已新增 JVM 协议测试，覆盖 32 MiB 完整帧、16 MiB 解压边界、HMAC 登录、运行时配置三态、控制重连分类、WebSocket、Peer Mesh frame/replay/session 刷新和客户端消息能力。JVM 测试不能替代真实设备；TCP/Direct HTTP、VPN 双机 ping、业务流量和 relay fallback 仍待端到端验收。
+  - 已新增 JVM 协议测试，覆盖 32 MiB 完整帧及超限拒绝、HMAC 登录、运行时配置三态、控制重连分类、WebSocket、Peer Mesh frame/replay/session 刷新和客户端消息能力。JVM 测试不能替代真实设备；TCP/Direct HTTP、VPN 双机 ping、业务流量和 relay fallback 仍待端到端验收。
 - C server：
   - `/api/client/auth/login` 返回 disabled `peerMesh` block。
   - `/api/client/auth/login` 同步返回 TCP 映射快照，便于非 Java 客户端在 HTTP 登录阶段按 Java 响应结构获取配置。
@@ -219,38 +222,49 @@ H-4 / H-5 / H-7 仍按打洞审计文档列为 OPEN，待基线数据确认对�
 
 ## 阶段 5：公共互传、客户端消息与协议边界
 
-状态：Go server 与 .NET server 的运行时主路径已对齐；C server 只提供可验证的兼容/禁用响应，Android client 已补客户端消息和控制通道边界。
+状态：Go server 与 .NET server 的运行时主路径和持久化房间角色已对齐；C server 只提供可验证的兼容/禁用响应，Android client 已补客户端消息和控制通道边界。
 
 - Go server 与 .NET server 已实现 Java 的 6 个附件 REST 接口、Aliyun OSS V4 预签名 PUT/GET/HEAD/DELETE、一次性下载授权、HEAD 完成校验、附件过期清理、公开来源 IP 与房间待上传限流，以及 `/ws/public-transfer/discovery` 的 roomToken 哈希隔离、同公网 IP 附近房间、人数/消息限流、roster 和定向 signal。
 - Go server 与 .NET server 已实现 `/ws/client-messages`：管理 JWT 鉴权失败返回 `403 + X-Auth-Reason`，按 tenant/owner 严格区分大小写授权，检查所有 `NETTY_ONLINE` session 的接收能力，并支持 admin 到 client 与 client 到 admin/client 的 Java `CLIENT_TO_CLIENT` fallback。
 - Go/.NET 登录会持久化 `clientMessageCapabilities` 并投影到管理客户端和 Peer Mesh roster；各客户端只声明真实能力，尚无附件/媒体预览数据面的客户端不会虚报 `attachments`、`mediaPreview` 或非零 `maxAttachmentBytes`。
+- Go server 与 .NET server 已实现 Java 的房间 access token、撤销、短配对码兑换和 OWNER/EDITOR/VIEWER 权限；公共 WebSocket 票据使用持久化 room id 作为 room key，并把 `roomRole`、`discoverable` 传入 discovery。附件完成需要可编辑角色，下载允许只读角色，旧附件仍兼容原始 roomToken hash。
+- Go server 与 .NET server 已实现 Java 的公共房间流程图版本与登录用户云端流程图：公共版本限制 3 MiB、每房间保留 50 份；登录用户文档按 tenant/owner 隔离、每用户最多 100 份，并用 revision 做并发更新校验。
 - Go/.NET 的公开 ICE 配置和 TURN 服务已补 Java 临时 HMAC-SHA1 credential、realm/nonce、MESSAGE-INTEGRITY、401/438 challenge；Java、Go、.NET 与 Android 客户端会按 transaction 与 TURN endpoint 跟踪受保护请求，更新 challenge 后换新 transaction 最多重试一次；STUN URL 归一化覆盖 `stun://`、显式端口和 IPv6。
-- Java、Go、.NET、C 与 Android 的 32 MiB 限制均按“11 字节 header + body 的完整帧”计算；最大 body 为配置值减 11。CompactBinary deflate 解压上限为 16 MiB，恰好等于上限允许，超过 1 字节拒绝。
+- Java、Go、.NET、C 与 Android 的 32 MiB 限制均按“11 字节 header + body 的完整帧”计算；最大 body 为配置值减 11。v2 CompactBinary 直接编码固定 schema，不含 `payloadType` 或 deflate；旧压缩 envelope 和 v1 fixture 必须拒绝。
 - C server 可返回 Java-shaped 公共 ICE 配置并为显式配置的外部 TURN 服务签发临时 credential；C 进程本身不监听 STUN/TURN。6 个附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，不会伪造成功 URL；启动登录会按真实 wire 字段持久化消息能力，但 C 尚无 live client-message / discovery / object-storage 数据面。
 
 ## 阶段 6：TLS、数据库和端到端验证
 
-状态：部分完成。
+状态：源码主路径已完成，外部数据库与真实部署矩阵仍待验收。
 
 - Java 是参考实现。
 - Go server 支持控制通道与管理 HTTP TLS，`file` 模式已对齐 Java/.NET 的 PKCS12 / PFX keystore 读取；未配置 keystore 时仍兼容 PEM 证书和私钥文件。
-- .NET server 支持 EF Core 多库和 TLS 配置；管理用户、流量明细、总流量租户字段、Peer Mesh、`transfer_attachment`、session 消息能力与 ACL direction 均已补齐 SQLite/MySQL/PostgreSQL provider-specific migration，并保留启动时幂等 SQL 兼容历史库。
+- .NET server 支持 EF Core 多库和 TLS 配置；管理用户、流量明细、总流量租户字段、Peer Mesh、`transfer_attachment`、房间/流程图、HTTP 媒体采集、session 消息能力与 ACL direction 均已补齐 SQLite/MySQL/PostgreSQL provider-specific migration，并保留启动时幂等 SQL 兼容历史库。
+- Java、Go、.NET server 的启动登录响应统一返回 `nettyTls`；Java、Go、.NET、Android 四种客户端在未显式覆盖时跟随该信号，并统一支持 PEM CA、证书主机名覆盖、系统信任与仅开发使用的跳过校验。管理 HTTPS 不再被误当成 control/data 原始 TCP TLS。
 - C server 尚未实现 TLS、HTTPS OIDC token exchange、ES 明细存储和 Peer Mesh 数据面；`/oidc-config` 已按 Java 前端契约返回浏览器登录配置，`/oidc/token` 已支持 HTTP token endpoint 的 Authorization Code + PKCE 代理交换，管理用户、客户端凭证、客户端应用包下载链接、客户端、映射、route、连接记录、流量汇总、SQLite 明细查询、SQLite 客户端启动凭证登录和 Direct HTTP 响应路径改写已具备基础租户/owner 过滤或 route 开关控制。
 
-## 当前验证（2026-07-22）
+## 当前验证（2026-08-04）
 
-- Java：`mvn -pl implementations/java/server -am -Dspecus.server.web.skip=true test` 全量通过；common `25/25`、client `41/41`、server `118/118`，合计 `184/184`（新增降级用例已定向复验）。
-- Go：server 与 client 均执行 `go test ./...` 全量通过，覆盖 v2 控制协议、SPM2/SPMTU2、TURN、HTTP/NAT stream、公共互传 Redis 协调和管理事件 Hub。
-- .NET：server 集成测试 `134/134`、client `106/106`、protocol `43/43` 全部通过；公共 discovery 测试数据已按客户端名称全局唯一规则隔离。
-- Android：`gradlew test assembleDebug --no-daemon` 通过；覆盖 v2 控制帧、SPM2/SPMTU2、Peer Mesh/TURN、STMSG2 和地址族逻辑。该结果不替代真机 VPN 与跨 NAT 双机验收。
-- 管理前端：`npm test` 为 22 个文件、`152/152` 项通过，`npm run build` 通过。
+- Java：`mvn -pl implementations/java/server -am -Dspecus.server.web.skip=true test` 全量通过；common `32/32`、client `68/68`、server `217/217`，合计 `317/317`。覆盖 control/data 角色、严格 RST/tombstone、TCP half-close、HTTP `DATA|END_STREAM`/trailers、SWS2 close 生命周期与客户端 TLS 配置。
+- Go：server 与 client 均执行 `go test ./...` 全量通过；覆盖 v2 控制协议、SPM2/SPMTU2、TURN、HTTP/NAT stream、SWS2、control/data TLS、公共互传 Redis 协调和管理事件 Hub。
+- .NET：server solution 的 protocol `45/45`、集成测试 `197/197`，client `149/149` 全部通过；覆盖 strict stream state、TCP half-close、HTTP `DATA|END_STREAM`、大请求流式 trailers、SWS2、control/data TLS、持久化互传房间角色与附件授权，以及 HTTP 媒体采集/离线回放边界。
+- Android：`gradlew clean test assembleDebug --no-daemon --no-problems-report` 通过，7 个 suite、`86/86`；覆盖 v2 控制帧、runtime-session 重连策略、重复登录保护、严格 TCP half-close、pending/tombstone、WebSocket pre-open 有界缓存/credit、SWS2 本地 ping/pong、TLS 超时与取消、SPM2/SPMTU2、Peer Mesh/TURN、STMSG2 和地址族逻辑。该结果不替代真机 VPN、真实证书与跨 NAT 双机验收。
+- 管理前端：`npm test -- --run` 为 30 个文件、`191/191` 项通过，`npm run build` 通过。
 - C server：`.github/workflows/protocol-v2.yml` 已加入 Ubuntu CMake build/ctest；当前 Windows 环境没有可用 WSL 发行版，本机仅完成中央向量、源码静态检查和 Git Bash 脚本语法校验，不伪报 POSIX 测试结果。
 - 仍需环境验收：真实 MySQL/PostgreSQL、真实私有 OSS/ES、Windows/Linux/macOS/Android 双机、跨 NAT direct/relay fallback、长时间压力与真实 TLS/OIDC。源码自动化通过不能替代这些外部系统与硬件验证。
+
+## 当前仍存在的不一致
+
+- Android `HttpURLConnection` 无法发送 request trailers、可靠保留带 body 的 GET/HEAD，或在上传尚未结束时并发读取 early response；实现会显式拒绝或延后读取，不会静默丢数据。
+- .NET `ClientWebSocket` 不向应用暴露原生 ping/pong frame；隧道侧 SWS2 PING 会本地回复同 payload PONG，PONG 幂等消费，上游 WebSocket 心跳由平台内部管理。
+- Android 的 TLS 自动化目前覆盖配置、超时、取消和 socket protect，尚未像 Java/Go/.NET 一样完成真实测试证书握手；生产 CA、L4 TLS 终止与多平台证书存储仍需环境验收。
+- 真实 MySQL/PostgreSQL、RustFS/OSS/Elasticsearch、跨 NAT direct/relay、真机 VPN/TUN 和长时间压力仍属于发布验收，不作为源码单测通过的替代结论。
+- C server 按用户要求冻结为轻量兼容子集，不纳入本次“全量对齐 Java”门禁；它缺少 TLS、ES/对象存储、live discovery/client-message、HTTP 媒体采集和 Peer Mesh 数据面等能力。
 
 ## 此前轮次历史验证记录（已被上节替代，仅供追溯）
 
 - Go server：历史记录显示 `go test ./...` 曾通过；本轮实际补充命令为 `GOCACHE=.gocache go test ./internal/peermesh ./internal/store ./internal/management`，只复核 Peer Mesh、store 和 management 三个 package。控制通道/外部 socket 背压、配置映射、协议 fixtures、登录/NAT/Direct HTTP、WebSocket、OIDC 与 TLS 等测试位于其它 package，不应归入这条定向命令的本轮覆盖；需要当前全量结论时应另行执行并记录 `go test ./...`。
-- Go client：本轮在 `implementations/go/client` 重新执行 `go build ./...` 与 `go test ./...` 通过（覆盖 per-peer OS 路由同步、虚拟包目标过滤与 roster 清空重建改动后的回归），并执行 `GOOS=linux GOARCH=amd64 go test -c ./internal/client`、`GOOS=darwin GOARCH=arm64 go test -c ./internal/client`、`GOOS=darwin GOARCH=amd64 go test -c ./internal/client` 覆盖 Linux TUN 与 macOS utun 路由同步的 build tag 编译；包含启动配置 http/https `serverBaseUrl` 校验、CompactBinary UUID 非 canonical 大小写保真、空 UUID 按 Java 语义保留为普通字符串 marker、nil / empty byte array 与 string list marker 区分、`clientSessionId=0L` 按 Java 语义保留为非空 long marker、`DirectHTTPResponse.error` null / empty string marker 区分、Direct HTTP 自签 HTTPS upstream、8 MiB Range 裁剪、双斜线 `relativePath` 保留、编码 `..` 段拒绝、请求体/响应体超限与 route/path 错误的 Java 中文文案、`MessageResponse + PEER_CONTROL` 解码、`NAT_CONTROL.httpSpecusConfigList` 缺省保留 / 空数组清空 / 有值替换三态语义、NAT metadata 字符串 `toString` / 整数数字字符串容错、HTTP route WebSocket target 双斜线路径保留 / target 构造错误 Java 中文文案 / 握手头过滤 / 本地 text frame 转 NAT `DATA source=ws`、普通 TCP `CONNECTED` 无效端口/元数据忽略语义、`LOGOUT_REQUEST` 关闭控制连接、Java 风格重连指数退避、控制登录失败分类、5 秒心跳 / 60 秒读空闲、Java NAT 枚举值、`changed-port` 分类、relay candidate / alternate NAT probe 节流、relay allocation 优先发送、健康 direct 不被 relay probe 抢占、`SYMMETRIC_NAT` 下仍尝试 direct candidate、pending virtual packet 队列、noop 虚拟设备 ICMP echo 应用层响应、X25519/HKDF/AES-GCM frame、raw/DER public key 兼容、replay window、public STUN candidate 生命周期、运行时 token 主动刷新和内置 Wintun 资源解压相关编译覆盖；历史交叉编译命令 `GOOS=linux GOARCH=amd64 go test -c ./internal/client`、`GOOS=darwin GOARCH=arm64 go test -c ./internal/client`、`GOOS=darwin GOARCH=amd64 go test -c ./internal/client` 用于覆盖 Linux TUN 与 macOS utun build tag。
+- Go client：本轮在 `implementations/go/client` 重新执行 `go build ./...` 与 `go test ./...` 通过（覆盖 per-peer OS 路由同步、虚拟包目标过滤与 roster 清空重建改动后的回归），并执行 `GOOS=linux GOARCH=amd64 go test -c ./internal/client`、`GOOS=darwin GOARCH=arm64 go test -c ./internal/client`、`GOOS=darwin GOARCH=amd64 go test -c ./internal/client` 覆盖 Linux TUN 与 macOS utun 路由同步的 build tag 编译；包含启动配置 http/https `serverBaseUrl` 校验、CompactBinary UUID 非 canonical 大小写保真、空 UUID 按 Java 语义保留为普通字符串 marker、nil / empty byte array 与 string list marker 区分、`clientSessionId=0L` 按 Java 语义保留为非空 long marker、`DirectHTTPResponse.error` null / empty string marker 区分、Direct HTTP 自签 HTTPS upstream、8 MiB Range 裁剪、双斜线 `relativePath` 保留、编码 `..` 段拒绝、请求体/响应体超限与 route/path 错误的 Java 中文文案、`MessageResponse + PEER_CONTROL` 解码、`NAT_CONTROL.httpSpecusConfigList` 缺省保留 / 空数组清空 / 有值替换三态语义、NAT metadata 字符串 `toString` / 整数数字字符串容错、HTTP route WebSocket target 双斜线路径保留 / target 构造错误 Java 中文文案 / 握手头过滤 / 本地 text frame 转 NAT `DATA source=ws`、普通 TCP `OPEN` 无效端口/元数据忽略语义、`LOGOUT_REQUEST` 关闭控制连接、Java 风格重连指数退避、控制登录失败分类、5 秒心跳 / 60 秒读空闲、Java NAT 枚举值、`changed-port` 分类、relay candidate / alternate NAT probe 节流、relay allocation 优先发送、健康 direct 不被 relay probe 抢占、`SYMMETRIC_NAT` 下仍尝试 direct candidate、pending virtual packet 队列、noop 虚拟设备 ICMP echo 应用层响应、X25519/HKDF/AES-GCM frame、raw/DER public key 兼容、replay window、public STUN candidate 生命周期、运行时 token 主动刷新和内置 Wintun 资源解压相关编译覆盖；历史交叉编译命令 `GOOS=linux GOARCH=amd64 go test -c ./internal/client`、`GOOS=darwin GOARCH=arm64 go test -c ./internal/client`、`GOOS=darwin GOARCH=amd64 go test -c ./internal/client` 用于覆盖 Linux TUN 与 macOS utun build tag。
 - .NET server：本轮执行 `dotnet build implementations\csharp\server\src\Specus.Server\Specus.Server.csproj --no-restore -p:SpecusServerWebSkip=true -v minimal` 通过；`dotnet test implementations\csharp\server\tests\Specus.IntegrationTests\Specus.IntegrationTests.csproj --no-restore -p:SpecusServerWebSkip=true -v minimal --filter "FullyQualifiedName~StunTurnServerTests"` 通过，覆盖标准 STUN/TURN allocation 过期重建、Refresh error、CreatePermission、Send Indication 和 Data Indication；`dotnet test implementations\csharp\server\tests\Specus.IntegrationTests\Specus.IntegrationTests.csproj --no-restore -p:SpecusServerWebSkip=true -v minimal --filter "FullyQualifiedName~PeerMeshServiceTests"` 通过，当前源码包含 9 个用例，覆盖 peer session 授权、关闭、roster 刷新、relay frame 授权、有效路径判定和 `/api/admin/peer-mesh/stats` 同口径聚合。AdminApiTests 在当前环境因测试配置里的 PostgreSQL connection string 不完整报 `Couldn't set data source`，未作为本轮回归结论。
 - .NET client / protocol：该历史轮次执行 `dotnet build implementations\csharp\client\src\Specus.Client\Specus.Client.csproj -v minimal` 通过；`dotnet test implementations\csharp\client\tests\Specus.Client.Tests\Specus.Client.Tests.csproj` 当时通过 69 个用例（覆盖 per-peer OS 路由同步、虚拟包目标过滤与 roster 清空重建改动后的回归），包含标准 STUN/TURN Binding、Allocate、Refresh、CreatePermission、Send Indication、relay candidate / alternate NAT probe 节流、relay allocation 优先发送、健康 direct 不被 relay probe 抢占、pending virtual packet 队列、Peer Mesh frame/replay/key 派生、IPv4 packet 解析、noop 虚拟设备 ICMP echo 应用层响应、macOS utun 路由 CIDR 计算与运行时 token 主动刷新编译覆盖；protocol 测试沿用当时通过结论。当前结果以上节为准。
 - C server：本机未安装 `make` / C 编译器，`make test` 未执行成功；当前补齐了 Java `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS` 与 `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` 配置别名及测试用例，旧变量仍兼容；同时补齐了 SQLite `/api/client/auth/login` 的 Java 兼容 HMAC 校验、机器用户身份创建/复用、`specus_client_session` 写入、Netty 登录校验与 `HTTP_AUTHENTICATED -> NETTY_ONLINE -> DISCONNECTED` 状态迁移、本地 HS256 管理 token 签发/刷新/校验、Direct HTTP 普通请求 bridge、Direct HTTP WebSocket upgrade bridge、管理 `/ws/connections` WebSocket Upgrade 鉴权入口和连接事件广播、SQLite 管理用户 / 数据库初始化 / 客户端凭证 / 客户端应用包下载链接 / 客户端 / TCP 映射 / HTTP route 管理、`GET /api/admin/connections` Java-shaped 分页查询、`GET /api/admin/connection-stats` 归档统计查询、`GET /api/admin/traffic` 和 `GET /api/admin/traffic/resources` 流量汇总查询代码与单测用例，并已将这些查询切到租户/owner 过滤后的 SQL 口径；TCP 隧道与 Direct HTTP 成功传输已接入汇总记账和 SQLite 明细采集，HTTP/TCP 明细分页、TCP frame 详情、TCP 串流查询已从空分页推进到真实 DB 查询；Peer Mesh 管理面已支持设备列表、设备 enabled 持久化、ACL list/create/delete、session list/close/close-open 与 64 位 clientId JSON 解析；Direct HTTP 响应路径改写已补 HTML/CSS、runtime polyfill 和 gzip/deflate 解码用例，仍待 Linux/C 工具链环境实际编译和 Java client 联调验证。

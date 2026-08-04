@@ -18,8 +18,8 @@ implementations/go/server/
 ## 阶段
 
 ### G1 — 协议库 ✅
-- 双向编解码:11 字节帧头、CompactBinary(varint/zigzag/UUID/枚举/字符串表 + ≥64B 自动 raw deflate)、NAT_MESSAGE(`type|metaLen|json meta|payload`)、HMAC 登录签名。
-- **验收**:`go test ./internal/protocol`;21 个 golden fixtures 全部交叉校验(非压缩字节级一致,deflate 语义自洽)。
+- 双向编解码：v2 11 字节帧头、无压缩 envelope 的固定 schema CompactBinary、16 字节 NAT stream 头、JSON metadata 与原始 data、control/data 连接角色及 HMAC 登录签名。
+- **验收**：`go test ./internal/protocol`；直接读取 `protocol/test-vectors/control-v2/frames` 的 34 个合法/非法 fixture，覆盖错误 version、serializer、command、长度、截断和尾随字节拒绝。
 
 ### G2 — 控制通道 + 登录 + 多库持久化 ✅
 - TCP 监听、帧读写、60s 读 / 30s 写空闲心跳看门狗、有界登录线程池(满则 SERVER_BUSY)、HMAC 校验 + ±60s 窗口 + 每分钟频率限制、会话顶替(REPLACED_BY_NEW_LOGIN)、连接审计落库。
@@ -27,7 +27,7 @@ implementations/go/server/
 - **验收**:登录成功 / 错密码拒绝 / 未认证即断开 / 心跳回环 / 连接记录落库。
 
 ### G3 — NAT TCP 转发 + 背压 + 流量 ✅
-- 每端口 listener、外部连接读循环→DATA、REGISTER/UNREGISTER/DATA/DISCONNECTED/KEEPALIVE、三级连接限额 + 全局计数、登录后推 NAT_CONTROL、流量 5s 刷盘。
+- 每端口 listener、外部连接读循环→DATA、REGISTER/REGISTER_RESULT/OPEN/DATA/FIN/RST/WINDOW_UPDATE/UNREGISTER/KEEPALIVE、三级连接限额 + 全局计数、登录后推 NAT_CONTROL、流量 5s 刷盘。
 - 背压:控制通道和外部 socket 写入都按 Java/.NET 对齐的 high/low watermark 统计待写字节；超过高水位暂停对应读循环，回落到低水位后恢复，避免慢 client 或慢公网连接造成无界积压。
 - **验收**:REGISTER → 外部连入 → 8KiB + 1MiB 双向回环 → 流量计数双向 > 0。
 

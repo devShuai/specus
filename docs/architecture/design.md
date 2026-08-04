@@ -1,13 +1,13 @@
 # specus 详细设计文档
 
-> 基线：2026-07-10，提交 `93823f4`。本文以 Java server/client/common 当前实现为准；跨语言线协议以 `protocol/spec/` 为权威入口。
+> 基线：2026-08-04，`main` 当前实现。本文以 Java server/client/common 为参考；跨语言线协议以 `protocol/spec/` 为权威入口。
 > README 面向运行与部署，本文聚焦模块边界、关键数据流、线程与安全模型。
 
 ## 1. 目标与边界
 
 `specus` 是以内网服务接入和私有组网为核心的多语言项目，Java 是当前参考实现。主要目标是：
 
-1. 通过一条长期控制连接承载登录、心跳、配置下发、TCP 隧道和 HTTP 直转。
+1. 通过一条 control 与一条专用 data 长连接分离管理信令和 TCP/HTTP/WebSocket 字节流。
 2. 使用管理面维护客户端凭证、账号、TCP 映射、HTTP 路由、连接记录和流量观测。
 3. 让同一租户和用户下的客户端通过 Peer Mesh 虚拟 IP 互访，优先 UDP direct，失败时回退标准 TURN relay。
 4. 默认以单节点、SQLite 和明文控制连接低门槛启动，同时提供 MySQL/PostgreSQL、TLS、OIDC、Elasticsearch 等升级路径。
@@ -16,7 +16,7 @@
 
 - 公网 TCP 映射、HTTP/WS 直转和 Peer Mesh UDP 数据面已经实现。
 - 公网 UDP 端口映射尚未实现；空的 `UdpConnection` 只是该能力的占位，不代表 Peer Mesh 没有 UDP。
-- 控制连接和在线路由状态仍在单个 server 进程内；多节点需要粘性路由或共享会话/路由层。
+- control/data 连接和在线路由状态仍在单个 server 进程内；多节点需要粘性路由或共享会话/路由层。
 
 ## 2. 顶层架构
 
@@ -39,7 +39,7 @@ Peer A 虚拟网卡 ◄──────── 加密 UDP direct / TURN relay �
 关键入口分为四类：
 
 - **客户端启动登录**：`POST /api/client/auth/login`，用 `apiKey/secret` HMAC 换取短期运行时 token、控制端地址和配置快照。
-- **控制连接**：默认 `7010/TCP`，可选 TLS；承载运行时 token 登录、心跳、`NAT_CONTROL`、`PEER_CONTROL`、`DIRECT_HTTP_*` 和 `NAT_MESSAGE`。
+- **控制与数据连接**：默认共用 `7010/TCP` 监听和同一 TLS 策略；control 承载管理/信令，data 专门承载 `NAT_MESSAGE` 字节流。
 - **公网业务入口**：每个已注册 TCP `listenPort` 一个动态监听；HTTP/WS 使用 `/http/**`。
 - **Peer Mesh 数据面**：标准 STUN/TURN 和客户端间 UDP direct；业务 IP 包端到端加密，relay 不解密业务明文。
 
@@ -58,200 +58,79 @@ Java 的协议变更需要同步 `protocol/spec/`、测试向量和其它语言�
 
 ### 4.1 帧格式与大小边界
 
-普通控制帧使用 11 字节固定头：
+所有 v2 帧使用 11 字节 big-endian 固定头：`magic(4) + version(1) + serializer(1) + command(1) +
+bodyLength(4)`。`magic=0x14353565`、`version=2`、`serializer=4`；任一字段、command、长度或 body 尾随字节
+不合法都必须拒绝。登录前完整帧上限为 `16 KiB`，登录后默认 `32 MiB`，NAT DATA 单分片不超过 `64 KiB`。
 
-```text
-+----------+---------+---------------+---------+------------+-----------------+
-| magic 4B | ver 1B  | serializer 1B | cmd 1B  | length 4B  | body length bytes|
-+----------+---------+---------------+---------+------------+-----------------+
-0          4         5               6         7            11
-```
+CompactBinary 按固定 schema 顺序编码字段，省略字段名并使用 varint/ZigZag 与显式 nullable marker；body 不带
+raw/Deflate 标志，也不执行通用压缩。`NAT_MESSAGE` body 使用独立的 16 字节头，后接可选 UTF-8 JSON metadata
+与原始 data 字节，详见 `protocol/spec/control-protocol.md`。
 
-- `magic = 0x14353565`，`version = 1`。
-- `length` 是 body 长度；`Spliter` 基于 `LengthFieldBasedFrameDecoder` 处理半包和粘包。
-- `Spliter` 默认最大**整帧**为 `32 MiB`。Java server 可用 `SPECUS_NETTY_MAX_FRAME_SIZE` 覆盖；Java client 当前使用默认值。
-- `CompactBinarySerializer` 的 `16 MiB` 是 Deflate **解压后 payload** 上限，不是整帧上限。
+### 4.2 Command、连接角色与消息类型
 
-`NAT_MESSAGE` 仍使用同一个 11 字节帧头，但 body 是专用布局：
+v2 只登记 `LOGIN_* (±1)`、`MESSAGE_* (±2)`、`LOGOUT_* (±3)`、`HEARTBEAT_* (±4)` 和 `NAT_MESSAGE (6)`。
+旧 `5/-5`、`7/-7` 与 serializer 回退已删除，收到即为协议违规。
 
-```text
-natType(4B) + metadataLength(4B) + metadata(JSON) + optional data(compact payload)
-```
+客户端先以相同 runtime token 建立 `control`，成功后再建立 `data`：
 
-因此 NAT 帧头的 serializer 标记为 FastJSON；只有 metadata 使用 JSON，隧道字节 `data` 使用紧凑 payload 的 raw/Deflate 包装。
+- control 只允许管理消息、`NAT_CONTROL`、`PEER_CONTROL`、心跳和退出；
+- data 只允许 `NAT_MESSAGE`、心跳和退出；
+- 每条 TCP 连接只能登录一次，角色不匹配、重复登录或登录前非登录帧会关闭连接；
+- control 断开时，同一 session 的 data 一并关闭。
 
-### 4.2 序列化算法
+`MessageType` 使用固定 wire ID：`SERVER_TO_CLIENT=1`、`CLIENT_TO_SERVER=2`、`CLIENT_TO_CLIENT=3`、
+`NAT_CONTROL=4`、`PEER_CONTROL=5`。`NatMessageType` 使用 `REGISTER`、`REGISTER_RESULT`、`OPEN`、`FIN`、
+`DATA`、`KEEPALIVE`、`UNREGISTER`、`RST`、`WINDOW_UPDATE`。
 
-| 线值 | 实现 | 当前用途 |
-| --- | --- | --- |
-| `1` | `FastJsonSerializer` | NAT metadata JSON；也作为可选普通帧 codec |
-| `2` | `JacksonSerializer` | 可选普通帧 codec；Spring MVC REST 不依赖这个封装类 |
-| `3` | `XML` 标记 | 仅保留常量，未注册 serializer |
-| `4` | `CompactBinarySerializer` | 普通控制帧默认 codec；双方依赖相同的预注册固定 schema，并非自描述格式 |
-| `5` | `ProtobufSerializer` | 已实现并有测试，但不在默认主路径 |
+### 4.3 两阶段客户端认证
 
-紧凑二进制省略字段名，按固定字段顺序编码，使用变长整数和短类型 codec。payload 首字节只表示 raw 或 Deflate；原始数据至少 `64 B` 且压缩后更小时才使用 Deflate。
+1. HTTP 启动登录读取 `client.jsonc`，用 `SHA-256(secret)` 作为 HMAC-SHA256 key，对
+   `apiKey/timestamp/nonce/machineFingerprint/osUser` 的换行串签名。服务端校验 `±60s` 时间窗，创建或复用
+   identity/account/session，返回 runtime token、Netty 地址、`nettyTls` 与配置快照；数据库只保存 token hash。
+2. control/data 分别发送 `clientName`、`clientSessionId`、`accessToken` 和 `connectionRole`。服务端验证过期、
+   账号/凭证状态、频率、实例上限与角色绑定，再推送 `NAT_CONTROL` / `PEER_CONTROL`。
 
-### 4.3 三层消息类型
+secret 明文不发送到服务端。当前没有共享 nonce 去重存储，同一 HTTP 登录请求在 60 秒窗口内仍可能重放。
 
-第一层是帧头 `Command`：
+## 5. 连接处理
 
-| Command | 值 | 说明 |
-| --- | ---: | --- |
-| `LOGIN_REQUEST` / `LOGIN_RESPONSE` | `1` / `-1` | 控制连接 token 登录 |
-| `MESSAGE_REQUEST` / `MESSAGE_RESPONSE` | `2` / `-2` | 通用控制消息 |
-| `LOGOUT_REQUEST` / `LOGOUT_RESPONSE` | `3` / `-3` | 主动离线 |
-| `HEARTBEAT_REQUEST` / `HEARTBEAT_RESPONSE` | `4` / `-4` | 心跳 |
-| `HTTP_REQUEST` / `HTTP_RESPONSE` | `5` / `-5` | 保留的同步 HTTP 协议类型；当前公网主路径不使用 |
-| `NAT_MESSAGE` | `6` | NAT/WS 隧道统一承载帧 |
-| `DIRECT_HTTP_REQUEST` / `DIRECT_HTTP_RESPONSE` | `7` / `-7` | 当前公网 HTTP 直转主路径 |
-
-第二层是 `MESSAGE_*` 内的 `MessageType`：
-
-- `SERVER_TO_CLIENT`
-- `CLIENT_TO_SERVER`
-- `CLIENT_TO_CLIENT`
-- `NAT_CONTROL`：TCP 映射与 HTTP 路由权威快照
-- `PEER_CONTROL`：Peer Mesh 设备、候选地址、探测和 session 信令
-
-第三层是 `NAT_MESSAGE` 内的 `NatMessageType`：
-
-- `REGISTER`、`REGISTER_RESULT`、`UNREGISTER`
-- `CONNECTED`、`DISCONNECTED`、`DATA`、`KEEPALIVE`
-- `HTTP_ROUTES_REPORT`：为旧客户端保留的线值；当前 Java server 收到后直接忽略
-
-### 4.4 两阶段客户端认证
-
-客户端认证不是在 Netty `LOGIN_REQUEST` 中直接发送密码 HMAC，而是分两步：
-
-1. **HTTP 启动登录**
-   - 客户端读取工作目录中的 `client.jsonc`，收集 `machineFingerprint`、`osUser` 等环境信息。
-   - canonical message 为 `apiKey + "\n" + timestamp + "\n" + nonce + "\n" + machineFingerprint + "\n" + osUser`。
-   - `key = SHA-256(secret)`，签名为 HMAC-SHA256；`timestamp` 单位是毫秒。
-   - server 从 `ClientCredential.secretHash` 还原 HMAC key，校验签名和 `±60s` 时间窗，创建/复用 `ClientIdentity` 与 `ClientAccount`，再创建 `ClientSession`。
-   - 响应包含 `clientName`、`clientSessionId`、明文 `accessToken`、token TTL、Netty 地址、TCP/HTTP 快照和 Peer Mesh 配置；数据库只保存 token hash。
-2. **Netty 控制连接登录**
-   - `LoginRequestPacket` 发送 `clientName`、`clientSessionId` 和 `accessToken`。
-   - server 只保存 token 的 SHA-256，验证 session 未过期、账号/凭证启用、连接频率和在线实例上限。
-   - 成功后绑定 `clientName → Channel`，写连接记录，并异步推送 `NAT_CONTROL` 与 `PEER_CONTROL`。
-
-secret 明文不会发送到 server；数据库保存其 SHA-256。当前没有 nonce 去重存储，因此同一 HTTP 登录请求在 60 秒窗口内仍可能被重放，时间窗只是弱重放缓解。
-
-## 5. Netty Pipeline
-
-### 5.1 Server 控制连接
-
-实际初始化顺序：
-
-```text
-[SslHandler]
-→ SocketIdleStateHandler
-→ Spliter(maxFrameSize)
-→ PacketCodecHandler
-→ ManagedLoginRequestHandler
-→ AuthHandler
-→ HeartbeatRequestHandler
-→ NatServerHandler
-→ DirectHttpResponseHandler
-→ ServerMessageHandler
-→ LogoutRequestHandler
-```
-
-- `SslHandler` 只在 `SPECUS_TLS_MODE != disabled` 时安装。
-- `ManagedLoginRequestHandler` 把 DB/token 校验提交到有界 `loginExecutor`，涉及 Channel 的绑定和回包再切回该 Channel 的 EventLoop。
-- `NatServerHandler` 从连接建立时就存在；它用 `REGISTER` 成功状态约束普通 TCP `DATA/DISCONNECTED`，并不是注册后才动态挂载。
-- `PacketCodecHandler` 在 server 同时承担 decode/encode；不是两个独立的 `PacketDecoder`/`PacketEncoder`。
-
-### 5.2 Java client 控制连接
-
-初始顺序：
-
-```text
-[SslHandler]
-→ ClientSocketIdleStateHandler
-→ Spliter
-→ PacketDecoder
-→ LoginResponseHandler
-→ MessageResponseHandler
-→ DirectHttpRequestHandler
-→ LogoutResponseHandler
-→ PacketEncoder
-```
-
-收到首个 `NAT_CONTROL` 后，`MessageResponseHandler` 动态追加 `NatClientHandler`；handler 添加到已激活 Channel 时立即注册当前 TCP 映射并上报 HTTP routes。后续完整快照通过 `applyConfig`/`applyRoutes` 热替换。
-
-客户端没有独立的 `AuthHandler` 或 `HeartbeatResponseHandler`。`DirectHttpRequestHandler` 接收 server 请求并回写 `DIRECT_HTTP_RESPONSE`；`DirectHttpResponseHandler` 位于 server。
+服务端监听在可选 `SslHandler` 后依次执行 idle、分帧、v2 codec、登录、连接角色检查和对应 control/data dispatcher；
+数据库登录在有界 executor 执行，Channel 状态变更切回其 EventLoop。Java 客户端为 control 和 data 分别建立同 TLS
+策略的 pipeline：control 处理登录响应、配置/Peer 消息和心跳，data 处理 NAT stream。首个及后续 `NAT_CONTROL`
+都是完整权威快照，TCP 映射执行 REGISTER/UNREGISTER，HTTP route 原子替换本地路由表。
 
 ## 6. 数据流
 
 ### 6.1 TCP NAT
 
-注册阶段：
+server 下发快照后，client 对每个映射发送 `REGISTER(port, specusAddress, specusPort)`；server 校验身份和全局端口
+占用、绑定公网 listener，再返回 `REGISTER_RESULT`。每条公网连接分配非零且连接内唯一的 `streamId`：
 
 ```text
-server NAT_CONTROL 完整快照
-  → client MessageResponseHandler
-  → NatClientHandler REGISTER(port, specusAddress, specusPort, clientName)
-  → server NatServerHandler 校验登录身份和全局端口占用
-  → RemotePortServerManager.bind(port)
-  → REGISTER_RESULT
+公网 accept → OPEN(streamId, port/channelId) → client 连接本地目标
+公网/本地字节 ⇄ DATA(streamId) + WINDOW_UPDATE credit
+任一方向 EOF → FIN(streamId)，只 half-close 该方向
+双方 FIN → 正常释放；取消或 I/O 错误 → RST 立即释放
 ```
 
-转发阶段使用 `port` 标识映射、使用 Netty `channelId` 标识一条公网连接：
-
-```text
-公网连接 channelActive
-  → CONNECTED {port, channelId}
-  → client 按 port 找目标并建立本地 TCP Channel
-
-公网字节
-  → DATA {channelId} + payload
-  → client LocalSpecusHandler
-  → 内网服务
-
-内网回包
-  → DATA {channelId} + payload
-  → server externalChannels[channelId]
-  → 公网连接
-```
-
-任一侧断开都发送 `DISCONNECTED {channelId}`。控制 Channel 与公网/本地 Channel 之间通过 `ChannelBackpressure` 联动 `AUTO_READ`，避免不可写时无限积压。`listenPort` 是整台 server 的全局资源，不能跨租户复用。
+收到 FIN 后仍继续反向传输；重复 FIN、同方向 DATA-after-FIN 和未知 stream 帧是协议违规。每流初始窗口 `1 MiB`、
+累计上限 `16 MiB`、待发送队列上限 `4 MiB`，按流公平轮转并结合 socket 可写性实施背压。`listenPort` 是整台
+server 的全局资源，不能跨租户复用。
 
 ### 6.2 HTTP 与 WebSocket 直转
 
-HTTP 主路径：
+`/http/{clientName}/{route}/**` 在专用 data 连接上同样建立 NAT stream。服务端先执行 route Basic gate，并从受保护
+请求剥离入口 Authorization；随后请求头用 `OPEN(source=http, phase=request)`，body 用 DATA，结束用 FIN，client
+以 response OPEN/DATA/FIN 流式返回。双方以 WINDOW_UPDATE 反馈实际消费，浏览器取消、超时和 upstream 错误通过
+RST 传播。request/response trailers 在 OPEN 的 `trailerNames` 声明，在 FIN 的 `trailers` 携带实际值。
 
-```text
-/http/{clientName}/{route}/**
-  → server 读取 route access policy；可选 Basic 认证在读取 body / Upgrade 前完成
-  → 受保护 route 剥离入口 Authorization
-  → HttpSpecusController 构造 DirectHttpRequestPacket
-  → DirectHttpDispatcher 注册 SyncFuture、写控制 Channel 并等待
-  → client DirectHttpRequestHandler 在线程池执行 DirectHttpForwarder
-  → 按 route 精确查 targetBaseUrl，转发 method/path/query/headers/body
-  → DIRECT_HTTP_RESPONSE
-  → server DirectHttpResponseHandler → DirectHttpDispatcher.ack
-  → Controller 返回状态码、headers 和 body
-```
+请求累计上限 `16 MiB`、响应累计上限 `64 MiB`；SSE 与下载无需整包缓冲。可解析的单段 Range 会裁剪到 `8 MiB`，
+其它 Range 由 upstream 决定。route 不存在由 client 拒绝；路径必须留在 base URL 内。路径改写只作用于可安全缓冲的
+HTML/CSS 等响应。
 
-当前边界：
-
-- server 请求体默认上限 `16 MiB`，等待默认 `30s`；离线返回 `503`，等待超时返回 `504`。
-- client 也把请求体本地读取限制为 `16 MiB`、响应体本地读取限制为 `64 MiB`，并把单段 Range 控制在
-  `8 MiB`；但 Direct HTTP 仍封装成单个控制帧，实际端到端能力还受默认 `32 MiB` 整帧和 deflate 后
-  `16 MiB` 解压上限约束。因此 `64 MiB` 不是可保证传输的响应上限，稳定使用应把完整序列化 payload
-  控制在 `16 MiB` 以下并预留字段开销。
-- route 不存在时由 client 拒绝，当前响应是 `502` 和“未配置 HTTP route”，不是 controller 预先返回 `404`。
-- 服务端持久化 route 默认公开；可按 route 开启 Basic 认证。凭据错误返回 `401`，配置查询故障 fail-closed 返回
-  `503`；未被服务端接管的 legacy 本地 route 继续公开以保持兼容。
-- 入口 Basic Authorization 只在 server 校验，不下发客户端；校验成功后也不透传 upstream、不进入 HTTP 明细。
-  公开 route 的 Authorization 保持原样，支持 upstream 自身鉴权。
-- client 校验 target scheme 为 HTTP/HTTPS、目标 origin 不变，且相对路径不能逃逸 base path。
-- HTTP 路由开启路径改写后，server 可改写可识别响应中的绝对路径；默认单体上限 `10 MiB`。
-
-WebSocket 升级同样挂在 `/http/**`，在返回 `101` 前复用同一 route Basic gate；通过后由
-`WebSocketSpecusHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以
-`source="ws"` 和 `channelId` 区分。
+WebSocket Upgrade 复用相同入口和 Basic gate，成功后使用 `OPEN(source=ws)` 建立 NAT stream；每个 WebSocket frame
+封装为 SWS2 后放入 DATA，FIN/RST 管理 stream 生命周期。SWS2 保留 opcode、FIN/RSV、close code 与 payload，禁止
+旧的一字节 text/binary 前缀。
 
 ### 6.3 Peer Mesh
 
@@ -263,6 +142,27 @@ Peer Mesh 默认关闭。启用后：
 - 客户端通过 STUN、UPnP/NAT-PMP/PCP 和候选探测尝试 UDP direct；direct 不健康时回退 TURN relay。
 - Peer 数据帧使用 X25519/HKDF 派生密钥和 AES-GCM；server relay 只处理授权与外层帧。
 
+### 6.4 HTTP 媒体采集与离线播放
+
+HTTP route 可独立开启 `mediaCaptureEnabled`。服务端在 Direct HTTP 响应写回浏览器的同时，把未经路径改写的原始
+媒体字节分片上传到专用 RustFS/S3 兼容私有桶；普通 HTTP 明细只保留预览，不重复保存已外置的媒体正文。当前识别
+HLS、DASH、渐进式音视频和媒体分段，按 ETag、Last-Modified、Range 与内容编码去重；中断的非清单响应可保留已收到
+的连续区间，清单必须完整才可用。
+
+播放端按同一资源的已缓存 Range 拼接对象，拒绝多段 Range 和缓存空洞。管理 API 先执行 tenant/owner 可见性检查；
+公开播放只能使用短期随机票据，票据同时绑定 capture id、tenant、到期时间和可选回源策略。HLS/DASH 清单中的相对
+资源会重写为票据或管理 asset 端点。完整配置但无法访问 RustFS 时服务端启动失败；配置关闭或不完整时媒体采集安全
+禁用。过期任务负责中止遗留 multipart、删除对象、引用和数据库记录。
+
+### 6.5 公共互传房间与流程图
+
+共享房间首次使用随机 owner token 建立，数据库只保存其 SHA-256；邀请 token 分为 `EDITOR` 与 `VIEWER`，支持撤销、
+到期和每房间数量上限。短配对码使用服务端 secret 的域分离 HMAC 保存，消费次数通过数据库原子更新；WebSocket
+票据、附件完成/下载与流程图版本都解析为同一持久化 room id 和角色，避免仅比较原始房间口令造成授权分叉。
+
+登录用户的云端流程图按 `tenantId + ownerUsername` 隔离，单用户最多 100 份、单快照最多 3 MiB；更新必须携带当前
+revision。公共房间版本最多保留 50 份，VIEWER 只读，只有 OWNER 可删除版本和管理邀请。
+
 ## 7. 安全模型
 
 ### 7.1 控制连接 TLS
@@ -273,7 +173,10 @@ Peer Mesh 默认关闭。启用后：
 | `file` | 从 JKS/PKCS12 keystore 加载 server 证书 |
 | `self-signed` | 启动时生成临时自签名证书，仅用于开发/测试 |
 
-Java client 入口默认仍以明文连接；启用 TLS 需要构造 `SslContext` 并使用 `NettyClient(SpecusBean, SslContext)`。`buildClientSslContext` 加载 truststore，`buildInsecureClientSslContext` 仅供测试。
+HTTP 登录响应通过 `nettyTls` 明确声明 control/data 原始 TCP 端点是否要求 TLS。Java、Go、.NET、Android 客户端的
+`controlTls.enabled` 省略时跟随该字段，旧服务端缺省按 `false`；显式 `true/false` 可覆盖。客户端支持 PEM CA、
+证书主机名覆盖和仅开发使用的 `insecureSkipVerify`，控制连接与专用数据连接共用同一 TLS 策略和握手超时。
+管理 `serverBaseUrl=https` 不隐含 Netty TLS，因为 HTTPS 可能终止于 HTTP 反向代理。
 
 ### 7.2 客户端与管理面鉴权
 
@@ -314,12 +217,15 @@ ClientCredential
 ### 8.2 路由、连接与流量
 
 - **`SpecusMapping`**：全局唯一 `listen_port`、目标地址/端口、启用状态和明细采集开关。
-- **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集、路径改写开关，以及
+- **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集、媒体采集、路径改写开关，以及
   可选的 Basic 用户名和密码哈希；展示模型只暴露 `authPasswordConfigured`，不返回哈希。
 - **`ConnectionRecord`**：client、channel、remote address、连接/断开时间、成功状态、失败原因和断开原因；不保存登录耗时或流量字节。
 - **`ConnectionStat`**：按 tenant、clientName、自然月累加 total/success/failure，长期保留。
 - **`TrafficUsage`**：按 `(client_id, usage_date)` 聚合上下行字节。
 - **`ResourceTrafficUsage`**：按 tenant、client、资源类型/键和 UTC 日期聚合 TCP 映射或 HTTP route 流量。
+- **`HttpMediaCapture` / `HttpMediaReference`**：记录媒体对象、Range、状态、保留期与清单引用；对象正文只在 RustFS。
+- **`PublicTransferRoom*` / `PublicTransferDiagramVersion`**：保存房间 owner/invite/pairing 角色与公共流程图版本。
+- **`UserDiagramDocument`**：按 tenant/owner 保存登录用户流程图快照和乐观锁 revision。
 
 连接记录关键索引是 `(client_id, connected_at)` 和 `connected_at`，分别服务频率限制/客户端历史与归档扫描。早于滚动保留窗口的记录按自然月汇总后，在同一事务中删除；默认保留 60 天。
 
@@ -344,8 +250,8 @@ HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后
 | 公网 TCP boss/worker | 与 control 分离；默认 boss 1、worker 使用 Netty 默认 |
 | `loginExecutor` | 有界池，默认 core 8、max 32、queue 20000；执行 token 鉴权、连接记录和登录后配置推送 |
 | Spring scheduler | 默认 pool size 2；执行流量 flush、连接归档、Peer/附件清理等定时任务 |
-| HTTP 直转 | Tomcat 线程在 `DirectHttpDispatcher.forward` 中等待 `SyncFuture`；Netty worker 收到响应后唤醒 |
-| client HTTP worker | `DirectHttpRequestHandler` 提交到共享 `ExecuteService` cached thread pool，避免阻塞 control EventLoop |
+| HTTP stream | Tomcat 请求线程等待 `HttpStreamExchange` 的响应头并按事件流持续写出；data EventLoop 只投递事件，不做阻塞 upstream I/O |
+| client HTTP worker | `HttpStreamForwarder` 提交到共享 `ExecuteService`，使用 Netty HTTP client 与手动 read/credit 背压，避免阻塞 data EventLoop |
 | TURN relay worker | 可配置有界工作池；队列满时丢弃新 relay 数据帧保护 server |
 
 所有 DB 和阻塞工作都应避免直接占用 Netty EventLoop。跨 Channel 写由 Netty 调度到目标 EventLoop；NAT 两端用 writability 和 `AUTO_READ` 做背压。
@@ -354,7 +260,7 @@ HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后
 
 ### 10.1 Java client 重连与 token 刷新
 
-控制连接失败后，`NettyClient` 使用 `2s → 4s → 8s → 16s → 32s → 60s` 指数退避，之后保持 60 秒上限。只有收到成功的 `LOGIN_RESPONSE` 才重置退避计数。
+control 连接失败后，`NettyClient` 使用 `2s → 4s → 8s → 16s → 32s → 60s` 指数退避，之后保持 60 秒上限。只有收到成功的 `LOGIN_RESPONSE` 才重置退避计数。
 
 普通重连复用未过期 runtime token，再走完整 Netty 登录；登录成功后 server 重新推送权威 `NAT_CONTROL`/`PEER_CONTROL`。token 快过期时 client 主动重新执行 HTTP 登录，刷新 token、session、控制端地址和配置；明确的认证/策略拒绝会停止无意义重试。
 
@@ -410,14 +316,14 @@ Admin REST mutation
   → NatControlService.pushSnapshotIfOnline
   → 在线 client 收到完整 NAT_CONTROL 权威快照
   → TCP 映射增删触发 REGISTER / UNREGISTER
-  → HTTP route 原子替换 DirectHttpRequestHandler 的不可变 route map
+  → HTTP route 原子替换 NatClientHandler 的不可变 route map
 ```
 
 客户端离线时自动推送静默跳过，下次登录重新取得完整快照；手动 `POST /api/admin/clients/{id}/nat-control` 在离线时返回 `409`。
 
 ## 13. 已知限制与后续工作
 
-- **Java client TLS 未配置化**：入口默认明文，需要把 truststore/校验策略正式加入 `client.jsonc`。
+- **真实 TLS 部署矩阵待验收**：Java、Go、.NET、Android 客户端 TLS 已配置化；Java、Go、.NET 已有本地证书握手测试，Android 当前覆盖配置、超时、取消与 socket protect，仍需补真实证书握手并覆盖生产 CA、L4 终止和多平台证书存储。
 - **HTTP 登录 nonce 未去重**：签名有 60 秒时间窗，但窗口内可重放；单节点可加有界 nonce cache，多节点需共享存储。
 - **公网 UDP 映射缺失**：如要实现，需要新增协议子类型、server `DatagramChannel` 和按来源端点维护的映射；这与已实现 Peer Mesh UDP 不同。
 - **E2E 覆盖有限**：已有 `EndToEndSpecusIT` 覆盖 SQLite 进程内 HTTP HMAC、Netty token、真实 TCP 隧道和 route 热更新，但 `*IT` 尚未接入 Maven Failsafe；仍缺真实 MySQL/PostgreSQL、跨进程和 TLS 矩阵。
@@ -433,7 +339,7 @@ Admin REST mutation
 | Client HTTP 认证 | `.../management/controller/ClientAuthResource.java`、`.../management/service/ClientAuthService.java` |
 | Client 凭证/账号 | `.../management/service/ClientCredentialService.java`、`.../management/service/ClientAccountService.java` |
 | NAT server | `.../handler/NatServerHandler.java`、`.../handler/RemoteSpecusHandler.java`、`.../server/RemotePortServerManager.java` |
-| HTTP/WS 直转 | `.../http/HttpSpecusController.java`、`.../http/DirectHttpDispatcher.java`、`.../http/WebSocketSpecusHandler.java` |
+| HTTP/WS 直转 | `.../http/HttpSpecusController.java`、`.../http/HttpStreamExchange.java`、`.../http/WebSocketSpecusHandler.java` |
 | Peer Mesh server | `.../management/service/PeerMeshService.java`、`.../management/service/PeerSignalService.java`、`.../peer/StunTurnServer.java` |
 | 管理 REST | `.../management/controller/*Resource.java`、`.../management/controller/AuthController.java`、`.../management/controller/OidcController.java` |
 | 安全 | `.../config/SecurityConfig.java`、`.../security/LocalTokenService.java`、`.../security/TlsContextFactory.java` |
@@ -441,7 +347,7 @@ Admin REST mutation
 | 编解码 | `.../codec/Spliter.java`、`.../codec/PacketCodecHandler.java`、`.../protocol/PacketCodec.java` |
 | 紧凑二进制 | `.../serialize/impl/CompactBinarySerializer.java` |
 | Java client 启动/连接 | `implementations/java/client/src/main/java/com/theshuai/specusclient/SpecusClientApplication.java`、`.../client/NettyClient.java` |
-| Java client NAT/HTTP | `.../handler/NatClientHandler.java`、`.../handler/LocalSpecusHandler.java`、`.../handler/DirectHttpRequestHandler.java` |
+| Java client NAT/HTTP | `.../handler/NatClientHandler.java`、`.../handler/LocalSpecusHandler.java`、`.../handler/HttpStreamForwarder.java` |
 | Java client Peer Mesh | `.../peer/PeerMeshClient.java`、`.../peer/PeerVirtualDevices.java` |
 | 进程内 E2E | `implementations/java/server/src/test/java/com/theshuai/specusserver/integration/EndToEndSpecusIT.java` |
 

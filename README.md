@@ -7,7 +7,7 @@
 
 引水渠 —— 内网服务接入、网络打洞与流量观测。
 
-`specus` 是项目的统一名称。项目以内网服务接入和私有组网为核心，Java 版本是当前基准实现；Go、C#、C 版本按同一协议对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
+`specus` 是项目的统一名称。项目以内网服务接入和私有组网为核心，Java 版本是当前基准实现；Go、C# 与 Android 按统一 v2 协议持续对齐，源码自动化与真实环境验收范围见下文，C server 冻结为明确列出的兼容子集。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
 
 > 当前 README 按 Java 基准实现维护；其它语言实现的覆盖范围见[当前状态](#当前状态)。
 
@@ -193,7 +193,7 @@ Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `specus0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
-> 完整示例见 `implementations/java/client/client.example.jsonc`、`implementations/go/client/client.example.jsonc` 和 `implementations/csharp/client/src/Specus.Client/client.example.jsonc`。
+> 完整示例见 `implementations/java/client/client.example.jsonc`、`implementations/go/client/client.example.jsonc`、`implementations/csharp/client/src/Specus.Client/client.example.jsonc` 和 `implementations/android/client/client.example.jsonc`。
 
 启动客户端：
 
@@ -206,7 +206,7 @@ Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不�
 
 Go / .NET CLI 客户端使用同一份配置结构。
 
-Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。开启 Peer Mesh 时，Android 会创建系统 VPN 接口，并接入 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新、direct-stale fallback 以及基础链路/流量/设备上报；端口预测和完整真机矩阵仍以 Java/Go/.NET 客户端为准。
+Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。其 control/data 通道支持登录响应驱动的 TLS，TCP 数据面使用 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE`、严格半关闭、有界建连缓存与最近关闭流 tombstone，HTTP/WebSocket route 使用同一流状态和 SWS2 envelope。配置非 `noop` 虚拟设备时 Android 会先申请 VPN 权限；只有服务端也开启 Peer Mesh 才会创建系统 VPN 接口。`noop` 不申请权限、不阻塞 TCP/HTTP，同时仍可运行 Peer Mesh 控制面和 UDP 探测。Android 还接入 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新、direct-stale fallback 以及基础链路/流量/设备上报；端口预测和完整真机矩阵仍以 Java/Go/.NET 客户端为准。
 
 Go 客户端：
 
@@ -474,7 +474,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `specus.public-transfer.presence-refresh-interval-ms` | `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | 租约刷新间隔，必须小于 TTL 一半 |
 | `specus.public-transfer.redis-command-timeout-ms` | `SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | `2000` | Redis 命令超时；故障时不回退本地状态 |
 
-## 控制连接 TLS
+## Control/Data 连接 TLS
 
 本地开发默认可使用明文 TCP（`SPECUS_TLS_MODE=disabled`）。生产 profile 或启用 `SPECUS_TLS_REQUIRE_ENCRYPTION=true` 后，公网 control/data 监听必须使用受信 TLS；只有 TLS 已由受信 L4 上游终止且进程绑定 loopback/私网地址时，才能显式设置 `SPECUS_TLS_TERMINATED_UPSTREAM=true`：
 
@@ -499,7 +499,24 @@ SPECUS_TLS_MODE=self-signed \
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
-> 服务端开启 TLS 后，**客户端必须同步开启 TLS**，否则握手失败。当前 Java 客户端入口（`SpecusClientApplication`）默认按明文连接；如需启用 TLS，请使用 `NettyClient.buildClientSslContext(truststorePath, truststorePassword)` 构造信任服务端证书的 `SslContext`，并以 `new NettyClient(specusBean, sslContext)` 启动；与自签名服务端联调时可用 `NettyClient.buildInsecureClientSslContext()`（仅限测试）。Go 客户端同样需要在控制连接上启用 TLS。
+Java、Go、.NET 服务端会在 HTTP 登录响应中返回 `nettyTls`，Java、Go、.NET、Android 客户端默认据此选择 control/data
+连接的明文或 TLS 模式。该信号描述原始 TCP 端点，不能用 `serverBaseUrl` 是否为 HTTPS 推断：管理 HTTPS 可能已由
+OpenResty 终止，而 `7010/TCP` 仍为明文。旧服务端未返回该字段时按 `false` 兼容。
+
+客户端可在 `client.jsonc` 中覆盖或补充信任配置：
+
+```jsonc
+"controlTls": {
+  // 省略/null：跟随 nettyTls；true/false：显式覆盖
+  // "enabled": true,
+  // "caCertificatePath": "./control-ca.pem",
+  // "serverName": "control.example.com",
+  "insecureSkipVerify": false
+}
+```
+
+配置 CA、`serverName` 或 `insecureSkipVerify` 也会启用 TLS；`enabled=false` 时不得配置这些附加项。
+`insecureSkipVerify=true` 会关闭证书链和主机名校验，仅可用于本地开发。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -601,23 +618,25 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - TCP 公网端口监听和双向数据转发
 - 服务端通过专用数据连接以 NAT stream 转发 HTTP/WebSocket，支持首部先达、流式 body、SSE、trailers、取消传播与窗口流控
 - Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、标准 STUN/TURN、公共 STUN 候选补充、UDP direct、server relay、NAT 类型探测、链路和会话展示
-- 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
+- 可选的 control/data 连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 免登录房间互传：匿名用户可使用 WebRTC Direct 和认证 TURN，登录用户额外支持 OSS 预签名兜底、云端下载与分享链接；Token 房间支持 OWNER/EDITOR/VIEWER 角色邀请、撤销和只读限制；专业流程图基于 maxGraph + Yjs，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标和服务端版本历史；支持 `.stdg`、多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg`、`.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
 - 使用统一 v2 线协议的 Go 客户端，支持 control/data 双连接、登录、心跳、自动重连、TCP 映射和 HTTP/WebSocket 流式直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled`、HTTP 路由 `pathRewriteEnabled`、逐 route Basic 入口认证及 `/http/**` WebSocket SWS2 隧道；C server 的 SQLite 管理路由也使用同一认证字段与数据面校验语义
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
 - Go/.NET server 已对齐 Java 公共互传与客户端消息主路径：`/ws/public-transfer/discovery`、6 个公共/管理附件接口、Aliyun OSS 预签名与 HEAD 完成校验、过期清理、来源 IP/房间限流、`/ws/client-messages`、消息能力持久化和 client/admin fallback；TURN 临时 credential、MESSAGE-INTEGRITY 及 401/438 challenge 也已补齐，Java/Go/.NET/Android 客户端会更新 challenge、换新 transaction 并最多重试一次
+- Go/.NET server 已对齐 Java 的 HTTP route 媒体采集与播放：逐 route 开关、RustFS/S3 multipart、HLS/DASH 清单改写、Range 去重和中断区间保留、跨对象回放、短期 tenant 绑定播放票据及过期清理；真实 RustFS 仍需在部署环境验收
+- Go/.NET server 已对齐 Java 的持久化互传房间角色、配对码、WebSocket room role/discoverable、附件角色授权、公共流程图版本和登录用户云端流程图；.NET 的 SQLite/MySQL/PostgreSQL migration 同步覆盖这些实体与媒体采集实体
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 提供明确列出的轻量子集
 - .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
-- Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、控制连接、TCP 映射、HTTP/HTTP route WebSocket 直转、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 基础数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、STUN/TURN、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 协议/状态机测试已覆盖帧边界、登录、重连和数据面 codec
+- Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、control/data TLS、严格 TCP 半关闭、HTTP/HTTP route WebSocket 流式直转、SWS2、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 基础数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、STUN/TURN、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 协议/状态机测试已覆盖帧边界、登录、重连、流状态和数据面 codec
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
 - Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 只实现 v2 控制/NAT stream 与管理面的轻量子集，不包含 TLS 控制连接、HTTPS OIDC token exchange、ES 明细、live client-message/公共发现、对象存储或 Peer Mesh 数据面。C 的附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，公共 ICE 仅描述显式配置的外部 STUN/TURN 服务。
-- Android Peer Mesh 已覆盖 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新和基础链路/流量/设备上报；端口预测、本地 ACL 镜像和完整真机端到端矩阵仍待补齐。
-- Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
+- Android Peer Mesh 已覆盖 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新和基础链路/流量/设备上报；端口预测、本地 ACL 镜像和完整真机端到端矩阵仍待补齐。Android 基于 `HttpURLConnection` 的 Direct HTTP upstream 不支持发送合法 request trailers，因此遇到 `OPEN.trailerNames` 或 FIN trailers 会显式 RST，不能静默丢弃；response trailers 仅在平台 API 实际暴露时转发。该 API 也无法可靠保留带 body 的 `GET/HEAD`，且不能在请求体仍上传时并行暴露 early response；Android 会显式拒绝前者并在请求结束后读取响应。
+- Java、Go、.NET、Android 客户端已支持登录响应驱动的 control/data TLS 与显式 CA/主机名覆盖；真实生产证书和 L4 TLS 终止仍需在目标部署环境验收。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 
 ## 开发入口
