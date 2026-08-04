@@ -8,7 +8,9 @@ param(
     [switch]$DryRun,
     [switch]$NoClean,
     [switch]$KeepRemoteTemp,
-    [switch]$IncludeStun
+    [switch]$IncludeStun,
+    [switch]$IncludeApm,
+    [string]$ApmServerUrl = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +22,13 @@ if ([string]::IsNullOrWhiteSpace($HostName)) {
 if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
     $SiteUrl = if ($env:DEPLOY_SITE_URL) { $env:DEPLOY_SITE_URL } else { "https://specus.devshuai.com" }
 }
+if ([string]::IsNullOrWhiteSpace($ApmServerUrl)) {
+    $ApmServerUrl = if ($env:DEPLOY_APM_SERVER_URL) {
+        $env:DEPLOY_APM_SERVER_URL
+    } else {
+        "http://127.0.0.1:8200"
+    }
+}
 
 if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
     throw "Invalid SSH host. Configure ports and advanced options in ~/.ssh/config."
@@ -27,7 +36,11 @@ if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
 if ($SiteUrl -notmatch '^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$') {
     throw "SiteUrl must be an HTTP(S) origin without a path or query."
 }
+if ($ApmServerUrl -notmatch '^https?://[A-Za-z0-9._-]+(:[0-9]+)?/?$') {
+    throw "ApmServerUrl must be an HTTP(S) origin without a path or query."
+}
 $SiteUrl = $SiteUrl.TrimEnd('/')
+$ApmServerUrl = $ApmServerUrl.TrimEnd('/')
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 
@@ -176,6 +189,9 @@ try {
 
     $deployFrontend = $Mode -eq "Frontend" -or $Mode -eq "All"
     $deployServer = $Mode -eq "Server" -or $Mode -eq "All"
+    if ($IncludeApm -and -not $deployServer) {
+        throw "-IncludeApm requires -Mode Server or -Mode All."
+    }
     $branch = (& $git branch --show-current).Trim()
     if (-not $branch) { $branch = "(detached)" }
 
@@ -184,6 +200,7 @@ try {
     Write-Host "  host:       $HostName"
     Write-Host "  site:       $SiteUrl"
     Write-Host "  STUN:       $(if ($IncludeStun) { 'all nodes, before specus-server' } else { 'not included' })"
+    Write-Host "  Elastic APM:$(if ($IncludeApm) { " enabled via $ApmServerUrl" } else { ' not included' })"
     Write-Host "  git branch: $branch"
     if ($changedPaths.Count -gt 0) {
         Write-Host "  workspace changes ($($changedPaths.Count)):"
@@ -196,7 +213,14 @@ try {
     }
 
     if (-not $DryRun -and -not $Yes) {
-        $deploymentScope = if ($IncludeStun) { "$Mode plus STUN" } else { $Mode }
+        $extras = @()
+        if ($IncludeStun) { $extras += "STUN" }
+        if ($IncludeApm) { $extras += "Elastic APM" }
+        $deploymentScope = if ($extras.Count -gt 0) {
+            "$Mode plus $($extras -join ' and ')"
+        } else {
+            $Mode
+        }
         $answer = Read-Host "Continue deploying $deploymentScope to ${HostName}? [y/N]"
         if ($answer -notin @("y", "Y", "yes", "YES")) {
             Write-DeployLog "cancelled"
@@ -286,6 +310,12 @@ try {
             Invoke-DeployCommand $scp @("-r", (Join-Path $RepoRoot "apps/admin-web/dist"), "${HostName}:${remoteRoot}/admin-web-dist")
         }
 
+        if ($IncludeApm) {
+            Invoke-DeployCommand $ssh @(
+                $HostName,
+                "sudo env SPECUS_APM_SERVER_URL=$ApmServerUrl bash $remoteRoot/java-systemd/install-elastic-apm-agent.sh --enable --restart"
+            )
+        }
         if ($deployServer) {
             Invoke-DeployCommand $ssh @($HostName, "sudo bash $remoteRoot/java-systemd/update.sh $remoteRoot/specus-server.jar")
         }
@@ -297,6 +327,13 @@ try {
         Write-DeployLog "verifying remote deployment"
         if ($deployServer) {
             Invoke-DeployCommand $ssh @($HostName, "systemctl is-active specus-server")
+        }
+        if ($IncludeApm) {
+            Invoke-DeployCommand $ssh @($HostName, "curl -fsS $ApmServerUrl/")
+            Invoke-DeployCommand $ssh @(
+                $HostName,
+                'pid=$(systemctl show specus-server -p MainPID --value); sudo xargs -0 -n1 < /proc/$pid/cmdline | grep -F -- "-javaagent:/opt/specus-server/elastic-apm-agent.jar"'
+            )
         }
         if ($deployFrontend) {
             Invoke-DeployCommand $ssh @($HostName, "sudo openresty -t")

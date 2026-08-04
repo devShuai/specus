@@ -14,6 +14,8 @@ DRY_RUN="false"
 NO_CLEAN="false"
 KEEP_REMOTE_TEMP="false"
 INCLUDE_STUN="false"
+INCLUDE_APM="false"
+APM_SERVER_URL="${DEPLOY_APM_SERVER_URL:-http://127.0.0.1:8200}"
 
 usage() {
   cat <<'EOF'
@@ -35,10 +37,12 @@ Options:
   --no-clean          Use Maven package without clean (explicit fallback only).
   --keep-remote-temp  Keep the successful upload directory under /tmp.
   --include-stun      Deploy both standalone STUN nodes before specus-server.
+  --include-apm       Install and enable Elastic APM Java Agent for specus-server.
+  --apm-server-url    APM Server origin (default: http://127.0.0.1:8200).
   -h, --help          Show this help.
 
 Environment:
-  DEPLOY_HOST, DEPLOY_SITE_URL
+  DEPLOY_HOST, DEPLOY_SITE_URL, DEPLOY_APM_SERVER_URL
 EOF
 }
 
@@ -113,6 +117,15 @@ while (($# > 0)); do
       INCLUDE_STUN="true"
       shift
       ;;
+    --include-apm)
+      INCLUDE_APM="true"
+      shift
+      ;;
+    --apm-server-url)
+      require_value "$1" "${2-}"
+      APM_SERVER_URL="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -127,7 +140,10 @@ done
   || die "invalid SSH host; configure ports and advanced options in ~/.ssh/config"
 [[ "$SITE_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]] \
   || die "site URL must be an HTTP(S) origin without a path or query"
+[[ "$APM_SERVER_URL" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?/?$ ]] \
+  || die "APM Server URL must be an HTTP(S) origin without a path or query"
 SITE_URL="${SITE_URL%/}"
+APM_SERVER_URL="${APM_SERVER_URL%/}"
 
 print_command() {
   printf '+'
@@ -223,6 +239,9 @@ case "$MODE" in
     die "internal mode error: $MODE"
     ;;
 esac
+if [[ "$INCLUDE_APM" == "true" && "$DEPLOY_SERVER" != "true" ]]; then
+  die "--include-apm requires server or all mode"
+fi
 
 log "deployment plan"
 branch="$(git branch --show-current 2>/dev/null || true)"
@@ -234,6 +253,11 @@ if [[ "$INCLUDE_STUN" == "true" ]]; then
   printf '  STUN:       all nodes, before specus-server\n'
 else
   printf '  STUN:       not included\n'
+fi
+if [[ "$INCLUDE_APM" == "true" ]]; then
+  printf '  Elastic APM: enabled via %s\n' "$APM_SERVER_URL"
+else
+  printf '  Elastic APM: not included\n'
 fi
 printf '  git branch: %s\n' "$branch"
 
@@ -256,6 +280,9 @@ if [[ "$DRY_RUN" != "true" && "$ASSUME_YES" != "true" ]]; then
   deployment_scope="$MODE"
   if [[ "$INCLUDE_STUN" == "true" ]]; then
     deployment_scope="${MODE} plus STUN"
+  fi
+  if [[ "$INCLUDE_APM" == "true" ]]; then
+    deployment_scope="${deployment_scope} plus Elastic APM"
   fi
   printf 'Continue deploying %s to %s? [y/N] ' "$deployment_scope" "$DEPLOY_HOST"
   read -r answer
@@ -368,6 +395,11 @@ if [[ "$DEPLOY_FRONTEND" == "true" ]]; then
   run scp -r "${REPO_ROOT}/apps/admin-web/dist" "${DEPLOY_HOST}:${REMOTE_ROOT}/admin-web-dist"
 fi
 
+if [[ "$INCLUDE_APM" == "true" ]]; then
+  run ssh "$DEPLOY_HOST" \
+    "sudo env SPECUS_APM_SERVER_URL=${APM_SERVER_URL} bash ${REMOTE_ROOT}/java-systemd/install-elastic-apm-agent.sh --enable --restart"
+fi
+
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
   run ssh "$DEPLOY_HOST" \
     "sudo bash ${REMOTE_ROOT}/java-systemd/update.sh ${REMOTE_ROOT}/specus-server.jar"
@@ -382,6 +414,11 @@ fi
 log "verifying remote deployment"
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
   run ssh "$DEPLOY_HOST" "systemctl is-active specus-server"
+fi
+if [[ "$INCLUDE_APM" == "true" ]]; then
+  run ssh "$DEPLOY_HOST" "curl -fsS ${APM_SERVER_URL}/"
+  run ssh "$DEPLOY_HOST" \
+    'pid=$(systemctl show specus-server -p MainPID --value); sudo xargs -0 -n1 < "/proc/$pid/cmdline" | grep -F -- "-javaagent:/opt/specus-server/elastic-apm-agent.jar"'
 fi
 if [[ "$DEPLOY_FRONTEND" == "true" ]]; then
   run ssh "$DEPLOY_HOST" "sudo openresty -t"

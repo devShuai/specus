@@ -25,6 +25,13 @@ powershell -ExecutionPolicy Bypass -File .\deploy\remote\deploy.ps1 `
   -Mode All -IncludeStun -Yes
 ```
 
+同时为 Java 服务安装并启用 Elastic APM Agent：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\remote\deploy.ps1 `
+  -Mode Server -IncludeApm -Yes
+```
+
 不加 `--yes` / `-Yes` 时，脚本会显示分支、改动文件和部署范围并等待确认。
 
 ## 部署模式
@@ -65,6 +72,30 @@ STUN 节点仍读取 `deploy/stun-server/remote/stun-deploy.config.json` 中各�
 一次；STUN 更新成功而后续 specus-server 更新失败时，两套服务各自保留自己的
 回滚结果，不执行跨服务降级。
 
+## 包含 Elastic APM
+
+PowerShell 的 `-IncludeApm` 和 Bash 的 `--include-apm` 会在更新 Java 服务前：
+
+1. 确认 APM Server 已可达且 `publish_ready=true`。
+2. 下载 Elastic APM Java Agent `1.56.0` 并校验固定 SHA-256。
+3. 以隐私优先配置更新 `/etc/specus-server/specus-server.env`。
+4. 先重启当前 Java 服务并完成健康检查；失败时自动恢复 env 和 systemd unit。
+5. 当前 JAR 验证通过后再执行常规 Java 更新，最后确认 JVM 命令行含 `-javaagent`。
+
+默认接收端是 `http://127.0.0.1:8200`，可通过
+`-ApmServerUrl` / `--apm-server-url` 或 `DEPLOY_APM_SERVER_URL` 覆盖：
+
+```bash
+./deploy/remote/deploy.sh server \
+  --include-apm \
+  --apm-server-url https://apm.example.com \
+  --yes
+```
+
+`IncludeApm` 只适用于 `server` / `all` 模式。接收端需要 secret token 时，先把
+`ELASTIC_APM_SECRET_TOKEN` 写入远端受保护的 `specus-server.env`；部署脚本不会
+把密钥放进 SSH 命令行。
+
 ## 参数
 
 ### Bash
@@ -77,14 +108,17 @@ STUN 节点仍读取 `deploy/stun-server/remote/stun-deploy.config.json` 中各�
 --no-clean              Maven 不执行 clean，仅作为文件锁等场景的显式回退
 --keep-remote-temp      成功后仍保留远端 /tmp 上传目录
 --include-stun          先部署并验收 ali2/ali 双节点独立 STUN
+--include-apm           安装并启用 Elastic APM Java Agent
+--apm-server-url        APM Server origin，默认 http://127.0.0.1:8200
 ```
 
-环境变量 `DEPLOY_HOST`、`DEPLOY_SITE_URL` 可提供默认值。
+环境变量 `DEPLOY_HOST`、`DEPLOY_SITE_URL`、`DEPLOY_APM_SERVER_URL` 可提供默认值。
 
 ### PowerShell
 
 参数分别为 `-HostName`、`-SiteUrl`、`-Yes`、`-DryRun`、`-NoClean`、
-`-KeepRemoteTemp`、`-IncludeStun`，也支持相同的两个环境变量。
+`-KeepRemoteTemp`、`-IncludeStun`、`-IncludeApm`、`-ApmServerUrl`，也支持
+对应的环境变量。
 
 ## 安全与回滚
 
@@ -94,6 +128,8 @@ STUN 节点仍读取 `deploy/stun-server/remote/stun-deploy.config.json` 中各�
   systemd active 和 Actuator `UP`；失败时自动回滚。
 - 启用 `IncludeStun` 时先更新两台独立 STUN 节点；任何节点失败都会阻止后续
   specus-server 和前端部署。
+- 启用 `IncludeApm` 时，Agent 下载或 APM Server 连通性检查失败会阻止 Java
+  更新；真实 env 不会被模板覆盖，只会幂等维护 `ELASTIC_APM_*` 字段。
 - 远端 `/etc/specus-server/specus-server.env` 不会被覆盖，只更新 env 示例文件。
 - OpenResty 更新复用 `deploy/openresty/install-admin-web.sh`，安装前会执行配置检查。
 - 每次上传使用唯一 `/tmp/specus-deploy-*` 目录。成功后自动清理；失败时保留并
