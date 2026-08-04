@@ -18,10 +18,22 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    packaging {
+        resources {
+            // Netty publishes these module-level metadata files in every split jar.
+            // They are diagnostic-only and cannot be merged into one Android APK.
+            excludes += [
+                    "META-INF/INDEX.LIST",
+                    "META-INF/io.netty.versions.properties"
+            ]
+        }
+    }
 }
 
 dependencies {
-    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    implementation "io.netty:netty-codec-http:4.1.110.Final"
+    implementation "io.netty:netty-handler:4.1.110.Final"
     testImplementation "junit:junit:4.13.2"
     // Android's org.json classes are stubs in local JVM tests. Use the matching
     // standalone implementation so protocol JSON is exercised for real.

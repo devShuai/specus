@@ -12,6 +12,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import java.io.Closeable;
+import java.io.IOException;
 import java.math.BigInteger;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -20,6 +21,7 @@ import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -30,8 +32,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,9 +47,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 final class PeerMeshEngine implements Closeable {
     private static final String TYPE_CONFIG = "peer-config";
@@ -59,6 +65,7 @@ final class PeerMeshEngine implements Closeable {
     private static final long RELAY_REQUEST_MIN_INTERVAL_MS = 15_000L;
     private static final long RELAY_REFRESH_WINDOW_MS = 60_000L;
     private static final long STUN_REQUEST_INTERVAL_MS = 60_000L;
+    private static final long SRFLX_OBSERVATION_TTL_MS = 180_000L;
     private static final long BEHAVIOR_DISCOVERY_MIN_INTERVAL_MS = 60_000L;
     private static final long BEHAVIOR_PROBE_TIMEOUT_MS = 1_600L;
     private static final long TURN_PERMISSION_TTL_MS = 240_000L;
@@ -69,6 +76,18 @@ final class PeerMeshEngine implements Closeable {
     private static final long REPORT_INTERVAL_MS = 60_000L;
     private static final long MAINTENANCE_INTERVAL_MS = 30_000L;
     private static final long DIRECT_STALE_MS = 45_000L;
+    private static final long PENDING_PROBE_TTL_MS = 15_000L;
+    private static final long PROBE_CLOCK_SKEW_MS = 15_000L;
+    private static final long RTT_HYSTERESIS_MS = 100L;
+    private static final int MAX_PROBE_REPLAY_ENTRIES = 4_096;
+    private static final int PROBE_BURST_COUNT = 3;
+    private static final long PROBE_BURST_INTERVAL_MS = 30L;
+    private static final long DIRECT_KEEPALIVE_INTERVAL_MS = 25_000L;
+    private static final int MAX_ADAPTIVE_PREDICTED_PORTS = 16;
+    private static final int MAX_ADAPTIVE_PORT_DELTA = 512;
+    private static final long CONNECTIVITY_CHECK_PACING_MS = 20L;
+    private static final long PORT_MAPPING_RETRY_INTERVAL_MS = 30_000L;
+    private static final int PORT_MAPPING_LEASE_SECONDS = 7_200;
     // H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
     // HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 30s
     // maintenance tick 压缩到数秒，不改变最终成功率。打通或过期即停。
@@ -109,8 +128,12 @@ final class PeerMeshEngine implements Closeable {
     private final Map<String, PeerInfo> peersByVirtualIp = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessionsById = new ConcurrentHashMap<>();
+    private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
+    private final ProbeReplayCache receivedProbeNonces =
+            new ProbeReplayCache(MAX_PROBE_REPLAY_ENTRIES);
     private final Map<Long, ArrayDeque<PendingPacket>> pendingPackets = new ConcurrentHashMap<>();
     private final Map<String, PeerCandidate> serverReflexiveCandidates = new ConcurrentHashMap<>();
+    private final Map<String, Long> serverReflexiveObservedAt = new ConcurrentHashMap<>();
     private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
     private final Map<String, PendingTurnRequest> pendingTurnRequests = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
@@ -123,6 +146,7 @@ final class PeerMeshEngine implements Closeable {
     private final Set<Long> holePunchRetryScheduled = ConcurrentHashMap.newKeySet();
     // H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
     private final Map<Long, Long> candidateReciprocateAt = new ConcurrentHashMap<>();
+    private final PeerUdpProbeRateLimiter udpProbeRateLimiter = new PeerUdpProbeRateLimiter();
     private final ScheduledExecutorService pathMtuScheduler = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "specus-peer-mesh-path-mtu");
         thread.setDaemon(true);
@@ -133,6 +157,12 @@ final class PeerMeshEngine implements Closeable {
     private volatile DatagramSocket udpSocket;
     private volatile Thread receiverThread;
     private volatile PeerCandidate relayCandidate;
+    private volatile PeerCandidate portMapCandidate;
+    private volatile PeerPortMappingService.Mapping portMapping;
+    private volatile PeerPortMappingService portMappingService;
+    private final PortMappingCommitGate portMappingCommitGate = new PortMappingCommitGate();
+    private volatile long lastPortMapAttemptMillis;
+    private final AtomicBoolean portMappingAttemptInFlight = new AtomicBoolean(false);
     private volatile String relayAllocationId;
     private volatile long relayAllocationExpiresAtMillis;
     private volatile long lastStunCandidateRequestMillis;
@@ -144,6 +174,7 @@ final class PeerMeshEngine implements Closeable {
     private volatile String natBehaviorDiscoveryMode = "";
     private volatile String lastEndpoint = "";
     private volatile Thread maintenanceThread;
+    private volatile ScheduledFuture<?> directKeepaliveTask;
     private volatile long lastDeviceReportMillis;
 
     PeerMeshEngine(SpecusCore.SpecusSession specusSession,
@@ -169,13 +200,16 @@ final class PeerMeshEngine implements Closeable {
         }
         boolean stunConfigChanged = config == null
                 || !equals(config.stunHost, nextConfig.stunHost)
-                || config.stunPort != nextConfig.stunPort;
+                || config.stunPort != nextConfig.stunPort
+                || !java.util.Objects.equals(config.publicStunServers, nextConfig.publicStunServers);
         pendingTurnRequests.clear();
 		turnChannelsByPeer.clear();
 		turnChannelsByNumber.clear();
 		nextTurnChannel.set(TurnChannelData.MIN_CHANNEL);
         if (stunConfigChanged) {
             pendingStunBindings.clear();
+            serverReflexiveCandidates.clear();
+            serverReflexiveObservedAt.clear();
             lastStunCandidateRequestMillis = 0L;
             lastBehaviorDiscoveryStartedMillis = 0L;
             natType = "";
@@ -189,6 +223,8 @@ final class PeerMeshEngine implements Closeable {
         config = nextConfig;
         enabled.set(true);
         startUdpSocket();
+        ensurePortMappingService();
+        tryAcquirePortMappingAsync();
         startMaintenance();
         if (vpnPlatform != null && specusSession.usesVpnDevice()) {
             vpnPlatform.startVpn(nextConfig, this::sendVirtualPacket);
@@ -525,16 +561,205 @@ final class PeerMeshEngine implements Closeable {
             return;
         }
         DatagramSocket socket = new DatagramSocket(0);
-        if (vpnPlatform != null && specusSession.usesVpnDevice()) {
-            vpnPlatform.protectDatagramSocket(socket);
-        }
+        protectPeerDatagramSocket(specusSession.usesVpnDevice(), vpnPlatform, socket);
         udpSocket = socket;
         receiverThread = new Thread(() -> receiveLoop(socket), "specus-peer-mesh-udp");
         receiverThread.setDaemon(true);
         receiverThread.start();
     }
 
+    static void protectPeerDatagramSocket(boolean usesVpn,
+                                           SpecusCore.VpnPlatform vpnPlatform,
+                                           DatagramSocket socket) throws IOException {
+        if (!usesVpn) {
+            return;
+        }
+        try {
+            if (vpnPlatform != null && vpnPlatform.protectDatagramSocket(socket)) {
+                return;
+            }
+        } catch (RuntimeException error) {
+            socket.close();
+            throw error;
+        }
+        socket.close();
+        throw new IOException("failed to protect peer mesh UDP socket from VPN");
+    }
+
+    private void ensurePortMappingService() {
+        if (portMappingService != null) {
+            return;
+        }
+        portMappingService = PeerPortMappingService.android(
+                AppContextHolder.context,
+                new PeerPortMappingService.SocketProtector() {
+                    @Override
+                    public void protect(DatagramSocket socket) throws IOException {
+                        if (vpnPlatform != null && specusSession.usesVpnDevice()
+                                && !vpnPlatform.protectDatagramSocket(socket)) {
+                            throw new IOException("failed to protect NAT mapping UDP socket");
+                        }
+                    }
+
+                    @Override
+                    public void protect(Socket socket) throws IOException {
+                        if (vpnPlatform != null && specusSession.usesVpnDevice()
+                                && !vpnPlatform.protectSocket(socket)) {
+                            throw new IOException("failed to protect NAT mapping TCP socket");
+                        }
+                    }
+                });
+    }
+
+    private void tryAcquirePortMappingAsync() {
+        DatagramSocket socket = udpSocket;
+        PeerPortMappingService service = portMappingService;
+        long now = System.currentTimeMillis();
+        if (!enabled.get() || service == null || socket == null || socket.isClosed()
+                || portMapping != null
+                || now - lastPortMapAttemptMillis < PORT_MAPPING_RETRY_INTERVAL_MS
+                || !portMappingAttemptInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        lastPortMapAttemptMillis = now;
+        int internalPort = socket.getLocalPort();
+        long mappingGeneration = portMappingCommitGate.snapshot();
+        try {
+            ioPool.execute(() -> {
+                PeerPortMappingService.Mapping mapping = null;
+                try {
+                    mapping = service.acquire(internalPort, internalPort,
+                            PORT_MAPPING_LEASE_SECONDS, "specus peer mesh");
+                    if (mapping != null && !installPortMapping(
+                            mapping, service, socket, null, mappingGeneration)) {
+                        service.release(mapping);
+                    }
+                } finally {
+                    portMappingAttemptInFlight.set(false);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            portMappingAttemptInFlight.set(false);
+        }
+    }
+
+    private boolean installPortMapping(PeerPortMappingService.Mapping mapping,
+                                       PeerPortMappingService service,
+                                       DatagramSocket socket,
+                                       PeerPortMappingService.Mapping expectedPrevious,
+                                       long mappingGeneration) {
+        if (mapping == null || isBlank(mapping.externalAddress)
+                || mapping.externalPort <= 0 || mapping.externalPort > 65_535) {
+            return false;
+        }
+        PeerCandidate candidate = new PeerCandidate();
+        candidate.type = "srflx";
+        candidate.transport = "udp";
+        candidate.address = mapping.externalAddress;
+        candidate.port = mapping.externalPort;
+        candidate.priority = 900L;
+        candidate.foundation = "port-map-" + mapping.protocol.name().toLowerCase(Locale.ROOT);
+        candidate.addressFamily = addressFamily(mapping.externalAddress);
+        boolean[] changed = {false};
+        boolean installed = portMappingCommitGate.commit(
+                mappingGeneration,
+                () -> enabled.get() && portMappingService == service
+                        && udpSocket == socket && socket != null && !socket.isClosed()
+                        && portMapping == expectedPrevious,
+                () -> {
+                    PeerCandidate previous = portMapCandidate;
+                    portMapping = mapping;
+                    portMapCandidate = candidate;
+                    changed[0] = previous == null
+                            || !equals(previous.address, candidate.address)
+                            || previous.port != candidate.port;
+                });
+        if (installed && changed[0]) {
+            try {
+                announceCandidatesToOnlinePeers();
+            } catch (Exception e) {
+                publish("Peer port mapping announce failed", e.getMessage());
+            }
+        }
+        return installed;
+    }
+
+    private void renewPortMappingIfNeeded() {
+        PeerPortMappingService.Mapping current = portMapping;
+        PeerPortMappingService service = portMappingService;
+        if (current == null) {
+            tryAcquirePortMappingAsync();
+            return;
+        }
+        if (service == null || !current.shouldRenew(System.currentTimeMillis())
+                || !portMappingAttemptInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        DatagramSocket socket = udpSocket;
+        long mappingGeneration = portMappingCommitGate.snapshot();
+        try {
+            ioPool.execute(() -> {
+                try {
+                    PeerPortMappingService.Mapping renewed = service.renew(
+                            current, PORT_MAPPING_LEASE_SECONDS, "specus peer mesh");
+                    if (renewed != null) {
+                        if (!installPortMapping(renewed, service, socket,
+                                current, mappingGeneration)) {
+                            service.release(renewed);
+                        }
+                    } else {
+                        boolean removed = portMappingCommitGate.commit(
+                                mappingGeneration,
+                                () -> enabled.get() && portMappingService == service
+                                        && portMapping == current,
+                                () -> {
+                                    portMapping = null;
+                                    portMapCandidate = null;
+                                    lastPortMapAttemptMillis = System.currentTimeMillis();
+                                });
+                        if (removed) {
+                            try {
+                                announceCandidatesToOnlinePeers();
+                            } catch (Exception e) {
+                                publish("Peer port mapping removal announce failed", e.getMessage());
+                            }
+                        }
+                    }
+                } finally {
+                    portMappingAttemptInFlight.set(false);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            portMappingAttemptInFlight.set(false);
+        }
+    }
+
+    private void releasePortMapping() {
+        portMappingCommitGate.invalidate();
+        PeerPortMappingService.Mapping current = portMapping;
+        PeerPortMappingService service = portMappingService;
+        portMapping = null;
+        portMapCandidate = null;
+        lastPortMapAttemptMillis = 0L;
+        if (service != null && current != null) {
+            service.release(current);
+        }
+    }
+
     private synchronized void startMaintenance() {
+        ScheduledFuture<?> keepalive = directKeepaliveTask;
+        if (keepalive == null || keepalive.isCancelled() || keepalive.isDone()) {
+            directKeepaliveTask = pathMtuScheduler.scheduleAtFixedRate(() -> {
+                if (!enabled.get()) {
+                    return;
+                }
+                try {
+                    keepaliveDirectPaths();
+                } catch (Exception e) {
+                    publish("Peer keepalive failed", e.getMessage());
+                }
+            }, 5L, 5L, TimeUnit.SECONDS);
+        }
         Thread current = maintenanceThread;
         if (current != null && current.isAlive()) {
             return;
@@ -554,9 +779,11 @@ final class PeerMeshEngine implements Closeable {
                 }
                 reportTrafficDeltas();
                 removeExpiredSessions();
+                removeExpiredProbes();
                 removeExpiredStunBindings();
                 removeExpiredTurnRequests();
                 requestPeerServerCandidates();
+                renewPortMappingIfNeeded();
                 announceCandidatesToOnlinePeers();
                 keepaliveActivePaths();
                 reportDeviceIfDue();
@@ -611,8 +838,13 @@ final class PeerMeshEngine implements Closeable {
             handleDataFrame(data, remote, relayFromAllocationId);
             return;
         }
-        JSONObject json = tryJson(data);
-        if (json == null || !PROBE_MAGIC.equals(json.optString("magic", ""))) {
+        if (remote == null
+                || !udpProbeRateLimiter.tryAcquire(remote.getAddress(), System.currentTimeMillis())) {
+            return;
+        }
+        JSONObject json = PeerUdpProbeCodec.decode(data, 0, data == null ? 0 : data.length);
+        SpecusCore.PeerMeshConfig current = config;
+        if (!validProbeEnvelope(json, current)) {
             return;
         }
         String type = json.optString("type", "");
@@ -736,6 +968,7 @@ final class PeerMeshEngine implements Closeable {
         candidate.priority = mapped.getAddress() instanceof Inet6Address ? 900 : 800;
         candidate.foundation = foundation;
         String key = candidateEndpointKey(candidate);
+        serverReflexiveObservedAt.put(key, System.currentTimeMillis());
         boolean candidateChanged = serverReflexiveCandidates.putIfAbsent(key, candidate) == null;
 
         if (pending.behaviorProbe != null) {
@@ -1020,9 +1253,20 @@ final class PeerMeshEngine implements Closeable {
     private void handleProbeCheck(JSONObject probe, InetSocketAddress remote, String relayFromAllocationId) throws Exception {
         long peerId = probe.optLong("fromClientId", 0L);
         PeerSession session = sessions.get(peerId);
+        long now = System.currentTimeMillis();
         if (session == null
                 || session.sessionId != probe.optLong("sessionId", 0L)
-                || !equals(session.token, probe.optString("token", ""))) {
+                || !equals(session.token, probe.optString("token", ""))
+                || session.isExpired(now)
+                || !ensureSessionKeyReady(session)) {
+            return;
+        }
+        long sentAtMillis = probe.optLong("sentAtMillis", 0L);
+        String nonce = probe.optString("nonce", "");
+        if (!probeTimestampWithinWindow(sentAtMillis, now)
+                || !receivedProbeNonces.accept(
+                        session.sessionId + "\u0000" + nonce,
+                        probeReplayExpiry(sentAtMillis), now)) {
             return;
         }
         markSessionPath(session, remote, relayFromAllocationId, -1L);
@@ -1035,9 +1279,9 @@ final class PeerMeshEngine implements Closeable {
         response.put("sessionId", session.sessionId);
         response.put("fromClientId", config == null ? 0L : config.clientId);
         response.put("toClientId", peerId);
-        response.put("nonce", probe.optString("nonce", ""));
+        response.put("nonce", nonce);
         response.put("token", session.token);
-        response.put("sentAtMillis", probe.optLong("sentAtMillis", System.currentTimeMillis()));
+        response.put("sentAtMillis", sentAtMillis);
         if (!isBlank(relayFromAllocationId)) {
             sendRelayPayload(relayFromAllocationId, response.toString().getBytes(StandardCharsets.UTF_8));
         } else {
@@ -1046,56 +1290,215 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private void handleProbeResponse(JSONObject probe, InetSocketAddress remote, String relayFromAllocationId) {
-        long peerId = probe.optLong("fromClientId", 0L);
-        PeerSession session = sessions.get(peerId);
-        if (session == null
-                || session.sessionId != probe.optLong("sessionId", 0L)
-                || !equals(session.token, probe.optString("token", ""))) {
+        String nonce = probe.optString("nonce", "");
+        PendingProbe pending = pendingProbes.get(nonce);
+        long now = System.currentTimeMillis();
+        if (pending == null
+                || now - pending.sentAtMillis > PENDING_PROBE_TTL_MS
+                || pending.peerId != probe.optLong("fromClientId", 0L)
+                || pending.sessionId != probe.optLong("sessionId", 0L)
+                || pending.sentAtMillis != probe.optLong("sentAtMillis", 0L)
+                || !pendingEndpointMatches(pending, remote, relayFromAllocationId)) {
             return;
         }
-        long sentAt = probe.optLong("sentAtMillis", 0L);
-        long rtt = sentAt <= 0 ? -1L : Math.max(0L, System.currentTimeMillis() - sentAt);
+        PeerSession session = sessions.get(pending.peerId);
+        if (session == null
+                || session.sessionId != pending.sessionId
+                || !equals(session.token, probe.optString("token", ""))
+                || session.isExpired(now)
+                || !ensureSessionKeyReady(session)
+                || !pendingProbes.remove(nonce, pending)) {
+            return;
+        }
+        if (pending.relay && session.hasHealthyDirect(now)) {
+            return;
+        }
+        long rtt = Math.max(0L, now - pending.sentAtMillis);
         markSessionPath(session, remote, relayFromAllocationId, rtt);
         session.pathReady = true;
-        flushPending(peerId);
+        flushPending(pending.peerId);
     }
 
-    private void markSessionPath(PeerSession session, InetSocketAddress remote, String relayFromAllocationId, long rttMillis) {
+    private boolean validProbeEnvelope(JSONObject probe, SpecusCore.PeerMeshConfig current) {
+        return current != null && validProbeEnvelope(probe, current.clientId);
+    }
+
+    static boolean validProbeEnvelope(JSONObject probe, long localClientId) {
+        if (probe == null || localClientId <= 0L
+                || !(probe.opt("type") instanceof String)
+                || !(probe.opt("token") instanceof String)
+                || !(probe.opt("nonce") instanceof String)
+                || !isIntegralJsonNumber(probe.opt("toClientId"))
+                || !isIntegralJsonNumber(probe.opt("fromClientId"))
+                || !isIntegralJsonNumber(probe.opt("sessionId"))
+                || !isIntegralJsonNumber(probe.opt("sentAtMillis"))
+                || probe.optLong("toClientId", 0L) != localClientId
+                || probe.optLong("fromClientId", 0L) <= 0L
+                || probe.optLong("sessionId", 0L) <= 0L
+                || probe.optLong("sentAtMillis", 0L) <= 0L
+                || isBlank(probe.optString("token", ""))) {
+            return false;
+        }
+        String nonce = probe.optString("nonce", "");
+        String type = probe.optString("type", "");
+        return !isBlank(nonce)
+                && nonce.length() <= 128
+                && ("check".equals(type) || "check-response".equals(type));
+    }
+
+    static boolean probeTimestampWithinWindow(long sentAtMillis, long nowMillis) {
+        if (sentAtMillis <= 0L || nowMillis <= 0L) {
+            return false;
+        }
+        long difference = sentAtMillis >= nowMillis
+                ? sentAtMillis - nowMillis : nowMillis - sentAtMillis;
+        return difference <= PROBE_CLOCK_SKEW_MS;
+    }
+
+    private static long probeReplayExpiry(long sentAtMillis) {
+        return sentAtMillis > Long.MAX_VALUE - PROBE_CLOCK_SKEW_MS
+                ? Long.MAX_VALUE : sentAtMillis + PROBE_CLOCK_SKEW_MS;
+    }
+
+    private static boolean isIntegralJsonNumber(Object value) {
+        return value instanceof Byte
+                || value instanceof Short
+                || value instanceof Integer
+                || value instanceof Long;
+    }
+
+    private boolean ensureSessionKeyReady(PeerSession session) {
+        if (session == null) {
+            return false;
+        }
+        if (session.aesKey == null) {
+            refreshSessionKey(peers.get(session.peerId), session);
+        }
+        return session.aesKey != null;
+    }
+
+    private boolean pendingEndpointMatches(PendingProbe pending,
+                                           InetSocketAddress remote,
+                                           String relayFromAllocationId) {
+        return pending != null && probeEndpointMatches(
+                pending.relay,
+                pending.remote,
+                pending.relayId,
+                pending.remote,
+                remote,
+                relayFromAllocationId);
+    }
+
+    static boolean probeEndpointMatches(boolean relay,
+                                        InetSocketAddress expectedDirect,
+                                        String expectedRelayId,
+                                        InetSocketAddress turnEndpoint,
+                                        InetSocketAddress observedRemote,
+                                        String relayFromAllocationId) {
+        if (observedRemote == null) {
+            return false;
+        }
+        if (!relay) {
+            return isBlank(relayFromAllocationId) && sameEndpoint(expectedDirect, observedRemote);
+        }
+        return !isBlank(relayFromAllocationId)
+                && sameEndpoint(turnEndpoint, observedRemote)
+                && sameEndpoint(parseRelayId(expectedRelayId), parseRelayId(relayFromAllocationId));
+    }
+
+    private static InetSocketAddress parseRelayId(String value) {
+        if (isBlank(value)) {
+            return null;
+        }
+        String normalized = value.trim();
+        if (normalized.startsWith("turn:")) {
+            normalized = normalized.substring("turn:".length());
+        }
+        return parseHostPort(normalized, 0, true);
+    }
+
+    private void markSessionPath(PeerSession session, InetSocketAddress remote,
+                                 String relayFromAllocationId, long rttMillis) {
         if (session == null) {
             return;
         }
         long now = System.currentTimeMillis();
         String pathType;
         String remoteText;
-        if (!isBlank(relayFromAllocationId)) {
-            InetSocketAddress turn = relayEndpoint();
-            session.remoteEndpoint = turn == null ? remote : turn;
-            session.relayTargetAllocationId = relayFromAllocationId;
-            pathType = "RELAY";
-            remoteText = "relay:" + relayFromAllocationId;
-        } else {
-            session.remoteEndpoint = remote;
-            session.relayTargetAllocationId = "";
-            pathType = "DIRECT";
-            remoteText = endpointKey(remote);
+        boolean shouldReport;
+        synchronized (session) {
+            if (!isBlank(relayFromAllocationId)) {
+                InetSocketAddress turn = relayEndpoint();
+                session.remoteEndpoint = turn == null ? remote : turn;
+                session.relayTargetAllocationId = relayFromAllocationId;
+                pathType = "RELAY";
+                remoteText = "relay:" + relayFromAllocationId;
+            } else {
+                if (remote == null) {
+                    return;
+                }
+                InetSocketAddress currentEndpoint = session.remoteEndpoint;
+                boolean same = sameEndpoint(currentEndpoint, remote);
+                boolean currentHealthy = "DIRECT".equals(session.currentPathType)
+                        && currentEndpoint != null
+                        && session.endpointSuccessMillis > 0L
+                        && now - session.endpointSuccessMillis <= DIRECT_STALE_MS;
+                session.bestDirectRtt = smoothRtt(session.bestDirectRtt, rttMillis);
+                if (!shouldAdoptDirectEndpoint(
+                        same, currentHealthy, session.endpointRtt, rttMillis)) {
+                    return;
+                }
+                session.remoteEndpoint = remote;
+                session.relayTargetAllocationId = "";
+                session.endpointSuccessMillis = now;
+                if (rttMillis >= 0L) {
+                    session.endpointRtt = rttMillis;
+                } else if (!same) {
+                    session.endpointRtt = Long.MAX_VALUE;
+                }
+                pathType = "DIRECT";
+                remoteText = endpointKey(remote);
+            }
+            boolean changed = !pathType.equals(session.currentPathType)
+                    || !remoteText.equals(session.lastPathRemoteText);
+            session.currentPathType = pathType;
+            session.lastPathRemoteText = remoteText;
+            if ("DIRECT".equals(pathType)) {
+                session.lastDirectSuccessMillis = now;
+            } else {
+                session.lastRelaySuccessMillis = now;
+                session.bestRelayRtt = smoothRtt(session.bestRelayRtt, rttMillis);
+            }
+            Long reportedSessionId = lastReportedSessionIds.get(session.peerId);
+            boolean newSession = reportedSessionId == null
+                    || reportedSessionId != session.sessionId;
+            shouldReport = newSession || changed
+                    || now - session.lastPathReportMillis >= REPORT_INTERVAL_MS;
+            if (shouldReport) {
+                session.lastPathReportMillis = now;
+                lastReportedSessionIds.put(session.peerId, session.sessionId);
+            }
         }
-        boolean changed = !pathType.equals(session.currentPathType) || !remoteText.equals(session.lastPathRemoteText);
-        session.currentPathType = pathType;
-        session.lastPathRemoteText = remoteText;
-        if ("DIRECT".equals(pathType)) {
-            session.lastDirectSuccessMillis = now;
-            session.bestDirectRtt = smoothRtt(session.bestDirectRtt, rttMillis);
-        } else {
-            session.lastRelaySuccessMillis = now;
-            session.bestRelayRtt = smoothRtt(session.bestRelayRtt, rttMillis);
-        }
-        Long reportedSessionId = lastReportedSessionIds.get(session.peerId);
-        boolean newSession = reportedSessionId == null || reportedSessionId != session.sessionId;
-        if (newSession || changed || now - session.lastPathReportMillis >= REPORT_INTERVAL_MS) {
+        if (shouldReport) {
             reportPath(session, pathType, localEndpointText(pathType), remoteText, rttMillis);
-            session.lastPathReportMillis = now;
-            lastReportedSessionIds.put(session.peerId, session.sessionId);
         }
+    }
+
+    static boolean shouldAdoptDirectEndpoint(boolean sameEndpoint,
+                                             boolean currentHealthy,
+                                             long currentRttMillis,
+                                             long candidateRttMillis) {
+        if (sameEndpoint || !currentHealthy) {
+            return true;
+        }
+        if (candidateRttMillis < 0L) {
+            return false;
+        }
+        if (currentRttMillis == Long.MAX_VALUE) {
+            return true;
+        }
+        return currentRttMillis > RTT_HYSTERESIS_MS
+                && candidateRttMillis < currentRttMillis - RTT_HYSTERESIS_MS;
     }
 
     private void preparePath(PeerInfo peer, PeerSession session) {
@@ -1177,40 +1580,258 @@ final class PeerMeshEngine implements Closeable {
         if (peer == null || session == null || config == null) {
             return;
         }
-        List<InetSocketAddress> targets = directCandidates(peer.candidates);
-        if (targets.isEmpty() && session.remoteEndpoint != null) {
-            targets = List.of(session.remoteEndpoint);
-        }
-        for (InetSocketAddress target : targets) {
-            for (int i = 0; i < 3; i++) {
-                try {
-                    JSONObject probe = new JSONObject();
-                    probe.put("magic", PROBE_MAGIC);
-                    probe.put("type", "check");
-                    probe.put("sessionId", session.sessionId);
-                    probe.put("fromClientId", config.clientId);
-                    probe.put("toClientId", peer.clientId);
-                    probe.put("nonce", UUID.randomUUID().toString().replace("-", ""));
-                    probe.put("token", session.token);
-                    probe.put("sentAtMillis", System.currentTimeMillis());
-                    sendUdpJson(probe, target);
-                } catch (Exception e) {
-                    publish("Peer probe failed", e.getMessage());
+        List<PeerCandidate> ordered = new ArrayList<>(demoteSameNatReflexiveCandidates(
+                peer.candidates, localReflexiveAddresses()));
+        ordered.sort((left, right) -> Long.compare(right.priority, left.priority));
+        LinkedHashSet<String> scheduledEndpoints = new LinkedHashSet<>();
+        long delayMillis = 0L;
+        for (PeerCandidate candidate : ordered) {
+            if (!isDirectUdpCandidate(candidate)) {
+                continue;
+            }
+            if (scheduledEndpoints.add(candidate.address + ":" + candidate.port)) {
+                sendUdpProbePaced(session, candidate, delayMillis);
+                delayMillis += CONNECTIVITY_CHECK_PACING_MS;
+            }
+            for (Integer predictedPort : adaptivePredictedPorts(
+                    candidate, peer.candidates, localReflexivePorts())) {
+                PeerCandidate predicted = copyCandidate(candidate);
+                predicted.port = predictedPort;
+                predicted.foundation = "adaptive-port-predict";
+                if (scheduledEndpoints.add(predicted.address + ":" + predicted.port)) {
+                    sendUdpProbePaced(session, predicted, delayMillis);
+                    delayMillis += CONNECTIVITY_CHECK_PACING_MS;
                 }
             }
         }
+        if (scheduledEndpoints.isEmpty() && session.remoteEndpoint != null) {
+            PeerCandidate fallback = new PeerCandidate();
+            fallback.type = "host";
+            fallback.transport = "udp";
+            fallback.address = session.remoteEndpoint.getHostString();
+            fallback.port = session.remoteEndpoint.getPort();
+            fallback.foundation = "known-endpoint";
+            sendUdpProbePaced(session, fallback, 0L);
+        }
         for (PeerCandidate candidate : relayCandidates(peer.candidates)) {
-            if (isBlank(candidate.relayId)) {
-                continue;
-            }
-            try {
-                JSONObject probe = buildProbe(peer, session);
-                sendRelayPayload(candidate.relayId, probe.toString().getBytes(StandardCharsets.UTF_8));
-            } catch (Exception e) {
-                publish("Peer relay probe failed", e.getMessage());
-            }
+            sendUdpProbePaced(session, candidate, delayMillis);
+            delayMillis += CONNECTIVITY_CHECK_PACING_MS;
         }
         scheduleHolePunchRetries(session);
+    }
+
+    private void sendUdpProbePaced(PeerSession session, PeerCandidate candidate, long delayMillis) {
+        if (delayMillis <= 0L) {
+            sendUdpProbe(session, candidate);
+            return;
+        }
+        long sessionId = session.sessionId;
+        try {
+            pathMtuScheduler.schedule(() -> {
+                PeerSession current = sessionsById.get(sessionId);
+                if (!enabled.get() || current != session || current.isExpired(System.currentTimeMillis())) {
+                    return;
+                }
+                sendUdpProbe(current, candidate);
+            }, delayMillis, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // Engine shutdown raced with a paced probe.
+        }
+    }
+
+    private void sendUdpProbe(PeerSession session, PeerCandidate candidate) {
+        DatagramSocket socket = udpSocket;
+        SpecusCore.PeerMeshConfig current = config;
+        if (!enabled.get() || socket == null || socket.isClosed() || current == null || session == null
+                || candidate == null || session.isExpired(System.currentTimeMillis())) {
+            return;
+        }
+        boolean relay = "relay".equalsIgnoreCase(candidate.type);
+        String relayTarget = relay ? candidate.relayId : "";
+        try {
+            InetSocketAddress remote = relay
+                    ? relayEndpoint()
+                    : new InetSocketAddress(candidate.address, candidate.port);
+            if (remote == null || remote.getPort() <= 0) {
+                return;
+            }
+            if (!relay) {
+                sendDirectProbeAttempt(socket, session, remote);
+                scheduleProbeBurst(socket, remote, session);
+                return;
+            }
+            String nonce = UUID.randomUUID().toString().replace("-", "");
+            long sentAtMillis = System.currentTimeMillis();
+            JSONObject probe = buildProbe(session, nonce, sentAtMillis);
+            byte[] bytes = probe.toString().getBytes(StandardCharsets.UTF_8);
+            PendingProbe pending = new PendingProbe(
+                    session.sessionId, session.peerId, sentAtMillis, remote, relay, relayTarget);
+            pendingProbes.put(nonce, pending);
+            if (isBlank(relayTarget) || !sendRelayPayload(relayTarget, bytes)) {
+                pendingProbes.remove(nonce, pending);
+            }
+        } catch (Exception e) {
+            publish("Peer probe failed", e.getMessage());
+        }
+    }
+
+    private void scheduleProbeBurst(DatagramSocket socket,
+                                    InetSocketAddress remote,
+                                    PeerSession session) {
+        for (int index = 1; index < PROBE_BURST_COUNT; index++) {
+            long delayMillis = PROBE_BURST_INTERVAL_MS * index;
+            try {
+                pathMtuScheduler.schedule(() -> {
+                    if (!enabled.get() || socket.isClosed()
+                            || sessionsById.get(session.sessionId) != session
+                            || session.isExpired(System.currentTimeMillis())) {
+                        return;
+                    }
+                    sendDirectProbeAttempt(socket, session, remote);
+                }, delayMillis, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException ignored) {
+                return;
+            }
+        }
+    }
+
+    private void sendDirectProbeAttempt(DatagramSocket socket,
+                                        PeerSession session,
+                                        InetSocketAddress remote) {
+        String nonce = UUID.randomUUID().toString().replace("-", "");
+        long sentAtMillis = System.currentTimeMillis();
+        PendingProbe pending = new PendingProbe(
+                session.sessionId, session.peerId, sentAtMillis, remote, false, "");
+        try {
+            JSONObject probe = buildProbe(session, nonce, sentAtMillis);
+            byte[] bytes = probe.toString().getBytes(StandardCharsets.UTF_8);
+            pendingProbes.put(nonce, pending);
+            socket.send(new DatagramPacket(bytes, bytes.length, remote));
+        } catch (Exception error) {
+            pendingProbes.remove(nonce, pending);
+            publish("Peer probe retry failed",
+                    "session=" + session.sessionId + " " + error.getMessage());
+        }
+    }
+
+    static List<Integer> adaptivePredictedPorts(PeerCandidate candidate,
+                                                List<PeerCandidate> allCandidates,
+                                                List<Integer> localReflexivePorts) {
+        if (!isDirectUdpCandidate(candidate)) {
+            return List.of();
+        }
+        List<Integer> sameAddressPorts = new ArrayList<>();
+        if (allCandidates != null) {
+            for (PeerCandidate item : allCandidates) {
+                if (isDirectUdpCandidate(item) && equals(candidate.address, item.address)) {
+                    addUniquePort(sameAddressPorts, item.port);
+                }
+            }
+        }
+        Collections.sort(sameAddressPorts);
+        List<Integer> deltas = deltasFromPorts(sameAddressPorts);
+        if (deltas.isEmpty()) {
+            List<Integer> localPorts = new ArrayList<>();
+            if (localReflexivePorts != null) {
+                for (Integer port : localReflexivePorts) {
+                    if (port != null) {
+                        addUniquePort(localPorts, port);
+                    }
+                }
+            }
+            Collections.sort(localPorts);
+            deltas = deltasFromPorts(localPorts);
+        }
+        List<Integer> predicted = new ArrayList<>();
+        for (Integer delta : deltas) {
+            if (delta == null || delta <= 0 || delta > MAX_ADAPTIVE_PORT_DELTA) {
+                continue;
+            }
+            addPredictedPort(predicted, candidate.port + delta, candidate.port);
+            addPredictedPort(predicted, candidate.port - delta, candidate.port);
+            if (predicted.size() >= MAX_ADAPTIVE_PREDICTED_PORTS) {
+                break;
+            }
+        }
+        return predicted.size() <= MAX_ADAPTIVE_PREDICTED_PORTS
+                ? predicted
+                : new ArrayList<>(predicted.subList(0, MAX_ADAPTIVE_PREDICTED_PORTS));
+    }
+
+    private static List<Integer> deltasFromPorts(List<Integer> ports) {
+        if (ports == null || ports.size() < 2) {
+            return List.of();
+        }
+        List<Integer> deltas = new ArrayList<>();
+        for (int index = 1; index < ports.size(); index++) {
+            int delta = Math.abs(ports.get(index) - ports.get(index - 1));
+            if (delta > 0 && delta <= MAX_ADAPTIVE_PORT_DELTA && !deltas.contains(delta)) {
+                deltas.add(delta);
+            }
+        }
+        return deltas;
+    }
+
+    private static void addUniquePort(List<Integer> ports, int port) {
+        if (port > 0 && port <= 65_535 && !ports.contains(port)) {
+            ports.add(port);
+        }
+    }
+
+    private static void addPredictedPort(List<Integer> ports, int port, int basePort) {
+        if (ports.size() >= MAX_ADAPTIVE_PREDICTED_PORTS
+                || port <= 0 || port > 65_535 || port == basePort || ports.contains(port)) {
+            return;
+        }
+        ports.add(port);
+    }
+
+    private static boolean isDirectUdpCandidate(PeerCandidate candidate) {
+        return candidate != null
+                && "udp".equalsIgnoreCase(candidate.transport)
+                && !"relay".equalsIgnoreCase(candidate.type)
+                && !isBlank(candidate.address)
+                && candidate.port > 0
+                && candidate.port <= 65_535;
+    }
+
+    private Set<String> localReflexiveAddresses() {
+        Set<String> addresses = new LinkedHashSet<>();
+        for (PeerCandidate candidate : serverReflexiveCandidates.values()) {
+            if (candidate != null && !isBlank(candidate.address)) {
+                addresses.add(candidate.address);
+            }
+        }
+        return addresses;
+    }
+
+    private List<Integer> localReflexivePorts() {
+        List<Integer> ports = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        serverReflexiveObservedAt.entrySet().removeIf(
+                entry -> now - entry.getValue() > SRFLX_OBSERVATION_TTL_MS);
+        for (Map.Entry<String, PeerCandidate> entry : serverReflexiveCandidates.entrySet()) {
+            PeerCandidate candidate = entry.getValue();
+            Long observedAt = serverReflexiveObservedAt.get(entry.getKey());
+            if (candidate != null && observedAt != null
+                    && now - observedAt <= SRFLX_OBSERVATION_TTL_MS) {
+                addUniquePort(ports, candidate.port);
+            }
+        }
+        return ports;
+    }
+
+    private static PeerCandidate copyCandidate(PeerCandidate source) {
+        PeerCandidate copy = new PeerCandidate();
+        copy.type = source.type;
+        copy.transport = source.transport;
+        copy.address = source.address;
+        copy.port = source.port;
+        copy.priority = source.priority;
+        copy.foundation = source.foundation;
+        copy.relayId = source.relayId;
+        copy.addressFamily = source.addressFamily;
+        return copy;
     }
 
     /**
@@ -1286,16 +1907,16 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
-    private JSONObject buildProbe(PeerInfo peer, PeerSession session) throws Exception {
+    private JSONObject buildProbe(PeerSession session, String nonce, long sentAtMillis) throws Exception {
         JSONObject probe = new JSONObject();
         probe.put("magic", PROBE_MAGIC);
         probe.put("type", "check");
         probe.put("sessionId", session.sessionId);
         probe.put("fromClientId", config.clientId);
-        probe.put("toClientId", peer.clientId);
-        probe.put("nonce", UUID.randomUUID().toString().replace("-", ""));
+        probe.put("toClientId", session.peerId);
+        probe.put("nonce", nonce);
         probe.put("token", session.token);
-        probe.put("sentAtMillis", System.currentTimeMillis());
+        probe.put("sentAtMillis", sentAtMillis);
         return probe;
     }
 
@@ -1384,6 +2005,10 @@ final class PeerMeshEngine implements Closeable {
         } catch (Exception ignored) {
         }
         result.addAll(serverReflexiveCandidates.values());
+        PeerCandidate portMap = portMapCandidate;
+        if (portMap != null) {
+            result.add(portMap);
+        }
         PeerCandidate relay = relayCandidate;
         if (relay != null) {
             result.add(relay);
@@ -1398,14 +2023,17 @@ final class PeerMeshEngine implements Closeable {
         long now = System.currentTimeMillis();
         if (now - lastStunCandidateRequestMillis >= STUN_REQUEST_INTERVAL_MS) {
             lastStunCandidateRequestMillis = now;
-            InetSocketAddress stun = stunEndpoint();
-            if (stun != null) {
-                sendStunBinding(stun, false);
+            Set<String> requested = new LinkedHashSet<>();
+            for (InetSocketAddress stun : stunEndpoints()) {
+                if (requested.add(endpointKey(stun))) {
+                    sendStunBinding(stun, false);
+                }
             }
             for (String item : config.publicStunServers == null ? List.<String>of() : config.publicStunServers) {
-                InetSocketAddress publicStun = parseStunServer(item);
-                if (publicStun != null) {
-                    sendStunBinding(publicStun, true);
+                for (InetSocketAddress publicStun : parseStunServers(item)) {
+                    if (requested.add(endpointKey(publicStun))) {
+                        sendStunBinding(publicStun, true);
+                    }
                 }
             }
         }
@@ -1591,6 +2219,14 @@ final class PeerMeshEngine implements Closeable {
         long now = System.currentTimeMillis();
         pendingStunBindings.entrySet().removeIf(
                 entry -> now - entry.getValue().sentAtMillis > TURN_REQUEST_TTL_MS);
+    }
+
+    private void removeExpiredProbes() {
+        long now = System.currentTimeMillis();
+        pendingProbes.entrySet().removeIf(
+                entry -> now - entry.getValue().sentAtMillis > PENDING_PROBE_TTL_MS);
+        receivedProbeNonces.cleanup(now);
+        udpProbeRateLimiter.cleanup(now);
     }
 
     private StunMessage.Attribute[] authenticatedTurnAttributes(StunMessage.Attribute... attributes) {
@@ -2093,16 +2729,21 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private InetSocketAddress stunEndpoint() {
+        List<InetSocketAddress> endpoints = stunEndpoints();
+        return endpoints.isEmpty() ? null : endpoints.get(0);
+    }
+
+    private List<InetSocketAddress> stunEndpoints() {
         SpecusCore.PeerMeshConfig current = config;
         if (current == null) {
-            return null;
+            return List.of();
         }
         String host = isBlank(current.stunHost) ? current.turnHost : current.stunHost;
         int port = current.stunPort > 0 ? current.stunPort : current.turnPort;
         if (isBlank(host) || port <= 0) {
-            return null;
+            return List.of();
         }
-        return new InetSocketAddress(host, port);
+        return resolveEndpoints(host, port);
     }
 
     private InetSocketAddress relayEndpoint() {
@@ -2113,9 +2754,9 @@ final class PeerMeshEngine implements Closeable {
         return new InetSocketAddress(current.turnHost, current.turnPort);
     }
 
-    private InetSocketAddress parseStunServer(String value) {
+    private List<InetSocketAddress> parseStunServers(String value) {
         if (isBlank(value)) {
-            return null;
+            return List.of();
         }
         String normalized = value.trim();
         String lower = normalized.toLowerCase(Locale.ROOT);
@@ -2124,7 +2765,35 @@ final class PeerMeshEngine implements Closeable {
         } else if (lower.startsWith("stun:")) {
             normalized = normalized.substring("stun:".length());
         }
-        return parseHostPort(normalized, 3478, false);
+        int slash = normalized.indexOf('/');
+        if (slash >= 0) {
+            normalized = normalized.substring(0, slash);
+        }
+        InetSocketAddress parsed = parseHostPort(normalized, 3478, false);
+        return parsed == null ? List.of() : resolveEndpoints(parsed.getHostString(), parsed.getPort());
+    }
+
+    static List<InetSocketAddress> resolveEndpoints(String host, int port) {
+        if (isBlank(host) || port <= 0 || port > 65_535) {
+            return List.of();
+        }
+        try {
+            List<InetAddress> addresses = new ArrayList<>(Arrays.asList(InetAddress.getAllByName(host)));
+            addresses.removeIf(address -> !(address instanceof Inet4Address) && !(address instanceof Inet6Address));
+            addresses.sort(Comparator
+                    .comparingInt((InetAddress address) -> address instanceof Inet4Address ? 0 : 1)
+                    .thenComparing(InetAddress::getHostAddress));
+            List<InetSocketAddress> endpoints = new ArrayList<>();
+            for (InetAddress address : addresses) {
+                InetSocketAddress endpoint = new InetSocketAddress(address, port);
+                if (!endpoints.contains(endpoint)) {
+                    endpoints.add(endpoint);
+                }
+            }
+            return endpoints;
+        } catch (Exception ignored) {
+            return List.of();
+        }
     }
 
     private InetSocketAddress parseEndpoint(String value) {
@@ -2306,8 +2975,12 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private void keepaliveActivePaths() {
+        long now = System.currentTimeMillis();
         for (PeerSession session : sessions.values()) {
-            if (session == null || session.isExpired(System.currentTimeMillis())) {
+            if (session == null || session.isExpired(now)) {
+                continue;
+            }
+            if (session.hasHealthyDirect(now) && "DIRECT".equals(session.currentPathType)) {
                 continue;
             }
             PeerInfo peer = peers.get(session.peerId);
@@ -2339,14 +3012,6 @@ final class PeerMeshEngine implements Closeable {
         return first == 0 || first >= 224;
     }
 
-    private JSONObject tryJson(byte[] data) {
-        try {
-            return new JSONObject(new String(data, StandardCharsets.UTF_8));
-        } catch (Exception ignored) {
-            return null;
-        }
-    }
-
     private void stop() {
         reportDevice("STOPPED", "");
         enabled.set(false);
@@ -2355,10 +3020,17 @@ final class PeerMeshEngine implements Closeable {
         if (maintenance != null) {
             maintenance.interrupt();
         }
+        ScheduledFuture<?> keepalive = directKeepaliveTask;
+        directKeepaliveTask = null;
+        if (keepalive != null) {
+            keepalive.cancel(false);
+        }
         peers.clear();
         peersByVirtualIp.clear();
         sessions.clear();
         sessionsById.clear();
+        pendingProbes.clear();
+        receivedProbeNonces.clear();
         lastReportedSessionIds.clear();
         peerKeyEpochs.clear();
         pendingPackets.clear();
@@ -2368,6 +3040,7 @@ final class PeerMeshEngine implements Closeable {
         pendingMessageAcks.clear();
         pathMtuCache.clear();
         serverReflexiveCandidates.clear();
+        serverReflexiveObservedAt.clear();
         pendingStunBindings.clear();
         pendingTurnRequests.clear();
         turnPermissions.clear();
@@ -2377,6 +3050,7 @@ final class PeerMeshEngine implements Closeable {
         relayCandidate = null;
         relayAllocationId = null;
         relayAllocationExpiresAtMillis = 0L;
+        releasePortMapping();
         lastStunCandidateRequestMillis = 0L;
         lastRelayCandidateRequestMillis = 0L;
         lastBehaviorDiscoveryStartedMillis = 0L;
@@ -2602,6 +3276,119 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
+    private static final class PendingProbe {
+        final long sessionId;
+        final long peerId;
+        final long sentAtMillis;
+        final InetSocketAddress remote;
+        final boolean relay;
+        final String relayId;
+
+        PendingProbe(long sessionId,
+                     long peerId,
+                     long sentAtMillis,
+                     InetSocketAddress remote,
+                     boolean relay,
+                     String relayId) {
+            this.sessionId = sessionId;
+            this.peerId = peerId;
+            this.sentAtMillis = sentAtMillis;
+            this.remote = remote;
+            this.relay = relay;
+            this.relayId = relayId == null ? "" : relayId;
+        }
+    }
+
+    private void keepaliveDirectPaths() {
+        long now = System.currentTimeMillis();
+        for (PeerSession session : sessions.values()) {
+            if (session == null
+                    || session.isExpired(now)
+                    || !session.hasHealthyDirect(now)
+                    || !"DIRECT".equals(session.currentPathType)
+                    || session.remoteEndpoint == null
+                    || now - session.lastDirectKeepaliveMillis < DIRECT_KEEPALIVE_INTERVAL_MS) {
+                continue;
+            }
+            PeerCandidate keepalive = new PeerCandidate();
+            keepalive.type = "host";
+            keepalive.transport = "udp";
+            keepalive.address = session.remoteEndpoint.getHostString();
+            keepalive.port = session.remoteEndpoint.getPort();
+            keepalive.foundation = "direct-keepalive";
+            sendUdpProbe(session, keepalive);
+            session.lastDirectKeepaliveMillis = now;
+        }
+    }
+
+    /** Prevents an acquire/renew result from being installed after stop invalidated its attempt. */
+    static final class PortMappingCommitGate {
+        private long generation;
+
+        synchronized long snapshot() {
+            return generation;
+        }
+
+        synchronized boolean commit(long expectedGeneration,
+                                    BooleanSupplier stillCurrent,
+                                    Runnable install) {
+            if (generation != expectedGeneration || !stillCurrent.getAsBoolean()) {
+                return false;
+            }
+            install.run();
+            return true;
+        }
+
+        synchronized void invalidate() {
+            generation++;
+        }
+    }
+
+    static final class ProbeReplayCache {
+        private final int maximumEntries;
+        private final Map<String, Long> entries = new HashMap<>();
+
+        ProbeReplayCache(int maximumEntries) {
+            if (maximumEntries <= 0) {
+                throw new IllegalArgumentException("probe replay cache limit must be positive");
+            }
+            this.maximumEntries = maximumEntries;
+        }
+
+        synchronized boolean accept(String key, long expiresAtMillis, long nowMillis) {
+            if (isBlank(key) || expiresAtMillis < nowMillis) {
+                return false;
+            }
+            Long existing = entries.get(key);
+            if (existing != null && existing >= nowMillis) {
+                return false;
+            }
+            if (existing != null) {
+                entries.remove(key);
+            }
+            if (entries.size() >= maximumEntries) {
+                cleanup(nowMillis);
+                if (entries.size() >= maximumEntries) {
+                    return false;
+                }
+            }
+            entries.put(key, expiresAtMillis);
+            return true;
+        }
+
+        synchronized void cleanup(long nowMillis) {
+            entries.entrySet().removeIf(entry -> entry.getValue() < nowMillis);
+        }
+
+        synchronized void clear() {
+            entries.clear();
+        }
+
+        synchronized int size() {
+            return entries.size();
+        }
+    }
+
     static final class PeerSession {
         final long peerId;
         final long sessionId;
@@ -2621,7 +3408,10 @@ final class PeerMeshEngine implements Closeable {
         volatile DataFrameCodec.TrafficCodec inboundCodec;
         volatile InetSocketAddress remoteEndpoint;
         volatile String relayTargetAllocationId = "";
+        volatile long endpointSuccessMillis;
+        volatile long endpointRtt = Long.MAX_VALUE;
         volatile long lastDirectSuccessMillis;
+        volatile long lastDirectKeepaliveMillis;
         volatile long lastRelaySuccessMillis;
         volatile long lastPathReportMillis;
         volatile String lastPathRemoteText = "";
@@ -2649,9 +3439,12 @@ final class PeerMeshEngine implements Closeable {
             }
             remoteEndpoint = previous.remoteEndpoint;
             relayTargetAllocationId = previous.relayTargetAllocationId;
+            endpointSuccessMillis = previous.endpointSuccessMillis;
+            endpointRtt = previous.endpointRtt;
             pathReady = previous.pathReady;
             directBytesSinceReport.addAndGet(previous.drainDirectBytes());
             lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
+            lastDirectKeepaliveMillis = previous.lastDirectKeepaliveMillis;
             lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
             lastPathReportMillis = previous.lastPathReportMillis;
             lastPathRemoteText = previous.lastPathRemoteText;

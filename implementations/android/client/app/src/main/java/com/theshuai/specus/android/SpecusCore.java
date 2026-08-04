@@ -6,13 +6,6 @@ import android.os.Build;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.WebSocket;
-import okhttp3.WebSocketListener;
-import okio.ByteString;
-
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.HostnameVerifier;
@@ -24,11 +17,11 @@ import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
-import javax.net.SocketFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -42,8 +35,6 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -53,6 +44,7 @@ import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -66,7 +58,9 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ExecutorService;
@@ -459,6 +453,33 @@ public final class SpecusCore {
         }
     }
 
+    /**
+     * Serializes the one-shot upstream start transition with cancellation.
+     *
+     * <p>The start action deliberately runs while holding the gate. Therefore, once
+     * {@link #close()} returns, a delayed worker can no longer invoke its start action. If start
+     * wins first, the owner can still close the now-published transport normally.</p>
+     */
+    static final class StartCloseGate {
+        private boolean closed;
+
+        synchronized boolean start(Runnable action) {
+            if (closed) {
+                return false;
+            }
+            action.run();
+            return true;
+        }
+
+        synchronized boolean close() {
+            if (closed) {
+                return false;
+            }
+            closed = true;
+            return true;
+        }
+    }
+
     static final class StartupConfig {
         final String serverBaseUrl;
         final String apiKey;
@@ -663,7 +684,7 @@ public final class SpecusCore {
             roots.load(null, null);
             CertificateFactory certificates = CertificateFactory.getInstance("X.509");
             int index = 0;
-            try (InputStream input = Files.newInputStream(Path.of(config.caCertificatePath))) {
+            try (InputStream input = new FileInputStream(config.caCertificatePath)) {
                 for (Certificate certificate : certificates.generateCertificates(input)) {
                     roots.setCertificateEntry("control-ca-" + index++, certificate);
                 }
@@ -1208,7 +1229,7 @@ public final class SpecusCore {
         private final ConcurrentHashMap<Integer, LocalSpecus> localSpecusMappings = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, LocalWebSocketSpecus> localWebSockets = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, HttpStreamForwarder> httpStreams = new ConcurrentHashMap<>();
-        private final ConcurrentHashMap<Integer, StreamSendWindow> sendWindows = new ConcurrentHashMap<>();
+        private final StreamFlowScheduler streamFlow = new StreamFlowScheduler();
         private final StreamLifecycleRegistry streamLifecycle =
                 new StreamLifecycleRegistry(PENDING_STREAM_LIMIT, RECENTLY_CLOSED_STREAM_LIMIT);
         private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -1232,7 +1253,6 @@ public final class SpecusCore {
         private volatile AppMessageListener appMessageListener;
         private volatile ControlExitAction exitAction = ControlExitAction.RETRY_WITH_BACKOFF;
         private volatile String exitReason = "control channel closed";
-        private final OkHttpClient webSocketClient;
 
         ControlConnection(SpecusSession session, ExecutorService ioPool, StatusSink status,
                           AtomicBoolean running, VpnPlatform vpnPlatform,
@@ -1243,7 +1263,6 @@ public final class SpecusCore {
             this.running = running;
             this.vpnPlatform = vpnPlatform;
             this.sessionRefresher = sessionRefresher;
-            this.webSocketClient = WebSocketSupport.newClient(this::protect);
             this.peerMeshEngine = new PeerMeshEngine(session, vpnPlatform, ioPool, this::sendPeerControl, status::publish,
                     this::dispatchAppMessage);
         }
@@ -1512,7 +1531,7 @@ public final class SpecusCore {
                 if (localSpecusMappings.containsKey(packet.streamId)
                         || localWebSockets.containsKey(packet.streamId)
                         || httpStreams.containsKey(packet.streamId)
-                        || sendWindows.containsKey(packet.streamId)) {
+                        || streamFlow.contains(packet.streamId)) {
                     sendReset(packet.streamId, 7, "duplicate OPEN");
                     return;
                 }
@@ -1523,7 +1542,7 @@ public final class SpecusCore {
                     sendReset(packet.streamId, 7, "duplicate or excessive pending stream");
                     return;
                 }
-                if (sendWindows.putIfAbsent(packet.streamId, new StreamSendWindow()) != null) {
+                if (!streamFlow.open(packet.streamId)) {
                     streamLifecycle.markClosed(packet.streamId);
                     sendReset(packet.streamId, 7, "duplicate OPEN");
                     return;
@@ -1572,7 +1591,9 @@ public final class SpecusCore {
                         webSocket.failFromRemote("invalid SWS2 DATA: " + message(error));
                         return;
                     }
-                    sendWindowUpdate(packet.streamId, consumed);
+                    if (consumed > 0) {
+                        sendWindowUpdate(packet.streamId, consumed);
+                    }
                     if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
                         closeSendWindow(packet.streamId);
                         webSocket.closeFromRemote();
@@ -1644,8 +1665,8 @@ public final class SpecusCore {
                         + Integer.toUnsignedString(packet.streamId));
             }
             if (packet.type == NatMessageType.WINDOW_UPDATE) {
-                StreamSendWindow window = sendWindows.get(packet.streamId);
-                if (window != null && !window.add(packet.value)) {
+                if (streamFlow.contains(packet.streamId)
+                        && !streamFlow.addCredit(packet.streamId, packet.value)) {
                     throw new IOException("invalid WINDOW_UPDATE credit");
                 }
                 return;
@@ -1657,10 +1678,7 @@ public final class SpecusCore {
         }
 
         private void closeSendWindow(int streamId) {
-            StreamSendWindow window = sendWindows.remove(streamId);
-            if (window != null) {
-                window.close();
-            }
+            streamFlow.closeStream(streamId);
         }
 
         private void openHttpStream(int streamId, Map<String, Object> metadata) throws Exception {
@@ -1769,13 +1787,11 @@ public final class SpecusCore {
         }
 
         void sendNatData(int streamId, byte[] data) throws Exception {
-            consumeSendCredit(streamId, data == null ? 0 : data.length);
-            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
+            sendStreamData(streamId, data);
         }
 
         void sendWsData(int streamId, byte[] data) throws Exception {
-            consumeSendCredit(streamId, data == null ? 0 : data.length);
-            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
+            sendStreamData(streamId, data);
         }
 
         void sendHttpHead(int streamId, int statusCode, List<String> headers,
@@ -1792,8 +1808,7 @@ public final class SpecusCore {
         }
 
         void sendHttpData(int streamId, byte[] data) throws Exception {
-            consumeSendCredit(streamId, data == null ? 0 : data.length);
-            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
+            sendStreamData(streamId, data);
         }
 
         void sendHttpFin(int streamId, List<String> trailers) throws Exception {
@@ -1801,7 +1816,7 @@ public final class SpecusCore {
             if (trailers != null && !trailers.isEmpty()) {
                 fin.meta = Map.of("trailers", trailers);
             }
-            send(fin);
+            streamFlow.finish(streamId, () -> sendData(fin));
         }
 
         void returnHttpRequestCredit(int streamId, int credit) throws Exception {
@@ -1872,11 +1887,10 @@ public final class SpecusCore {
             streamLifecycle.markOpened(streamId);
         }
 
-        private void consumeSendCredit(int streamId, int bytes) throws IOException {
-            StreamSendWindow window = sendWindows.get(streamId);
-            if (window == null || !window.consume(bytes)) {
-                throw new IOException("stream send window closed");
-            }
+        private void sendStreamData(int streamId, byte[] data) throws Exception {
+            byte[] payload = data == null ? new byte[0] : data;
+            NatMessage packet = Packet.stream(NatMessageType.DATA, streamId, 0, payload);
+            streamFlow.send(streamId, payload.length, () -> sendData(packet));
         }
 
         void protect(Socket socket) throws IOException {
@@ -1886,22 +1900,15 @@ public final class SpecusCore {
         }
 
         void sendFin(int streamId) throws Exception {
-            StreamSendWindow window = sendWindows.remove(streamId);
-            if (window != null) {
-                window.close();
-            }
-            send(Packet.stream(NatMessageType.FIN, streamId, 0, null));
+            NatMessage fin = Packet.stream(NatMessageType.FIN, streamId, 0, null);
+            streamFlow.finish(streamId, () -> sendData(fin));
         }
 
         private void sendReset(int streamId, long errorCode, String reason) throws Exception {
-            StreamSendWindow window = sendWindows.remove(streamId);
-            if (window != null) {
-                window.close();
-            }
             NatMessage reset = Packet.stream(NatMessageType.RST, streamId, errorCode, null);
             reset.meta = Map.of("reason", reason);
             try {
-                send(reset);
+                streamFlow.reset(streamId, () -> sendData(reset));
             } finally {
                 streamLifecycle.markClosed(streamId);
             }
@@ -1934,7 +1941,7 @@ public final class SpecusCore {
                         asString(meta.get("relativePath")),
                         asString(meta.get("rawQuery")));
                 LocalWebSocketSpecus specus = new LocalWebSocketSpecus(
-                        streamId, channelId, target, meta.get("headers"), this, webSocketClient);
+                        streamId, channelId, target, meta.get("headers"), this);
                 LocalWebSocketSpecus replaced = localWebSockets.put(streamId, specus);
                 if (replaced != null) {
                     replaced.closeFromControl();
@@ -2029,53 +2036,8 @@ public final class SpecusCore {
                 stream.closeFromControl();
             }
             httpStreams.clear();
-            for (StreamSendWindow window : sendWindows.values()) {
-                window.close();
-            }
-            sendWindows.clear();
+            streamFlow.close();
             streamLifecycle.clear();
-            webSocketClient.dispatcher().executorService().shutdown();
-            webSocketClient.connectionPool().evictAll();
-        }
-    }
-
-    private static final class StreamSendWindow {
-        private static final long INITIAL_BYTES = 1024L * 1024L;
-        private static final long MAXIMUM_BYTES = 16L * 1024L * 1024L;
-        private long credit = INITIAL_BYTES;
-        private boolean closed;
-
-        synchronized boolean consume(int bytes) throws IOException {
-            if (bytes <= 0 || bytes > MAXIMUM_BYTES) {
-                return false;
-            }
-            while (!closed && credit < bytes) {
-                try {
-                    wait();
-                } catch (InterruptedException error) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("interrupted while waiting for stream credit", error);
-                }
-            }
-            if (closed) {
-                return false;
-            }
-            credit -= bytes;
-            return true;
-        }
-
-        synchronized boolean add(long bytes) {
-            if (closed || bytes <= 0 || bytes > MAXIMUM_BYTES || credit > MAXIMUM_BYTES - bytes) {
-                return false;
-            }
-            credit += bytes;
-            notifyAll();
-            return true;
-        }
-
-        synchronized void close() {
-            closed = true;
-            notifyAll();
         }
     }
 
@@ -2365,20 +2327,6 @@ public final class SpecusCore {
         private WebSocketSupport() {
         }
 
-        interface SocketProtector {
-            void protect(Socket socket) throws IOException;
-        }
-
-        static OkHttpClient newClient(SocketProtector protector) {
-            return new OkHttpClient.Builder()
-                    .socketFactory(new ProtectedSocketFactory(protector))
-                    .connectTimeout(5, TimeUnit.SECONDS)
-                    .readTimeout(0, TimeUnit.MILLISECONDS)
-                    .writeTimeout(20, TimeUnit.SECONDS)
-                    .retryOnConnectionFailure(false)
-                    .build();
-        }
-
         static URI buildTarget(String targetBaseUrl, String relativePath, String rawQuery) {
             if (isBlank(targetBaseUrl)) {
                 throw new IllegalArgumentException("HTTP route is not configured");
@@ -2407,26 +2355,6 @@ public final class SpecusCore {
             return URI.create(webSocketScheme + serialized.substring(serialized.indexOf(':')));
         }
 
-        static void copyHandshakeHeaders(Object headers, Request.Builder request) {
-            if (!(headers instanceof Iterable<?> values)) {
-                return;
-            }
-            for (Object item : values) {
-                if (!(item instanceof String line)) {
-                    continue;
-                }
-                int separator = line.indexOf(':');
-                if (separator <= 0) {
-                    continue;
-                }
-                String name = line.substring(0, separator).trim();
-                if (name.isEmpty() || SKIPPED_HEADERS.contains(name.toLowerCase(Locale.ROOT))) {
-                    continue;
-                }
-                request.addHeader(name, line.substring(separator + 1).trim());
-            }
-        }
-
         static byte[] encodeFrame(int opcode, boolean fin, int rsv, int closeCode, byte[] payload) {
             byte[] value = payload == null ? new byte[0] : payload;
             validateFrame(opcode, fin, rsv, closeCode, value.length);
@@ -2438,6 +2366,43 @@ public final class SpecusCore {
             buffer.putInt(value.length);
             buffer.put(value);
             return buffer.array();
+        }
+
+        /**
+         * Normalizes one physical WebSocket data frame into atomic SWS2 envelopes.
+         *
+         * <p>This mirrors the Java client: the first envelope retains opcode/RSV, subsequent
+         * envelopes are continuations, and only the last envelope inherits FIN. WebSocket control
+         * frames are never fragmented.</p>
+         */
+        static List<byte[]> encodeFrameChunks(int opcode, boolean fin, int rsv,
+                                              int closeCode, byte[] payload) {
+            byte[] value = payload == null ? new byte[0] : payload;
+            boolean control = opcode >= OPCODE_CLOSE;
+            if (control) {
+                return List.of(encodeFrame(opcode, fin, rsv, closeCode, value));
+            }
+            if (value.length > MAX_MESSAGE_BYTES) {
+                throw new IllegalArgumentException("WebSocket data frame exceeds 16 MiB");
+            }
+            List<byte[]> chunks = new ArrayList<>(Math.max(1,
+                    (value.length + MAX_FRAME_PAYLOAD_BYTES - 1) / MAX_FRAME_PAYLOAD_BYTES));
+            int offset = 0;
+            boolean first = true;
+            do {
+                int length = Math.min(MAX_FRAME_PAYLOAD_BYTES, value.length - offset);
+                byte[] chunk = Arrays.copyOfRange(value, offset, offset + length);
+                offset += length;
+                boolean last = offset == value.length;
+                chunks.add(encodeFrame(
+                        first ? opcode : OPCODE_CONTINUATION,
+                        fin && last,
+                        first ? rsv : 0,
+                        first ? closeCode : 0,
+                        chunk));
+                first = false;
+            } while (offset < value.length);
+            return chunks;
         }
 
         static Frame decodeFrame(byte[] encoded) {
@@ -2465,20 +2430,6 @@ public final class SpecusCore {
             buffer.get(payload);
             validateFrame(opcode, fin, rsv, closeCode, payloadLength);
             return new Frame(opcode, fin, rsv, closeCode, payload);
-        }
-
-        static boolean isLocallyTerminatedControlFrame(Frame frame) {
-            return frame != null && (frame.opcode == OPCODE_PING || frame.opcode == OPCODE_PONG);
-        }
-
-        static byte[] localControlResponse(Frame frame) {
-            if (frame == null || frame.opcode == OPCODE_PONG) {
-                return null;
-            }
-            if (frame.opcode != OPCODE_PING) {
-                throw new IllegalArgumentException("frame is not a locally terminated control frame");
-            }
-            return encodeFrame(OPCODE_PONG, true, 0, 0, frame.payload);
         }
 
         private static void validateFrame(int opcode, boolean fin, int rsv, int closeCode, int payloadLength) {
@@ -2537,67 +2488,6 @@ public final class SpecusCore {
             }
         }
 
-        private static final class ProtectedSocketFactory extends SocketFactory {
-            private final SocketProtector protector;
-
-            private ProtectedSocketFactory(SocketProtector protector) {
-                this.protector = protector;
-            }
-
-            private Socket protectedSocket() throws IOException {
-                Socket socket = new Socket();
-                try {
-                    if (protector != null) {
-                        protector.protect(socket);
-                    }
-                    return socket;
-                } catch (IOException error) {
-                    closeQuietly(socket);
-                    throw error;
-                } catch (RuntimeException error) {
-                    closeQuietly(socket);
-                    throw error;
-                }
-            }
-
-            @Override
-            public Socket createSocket() throws IOException {
-                return protectedSocket();
-            }
-
-            @Override
-            public Socket createSocket(String host, int port) throws IOException {
-                Socket socket = protectedSocket();
-                socket.connect(new InetSocketAddress(host, port));
-                return socket;
-            }
-
-            @Override
-            public Socket createSocket(String host, int port, InetAddress localHost, int localPort) throws IOException {
-                Socket socket = protectedSocket();
-                socket.bind(new InetSocketAddress(localHost, localPort));
-                socket.connect(new InetSocketAddress(host, port));
-                return socket;
-            }
-
-            @Override
-            public Socket createSocket(InetAddress host, int port) throws IOException {
-                Socket socket = protectedSocket();
-                socket.connect(new InetSocketAddress(host, port));
-                return socket;
-            }
-
-            @Override
-            public Socket createSocket(InetAddress address,
-                                       int port,
-                                       InetAddress localAddress,
-                                       int localPort) throws IOException {
-                Socket socket = protectedSocket();
-                socket.bind(new InetSocketAddress(localAddress, localPort));
-                socket.connect(new InetSocketAddress(address, port));
-                return socket;
-            }
-        }
     }
 
     static final class WebSocketIngressState {
@@ -2643,9 +2533,6 @@ public final class SpecusCore {
                 frame = WebSocketSupport.decodeFrame(data);
             } catch (IllegalArgumentException error) {
                 throw new IOException(error.getMessage(), error);
-            }
-            if (frame.rsv != 0) {
-                throw new IOException("OkHttp endpoint did not negotiate RSV extensions");
             }
             validateSequence(frame);
             return new AcceptedFrame(frame, data.length);
@@ -2727,100 +2614,81 @@ public final class SpecusCore {
         private final URI target;
         private final Object headers;
         private final ControlConnection control;
-        private final OkHttpClient client;
         private final AtomicBoolean finished = new AtomicBoolean(false);
         private final AtomicBoolean suppressDisconnect = new AtomicBoolean(false);
+        private final StartCloseGate upstreamLifecycle = new StartCloseGate();
         private final WebSocketIngressState ingress = new WebSocketIngressState();
-        private volatile WebSocket webSocket;
+        private volatile NettyWebSocketTransport webSocket;
         private volatile boolean opened;
         private boolean remoteFinPending;
-        private ByteArrayOutputStream incomingMessage;
-        private int incomingOpcode = -1;
 
         private LocalWebSocketSpecus(int streamId,
                                     String channelId,
                                     URI target,
                                     Object headers,
-                                    ControlConnection control,
-                                    OkHttpClient client) {
+                                    ControlConnection control) {
             this.streamId = streamId;
             this.channelId = channelId;
             this.target = target;
             this.headers = headers;
             this.control = control;
-            this.client = client;
         }
 
         void start() {
-            Request.Builder request = new Request.Builder().url(target.toString());
-            WebSocketSupport.copyHandshakeHeaders(headers, request);
-            webSocket = client.newWebSocket(request.build(), new WebSocketListener() {
+            NettyWebSocketTransport transport = new NettyWebSocketTransport(
+                    target, headers, control::protect, new NettyWebSocketTransport.Listener() {
                 @Override
-                public void onOpen(WebSocket socket, Response response) {
-                    onUpstreamOpen(socket);
+                public void onOpen() {
+                    onUpstreamOpen();
                 }
 
                 @Override
-                public void onMessage(WebSocket socket, String text) {
-                    byte[] payload = text.getBytes(StandardCharsets.UTF_8);
-                    forwardToControl(socket, WebSocketSupport.OPCODE_TEXT, payload);
+                public void onFrame(int opcode, boolean fin, int rsv,
+                                    int closeCode, byte[] payload) {
+                    forwardToControl(opcode, fin, rsv, closeCode, payload);
                 }
 
                 @Override
-                public void onMessage(WebSocket socket, ByteString bytes) {
-                    forwardToControl(socket, WebSocketSupport.OPCODE_BINARY, bytes.toByteArray());
+                public void onClosed(String detail) {
+                    finish(true, detail);
                 }
 
                 @Override
-                public void onClosing(WebSocket socket, int code, String reason) {
-                    try {
-                        control.sendWsData(streamId, WebSocketSupport.encodeFrame(
-                                WebSocketSupport.OPCODE_CLOSE, true, 0, code,
-                                WebSocketSupport.closeReasonBytes(reason)));
-                    } catch (Exception ignored) {
-                    }
-                    socket.close(code, reason);
-                }
-
-                @Override
-                public void onClosed(WebSocket socket, int code, String reason) {
-                    finish(true, "local websocket closed");
-                }
-
-                @Override
-                public void onFailure(WebSocket socket, Throwable error, Response response) {
+                public void onFailure(Throwable error) {
                     finish(true, message(error));
                 }
             });
+            if (!upstreamLifecycle.start(() -> {
+                webSocket = transport;
+                transport.start();
+            })) {
+                transport.close();
+            }
         }
 
-        synchronized int write(byte[] data) throws IOException {
-            if (finished.get()) {
-                throw new IOException("WebSocket stream is closed");
-            }
-            WebSocketIngressState.AcceptedFrame accepted = ingress.accept(data);
-            if (WebSocketSupport.isLocallyTerminatedControlFrame(accepted.frame)) {
-                byte[] response = WebSocketSupport.localControlResponse(accepted.frame);
-                if (response != null) {
-                    try {
-                        control.sendWsData(streamId, response);
-                    } catch (Exception error) {
-                        throw new IOException("failed to send local SWS2 PONG", error);
-                    }
+        int write(byte[] data) throws IOException {
+            WebSocketIngressState.AcceptedFrame accepted;
+            CompletableFuture<Void> write;
+            synchronized (this) {
+                if (finished.get()) {
+                    throw new IOException("WebSocket stream is closed");
                 }
-                return accepted.credit;
+                accepted = ingress.accept(data);
+                NettyWebSocketTransport socket = webSocket;
+                if (!opened || socket == null) {
+                    ingress.cache(accepted);
+                    // Pre-open DATA remains charged until its corresponding Netty write finishes.
+                    return 0;
+                }
+                write = deliverIncomingFrame(socket, accepted.frame);
             }
-            WebSocket socket = webSocket;
-            if (!opened || socket == null) {
-                ingress.cache(accepted);
-                return accepted.credit;
-            }
-            deliverIncomingFrame(socket, accepted.frame);
+            awaitWebSocketWrite(write);
             return accepted.credit;
         }
 
         void failFromRemote(String detail) {
-            WebSocket socket;
+            upstreamLifecycle.close();
+            NettyWebSocketTransport socket;
             synchronized (this) {
                 if (!finished.compareAndSet(false, true)) {
                     return;
@@ -2833,80 +2701,77 @@ public final class SpecusCore {
             control.resetWebSocketStream(streamId, this, 5,
                     firstText(detail, "invalid SWS2 DATA"));
             if (socket != null) {
-                socket.cancel();
+                socket.close();
             }
         }
 
-        private void onUpstreamOpen(WebSocket socket) {
-            String failure = null;
+        private void onUpstreamOpen() {
+            List<WebSocketIngressState.AcceptedFrame> pending;
             boolean closeAfterFlush = false;
             synchronized (this) {
                 if (finished.get()) {
-                    socket.cancel();
+                    NettyWebSocketTransport socket = webSocket;
+                    if (socket != null) {
+                        socket.close();
+                    }
                     return;
                 }
-                webSocket = socket;
                 opened = true;
                 control.markStreamOpened(streamId);
-                try {
-                    for (WebSocketIngressState.AcceptedFrame accepted : ingress.drain()) {
-                        deliverIncomingFrame(socket, accepted.frame);
-                    }
-                    closeAfterFlush = remoteFinPending;
-                } catch (Exception error) {
-                    failure = message(error);
-                }
+                pending = ingress.drain();
+                closeAfterFlush = remoteFinPending;
             }
-            if (failure != null) {
-                failFromRemote("failed to flush pre-open SWS2 DATA: " + failure);
+            CompletableFuture<?>[] writes = new CompletableFuture<?>[pending.size()];
+            for (int index = 0; index < pending.size(); index++) {
+                WebSocketIngressState.AcceptedFrame accepted = pending.get(index);
+                writes[index] = deliverIncomingFrame(webSocket, accepted.frame)
+                        .thenRun(() -> returnPreOpenCredit(accepted.credit));
+            }
+            boolean shouldClose = closeAfterFlush;
+            CompletableFuture.allOf(writes).whenComplete((ignored, error) -> {
+                if (error != null) {
+                    failFromRemote("failed to flush pre-open SWS2 DATA: " + message(error));
+                    return;
+                }
+                control.status.publish("WebSocket connected", target.getHost(), true);
+                if (shouldClose) {
+                    closeWithoutDisconnect();
+                }
+            });
+        }
+
+        private CompletableFuture<Void> deliverIncomingFrame(NettyWebSocketTransport socket,
+                                                              WebSocketSupport.Frame frame) {
+            if (socket == null) {
+                CompletableFuture<Void> failed = new CompletableFuture<>();
+                failed.completeExceptionally(
+                        new IOException("local websocket frame write rejected"));
+                return failed;
+            }
+            return socket.send(frame.opcode, frame.fin, frame.rsv,
+                    frame.closeCode, frame.payload);
+        }
+
+        private void returnPreOpenCredit(int credit) {
+            if (finished.get()) {
                 return;
             }
-            control.status.publish("WebSocket connected", target.getHost(), true);
-            if (closeAfterFlush) {
-                closeWithoutDisconnect();
+            try {
+                control.sendWindowUpdate(streamId, credit);
+            } catch (Exception error) {
+                throw new java.util.concurrent.CompletionException(error);
             }
         }
 
-        private void deliverIncomingFrame(WebSocket socket,
-                                          WebSocketSupport.Frame frame) throws IOException {
-            if (frame.opcode == WebSocketSupport.OPCODE_CLOSE) {
-                if (!socket.close(frame.closeCode == 0 ? 1000 : frame.closeCode,
-                        new String(frame.payload, StandardCharsets.UTF_8))) {
-                    throw new IOException("local websocket close rejected");
-                }
-                return;
-            }
-            if (frame.opcode == WebSocketSupport.OPCODE_CONTINUATION) {
-                if (incomingMessage == null) {
-                    throw new IOException("orphan SWS2 continuation frame");
-                }
-            } else {
-                if (frame.opcode != WebSocketSupport.OPCODE_TEXT
-                        && frame.opcode != WebSocketSupport.OPCODE_BINARY) {
-                    throw new IOException("unsupported SWS2 data opcode");
-                }
-                if (incomingMessage != null) {
-                    throw new IOException("new SWS2 message before prior message completed");
-                }
-                incomingOpcode = frame.opcode;
-                incomingMessage = new ByteArrayOutputStream(Math.max(32, frame.payload.length));
-            }
-            incomingMessage.write(frame.payload, 0, frame.payload.length);
-            if (incomingMessage.size() > WebSocketSupport.MAX_MESSAGE_BYTES) {
-                throw new IOException("websocket message exceeds limit");
-            }
-            if (!frame.fin) {
-                return;
-            }
-            byte[] payload = incomingMessage.toByteArray();
-            int opcode = incomingOpcode;
-            incomingMessage = null;
-            incomingOpcode = -1;
-            boolean accepted = opcode == WebSocketSupport.OPCODE_TEXT
-                    ? socket.send(new String(payload, StandardCharsets.UTF_8))
-                    : socket.send(ByteString.of(payload));
-            if (!accepted) {
-                throw new IOException("local websocket write rejected");
+        private static void awaitWebSocketWrite(CompletableFuture<Void> write) throws IOException {
+            try {
+                write.get();
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while writing local websocket frame", error);
+            } catch (ExecutionException error) {
+                Throwable cause = error.getCause() == null ? error : error.getCause();
+                throw new IOException(message(cause), cause);
             }
         }
 
@@ -2935,39 +2800,30 @@ public final class SpecusCore {
         private void closeWithoutDisconnect() {
             suppressDisconnect.set(true);
             finish(false, "");
-            WebSocket socket = webSocket;
+            NettyWebSocketTransport socket = webSocket;
             if (socket != null) {
-                socket.cancel();
+                socket.close();
             }
         }
 
-        private void forwardToControl(WebSocket socket, int opcode, byte[] payload) {
-            if (payload.length > WebSocketSupport.MAX_MESSAGE_BYTES) {
-                socket.close(1009, "message too large");
-                finish(true, "websocket message exceeds limit");
-                return;
-            }
+        private void forwardToControl(int opcode, boolean fin, int rsv,
+                                      int closeCode, byte[] payload) {
             try {
-                int offset = 0;
-                boolean first = true;
-                do {
-                    int length = Math.min(WebSocketSupport.MAX_FRAME_PAYLOAD_BYTES, payload.length - offset);
-                    byte[] chunk = new byte[length];
-                    System.arraycopy(payload, offset, chunk, 0, length);
-                    offset += length;
-                    boolean last = offset == payload.length;
-                    control.sendWsData(streamId, WebSocketSupport.encodeFrame(
-                            first ? opcode : WebSocketSupport.OPCODE_CONTINUATION,
-                            last, 0, 0, chunk));
-                    first = false;
-                } while (offset < payload.length);
+                for (byte[] chunk : WebSocketSupport.encodeFrameChunks(
+                        opcode, fin, rsv, closeCode, payload)) {
+                    control.sendWsData(streamId, chunk);
+                }
             } catch (Exception error) {
-                socket.cancel();
+                NettyWebSocketTransport socket = webSocket;
+                if (socket != null) {
+                    socket.close();
+                }
                 finish(false, message(error));
             }
         }
 
         private void finish(boolean notifyControl, String detail) {
+            upstreamLifecycle.close();
             synchronized (this) {
                 if (!finished.compareAndSet(false, true)) {
                     return;
@@ -2994,17 +2850,6 @@ public final class SpecusCore {
         void onRequestEnd(Map<String, Object> metadata);
     }
 
-    static final class HttpUrlConnectionRequestPolicy {
-        private HttpUrlConnectionRequestPolicy() {
-        }
-
-        static boolean opensRequestBody(String method, long contentLength) {
-            return contentLength != 0L
-                    && !"GET".equalsIgnoreCase(method)
-                    && !"HEAD".equalsIgnoreCase(method);
-        }
-    }
-
     static void dispatchHttpData(HttpRequestIngress ingress, byte[] data,
                                  boolean endStream, Map<String, Object> metadata) {
         ingress.onRequestData(data);
@@ -3025,10 +2870,12 @@ public final class SpecusCore {
         private final ArrayBlockingQueue<RequestChunk> requestQueue =
                 new ArrayBlockingQueue<>(REQUEST_QUEUE_CAPACITY);
         private final AtomicBoolean closed = new AtomicBoolean(false);
-        private long receiveCredit = StreamSendWindow.INITIAL_BYTES;
+        private final StartCloseGate upstreamLifecycle = new StartCloseGate();
+        private long receiveCredit = StreamFlowScheduler.INITIAL_BYTES;
         private long receiveOutstanding;
         private boolean requestEnded;
-        private volatile HttpURLConnection connection;
+        private volatile NettyHttpTransport connection;
+        private volatile boolean responseCompleted;
 
         HttpStreamForwarder(int streamId, Map<String, Object> metadata,
                             Map<String, String> routes, ControlConnection control,
@@ -3077,14 +2924,14 @@ public final class SpecusCore {
                     error = "duplicate HTTP request FIN";
                 } else {
                     try {
-                        HttpTrailerPolicy.requireNoRequestTrailers(
+                        List<String> trailers = HttpTrailerPolicy.metadataLines(
                                 endMetadata == null ? null : endMetadata.get("trailers"));
                         requestEnded = true;
-                        if (!requestQueue.offer(RequestChunk.END)) {
+                        if (!requestQueue.offer(RequestChunk.end(trailers))) {
                             error = "HTTP request queue is full at FIN";
                         }
-                    } catch (IOException unsupported) {
-                        error = unsupported.getMessage();
+                    } catch (IOException invalid) {
+                        error = invalid.getMessage();
                     }
                 }
             }
@@ -3094,12 +2941,12 @@ public final class SpecusCore {
         }
 
         void closeFromControl() {
-            if (!closed.compareAndSet(false, true)) {
+            if (!upstreamLifecycle.close() || !closed.compareAndSet(false, true)) {
                 return;
             }
-            HttpURLConnection active = connection;
+            NettyHttpTransport active = connection;
             if (active != null) {
-                active.disconnect();
+                active.close();
             }
             requestQueue.clear();
             requestQueue.offer(RequestChunk.CANCELLED);
@@ -3107,146 +2954,110 @@ public final class SpecusCore {
 
         private void forward() {
             boolean completed = false;
+            NettyHttpTransport opened = null;
             try {
-                HttpTrailerPolicy.requireNoRequestTrailers(metadata.get("trailerNames"));
                 String route = asString(metadata.get("route"));
                 URI target = DirectHttpForwarder.buildTarget(routes.get(route),
                         asString(metadata.get("relativePath")), asString(metadata.get("rawQuery")));
-                HttpURLConnection opened = (HttpURLConnection) target.toURL().openConnection();
-                connection = opened;
-                opened.setConnectTimeout(5000);
-                opened.setReadTimeout(0);
-                opened.setInstanceFollowRedirects(false);
                 String method = firstText(asString(metadata.get("method")), "GET");
-                opened.setRequestMethod(method);
-                if (opened instanceof HttpsURLConnection https) {
-                    https.setSSLSocketFactory(DirectHttpForwarder.TRUST_ALL_SSL_FACTORY);
-                    https.setHostnameVerifier(DirectHttpForwarder.TRUST_ALL_HOSTNAMES);
-                }
-
                 List<String> requestHeaders = stringList(metadata.get("headers"));
                 String boundedRange = DirectHttpForwarder.boundedRange(
                         DirectHttpForwarder.firstHeader(requestHeaders, "range"));
-                DirectHttpForwarder.copyHeaders(requestHeaders, (name, value) -> {
-                    if (boundedRange == null || !"range".equalsIgnoreCase(name)) {
-                        opened.addRequestProperty(name, value);
-                    }
-                });
-                if (boundedRange != null) {
-                    opened.setRequestProperty("Range", boundedRange);
-                }
-                if (DirectHttpForwarder.firstHeader(requestHeaders, "accept-encoding") == null) {
-                    opened.setRequestProperty("Accept-Encoding", "identity");
-                }
-
                 Integer contentLengthValue = asInt(metadata.get("contentLength"));
                 long contentLength = contentLengthValue == null ? -1L : contentLengthValue;
-                if (contentLength > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
+                if (contentLength < -1L
+                        || contentLength > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
                     throw new IOException("HTTP request body exceeds limit");
                 }
-                boolean mayHaveBody = HttpUrlConnectionRequestPolicy.opensRequestBody(
-                        method, contentLength);
-                OutputStream requestBody = null;
-                if (mayHaveBody) {
-                    opened.setDoOutput(true);
-                    if (contentLength >= 0) {
-                        opened.setFixedLengthStreamingMode(contentLength);
-                    } else {
-                        opened.setChunkedStreamingMode(CHUNK_SIZE);
-                    }
-                    requestBody = opened.getOutputStream();
-                }
-                long requestBytes = pumpRequest(requestBody);
-                if (contentLength >= 0 && requestBytes != contentLength) {
-                    throw new IOException("HTTP request content length mismatch");
-                }
-
-                int statusCode = opened.getResponseCode();
-                Map<String, List<String>> responseFields = opened.getHeaderFields();
-                List<String> trailerNames = declaredTrailers(responseFields);
-                control.sendHttpHead(streamId, statusCode,
-                        DirectHttpForwarder.headers(responseFields), trailerNames);
-
-                long announcedLength = opened.getContentLengthLong();
-                if (announcedLength > DirectHttpForwarder.MAX_RESPONSE_BODY_SIZE) {
-                    throw new IOException("HTTP response body exceeds limit");
-                }
-                InputStream responseBody = statusCode >= 400
-                        ? opened.getErrorStream() : opened.getInputStream();
-                long responseBytes = 0;
-                if (responseBody != null) {
-                    try (InputStream input = responseBody) {
-                        byte[] buffer = new byte[CHUNK_SIZE];
-                        int read;
-                        while (!closed.get() && (read = input.read(buffer)) >= 0) {
-                            if (read == 0) {
-                                continue;
+                List<String> trailerNames = HttpTrailerPolicy.validNames(
+                        stringList(metadata.get("trailerNames")));
+                opened = new NettyHttpTransport(target, method, requestHeaders, boundedRange,
+                        contentLength, trailerNames, control::protect,
+                        new NettyHttpTransport.Listener() {
+                            @Override
+                            public void onResponseHead(int statusCode, List<String> headers,
+                                                       List<String> responseTrailerNames) throws Exception {
+                                control.sendHttpHead(streamId, statusCode, headers, responseTrailerNames);
                             }
-                            responseBytes += read;
-                            if (responseBytes > DirectHttpForwarder.MAX_RESPONSE_BODY_SIZE) {
-                                throw new IOException("HTTP response body exceeds limit");
+
+                            @Override
+                            public void onResponseData(byte[] data) throws Exception {
+                                control.sendHttpData(streamId, data);
                             }
-                            byte[] chunk = new byte[read];
-                            System.arraycopy(buffer, 0, chunk, 0, read);
-                            control.sendHttpData(streamId, chunk);
-                        }
-                    }
+
+                            @Override
+                            public void onResponseEnd(List<String> trailers) throws Exception {
+                                control.sendHttpFin(streamId, trailers);
+                                responseCompleted = true;
+                                requestQueue.clear();
+                                requestQueue.offer(RequestChunk.CANCELLED);
+                            }
+                        });
+                connection = opened;
+                if (!upstreamLifecycle.start(opened::start)) {
+                    return;
                 }
-                if (closed.get()) {
-                    throw new IOException("HTTP stream cancelled");
+                pumpRequest(opened, contentLength);
+                if (!responseCompleted) {
+                    opened.awaitCompletion();
                 }
-                control.sendHttpFin(streamId, responseTrailers(opened, trailerNames));
-                completed = true;
+                completed = responseCompleted && opened.isComplete();
             } catch (Throwable error) {
-                if (!closed.get()) {
+                completed = responseCompleted;
+                if (!closed.get() && !responseCompleted) {
                     fail(22, message(error));
                 }
             } finally {
-                HttpURLConnection active = connection;
-                if (active != null) {
-                    active.disconnect();
+                if (opened != null) {
+                    opened.close();
                 }
-                if (completed && closed.compareAndSet(false, true)) {
+                if (completed && upstreamLifecycle.close()
+                        && closed.compareAndSet(false, true)) {
                     control.completeHttpStream(streamId, this);
                 }
             }
         }
 
-        private long pumpRequest(OutputStream output) throws Exception {
+        private long pumpRequest(NettyHttpTransport output, long contentLength) throws Exception {
             long total = 0;
-            try {
-                while (true) {
-                    RequestChunk chunk = requestQueue.take();
-                    if (chunk == RequestChunk.CANCELLED) {
-                        throw new IOException("HTTP request cancelled");
+            while (true) {
+                RequestChunk chunk = requestQueue.take();
+                if (chunk == RequestChunk.CANCELLED) {
+                    if (responseCompleted) {
+                        return total;
                     }
-                    if (chunk.end) {
-                        break;
-                    }
-                    if (output == null) {
-                        throw new IOException(
-                                "Android HttpURLConnection cannot preserve this method with a request body");
-                    }
-                    total += chunk.data.length;
-                    if (total > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
-                        throw new IOException("HTTP request body exceeds limit");
-                    }
-                    output.write(chunk.data);
-                    returnRequestCredit(chunk.data.length);
+                    throw new IOException("HTTP request cancelled");
                 }
-                if (output != null) {
-                    output.flush();
+                if (chunk.end) {
+                    if (contentLength >= 0 && total != contentLength) {
+                        throw new IOException("HTTP request content length mismatch");
+                    }
+                    output.finishRequest(chunk.trailers);
+                    return total;
                 }
-                return total;
-            } finally {
-                closeQuietly(output);
+                total += chunk.data.length;
+                if (total > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
+                    throw new IOException("HTTP request body exceeds limit");
+                }
+                if (contentLength >= 0 && total > contentLength) {
+                    throw new IOException("HTTP request DATA exceeds declared contentLength");
+                }
+                try {
+                    output.writeData(chunk.data);
+                } catch (Exception error) {
+                    if (responseCompleted) {
+                        return total;
+                    }
+                    throw error;
+                }
+                returnRequestCredit(chunk.data.length);
             }
         }
 
         private void returnRequestCredit(int bytes) throws Exception {
             synchronized (this) {
                 if (bytes > receiveOutstanding
-                        || receiveCredit > StreamSendWindow.MAXIMUM_BYTES - bytes) {
+                        || receiveCredit > StreamFlowScheduler.MAXIMUM_BYTES - bytes) {
                     throw new IOException("HTTP request receive window overflow");
                 }
                 receiveOutstanding -= bytes;
@@ -3256,57 +3067,36 @@ public final class SpecusCore {
         }
 
         private void fail(long code, String reason) {
-            if (!closed.compareAndSet(false, true)) {
+            if (!upstreamLifecycle.close() || !closed.compareAndSet(false, true)) {
                 return;
             }
-            HttpURLConnection active = connection;
+            NettyHttpTransport active = connection;
             if (active != null) {
-                active.disconnect();
+                active.close();
             }
             requestQueue.clear();
             requestQueue.offer(RequestChunk.CANCELLED);
             control.resetHttpStream(streamId, this, code, firstText(reason, "HTTP stream failed"));
         }
 
-        private static List<String> declaredTrailers(Map<String, List<String>> fields) {
-            List<String> candidates = new ArrayList<>();
-            if (fields == null) {
-                return candidates;
-            }
-            for (Map.Entry<String, List<String>> entry : fields.entrySet()) {
-                if (entry.getKey() == null || !"trailer".equalsIgnoreCase(entry.getKey())) {
-                    continue;
-                }
-                for (String value : entry.getValue()) {
-                    for (String name : value.split(",")) {
-                        candidates.add(name);
-                    }
-                }
-            }
-            return HttpTrailerPolicy.validNames(candidates);
-        }
-
-        private static List<String> responseTrailers(HttpURLConnection connection,
-                                                     List<String> names) {
-            List<String> result = new ArrayList<>();
-            for (String name : names) {
-                String value = connection.getHeaderField(name);
-                if (value != null) {
-                    result.add(name + ":" + value);
-                }
-            }
-            return HttpTrailerPolicy.validLines(result, names);
-        }
-
         private static final class RequestChunk {
-            static final RequestChunk END = new RequestChunk(new byte[0], true);
-            static final RequestChunk CANCELLED = new RequestChunk(new byte[0], false);
+            static final RequestChunk CANCELLED = new RequestChunk(new byte[0], false, List.of());
             final byte[] data;
             final boolean end;
+            final List<String> trailers;
 
             RequestChunk(byte[] data, boolean end) {
+                this(data, end, List.of());
+            }
+
+            RequestChunk(byte[] data, boolean end, List<String> trailers) {
                 this.data = data;
                 this.end = end;
+                this.trailers = trailers == null ? List.of() : List.copyOf(trailers);
+            }
+
+            static RequestChunk end(List<String> trailers) {
+                return new RequestChunk(new byte[0], true, trailers);
             }
         }
     }
@@ -3351,28 +3141,32 @@ public final class SpecusCore {
                     continue;
                 }
                 String name = line.substring(0, separator).trim();
-                String value = line.substring(separator + 1).trim();
+                String rawValue = line.substring(separator + 1);
+                String value = trimHttpOws(rawValue);
                 String lower = name.toLowerCase(Locale.ROOT);
                 if (declared.contains(lower) && isHeaderName(name)
                         && !FORBIDDEN_NAMES.contains(lower)
-                        && value.indexOf('\r') < 0 && value.indexOf('\n') < 0) {
+                        && rawValue.indexOf('\r') < 0 && rawValue.indexOf('\n') < 0) {
                     result.add(name + ":" + value);
                 }
             }
             return result;
         }
 
-        static void requireNoRequestTrailers(Object value) throws IOException {
+        static List<String> metadataLines(Object value) throws IOException {
             if (value == null) {
-                return;
+                return List.of();
             }
             if (!(value instanceof List<?> values)) {
                 throw new IOException("HTTP request trailers metadata must be an array");
             }
-            if (!values.isEmpty()) {
-                throw new IOException(
-                        "Android HttpURLConnection cannot forward HTTP request trailers");
+            List<String> result = new ArrayList<>(values.size());
+            for (Object item : values) {
+                if (item != null) {
+                    result.add(item.toString());
+                }
             }
+            return result;
         }
 
         private static boolean isHeaderName(String value) {
@@ -3386,6 +3180,14 @@ public final class SpecusCore {
                 }
             }
             return true;
+        }
+
+        private static String trimHttpOws(String value) {
+            int start = 0;
+            int end = value.length();
+            while (start < end && (value.charAt(start) == ' ' || value.charAt(start) == '\t')) start++;
+            while (end > start && (value.charAt(end - 1) == ' ' || value.charAt(end - 1) == '\t')) end--;
+            return value.substring(start, end);
         }
     }
 
@@ -3800,6 +3602,9 @@ public final class SpecusCore {
             }
             if (type == NatMessageType.DATA && (metadataLength != 0 || value != 0)) {
                 throw new IOException("DATA cannot carry metadata/value");
+            }
+            if (type == NatMessageType.DATA && dataLength > StreamFlowScheduler.MAX_CHUNK_BYTES) {
+                throw new IOException("DATA exceeds the 64 KiB wire limit");
             }
             if (type == NatMessageType.FIN && (dataLength != 0 || flags != 0)) {
                 throw new IOException("FIN cannot carry binary data/flags");

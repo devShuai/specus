@@ -1,6 +1,7 @@
 package com.theshuai.specus.android;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -112,6 +113,7 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     protected void onStart() {
         super.onStart();
         IntentFilter statusFilter = new IntentFilter(StatusEvents.ACTION_STATUS);
@@ -120,6 +122,8 @@ public class MainActivity extends Activity {
             registerReceiver(statusReceiver, statusFilter, Context.RECEIVER_NOT_EXPORTED);
             registerReceiver(chatReceiver, chatFilter, Context.RECEIVER_NOT_EXPORTED);
         } else {
+            // The flags overload is API 33. Older releases use the compatible overload; these
+            // receivers only handle in-process status events and are unregistered on stop.
             registerReceiver(statusReceiver, statusFilter);
             registerReceiver(chatReceiver, chatFilter);
         }

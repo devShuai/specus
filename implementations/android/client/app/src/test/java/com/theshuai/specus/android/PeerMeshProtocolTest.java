@@ -3,6 +3,7 @@ package com.theshuai.specus.android;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -14,6 +15,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class PeerMeshProtocolTest {
@@ -110,6 +112,70 @@ public class PeerMeshProtocolTest {
         assertFalse(replay.accept(101L));
         assertTrue(replay.accept(5000L));
         assertFalse(replay.accept(100L));
+    }
+
+    @Test
+    public void udpCheckTimestampAndNonceReplayWindowAreBounded() {
+        long now = 1_000_000L;
+        assertTrue(PeerMeshEngine.probeTimestampWithinWindow(now - 15_000L, now));
+        assertTrue(PeerMeshEngine.probeTimestampWithinWindow(now + 15_000L, now));
+        assertFalse(PeerMeshEngine.probeTimestampWithinWindow(now - 15_001L, now));
+        assertFalse(PeerMeshEngine.probeTimestampWithinWindow(now + 15_001L, now));
+
+        PeerMeshEngine.ProbeReplayCache replay = new PeerMeshEngine.ProbeReplayCache(2);
+        assertTrue(replay.accept("1:nonce-a", now + 100L, now));
+        assertFalse(replay.accept("1:nonce-a", now + 100L, now));
+        assertTrue(replay.accept("1:nonce-b", now + 100L, now));
+        assertFalse(replay.accept("1:nonce-c", now + 100L, now));
+        assertEquals(2, replay.size());
+
+        replay.cleanup(now + 101L);
+        assertEquals(0, replay.size());
+        assertTrue(replay.accept("1:nonce-c", now + 200L, now + 101L));
+    }
+
+    @Test
+    public void directEndpointSelectionIsStickyUnlessCandidateRttIsMeaningfullyBetter() {
+        assertTrue(PeerMeshEngine.shouldAdoptDirectEndpoint(true, true, 40L, 500L));
+        assertTrue(PeerMeshEngine.shouldAdoptDirectEndpoint(false, false, 40L, -1L));
+        assertFalse(PeerMeshEngine.shouldAdoptDirectEndpoint(false, true, 250L, -1L));
+        assertFalse(PeerMeshEngine.shouldAdoptDirectEndpoint(false, true, 250L, 150L));
+        assertTrue(PeerMeshEngine.shouldAdoptDirectEndpoint(false, true, 250L, 149L));
+        assertTrue(PeerMeshEngine.shouldAdoptDirectEndpoint(
+                false, true, Long.MAX_VALUE, 500L));
+    }
+
+    @Test
+    public void peerUdpSocketIsClosedWhenVpnProtectionFails() throws Exception {
+        DatagramSocket socket = new DatagramSocket(0);
+        SpecusCore.VpnPlatform platform = new SpecusCore.VpnPlatform() {
+            @Override
+            public void startVpn(SpecusCore.PeerMeshConfig config,
+                                 SpecusCore.VpnPacketHandler packetHandler) {
+            }
+
+            @Override
+            public void stopVpn() {
+            }
+
+            @Override
+            public boolean protectSocket(java.net.Socket ignored) {
+                return false;
+            }
+
+            @Override
+            public boolean protectDatagramSocket(DatagramSocket ignored) {
+                return false;
+            }
+
+            @Override
+            public void writeVpnPacket(byte[] packet) {
+            }
+        };
+
+        assertThrows(java.io.IOException.class,
+                () -> PeerMeshEngine.protectPeerDatagramSocket(true, platform, socket));
+        assertTrue(socket.isClosed());
     }
 
     @Test

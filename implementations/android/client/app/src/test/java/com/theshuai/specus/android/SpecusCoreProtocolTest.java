@@ -219,6 +219,55 @@ public class SpecusCoreProtocolTest {
     }
 
     @Test
+    public void upstreamStartGateNeverStartsAfterCloseWins() {
+        SpecusCore.StartCloseGate gate = new SpecusCore.StartCloseGate();
+        AtomicBoolean started = new AtomicBoolean(false);
+
+        assertTrue(gate.close());
+        assertFalse(gate.start(() -> started.set(true)));
+        assertFalse(started.get());
+        assertFalse(gate.close());
+    }
+
+    @Test
+    public void upstreamCloseWaitsForAnAlreadyWinningStartTransition() throws Exception {
+        SpecusCore.StartCloseGate gate = new SpecusCore.StartCloseGate();
+        CountDownLatch startEntered = new CountDownLatch(1);
+        CountDownLatch releaseStart = new CountDownLatch(1);
+        CountDownLatch closeEntered = new CountDownLatch(1);
+        AtomicBoolean closeResult = new AtomicBoolean(false);
+
+        Thread starter = new Thread(() -> gate.start(() -> {
+            startEntered.countDown();
+            try {
+                assertTrue(releaseStart.await(2, TimeUnit.SECONDS));
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(error);
+            }
+        }), "upstream-start-winner");
+        starter.start();
+        assertTrue(startEntered.await(1, TimeUnit.SECONDS));
+
+        Thread closer = new Thread(() -> {
+            closeEntered.countDown();
+            closeResult.set(gate.close());
+        }, "upstream-close-waiter");
+        closer.start();
+        assertTrue(closeEntered.await(1, TimeUnit.SECONDS));
+        Thread.sleep(50L);
+        assertTrue("close cannot overtake a publishing start action", closer.isAlive());
+
+        releaseStart.countDown();
+        starter.join(2_000L);
+        closer.join(2_000L);
+        assertFalse(starter.isAlive());
+        assertFalse(closer.isAlive());
+        assertTrue(closeResult.get());
+        assertFalse(gate.start(() -> { }));
+    }
+
+    @Test
     public void webSocketRouteUsesHttpBasePathAndSws2Envelope() {
         URI clear = SpecusCore.WebSocketSupport.buildTarget(
                 "http://127.0.0.1:8080/base", "/events", "room=1");
@@ -241,6 +290,47 @@ public class SpecusCoreProtocolTest {
         assertThrows(IllegalArgumentException.class,
                 () -> SpecusCore.WebSocketSupport.decodeFrame(new byte[]{0x01, 'o', 'l', 'd'}));
         assertEquals(16 * 1024 * 1024, SpecusCore.WebSocketSupport.MAX_MESSAGE_BYTES);
+        assertEquals(64 * 1024 - SpecusCore.WebSocketSupport.HEADER_BYTES,
+                SpecusCore.WebSocketSupport.MAX_FRAME_PAYLOAD_BYTES);
+        assertThrows(IllegalArgumentException.class,
+                () -> SpecusCore.WebSocketSupport.encodeFrame(
+                        SpecusCore.WebSocketSupport.OPCODE_BINARY, true, 0, 0,
+                        new byte[SpecusCore.WebSocketSupport.MAX_FRAME_PAYLOAD_BYTES + 1]));
+    }
+
+    @Test
+    public void largeWebSocketDataFrameUsesSws2ContinuationChunks() {
+        byte[] payload = new byte[SpecusCore.WebSocketSupport.MAX_FRAME_PAYLOAD_BYTES + 17];
+        for (int index = 0; index < payload.length; index++) {
+            payload[index] = (byte) index;
+        }
+
+        List<byte[]> encoded = SpecusCore.WebSocketSupport.encodeFrameChunks(
+                SpecusCore.WebSocketSupport.OPCODE_BINARY, true, 5, 0, payload);
+        assertEquals(2, encoded.size());
+        SpecusCore.WebSocketSupport.Frame first =
+                SpecusCore.WebSocketSupport.decodeFrame(encoded.get(0));
+        SpecusCore.WebSocketSupport.Frame last =
+                SpecusCore.WebSocketSupport.decodeFrame(encoded.get(1));
+        assertEquals(SpecusCore.WebSocketSupport.OPCODE_BINARY, first.opcode);
+        assertFalse(first.fin);
+        assertEquals(5, first.rsv);
+        assertEquals(SpecusCore.WebSocketSupport.OPCODE_CONTINUATION, last.opcode);
+        assertTrue(last.fin);
+        assertEquals(0, last.rsv);
+        ByteArrayOutputStream restored = new ByteArrayOutputStream(payload.length);
+        restored.writeBytes(first.payload);
+        restored.writeBytes(last.payload);
+        assertArrayEquals(payload, restored.toByteArray());
+
+        assertThrows(IllegalArgumentException.class,
+                () -> SpecusCore.WebSocketSupport.encodeFrameChunks(
+                        SpecusCore.WebSocketSupport.OPCODE_BINARY, true, 0, 0,
+                        new byte[SpecusCore.WebSocketSupport.MAX_MESSAGE_BYTES + 1]));
+        assertThrows(IllegalArgumentException.class,
+                () -> SpecusCore.WebSocketSupport.encodeFrameChunks(
+                        SpecusCore.WebSocketSupport.OPCODE_PING, true, 0, 0,
+                        new byte[126]));
     }
 
     @Test
@@ -407,23 +497,20 @@ public class SpecusCoreProtocolTest {
     }
 
     @Test
-    public void websocketPingIsAnsweredLocallyAndPongIsIdempotentlyConsumed() throws Exception {
+    public void websocketControlFramesRemainAvailableForTheUpstreamTransport() throws Exception {
         SpecusCore.WebSocketIngressState ingress = new SpecusCore.WebSocketIngressState();
         byte[] payload = "health".getBytes(StandardCharsets.UTF_8);
         SpecusCore.WebSocketIngressState.AcceptedFrame ping = ingress.accept(
                 SpecusCore.WebSocketSupport.encodeFrame(
                         SpecusCore.WebSocketSupport.OPCODE_PING, true, 0, 0, payload));
-        assertTrue(SpecusCore.WebSocketSupport.isLocallyTerminatedControlFrame(ping.frame));
-        SpecusCore.WebSocketSupport.Frame pong = SpecusCore.WebSocketSupport.decodeFrame(
-                SpecusCore.WebSocketSupport.localControlResponse(ping.frame));
-        assertEquals(SpecusCore.WebSocketSupport.OPCODE_PONG, pong.opcode);
-        assertArrayEquals(payload, pong.payload);
+        assertEquals(SpecusCore.WebSocketSupport.OPCODE_PING, ping.frame.opcode);
+        assertArrayEquals(payload, ping.frame.payload);
 
         SpecusCore.WebSocketIngressState.AcceptedFrame receivedPong = ingress.accept(
                 SpecusCore.WebSocketSupport.encodeFrame(
                         SpecusCore.WebSocketSupport.OPCODE_PONG, true, 0, 0, payload));
-        assertTrue(SpecusCore.WebSocketSupport.isLocallyTerminatedControlFrame(receivedPong.frame));
-        assertNull(SpecusCore.WebSocketSupport.localControlResponse(receivedPong.frame));
+        assertEquals(SpecusCore.WebSocketSupport.OPCODE_PONG, receivedPong.frame.opcode);
+        assertArrayEquals(payload, receivedPong.frame.payload);
     }
 
     @Test
@@ -458,21 +545,12 @@ public class SpecusCoreProtocolTest {
     }
 
     @Test
-    public void requestTrailersAreExplicitlyRejectedByHttpUrlConnectionTransport() throws Exception {
-        SpecusCore.HttpTrailerPolicy.requireNoRequestTrailers(List.of());
-        IOException error = assertThrows(IOException.class,
-                () -> SpecusCore.HttpTrailerPolicy.requireNoRequestTrailers(List.of("Digest")));
-        assertTrue(error.getMessage().contains("HttpURLConnection"));
+    public void requestTrailerMetadataIsPreservedForTheStreamingTransport() throws Exception {
+        assertEquals(List.of(), SpecusCore.HttpTrailerPolicy.metadataLines(null));
+        assertEquals(List.of("Digest:sha-256=ok"),
+                SpecusCore.HttpTrailerPolicy.metadataLines(List.of("Digest:sha-256=ok")));
         assertThrows(IOException.class,
-                () -> SpecusCore.HttpTrailerPolicy.requireNoRequestTrailers("Digest"));
-    }
-
-    @Test
-    public void httpUrlConnectionDoesNotSilentlyRewriteGetOrHeadBodies() {
-        assertFalse(SpecusCore.HttpUrlConnectionRequestPolicy.opensRequestBody("GET", 1));
-        assertFalse(SpecusCore.HttpUrlConnectionRequestPolicy.opensRequestBody("HEAD", -1));
-        assertFalse(SpecusCore.HttpUrlConnectionRequestPolicy.opensRequestBody("POST", 0));
-        assertTrue(SpecusCore.HttpUrlConnectionRequestPolicy.opensRequestBody("POST", 1));
+                () -> SpecusCore.HttpTrailerPolicy.metadataLines("Digest"));
     }
 
     @Test
@@ -663,6 +741,15 @@ public class SpecusCoreProtocolTest {
     }
 
     @Test
+    public void natDataWirePayloadIsLimitedToSixtyFourKiB() throws Exception {
+        assertNotNull(SpecusCore.PacketCodec.read(new ByteArrayInputStream(
+                natDataWire(StreamFlowScheduler.MAX_CHUNK_BYTES))));
+        assertThrows(IOException.class, () -> SpecusCore.PacketCodec.read(
+                new ByteArrayInputStream(natDataWire(
+                        StreamFlowScheduler.MAX_CHUNK_BYTES + 1))));
+    }
+
+    @Test
     public void protocolV1IsRejectedBeforeBodyAllocation() {
         ByteBuffer header = ByteBuffer.allocate(SpecusCore.PacketCodec.HEADER_BYTES);
         header.putInt(SpecusCore.PacketCodec.MAGIC);
@@ -829,6 +916,24 @@ public class SpecusCoreProtocolTest {
             }
         }
         throw new IllegalStateException("cannot locate application protocol v2 vector");
+    }
+
+    private static byte[] natDataWire(int dataLength) {
+        int bodyLength = 16 + dataLength;
+        ByteBuffer wire = ByteBuffer.allocate(SpecusCore.PacketCodec.HEADER_BYTES + bodyLength);
+        wire.putInt(SpecusCore.PacketCodec.MAGIC);
+        wire.put((byte) SpecusCore.PacketCodec.VERSION);
+        wire.put((byte) 4);
+        wire.put((byte) 6);
+        wire.putInt(bodyLength);
+        wire.put((byte) 5);
+        wire.put((byte) 0);
+        wire.putShort((short) 0);
+        wire.putInt(1);
+        wire.putInt(0);
+        wire.putInt(dataLength);
+        wire.position(wire.limit());
+        return wire.array();
     }
 
     private static final class SizedInputStream extends InputStream {
