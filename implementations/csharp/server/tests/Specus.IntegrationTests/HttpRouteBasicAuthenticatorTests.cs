@@ -37,6 +37,18 @@ public sealed class HttpRouteBasicAuthenticatorTests
             Username, PasswordHash));
     }
 
+    [Fact]
+    public void RejectsMalformedStoredPolicyBeforeCredentialComparison()
+    {
+        Assert.False(HttpRouteBasicAuthenticator.IsConfigured(null, PasswordHash));
+        Assert.False(HttpRouteBasicAuthenticator.IsConfigured("   ", PasswordHash));
+        Assert.False(HttpRouteBasicAuthenticator.IsConfigured(Username, null));
+        Assert.False(HttpRouteBasicAuthenticator.IsConfigured(Username, "abc"));
+        Assert.False(HttpRouteBasicAuthenticator.IsConfigured(Username,
+            new string('g', 64)));
+        Assert.True(HttpRouteBasicAuthenticator.IsConfigured(Username, PasswordHash));
+    }
+
     private static string Basic(string username, string password) =>
         "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}"));
 }
