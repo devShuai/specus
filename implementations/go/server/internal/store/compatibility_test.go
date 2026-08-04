@@ -170,6 +170,55 @@ func TestStartupMigrationAddsPeerMeshACLDirectionWithJavaDefault(t *testing.T) {
 	}
 }
 
+func TestStartupMigrationAddsHTTPRouteAuthenticationColumnsAsPublic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-http-route.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE http_route_mapping (
+		id INTEGER PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		client_id INTEGER NOT NULL,
+		client_name TEXT NOT NULL,
+		route TEXT NOT NULL,
+		target_base_url TEXT NOT NULL,
+		enabled INTEGER NOT NULL,
+		detail_capture_enabled INTEGER NOT NULL DEFAULT 0,
+		path_rewrite_enabled INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE (client_id, route)
+	)`)
+	if err == nil {
+		_, err = legacy.Exec(`INSERT INTO http_route_mapping
+			(id, tenant_id, client_id, client_name, route, target_base_url, enabled,
+			 detail_capture_enabled, path_rewrite_enabled, created_at, updated_at)
+			VALUES (1, 'default', 10, 'legacy-client', 'web', 'http://127.0.0.1:8080', 1,
+			 0, 0, '2026-08-04T00:00:00.0000000Z', '2026-08-04T00:00:00.0000000Z')`)
+	}
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare legacy HTTP route schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open and migrate legacy HTTP route schema: %v", err)
+	}
+	defer db.Close()
+	routes, err := db.ListHTTPRoutes(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list migrated HTTP routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].AuthEnabled || routes[0].AuthUsername != "" ||
+		routes[0].AuthPasswordHash != "" {
+		t.Fatalf("migrated route auth = %+v, want public defaults", routes)
+	}
+}
+
 func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-java-ticket.db")
 	legacy, err := sql.Open("sqlite", path)

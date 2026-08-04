@@ -52,9 +52,9 @@ type ClientResult struct {
 
 // ClientDetail is the aggregate detail shape used by the management drawer.
 type ClientDetail struct {
-	Client     ClientView      `json:"client"`
-	SpecusMappings    []SpecusView    `json:"specusMappings"`
-	HTTPRoutes []HTTPRouteView `json:"httpRoutes"`
+	Client         ClientView      `json:"client"`
+	SpecusMappings []SpecusView    `json:"specusMappings"`
+	HTTPRoutes     []HTTPRouteView `json:"httpRoutes"`
 }
 
 // CredentialView is the JSON representation of a startup credential.
@@ -104,16 +104,19 @@ type SpecusView struct {
 
 // HTTPRouteView is the JSON representation of an HTTP route mapping.
 type HTTPRouteView struct {
-	ID                   int64  `json:"id"`
-	ClientID             int64  `json:"clientId"`
-	ClientName           string `json:"clientName"`
-	Route                string `json:"route"`
-	TargetBaseURL        string `json:"targetBaseUrl"`
-	Enabled              bool   `json:"enabled"`
-	DetailCaptureEnabled bool   `json:"detailCaptureEnabled"`
-	PathRewriteEnabled   bool   `json:"pathRewriteEnabled"`
-	CreatedAt            string `json:"createdAt"`
-	UpdatedAt            string `json:"updatedAt"`
+	ID                     int64  `json:"id"`
+	ClientID               int64  `json:"clientId"`
+	ClientName             string `json:"clientName"`
+	Route                  string `json:"route"`
+	TargetBaseURL          string `json:"targetBaseUrl"`
+	Enabled                bool   `json:"enabled"`
+	DetailCaptureEnabled   bool   `json:"detailCaptureEnabled"`
+	PathRewriteEnabled     bool   `json:"pathRewriteEnabled"`
+	AuthEnabled            bool   `json:"authEnabled"`
+	AuthUsername           string `json:"authUsername"`
+	AuthPasswordConfigured bool   `json:"authPasswordConfigured"`
+	CreatedAt              string `json:"createdAt"`
+	UpdatedAt              string `json:"updatedAt"`
 }
 
 // ConnectionItem is one row in a paged connection listing.
@@ -292,11 +295,14 @@ type specusMutation struct {
 
 // httpRouteMutation is the create/update HTTP route request body.
 type httpRouteMutation struct {
-	Route                string `json:"route"`
-	TargetBaseURL        string `json:"targetBaseUrl"`
-	Enabled              *bool  `json:"enabled"`
-	DetailCaptureEnabled *bool  `json:"detailCaptureEnabled"`
-	PathRewriteEnabled   *bool  `json:"pathRewriteEnabled"`
+	Route                string  `json:"route"`
+	TargetBaseURL        string  `json:"targetBaseUrl"`
+	Enabled              *bool   `json:"enabled"`
+	DetailCaptureEnabled *bool   `json:"detailCaptureEnabled"`
+	PathRewriteEnabled   *bool   `json:"pathRewriteEnabled"`
+	AuthEnabled          *bool   `json:"authEnabled"`
+	AuthUsername         *string `json:"authUsername"`
+	AuthPassword         *string `json:"authPassword"`
 }
 
 // loginRequest is the admin login body.

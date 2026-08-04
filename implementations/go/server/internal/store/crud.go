@@ -364,7 +364,8 @@ func (db *DB) DeleteSpecus(ctx context.Context, id int64) error {
 // ListHTTPRoutes returns HTTP route mappings, optionally filtered by client id, ordered by id.
 func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteMapping, error) {
 	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, route, target_base_url, enabled,
-		detail_capture_enabled, path_rewrite_enabled, created_at, updated_at
+		detail_capture_enabled, path_rewrite_enabled, auth_enabled, COALESCE(auth_username, ''),
+		COALESCE(auth_password_hash, ''), created_at, updated_at
 		FROM http_route_mapping`
 	var args []any
 	if clientID != nil {
@@ -384,15 +385,18 @@ func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteM
 			enabled            databaseBoolean
 			detailCapture      databaseBoolean
 			pathRewrite        databaseBoolean
+			authEnabled        databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.ClientID, &r.ClientName, &r.Route, &r.TargetBaseURL,
-			&enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
+			&enabled, &detailCapture, &pathRewrite, &authEnabled, &r.AuthUsername, &r.AuthPasswordHash,
+			&createdAt, &updated); err != nil {
 			return nil, err
 		}
 		r.Enabled = bool(enabled)
 		r.DetailCaptureEnabled = bool(detailCapture)
 		r.PathRewriteEnabled = bool(pathRewrite)
+		r.AuthEnabled = bool(authEnabled)
 		r.CreatedAt = parseTime(createdAt)
 		r.UpdatedAt = parseTime(updated)
 		routes = append(routes, r)
@@ -426,20 +430,23 @@ func (db *DB) RouteInUse(ctx context.Context, clientID int64, route string, excl
 func (db *DB) InsertHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 	query := db.rebind(`INSERT INTO http_route_mapping
 		(id, tenant_id, client_id, client_name, route, target_base_url, enabled, detail_capture_enabled,
-		 path_rewrite_enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		 path_rewrite_enabled, auth_enabled, auth_username, auth_password_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, r.ID, defaultTenant(r.TenantID), r.ClientID, r.ClientName, r.Route,
 		r.TargetBaseURL, boolToInt(r.Enabled), boolToInt(r.DetailCaptureEnabled),
-		boolToInt(r.PathRewriteEnabled), formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
+		boolToInt(r.PathRewriteEnabled), boolToInt(r.AuthEnabled), r.AuthUsername, r.AuthPasswordHash,
+		formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
 	return err
 }
 
 // UpdateHTTPRoute updates an HTTP route mapping's mutable fields.
 func (db *DB) UpdateHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 	query := db.rebind(`UPDATE http_route_mapping SET route = ?, target_base_url = ?, enabled = ?,
-		detail_capture_enabled = ?, path_rewrite_enabled = ?, updated_at = ? WHERE id = ?`)
+		detail_capture_enabled = ?, path_rewrite_enabled = ?, auth_enabled = ?, auth_username = ?,
+		auth_password_hash = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, r.Route, r.TargetBaseURL, boolToInt(r.Enabled),
-		boolToInt(r.DetailCaptureEnabled), boolToInt(r.PathRewriteEnabled), formatTime(r.UpdatedAt), r.ID)
+		boolToInt(r.DetailCaptureEnabled), boolToInt(r.PathRewriteEnabled), boolToInt(r.AuthEnabled),
+		r.AuthUsername, r.AuthPasswordHash, formatTime(r.UpdatedAt), r.ID)
 	return err
 }
 

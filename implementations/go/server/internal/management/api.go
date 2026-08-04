@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
@@ -711,9 +712,9 @@ func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
 		routeViews = append(routeViews, httpRouteView(route))
 	}
 	writeJSON(w, http.StatusOK, ClientDetail{
-		Client:     a.clientView(r.Context(), *account),
-		SpecusMappings:    specusViews,
-		HTTPRoutes: routeViews,
+		Client:         a.clientView(r.Context(), *account),
+		SpecusMappings: specusViews,
+		HTTPRoutes:     routeViews,
 	})
 }
 
@@ -1360,9 +1361,9 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"pushed":     result.SpecusMappings,
-		"specusMappings":    result.SpecusMappings,
-		"httpRoutes": result.HTTPRoutes,
+		"pushed":         result.SpecusMappings,
+		"specusMappings": result.SpecusMappings,
+		"httpRoutes":     result.HTTPRoutes,
 	})
 }
 
@@ -1446,6 +1447,10 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
+	if err := applyHTTPRouteAuthMutation(&mapping, req); err != nil {
+		a.fail(w, err)
+		return
+	}
 	if err := a.db.InsertHTTPRoute(r.Context(), mapping); err != nil {
 		a.fail(w, err)
 		return
@@ -1496,6 +1501,10 @@ func (a *API) handleUpdateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 	mapping.Enabled = boolOr(req.Enabled, mapping.Enabled)
 	mapping.DetailCaptureEnabled = boolOr(req.DetailCaptureEnabled, mapping.DetailCaptureEnabled)
 	mapping.PathRewriteEnabled = boolOr(req.PathRewriteEnabled, mapping.PathRewriteEnabled)
+	if err := applyHTTPRouteAuthMutation(mapping, req); err != nil {
+		a.fail(w, err)
+		return
+	}
 	mapping.UpdatedAt = time.Now()
 	if err := a.db.UpdateHTTPRoute(r.Context(), *mapping); err != nil {
 		a.fail(w, err)
@@ -2543,6 +2552,37 @@ func validateRoute(route, targetBaseURL string) error {
 	return nil
 }
 
+func applyHTTPRouteAuthMutation(mapping *store.HTTPRouteMapping, req httpRouteMutation) error {
+	if req.AuthEnabled != nil {
+		mapping.AuthEnabled = *req.AuthEnabled
+	}
+	if req.AuthUsername != nil {
+		username := strings.TrimSpace(*req.AuthUsername)
+		if utf8.RuneCountInString(username) > 120 {
+			return validation("认证用户名不能超过 120 个字符")
+		}
+		if strings.ContainsAny(username, ":\r\n") {
+			return validation("认证用户名不能包含冒号或换行符")
+		}
+		mapping.AuthUsername = username
+	}
+	if req.AuthPassword != nil && strings.TrimSpace(*req.AuthPassword) != "" {
+		if utf8.RuneCountInString(*req.AuthPassword) > 256 {
+			return validation("认证密码不能超过 256 个字符")
+		}
+		mapping.AuthPasswordHash = auth.HashPassword(*req.AuthPassword)
+	}
+	if mapping.AuthEnabled {
+		if strings.TrimSpace(mapping.AuthUsername) == "" {
+			return validation("开启认证时认证用户名不能为空")
+		}
+		if strings.TrimSpace(mapping.AuthPasswordHash) == "" {
+			return validation("开启认证时必须设置认证密码")
+		}
+	}
+	return nil
+}
+
 var (
 	allowedDownloadImplementations = map[string]struct{}{"java": {}, "go": {}, "csharp": {}}
 	allowedDownloadPlatforms       = map[string]struct{}{"windows": {}, "linux": {}, "macos": {}, "any": {}}
@@ -2682,7 +2722,9 @@ func httpRouteView(r store.HTTPRouteMapping) HTTPRouteView {
 		ID: r.ID, ClientID: r.ClientID, ClientName: r.ClientName, Route: r.Route,
 		TargetBaseURL: r.TargetBaseURL, Enabled: r.Enabled,
 		DetailCaptureEnabled: r.DetailCaptureEnabled, PathRewriteEnabled: r.PathRewriteEnabled,
-		CreatedAt: r.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: r.UpdatedAt.Format(time.RFC3339Nano),
+		AuthEnabled: r.AuthEnabled, AuthUsername: r.AuthUsername,
+		AuthPasswordConfigured: strings.TrimSpace(r.AuthPasswordHash) != "",
+		CreatedAt:              r.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: r.UpdatedAt.Format(time.RFC3339Nano),
 	}
 }
 

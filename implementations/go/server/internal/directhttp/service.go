@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -65,7 +67,7 @@ type TrafficRecorder interface {
 }
 
 type RouteSettings interface {
-	HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route string) (bool, error)
+	HTTPRouteAccessPolicy(ctx context.Context, clientName, route string) (*store.HTTPRouteAccessPolicy, error)
 }
 
 type DetailRecorder interface {
@@ -107,16 +109,40 @@ func (s *Service) SetReconnectGrace(grace time.Duration) {
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	clientName := r.PathValue("clientName")
+	route := r.PathValue("route")
+	policy, err := s.routePolicy(r.Context(), clientName, route)
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+		writeTextError(w, http.StatusServiceUnavailable, "HTTP 路由认证暂时不可用")
+		return
+	}
+	if policy != nil && !policy.Enabled {
+		w.Header().Set("Cache-Control", "no-store")
+		writeTextError(w, http.StatusNotFound, "HTTP 路由未启用")
+		return
+	}
+	protected := policy != nil && policy.AuthEnabled
+	if protected && !validProtectedRoutePolicy(policy) {
+		w.Header().Set("Cache-Control", "no-store")
+		writeTextError(w, http.StatusServiceUnavailable, "HTTP 路由认证暂时不可用")
+		return
+	}
+	if protected && !validBasicCredentials(r, policy) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Specus HTTP Route", charset="UTF-8"`)
+		w.Header().Set("Cache-Control", "no-store")
+		writeTextError(w, http.StatusUnauthorized, "HTTP 路由需要认证")
+		return
+	}
+
 	// 带 Upgrade: websocket 的 /http/** 请求走 WS 隧道（对齐 Java WebSocketSpecusConfig 的路由分流）。
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		s.serveWebSocket(w, r)
+		s.serveWebSocket(w, r, protected)
 		return
 	}
 	startedAt := time.Now()
-	clientName := r.PathValue("clientName")
-	route := r.PathValue("route")
 	path := relativePath(r)
-	requestHeaders := collectHeaders(r.Header, skippedHeaders)
+	requestHeaders := collectHeaders(r.Header, skippedHeaders, protected)
 	requestCapture := &limitedCapture{limit: detailCaptureBytes}
 
 	fail := func(status int, message string) {
@@ -149,7 +175,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metadata := map[string]any{
 		"source": "http", "phase": "request", "method": r.Method, "route": route,
 		"relativePath": path, "rawQuery": r.URL.RawQuery, "headers": requestHeaders,
-		"contentLength": r.ContentLength, "trailerNames": headerNames(r.Trailer),
+		"contentLength": r.ContentLength, "trailerNames": headerNames(r.Trailer, protected),
 	}
 	stream, err := s.openStream(clientName, metadata)
 	if err != nil {
@@ -160,7 +186,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	pumpResult := make(chan error, 1)
 	go func() {
-		pumpResult <- s.pumpRequest(r.Context(), r.Body, r.Trailer, stream, clientName, route, requestCapture)
+		pumpResult <- s.pumpRequest(r.Context(), r.Body, r.Trailer, stream, clientName, route, requestCapture,
+			protected)
 	}()
 
 	headerCtx := r.Context()
@@ -195,7 +222,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	responseHeaders := metadataStrings(head, "headers")
 	declareTrailers(w, metadataStrings(head, "trailerNames"))
 
-	rewrite := s.pathRewriteEnabled(r.Context(), clientName, route) &&
+	rewrite := policy != nil && policy.PathRewriteEnabled &&
 		isRewritableContentType(responseHeaders)
 	responseCapture := &limitedCapture{limit: detailCaptureBytes}
 	var rewriteBuffer bytes.Buffer
@@ -304,7 +331,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveWebSocket 处理 /http/{clientName}/{route}/** 的 WS 升级请求（对齐 Java WebSocketSpecusHandler）：
 // 握手成功后发送带 source=ws metadata 的 OPEN 帧，随后进入浏览器消息的读循环。
-func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, protected bool) {
 	clientName := r.PathValue("clientName")
 	route := r.PathValue("route")
 	// InsecureSkipVerify 跳过 Origin 校验，对齐 Java setAllowedOriginPatterns("*")。
@@ -327,7 +354,7 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	metadata := map[string]any{
 		"source": "ws", "channelId": newWSChannelID(), "clientName": clientName,
 		"route": route, "relativePath": relativePath(r), "rawQuery": r.URL.RawQuery,
-		"headers": collectHeaders(r.Header, wsSkippedHeaders), "body": []byte{},
+		"headers": collectHeaders(r.Header, wsSkippedHeaders, protected), "body": []byte{},
 	}
 	specus, err := s.openWS(clientName, metadata, conn)
 	if err != nil {
@@ -351,7 +378,7 @@ func (s *Service) clientOnline(ctx context.Context, clientName string) bool {
 }
 
 func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers http.Header, stream Stream,
-	clientName, route string, capture *limitedCapture) error {
+	clientName, route string, capture *limitedCapture, stripAuthorization bool) error {
 	defer body.Close()
 	buffer := make([]byte, httpChunkBytes)
 	total := 0
@@ -375,7 +402,7 @@ func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				metadata := map[string]any(nil)
-				if values := collectHeaders(trailers, skippedHeaders); len(values) > 0 {
+				if values := collectHeaders(trailers, skippedHeaders, stripAuthorization); len(values) > 0 {
 					metadata = map[string]any{"trailers": values}
 				}
 				return stream.FinishRequest(metadata)
@@ -400,12 +427,38 @@ func (s *Service) recordHTTPDetail(ctx context.Context, clientName, route, metho
 	})
 }
 
-func (s *Service) pathRewriteEnabled(ctx context.Context, clientName, route string) bool {
+func (s *Service) routePolicy(ctx context.Context, clientName, route string) (*store.HTTPRouteAccessPolicy, error) {
 	if s.routes == nil {
+		return nil, nil
+	}
+	return s.routes.HTTPRouteAccessPolicy(ctx, clientName, route)
+}
+
+func validProtectedRoutePolicy(policy *store.HTTPRouteAccessPolicy) bool {
+	if policy == nil || !policy.AuthEnabled || strings.TrimSpace(policy.AuthUsername) == "" ||
+		len(policy.AuthPasswordHash) != sha256.Size*2 {
 		return false
 	}
-	enabled, err := s.routes.HTTPRoutePathRewriteEnabled(ctx, clientName, route)
-	return err == nil && enabled
+	_, err := hex.DecodeString(policy.AuthPasswordHash)
+	return err == nil
+}
+
+func validBasicCredentials(r *http.Request, policy *store.HTTPRouteAccessPolicy) bool {
+	if policy == nil || !policy.AuthEnabled {
+		return true
+	}
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	actualUsername := sha256.Sum256([]byte(username))
+	expectedUsername := sha256.Sum256([]byte(policy.AuthUsername))
+	usernameMatches := subtle.ConstantTimeCompare(actualUsername[:], expectedUsername[:]) == 1
+	actualPasswordHash := sha256.Sum256([]byte(password))
+	expectedPasswordHash := strings.ToLower(strings.TrimSpace(policy.AuthPasswordHash))
+	passwordMatches := subtle.ConstantTimeCompare(
+		[]byte(fmt.Sprintf("%x", actualPasswordHash[:])), []byte(expectedPasswordHash)) == 1
+	return usernameMatches && passwordMatches
 }
 
 func relativePath(r *http.Request) string {
@@ -430,10 +483,11 @@ func relativePath(r *http.Request) string {
 	return path[afterClient+routeSeparator:]
 }
 
-func collectHeaders(header http.Header, skipped map[string]struct{}) []string {
+func collectHeaders(header http.Header, skipped map[string]struct{}, stripAuthorization bool) []string {
 	var headers []string
 	for name, values := range header {
-		if _, skip := skipped[strings.ToLower(name)]; skip {
+		lowerName := strings.ToLower(name)
+		if _, skip := skipped[lowerName]; skip || stripAuthorization && lowerName == "authorization" {
 			continue
 		}
 		for _, value := range values {
@@ -443,10 +497,11 @@ func collectHeaders(header http.Header, skipped map[string]struct{}) []string {
 	return headers
 }
 
-func headerNames(header http.Header) []string {
+func headerNames(header http.Header, stripAuthorization bool) []string {
 	names := make([]string, 0, len(header))
 	for name := range header {
-		if httpgutsValidHeaderName(name) {
+		if httpgutsValidHeaderName(name) &&
+			!(stripAuthorization && strings.EqualFold(name, "Authorization")) {
 			names = append(names, name)
 		}
 	}

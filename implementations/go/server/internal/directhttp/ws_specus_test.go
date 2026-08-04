@@ -11,6 +11,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
@@ -118,7 +119,9 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 					finishes.Add(1)
 					return nil
 				}, nil), nil
-		}, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashPassword("ws-password"),
+		}}, nil, store.TrafficDetailOptions{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -129,8 +132,11 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 	}))
 	defer server.Close()
 
+	authRequest := httptest.NewRequest(http.MethodGet, server.URL, nil)
+	authRequest.SetBasicAuth("ws-user", "ws-password")
 	browser, _, err := websocket.Dial(ctx,
-		"ws"+strings.TrimPrefix(server.URL, "http")+"/http/Demo%20client/api/ws/chat?x=%2F", nil)
+		"ws"+strings.TrimPrefix(server.URL, "http")+"/http/Demo%20client/api/ws/chat?x=%2F",
+		&websocket.DialOptions{HTTPHeader: authRequest.Header})
 	if err != nil {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
@@ -148,8 +154,9 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 		t.Fatalf("unexpected OPEN metadata: %+v", opened)
 	}
 	for _, header := range metadataStrings(opened, "headers") {
-		if strings.HasPrefix(strings.ToLower(header), "sec-websocket-") {
-			t.Fatalf("WS handshake header should be skipped: %q", header)
+		lowerHeader := strings.ToLower(header)
+		if strings.HasPrefix(lowerHeader, "sec-websocket-") || strings.HasPrefix(lowerHeader, "authorization:") {
+			t.Fatalf("WS handshake/auth header should be skipped: %q", header)
 		}
 	}
 
@@ -191,6 +198,47 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 	if finishes.Load() != 1 {
 		t.Fatalf("finishes = %d, want 1", finishes.Load())
 	}
+}
+
+func TestServeWebSocketRejectsMissingBasicAuthBeforeUpgrade(t *testing.T) {
+	opened := false
+	service := NewService(onlineRegistry("Demo client"), nil,
+		func(string, map[string]any, *websocket.Conn) (*WebSocketSpecus, error) {
+			opened = true
+			return nil, nil
+		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashPassword("ws-password"),
+		}}, nil, store.TrafficDetailOptions{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("clientName", "Demo client")
+		r.SetPathValue("route", "api")
+		service.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx,
+		"ws"+strings.TrimPrefix(server.URL, "http")+"/http/Demo%20client/api/ws/chat", nil)
+	if conn != nil {
+		conn.CloseNow()
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized || opened {
+		t.Fatalf("err/status/opened = %v/%v/%t, want dial error/401/false", err, responseStatus(response), opened)
+	}
+	if challenge := response.Header.Get("WWW-Authenticate"); !strings.HasPrefix(challenge, "Basic ") {
+		t.Fatalf("WWW-Authenticate = %q", challenge)
+	}
+}
+
+func responseStatus(response *http.Response) any {
+	if response == nil {
+		return nil
+	}
+	return response.StatusCode
 }
 
 // TestWSSpecusChunksLargeBrowserMessage 大消息切成 maxSWS2Payload 的帧，

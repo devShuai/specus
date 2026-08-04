@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -11,11 +12,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 func TestHTTPDataChannelSurvivesUnknownFrameAndStreamsFragmentedResponse(t *testing.T) {
 	app, port := startTestApp(t)
+	account, err := app.db.FindClientByName(context.Background(), DemoClientName)
+	if err != nil || account == nil {
+		t.Fatalf("load demo client: account=%+v err=%v", account, err)
+	}
+	now := time.Now().UTC()
+	if err := app.db.InsertHTTPRoute(context.Background(), store.HTTPRouteMapping{
+		ID: auth.NewClientID(), TenantID: account.TenantID, ClientID: account.ID, ClientName: account.ClientName,
+		Route: "web", TargetBaseURL: "http://127.0.0.1:8080", Enabled: true,
+		AuthEnabled: true, AuthUsername: "e2e-user", AuthPasswordHash: auth.HashPassword("e2e-password"),
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert protected HTTP route: %v", err)
+	}
 	controlConn, dataConn, dataReader := loginHTTPTestChannels(t, app, port)
 	defer controlConn.Close()
 	defer dataConn.Close()
@@ -88,7 +104,20 @@ func TestHTTPDataChannelSurvivesUnknownFrameAndStreamsFragmentedResponse(t *test
 
 	_, management := newHTTPTestServer(t, app)
 	httpClient := &http.Client{Timeout: 15 * time.Second}
-	response, err := httpClient.Get(management.URL + "/http/Demo%20client/web/fragmented")
+	unauthorized, err := httpClient.Get(management.URL + "/http/Demo%20client/web/fragmented")
+	if err != nil {
+		t.Fatalf("unauthenticated HTTP specus request: %v", err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated HTTP specus status = %d, want 401", unauthorized.StatusCode)
+	}
+	request, err := http.NewRequest(http.MethodGet, management.URL+"/http/Demo%20client/web/fragmented", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.SetBasicAuth("e2e-user", "e2e-password")
+	response, err := httpClient.Do(request)
 	if err != nil {
 		t.Fatalf("HTTP specus request: %v", err)
 	}

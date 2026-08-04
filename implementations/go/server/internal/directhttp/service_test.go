@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -201,6 +202,242 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 	}
 }
 
+func TestServeHTTPEnforcesManagedRouteBasicAuthentication(t *testing.T) {
+	policy := &store.HTTPRouteAccessPolicy{
+		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashPassword("route-password"),
+	}
+	routes := &staticRouteSettings{policy: policy}
+	opened := false
+	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
+		opened = true
+		return nil, errors.New("must not open")
+	}, nil, time.Second, 1024, 1024, nil, routes, nil, store.TrafficDetailOptions{})
+
+	for name, configure := range map[string]func(*http.Request){
+		"missing": nil,
+		"bearer":  func(request *http.Request) { request.Header.Set("Authorization", "Bearer token") },
+		"username": func(request *http.Request) {
+			request.SetBasicAuth("wrong-user", "route-password")
+		},
+		"password": func(request *http.Request) {
+			request.SetBasicAuth("route-user", "wrong-password")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opened = false
+			request := specusRequest(http.MethodPost, "/http/Demo%20client/api/private", "secret-body")
+			if configure != nil {
+				configure(request)
+			}
+			response := httptest.NewRecorder()
+
+			service.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized || opened {
+				t.Fatalf("response/opened = %d/%t, want 401/false", response.Code, opened)
+			}
+			if challenge := response.Header().Get("WWW-Authenticate"); !strings.HasPrefix(challenge, "Basic ") {
+				t.Fatalf("WWW-Authenticate = %q", challenge)
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+			}
+		})
+	}
+}
+
+func TestServeHTTPStripsProtectedRouteAuthorizationFromTunnelAndDetail(t *testing.T) {
+	stream := newFakeStream()
+	stream.head = map[string]any{"statusCode": 200, "headers": []string{"Content-Type:text/plain"}}
+	stream.responses = []fakeResponse{{data: []byte("ok")}, {end: true}}
+	recorder := &capturingDetailRecorder{}
+	var opened map[string]any
+	service := NewService(onlineRegistry("Demo client"), func(_ string, metadata map[string]any) (Stream, error) {
+		opened = metadata
+		return stream, nil
+	}, nil, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashPassword("route-password"),
+	}}, recorder, store.TrafficDetailOptions{Enabled: true})
+	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/private", "")
+	request.SetBasicAuth("route-user", "route-password")
+	request.Header.Set("X-Request", "visible")
+	response := httptest.NewRecorder()
+
+	service.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Body.String() != "ok" {
+		t.Fatalf("response = %d/%q", response.Code, response.Body.String())
+	}
+	assertNoAuthorizationHeader(t, metadataStrings(opened, "headers"))
+	assertNoAuthorizationHeader(t, recorder.record.RequestHeaders)
+	if !containsHeader(opened, "X-Request:visible") {
+		t.Fatalf("ordinary request header was not forwarded: %#v", opened["headers"])
+	}
+}
+
+func TestServeHTTPKeepsAuthorizationForPublicAndUnmanagedRoutes(t *testing.T) {
+	for name, settings := range map[string]RouteSettings{
+		"unmanaged": &staticRouteSettings{},
+		"managed public": &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: false,
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stream := newFakeStream()
+			stream.head = map[string]any{"statusCode": 204}
+			stream.responses = []fakeResponse{{end: true}}
+			var opened map[string]any
+			service := NewService(onlineRegistry("Demo client"), func(_ string, metadata map[string]any) (Stream, error) {
+				opened = metadata
+				return stream, nil
+			}, nil, time.Second, 1024, 1024, nil, settings, nil, store.TrafficDetailOptions{})
+			request := specusRequest(http.MethodGet, "/http/Demo%20client/api/public", "")
+			request.Header.Set("Authorization", "Bearer upstream-token")
+			response := httptest.NewRecorder()
+
+			service.ServeHTTP(response, request)
+
+			if response.Code != http.StatusNoContent || !containsHeader(opened, "Authorization:Bearer upstream-token") {
+				t.Fatalf("response/headers = %d/%#v", response.Code, opened["headers"])
+			}
+		})
+	}
+}
+
+func TestServeHTTPFiltersAuthorizationRequestTrailersByRoutePolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		settings  RouteSettings
+		protected bool
+	}{
+		{name: "protected", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
+			AuthPasswordHash: auth.HashPassword("route-password"),
+		}}, protected: true},
+		{name: "managed public", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true,
+		}}},
+		{name: "legacy unmanaged", settings: &staticRouteSettings{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream := newFakeStream()
+			stream.head = map[string]any{"statusCode": 204}
+			stream.responses = []fakeResponse{{end: true}}
+			var opened map[string]any
+			service := NewService(onlineRegistry("Demo client"), func(_ string, metadata map[string]any) (Stream, error) {
+				opened = metadata
+				return stream, nil
+			}, nil, time.Second, 1024, 1024, nil, test.settings, nil, store.TrafficDetailOptions{})
+			request := specusRequest(http.MethodPost, "/http/Demo%20client/api/trailers", "body")
+			if test.protected {
+				request.SetBasicAuth("route-user", "route-password")
+			} else {
+				request.Header.Set("Authorization", "Bearer upstream-token")
+			}
+			request.Trailer = http.Header{
+				"Authorization": {"Bearer trailer-token"},
+				"X-Trailer":     {"visible"},
+			}
+			response := httptest.NewRecorder()
+
+			service.ServeHTTP(response, request)
+
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("response = %d, want 204", response.Code)
+			}
+			trailerNames := metadataStrings(opened, "trailerNames")
+			trailers := metadataStrings(stream.finishedMetadata(), "trailers")
+			if !containsFold(trailerNames, "X-Trailer") || !containsHeaderValue(trailers, "X-Trailer:visible") {
+				t.Fatalf("ordinary trailer missing: names=%#v values=%#v", trailerNames, trailers)
+			}
+			if test.protected {
+				assertNoAuthorizationHeader(t, trailers)
+				if containsFold(trailerNames, "Authorization") {
+					t.Fatalf("protected trailer names leaked Authorization: %#v", trailerNames)
+				}
+			} else if !containsFold(trailerNames, "Authorization") ||
+				!containsHeaderValue(trailers, "Authorization:Bearer trailer-token") {
+				t.Fatalf("public/legacy Authorization trailer was not preserved: names=%#v values=%#v",
+					trailerNames, trailers)
+			}
+		})
+	}
+}
+
+func TestServeHTTPFailsClosedWhenRoutePolicyCannotBeLoaded(t *testing.T) {
+	opened := false
+	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
+		opened = true
+		return nil, nil
+	}, nil, time.Second, 1024, 1024, nil, &staticRouteSettings{err: errors.New("database unavailable")},
+		nil, store.TrafficDetailOptions{})
+	response := httptest.NewRecorder()
+
+	service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/private", ""))
+
+	if response.Code != http.StatusServiceUnavailable || opened {
+		t.Fatalf("response/opened = %d/%t, want 503/false", response.Code, opened)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
+}
+
+func TestServeHTTPRejectsDisabledAndIncompleteManagedPolicies(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     *store.HTTPRouteAccessPolicy
+		username   string
+		password   string
+		wantStatus int
+	}{
+		{name: "disabled", policy: &store.HTTPRouteAccessPolicy{Enabled: false},
+			username: "route-user", password: "password", wantStatus: http.StatusNotFound},
+		{name: "missing username", policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthPasswordHash: auth.HashPassword("password"),
+		}, username: "", password: "password", wantStatus: http.StatusServiceUnavailable},
+		{name: "whitespace username", policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "   ", AuthPasswordHash: auth.HashPassword("password"),
+		}, username: "   ", password: "password", wantStatus: http.StatusServiceUnavailable},
+		{name: "missing password hash", policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
+		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
+		{name: "wrong password hash length", policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("a", 63),
+		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
+		{name: "non-hex password hash", policy: &store.HTTPRouteAccessPolicy{
+			Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("z", 64),
+		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opened := false
+			service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
+				opened = true
+				return nil, nil
+			}, nil, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: test.policy},
+				nil, store.TrafficDetailOptions{})
+			request := specusRequest(http.MethodGet, "/http/Demo%20client/api/private", "")
+			request.SetBasicAuth(test.username, test.password)
+			response := httptest.NewRecorder()
+
+			service.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus || opened {
+				t.Fatalf("response/opened = %d/%t, want %d/false", response.Code, opened, test.wantStatus)
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+			}
+			if test.wantStatus == http.StatusServiceUnavailable && response.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("invalid server auth configuration must not challenge the caller: %q",
+					response.Header().Get("WWW-Authenticate"))
+			}
+		})
+	}
+}
+
 func specusRequest(method, target, body string) *http.Request {
 	request := httptest.NewRequest(method, target, strings.NewReader(body))
 	request.SetPathValue("clientName", "Demo client")
@@ -236,16 +473,17 @@ type fakeResponse struct {
 }
 
 type fakeStream struct {
-	mu            sync.Mutex
-	request       bytes.Buffer
-	finished      chan struct{}
-	finishOnce    sync.Once
-	head          map[string]any
-	responses     []fakeResponse
-	responseIndex int
-	consumed      int
-	resetReason   string
-	blockHead     bool
+	mu             sync.Mutex
+	request        bytes.Buffer
+	finished       chan struct{}
+	finishOnce     sync.Once
+	head           map[string]any
+	responses      []fakeResponse
+	responseIndex  int
+	consumed       int
+	resetReason    string
+	blockHead      bool
+	finishMetadata map[string]any
 }
 
 func newFakeStream() *fakeStream { return &fakeStream{finished: make(chan struct{})} }
@@ -255,7 +493,10 @@ func (s *fakeStream) SendData(_ context.Context, data []byte) error {
 	_, _ = s.request.Write(data)
 	return nil
 }
-func (s *fakeStream) FinishRequest(map[string]any) error {
+func (s *fakeStream) FinishRequest(metadata map[string]any) error {
+	s.mu.Lock()
+	s.finishMetadata = metadata
+	s.mu.Unlock()
 	s.finishOnce.Do(func() { close(s.finished) })
 	return nil
 }
@@ -287,6 +528,11 @@ func (s *fakeStream) requestBody() []byte {
 	defer s.mu.Unlock()
 	return append([]byte(nil), s.request.Bytes()...)
 }
+func (s *fakeStream) finishedMetadata() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finishMetadata
+}
 
 type capturingDetailRecorder struct{ record store.HTTPExchangeRecord }
 
@@ -299,3 +545,48 @@ type capturingTrafficRecorder struct{ upload, download int64 }
 
 func (r *capturingTrafficRecorder) RecordHTTPUpload(_, _ string, bytes int64)   { r.upload += bytes }
 func (r *capturingTrafficRecorder) RecordHTTPDownload(_, _ string, bytes int64) { r.download += bytes }
+
+type staticRouteSettings struct {
+	policy *store.HTTPRouteAccessPolicy
+	err    error
+}
+
+func (s *staticRouteSettings) HTTPRouteAccessPolicy(context.Context, string, string) (*store.HTTPRouteAccessPolicy, error) {
+	return s.policy, s.err
+}
+
+func assertNoAuthorizationHeader(t *testing.T, headers []string) {
+	t.Helper()
+	for _, header := range headers {
+		if strings.HasPrefix(strings.ToLower(header), "authorization:") {
+			t.Fatalf("Authorization must not leave the route auth gate: %q", header)
+		}
+	}
+}
+
+func containsHeader(metadata map[string]any, expected string) bool {
+	for _, header := range metadataStrings(metadata, "headers") {
+		if header == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(values []string, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHeaderValue(headers []string, expected string) bool {
+	for _, header := range headers {
+		if strings.EqualFold(header, expected) {
+			return true
+		}
+	}
+	return false
+}

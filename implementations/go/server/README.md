@@ -130,7 +130,7 @@ SPECUS_CONNECTIONSTRINGS_SPECUS="user:pass@tcp(localhost:3306)/specus?parseTime=
 
 启动时按 dialect 用 `CREATE TABLE IF NOT EXISTS` 幂等建表(`internal/store/schema/*.sql`),客户端账号、启动凭证、机器身份、带客户端消息能力字段的运行时会话、`transfer_attachment`、管理用户、映射和统计表与 .NET/Java 对齐；历史 `peer_mesh_acl` 会幂等补充默认 `OUTBOUND` 的 `direction` 列；时间戳统一存 ISO-8601 字符串以保证字典序=时序。
 
-映射表已包含 Java 管理面当前使用的通道级开关：TCP 映射的 `detail_capture_enabled`，HTTP 路由的 `detail_capture_enabled` 与 `path_rewrite_enabled`。这些字段默认关闭，启动迁移会对历史库幂等补列；当前 Go server 已能通过管理 API 保存和返回这些配置，并在 `path_rewrite_enabled=true` 时对可文本化 HTTP 响应做路径改写。
+映射表已包含 Java 管理面当前使用的通道级开关：TCP 映射的 `detail_capture_enabled`，HTTP 路由的 `detail_capture_enabled`、`path_rewrite_enabled` 与逐 route Basic 认证字段。认证默认关闭，管理响应只返回 `authPasswordConfigured`，不会返回密码或哈希；HTTP/WebSocket 都在打开隧道前校验，受保护 route 的入口 `Authorization` 不会下发客户端或写入流量明细。启动迁移会对历史库幂等补列；当前 Go server 也会在 `path_rewrite_enabled=true` 时对可文本化 HTTP 响应做路径改写。
 
 资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `specus_resource_traffic_usage`，HTTP stream 成功/失败响应会写入 `specus_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `specus_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 业务响应展示可解码 `gzip`、`deflate`（zlib / raw）和 `br` Brotli；这不改变 v2 wire body 禁止通用压缩的约束。
 

@@ -338,8 +338,22 @@ type HTTPRouteMapping struct {
 	Enabled              bool
 	DetailCaptureEnabled bool
 	PathRewriteEnabled   bool
+	AuthEnabled          bool
+	AuthUsername         string
+	AuthPasswordHash     string
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+}
+
+// HTTPRouteAccessPolicy contains only the server-side settings needed before a public
+// HTTP/WS request is allowed into a client's tunnel. A nil policy means the route is not
+// managed by the server and therefore retains the legacy public-access behaviour.
+type HTTPRouteAccessPolicy struct {
+	Enabled            bool
+	PathRewriteEnabled bool
+	AuthEnabled        bool
+	AuthUsername       string
+	AuthPasswordHash   string
 }
 
 // TrafficUsage mirrors specus_traffic_usage.

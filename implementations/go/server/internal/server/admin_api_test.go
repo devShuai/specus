@@ -526,7 +526,7 @@ func TestClientAndSpecusCrud(t *testing.T) {
 		t.Fatalf("client detail status %d", resp.StatusCode)
 	}
 	var detail struct {
-		Client  management_ClientView `json:"client"`
+		Client         management_ClientView `json:"client"`
 		SpecusMappings []struct {
 			ListenPort int `json:"listenPort"`
 		} `json:"specusMappings"`
@@ -614,7 +614,7 @@ func TestPeerMeshACLAPIExposesAndPersistsDirection(t *testing.T) {
 }
 
 func TestHTTPRouteValidation(t *testing.T) {
-	_, ts := newAPIServer(t)
+	app, ts := newAPIServer(t)
 	token := adminToken(t, ts)
 	clients := listClients(t, ts, token)
 	demo := findClient(t, clients, DemoClientName)
@@ -641,6 +641,119 @@ func TestHTTPRouteValidation(t *testing.T) {
 	resp.Body.Close()
 	if !route.DetailCaptureEnabled || !route.PathRewriteEnabled {
 		t.Fatalf("expected route capture/rewrite flags enabled: %+v", route)
+	}
+
+	// Enabling route authentication requires both a valid Basic username and a password.
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/http-routes", token,
+		`{"route":"missing-auth","targetBaseUrl":"https://example.com","authEnabled":true}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for enabled auth without credentials, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Username/password limits count Unicode code points rather than UTF-8 bytes.
+	createUnicodeAuthRoute := func(route, username, password string) int {
+		payload, err := json.Marshal(map[string]any{
+			"route": route, "targetBaseUrl": "https://example.com", "authEnabled": true,
+			"authUsername": username, "authPassword": password,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := authRequest(t, ts, http.MethodPost,
+			"/api/admin/clients/"+itoa(demo.ID)+"/http-routes", token, string(payload))
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	if status := createUnicodeAuthRoute("unicode-limit", strings.Repeat("🙂", 120),
+		strings.Repeat("密", 256)); status != http.StatusCreated {
+		t.Fatalf("expected Unicode code-point limits to accept 120/256 characters, got %d", status)
+	}
+	if status := createUnicodeAuthRoute("unicode-user-too-long", strings.Repeat("🙂", 121),
+		"password"); status != http.StatusBadRequest {
+		t.Fatalf("expected 121-code-point username to be rejected, got %d", status)
+	}
+	if status := createUnicodeAuthRoute("unicode-password-too-long", "route-user",
+		strings.Repeat("密", 257)); status != http.StatusBadRequest {
+		t.Fatalf("expected 257-code-point password to be rejected, got %d", status)
+	}
+
+	const rawPassword = "  route-password  "
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/http-routes", token,
+		`{"route":"private","targetBaseUrl":"https://example.com/private","authEnabled":true,`+
+			`"authUsername":" route-user ","authPassword":"  route-password  "}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for authenticated route, got %d", resp.StatusCode)
+	}
+	createdBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protected struct {
+		ID                     int64  `json:"id"`
+		AuthEnabled            bool   `json:"authEnabled"`
+		AuthUsername           string `json:"authUsername"`
+		AuthPasswordConfigured bool   `json:"authPasswordConfigured"`
+	}
+	if err := json.Unmarshal(createdBody, &protected); err != nil {
+		t.Fatal(err)
+	}
+	var rawView map[string]json.RawMessage
+	if err := json.Unmarshal(createdBody, &rawView); err != nil {
+		t.Fatal(err)
+	}
+	if !protected.AuthEnabled || protected.AuthUsername != "route-user" || !protected.AuthPasswordConfigured {
+		t.Fatalf("unexpected authenticated route view: %+v", protected)
+	}
+	if _, exposed := rawView["authPassword"]; exposed {
+		t.Fatal("HTTP route response exposed authPassword")
+	}
+	if _, exposed := rawView["authPasswordHash"]; exposed {
+		t.Fatal("HTTP route response exposed authPasswordHash")
+	}
+	stored, err := app.db.GetHTTPRoute(context.Background(), protected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256([]byte(rawPassword))
+	if stored.AuthPasswordHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("password was not hashed verbatim: %q", stored.AuthPasswordHash)
+	}
+
+	// A blank password update preserves the existing hash while allowing other auth fields to change.
+	resp = authRequest(t, ts, http.MethodPut, "/api/admin/http-routes/"+itoa(protected.ID), token,
+		`{"route":"private","targetBaseUrl":"https://example.com/private","authEnabled":true,`+
+			`"authUsername":"renamed-user","authPassword":"   "}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("blank password preservation update status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	stored, err = app.db.GetHTTPRoute(context.Background(), protected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.AuthUsername != "renamed-user" || stored.AuthPasswordHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("blank password update changed credentials unexpectedly: %+v", stored)
+	}
+
+	// Disabling authentication keeps credentials, so re-enabling does not require resubmitting a password.
+	for _, enabled := range []bool{false, true} {
+		resp = authRequest(t, ts, http.MethodPut, "/api/admin/http-routes/"+itoa(protected.ID), token,
+			`{"route":"private","targetBaseUrl":"https://example.com/private","authEnabled":`+
+				strconv.FormatBool(enabled)+`}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set authEnabled=%t status %d", enabled, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	stored, err = app.db.GetHTTPRoute(context.Background(), protected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.AuthEnabled || stored.AuthUsername != "renamed-user" ||
+		stored.AuthPasswordHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("disable/re-enable did not retain credentials: %+v", stored)
 	}
 }
 

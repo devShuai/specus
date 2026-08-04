@@ -269,6 +269,9 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
   enabled INTEGER NOT NULL,
   detail_capture_enabled INTEGER NOT NULL DEFAULT 0,
   path_rewrite_enabled INTEGER NOT NULL DEFAULT 0,
+  auth_enabled INTEGER NOT NULL DEFAULT 0,
+  auth_username TEXT NOT NULL DEFAULT '',
+  auth_password_hash TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (client_id, route)
