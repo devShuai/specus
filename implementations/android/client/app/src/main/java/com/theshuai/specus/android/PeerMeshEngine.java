@@ -190,7 +190,7 @@ final class PeerMeshEngine implements Closeable {
         enabled.set(true);
         startUdpSocket();
         startMaintenance();
-        if (vpnPlatform != null) {
+        if (vpnPlatform != null && specusSession.usesVpnDevice()) {
             vpnPlatform.startVpn(nextConfig, this::sendVirtualPacket);
         }
         reportDevice("ACTIVE", "");
@@ -350,7 +350,7 @@ final class PeerMeshEngine implements Closeable {
         }
         current.peerRoutes = SpecusCore.PeerMeshConfig.normalizePeerRoutes(
                 onlinePeerVirtualIps(), current.virtualIp);
-        if (vpnPlatform != null && current.enabled) {
+        if (vpnPlatform != null && current.enabled && specusSession.usesVpnDevice()) {
             vpnPlatform.startVpn(current, this::sendVirtualPacket);
         }
     }
@@ -510,7 +510,7 @@ final class PeerMeshEngine implements Closeable {
 
     private void injectPacketTooBig(byte[] packet, int pathMtu) {
         byte[] response = IpPacket.icmpFragmentationNeeded(packet, pathMtu);
-        if (response != null && vpnPlatform != null) {
+        if (response != null && vpnPlatform != null && specusSession.usesVpnDevice()) {
             try {
                 vpnPlatform.writeVpnPacket(response);
             } catch (Exception e) {
@@ -525,7 +525,7 @@ final class PeerMeshEngine implements Closeable {
             return;
         }
         DatagramSocket socket = new DatagramSocket(0);
-        if (vpnPlatform != null) {
+        if (vpnPlatform != null && specusSession.usesVpnDevice()) {
             vpnPlatform.protectDatagramSocket(socket);
         }
         udpSocket = socket;
@@ -941,7 +941,7 @@ final class PeerMeshEngine implements Closeable {
         if (handlePeerAppMessage(frame.plaintext, session, relayFromAllocationId)) {
             return;
         }
-        if (vpnPlatform != null) {
+        if (vpnPlatform != null && specusSession.usesVpnDevice()) {
             vpnPlatform.writeVpnPacket(frame.plaintext);
         }
     }

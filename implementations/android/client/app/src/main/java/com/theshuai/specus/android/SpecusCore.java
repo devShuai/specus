@@ -18,7 +18,11 @@ import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 import javax.net.SocketFactory;
 
@@ -38,16 +42,23 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -65,6 +76,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class SpecusCore {
     static final int CONTROL_READ_IDLE_TIMEOUT_MILLIS = 60_000;
+    static final int CONTROL_CONNECT_TIMEOUT_MILLIS = 5_000;
+    static final int CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS = 10_000;
+    static final int WEBSOCKET_PREOPEN_FIN_TIMEOUT_MILLIS = 5_000;
     static final String CONNECTION_ROLE_CONTROL = "control";
     static final String CONNECTION_ROLE_DATA = "data";
 
@@ -150,12 +164,15 @@ public final class SpecusCore {
             int attempt = 0;
             try {
                 StartupConfig config = StartupConfig.parse(configText);
+                SpecusSession session = null;
                 while (running.get()) {
                     ControlConnection next = null;
                     try {
-                        publish("HTTP login", config.serverBaseUrl, true);
-                        SpecusSession session = AuthClient.login(context, config);
-                        session.applyStartup(config);
+                        if (session == null) {
+                            publish("HTTP login", config.serverBaseUrl, true);
+                            session = AuthClient.login(context, config);
+                            session.applyStartup(config);
+                        }
                         startOrStopVpn(session);
                         publish("Control connecting", session.nettyHost + ":" + session.nettyPort, true);
                         next = new ControlConnection(
@@ -193,6 +210,7 @@ public final class SpecusCore {
                     ControlExitAction exitAction = next == null
                             ? ControlExitAction.RETRY_WITH_BACKOFF
                             : next.exitAction();
+                    session = RuntimeSessionPolicy.retainOrClear(session, exitAction);
                     if (exitAction == ControlExitAction.STOP_RECONNECTING) {
                         running.set(false);
                         break;
@@ -227,7 +245,7 @@ public final class SpecusCore {
                 return;
             }
             PeerMeshConfig peerMesh = session.peerMesh;
-            if (peerMesh != null && peerMesh.enabled) {
+            if (session.usesVpnDevice() && peerMesh != null && peerMesh.enabled) {
                 vpnPlatform.startVpn(peerMesh, packet -> {
                     // The control-channel peer mesh engine owns the live packet handler once
                     // control login succeeds. This early setup is intentionally inert.
@@ -303,6 +321,21 @@ public final class SpecusCore {
         STOP_RECONNECTING
     }
 
+    static final class RuntimeSessionPolicy {
+        private RuntimeSessionPolicy() {
+        }
+
+        static SpecusSession retainOrClear(SpecusSession session, ControlExitAction exitAction) {
+            return exitAction == ControlExitAction.IMMEDIATE_HTTP_LOGIN ? null : session;
+        }
+    }
+
+    static void requireFirstLoginResponse(boolean loginSucceeded) throws IOException {
+        if (loginSucceeded) {
+            throw new IOException("duplicate LOGIN_RESPONSE on authenticated control connection");
+        }
+    }
+
     static final class HeartbeatPolicy {
         static final long WRITE_IDLE_MILLIS = 5_000L;
 
@@ -314,11 +347,11 @@ public final class SpecusCore {
         }
     }
 
-    static final class TcpConnectedPolicy {
-        private TcpConnectedPolicy() {
+    static final class TcpOpenPolicy {
+        private TcpOpenPolicy() {
         }
 
-        static boolean shouldIgnore(Integer port, String channelId, boolean configuredPort) {
+        static boolean isInvalid(Integer port, String channelId, boolean configuredPort) {
             return port == null || isBlank(channelId) || !configuredPort;
         }
     }
@@ -328,32 +361,120 @@ public final class SpecusCore {
         }
 
         static String apply(Set<Integer> registeredPorts, Map<String, Object> metadata) {
-            if (!Boolean.FALSE.equals(metadata.get("success"))) {
+            if (metadata != null && Boolean.TRUE.equals(metadata.get("success"))) {
                 return null;
             }
-            Integer port = asInt(metadata.get("port"));
+            Integer port = metadata == null ? null : asInt(metadata.get("port"));
             if (port != null) {
                 registeredPorts.remove(port);
             }
-            String reason = asString(metadata.get("reason"));
+            String reason = metadata == null ? null : asString(metadata.get("reason"));
             return (port == null ? "unknown port" : "port " + port)
                     + ": " + (isBlank(reason) ? "registration rejected" : reason);
         }
     }
 
-    private static final class StartupConfig {
+    static final class RecentStreamTombstones {
+        private final int capacity;
+        private final Set<Integer> streamIds = new LinkedHashSet<>();
+
+        RecentStreamTombstones(int capacity) {
+            if (capacity <= 0) {
+                throw new IllegalArgumentException("capacity must be positive");
+            }
+            this.capacity = capacity;
+        }
+
+        synchronized void add(int streamId) {
+            streamIds.remove(streamId);
+            streamIds.add(streamId);
+            if (streamIds.size() > capacity) {
+                Iterator<Integer> iterator = streamIds.iterator();
+                iterator.next();
+                iterator.remove();
+            }
+        }
+
+        synchronized boolean contains(int streamId) {
+            return streamIds.contains(streamId);
+        }
+
+        synchronized void remove(int streamId) {
+            streamIds.remove(streamId);
+        }
+
+        synchronized void clear() {
+            streamIds.clear();
+        }
+    }
+
+    static final class StreamLifecycleRegistry {
+        private final int pendingLimit;
+        private final Set<Integer> pendingStreamIds = new HashSet<>();
+        private final RecentStreamTombstones recentlyClosedStreams;
+
+        StreamLifecycleRegistry(int pendingLimit, int tombstoneLimit) {
+            if (pendingLimit <= 0) {
+                throw new IllegalArgumentException("pendingLimit must be positive");
+            }
+            this.pendingLimit = pendingLimit;
+            this.recentlyClosedStreams = new RecentStreamTombstones(tombstoneLimit);
+        }
+
+        synchronized boolean beginPending(int streamId) {
+            recentlyClosedStreams.remove(streamId);
+            if (pendingStreamIds.contains(streamId) || pendingStreamIds.size() >= pendingLimit) {
+                return false;
+            }
+            pendingStreamIds.add(streamId);
+            return true;
+        }
+
+        synchronized void markOpened(int streamId) {
+            if (pendingStreamIds.remove(streamId)) {
+                recentlyClosedStreams.remove(streamId);
+            }
+        }
+
+        synchronized void markOpenedImmediately(int streamId) {
+            recentlyClosedStreams.remove(streamId);
+        }
+
+        synchronized void markClosed(int streamId) {
+            pendingStreamIds.remove(streamId);
+            recentlyClosedStreams.add(streamId);
+        }
+
+        synchronized boolean isRecentlyClosed(int streamId) {
+            return recentlyClosedStreams.contains(streamId);
+        }
+
+        synchronized int pendingCount() {
+            return pendingStreamIds.size();
+        }
+
+        synchronized void clear() {
+            pendingStreamIds.clear();
+            recentlyClosedStreams.clear();
+        }
+    }
+
+    static final class StartupConfig {
         final String serverBaseUrl;
         final String apiKey;
         final String secret;
+        final ControlTlsConfig controlTls;
         final String peerMeshDevice;
         final String peerMeshTunName;
         final int peerMeshMtu;
 
         private StartupConfig(String serverBaseUrl, String apiKey, String secret,
+                              ControlTlsConfig controlTls,
                               String peerMeshDevice, String peerMeshTunName, int peerMeshMtu) {
             this.serverBaseUrl = serverBaseUrl;
             this.apiKey = apiKey;
             this.secret = secret;
+            this.controlTls = controlTls;
             this.peerMeshDevice = peerMeshDevice;
             this.peerMeshTunName = peerMeshTunName;
             this.peerMeshMtu = peerMeshMtu;
@@ -368,9 +489,14 @@ public final class SpecusCore {
                     trimTrailingSlash(serverBaseUrl),
                     apiKey.trim(),
                     secret.trim(),
+                    ControlTlsConfig.parse(json.optJSONObject("controlTls")),
                     firstText(json.optString("peerMeshDevice", "noop").trim(), "noop"),
                     firstText(json.optString("peerMeshTunName", "specus0").trim(), "specus0"),
                     PeerMeshConfig.normalizeMtu(json.optInt("peerMeshMtu", PeerMeshConfig.DEFAULT_MTU)));
+        }
+
+        boolean requiresVpnPermission() {
+            return !"noop".equalsIgnoreCase(peerMeshDevice);
         }
 
         private static String required(JSONObject json, String name) throws Exception {
@@ -379,6 +505,233 @@ public final class SpecusCore {
                 throw new IllegalArgumentException("config missing " + name);
             }
             return value;
+        }
+    }
+
+    /** TLS policy shared by the control and data raw TCP connections. */
+    static final class ControlTlsConfig {
+        final Boolean enabled;
+        final String caCertificatePath;
+        final String serverName;
+        final boolean insecureSkipVerify;
+
+        private ControlTlsConfig(Boolean enabled, String caCertificatePath,
+                                 String serverName, boolean insecureSkipVerify) {
+            this.enabled = enabled;
+            this.caCertificatePath = trimToNull(caCertificatePath);
+            this.serverName = trimToNull(serverName);
+            this.insecureSkipVerify = insecureSkipVerify;
+            validate();
+        }
+
+        static ControlTlsConfig parse(JSONObject json) {
+            if (json == null) {
+                return new ControlTlsConfig(null, null, null, false);
+            }
+            Boolean enabled = null;
+            Object enabledValue = json.opt("enabled");
+            if (enabledValue != null && enabledValue != JSONObject.NULL) {
+                if (!(enabledValue instanceof Boolean value)) {
+                    throw new IllegalArgumentException("controlTls.enabled must be boolean or null");
+                }
+                enabled = value;
+            }
+            return new ControlTlsConfig(
+                    enabled,
+                    json.optString("caCertificatePath", null),
+                    json.optString("serverName", null),
+                    json.optBoolean("insecureSkipVerify", false));
+        }
+
+        boolean resolveEnabled(boolean runtimeNettyTls) {
+            if (enabled != null) {
+                return enabled;
+            }
+            return runtimeNettyTls || caCertificatePath != null
+                    || serverName != null || insecureSkipVerify;
+        }
+
+        String resolveServerName(String nettyHost) {
+            return serverName == null ? nettyHost : serverName;
+        }
+
+        private void validate() {
+            boolean hasTlsOptions = caCertificatePath != null
+                    || serverName != null || insecureSkipVerify;
+            if (Boolean.FALSE.equals(enabled) && hasTlsOptions) {
+                throw new IllegalArgumentException(
+                        "controlTls TLS options cannot be configured when controlTls.enabled is false");
+            }
+            if (caCertificatePath != null && insecureSkipVerify) {
+                throw new IllegalArgumentException(
+                        "controlTls.caCertificatePath cannot be combined with controlTls.insecureSkipVerify");
+            }
+            validateServerName(serverName);
+        }
+
+        private static void validateServerName(String value) {
+            if (value == null) {
+                return;
+            }
+            if (value.contains("://") || value.indexOf('/') >= 0 || value.indexOf('\\') >= 0) {
+                throw new IllegalArgumentException(
+                        "controlTls.serverName must be a hostname or IP address without scheme or path");
+            }
+            if (value.startsWith("[") || value.endsWith("]")) {
+                throw new IllegalArgumentException(
+                        "controlTls.serverName must not use brackets around an IP address");
+            }
+            if (value.indexOf(':') >= 0 && !isIpAddress(value)) {
+                throw new IllegalArgumentException("controlTls.serverName must not include a port");
+            }
+        }
+
+        private static boolean isIpAddress(String value) {
+            try {
+                return InetAddress.getByName(value).getHostAddress() != null
+                        && (value.indexOf(':') >= 0 || value.matches("[0-9.]+"));
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+
+        private static String trimToNull(String value) {
+            if (value == null || value.trim().isEmpty()) {
+                return null;
+            }
+            return value.trim();
+        }
+    }
+
+    static final class ControlTlsSockets {
+        private ControlTlsSockets() {
+        }
+
+        static Socket wrapConnected(Socket raw, String nettyHost, int nettyPort,
+                                    boolean runtimeNettyTls, ControlTlsConfig config,
+                                    int handshakeTimeoutMillis) throws Exception {
+            ControlTlsConfig policy = config == null ? ControlTlsConfig.parse(null) : config;
+            if (!policy.resolveEnabled(runtimeNettyTls)) {
+                return raw;
+            }
+            if (handshakeTimeoutMillis <= 0) {
+                throw new IllegalArgumentException("TLS handshake timeout must be positive");
+            }
+            String peerName = policy.resolveServerName(nettyHost);
+            SSLContext context = buildContext(policy);
+            try {
+                raw.setSoTimeout(handshakeTimeoutMillis);
+                SSLSocketFactory factory = context.getSocketFactory();
+                SSLSocket tls = (SSLSocket) factory.createSocket(raw, peerName, nettyPort, true);
+                SSLParameters parameters = tls.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm(
+                        policy.insecureSkipVerify ? "" : "HTTPS");
+                tls.setSSLParameters(parameters);
+                enableModernProtocols(tls);
+                tls.startHandshake();
+                return tls;
+            } catch (Exception error) {
+                closeQuietly(raw);
+                throw error;
+            }
+        }
+
+        static SSLContext buildContext(ControlTlsConfig config) throws Exception {
+            SSLContext context = SSLContext.getInstance("TLS");
+            if (config.insecureSkipVerify) {
+                context.init(null, new TrustManager[]{new X509TrustManager() {
+                    @Override
+                    public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
+                }}, new SecureRandom());
+                return context;
+            }
+            if (config.caCertificatePath == null) {
+                context.init(null, null, null);
+                return context;
+            }
+            KeyStore roots = KeyStore.getInstance(KeyStore.getDefaultType());
+            roots.load(null, null);
+            CertificateFactory certificates = CertificateFactory.getInstance("X.509");
+            int index = 0;
+            try (InputStream input = Files.newInputStream(Path.of(config.caCertificatePath))) {
+                for (Certificate certificate : certificates.generateCertificates(input)) {
+                    roots.setCertificateEntry("control-ca-" + index++, certificate);
+                }
+            } catch (IOException error) {
+                throw new IOException("cannot read controlTls.caCertificatePath '"
+                        + config.caCertificatePath + "'", error);
+            }
+            if (index == 0) {
+                throw new IOException("controlTls.caCertificatePath does not contain a PEM certificate");
+            }
+            TrustManagerFactory trust = TrustManagerFactory.getInstance(
+                    TrustManagerFactory.getDefaultAlgorithm());
+            trust.init(roots);
+            context.init(null, trust.getTrustManagers(), null);
+            return context;
+        }
+
+        private static void enableModernProtocols(SSLSocket socket) {
+            List<String> enabled = new ArrayList<>();
+            for (String protocol : socket.getSupportedProtocols()) {
+                if ("TLSv1.2".equals(protocol) || "TLSv1.3".equals(protocol)) {
+                    enabled.add(protocol);
+                }
+            }
+            if (!enabled.isEmpty()) {
+                socket.setEnabledProtocols(enabled.toArray(new String[0]));
+            }
+        }
+    }
+
+    /** Tracks sockets that have not yet been handed off to a live control/data connection. */
+    static final class ConnectingSocketTracker implements Closeable {
+        private final Set<Socket> sockets = new HashSet<>();
+        private boolean closed;
+
+        synchronized void track(Socket socket) throws IOException {
+            if (closed) {
+                closeQuietly(socket);
+                throw new EOFException("control connection is closing");
+            }
+            sockets.add(socket);
+        }
+
+        synchronized void untrack(Socket socket) {
+            sockets.remove(socket);
+        }
+
+        @Override
+        public void close() {
+            List<Socket> pending;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                pending = new ArrayList<>(sockets);
+                sockets.clear();
+            }
+            for (Socket socket : pending) {
+                closeQuietly(socket);
+            }
+        }
+    }
+
+    static void protectSocket(VpnPlatform vpnPlatform, Socket socket) throws IOException {
+        if (vpnPlatform != null && !vpnPlatform.protectSocket(socket)) {
+            closeQuietly(socket);
+            throw new IOException("failed to protect socket from the Android VPN");
         }
     }
 
@@ -568,6 +921,9 @@ public final class SpecusCore {
         volatile long tokenExpiresAtMillis;
         volatile String nettyHost;
         volatile int nettyPort;
+        volatile boolean nettyTls;
+        volatile ControlTlsConfig controlTls = ControlTlsConfig.parse(null);
+        volatile String peerMeshDevice = "noop";
         volatile PeerMeshConfig peerMesh = new PeerMeshConfig();
         volatile List<SpecusEndpoint> specusMappings = new ArrayList<>();
         volatile List<HttpRouteEndpoint> httpRoutes = new ArrayList<>();
@@ -584,6 +940,7 @@ public final class SpecusCore {
             }
             session.nettyHost = json.optString("nettyHost", null);
             session.nettyPort = json.optInt("nettyPort", 0);
+            session.nettyTls = json.optBoolean("nettyTls", false);
             session.specusMappings = parseSpecusMappings(json.optJSONArray("specusConfigList"));
             session.httpRoutes = parseHttpRoutes(json.optJSONArray("httpSpecusConfigList"));
             session.peerMesh = PeerMeshConfig.parse(json.optJSONObject("peerMesh"));
@@ -591,10 +948,16 @@ public final class SpecusCore {
         }
 
         void applyStartup(StartupConfig config) {
+            controlTls = config.controlTls;
+            peerMeshDevice = config.peerMeshDevice;
             if (peerMesh == null) {
                 peerMesh = new PeerMeshConfig();
             }
             peerMesh.mtu = PeerMeshConfig.normalizeMtu(config.peerMeshMtu);
+        }
+
+        boolean usesVpnDevice() {
+            return !"noop".equalsIgnoreCase(firstText(peerMeshDevice, "noop"));
         }
 
         synchronized void applyRefresh(SpecusSession refreshed) {
@@ -614,6 +977,9 @@ public final class SpecusCore {
             tokenExpiresAtMillis = refreshed.tokenExpiresAtMillis;
             nettyHost = refreshed.nettyHost;
             nettyPort = refreshed.nettyPort;
+            nettyTls = refreshed.nettyTls;
+            controlTls = refreshed.controlTls;
+            peerMeshDevice = refreshed.peerMeshDevice;
             specusMappings = refreshed.specusMappings == null ? new ArrayList<>() : refreshed.specusMappings;
             httpRoutes = refreshed.httpRoutes == null ? new ArrayList<>() : refreshed.httpRoutes;
             peerMesh = refreshed.peerMesh == null ? new PeerMeshConfig() : refreshed.peerMesh;
@@ -820,6 +1186,9 @@ public final class SpecusCore {
     }
 
     private static final class ControlConnection implements Closeable {
+        private static final int PENDING_STREAM_LIMIT = 1024;
+        private static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
+
         private final SpecusSession session;
         private final ExecutorService ioPool;
         private final StatusSink status;
@@ -830,6 +1199,7 @@ public final class SpecusCore {
         private final Object sendLock = new Object();
         private final Object dataSendLock = new Object();
         private final Object configurationLock = new Object();
+        private final ConnectingSocketTracker connectingSockets = new ConnectingSocketTracker();
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
         private final AtomicLong lastWriteAtMillis = new AtomicLong(0L);
@@ -839,6 +1209,8 @@ public final class SpecusCore {
         private final ConcurrentHashMap<Integer, LocalWebSocketSpecus> localWebSockets = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, HttpStreamForwarder> httpStreams = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, StreamSendWindow> sendWindows = new ConcurrentHashMap<>();
+        private final StreamLifecycleRegistry streamLifecycle =
+                new StreamLifecycleRegistry(PENDING_STREAM_LIMIT, RECENTLY_CLOSED_STREAM_LIMIT);
         private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "specus-heartbeat");
             thread.setDaemon(true);
@@ -888,13 +1260,9 @@ public final class SpecusCore {
         }
 
         void runBlocking() throws Exception {
-            Socket s = new Socket();
+            Socket s = connectServerSocket(false);
             socket = s;
-            protect(s);
-            s.setTcpNoDelay(true);
-            s.setKeepAlive(true);
             s.setSoTimeout(CONTROL_READ_IDLE_TIMEOUT_MILLIS);
-            s.connect(new InetSocketAddress(session.nettyHost, session.nettyPort), 5000);
             input = s.getInputStream();
             output = s.getOutputStream();
             send(Packet.loginRequest(session.clientName, session.clientSessionId, session.accessToken,
@@ -924,6 +1292,7 @@ public final class SpecusCore {
         private void handle(Packet packet) throws Exception {
             switch (packet.command) {
                 case Command.LOGIN_RESPONSE:
+                    requireFirstLoginResponse(loginSucceeded);
                     LoginResponse login = (LoginResponse) packet;
                     if (login.success) {
                         connectData();
@@ -935,15 +1304,7 @@ public final class SpecusCore {
                         }
                         scheduleTokenRefresh();
                     } else {
-                        LoginFailureAction action = LoginFailureAction.classify(login.reason);
-                        exitReason = firstText(login.reason, "control login rejected");
-                        if (action == LoginFailureAction.REFRESH_CREDENTIALS) {
-                            exitAction = ControlExitAction.IMMEDIATE_HTTP_LOGIN;
-                        } else if (action == LoginFailureAction.RETRY_WITH_BACKOFF) {
-                            exitAction = ControlExitAction.RETRY_WITH_BACKOFF;
-                        } else {
-                            exitAction = ControlExitAction.STOP_RECONNECTING;
-                        }
+                        classifyLoginFailure(login.reason, "control login rejected");
                         throw new IOException("control login rejected: " + exitReason);
                     }
                     break;
@@ -964,13 +1325,9 @@ public final class SpecusCore {
         }
 
         private void connectData() throws Exception {
-            Socket data = new Socket();
+            Socket data = connectServerSocket(true);
             dataSocket = data;
-            protect(data);
-            data.setTcpNoDelay(true);
-            data.setKeepAlive(true);
             data.setSoTimeout(CONTROL_READ_IDLE_TIMEOUT_MILLIS);
-            data.connect(new InetSocketAddress(session.nettyHost, session.nettyPort), 5000);
             dataInput = data.getInputStream();
             dataOutput = data.getOutputStream();
             sendData(Packet.loginRequest(session.clientName, session.clientSessionId, session.accessToken,
@@ -981,10 +1338,54 @@ public final class SpecusCore {
             }
             LoginResponse login = (LoginResponse) response;
             if (!login.success) {
+                classifyLoginFailure(login.reason, "data login rejected");
                 throw new IOException("data login rejected: " + firstText(login.reason, "login rejected"));
             }
             dataLoginSucceeded = true;
             ioPool.submit(this::readDataLoop);
+        }
+
+        private void classifyLoginFailure(String reason, String fallback) {
+            LoginFailureAction action = LoginFailureAction.classify(reason);
+            exitReason = firstText(reason, fallback);
+            if (action == LoginFailureAction.REFRESH_CREDENTIALS) {
+                exitAction = ControlExitAction.IMMEDIATE_HTTP_LOGIN;
+            } else if (action == LoginFailureAction.RETRY_WITH_BACKOFF) {
+                exitAction = ControlExitAction.RETRY_WITH_BACKOFF;
+            } else {
+                exitAction = ControlExitAction.STOP_RECONNECTING;
+            }
+        }
+
+        private Socket connectServerSocket(boolean dataChannel) throws Exception {
+            Socket raw = new Socket();
+            connectingSockets.track(raw);
+            try {
+                protect(raw);
+                raw.setTcpNoDelay(true);
+                raw.setKeepAlive(true);
+                raw.connect(new InetSocketAddress(session.nettyHost, session.nettyPort),
+                        CONTROL_CONNECT_TIMEOUT_MILLIS);
+                Socket connected = ControlTlsSockets.wrapConnected(
+                        raw, session.nettyHost, session.nettyPort,
+                        session.nettyTls, session.controlTls,
+                        CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS);
+                if (dataChannel) {
+                    dataSocket = connected;
+                } else {
+                    socket = connected;
+                }
+                if (closed.get()) {
+                    closeQuietly(connected);
+                    throw new EOFException("control connection closed while connecting");
+                }
+                return connected;
+            } catch (Exception error) {
+                closeQuietly(raw);
+                throw error;
+            } finally {
+                connectingSockets.untrack(raw);
+            }
         }
 
         private void readDataLoop() {
@@ -1090,7 +1491,7 @@ public final class SpecusCore {
                 return;
             }
             PeerMeshConfig peerMesh = session.peerMesh;
-            if (peerMesh != null && peerMesh.enabled) {
+            if (session.usesVpnDevice() && peerMesh != null && peerMesh.enabled) {
                 vpnPlatform.startVpn(peerMesh, packet -> {
                     // The live handler is installed by PeerMeshEngine after control login.
                 });
@@ -1108,11 +1509,25 @@ public final class SpecusCore {
                 return;
             }
             if (packet.type == NatMessageType.OPEN) {
-                StreamSendWindow previousWindow = sendWindows.put(packet.streamId, new StreamSendWindow());
-                if (previousWindow != null) {
-                    previousWindow.close();
+                if (localSpecusMappings.containsKey(packet.streamId)
+                        || localWebSockets.containsKey(packet.streamId)
+                        || httpStreams.containsKey(packet.streamId)
+                        || sendWindows.containsKey(packet.streamId)) {
+                    sendReset(packet.streamId, 7, "duplicate OPEN");
+                    return;
                 }
                 String source = asString(packet.meta.get("source"));
+                if ("http".equals(source)) {
+                    streamLifecycle.markOpenedImmediately(packet.streamId);
+                } else if (!streamLifecycle.beginPending(packet.streamId)) {
+                    sendReset(packet.streamId, 7, "duplicate or excessive pending stream");
+                    return;
+                }
+                if (sendWindows.putIfAbsent(packet.streamId, new StreamSendWindow()) != null) {
+                    streamLifecycle.markClosed(packet.streamId);
+                    sendReset(packet.streamId, 7, "duplicate OPEN");
+                    return;
+                }
                 if ("http".equals(source)) {
                     openHttpStream(packet.streamId, packet.meta);
                     return;
@@ -1124,42 +1539,59 @@ public final class SpecusCore {
                 Integer port = asInt(packet.meta.get("port"));
                 String channelId = asString(packet.meta.get("channelId"));
                 SpecusEndpoint endpoint = port == null ? null : session.specusMap().get(port);
-                if (TcpConnectedPolicy.shouldIgnore(port, channelId, endpoint != null)) {
-                    status.publish("NAT CONNECTED ignored",
+                if (TcpOpenPolicy.isInvalid(port, channelId, endpoint != null)) {
+                    status.publish("NAT OPEN rejected",
                             port == null || isBlank(channelId)
                                     ? "missing port/channelId"
                                     : "unknown port " + port,
                             true);
+                    sendReset(packet.streamId, 1, "invalid TCP OPEN");
                     return;
                 }
                 LocalSpecus specus = new LocalSpecus(packet.streamId, endpoint, this, ioPool);
-                localSpecusMappings.put(packet.streamId, specus);
+                if (localSpecusMappings.putIfAbsent(packet.streamId, specus) != null) {
+                    throw new IOException("duplicate TCP OPEN for stream "
+                            + Integer.toUnsignedString(packet.streamId));
+                }
                 specus.start();
                 return;
             }
             if (packet.type == NatMessageType.DATA) {
                 HttpStreamForwarder http = httpStreams.get(packet.streamId);
                 if (http != null) {
-                    http.onRequestData(packet.data);
+                    dispatchHttpData(http, packet.data,
+                            (packet.flags & NatMessage.FLAG_END_STREAM) != 0, packet.meta);
                     return;
                 }
                 LocalWebSocketSpecus webSocket = localWebSockets.get(packet.streamId);
                 if (webSocket != null) {
-                    webSocket.write(packet.data);
-                    sendWindowUpdate(packet.streamId, packet.data == null ? 0 : packet.data.length);
+                    int consumed;
+                    try {
+                        consumed = webSocket.write(packet.data);
+                    } catch (Exception error) {
+                        webSocket.failFromRemote("invalid SWS2 DATA: " + message(error));
+                        return;
+                    }
+                    sendWindowUpdate(packet.streamId, consumed);
                     if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
+                        closeSendWindow(packet.streamId);
                         webSocket.closeFromRemote();
                     }
                     return;
                 }
                 LocalSpecus specus = localSpecusMappings.get(packet.streamId);
                 if (specus != null) {
-                    specus.write(packet.data);
-                    sendWindowUpdate(packet.streamId, packet.data == null ? 0 : packet.data.length);
-                    if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
-                        specus.closeFromRemote();
+                    try {
+                        specus.write(packet.data);
+                        if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
+                            specus.receiveRemoteFin();
+                        }
+                    } catch (IOException protocolError) {
+                        specus.failRemoteProtocol(message(protocolError));
                     }
+                    return;
                 }
+                sendReset(packet.streamId, 7, "DATA for unknown TCP stream");
                 return;
             }
             if (packet.type == NatMessageType.FIN) {
@@ -1168,39 +1600,66 @@ public final class SpecusCore {
                     http.onRequestEnd(packet.meta);
                     return;
                 }
+                LocalWebSocketSpecus webSocket = localWebSockets.remove(packet.streamId);
+                if (webSocket != null) {
+                    closeSendWindow(packet.streamId);
+                    webSocket.closeFromRemote();
+                    return;
+                }
+                LocalSpecus specus = localSpecusMappings.get(packet.streamId);
+                if (specus != null) {
+                    try {
+                        specus.receiveRemoteFin();
+                    } catch (IOException protocolError) {
+                        specus.failRemoteProtocol(message(protocolError));
+                    }
+                    return;
+                }
+                sendReset(packet.streamId, 7, "FIN for unknown TCP stream");
+                return;
             }
             if (packet.type == NatMessageType.RST) {
                 HttpStreamForwarder http = httpStreams.remove(packet.streamId);
                 if (http != null) {
-                    StreamSendWindow window = sendWindows.remove(packet.streamId);
-                    if (window != null) {
-                        window.close();
-                    }
+                    closeSendWindow(packet.streamId);
+                    streamLifecycle.markClosed(packet.streamId);
                     http.closeFromControl();
                     return;
                 }
-            }
-            if (packet.type == NatMessageType.FIN || packet.type == NatMessageType.RST) {
-                StreamSendWindow window = sendWindows.remove(packet.streamId);
-                if (window != null) {
-                    window.close();
-                }
                 LocalWebSocketSpecus webSocket = localWebSockets.remove(packet.streamId);
                 if (webSocket != null) {
+                    closeSendWindow(packet.streamId);
                     webSocket.closeFromRemote();
                     return;
                 }
-                LocalSpecus specus = localSpecusMappings.remove(packet.streamId);
+                LocalSpecus specus = localSpecusMappings.get(packet.streamId);
                 if (specus != null) {
-                    specus.closeFromRemote();
+                    specus.receiveRemoteReset();
+                    return;
                 }
-                return;
+                if (streamLifecycle.isRecentlyClosed(packet.streamId)) {
+                    return;
+                }
+                throw new IOException("RST for unknown stream "
+                        + Integer.toUnsignedString(packet.streamId));
             }
             if (packet.type == NatMessageType.WINDOW_UPDATE) {
                 StreamSendWindow window = sendWindows.get(packet.streamId);
                 if (window != null && !window.add(packet.value)) {
                     throw new IOException("invalid WINDOW_UPDATE credit");
                 }
+                return;
+            }
+            if (packet.type == NatMessageType.KEEPALIVE) {
+                return;
+            }
+            throw new IOException("unexpected NAT stream type: " + packet.type);
+        }
+
+        private void closeSendWindow(int streamId) {
+            StreamSendWindow window = sendWindows.remove(streamId);
+            if (window != null) {
+                window.close();
             }
         }
 
@@ -1351,9 +1810,30 @@ public final class SpecusCore {
 
         void completeHttpStream(int streamId, HttpStreamForwarder expected) {
             httpStreams.remove(streamId, expected);
-            StreamSendWindow window = sendWindows.remove(streamId);
-            if (window != null) {
-                window.close();
+            closeSendWindow(streamId);
+            streamLifecycle.markClosed(streamId);
+        }
+
+        void completeTcpStream(int streamId, LocalSpecus expected) {
+            localSpecusMappings.remove(streamId, expected);
+            closeSendWindow(streamId);
+            streamLifecycle.markClosed(streamId);
+        }
+
+        void completeWebSocketStream(int streamId, LocalWebSocketSpecus expected) {
+            localWebSockets.remove(streamId, expected);
+            closeSendWindow(streamId);
+            streamLifecycle.markClosed(streamId);
+        }
+
+        void resetTcpStream(int streamId, LocalSpecus expected,
+                            long errorCode, String reason) {
+            if (!localSpecusMappings.remove(streamId, expected)) {
+                return;
+            }
+            try {
+                sendReset(streamId, errorCode, reason);
+            } catch (Exception ignored) {
             }
         }
 
@@ -1368,6 +1848,30 @@ public final class SpecusCore {
             }
         }
 
+        void resetWebSocketStream(int streamId, LocalWebSocketSpecus expected,
+                                  long errorCode, String reason) {
+            if (!localWebSockets.remove(streamId, expected)) {
+                return;
+            }
+            try {
+                sendReset(streamId, errorCode, reason);
+            } catch (Exception ignored) {
+            }
+        }
+
+        void scheduleWebSocketPreOpenClose(LocalWebSocketSpecus expected) {
+            try {
+                heartbeat.schedule(expected::expireRemoteFin,
+                        WEBSOCKET_PREOPEN_FIN_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (RuntimeException ignored) {
+                expected.expireRemoteFin();
+            }
+        }
+
+        void markStreamOpened(int streamId) {
+            streamLifecycle.markOpened(streamId);
+        }
+
         private void consumeSendCredit(int streamId, int bytes) throws IOException {
             StreamSendWindow window = sendWindows.get(streamId);
             if (window == null || !window.consume(bytes)) {
@@ -1375,9 +1879,9 @@ public final class SpecusCore {
             }
         }
 
-        void protect(Socket socket) {
-            if (vpnPlatform != null) {
-                vpnPlatform.protectSocket(socket);
+        void protect(Socket socket) throws IOException {
+            if (session.usesVpnDevice()) {
+                protectSocket(vpnPlatform, socket);
             }
         }
 
@@ -1396,7 +1900,11 @@ public final class SpecusCore {
             }
             NatMessage reset = Packet.stream(NatMessageType.RST, streamId, errorCode, null);
             reset.meta = Map.of("reason", reason);
-            send(reset);
+            try {
+                send(reset);
+            } finally {
+                streamLifecycle.markClosed(streamId);
+            }
         }
 
         private void sendWindowUpdate(int streamId, int credit) throws Exception {
@@ -1411,9 +1919,7 @@ public final class SpecusCore {
             String route = asString(meta.get("route"));
             if (isBlank(channelId) || isBlank(route)) {
                 status.publish("WebSocket route rejected", "missing channelId/route", true);
-                if (!isBlank(channelId)) {
-                    sendReset(streamId, 2, "invalid websocket open");
-                }
+                sendReset(streamId, 2, "invalid websocket open");
                 return;
             }
             String targetBaseUrl = session.routeMap().get(route);
@@ -1504,6 +2010,13 @@ public final class SpecusCore {
             heartbeat.shutdownNow();
             credentialRefresh.shutdownNow();
             peerMeshEngine.close();
+            connectingSockets.close();
+            closeQuietly(input);
+            closeQuietly(output);
+            closeQuietly(socket);
+            closeQuietly(dataInput);
+            closeQuietly(dataOutput);
+            closeQuietly(dataSocket);
             for (LocalSpecus specus : localSpecusMappings.values()) {
                 closeQuietly(specus);
             }
@@ -1520,14 +2033,9 @@ public final class SpecusCore {
                 window.close();
             }
             sendWindows.clear();
+            streamLifecycle.clear();
             webSocketClient.dispatcher().executorService().shutdown();
             webSocketClient.connectionPool().evictAll();
-            closeQuietly(input);
-            closeQuietly(output);
-            closeQuietly(socket);
-            closeQuietly(dataInput);
-            closeQuietly(dataOutput);
-            closeQuietly(dataSocket);
         }
     }
 
@@ -1571,12 +2079,82 @@ public final class SpecusCore {
         }
     }
 
+    static final class TcpHalfCloseState {
+        @FunctionalInterface
+        interface FinSender {
+            void send() throws Exception;
+        }
+
+        enum Transition {
+            ACCEPTED,
+            DUPLICATE,
+            RESET
+        }
+
+        private boolean localFinStarted;
+        private boolean localFinSent;
+        private boolean remoteFinReceived;
+        private boolean remoteOutputShutdown;
+        private boolean reset;
+
+        synchronized Transition sendLocalFin(FinSender sender) throws Exception {
+            if (reset) return Transition.RESET;
+            if (localFinStarted) return Transition.DUPLICATE;
+            localFinStarted = true;
+            sender.send();
+            if (!reset) localFinSent = true;
+            return Transition.ACCEPTED;
+        }
+
+        synchronized Transition receiveRemoteFin() {
+            if (reset) return Transition.RESET;
+            if (remoteFinReceived) return Transition.DUPLICATE;
+            remoteFinReceived = true;
+            return Transition.ACCEPTED;
+        }
+
+        synchronized void completeRemoteOutputShutdown() {
+            if (remoteFinReceived && !reset) remoteOutputShutdown = true;
+        }
+
+        synchronized boolean canSendLocalData() {
+            return !reset && !localFinStarted;
+        }
+
+        synchronized boolean canReceiveRemoteData() {
+            return !reset && !remoteFinReceived;
+        }
+
+        synchronized boolean remoteFinReceived() {
+            return remoteFinReceived;
+        }
+
+        synchronized boolean reset() {
+            if (reset) return false;
+            reset = true;
+            return true;
+        }
+
+        synchronized boolean isReset() {
+            return reset;
+        }
+
+        synchronized boolean isGracefullyComplete() {
+            return !reset && localFinSent && remoteOutputShutdown;
+        }
+    }
+
     private static final class LocalSpecus implements Closeable {
+        private static final int MAX_PENDING_REMOTE_BYTES = 1024 * 1024;
+
         private final int streamId;
         private final SpecusEndpoint endpoint;
         private final ControlConnection control;
         private final ExecutorService ioPool;
-        private final AtomicBoolean closed = new AtomicBoolean(false);
+        private final TcpHalfCloseState closeState = new TcpHalfCloseState();
+        private final Object outputLock = new Object();
+        private final List<byte[]> pendingRemoteData = new ArrayList<>();
+        private int pendingRemoteBytes;
         private volatile Socket socket;
 
         LocalSpecus(int streamId, SpecusEndpoint endpoint, ControlConnection control, ExecutorService ioPool) {
@@ -1587,52 +2165,182 @@ public final class SpecusCore {
         }
 
         void start() {
-            ioPool.submit(() -> {
-                try {
-                    Socket local = new Socket();
-                    socket = local;
-                    control.protect(local);
-                    local.setTcpNoDelay(true);
-                    local.connect(new InetSocketAddress(endpoint.specusAddress, endpoint.specusPort), 5000);
-                    byte[] buffer = new byte[16 * 1024];
-                    InputStream in = local.getInputStream();
-                    int read;
-                    while (!closed.get() && (read = in.read(buffer)) >= 0) {
-                        byte[] data = new byte[read];
-                        System.arraycopy(buffer, 0, data, 0, read);
-                        control.sendNatData(streamId, data);
-                    }
-                } catch (Throwable ignored) {
-                } finally {
-                    control.localSpecusMappings.remove(streamId, this);
-                    if (closed.compareAndSet(false, true)) {
-                        try {
-                            control.sendFin(streamId);
-                        } catch (Exception ignored) {
-                        }
-                    }
-                    closeQuietly(socket);
-                }
-            });
+            ioPool.submit(this::runLocalInput);
         }
 
-        void write(byte[] data) throws IOException {
-            Socket local = socket;
-            if (local != null && data != null) {
-                OutputStream out = local.getOutputStream();
-                out.write(data);
-                out.flush();
+        private void runLocalInput() {
+            Socket local = null;
+            try {
+                local = new Socket();
+                control.protect(local);
+                local.setTcpNoDelay(true);
+                local.connect(new InetSocketAddress(endpoint.specusAddress, endpoint.specusPort), 5000);
+                attachAndFlush(local);
+                control.markStreamOpened(streamId);
+                if (closeState.isReset()) {
+                    return;
+                }
+                byte[] buffer = new byte[16 * 1024];
+                InputStream in = local.getInputStream();
+                while (!closeState.isReset()) {
+                    int read = in.read(buffer);
+                    if (read < 0) {
+                        sendLocalFin();
+                        return;
+                    }
+                    if (read == 0) {
+                        continue;
+                    }
+                    if (!closeState.canSendLocalData()) {
+                        throw new IOException("local TCP DATA after FIN");
+                    }
+                    byte[] data = new byte[read];
+                    System.arraycopy(buffer, 0, data, 0, read);
+                    control.sendNatData(streamId, data);
+                }
+            } catch (Exception error) {
+                closeQuietly(local);
+                if (!closeState.isReset() && !closeState.isGracefullyComplete()) {
+                    failLocalIo("local TCP I/O failed: " + message(error));
+                }
             }
         }
 
-        void closeFromRemote() {
-            closed.set(true);
+        void write(byte[] data) throws IOException {
+            byte[] value = data == null ? new byte[0] : data;
+            synchronized (outputLock) {
+                if (!closeState.canReceiveRemoteData()) {
+                    throw new IOException("remote TCP DATA after FIN");
+                }
+                Socket local = socket;
+                if (local == null) {
+                    if ((long) pendingRemoteBytes + value.length > MAX_PENDING_REMOTE_BYTES) {
+                        throw new IOException("remote TCP DATA exceeded pre-connect buffer");
+                    }
+                    if (value.length > 0) {
+                        pendingRemoteData.add(value.clone());
+                        pendingRemoteBytes += value.length;
+                    }
+                    return;
+                }
+                writeToLocal(local, value);
+            }
+        }
+
+        void receiveRemoteFin() throws IOException {
+            synchronized (outputLock) {
+                TcpHalfCloseState.Transition transition = closeState.receiveRemoteFin();
+                if (transition == TcpHalfCloseState.Transition.DUPLICATE) {
+                    throw new IOException("duplicate remote TCP FIN");
+                }
+                if (transition == TcpHalfCloseState.Transition.RESET) {
+                    return;
+                }
+                Socket local = socket;
+                if (local != null && !shutdownLocalOutput(local)) {
+                    return;
+                }
+            }
+            closeIfComplete();
+        }
+
+        void receiveRemoteReset() {
+            if (closeState.reset()) {
+                control.completeTcpStream(streamId, this);
+            }
+            closeQuietly(socket);
+        }
+
+        private void attachAndFlush(Socket local) throws Exception {
+            synchronized (outputLock) {
+                if (closeState.isReset()) {
+                    closeQuietly(local);
+                    return;
+                }
+                socket = local;
+                for (byte[] data : pendingRemoteData) {
+                    writeToLocal(local, data);
+                    if (closeState.isReset()) {
+                        return;
+                    }
+                }
+                pendingRemoteData.clear();
+                pendingRemoteBytes = 0;
+                if (closeState.remoteFinReceived() && !shutdownLocalOutput(local)) {
+                    return;
+                }
+            }
+            closeIfComplete();
+        }
+
+        private void writeToLocal(Socket local, byte[] data) {
+            if (data.length == 0 || closeState.isReset()) {
+                return;
+            }
+            try {
+                OutputStream out = local.getOutputStream();
+                out.write(data);
+                out.flush();
+                control.sendWindowUpdate(streamId, data.length);
+            } catch (Exception error) {
+                failLocalIo("write to local TCP failed: " + message(error));
+            }
+        }
+
+        private boolean shutdownLocalOutput(Socket local) {
+            try {
+                if (!local.isOutputShutdown()) {
+                    local.shutdownOutput();
+                }
+                closeState.completeRemoteOutputShutdown();
+                return true;
+            } catch (Exception error) {
+                failLocalIo("failed to half-close local TCP output: " + message(error));
+                return false;
+            }
+        }
+
+        private void sendLocalFin() {
+            try {
+                TcpHalfCloseState.Transition transition = closeState.sendLocalFin(
+                        () -> control.sendFin(streamId));
+                if (transition == TcpHalfCloseState.Transition.ACCEPTED) {
+                    closeIfComplete();
+                }
+            } catch (Exception error) {
+                failLocalIo("failed to send local TCP FIN: " + message(error));
+            }
+        }
+
+        private void failLocalIo(String reason) {
+            if (!closeState.reset()) {
+                return;
+            }
+            control.resetTcpStream(streamId, this, 9, reason);
+            closeQuietly(socket);
+        }
+
+        private void failRemoteProtocol(String reason) {
+            if (!closeState.reset()) {
+                return;
+            }
+            control.resetTcpStream(streamId, this, 7,
+                    firstText(reason, "invalid remote TCP stream transition"));
+            closeQuietly(socket);
+        }
+
+        private void closeIfComplete() {
+            if (!closeState.isGracefullyComplete()) {
+                return;
+            }
+            control.completeTcpStream(streamId, this);
             closeQuietly(socket);
         }
 
         @Override
         public void close() {
-            closeFromRemote();
+            closeState.reset();
+            closeQuietly(socket);
         }
     }
 
@@ -1658,7 +2366,7 @@ public final class SpecusCore {
         }
 
         interface SocketProtector {
-            void protect(Socket socket);
+            void protect(Socket socket) throws IOException;
         }
 
         static OkHttpClient newClient(SocketProtector protector) {
@@ -1759,6 +2467,20 @@ public final class SpecusCore {
             return new Frame(opcode, fin, rsv, closeCode, payload);
         }
 
+        static boolean isLocallyTerminatedControlFrame(Frame frame) {
+            return frame != null && (frame.opcode == OPCODE_PING || frame.opcode == OPCODE_PONG);
+        }
+
+        static byte[] localControlResponse(Frame frame) {
+            if (frame == null || frame.opcode == OPCODE_PONG) {
+                return null;
+            }
+            if (frame.opcode != OPCODE_PING) {
+                throw new IllegalArgumentException("frame is not a locally terminated control frame");
+            }
+            return encodeFrame(OPCODE_PONG, true, 0, 0, frame.payload);
+        }
+
         private static void validateFrame(int opcode, boolean fin, int rsv, int closeCode, int payloadLength) {
             if (opcode != OPCODE_CONTINUATION && opcode != OPCODE_TEXT && opcode != OPCODE_BINARY
                     && opcode != OPCODE_CLOSE && opcode != OPCODE_PING && opcode != OPCODE_PONG) {
@@ -1772,6 +2494,8 @@ public final class SpecusCore {
             }
             if (opcode == OPCODE_CLOSE) {
                 if (payloadLength > 123 || (closeCode != 0 && (closeCode < 1000 || closeCode >= 5000))
+                        || closeCode == 1004 || closeCode == 1005
+                        || closeCode == 1006 || closeCode == 1015
                         || (closeCode == 0 && payloadLength != 0)) {
                     throw new IllegalArgumentException("invalid SWS2 close frame");
                 }
@@ -1820,16 +2544,24 @@ public final class SpecusCore {
                 this.protector = protector;
             }
 
-            private Socket protectedSocket() {
+            private Socket protectedSocket() throws IOException {
                 Socket socket = new Socket();
-                if (protector != null) {
-                    protector.protect(socket);
+                try {
+                    if (protector != null) {
+                        protector.protect(socket);
+                    }
+                    return socket;
+                } catch (IOException error) {
+                    closeQuietly(socket);
+                    throw error;
+                } catch (RuntimeException error) {
+                    closeQuietly(socket);
+                    throw error;
                 }
-                return socket;
             }
 
             @Override
-            public Socket createSocket() {
+            public Socket createSocket() throws IOException {
                 return protectedSocket();
             }
 
@@ -1868,6 +2600,127 @@ public final class SpecusCore {
         }
     }
 
+    static final class WebSocketIngressState {
+        static final int DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
+        static final int DEFAULT_MAX_PENDING_FRAMES = 1024;
+
+        static final class AcceptedFrame {
+            final WebSocketSupport.Frame frame;
+            final int credit;
+
+            private AcceptedFrame(WebSocketSupport.Frame frame, int credit) {
+                this.frame = frame;
+                this.credit = credit;
+            }
+        }
+
+        private final int maxPendingBytes;
+        private final int maxPendingFrames;
+        private final ArrayDeque<AcceptedFrame> pending = new ArrayDeque<>();
+        private int pendingBytes;
+        private int fragmentedOpcode = -1;
+        private int fragmentedBytes;
+        private boolean closeReceived;
+
+        WebSocketIngressState() {
+            this(DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_FRAMES);
+        }
+
+        WebSocketIngressState(int maxPendingBytes, int maxPendingFrames) {
+            if (maxPendingBytes <= 0 || maxPendingFrames <= 0) {
+                throw new IllegalArgumentException("pending WebSocket limits must be positive");
+            }
+            this.maxPendingBytes = maxPendingBytes;
+            this.maxPendingFrames = maxPendingFrames;
+        }
+
+        AcceptedFrame accept(byte[] data) throws IOException {
+            if (data == null || data.length == 0) {
+                throw new IOException("empty SWS2 DATA");
+            }
+            final WebSocketSupport.Frame frame;
+            try {
+                frame = WebSocketSupport.decodeFrame(data);
+            } catch (IllegalArgumentException error) {
+                throw new IOException(error.getMessage(), error);
+            }
+            if (frame.rsv != 0) {
+                throw new IOException("OkHttp endpoint did not negotiate RSV extensions");
+            }
+            validateSequence(frame);
+            return new AcceptedFrame(frame, data.length);
+        }
+
+        void cache(AcceptedFrame accepted) throws IOException {
+            if (pending.size() >= maxPendingFrames
+                    || accepted.credit > maxPendingBytes - pendingBytes) {
+                throw new IOException("SWS2 DATA exceeded pre-open buffer");
+            }
+            pending.addLast(accepted);
+            pendingBytes += accepted.credit;
+        }
+
+        List<AcceptedFrame> drain() {
+            List<AcceptedFrame> frames = new ArrayList<>(pending);
+            pending.clear();
+            pendingBytes = 0;
+            return frames;
+        }
+
+        boolean hasPending() {
+            return !pending.isEmpty();
+        }
+
+        int pendingBytes() {
+            return pendingBytes;
+        }
+
+        private void validateSequence(WebSocketSupport.Frame frame) throws IOException {
+            if (closeReceived) {
+                throw new IOException("SWS2 DATA after CLOSE");
+            }
+            if (frame.opcode == WebSocketSupport.OPCODE_CLOSE) {
+                closeReceived = true;
+                return;
+            }
+            if (frame.opcode == WebSocketSupport.OPCODE_PING
+                    || frame.opcode == WebSocketSupport.OPCODE_PONG) {
+                return;
+            }
+            if (frame.opcode == WebSocketSupport.OPCODE_CONTINUATION) {
+                if (fragmentedOpcode < 0) {
+                    throw new IOException("orphan SWS2 continuation frame");
+                }
+                fragmentedBytes = checkedMessageBytes(fragmentedBytes, frame.payload.length);
+                if (frame.fin) {
+                    fragmentedOpcode = -1;
+                    fragmentedBytes = 0;
+                }
+                return;
+            }
+            if (frame.opcode != WebSocketSupport.OPCODE_TEXT
+                    && frame.opcode != WebSocketSupport.OPCODE_BINARY) {
+                throw new IOException("unsupported SWS2 data opcode");
+            }
+            if (fragmentedOpcode >= 0) {
+                throw new IOException("new SWS2 message before prior message completed");
+            }
+            int messageBytes = checkedMessageBytes(0, frame.payload.length);
+            if (!frame.fin) {
+                fragmentedOpcode = frame.opcode;
+                fragmentedBytes = messageBytes;
+            }
+        }
+
+        private static int checkedMessageBytes(int current, int added) throws IOException {
+            long total = (long) current + added;
+            if (total > WebSocketSupport.MAX_MESSAGE_BYTES) {
+                throw new IOException("websocket message exceeds limit");
+            }
+            return (int) total;
+        }
+    }
+
     private static final class LocalWebSocketSpecus {
         private final int streamId;
         private final String channelId;
@@ -1877,8 +2730,10 @@ public final class SpecusCore {
         private final OkHttpClient client;
         private final AtomicBoolean finished = new AtomicBoolean(false);
         private final AtomicBoolean suppressDisconnect = new AtomicBoolean(false);
+        private final WebSocketIngressState ingress = new WebSocketIngressState();
         private volatile WebSocket webSocket;
         private volatile boolean opened;
+        private boolean remoteFinPending;
         private ByteArrayOutputStream incomingMessage;
         private int incomingOpcode = -1;
 
@@ -1902,12 +2757,7 @@ public final class SpecusCore {
             webSocket = client.newWebSocket(request.build(), new WebSocketListener() {
                 @Override
                 public void onOpen(WebSocket socket, Response response) {
-                    if (finished.get()) {
-                        socket.cancel();
-                        return;
-                    }
-                    opened = true;
-                    control.status.publish("WebSocket connected", target.getHost(), true);
+                    onUpstreamOpen(socket);
                 }
 
                 @Override
@@ -1944,51 +2794,106 @@ public final class SpecusCore {
             });
         }
 
-        synchronized void write(byte[] data) {
-            WebSocket socket = webSocket;
-            if (!opened || socket == null || data == null || finished.get()) {
-                return;
+        synchronized int write(byte[] data) throws IOException {
+            if (finished.get()) {
+                throw new IOException("WebSocket stream is closed");
             }
-            try {
-                WebSocketSupport.Frame frame = WebSocketSupport.decodeFrame(data);
-                if (frame.rsv != 0) {
-                    throw new IllegalArgumentException("OkHttp endpoint did not negotiate RSV extensions");
+            WebSocketIngressState.AcceptedFrame accepted = ingress.accept(data);
+            if (WebSocketSupport.isLocallyTerminatedControlFrame(accepted.frame)) {
+                byte[] response = WebSocketSupport.localControlResponse(accepted.frame);
+                if (response != null) {
+                    try {
+                        control.sendWsData(streamId, response);
+                    } catch (Exception error) {
+                        throw new IOException("failed to send local SWS2 PONG", error);
+                    }
                 }
-                if (frame.opcode == WebSocketSupport.OPCODE_CLOSE) {
-                    socket.close(frame.closeCode == 0 ? 1000 : frame.closeCode,
-                            new String(frame.payload, StandardCharsets.UTF_8));
+                return accepted.credit;
+            }
+            WebSocket socket = webSocket;
+            if (!opened || socket == null) {
+                ingress.cache(accepted);
+                return accepted.credit;
+            }
+            deliverIncomingFrame(socket, accepted.frame);
+            return accepted.credit;
+        }
+
+        void failFromRemote(String detail) {
+            WebSocket socket;
+            synchronized (this) {
+                if (!finished.compareAndSet(false, true)) {
                     return;
                 }
-                if (frame.opcode == WebSocketSupport.OPCODE_PING
-                        || frame.opcode == WebSocketSupport.OPCODE_PONG) {
-                    throw new IllegalArgumentException("OkHttp cannot emit explicit ping/pong frames");
-                }
-                appendIncomingFrame(socket, frame);
-            } catch (Exception error) {
-                socket.close(1002, "invalid SWS2 frame");
-                finish(true, message(error));
+                suppressDisconnect.set(true);
+                opened = false;
+                ingress.drain();
+                socket = webSocket;
+            }
+            control.resetWebSocketStream(streamId, this, 5,
+                    firstText(detail, "invalid SWS2 DATA"));
+            if (socket != null) {
+                socket.cancel();
             }
         }
 
-        private void appendIncomingFrame(WebSocket socket, WebSocketSupport.Frame frame) {
+        private void onUpstreamOpen(WebSocket socket) {
+            String failure = null;
+            boolean closeAfterFlush = false;
+            synchronized (this) {
+                if (finished.get()) {
+                    socket.cancel();
+                    return;
+                }
+                webSocket = socket;
+                opened = true;
+                control.markStreamOpened(streamId);
+                try {
+                    for (WebSocketIngressState.AcceptedFrame accepted : ingress.drain()) {
+                        deliverIncomingFrame(socket, accepted.frame);
+                    }
+                    closeAfterFlush = remoteFinPending;
+                } catch (Exception error) {
+                    failure = message(error);
+                }
+            }
+            if (failure != null) {
+                failFromRemote("failed to flush pre-open SWS2 DATA: " + failure);
+                return;
+            }
+            control.status.publish("WebSocket connected", target.getHost(), true);
+            if (closeAfterFlush) {
+                closeWithoutDisconnect();
+            }
+        }
+
+        private void deliverIncomingFrame(WebSocket socket,
+                                          WebSocketSupport.Frame frame) throws IOException {
+            if (frame.opcode == WebSocketSupport.OPCODE_CLOSE) {
+                if (!socket.close(frame.closeCode == 0 ? 1000 : frame.closeCode,
+                        new String(frame.payload, StandardCharsets.UTF_8))) {
+                    throw new IOException("local websocket close rejected");
+                }
+                return;
+            }
             if (frame.opcode == WebSocketSupport.OPCODE_CONTINUATION) {
                 if (incomingMessage == null) {
-                    throw new IllegalArgumentException("orphan SWS2 continuation frame");
+                    throw new IOException("orphan SWS2 continuation frame");
                 }
             } else {
                 if (frame.opcode != WebSocketSupport.OPCODE_TEXT
                         && frame.opcode != WebSocketSupport.OPCODE_BINARY) {
-                    throw new IllegalArgumentException("unsupported SWS2 data opcode");
+                    throw new IOException("unsupported SWS2 data opcode");
                 }
                 if (incomingMessage != null) {
-                    throw new IllegalArgumentException("new SWS2 message before prior message completed");
+                    throw new IOException("new SWS2 message before prior message completed");
                 }
                 incomingOpcode = frame.opcode;
                 incomingMessage = new ByteArrayOutputStream(Math.max(32, frame.payload.length));
             }
             incomingMessage.write(frame.payload, 0, frame.payload.length);
             if (incomingMessage.size() > WebSocketSupport.MAX_MESSAGE_BYTES) {
-                throw new IllegalArgumentException("websocket message exceeds limit");
+                throw new IOException("websocket message exceeds limit");
             }
             if (!frame.fin) {
                 return;
@@ -2001,13 +2906,26 @@ public final class SpecusCore {
                     ? socket.send(new String(payload, StandardCharsets.UTF_8))
                     : socket.send(ByteString.of(payload));
             if (!accepted) {
-                socket.cancel();
-                finish(true, "local websocket write rejected");
+                throw new IOException("local websocket write rejected");
             }
         }
 
-        void closeFromRemote() {
+        synchronized void closeFromRemote() {
+            suppressDisconnect.set(true);
+            if (!finished.get() && !opened && ingress.hasPending()) {
+                if (!remoteFinPending) {
+                    remoteFinPending = true;
+                    control.scheduleWebSocketPreOpenClose(this);
+                }
+                return;
+            }
             closeWithoutDisconnect();
+        }
+
+        synchronized void expireRemoteFin() {
+            if (remoteFinPending && !opened && !finished.get()) {
+                closeWithoutDisconnect();
+            }
         }
 
         void closeFromControl() {
@@ -2050,11 +2968,13 @@ public final class SpecusCore {
         }
 
         private void finish(boolean notifyControl, String detail) {
-            if (!finished.compareAndSet(false, true)) {
-                return;
+            synchronized (this) {
+                if (!finished.compareAndSet(false, true)) {
+                    return;
+                }
+                opened = false;
+                ingress.drain();
             }
-            opened = false;
-            control.localWebSockets.remove(streamId, this);
             if (!isBlank(detail)) {
                 control.status.publish("WebSocket disconnected", detail, true);
             }
@@ -2064,10 +2984,36 @@ public final class SpecusCore {
                 } catch (Exception ignored) {
                 }
             }
+            control.completeWebSocketStream(streamId, this);
         }
     }
 
-    private static final class HttpStreamForwarder {
+    interface HttpRequestIngress {
+        void onRequestData(byte[] data);
+
+        void onRequestEnd(Map<String, Object> metadata);
+    }
+
+    static final class HttpUrlConnectionRequestPolicy {
+        private HttpUrlConnectionRequestPolicy() {
+        }
+
+        static boolean opensRequestBody(String method, long contentLength) {
+            return contentLength != 0L
+                    && !"GET".equalsIgnoreCase(method)
+                    && !"HEAD".equalsIgnoreCase(method);
+        }
+    }
+
+    static void dispatchHttpData(HttpRequestIngress ingress, byte[] data,
+                                 boolean endStream, Map<String, Object> metadata) {
+        ingress.onRequestData(data);
+        if (endStream) {
+            ingress.onRequestEnd(metadata);
+        }
+    }
+
+    private static final class HttpStreamForwarder implements HttpRequestIngress {
         private static final int REQUEST_QUEUE_CAPACITY = 32;
         private static final int CHUNK_SIZE = 64 * 1024;
 
@@ -2098,14 +3044,14 @@ public final class SpecusCore {
             ioPool.submit(this::forward);
         }
 
-        void onRequestData(byte[] data) {
-            if (data == null || data.length == 0) {
-                return;
-            }
+        @Override
+        public void onRequestData(byte[] data) {
             String error = null;
             synchronized (this) {
                 if (closed.get() || requestEnded) {
                     error = "HTTP request DATA after end";
+                } else if (data == null || data.length == 0) {
+                    error = "HTTP request DATA is empty";
                 } else if (data.length > receiveCredit) {
                     error = "HTTP request exceeded receive window";
                 } else {
@@ -2123,17 +3069,22 @@ public final class SpecusCore {
             }
         }
 
-        void onRequestEnd(Map<String, Object> endMetadata) {
+        @Override
+        public void onRequestEnd(Map<String, Object> endMetadata) {
             String error = null;
             synchronized (this) {
                 if (closed.get() || requestEnded) {
                     error = "duplicate HTTP request FIN";
-                } else if (!stringList(endMetadata == null ? null : endMetadata.get("trailers")).isEmpty()) {
-                    error = "Android HTTP transport does not support request trailers";
                 } else {
-                    requestEnded = true;
-                    if (!requestQueue.offer(RequestChunk.END)) {
-                        error = "HTTP request queue is full at FIN";
+                    try {
+                        HttpTrailerPolicy.requireNoRequestTrailers(
+                                endMetadata == null ? null : endMetadata.get("trailers"));
+                        requestEnded = true;
+                        if (!requestQueue.offer(RequestChunk.END)) {
+                            error = "HTTP request queue is full at FIN";
+                        }
+                    } catch (IOException unsupported) {
+                        error = unsupported.getMessage();
                     }
                 }
             }
@@ -2157,9 +3108,7 @@ public final class SpecusCore {
         private void forward() {
             boolean completed = false;
             try {
-                if (!stringList(metadata.get("trailerNames")).isEmpty()) {
-                    throw new IOException("Android HTTP transport does not support request trailers");
-                }
+                HttpTrailerPolicy.requireNoRequestTrailers(metadata.get("trailerNames"));
                 String route = asString(metadata.get("route"));
                 URI target = DirectHttpForwarder.buildTarget(routes.get(route),
                         asString(metadata.get("relativePath")), asString(metadata.get("rawQuery")));
@@ -2195,8 +3144,8 @@ public final class SpecusCore {
                 if (contentLength > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
                     throw new IOException("HTTP request body exceeds limit");
                 }
-                boolean mayHaveBody = contentLength != 0 && !"GET".equalsIgnoreCase(method)
-                        && !"HEAD".equalsIgnoreCase(method);
+                boolean mayHaveBody = HttpUrlConnectionRequestPolicy.opensRequestBody(
+                        method, contentLength);
                 OutputStream requestBody = null;
                 if (mayHaveBody) {
                     opened.setDoOutput(true);
@@ -2275,7 +3224,8 @@ public final class SpecusCore {
                         break;
                     }
                     if (output == null) {
-                        throw new IOException("HTTP method does not accept a request body");
+                        throw new IOException(
+                                "Android HttpURLConnection cannot preserve this method with a request body");
                     }
                     total += chunk.data.length;
                     if (total > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
@@ -2319,9 +3269,9 @@ public final class SpecusCore {
         }
 
         private static List<String> declaredTrailers(Map<String, List<String>> fields) {
-            List<String> result = new ArrayList<>();
+            List<String> candidates = new ArrayList<>();
             if (fields == null) {
-                return result;
+                return candidates;
             }
             for (Map.Entry<String, List<String>> entry : fields.entrySet()) {
                 if (entry.getKey() == null || !"trailer".equalsIgnoreCase(entry.getKey())) {
@@ -2329,14 +3279,11 @@ public final class SpecusCore {
                 }
                 for (String value : entry.getValue()) {
                     for (String name : value.split(",")) {
-                        String trimmed = name.trim();
-                        if (isHeaderName(trimmed) && !result.contains(trimmed)) {
-                            result.add(trimmed);
-                        }
+                        candidates.add(name);
                     }
                 }
             }
-            return result;
+            return HttpTrailerPolicy.validNames(candidates);
         }
 
         private static List<String> responseTrailers(HttpURLConnection connection,
@@ -2348,7 +3295,84 @@ public final class SpecusCore {
                     result.add(name + ":" + value);
                 }
             }
+            return HttpTrailerPolicy.validLines(result, names);
+        }
+
+        private static final class RequestChunk {
+            static final RequestChunk END = new RequestChunk(new byte[0], true);
+            static final RequestChunk CANCELLED = new RequestChunk(new byte[0], false);
+            final byte[] data;
+            final boolean end;
+
+            RequestChunk(byte[] data, boolean end) {
+                this.data = data;
+                this.end = end;
+            }
+        }
+    }
+
+    static final class HttpTrailerPolicy {
+        private static final Set<String> FORBIDDEN_NAMES = Set.of(
+                "connection", "content-length", "host", "keep-alive",
+                "proxy-authenticate", "proxy-authorization", "te", "trailer",
+                "transfer-encoding", "upgrade");
+
+        private HttpTrailerPolicy() {
+        }
+
+        static List<String> validNames(List<String> candidates) {
+            List<String> result = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            if (candidates == null) {
+                return result;
+            }
+            for (String candidate : candidates) {
+                String name = candidate == null ? "" : candidate.trim();
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (isHeaderName(name) && !FORBIDDEN_NAMES.contains(lower) && seen.add(lower)) {
+                    result.add(name);
+                }
+            }
             return result;
+        }
+
+        static List<String> validLines(List<String> lines, List<String> declaredNames) {
+            Set<String> declared = new HashSet<>();
+            for (String name : validNames(declaredNames)) {
+                declared.add(name.toLowerCase(Locale.ROOT));
+            }
+            List<String> result = new ArrayList<>();
+            if (lines == null) {
+                return result;
+            }
+            for (String line : lines) {
+                int separator = line == null ? -1 : line.indexOf(':');
+                if (separator <= 0) {
+                    continue;
+                }
+                String name = line.substring(0, separator).trim();
+                String value = line.substring(separator + 1).trim();
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (declared.contains(lower) && isHeaderName(name)
+                        && !FORBIDDEN_NAMES.contains(lower)
+                        && value.indexOf('\r') < 0 && value.indexOf('\n') < 0) {
+                    result.add(name + ":" + value);
+                }
+            }
+            return result;
+        }
+
+        static void requireNoRequestTrailers(Object value) throws IOException {
+            if (value == null) {
+                return;
+            }
+            if (!(value instanceof List<?> values)) {
+                throw new IOException("HTTP request trailers metadata must be an array");
+            }
+            if (!values.isEmpty()) {
+                throw new IOException(
+                        "Android HttpURLConnection cannot forward HTTP request trailers");
+            }
         }
 
         private static boolean isHeaderName(String value) {
@@ -2362,18 +3386,6 @@ public final class SpecusCore {
                 }
             }
             return true;
-        }
-
-        private static final class RequestChunk {
-            static final RequestChunk END = new RequestChunk(new byte[0], true);
-            static final RequestChunk CANCELLED = new RequestChunk(new byte[0], false);
-            final byte[] data;
-            final boolean end;
-
-            RequestChunk(byte[] data, boolean end) {
-                this.data = data;
-                this.end = end;
-            }
         }
     }
 

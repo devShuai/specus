@@ -419,8 +419,9 @@ public class MainActivity extends Activity {
                     .setAction(SpecusForegroundService.ACTION_STOP));
             return;
         }
+        String updatedConfig;
         try {
-            ConfigStorage.updateBasicConfig(this,
+            updatedConfig = ConfigStorage.updateBasicConfig(this,
                     serverEditor.getText().toString(),
                     apiKeyEditor.getText().toString(),
                     secretEditor.getText().toString(),
@@ -429,7 +430,15 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "配置格式错误，请检查高级配置", Toast.LENGTH_SHORT).show();
             return;
         }
-        requestVpnThenStart();
+        try {
+            if (SpecusCore.StartupConfig.parse(updatedConfig).requiresVpnPermission()) {
+                requestVpnThenStart();
+            } else {
+                startSpecusService();
+            }
+        } catch (Exception error) {
+            Toast.makeText(this, "配置格式错误，请检查高级配置", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void sendMessage() {
