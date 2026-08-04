@@ -521,28 +521,32 @@ internal sealed class NatClientHandler : IAsyncDisposable
             return false;
         }
 
-        var wsUrl = targetBaseUrl.Trim();
-        if (wsUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        var baseUrl = targetBaseUrl.Trim();
+        string httpBaseUrl;
+        string targetScheme;
+        if (baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
         {
-            wsUrl = "ws://" + wsUrl["http://".Length..];
+            httpBaseUrl = "http://" + baseUrl["http://".Length..];
+            targetScheme = "ws";
         }
-        else if (wsUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        else if (baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
-            wsUrl = "wss://" + wsUrl["https://".Length..];
+            httpBaseUrl = "https://" + baseUrl["https://".Length..];
+            targetScheme = "wss";
         }
-        else if (!wsUrl.StartsWith("ws://", StringComparison.OrdinalIgnoreCase)
-                 && !wsUrl.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
+        else if (baseUrl.StartsWith("ws://", StringComparison.OrdinalIgnoreCase))
+        {
+            httpBaseUrl = "http://" + baseUrl["ws://".Length..];
+            targetScheme = "ws";
+        }
+        else if (baseUrl.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
+        {
+            httpBaseUrl = "https://" + baseUrl["wss://".Length..];
+            targetScheme = "wss";
+        }
+        else
         {
             error = "HTTP route 仅支持 http/https/ws/wss";
-            return false;
-        }
-
-        if (!Uri.TryCreate(wsUrl, UriKind.Absolute, out var baseUri)
-            || string.IsNullOrWhiteSpace(baseUri.Host)
-            || !string.IsNullOrEmpty(baseUri.Query)
-            || !string.IsNullOrEmpty(baseUri.Fragment))
-        {
-            error = "HTTP route 地址无效";
             return false;
         }
 
@@ -552,30 +556,15 @@ internal sealed class NatClientHandler : IAsyncDisposable
             error = "relativePath 含有非法控制字符";
             return false;
         }
-        var escapedPath = baseUri.GetComponents(UriComponents.Path, UriFormat.UriEscaped);
-        var basePath = escapedPath.Length == 0 ? "" : "/" + escapedPath;
-        string path;
-        if (basePath.EndsWith("/", StringComparison.Ordinal) && tail.StartsWith("/", StringComparison.Ordinal))
+        if (!DirectHttpForwarder.TryBuildTarget(httpBaseUrl, tail, rawQuery, out var httpTarget, out error))
         {
-            path = basePath + tail[1..];
-        }
-        else if (basePath.Length > 0 && !basePath.EndsWith("/", StringComparison.Ordinal)
-                 && !tail.StartsWith("/", StringComparison.Ordinal))
-        {
-            path = basePath + "/" + tail;
-        }
-        else
-        {
-            path = basePath + tail;
-        }
-        if (path.Length == 0)
-        {
-            path = "/";
+            return false;
         }
 
-        var full = baseUri.GetLeftPart(UriPartial.Authority) + path
-            + (string.IsNullOrWhiteSpace(rawQuery) ? "" : "?" + rawQuery);
-        if (!Uri.TryCreate(full, UriKind.Absolute, out var created))
+        var httpText = httpTarget.OriginalString;
+        var schemeSeparator = httpText.IndexOf(':');
+        if (schemeSeparator < 0
+            || !Uri.TryCreate(targetScheme + httpText[schemeSeparator..], UriKind.Absolute, out var created))
         {
             error = "目标地址拼接失败";
             return false;

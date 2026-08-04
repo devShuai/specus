@@ -135,6 +135,32 @@ public class NatClientHandlerWebSocketTests
         Assert.Equal("ws://example.test/base//assets/socket", target.ToString());
     }
 
+    [Fact]
+    public void TryBuildWebSocketTarget_PreservesEncodedPathAndRawQuery()
+    {
+        var ok = NatClientHandler.TryBuildWebSocketTarget(
+            "http://example.test/base%2Froot",
+            "/%E4%BD%A0%2F%252F",
+            "next=%2Fraw",
+            out var target,
+            out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal("ws://example.test/base%2Froot/%E4%BD%A0%2F%252F?next=%2Fraw", target.OriginalString);
+    }
+
+    [Theory]
+    [InlineData("/../admin")]
+    [InlineData("/%2e%2e/admin")]
+    public void TryBuildWebSocketTarget_RejectsDotSegments(string relativePath)
+    {
+        var ok = NatClientHandler.TryBuildWebSocketTarget(
+            "http://example.test/base", relativePath, null, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Equal("HTTP 转发路径越界", error);
+    }
+
     [Theory]
     [InlineData("", "/", "未配置 HTTP route")]
     [InlineData("ftp://example.test/base", "/", "HTTP route 仅支持 http/https/ws/wss")]
