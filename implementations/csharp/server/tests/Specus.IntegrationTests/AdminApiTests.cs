@@ -911,7 +911,8 @@ public sealed class AdminApiTests : IAsyncLifetime
             Assert.NotNull(row.ResponsePreviewText);
             Assert.Contains("Content-Encoding:gzip", row.ResponseHeaders);
             Assert.Contains("Content-Length:999", row.ResponseHeaders);
-            Assert.Contains("/http/Demo%20client/rewrite-capture/img/logo.png", row.ResponsePreviewText);
+            Assert.Contains("src=\"/img/logo.png\"", row.ResponsePreviewText);
+            Assert.DoesNotContain("/http/Demo%20client/rewrite-capture/", row.ResponsePreviewText);
         }
         finally
         {

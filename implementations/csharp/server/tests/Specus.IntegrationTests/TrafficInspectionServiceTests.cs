@@ -1,4 +1,5 @@
 using System.Text;
+using System.IO.Compression;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Specus.Server.Authentication;
@@ -77,7 +78,34 @@ public sealed class TrafficInspectionServiceTests
             Assert.Equal("GET", row.Method);
             Assert.Equal("json", row.ResponseBodyType);
             Assert.Equal("""{"ok":true}""", row.ResponsePreviewText);
+            Assert.Equal(Encoding.UTF8.GetBytes("""{"ok":true}"""), row.ResponseBodyData);
+            Assert.Equal("7B 22 6F 6B 22 3A 74 72 75 65 7D", row.ResponsePreviewHex);
             Assert.True(row.ElapsedMs >= 0);
         }
+    }
+
+    [Fact]
+    public void HttpBodyDataCodecDecodesStoredWireBytesForDetailDisplay()
+    {
+        var text = Encoding.UTF8.GetBytes("你好，Specus");
+        byte[] compressed;
+        using (var output = new MemoryStream())
+        {
+            using (var gzip = new GZipStream(output, CompressionLevel.SmallestSize, leaveOpen: true))
+            {
+                gzip.Write(text);
+            }
+            compressed = output.ToArray();
+        }
+
+        Assert.Equal("你好，Specus", HttpBodyDataCodec.ToDisplayText(
+            compressed, "text/plain; charset=utf-8", "Content-Encoding: gzip", fallbackText: null));
+        Assert.Equal("data:image/png;base64,AAECAw==", HttpBodyDataCodec.ToDisplayText(
+            [0, 1, 2, 3], "image/png", headers: null, fallbackText: null));
+        Assert.Equal("data:application/octet-stream;base64,bm90LWd6aXA=",
+            HttpBodyDataCodec.ToDisplayText("not-gzip"u8.ToArray(), "text/plain",
+                "Content-Encoding: gzip", fallbackText: null));
+        Assert.Equal("legacy preview", HttpBodyDataCodec.ToDisplayText(
+            bodyData: null, "text/plain", headers: null, fallbackText: "legacy preview"));
     }
 }

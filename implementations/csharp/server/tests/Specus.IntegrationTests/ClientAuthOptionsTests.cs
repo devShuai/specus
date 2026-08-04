@@ -44,6 +44,9 @@ public sealed class ClientAuthOptionsTests
         {
             ["Specus:Auth:TokenTtlSeconds"] = "60",
             ["Specus:ClientAuth:TokenTtlSeconds"] = "1234",
+            ["Specus:Tls:RequireEncryption"] = "true",
+            ["Specus:Tls:TerminatedUpstream"] = "true",
+            ["Specus:Netty:BindAddress"] = "127.0.0.1",
         });
         using var client = server.CreateClient();
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
@@ -80,7 +83,7 @@ public sealed class ClientAuthOptionsTests
         response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadAsStringAsync();
         using var document = JsonDocument.Parse(json);
-        Assert.False(document.RootElement.GetProperty("nettyTls").GetBoolean());
+        Assert.True(document.RootElement.GetProperty("nettyTls").GetBoolean());
         var body = JsonSerializer.Deserialize<ClientAuthLoginBody>(json,
             new JsonSerializerOptions(JsonSerializerDefaults.Web));
 

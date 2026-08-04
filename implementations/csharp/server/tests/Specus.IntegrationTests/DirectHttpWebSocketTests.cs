@@ -12,6 +12,7 @@ using Specus.Server.ControlChannel;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Hosting;
+using Specus.Server.Http;
 using Specus.Server.Nat;
 using Specus.Server.Networking;
 using Specus.Server.Sessions;
@@ -194,6 +195,37 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task BrowserPingIsAnsweredLocallyAndOnlyBrowserPongBecomesSws2Data()
+    {
+        await using var session = BoundNatSession.Bind(_server!);
+        const uint streamId = 7001;
+        var pingPayload = "route-ping"u8.ToArray();
+        var pongPayload = "route-pong"u8.ToArray();
+        var transport = new ScriptedDuplexStream([
+            .. BuildMaskedClientControlFrame(WebSocketSpecusFrame.OpcodePing, pingPayload),
+            .. BuildMaskedClientControlFrame(WebSocketSpecusFrame.OpcodePong, pongPayload),
+        ]);
+        await using var socket = RawServerWebSocketConnection.CreateForTesting(transport);
+        await using var stream = new WebSocketSpecusStream(session.Context, streamId, (_, _) => { });
+
+        await DirectHttpEndpoints.PumpBrowserWebSocketAsync(socket, stream,
+            new DirectHttpEndpoints.WebSocketTunnelCloseState(), CancellationToken.None);
+
+        var packet = Assert.Single(session.Writer.Snapshot(), item =>
+            item.NatMessageType == NatMessageType.Data && item.StreamId == streamId);
+        var tunnelFrame = WebSocketSpecusFrame.Decode(packet.Data!);
+        Assert.Equal(WebSocketSpecusFrame.OpcodePong, tunnelFrame.Opcode);
+        Assert.Equal(pongPayload, tunnelFrame.Payload);
+        byte[] expectedPong =
+        [
+            (byte)0x8A,
+            (byte)pingPayload.Length,
+            .. pingPayload,
+        ];
+        Assert.Equal(expectedPong, transport.WrittenBytes);
+    }
+
+    [Fact]
     public async Task NatTextAndFragmentedBinaryReachBrowserAndReturnWindowCredit()
     {
         await using var session = BoundNatSession.Bind(_server!);
@@ -290,6 +322,8 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         Assert.Equal(WebSocketMessageType.Close, received.Result.MessageType);
         Assert.Equal(WebSocketCloseStatus.EndpointUnavailable, received.Result.CloseStatus);
         Assert.Equal("upstream gone", received.Result.CloseStatusDescription);
+        await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "upstream gone",
+            cancellation.Token);
         await AssertWindowCreditAsync(session.Writer, opened.StreamId, encodedClose.Length,
             cancellation.Token);
 
@@ -474,6 +508,21 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         Data = data,
     };
 
+    private static byte[] BuildMaskedClientControlFrame(byte opcode, byte[] payload)
+    {
+        Assert.InRange(payload.Length, 0, 125);
+        ReadOnlySpan<byte> mask = [0x12, 0x34, 0x56, 0x78];
+        var wire = new byte[6 + payload.Length];
+        wire[0] = (byte)(0x80 | opcode);
+        wire[1] = (byte)(0x80 | payload.Length);
+        mask.CopyTo(wire.AsSpan(2, 4));
+        for (var index = 0; index < payload.Length; index++)
+        {
+            wire[6 + index] = (byte)(payload[index] ^ mask[index & 3]);
+        }
+        return wire;
+    }
+
     private static bool IsCloseData(NatMessagePacket packet, uint streamId)
     {
         if (packet.NatMessageType != NatMessageType.Data || packet.StreamId != streamId
@@ -509,6 +558,51 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     private sealed record ReceivedFrame(WebSocketReceiveResult Result, byte[] Payload);
+
+    private sealed class ScriptedDuplexStream(byte[] input) : Stream
+    {
+        private readonly MemoryStream _input = new(input, writable: false);
+        private readonly MemoryStream _output = new();
+
+        public byte[] WrittenBytes => _output.ToArray();
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            _input.ReadAsync(buffer, cancellationToken);
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            _output.WriteAsync(buffer, cancellationToken);
+
+        public override void Flush() => _output.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) =>
+            _output.FlushAsync(cancellationToken);
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            _input.Read(buffer, offset, count);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) =>
+            _output.Write(buffer, offset, count);
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _input.Dispose();
+                _output.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
 
     private sealed class BoundNatSession : IAsyncDisposable
     {

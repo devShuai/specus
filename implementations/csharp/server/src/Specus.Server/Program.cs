@@ -67,28 +67,36 @@ builder.WebHost.ConfigureKestrel((context, kestrel) =>
 
 builder.Services.AddDbContext<SpecusDbContext>(options =>
 {
-    var cs = builder.Configuration.GetConnectionString("Specus")
-        ?? "Data Source=./specus.db";
-    var provider = builder.Configuration[$"{DatabaseOptions.SectionName}:Provider"] ?? "sqlite";
-    switch (provider.Trim().ToLowerInvariant())
+    var databaseOptions = builder.Configuration.GetSection(DatabaseOptions.SectionName)
+        .Get<DatabaseOptions>() ?? new DatabaseOptions();
+    var database = DatabaseConfiguration.Resolve(databaseOptions,
+        builder.Configuration.GetConnectionString("Specus"));
+    switch (database.Provider)
     {
         case "postgres":
-        case "postgresql":
-        case "npgsql":
-            options.UseNpgsql(cs, o => o.MigrationsAssembly("Specus.Server.Data.Postgres"));
+            options.UseNpgsql(database.ConnectionString, o =>
+            {
+                o.MigrationsAssembly("Specus.Server.Data.Postgres");
+                o.MaxBatchSize(database.BatchSize);
+            });
             break;
         case "mysql":
-        case "mariadb":
-            options.UseMySQL(cs, o => o.MigrationsAssembly("Specus.Server.Data.MySql"));
+            options.UseMySQL(database.ConnectionString, o =>
+            {
+                o.MigrationsAssembly("Specus.Server.Data.MySql");
+                o.MaxBatchSize(database.BatchSize);
+            });
             break;
         case "sqlite":
             // Migrations for SQLite live in the Data project itself.
-            options.UseSqlite(cs, o => o.MigrationsAssembly("Specus.Server.Data"));
+            options.UseSqlite(database.ConnectionString, o =>
+            {
+                o.MigrationsAssembly("Specus.Server.Data");
+                o.MaxBatchSize(database.BatchSize);
+            });
             break;
         default:
-            throw new InvalidOperationException(
-                $"Unknown {DatabaseOptions.SectionName}:Provider '{provider}'. " +
-                "Use 'sqlite', 'postgres', or 'mysql'.");
+            throw new InvalidOperationException($"Unknown database provider '{database.Provider}'.");
     }
 });
 
@@ -139,11 +147,11 @@ builder.Services.AddHttpClient(nameof(RustFsMediaStorage), client =>
 
 builder.Services.AddSingleton<ClientAuthSessionStore>();
 builder.Services.AddSingleton<LocalTokenService>();
-builder.Services.AddSingleton<AdminBearerTokenValidator>();
+builder.Services.AddScoped<AdminBearerTokenValidator>();
 builder.Services.AddSingleton<WebSocketTicketService>();
 builder.Services.AddSingleton<OidcTokenValidator>();
 builder.Services.AddSingleton<IOidcJwkProvider, HttpOidcJwkProvider>();
-builder.Services.AddSingleton<OidcTokenExchangeService>();
+builder.Services.AddScoped<OidcTokenExchangeService>();
 builder.Services.AddSingleton<IOidcTokenEndpointClient, HttpOidcTokenEndpointClient>();
 builder.Services.AddSingleton<DatabaseInitializer>();
 builder.Services.AddSingleton<ConnectionArchiveService>();

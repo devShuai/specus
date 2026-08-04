@@ -95,6 +95,28 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public async Task StandaloneAlternateStunIsPublishedForBrowserIce()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync(
+            enabled: false,
+            standaloneStunAddress: "stun-primary.example.com",
+            standaloneStunPort: 3478,
+            standaloneStunAlternateAddress: "stun-alternate.example.com",
+            standaloneStunAlternatePort: 3479);
+
+        var stun = fixture.Service.PublicStunConfig("ignored.example.com");
+        var ice = fixture.Service.PublicIceConfig("ignored.example.com");
+
+        Assert.Equal(new[]
+        {
+            "stun:stun-primary.example.com:3478",
+            "stun:stun-alternate.example.com:3479",
+        }, stun.StunServers);
+        Assert.Contains(ice.IceServers,
+            server => server.Urls == "stun:stun-alternate.example.com:3479");
+    }
+
+    [Fact]
     public async Task DeviceReportPersistsNatBehaviorFields()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();
@@ -710,6 +732,8 @@ public sealed class PeerMeshServiceTests
             IReadOnlyList<string>? publicStunServers = null,
             string standaloneStunAddress = "",
             int standaloneStunPort = 3478,
+            string standaloneStunAlternateAddress = "",
+            int standaloneStunAlternatePort = 0,
             bool enabled = true,
             int stunTurnPort = 3478)
         {
@@ -729,6 +753,8 @@ public sealed class PeerMeshServiceTests
                 StunTurnPort = stunTurnPort,
                 StandaloneStunAddress = standaloneStunAddress,
                 StandaloneStunPort = standaloneStunPort,
+                StandaloneStunAlternateAddress = standaloneStunAlternateAddress,
+                StandaloneStunAlternatePort = standaloneStunAlternatePort,
                 PublicStunServers = publicStunServers?.ToList() ?? [],
                 SessionTtlSeconds = 3600,
             }), NullLogger<PeerMeshService>.Instance);

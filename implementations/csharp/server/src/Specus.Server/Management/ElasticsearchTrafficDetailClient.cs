@@ -95,8 +95,10 @@ public sealed class ElasticsearchTrafficDetailClient
                     "requestHeaders",
                     "responseHeaders",
                     "requestPreviewHex",
+                    "requestBodyData",
                     "requestPreviewText",
                     "responsePreviewHex",
+                    "responseBodyData",
                     "responsePreviewText",
                 },
             },
@@ -637,8 +639,10 @@ public sealed class ElasticsearchTrafficDetailClient
         ["requestHeaders"] = Type("text"),
         ["responseHeaders"] = Type("text"),
         ["requestPreviewHex"] = Type("text"),
+        ["requestBodyData"] = Type("binary"),
         ["requestPreviewText"] = Type("text"),
         ["responsePreviewHex"] = Type("text"),
+        ["responseBodyData"] = Type("binary"),
         ["responsePreviewText"] = Type("text"),
         ["requestTruncated"] = Type("boolean"),
         ["responseTruncated"] = Type("boolean"),
@@ -700,8 +704,10 @@ public sealed class ElasticsearchTrafficDetailClient
         public string? RequestHeaders { get; init; }
         public string? ResponseHeaders { get; init; }
         public string? RequestPreviewHex { get; init; }
+        public byte[]? RequestBodyData { get; init; }
         public string? RequestPreviewText { get; init; }
         public string? ResponsePreviewHex { get; init; }
+        public byte[]? ResponseBodyData { get; init; }
         public string? ResponsePreviewText { get; init; }
         public bool RequestTruncated { get; init; }
         public bool ResponseTruncated { get; init; }
@@ -734,8 +740,10 @@ public sealed class ElasticsearchTrafficDetailClient
             RequestHeaders = exchange.RequestHeaders,
             ResponseHeaders = exchange.ResponseHeaders,
             RequestPreviewHex = exchange.RequestPreviewHex,
+            RequestBodyData = exchange.RequestBodyData,
             RequestPreviewText = exchange.RequestPreviewText,
             ResponsePreviewHex = exchange.ResponsePreviewHex,
+            ResponseBodyData = exchange.ResponseBodyData,
             ResponsePreviewText = exchange.ResponsePreviewText,
             RequestTruncated = exchange.RequestTruncated,
             ResponseTruncated = exchange.ResponseTruncated,
@@ -765,9 +773,15 @@ public sealed class ElasticsearchTrafficDetailClient
             includeDetail ? RequestHeaders : null,
             includeDetail ? ResponseHeaders : null,
             includeDetail ? RequestPreviewHex : null,
-            includeDetail ? RequestPreviewText : null,
+            includeDetail
+                ? HttpBodyDataCodec.ToDisplayText(RequestBodyData,
+                    RequestContentType, RequestHeaders, RequestPreviewText)
+                : null,
             includeDetail ? ResponsePreviewHex : null,
-            includeDetail ? ResponsePreviewText : null,
+            includeDetail
+                ? HttpBodyDataCodec.ToDisplayText(ResponseBodyData,
+                    ResponseContentType, ResponseHeaders, ResponsePreviewText)
+                : null,
             RequestTruncated,
             ResponseTruncated,
             CapturedAt);

@@ -7,6 +7,7 @@ namespace Specus.Server.Data.Entities;
 public sealed class SpecusMapping
 {
     public long Id { get; set; }
+    public string? TenantId { get; set; }
     public long ClientId { get; set; }
     public string ClientName { get; set; } = string.Empty;
     public int ListenPort { get; set; }
@@ -22,6 +23,7 @@ public sealed class SpecusMapping
 public sealed class HttpRouteMapping
 {
     public long Id { get; set; }
+    public string? TenantId { get; set; }
     public long ClientId { get; set; }
     public string ClientName { get; set; } = string.Empty;
     public string Route { get; set; } = string.Empty;
@@ -96,8 +98,10 @@ public sealed class HttpTrafficExchange
     public string? RequestHeaders { get; set; }
     public string? ResponseHeaders { get; set; }
     public string? RequestPreviewHex { get; set; }
+    public byte[]? RequestBodyData { get; set; }
     public string? RequestPreviewText { get; set; }
     public string? ResponsePreviewHex { get; set; }
+    public byte[]? ResponseBodyData { get; set; }
     public string? ResponsePreviewText { get; set; }
     public bool RequestTruncated { get; set; }
     public bool ResponseTruncated { get; set; }

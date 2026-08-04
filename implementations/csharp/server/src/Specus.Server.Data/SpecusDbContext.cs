@@ -212,6 +212,9 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
             b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
             b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.OidcIssuer).HasColumnName("oidc_issuer").HasMaxLength(255);
+            b.Property(x => x.OidcSubject).HasColumnName("oidc_subject").HasMaxLength(255);
+            b.Property(x => x.OidcIdentityKey).HasColumnName("oidc_identity_key").HasMaxLength(64);
             b.Property(x => x.Role).HasColumnName("role").HasMaxLength(20).IsRequired()
                 .HasConversion<string>();
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
@@ -221,6 +224,8 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_management_user_tenant");
             b.HasIndex(x => x.Role).HasDatabaseName("idx_management_user_role");
+            b.HasIndex(x => x.OidcIdentityKey).IsUnique()
+                .HasDatabaseName("uq_management_user_oidc_identity_key");
         });
 
         modelBuilder.Entity<ManagementUserEmail>(b =>
@@ -315,6 +320,7 @@ public sealed class SpecusDbContext : DbContext
             b.ToTable("specus_mapping");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
             b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
             b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.ListenPort).HasColumnName("listen_port").IsRequired();
@@ -326,8 +332,13 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
-            b.HasIndex(x => x.ListenPort).IsUnique();
-            b.HasIndex(x => x.ClientId);
+            b.HasIndex(x => x.ListenPort).IsUnique().HasDatabaseName("uk_specus_mapping_listen_port");
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_specus_mapping_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_specus_mapping_client");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Id })
+                .HasDatabaseName("idx_specus_mapping_tenant_client_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Enabled, x.Id })
+                .HasDatabaseName("idx_specus_mapping_tenant_client_enabled_id");
         });
 
         modelBuilder.Entity<HttpRouteMapping>(b =>
@@ -335,6 +346,7 @@ public sealed class SpecusDbContext : DbContext
             b.ToTable("http_route_mapping");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
             b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
             b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.Route).HasColumnName("route").HasMaxLength(60).IsRequired();
@@ -350,8 +362,16 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
-            b.HasIndex(x => new { x.ClientId, x.Route }).IsUnique();
-            b.HasIndex(x => x.ClientId);
+            b.HasIndex(x => new { x.ClientId, x.Route }).IsUnique()
+                .HasDatabaseName("uk_http_route_client_route");
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_http_route_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_http_route_client");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Id })
+                .HasDatabaseName("idx_http_route_tenant_client_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Enabled, x.Id })
+                .HasDatabaseName("idx_http_route_tenant_client_enabled_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.Route })
+                .HasDatabaseName("idx_http_route_tenant_client_route");
         });
 
         modelBuilder.Entity<HttpMediaCapture>(b =>
@@ -497,8 +517,10 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.RequestHeaders).HasColumnName("request_headers").HasMaxLength(8192);
             b.Property(x => x.ResponseHeaders).HasColumnName("response_headers").HasMaxLength(8192);
             b.Property(x => x.RequestPreviewHex).HasColumnName("request_preview_hex").HasMaxLength(4096);
+            b.Property(x => x.RequestBodyData).HasColumnName("request_body_data");
             b.Property(x => x.RequestPreviewText).HasColumnName("request_preview_text");
             b.Property(x => x.ResponsePreviewHex).HasColumnName("response_preview_hex").HasMaxLength(4096);
+            b.Property(x => x.ResponseBodyData).HasColumnName("response_body_data");
             b.Property(x => x.ResponsePreviewText).HasColumnName("response_preview_text");
             b.Property(x => x.RequestTruncated).HasColumnName("request_truncated").IsRequired();
             b.Property(x => x.ResponseTruncated).HasColumnName("response_truncated").IsRequired();
@@ -637,6 +659,8 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.DirectBytes).HasColumnName("direct_bytes").IsRequired();
             b.Property(x => x.RelayBytes).HasColumnName("relay_bytes").IsRequired();
             b.Property(x => x.LastTrafficAt).HasColumnName("last_traffic_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.LastKeepaliveAt).HasColumnName("last_keepalive_at").HasMaxLength(40)
                 .HasConversion(isoNullable);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_peer_mesh_session_tenant");
             b.HasIndex(x => new { x.TenantId, x.SourceClientId }).HasDatabaseName("idx_peer_mesh_session_source");

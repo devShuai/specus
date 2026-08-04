@@ -915,6 +915,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(512)")
                         .HasColumnName("target_base_url");
 
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -923,10 +928,24 @@ namespace Specus.Server.Data.Postgres.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ClientId");
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_http_route_client");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_http_route_tenant");
 
                     b.HasIndex("ClientId", "Route")
-                        .IsUnique();
+                        .IsUnique()
+                        .HasDatabaseName("uk_http_route_client_route");
+
+                    b.HasIndex("TenantId", "ClientId", "Id")
+                        .HasDatabaseName("idx_http_route_tenant_client_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Route")
+                        .HasDatabaseName("idx_http_route_tenant_client_route");
+
+                    b.HasIndex("TenantId", "ClientId", "Enabled", "Id")
+                        .HasDatabaseName("idx_http_route_tenant_client_enabled_id");
 
                     b.ToTable("http_route_mapping", (string)null);
                 });
@@ -986,6 +1005,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(255)")
                         .HasColumnName("remote_address");
 
+                    b.Property<byte[]>("RequestBodyData")
+                        .HasColumnType("bytea")
+                        .HasColumnName("request_body_data");
+
                     b.Property<long>("RequestBytes")
                         .HasColumnType("bigint")
                         .HasColumnName("request_bytes");
@@ -1021,6 +1044,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasMaxLength(255)
                         .HasColumnType("character varying(255)")
                         .HasColumnName("resource_name");
+
+                    b.Property<byte[]>("ResponseBodyData")
+                        .HasColumnType("bytea")
+                        .HasColumnName("response_body_data");
 
                     b.Property<string>("ResponseBodyType")
                         .IsRequired()
@@ -1187,6 +1214,21 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("enabled");
 
+                    b.Property<string>("OidcIdentityKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("oidc_identity_key");
+
+                    b.Property<string>("OidcIssuer")
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)")
+                        .HasColumnName("oidc_issuer");
+
+                    b.Property<string>("OidcSubject")
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)")
+                        .HasColumnName("oidc_subject");
+
                     b.Property<string>("PasswordHash")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -1212,6 +1254,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnName("updated_at");
 
                     b.HasKey("Username");
+
+                    b.HasIndex("OidcIdentityKey")
+                        .IsUnique()
+                        .HasDatabaseName("uq_management_user_oidc_identity_key");
 
                     b.HasIndex("Role")
                         .HasDatabaseName("idx_management_user_role");
@@ -1494,6 +1540,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)")
                         .HasColumnName("expires_at");
+
+                    b.Property<string>("LastKeepaliveAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("last_keepalive_at");
 
                     b.Property<string>("LastTrafficAt")
                         .HasMaxLength(40)
@@ -1937,6 +1988,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("integer")
                         .HasColumnName("target_port");
 
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -1945,10 +2001,21 @@ namespace Specus.Server.Data.Postgres.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ClientId");
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_specus_mapping_client");
 
                     b.HasIndex("ListenPort")
-                        .IsUnique();
+                        .IsUnique()
+                        .HasDatabaseName("uk_specus_mapping_listen_port");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_specus_mapping_tenant");
+
+                    b.HasIndex("TenantId", "ClientId", "Id")
+                        .HasDatabaseName("idx_specus_mapping_tenant_client_id");
+
+                    b.HasIndex("TenantId", "ClientId", "Enabled", "Id")
+                        .HasDatabaseName("idx_specus_mapping_tenant_client_enabled_id");
 
                     b.ToTable("specus_mapping", (string)null);
                 });

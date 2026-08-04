@@ -148,8 +148,9 @@ public static class AdminApiEndpoints
             return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 
-        app.MapPost("/auth/refresh", (HttpContext context, LocalTokenService tokens,
-            IOptions<AuthOptions> authOptions) =>
+        app.MapPost("/auth/refresh", async (HttpContext context, LocalTokenService tokens,
+            IOptions<AuthOptions> authOptions, ManagementUserService users,
+            CancellationToken cancellationToken) =>
         {
             if (!string.Equals(context.User.FindFirst("iss")?.Value, LocalTokenService.Issuer,
                     StringComparison.Ordinal))
@@ -159,7 +160,15 @@ public static class AdminApiEndpoints
             }
 
             var principal = ManagementContext.From(context, authOptions.Value);
-            return Results.Ok(tokens.IssueTokenBody(principal.Username, principal.TenantId, principal.Role));
+            var current = await users.ResolveRefreshUserAsync(principal.Username, cancellationToken)
+                .ConfigureAwait(false);
+            if (current is null)
+            {
+                return Results.Json(new { error = "账号不存在或已禁用" },
+                    statusCode: StatusCodes.Status401Unauthorized);
+            }
+            return Results.Ok(tokens.IssueTokenBody(current.Username, current.TenantId,
+                current.Role));
         });
 
         app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens,
@@ -171,6 +180,7 @@ public static class AdminApiEndpoints
             {
                 configured = !string.IsNullOrWhiteSpace(oidc.ClientId),
                 authorizationEndpoint = oidc.AuthorizationEndpoint,
+                registrationEndpoint = oidc.RegistrationEndpoint,
                 endSessionEndpoint = oidc.EndSessionEndpoint,
                 clientId = oidc.ClientId,
                 redirectUri = oidc.RedirectUri,
@@ -648,7 +658,7 @@ public static class AdminApiEndpoints
                 var created = await service.CreateAclAsync(
                         ManagementContext.From(context, authOptions.Value), request, cancellationToken)
                     .ConfigureAwait(false);
-                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+                return Results.Ok(created);
             });
 
         app.MapDelete("/api/admin/peer-mesh/acls/{id:long}",
@@ -658,7 +668,7 @@ public static class AdminApiEndpoints
                 await service.DeleteAclAsync(ManagementContext.From(context, authOptions.Value),
                         id, cancellationToken)
                     .ConfigureAwait(false);
-                return Results.NoContent();
+                return Results.Ok();
             });
 
         app.MapGet("/api/admin/peer-mesh/stats",

@@ -62,4 +62,5 @@ public sealed class PeerMeshSession
     public long DirectBytes { get; set; }
     public long RelayBytes { get; set; }
     public DateTimeOffset? LastTrafficAt { get; set; }
+    public DateTimeOffset? LastKeepaliveAt { get; set; }
 }

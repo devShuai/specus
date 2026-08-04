@@ -53,6 +53,7 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
     private readonly CancellationTokenSource _lifetimeCts;
     private readonly ILogger _logger;
     private readonly int _maxFrameSize;
+    private readonly int _preAuthMaxFrameSize;
     private readonly IControlChannelDispatcher _dispatcher;
 
     private long _lastReadTicks;
@@ -69,6 +70,7 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         _dispatcher = dispatcher;
         _logger = logger;
         _maxFrameSize = options.MaxFrameSize;
+        _preAuthMaxFrameSize = options.PreAuthMaxFrameSize;
         _lifetimeCts = CancellationTokenSource.CreateLinkedTokenSource(hostStopping);
 
         var channelId = Guid.NewGuid().ToString("N");
@@ -113,7 +115,7 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
                 try
                 {
                     var preAuth = Context.ClientName is null;
-                    var frameLimit = preAuth ? PacketCodec.PreAuthMaxFrameSize : _maxFrameSize;
+                    var frameLimit = preAuth ? _preAuthMaxFrameSize : _maxFrameSize;
                     packet = await FrameReader.ReadFrameAsync(_reader, frameLimit, _lifetimeCts.Token)
                         .ConfigureAwait(false);
                     if (Context.ClientName is null && packet is not null && packet is not LoginRequestPacket)

@@ -135,11 +135,6 @@ public sealed class LocalTokenService
             }
             var tenantId = TryGetString(payload.RootElement, "tenant_id") ?? _options.TenantId;
             var role = ParseRole(TryGetString(payload.RootElement, "role"));
-            if (role == ManagementRole.User
-                && string.Equals(subject, _options.Username, StringComparison.OrdinalIgnoreCase))
-            {
-                role = ManagementRole.Admin;
-            }
             var exp = payload.RootElement.GetProperty("exp").GetInt64();
             if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= exp)
             {

@@ -143,6 +143,7 @@ public sealed class PeerMeshService
             session.Status = StatusActive;
             session.PathType = PathRelay;
             session.UpdatedAt = now;
+            session.LastKeepaliveAt = now;
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
         CacheRelayAuthorization(session, now);
@@ -231,6 +232,21 @@ public sealed class PeerMeshService
             {
                 selfHosted = $"stun:{BracketIpv6(host)}:{port}";
                 servers.Add(selfHosted);
+            }
+        }
+        var alternateHost = NormalizeHost(
+            string.IsNullOrWhiteSpace(_options.StandaloneStunAlternateAddress)
+                ? _options.StunAlternatePublicAddress
+                : _options.StandaloneStunAlternateAddress);
+        var alternatePort = _options.StandaloneStunAlternatePort > 0
+            ? _options.StandaloneStunAlternatePort
+            : _options.NatProbeAlternatePort;
+        if (!string.IsNullOrWhiteSpace(alternateHost) && alternatePort is > 0 and <= 65535)
+        {
+            var alternate = $"stun:{BracketIpv6(alternateHost)}:{alternatePort}";
+            if (!servers.Contains(alternate, StringComparer.OrdinalIgnoreCase))
+            {
+                servers.Add(alternate);
             }
         }
         foreach (var item in _options.PublicStunServers
@@ -1062,6 +1078,7 @@ public sealed class PeerMeshService
             session.LocalEndpoint = Limit(report.LocalEndpoint, 255);
             session.RemoteEndpoint = Limit(report.RemoteEndpoint, 255);
             session.UpdatedAt = now;
+            session.LastKeepaliveAt = now;
         }
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -1461,6 +1478,7 @@ public sealed class PeerMeshService
         session.RelayBytes = SaturatedAdd(session.RelayBytes, relayBytes);
         session.PathType = EffectivePathType(session);
         session.LastTrafficAt = now;
+        session.LastKeepaliveAt = now;
         session.UpdatedAt = now;
     }
 
@@ -1547,7 +1565,7 @@ public sealed class PeerMeshService
         session.Id, session.SourceClientId, session.SourceClientName, session.TargetClientId,
         session.TargetClientName, EffectivePathType(session), session.Status, session.RttMillis,
         session.LocalEndpoint, session.RemoteEndpoint, session.DirectBytes, session.RelayBytes,
-        Iso(session.LastTrafficAt), Iso(session.StartedAt)!, Iso(session.UpdatedAt)!,
+        Iso(session.LastTrafficAt), Iso(session.LastKeepaliveAt), Iso(session.StartedAt)!, Iso(session.UpdatedAt)!,
         Iso(session.ExpiresAt)!, Iso(session.ClosedAt));
 
     private static string EffectivePathType(PeerMeshSession session)
@@ -1824,6 +1842,7 @@ public sealed record PeerMeshSessionView(
     long DirectBytes,
     long RelayBytes,
     string? LastTrafficAt,
+    string? LastKeepaliveAt,
     string StartedAt,
     string UpdatedAt,
     string ExpiresAt,

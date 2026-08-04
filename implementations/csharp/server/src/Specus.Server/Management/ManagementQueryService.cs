@@ -740,9 +740,15 @@ public sealed class ManagementQueryService
         includeDetail ? exchange.RequestHeaders : null,
         includeDetail ? exchange.ResponseHeaders : null,
         includeDetail ? exchange.RequestPreviewHex : null,
-        includeDetail ? exchange.RequestPreviewText : null,
+        includeDetail
+            ? HttpBodyDataCodec.ToDisplayText(exchange.RequestBodyData,
+                exchange.RequestContentType, exchange.RequestHeaders, exchange.RequestPreviewText)
+            : null,
         includeDetail ? exchange.ResponsePreviewHex : null,
-        includeDetail ? exchange.ResponsePreviewText : null,
+        includeDetail
+            ? HttpBodyDataCodec.ToDisplayText(exchange.ResponseBodyData,
+                exchange.ResponseContentType, exchange.ResponseHeaders, exchange.ResponsePreviewText)
+            : null,
         exchange.RequestTruncated,
         exchange.ResponseTruncated,
         exchange.CapturedAt.ToString("O"));

@@ -382,15 +382,19 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
             direction = "inbound",
         });
 
-        Assert.Equal(HttpStatusCode.Created, create.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, create.StatusCode);
         using var created = JsonDocument.Parse(await create.Content.ReadAsStringAsync());
         Assert.Equal("INBOUND", created.RootElement.GetProperty("direction").GetString());
+        var aclId = created.RootElement.GetProperty("id").GetInt64();
 
         using var list = await client.GetAsync("/api/admin/peer-mesh/acls");
         list.EnsureSuccessStatusCode();
         using var listed = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
         var acl = Assert.Single(listed.RootElement.EnumerateArray());
         Assert.Equal("INBOUND", acl.GetProperty("direction").GetString());
+
+        using var delete = await client.DeleteAsync($"/api/admin/peer-mesh/acls/{aclId}");
+        Assert.Equal(HttpStatusCode.OK, delete.StatusCode);
     }
 
     [Fact]
@@ -465,6 +469,16 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
                 PasswordHash = "unused",
                 Enabled = true,
                 ConnectionRateLimitPerMinute = 30,
+                CreatedAt = now,
+                UpdatedAt = now,
+            });
+            db.ManagementUsers.Add(new ManagementUser
+            {
+                Username = "Alice",
+                TenantId = "default",
+                PasswordHash = "unused",
+                Role = ManagementRole.User,
+                Enabled = true,
                 CreatedAt = now,
                 UpdatedAt = now,
             });

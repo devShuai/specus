@@ -117,8 +117,10 @@ public sealed class TrafficInspectionService : BackgroundService
             Cap(JoinHeaders(capture.RequestHeaders), HeaderChars),
             Cap(JoinHeaders(capture.ResponseHeaders), HeaderChars),
             requestPreview.Hex,
+            requestPreview.Data,
             requestPreview.Text,
             responsePreview.Hex,
+            responsePreview.Data,
             responsePreview.Text,
             requestPreview.Truncated,
             responsePreview.Truncated,
@@ -264,8 +266,10 @@ public sealed class TrafficInspectionService : BackgroundService
                 RequestHeaders = item.RequestHeaders,
                 ResponseHeaders = item.ResponseHeaders,
                 RequestPreviewHex = item.RequestPreviewHex,
+                RequestBodyData = item.RequestBodyData,
                 RequestPreviewText = item.RequestPreviewText,
                 ResponsePreviewHex = item.ResponsePreviewHex,
+                ResponseBodyData = item.ResponseBodyData,
                 ResponsePreviewText = item.ResponsePreviewText,
                 RequestTruncated = item.RequestTruncated,
                 ResponseTruncated = item.ResponseTruncated,
@@ -582,22 +586,17 @@ public sealed class TrafficInspectionService : BackgroundService
     {
         if (data is null || data.Length == 0)
         {
-            return new Preview(string.Empty, string.Empty, false);
+            return new Preview(string.Empty, [], string.Empty, false);
         }
+        var (hex, _, _) = TcpPreview(data, PreviewBytes);
         var display = DecodeContentEncoding(data, contentEncoding);
-        if (!display.Decoded && HasEncodedBody(contentEncoding) && !LooksLikeText(display.Data))
-        {
-            return new Preview(string.Empty,
-                $"data:application/octet-stream;base64,{Convert.ToBase64String(display.Data)}",
-                display.Truncated);
-        }
         if (!IsTextBody(contentType) && !LooksLikeText(display.Data))
         {
-            return new Preview(string.Empty,
-                $"data:{MediaType(contentType)};base64,{Convert.ToBase64String(display.Data)}",
-                display.Truncated);
+            return new Preview(hex, data.ToArray(), string.Empty, false);
         }
-        return new Preview(string.Empty, SanitizeText(Encoding.UTF8.GetString(display.Data)), display.Truncated);
+        return new Preview(hex, data.ToArray(),
+            Cap(SanitizeText(Encoding.UTF8.GetString(display.Data)), PreviewBytes) ?? string.Empty,
+            false);
     }
 
     private DecodedBody DecodeContentEncoding(byte[] data, string? contentEncoding)
@@ -814,7 +813,7 @@ public sealed class TrafficInspectionService : BackgroundService
 
     private sealed record ResourceDescriptor(long? ResourceId, string? ResourceName);
 
-    private sealed record Preview(string Hex, string Text, bool Truncated);
+    private sealed record Preview(string Hex, byte[] Data, string Text, bool Truncated);
 
     private sealed record DecodedBody(byte[] Data, bool Decoded, bool Truncated);
 
@@ -839,8 +838,10 @@ public sealed class TrafficInspectionService : BackgroundService
         string? RequestHeaders,
         string? ResponseHeaders,
         string RequestPreviewHex,
+        byte[] RequestBodyData,
         string RequestPreviewText,
         string ResponsePreviewHex,
+        byte[] ResponseBodyData,
         string ResponsePreviewText,
         bool RequestTruncated,
         bool ResponseTruncated,

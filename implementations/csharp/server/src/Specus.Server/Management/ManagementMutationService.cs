@@ -302,6 +302,7 @@ public sealed class ManagementMutationService
         var mapping = new SpecusMapping
         {
             Id = ClientIdGenerator.NewId(),
+            TenantId = account.TenantId,
             ClientId = account.Id,
             ClientName = account.ClientName,
             ListenPort = listenPort,
@@ -395,6 +396,7 @@ public sealed class ManagementMutationService
         var row = new HttpRouteMapping
         {
             Id = ClientIdGenerator.NewId(),
+            TenantId = account.TenantId,
             ClientId = account.Id,
             ClientName = account.ClientName,
             Route = route,

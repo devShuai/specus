@@ -24,6 +24,8 @@ public sealed class ControlChannelListener : IHostedService
 {
     private readonly ILogger<ControlChannelListener> _logger;
     private readonly IOptions<NettyServerOptions> _options;
+    private readonly TlsOptions _tlsOptions;
+    private readonly IHostEnvironment _environment;
     private readonly ControlChannelTlsProvider _tlsProvider;
     private readonly IControlChannelDispatcher _dispatcher;
     private readonly ILoggerFactory _loggerFactory;
@@ -32,18 +34,23 @@ public sealed class ControlChannelListener : IHostedService
     private TcpListener? _listener;
     private Task? _acceptLoop;
     private X509Certificate2? _serverCertificate;
+    private int _stopState;
 
     /// <summary>Available after <see cref="StartAsync"/>. Returns -1 before bind succeeds.</summary>
     public int BoundPort { get; private set; } = -1;
 
     public ControlChannelListener(ILogger<ControlChannelListener> logger,
         IOptions<NettyServerOptions> options,
+        IOptions<TlsOptions> tlsOptions,
+        IHostEnvironment environment,
         ControlChannelTlsProvider tlsProvider,
         IControlChannelDispatcher dispatcher,
         ILoggerFactory loggerFactory)
     {
         _logger = logger;
         _options = options;
+        _tlsOptions = tlsOptions.Value;
+        _environment = environment;
         _tlsProvider = tlsProvider;
         _dispatcher = dispatcher;
         _loggerFactory = loggerFactory;
@@ -51,17 +58,23 @@ public sealed class ControlChannelListener : IHostedService
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        var configured = _options.Value.Port;
-        _listener = new TcpListener(IPAddress.Any, configured);
-        _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _listener.Start(backlog: 8192);
+        var options = _options.Value;
+        ValidateConfiguration(options);
+        var configured = options.Port;
+        var bindAddress = ResolveBindAddress(options.BindAddress);
+        // Load/validate TLS material before opening the public socket. A bad keystore must fail
+        // startup without leaving a plaintext listener briefly bound.
         _serverCertificate = _tlsProvider.GetServerCertificate();
+        _listener = new TcpListener(bindAddress, configured);
+        _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress,
+            options.ReuseAddress);
+        _listener.Start(backlog: Math.Max(1, options.SoBacklog));
         if (_serverCertificate is null)
         {
             _logger.LogInformation("[tls] control channel is PLAIN (TLS disabled)");
         }
         BoundPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
-        _logger.LogInformation("control channel bound on port {Port}", BoundPort);
+        _logger.LogInformation("control channel bound on {Address}:{Port}", bindAddress, BoundPort);
 
         _acceptLoop = Task.Run(AcceptLoopAsync, cancellationToken);
         return Task.CompletedTask;
@@ -69,6 +82,10 @@ public sealed class ControlChannelListener : IHostedService
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        if (Interlocked.Exchange(ref _stopState, 1) != 0)
+        {
+            return;
+        }
         _shutdownCts.Cancel();
         try { _listener?.Stop(); } catch { /* socket already torn down */ }
 
@@ -112,10 +129,11 @@ public sealed class ControlChannelListener : IHostedService
             }
 
             // Match Java child options: TCP_NODELAY + SO_KEEPALIVE.
-            socket.NoDelay = true;
+            socket.NoDelay = _options.Value.TcpNoDelay;
             try
             {
-                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive,
+                    _options.Value.KeepAlive);
             }
             catch (SocketException)
             {
@@ -162,5 +180,81 @@ public sealed class ControlChannelListener : IHostedService
             try { stream.Dispose(); } catch { /* already gone */ }
             try { socket.Close(); } catch { /* already gone */ }
         }
+    }
+
+    internal void ValidateConfiguration(NettyServerOptions options)
+    {
+        if (options.PreAuthMaxFrameSize < Specus.Protocol.Codec.PacketCodec.HeaderSize
+            || options.PreAuthMaxFrameSize > options.MaxFrameSize)
+        {
+            throw new InvalidOperationException(
+                "pre-auth frame size must be between the protocol header and max frame size");
+        }
+
+        var production = _tlsOptions.RequireEncryption
+            || string.Equals(_environment.EnvironmentName, "prod", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(_environment.EnvironmentName, "production", StringComparison.OrdinalIgnoreCase);
+        if (!production)
+        {
+            return;
+        }
+
+        var mode = _tlsOptions.ResolveMode();
+        if (mode == TlsMode.SelfSigned)
+        {
+            throw new InvalidOperationException(
+                "production control channel cannot use a self-signed certificate");
+        }
+
+        var bindAddress = ResolveBindAddress(options.BindAddress);
+        if (mode == TlsMode.Disabled
+            && (!_tlsOptions.TerminatedUpstream || !IsPrivateBindAddress(bindAddress)))
+        {
+            throw new InvalidOperationException(
+                "production control channel requires TLS, or trusted upstream TLS with a private/loopback bind address");
+        }
+    }
+
+    internal static IPAddress ResolveBindAddress(string? value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? "0.0.0.0" : value.Trim();
+        if (IPAddress.TryParse(normalized, out var parsed))
+        {
+            return parsed;
+        }
+        try
+        {
+            return Dns.GetHostAddresses(normalized)
+                       .FirstOrDefault(address => address.AddressFamily is AddressFamily.InterNetwork
+                           or AddressFamily.InterNetworkV6)
+                   ?? throw new InvalidOperationException($"control bind address cannot be resolved: {normalized}");
+        }
+        catch (SocketException ex)
+        {
+            throw new InvalidOperationException($"control bind address cannot be resolved: {normalized}", ex);
+        }
+    }
+
+    internal static bool IsPrivateBindAddress(IPAddress address)
+    {
+        if (address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
+        {
+            return false;
+        }
+        if (IPAddress.IsLoopback(address) || address.IsIPv6LinkLocal || address.IsIPv6SiteLocal)
+        {
+            return true;
+        }
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            var ipv6 = address.GetAddressBytes();
+            return (ipv6[0] & 0xfe) == 0xfc;
+        }
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 10
+               || bytes[0] == 127
+               || bytes[0] == 169 && bytes[1] == 254
+               || bytes[0] == 172 && bytes[1] is >= 16 and <= 31
+               || bytes[0] == 192 && bytes[1] == 168;
     }
 }

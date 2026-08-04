@@ -47,6 +47,201 @@ public sealed class ManagementUserService
             user.Role, BuiltInAdmin: false);
     }
 
+    /// <summary>
+    /// Resolves a verified OIDC identity by immutable issuer/subject. This intentionally mirrors
+    /// Java: first login may bind an enabled imported username, otherwise it provisions a local
+    /// least-privileged USER in the configured default tenant.
+    /// </summary>
+    public async Task<LoginUser?> ResolveOrProvisionOidcUserAsync(string? issuer, string? subject,
+        string? preferredUsername, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(issuer)
+            || string.IsNullOrWhiteSpace(subject)
+            || string.IsNullOrWhiteSpace(preferredUsername))
+        {
+            return null;
+        }
+
+        var normalizedIssuer = issuer.Trim();
+        var normalizedSubject = subject.Trim();
+        if (normalizedIssuer.Length > 255 || normalizedSubject.Length > 255)
+        {
+            return null;
+        }
+
+        string username;
+        try
+        {
+            username = NormalizeUsername(preferredUsername);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+
+        if (string.Equals(username, _auth.Username, StringComparison.OrdinalIgnoreCase))
+        {
+            // The configured break-glass administrator is never claimable by an external IdP.
+            return null;
+        }
+
+        var identityKey = OidcIdentityKey(normalizedIssuer, normalizedSubject);
+        var bound = await _db.ManagementUsers.AsNoTracking()
+            .FirstOrDefaultAsync(user => user.OidcIdentityKey == identityKey, cancellationToken)
+            .ConfigureAwait(false);
+        if (bound is not null)
+        {
+            return IsExactEnabledOidcBinding(bound, normalizedIssuer, normalizedSubject, identityKey)
+                && !string.Equals(bound.Username, _auth.Username, StringComparison.OrdinalIgnoreCase)
+                ? ToLoginUser(bound)
+                : null;
+        }
+
+        var existing = await _db.ManagementUsers.AsNoTracking()
+            .FirstOrDefaultAsync(user => user.Username.ToLower() == username.ToLower(), cancellationToken)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            if (!existing.Enabled)
+            {
+                return null;
+            }
+            if (!string.IsNullOrWhiteSpace(existing.OidcIssuer)
+                || !string.IsNullOrWhiteSpace(existing.OidcSubject))
+            {
+                return string.Equals(existing.OidcIdentityKey, identityKey, StringComparison.Ordinal)
+                    ? ToLoginUser(existing)
+                    : null;
+            }
+
+            // Compare-and-set makes two simultaneous first logins for the same imported username
+            // deterministic: exactly one immutable issuer/subject wins the binding.
+            var updated = await _db.ManagementUsers
+                .Where(user => user.Username == existing.Username
+                    && user.Enabled
+                    && (user.OidcIssuer == null || user.OidcIssuer == string.Empty)
+                    && (user.OidcSubject == null || user.OidcSubject == string.Empty)
+                    && (user.OidcIdentityKey == null || user.OidcIdentityKey == string.Empty))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(user => user.OidcIssuer, normalizedIssuer)
+                    .SetProperty(user => user.OidcSubject, normalizedSubject)
+                    .SetProperty(user => user.OidcIdentityKey, identityKey)
+                    .SetProperty(user => user.UpdatedAt, DateTimeOffset.UtcNow), cancellationToken)
+                .ConfigureAwait(false);
+            var winner = await _db.ManagementUsers.AsNoTracking()
+                .FirstOrDefaultAsync(user => user.Username == existing.Username, cancellationToken)
+                .ConfigureAwait(false);
+            return updated == 1
+                   && winner is not null
+                   && IsExactEnabledOidcBinding(winner, normalizedIssuer, normalizedSubject,
+                       identityKey)
+                ? ToLoginUser(winner)
+                : winner is not null
+                  && IsExactEnabledOidcBinding(winner, normalizedIssuer, normalizedSubject,
+                      identityKey)
+                    ? ToLoginUser(winner)
+                    : null;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var user = new ManagementUser
+        {
+            Username = username,
+            TenantId = ManagementContext.NormalizeTenant(_auth.TenantId),
+            PasswordHash = PasswordHasher.Hash(PasswordHasher.GeneratePassword()),
+            OidcIssuer = normalizedIssuer,
+            OidcSubject = normalizedSubject,
+            OidcIdentityKey = identityKey,
+            Role = ManagementRole.User,
+            Enabled = true,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        _db.ManagementUsers.Add(user);
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException)
+        {
+            // A concurrent first login may have inserted the same immutable identity. Clear the
+            // failed unit of work and resolve the winner instead of creating a second binding.
+            _db.Entry(user).State = EntityState.Detached;
+            var concurrent = await _db.ManagementUsers.AsNoTracking()
+                .FirstOrDefaultAsync(item => item.OidcIdentityKey == identityKey, cancellationToken)
+                .ConfigureAwait(false);
+            return concurrent is not null
+                   && !string.Equals(concurrent.Username, _auth.Username,
+                       StringComparison.OrdinalIgnoreCase)
+                   && IsExactEnabledOidcBinding(concurrent, normalizedIssuer, normalizedSubject,
+                       identityKey)
+                ? ToLoginUser(concurrent)
+                : null;
+        }
+        return ToLoginUser(user);
+    }
+
+    /// <summary>
+    /// Resolves an already-bound external identity for direct OIDC bearer authentication. This
+    /// path never provisions users and always reloads the current local tenant, role and status.
+    /// </summary>
+    public async Task<LoginUser?> ResolveBoundOidcUserAsync(string? issuer, string? subject,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(issuer) || string.IsNullOrWhiteSpace(subject))
+        {
+            return null;
+        }
+        var normalizedIssuer = issuer.Trim();
+        var normalizedSubject = subject.Trim();
+        if (normalizedIssuer.Length > 255 || normalizedSubject.Length > 255)
+        {
+            return null;
+        }
+        var identityKey = OidcIdentityKey(normalizedIssuer, normalizedSubject);
+        var user = await _db.ManagementUsers.AsNoTracking()
+            .FirstOrDefaultAsync(item => item.OidcIdentityKey == identityKey, cancellationToken)
+            .ConfigureAwait(false);
+        if (user is null
+            || string.Equals(user.Username, _auth.Username, StringComparison.OrdinalIgnoreCase)
+            || !IsExactEnabledOidcBinding(user, normalizedIssuer, normalizedSubject, identityKey))
+        {
+            return null;
+        }
+        return ToLoginUser(user);
+    }
+
+    /// <summary>Reloads a local-token subject before issuing a refreshed token.</summary>
+    public async Task<LoginUser?> ResolveRefreshUserAsync(string? username,
+        CancellationToken cancellationToken)
+    {
+        string normalized;
+        try
+        {
+            normalized = NormalizeUsername(username);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+
+        if (string.Equals(normalized, _auth.Username, StringComparison.OrdinalIgnoreCase))
+        {
+            if (!_auth.PasswordLoginEnabled || string.IsNullOrWhiteSpace(_auth.Password))
+            {
+                return null;
+            }
+            return new LoginUser(_auth.Username, ManagementContext.NormalizeTenant(_auth.TenantId),
+                ManagementRole.Admin, BuiltInAdmin: true);
+        }
+
+        var user = await _db.ManagementUsers.AsNoTracking()
+            .FirstOrDefaultAsync(item => item.Username.ToLower() == normalized.ToLower(),
+                cancellationToken)
+            .ConfigureAwait(false);
+        return user is { Enabled: true } ? ToLoginUser(user) : null;
+    }
+
     public async Task<ManagementUserView> CurrentUserAsync(ManagementContext context,
         CancellationToken cancellationToken)
     {
@@ -224,6 +419,28 @@ public sealed class ManagementUserService
         }
         return normalized;
     }
+
+    private static string OidcIdentityKey(string issuer, string subject)
+    {
+        using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        digest.AppendData(System.Text.Encoding.UTF8.GetBytes(issuer));
+        digest.AppendData([0]);
+        digest.AppendData(System.Text.Encoding.UTF8.GetBytes(subject));
+        return Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static LoginUser ToLoginUser(ManagementUser user) => new(
+        user.Username,
+        ManagementContext.NormalizeTenant(user.TenantId),
+        user.Role,
+        BuiltInAdmin: false);
+
+    private static bool IsExactEnabledOidcBinding(ManagementUser user, string issuer,
+        string subject, string identityKey) =>
+        user.Enabled
+        && string.Equals(user.OidcIssuer, issuer, StringComparison.Ordinal)
+        && string.Equals(user.OidcSubject, subject, StringComparison.Ordinal)
+        && string.Equals(user.OidcIdentityKey, identityKey, StringComparison.Ordinal);
 
     private static ManagementUserView ToView(ManagementUser user)
     {

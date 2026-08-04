@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Specus.Server.Configuration;
+using Specus.Server.Management;
 
 namespace Specus.Server.Security;
 
@@ -11,14 +12,23 @@ public sealed class OidcTokenExchangeService
 {
     private readonly OidcOptions _options;
     private readonly IOidcTokenEndpointClient _client;
+    private readonly OidcTokenValidator _validator;
+    private readonly ManagementUserService _users;
+    private readonly LocalTokenService _localTokens;
     private readonly ILogger<OidcTokenExchangeService> _logger;
 
     public OidcTokenExchangeService(IOptions<OidcOptions> options,
         IOidcTokenEndpointClient client,
+        OidcTokenValidator validator,
+        ManagementUserService users,
+        LocalTokenService localTokens,
         ILogger<OidcTokenExchangeService> logger)
     {
         _options = options.Value;
         _client = client;
+        _validator = validator;
+        _users = users;
+        _localTokens = localTokens;
         _logger = logger;
     }
 
@@ -33,9 +43,10 @@ public sealed class OidcTokenExchangeService
 
         if (request is null
             || string.IsNullOrWhiteSpace(request.Code)
-            || string.IsNullOrWhiteSpace(request.CodeVerifier))
+            || string.IsNullOrWhiteSpace(request.CodeVerifier)
+            || string.IsNullOrWhiteSpace(request.Nonce))
         {
-            return Results.Json(new { error = "缺少 code 或 code_verifier" },
+            return Results.Json(new { error = "缺少 code、code_verifier 或 nonce" },
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
@@ -76,12 +87,38 @@ public sealed class OidcTokenExchangeService
                     statusCode: StatusCodes.Status502BadGateway);
             }
 
+            var rawIdToken = ReadString(body.RootElement, "id_token");
+            if (string.IsNullOrWhiteSpace(rawIdToken))
+            {
+                _logger.LogWarning("[oidc] token exchange response is missing id_token");
+                return Results.Json(new { error = "OIDC 响应缺少 ID Token" },
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
+
+            var identity = await _validator.ValidateIdTokenAsync(rawIdToken, request.Nonce,
+                cancellationToken).ConfigureAwait(false);
+            if (identity is null)
+            {
+                _logger.LogWarning("[oidc] ID Token validation failed");
+                return Results.Json(new { error = "OIDC ID Token 身份或 nonce 校验失败" },
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
+
+            var user = await _users.ResolveOrProvisionOidcUserAsync(identity.Issuer,
+                identity.Subject, identity.PreferredUsername, cancellationToken).ConfigureAwait(false);
+            if (user is null)
+            {
+                _logger.LogWarning("[oidc] authenticated identity is disabled or conflicts with an existing binding");
+                return Results.Json(new { error = "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突" },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
             return Results.Ok(new
             {
-                accessToken = ReadString(body.RootElement, "access_token"),
-                idToken = ReadString(body.RootElement, "id_token"),
+                accessToken = _localTokens.IssueToken(user.Username, user.TenantId, user.Role),
+                idToken = rawIdToken,
                 tokenType = ReadString(body.RootElement, "token_type") ?? "Bearer",
-                expiresIn = ReadInt64(body.RootElement, "expires_in"),
+                expiresIn = _localTokens.TtlSeconds,
             });
         }
         catch (JsonException ex)
@@ -104,13 +141,9 @@ public sealed class OidcTokenExchangeService
             ? property.GetString()
             : null;
 
-    private static long ReadInt64(JsonElement element, string propertyName) =>
-        element.TryGetProperty(propertyName, out var property) && property.TryGetInt64(out var value)
-            ? value
-            : 0;
 }
 
-public sealed record OidcTokenExchangeRequest(string Code, string CodeVerifier);
+public sealed record OidcTokenExchangeRequest(string Code, string CodeVerifier, string Nonce);
 
 public sealed record OidcTokenEndpointRequest(Uri TokenEndpoint,
     IReadOnlyDictionary<string, string> Form,

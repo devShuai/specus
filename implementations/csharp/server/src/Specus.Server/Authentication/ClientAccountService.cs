@@ -86,7 +86,7 @@ public sealed class ClientAccountService
             TokenTtlSeconds = ttlSeconds,
             NettyHost = ResolveNettyHost(requestServerName),
             NettyPort = _netty.Port,
-            NettyTls = _tls.ResolveMode() != TlsMode.Disabled,
+            NettyTls = _tls.ResolveMode() != TlsMode.Disabled || _tls.TerminatedUpstream,
             MaxOnlineInstances = credential.MaxOnlineInstances,
             SpecusConfigList = await _db.SpecusMappings
                 .AsNoTracking()

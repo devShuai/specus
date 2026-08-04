@@ -23,11 +23,12 @@ public sealed class SecureDefaultConfigurationTests
         Assert.Equal(string.Empty,
             specus.GetProperty("Elasticsearch").GetProperty("Password").GetString());
         var auth = specus.GetProperty("Auth");
-        Assert.False(auth.GetProperty("PasswordLoginEnabled").GetBoolean());
-        Assert.False(auth.GetProperty("RegistrationEnabled").GetBoolean());
+        Assert.True(auth.GetProperty("PasswordLoginEnabled").GetBoolean());
+        Assert.True(auth.GetProperty("RegistrationEnabled").GetBoolean());
         Assert.False(auth.GetProperty("TurnstileEnabled").GetBoolean());
         Assert.False(auth.GetProperty("EmailVerificationEnabled").GetBoolean());
-        Assert.Equal(string.Empty, auth.GetProperty("Password").GetString());
+        Assert.Equal("admin", auth.GetProperty("Username").GetString());
+        Assert.Equal("admin", auth.GetProperty("Password").GetString());
         Assert.Equal(string.Empty, auth.GetProperty("TurnstileSecretKey").GetString());
         Assert.Equal(string.Empty, auth.GetProperty("SmtpPassword").GetString());
 
@@ -36,14 +37,15 @@ public sealed class SecureDefaultConfigurationTests
     }
 
     [Fact]
-    public void AuthOptionFallbackIsDisabledUntilASecretIsConfigured()
+    public void AuthOptionFallbackMatchesJavaDevelopmentDefaults()
     {
         var options = new AuthOptions();
 
-        Assert.False(options.PasswordLoginEnabled);
-        Assert.False(options.RegistrationEnabled);
+        Assert.True(options.PasswordLoginEnabled);
+        Assert.True(options.RegistrationEnabled);
         Assert.False(options.TurnstileEnabled);
         Assert.False(options.EmailVerificationEnabled);
-        Assert.Equal(string.Empty, options.Password);
+        Assert.Equal("admin", options.Username);
+        Assert.Equal("admin", options.Password);
     }
 }

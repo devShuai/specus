@@ -13,12 +13,24 @@ public sealed class NettyServerOptions
 
     public int Port { get; set; } = 7010;
 
+    public string BindAddress { get; set; } = "0.0.0.0";
+
+    public int SoBacklog { get; set; } = 8192;
+
+    public bool ReuseAddress { get; set; } = true;
+
+    public bool KeepAlive { get; set; } = true;
+
+    public bool TcpNoDelay { get; set; } = true;
+
     /// <summary>
     /// Hard cap on a single decoded frame (bytes). The reader closes the connection if it sees
     /// a header advertising a length above this — protects against runaway memory on a malformed
     /// peer.
     /// </summary>
     public int MaxFrameSize { get; set; } = 32 * 1024 * 1024;
+
+    public int PreAuthMaxFrameSize { get; set; } = 16 * 1024;
 
     public int WriteBufferLowWaterMark { get; set; } = 32 * 1024;
 
@@ -56,6 +68,16 @@ public sealed class DatabaseOptions
     /// </summary>
     public string Provider { get; set; } = "sqlite";
 
+    /// <summary>Java-compatible JDBC URL, for example jdbc:sqlite:./specus.db.</summary>
+    public string Url { get; set; } = string.Empty;
+
+    public string Username { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public string Driver { get; set; } = string.Empty;
+    public string Dialect { get; set; } = string.Empty;
+    public int PoolSize { get; set; } = 1;
+    public int BatchSize { get; set; } = 50;
+
     public bool SeedDemoClient { get; set; } = true;
 }
 
@@ -70,10 +92,10 @@ public sealed class AuthOptions
 {
     public const string SectionName = "Specus:Auth";
 
-    public bool PasswordLoginEnabled { get; set; } = false;
-    public bool RegistrationEnabled { get; set; } = false;
+    public bool PasswordLoginEnabled { get; set; } = true;
+    public bool RegistrationEnabled { get; set; } = true;
     public string Username { get; set; } = "admin";
-    public string Password { get; set; } = string.Empty;
+    public string Password { get; set; } = "admin";
     public string TenantId { get; set; } = "default";
     public string? JwtSecret { get; set; }
     public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
@@ -288,15 +310,16 @@ public sealed class OidcOptions
 {
     public const string SectionName = "Specus:Oidc";
 
-    public string Issuer { get; set; } = "https://gateway.toys.theshuai.com/auth";
-    public string JwkSetUri { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/jwks";
-    public string AuthorizationEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/authorize";
-    public string TokenEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/token";
-    public string EndSessionEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/connect/logout";
+    public string Issuer { get; set; } = "https://certus.devshuai.com";
+    public string JwkSetUri { get; set; } = "https://certus.devshuai.com/oauth2/jwks";
+    public string AuthorizationEndpoint { get; set; } = "https://certus.devshuai.com/oauth2/authorize";
+    public string RegistrationEndpoint { get; set; } = "https://certus.devshuai.com/register";
+    public string TokenEndpoint { get; set; } = "https://certus.devshuai.com/oauth2/token";
+    public string EndSessionEndpoint { get; set; } = "https://certus.devshuai.com/oauth2/logout";
     public string ClientId { get; set; } = string.Empty;
     public string ClientSecret { get; set; } = string.Empty;
     public string RedirectUri { get; set; } = "http://127.0.0.1:8088/";
-    public string Scope { get; set; } = "openid";
+    public string Scope { get; set; } = "openid profile email";
     public string Audience { get; set; } = string.Empty;
     public string TenantClaim { get; set; } = "tenant_id";
 }
@@ -313,6 +336,8 @@ public sealed class TlsOptions
     public string? Keystore { get; set; }
     public string? KeystorePassword { get; set; }
     public string? KeyPassword { get; set; }
+    public bool RequireEncryption { get; set; }
+    public bool TerminatedUpstream { get; set; }
 
     public TlsMode ResolveMode() => Mode?.Trim().ToLowerInvariant() switch
     {

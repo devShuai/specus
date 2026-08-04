@@ -12,7 +12,17 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_NETTY_PORT"] = "7011",
             ["SPECUS_NETTY_MAX_FRAME_SIZE"] = "1024",
             ["SPECUS_NETTY_WRITE_BUFFER_HIGH_WATER_MARK"] = "2048",
+            ["SPECUS_NETTY_BIND_ADDRESS"] = "127.0.0.1",
+            ["SPECUS_NETTY_SO_BACKLOG"] = "256",
+            ["SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE"] = "8192",
             ["SPECUS_DB_SEED_DEMO_CLIENT"] = "false",
+            ["SPECUS_DB_URL"] = "jdbc:postgresql://db.example/specus",
+            ["SPECUS_DB_USERNAME"] = "specus_user",
+            ["SPECUS_DB_PASSWORD"] = "specus_password",
+            ["SPECUS_DB_DRIVER"] = "org.postgresql.Driver",
+            ["SPECUS_DB_DIALECT"] = "org.hibernate.dialect.PostgreSQLDialect",
+            ["SPECUS_DB_POOL_SIZE"] = "12",
+            ["SPECUS_DB_BATCH_SIZE"] = "64",
             ["SPECUS_LOGIN_EXECUTOR_QUEUE_CAPACITY"] = "7",
             ["SPECUS_LOGIN_EXECUTOR_CORE"] = "5",
             ["SPECUS_LOGIN_EXECUTOR_MAX"] = "32",
@@ -34,6 +44,9 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_PEER_MESH_CIDR"] = "100.96.0.0/11",
             ["SPECUS_PEER_MESH_PUBLIC_ADDRESS"] = "turn.example.com",
             ["SPECUS_PEER_MESH_STUN_TURN_PORT"] = "3478",
+            ["SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS"] = "stun-alt.example.com",
+            ["SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT"] = "3480",
+            ["SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS"] = "stun-public.example.com",
             ["SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT"] = "3479",
             ["SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS"] = "stun:stun1.example.com:3478, stun:stun2.example.com:3478",
             ["SPECUS_PEER_MESH_SESSION_TTL_SECONDS"] = "3600",
@@ -69,6 +82,8 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_OIDC_JWK_SET_URI"] = "https://issuer.example/jwks",
             ["SPECUS_OIDC_TENANT_CLAIM"] = "org_id",
             ["SPECUS_TLS_KEYSTORE_PASSWORD"] = "changeit",
+            ["SPECUS_TLS_REQUIRE_ENCRYPTION"] = "true",
+            ["SPECUS_TLS_TERMINATED_UPSTREAM"] = "true",
         };
 
         var mapped = SpecusEnvironmentVariables.BuildConfigurationMap(variables);
@@ -76,7 +91,17 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("7011", mapped["Specus:Netty:Port"]);
         Assert.Equal("1024", mapped["Specus:Netty:MaxFrameSize"]);
         Assert.Equal("2048", mapped["Specus:Netty:WriteBufferHighWaterMark"]);
+        Assert.Equal("127.0.0.1", mapped["Specus:Netty:BindAddress"]);
+        Assert.Equal("256", mapped["Specus:Netty:SoBacklog"]);
+        Assert.Equal("8192", mapped["Specus:Netty:PreAuthMaxFrameSize"]);
         Assert.Equal("false", mapped["Specus:Database:SeedDemoClient"]);
+        Assert.Equal("jdbc:postgresql://db.example/specus", mapped["Specus:Database:Url"]);
+        Assert.Equal("specus_user", mapped["Specus:Database:Username"]);
+        Assert.Equal("specus_password", mapped["Specus:Database:Password"]);
+        Assert.Equal("org.postgresql.Driver", mapped["Specus:Database:Driver"]);
+        Assert.Equal("org.hibernate.dialect.PostgreSQLDialect", mapped["Specus:Database:Dialect"]);
+        Assert.Equal("12", mapped["Specus:Database:PoolSize"]);
+        Assert.Equal("64", mapped["Specus:Database:BatchSize"]);
         Assert.Equal("5", mapped["Specus:Login:ExecutorCoreSize"]);
         Assert.Equal("32", mapped["Specus:Login:ExecutorMaxSize"]);
         Assert.Equal("4096", mapped["Specus:Login:ExecutorQueueCapacity"]);
@@ -97,6 +122,9 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("100.96.0.0/11", mapped["Specus:PeerMesh:Cidr"]);
         Assert.Equal("turn.example.com", mapped["Specus:PeerMesh:PublicAddress"]);
         Assert.Equal("3478", mapped["Specus:PeerMesh:StunTurnPort"]);
+        Assert.Equal("stun-alt.example.com", mapped["Specus:PeerMesh:StandaloneStunAlternateAddress"]);
+        Assert.Equal("3480", mapped["Specus:PeerMesh:StandaloneStunAlternatePort"]);
+        Assert.Equal("stun-public.example.com", mapped["Specus:PeerMesh:StunAlternatePublicAddress"]);
         Assert.Equal("3479", mapped["Specus:PeerMesh:NatProbeAlternatePort"]);
         Assert.Equal("stun:stun1.example.com:3478", mapped["Specus:PeerMesh:PublicStunServers:0"]);
         Assert.Equal("stun:stun2.example.com:3478", mapped["Specus:PeerMesh:PublicStunServers:1"]);
@@ -134,6 +162,8 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("https://issuer.example/jwks", mapped["Specus:Oidc:JwkSetUri"]);
         Assert.Equal("org_id", mapped["Specus:Oidc:TenantClaim"]);
         Assert.Equal("changeit", mapped["Specus:Tls:KeystorePassword"]);
+        Assert.Equal("true", mapped["Specus:Tls:RequireEncryption"]);
+        Assert.Equal("true", mapped["Specus:Tls:TerminatedUpstream"]);
     }
 
     [Fact]

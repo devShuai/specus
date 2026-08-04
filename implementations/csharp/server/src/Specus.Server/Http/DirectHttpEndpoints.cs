@@ -98,10 +98,18 @@ public static class DirectHttpEndpoints
             return;
         }
 
-        if (context.WebSockets.IsWebSocketRequest)
+        if (RawServerWebSocketConnection.LooksLikeWebSocketUpgrade(context.Request))
         {
-            await ForwardWebSocketAsync(context, clientName, route, relativePath, dispatcher,
-                accessPolicy.AuthEnabled).ConfigureAwait(false);
+            try
+            {
+                await ForwardWebSocketAsync(context, clientName, route, relativePath, dispatcher,
+                    accessPolicy.AuthEnabled).ConfigureAwait(false);
+            }
+            catch (RawWebSocketHandshakeException ex) when (!context.Response.HasStarted)
+            {
+                await WriteTextErrorAsync(context.Response, ex.StatusCode, ex.Message)
+                    .ConfigureAwait(false);
+            }
             return;
         }
 
@@ -190,7 +198,6 @@ public static class DirectHttpEndpoints
             var rewrite = accessPolicy.PathRewriteEnabled && IsRewritable(originalResponseHeaders);
             using var rewriteBuffer = new MemoryStream();
             var responseStarted = false;
-            long responseBytes = 0;
             List<string>? responseTrailers = null;
 
             void StartResponse()
@@ -213,9 +220,10 @@ public static class DirectHttpEndpoints
                     break;
                 }
                 var data = item.Data ?? Array.Empty<byte>();
-                responseBytes += data.Length;
 
                 await mediaCapture.AppendAsync(data, context.RequestAborted).ConfigureAwait(false);
+                responseCapture.Write(data);
+                traffic.RecordHttpDownload(clientName, route, data.Length);
 
                 if (rewrite && rewriteBuffer.Length + data.Length <= options.Value.RewriteMaxBodyBytes)
                 {
@@ -228,12 +236,12 @@ public static class DirectHttpEndpoints
                     rewrite = false;
                     StartResponse();
                     var buffered = rewriteBuffer.ToArray();
-                    await WriteResponseChunkAsync(context.Response, buffered, responseCapture,
-                        traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+                    await WriteResponseChunkAsync(context.Response, buffered,
+                        context.RequestAborted).ConfigureAwait(false);
                 }
                 StartResponse();
-                await WriteResponseChunkAsync(context.Response, data, responseCapture,
-                    traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+                await WriteResponseChunkAsync(context.Response, data,
+                    context.RequestAborted).ConfigureAwait(false);
                 await stream.ConsumeResponseAsync(data.Length, context.RequestAborted).ConfigureAwait(false);
             }
 
@@ -249,8 +257,8 @@ public static class DirectHttpEndpoints
                     responseHeaders = StripRewriteHeaders(responseHeaders);
                 }
                 StartResponse();
-                await WriteResponseChunkAsync(context.Response, body, responseCapture,
-                    traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+                await WriteResponseChunkAsync(context.Response, body,
+                    context.RequestAborted).ConfigureAwait(false);
             }
             else if (!responseStarted)
             {
@@ -459,8 +467,8 @@ public static class DirectHttpEndpoints
             ["body"] = Array.Empty<byte>(),
         };
 
-        using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
-        using var browserWriteLock = new SemaphoreSlim(1, 1);
+        await using var socket = await RawServerWebSocketConnection.AcceptAsync(
+            context, context.RequestAborted).ConfigureAwait(false);
         var closeState = new WebSocketTunnelCloseState();
         WebSocketSpecusStream stream;
         try
@@ -470,27 +478,25 @@ public static class DirectHttpEndpoints
         }
         catch (DirectHttpSpecusException ex)
         {
-            await SafeCloseOutputAsync(socket, browserWriteLock,
-                    WebSocketCloseStatus.InternalServerError, ex.Message)
+            await SafeSendBrowserCloseAsync(socket,
+                    (ushort)WebSocketCloseStatus.InternalServerError, ex.Message)
                 .ConfigureAwait(false);
             return;
         }
 
         await using var streamLifetime = stream;
         using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
-        var browserToClient = PumpBrowserWebSocketAsync(socket, stream, browserWriteLock,
-            closeState, pumpCts.Token);
-        var clientToBrowser = PumpClientWebSocketAsync(socket, stream, browserWriteLock,
-            closeState, pumpCts.Token);
+        var browserToClient = PumpBrowserWebSocketAsync(socket, stream, closeState, pumpCts.Token);
+        var clientToBrowser = PumpClientWebSocketAsync(socket, stream, closeState, pumpCts.Token);
         var completed = await Task.WhenAny(browserToClient, clientToBrowser).ConfigureAwait(false);
-        if (ReferenceEquals(completed, browserToClient) && closeState.ClientInitiated
-            && !clientToBrowser.IsCompleted)
+        var peerPump = ReferenceEquals(completed, browserToClient) ? clientToBrowser : browserToClient;
+        if (closeState.CloseStarted && !peerPump.IsCompleted)
         {
-            var peerTerminal = await Task.WhenAny(clientToBrowser, Task.Delay(TimeSpan.FromSeconds(5),
+            var peerTerminal = await Task.WhenAny(peerPump, Task.Delay(TimeSpan.FromSeconds(5),
                 context.RequestAborted)).ConfigureAwait(false);
-            if (ReferenceEquals(peerTerminal, clientToBrowser))
+            if (ReferenceEquals(peerTerminal, peerPump))
             {
-                completed = clientToBrowser;
+                completed = peerPump;
             }
         }
         try
@@ -505,89 +511,68 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private static async Task PumpBrowserWebSocketAsync(WebSocket socket,
-        WebSocketSpecusStream stream, SemaphoreSlim browserWriteLock,
+    internal static async Task PumpBrowserWebSocketAsync(RawServerWebSocketConnection socket,
+        WebSocketSpecusStream stream,
         WebSocketTunnelCloseState closeState, CancellationToken cancellationToken)
     {
-        var buffer = new byte[WebSocketSpecusFrame.MaxPayloadBytes];
-        var firstFragment = true;
+        var fragmentOpen = false;
         long messageBytes = 0;
         try
         {
-            while (!cancellationToken.IsCancellationRequested
-                   && socket.State is WebSocketState.Open or WebSocketState.CloseSent)
+            while (!cancellationToken.IsCancellationRequested && socket.IsOpen)
             {
-                var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken)
-                    .ConfigureAwait(false);
-                if (result.MessageType == WebSocketMessageType.Close)
+                var frame = await socket.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+                if (frame is null)
                 {
-                    var status = NormalizeCloseStatus(result.CloseStatus);
-                    var reason = result.CloseStatusDescription ?? string.Empty;
-                    if (!closeState.ClientInitiated)
-                    {
-                        await SendWebSocketCloseToClientAsync(stream, status, reason, cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                    await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
-                        .ConfigureAwait(false);
+                    break;
+                }
+                ValidateWebSocketFragmentSequence(frame, ref fragmentOpen, ref messageBytes);
+                if (frame.Opcode == WebSocketSpecusFrame.OpcodeClose)
+                {
+                    closeState.MarkBrowserInitiated();
+                    using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    closeCts.CancelAfter(TimeSpan.FromSeconds(5));
+                    await SendRawWebSocketFrameToClientAsync(stream, frame, finish: true,
+                        closeCts.Token).ConfigureAwait(false);
+                    await socket.ReplyToCloseAsync(frame, closeCts.Token).ConfigureAwait(false);
                     return;
                 }
-
-                messageBytes += result.Count;
-                if (messageBytes > WebSocketMaxMessageBytes)
-                {
-                    const string reason = "WebSocket message exceeds limit";
-                    await SendWebSocketCloseToClientAsync(stream, WebSocketCloseStatus.MessageTooBig,
-                        reason, cancellationToken).ConfigureAwait(false);
-                    await SafeCloseOutputAsync(socket, browserWriteLock,
-                            WebSocketCloseStatus.MessageTooBig, reason)
-                        .ConfigureAwait(false);
-                    return;
-                }
-
-                var opcode = firstFragment
-                    ? result.MessageType == WebSocketMessageType.Text
-                        ? WebSocketSpecusFrame.OpcodeText
-                        : WebSocketSpecusFrame.OpcodeBinary
-                    : WebSocketSpecusFrame.OpcodeContinuation;
-                var frame = new WebSocketSpecusFrame(opcode, result.EndOfMessage, 0, 0,
-                    buffer.AsSpan(0, result.Count).ToArray());
-                await stream.SendDataAsync(frame.Encode(), cancellationToken).ConfigureAwait(false);
-
-                if (result.EndOfMessage)
-                {
-                    firstFragment = true;
-                    messageBytes = 0;
-                }
-                else
-                {
-                    firstFragment = false;
-                }
+                await SendRawWebSocketFrameToClientAsync(stream, frame, finish: false,
+                    cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // The opposite side ended the tunnel or the HTTP request was aborted.
         }
-        catch (Exception ex) when (ex is WebSocketException or IOException)
+        catch (Exception ex) when (ex is InvalidDataException or ArgumentException)
+        {
+            closeState.MarkBrowserInitiated();
+            await SendGeneratedCloseToClientAsync(stream,
+                (ushort)WebSocketCloseStatus.ProtocolError, "invalid WebSocket frame",
+                CancellationToken.None).ConfigureAwait(false);
+            await SafeSendBrowserCloseAsync(socket,
+                (ushort)WebSocketCloseStatus.ProtocolError, "invalid WebSocket frame")
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
             if (stream.PeerTerminated)
             {
                 closeState.MarkClientInitiated();
                 return;
             }
-            await SendWebSocketCloseToClientAsync(stream, WebSocketCloseStatus.InternalServerError,
-                string.Empty, CancellationToken.None).ConfigureAwait(false);
+            await SendGeneratedCloseToClientAsync(stream,
+                (ushort)WebSocketCloseStatus.InternalServerError, string.Empty,
+                CancellationToken.None).ConfigureAwait(false);
         }
     }
 
-    private static async Task PumpClientWebSocketAsync(WebSocket socket,
-        WebSocketSpecusStream stream, SemaphoreSlim browserWriteLock,
+    private static async Task PumpClientWebSocketAsync(RawServerWebSocketConnection socket,
+        WebSocketSpecusStream stream,
         WebSocketTunnelCloseState closeState, CancellationToken cancellationToken)
     {
-        WebSocketMessageType? fragmentType = null;
-        WebSocketCloseStatus? clientCloseStatus = null;
-        var clientCloseReason = string.Empty;
+        var fragmentOpen = false;
         long messageBytes = 0;
         try
         {
@@ -596,16 +581,11 @@ public static class DirectHttpEndpoints
                 var item = await stream.ReadAsync(cancellationToken).ConfigureAwait(false);
                 if (item.End)
                 {
-                    closeState.MarkClientInitiated();
-                    if (clientCloseStatus is { } closeStatus)
+                    if (!closeState.CloseStarted)
                     {
-                        await SendWebSocketCloseToClientAsync(stream, closeStatus,
-                            clientCloseReason, cancellationToken).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        await SafeCloseOutputAsync(socket, browserWriteLock,
-                                WebSocketCloseStatus.EndpointUnavailable, string.Empty)
+                        closeState.MarkClientInitiated();
+                        await SafeSendBrowserCloseAsync(socket,
+                                (ushort)WebSocketCloseStatus.EndpointUnavailable, string.Empty)
                             .ConfigureAwait(false);
                     }
                     return;
@@ -613,66 +593,21 @@ public static class DirectHttpEndpoints
 
                 var encoded = item.Data ?? Array.Empty<byte>();
                 var frame = WebSocketSpecusFrame.Decode(encoded);
-                if (frame.Rsv != 0)
+                var payload = frame.Payload;
+                if (frame.Opcode == WebSocketSpecusFrame.OpcodeClose)
                 {
-                    throw new InvalidDataException("RSV extensions are unavailable on the ASP.NET endpoint");
+                    payload = frame.CloseCode == 0
+                        ? []
+                        : [(byte)(frame.CloseCode >> 8), (byte)frame.CloseCode, .. payload];
                 }
-
-                switch (frame.Opcode)
+                var rawFrame = new RawServerWebSocketFrame(
+                    frame.Opcode, frame.FinalFragment, frame.Rsv, payload);
+                ValidateWebSocketFragmentSequence(rawFrame, ref fragmentOpen, ref messageBytes);
+                if (frame.Opcode == WebSocketSpecusFrame.OpcodeClose)
                 {
-                    case WebSocketSpecusFrame.OpcodeText:
-                    case WebSocketSpecusFrame.OpcodeBinary:
-                        {
-                            if (fragmentType is not null)
-                            {
-                                throw new InvalidDataException(
-                                    "new SWS2 message before fragmented message completed");
-                            }
-                            var messageType = frame.Opcode == WebSocketSpecusFrame.OpcodeText
-                                ? WebSocketMessageType.Text
-                                : WebSocketMessageType.Binary;
-                            messageBytes = frame.Payload.Length;
-                            EnsureWebSocketMessageSize(messageBytes);
-                            await SendBrowserFrameAsync(socket, browserWriteLock, frame.Payload,
-                                messageType, frame.FinalFragment, cancellationToken).ConfigureAwait(false);
-                            if (!frame.FinalFragment)
-                            {
-                                fragmentType = messageType;
-                            }
-                            break;
-                        }
-                    case WebSocketSpecusFrame.OpcodeContinuation:
-                        if (fragmentType is null)
-                        {
-                            throw new InvalidDataException("orphan SWS2 continuation frame");
-                        }
-                        messageBytes += frame.Payload.Length;
-                        EnsureWebSocketMessageSize(messageBytes);
-                        await SendBrowserFrameAsync(socket, browserWriteLock, frame.Payload,
-                            fragmentType.Value, frame.FinalFragment, cancellationToken).ConfigureAwait(false);
-                        if (frame.FinalFragment)
-                        {
-                            fragmentType = null;
-                            messageBytes = 0;
-                        }
-                        break;
-                    case WebSocketSpecusFrame.OpcodePing:
-                    case WebSocketSpecusFrame.OpcodePong:
-                        // System.Net.WebSockets handles browser control frames internally and exposes
-                        // no API for a custom pong payload. Keep the tunnel open for valid control frames.
-                        break;
-                    case WebSocketSpecusFrame.OpcodeClose:
-                        closeState.MarkClientInitiated();
-                        var status = NormalizeCloseStatus(frame.CloseCode == 0
-                            ? null
-                            : (WebSocketCloseStatus)frame.CloseCode);
-                        var reason = Encoding.UTF8.GetString(frame.Payload);
-                        clientCloseStatus = status;
-                        clientCloseReason = reason;
-                        await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
-                            .ConfigureAwait(false);
-                        break;
+                    closeState.MarkClientInitiated();
                 }
+                await socket.WriteFrameAsync(rawFrame, cancellationToken).ConfigureAwait(false);
                 await stream.ConsumeAsync(encoded.Length, CancellationToken.None).ConfigureAwait(false);
             }
         }
@@ -684,33 +619,61 @@ public static class DirectHttpEndpoints
         {
             await stream.ResetAsync(30, "invalid WebSocket SWS2 frame", CancellationToken.None)
                 .ConfigureAwait(false);
-            await SafeCloseOutputAsync(socket, browserWriteLock, WebSocketCloseStatus.ProtocolError,
-                "invalid WebSocket frame").ConfigureAwait(false);
+            await SafeSendBrowserCloseAsync(socket,
+                (ushort)WebSocketCloseStatus.ProtocolError, "invalid WebSocket frame")
+                .ConfigureAwait(false);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
             closeState.MarkClientInitiated();
-            await SafeCloseOutputAsync(socket, browserWriteLock, WebSocketCloseStatus.InternalServerError,
-                "WebSocket tunnel reset").ConfigureAwait(false);
+            await SafeSendBrowserCloseAsync(socket,
+                (ushort)WebSocketCloseStatus.InternalServerError, "WebSocket tunnel reset")
+                .ConfigureAwait(false);
         }
     }
 
-    private static async Task SendWebSocketCloseToClientAsync(WebSocketSpecusStream stream,
-        WebSocketCloseStatus status, string reason, CancellationToken cancellationToken)
+    private static async Task SendRawWebSocketFrameToClientAsync(WebSocketSpecusStream stream,
+        RawServerWebSocketFrame rawFrame, bool finish, CancellationToken cancellationToken)
     {
-        var reasonBytes = Encoding.UTF8.GetBytes(reason);
-        if (reasonBytes.Length > 123)
+        var (closeCode, payload) = SplitClosePayload(rawFrame);
+        var offset = 0;
+        var first = true;
+        do
         {
-            reasonBytes = reasonBytes[..123];
+            var length = Math.Min(WebSocketSpecusFrame.MaxPayloadBytes, payload.Length - offset);
+            var last = offset + length == payload.Length;
+            var frame = new WebSocketSpecusFrame(
+                first ? rawFrame.Opcode : WebSocketSpecusFrame.OpcodeContinuation,
+                rawFrame.FinalFragment && last,
+                first ? rawFrame.Rsv : (byte)0,
+                first ? closeCode : (ushort)0,
+                payload.AsSpan(offset, length).ToArray());
+            await stream.SendDataAsync(frame.Encode(), cancellationToken).ConfigureAwait(false);
+            offset += length;
+            first = false;
         }
-        var frame = new WebSocketSpecusFrame(WebSocketSpecusFrame.OpcodeClose, true, 0,
-            checked((ushort)status), reasonBytes);
+        while (offset < payload.Length);
+        if (finish)
+        {
+            await stream.FinishAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task SendGeneratedCloseToClientAsync(WebSocketSpecusStream stream,
+        ushort status, string reason, CancellationToken cancellationToken)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(TruncateCloseReason(reason));
+        var payload = new byte[2 + reasonBytes.Length];
+        payload[0] = (byte)(status >> 8);
+        payload[1] = (byte)status;
+        reasonBytes.CopyTo(payload, 2);
         using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         closeCts.CancelAfter(TimeSpan.FromSeconds(5));
         try
         {
-            await stream.SendDataAsync(frame.Encode(), closeCts.Token).ConfigureAwait(false);
-            await stream.FinishAsync(closeCts.Token).ConfigureAwait(false);
+            await SendRawWebSocketFrameToClientAsync(stream,
+                new RawServerWebSocketFrame(WebSocketSpecusFrame.OpcodeClose, true, 0, payload),
+                finish: true, closeCts.Token).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException)
         {
@@ -718,69 +681,70 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private static WebSocketCloseStatus NormalizeCloseStatus(WebSocketCloseStatus? status)
+    private static void ValidateWebSocketFragmentSequence(RawServerWebSocketFrame frame,
+        ref bool fragmentOpen, ref long messageBytes)
     {
-        var code = (int)(status ?? WebSocketCloseStatus.NormalClosure);
-        return code is >= 1000 and < 5000
-               && code is not 1004 and not 1005 and not 1006 and not 1015
-            ? (WebSocketCloseStatus)code
-            : WebSocketCloseStatus.InternalServerError;
-    }
-
-    private static void EnsureWebSocketMessageSize(long bytes)
-    {
-        if (bytes > WebSocketMaxMessageBytes)
+        if (frame.Opcode >= WebSocketSpecusFrame.OpcodeClose)
+        {
+            return;
+        }
+        if (frame.Opcode == WebSocketSpecusFrame.OpcodeContinuation)
+        {
+            if (!fragmentOpen)
+            {
+                throw new InvalidDataException("orphan WebSocket continuation frame");
+            }
+        }
+        else if (fragmentOpen)
+        {
+            throw new InvalidDataException(
+                "new WebSocket message before fragmented message completed");
+        }
+        messageBytes = checked(messageBytes + frame.Payload.Length);
+        if (messageBytes > WebSocketMaxMessageBytes)
         {
             throw new InvalidDataException("WebSocket message exceeds limit");
         }
+        fragmentOpen = !frame.FinalFragment;
+        if (frame.FinalFragment)
+        {
+            messageBytes = 0;
+        }
     }
 
-    private static async Task SendBrowserFrameAsync(WebSocket socket, SemaphoreSlim browserWriteLock,
-        ReadOnlyMemory<byte> payload, WebSocketMessageType messageType, bool endOfMessage,
-        CancellationToken cancellationToken)
+    private static (ushort CloseCode, byte[] Payload) SplitClosePayload(
+        RawServerWebSocketFrame frame)
     {
-        await browserWriteLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        if (frame.Opcode != WebSocketSpecusFrame.OpcodeClose || frame.Payload.Length == 0)
         {
-            if (socket.State != WebSocketState.Open)
-            {
-                throw new WebSocketException("browser WebSocket is not open");
-            }
-            await socket.SendAsync(payload, messageType, endOfMessage, cancellationToken)
-                .ConfigureAwait(false);
+            return (0, frame.Payload);
         }
-        finally
+        if (frame.Payload.Length == 1)
         {
-            browserWriteLock.Release();
+            throw new InvalidDataException("invalid WebSocket close payload");
         }
+        return ((ushort)((frame.Payload[0] << 8) | frame.Payload[1]), frame.Payload[2..]);
     }
 
-    private static async Task<bool> SafeCloseOutputAsync(WebSocket socket,
-        SemaphoreSlim browserWriteLock, WebSocketCloseStatus status, string reason)
+    private static async Task<bool> SafeSendBrowserCloseAsync(
+        RawServerWebSocketConnection socket, ushort status, string reason)
     {
         using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         try
         {
-            await browserWriteLock.WaitAsync(closeCts.Token).ConfigureAwait(false);
-            try
-            {
-                if (socket.State is not (WebSocketState.Open or WebSocketState.CloseReceived))
-                {
-                    return false;
-                }
-                await socket.CloseOutputAsync(status, TruncateCloseReason(reason), closeCts.Token)
-                    .ConfigureAwait(false);
-                return true;
-            }
-            finally
-            {
-                browserWriteLock.Release();
-            }
+            var reasonBytes = Encoding.UTF8.GetBytes(TruncateCloseReason(reason));
+            var payload = new byte[2 + reasonBytes.Length];
+            payload[0] = (byte)(status >> 8);
+            payload[1] = (byte)status;
+            reasonBytes.CopyTo(payload, 2);
+            await socket.WriteFrameAsync(new RawServerWebSocketFrame(
+                WebSocketSpecusFrame.OpcodeClose, true, 0, payload), closeCts.Token)
+                .ConfigureAwait(false);
+            return true;
         }
-        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or ArgumentException
+        catch (Exception ex) when (ex is OperationCanceledException or IOException
                                    or InvalidOperationException or ObjectDisposedException)
         {
-            // The browser already disconnected.
             return false;
         }
     }
@@ -821,13 +785,17 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private sealed class WebSocketTunnelCloseState
+    internal sealed class WebSocketTunnelCloseState
     {
         private int _clientInitiated;
+        private int _browserInitiated;
 
         public bool ClientInitiated => Volatile.Read(ref _clientInitiated) != 0;
+        public bool CloseStarted => ClientInitiated
+            || Volatile.Read(ref _browserInitiated) != 0;
 
         public void MarkClientInitiated() => Interlocked.Exchange(ref _clientInitiated, 1);
+        public void MarkBrowserInitiated() => Interlocked.Exchange(ref _browserInitiated, 1);
     }
 
     private static List<string> PlainErrorHeaders() => ["Content-Type:text/plain;charset=UTF-8"];
@@ -934,7 +902,6 @@ public static class DirectHttpEndpoints
     }
 
     private static async Task WriteResponseChunkAsync(HttpResponse response, byte[] data,
-        LimitedCapture capture, TrafficUsageService traffic, string clientName, string route,
         CancellationToken cancellationToken)
     {
         if (data.Length == 0)
@@ -943,8 +910,6 @@ public static class DirectHttpEndpoints
         }
         await response.Body.WriteAsync(data, cancellationToken).ConfigureAwait(false);
         await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
-        capture.Write(data);
-        traffic.RecordHttpDownload(clientName, route, data.Length);
     }
 
     private static int? AsInt(Dictionary<string, object?>? metadata, string key)
