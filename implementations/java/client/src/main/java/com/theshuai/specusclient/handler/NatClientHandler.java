@@ -27,7 +27,6 @@ import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
-import io.netty.handler.codec.http.websocketx.WebSocketClientProtocolHandler;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
@@ -465,7 +464,8 @@ public class NatClientHandler extends NatCommonHandler {
                         }
                         ch.pipeline().addLast(new HttpClientCodec());
                         ch.pipeline().addLast(new HttpObjectAggregator(65536));
-                        ch.pipeline().addLast(new WebSocketClientProtocolHandler(handshaker));
+                        ch.pipeline().addLast(
+                                new FramePreservingWebSocketClientProtocolHandler(handshaker));
                         ch.pipeline().addLast(new WsLocalSpecusHandler(thisHandler, streamId, channelId));
                     }
                 });

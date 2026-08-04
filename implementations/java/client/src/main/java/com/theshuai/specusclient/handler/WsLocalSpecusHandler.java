@@ -24,7 +24,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>{@code 0x01} TextFrame</li>
  *   <li>{@code 0x02} BinaryFrame</li>
  * </ul>
- * Ping/Pong 由本地 WS 客户端栈自动处理，不进 DATA 帧。
+ * Ping/Pong/Close 由前置的 frame-preserving protocol handler 透传到这里，并和 data frame
+ * 一样使用 SWS2；这样 upstream 与公网 WebSocket peer 才是彼此的控制帧端点。
  *
  * <p>握手完成通过拦截 {@link WebSocketClientProtocolHandler.ClientHandshakeStateEvent#HANDSHAKE_COMPLETE}
  * 事件感知，完成后把自己注册进 {@link NatClientHandler} 的 wsLocalChannels，让后续 DATA 帧能路由进来。
