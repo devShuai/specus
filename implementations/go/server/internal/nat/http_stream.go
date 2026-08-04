@@ -226,13 +226,13 @@ func (s *HTTPStream) onHead(metadata map[string]any) httpStreamFrameResult {
 		return httpStreamFrameInvalidState
 	}
 	s.windowMu.Lock()
+	if s.responseHead || s.terminalQueued {
+		s.windowMu.Unlock()
+		return httpStreamFrameInvalidState
+	}
 	if s.closed {
 		s.windowMu.Unlock()
 		return httpStreamFrameClosed
-	}
-	if s.responseHead {
-		s.windowMu.Unlock()
-		return httpStreamFrameInvalidState
 	}
 	s.responseHead = true
 	s.windowMu.Unlock()
@@ -251,11 +251,15 @@ func (s *HTTPStream) onData(data []byte) httpStreamFrameResult {
 		return httpStreamFrameInvalidState
 	}
 	s.windowMu.Lock()
+	if s.terminalQueued {
+		s.windowMu.Unlock()
+		return httpStreamFrameInvalidState
+	}
 	if s.closed {
 		s.windowMu.Unlock()
 		return httpStreamFrameClosed
 	}
-	if s.terminalQueued {
+	if !s.responseHead {
 		s.windowMu.Unlock()
 		return httpStreamFrameInvalidState
 	}
@@ -290,11 +294,15 @@ func (s *HTTPStream) onEnd(metadata map[string]any) httpStreamFrameResult {
 	s.windowMu.Lock()
 	if s.terminalQueued {
 		s.windowMu.Unlock()
-		return httpStreamFrameAccepted
+		return httpStreamFrameInvalidState
 	}
 	if s.closed {
 		s.windowMu.Unlock()
 		return httpStreamFrameClosed
+	}
+	if !s.responseHead {
+		s.windowMu.Unlock()
+		return httpStreamFrameInvalidState
 	}
 	s.terminalQueued = true
 	s.windowMu.Unlock()

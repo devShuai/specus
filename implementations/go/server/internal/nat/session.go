@@ -3,7 +3,9 @@ package nat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -128,14 +130,15 @@ type clientSession struct {
 	limits     Limits
 	logger     *slog.Logger
 
-	mu             sync.Mutex
-	bindings       map[int]*portListener
-	externals      map[uint32]*externalConn
-	httpStreams    map[uint32]*HTTPStream
-	wsStreams      map[uint32]*directhttp.WebSocketSpecus
-	nextStreamID   uint32
-	activeExternal int
-	portCounts     map[int]int
+	mu                    sync.Mutex
+	bindings              map[int]*portListener
+	externals             map[uint32]*externalConn
+	httpStreams           map[uint32]*HTTPStream
+	wsStreams             map[uint32]*directhttp.WebSocketSpecus
+	recentlyClosedStreams recentStreamTombstones
+	nextStreamID          uint32
+	activeExternal        int
+	portCounts            map[int]int
 
 	controlBackpressureUnsubscribe func()
 }
@@ -143,19 +146,20 @@ type clientSession struct {
 func newClientSession(conn *control.Conn, manager *RemotePortManager, traffic *TrafficService,
 	detail DetailRecorder, detailOpts store.TrafficDetailOptions, limits Limits, logger *slog.Logger) *clientSession {
 	session := &clientSession{
-		conn:         conn,
-		manager:      manager,
-		traffic:      traffic,
-		detail:       detail,
-		detailOpts:   detailOpts,
-		limits:       limits,
-		logger:       logger,
-		bindings:     make(map[int]*portListener),
-		externals:    make(map[uint32]*externalConn),
-		httpStreams:  make(map[uint32]*HTTPStream),
-		wsStreams:    make(map[uint32]*directhttp.WebSocketSpecus),
-		nextStreamID: 1,
-		portCounts:   make(map[int]int),
+		conn:                  conn,
+		manager:               manager,
+		traffic:               traffic,
+		detail:                detail,
+		detailOpts:            detailOpts,
+		limits:                limits,
+		logger:                logger,
+		bindings:              make(map[int]*portListener),
+		externals:             make(map[uint32]*externalConn),
+		httpStreams:           make(map[uint32]*HTTPStream),
+		wsStreams:             make(map[uint32]*directhttp.WebSocketSpecus),
+		recentlyClosedStreams: newRecentStreamTombstones(recentStreamTombstoneLimit),
+		nextStreamID:          1,
+		portCounts:            make(map[int]int),
 	}
 	session.controlBackpressureUnsubscribe = conn.WriteBackpressure.AddListener(func(bool) {
 		session.updateExternalReadsForControlWritability()
@@ -180,8 +184,7 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 		if s.handleWSData(message) {
 			return nil
 		}
-		s.handleData(message)
-		return nil
+		return s.handleData(message)
 	case protocol.NatFin, protocol.NatRST:
 		if s.handleHTTPEnd(message) {
 			return nil
@@ -189,8 +192,7 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 		if s.handleWSEnd(message) {
 			return nil
 		}
-		s.handleClientClose(message)
-		return nil
+		return s.handleClientClose(message)
 	case protocol.NatWindowUpdate:
 		return s.handleWindowUpdate(message)
 	case protocol.NatOpen:
@@ -202,13 +204,17 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 }
 
 func (s *clientSession) protocolViolation(message protocol.NatMessage, detail string) error {
-	s.logger.Warn("NAT protocol violation",
-		"client", s.conn.ClientName(), "channel", s.conn.ChannelID(),
-		"type", message.Type, "streamId", message.StreamID, "value", message.Value,
-		"dataBytes", len(message.Data), "detail", detail)
-	s.conn.MarkReason(store.ReasonProtocolViolation)
-	s.conn.Close(store.ReasonProtocolViolation)
-	return nil
+	if s.logger != nil && s.conn != nil {
+		s.logger.Warn("NAT protocol violation",
+			"client", s.conn.ClientName(), "channel", s.conn.ChannelID(),
+			"type", message.Type, "streamId", message.StreamID, "value", message.Value,
+			"dataBytes", len(message.Data), "detail", detail)
+	}
+	if s.conn != nil {
+		s.conn.MarkReason(store.ReasonProtocolViolation)
+		s.conn.Close(store.ReasonProtocolViolation)
+	}
+	return fmt.Errorf("NAT protocol violation on stream %d: %s", message.StreamID, detail)
 }
 
 func (s *clientSession) handleRegister(message protocol.NatMessage) error {
@@ -271,47 +277,70 @@ func (s *clientSession) handleUnregister(message protocol.NatMessage) {
 	s.manager.Release(listener)
 }
 
-func (s *clientSession) handleData(message protocol.NatMessage) {
-	if len(message.Data) == 0 {
-		return
-	}
+func (s *clientSession) handleData(message protocol.NatMessage) error {
 	s.mu.Lock()
 	external := s.externals[message.StreamID]
 	s.mu.Unlock()
 	if external == nil {
-		return
+		s.resetTCPStream(message.StreamID, 7, "DATA for unknown TCP stream")
+		return nil
 	}
-	if external.write(message.Data) {
+	if !external.canReceiveClientData() {
+		s.resetExternal(external, 7, "client TCP DATA after FIN")
+		return nil
+	}
+	if len(message.Data) > 0 {
+		if err := external.write(message.Data); err != nil {
+			s.resetExternal(external, 9, "write to external TCP stream failed")
+			return nil
+		}
 		s.traffic.RecordTCPUpload(s.conn.ClientName(), external.port, int64(len(message.Data)))
 		s.recordTCPFrame(protocol.NatData, external, message.Data, store.TCPDirectionClientToPublic)
 		_ = s.conn.SendPriority(protocol.NatMessage{
 			Type: protocol.NatWindowUpdate, StreamID: message.StreamID, Value: uint32(len(message.Data)),
 		})
-		if message.Flags&protocol.NatFlagEndStream != 0 {
-			s.finishClientDirection(external)
-		}
 	}
+	if message.Flags&protocol.NatFlagEndStream != 0 {
+		return s.finishClientDirection(message, external)
+	}
+	return nil
 }
 
-func (s *clientSession) handleClientClose(message protocol.NatMessage) {
+func (s *clientSession) handleClientClose(message protocol.NatMessage) error {
 	s.mu.Lock()
 	external := s.externals[message.StreamID]
 	s.mu.Unlock()
 	if external == nil {
-		return
+		if message.Type == protocol.NatRST {
+			if s.recentlyClosedStreams.contains(message.StreamID) {
+				return nil
+			}
+			return s.protocolViolation(message, "RST for never-opened stream")
+		}
+		s.resetTCPStream(message.StreamID, 7, "FIN for unknown TCP stream")
+		return nil
 	}
 	if message.Type == protocol.NatRST {
 		s.cleanupExternal(external)
-		return
+		return nil
 	}
-	s.finishClientDirection(external)
+	return s.finishClientDirection(message, external)
 }
 
-func (s *clientSession) finishClientDirection(external *externalConn) {
-	external.shutdownWrite()
-	if external.markClientFinished() {
+func (s *clientSession) finishClientDirection(message protocol.NatMessage, external *externalConn) error {
+	complete, accepted := external.markClientFinished()
+	if !accepted {
+		s.resetExternal(external, 7, "duplicate client TCP FIN")
+		return nil
+	}
+	if err := external.shutdownWrite(); err != nil {
+		s.resetExternal(external, 9, "failed to half-close external TCP stream")
+		return nil
+	}
+	if complete {
 		s.cleanupExternal(external)
 	}
+	return nil
 }
 
 func (s *clientSession) handleWindowUpdate(message protocol.NatMessage) error {
@@ -343,6 +372,7 @@ func (s *clientSession) handleWindowUpdate(message protocol.NatMessage) error {
 
 func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, error) {
 	streamID := s.allocateStreamID()
+	s.markStreamOpened(streamID)
 	stream := newHTTPStream(s.conn, streamID, s.removeHTTPStream)
 	s.mu.Lock()
 	s.httpStreams[streamID] = stream
@@ -383,7 +413,12 @@ func (s *clientSession) handleHTTPData(message protocol.NatMessage) bool {
 		return false
 	}
 	switch stream.onData(message.Data) {
-	case httpStreamFrameAccepted, httpStreamFrameClosed:
+	case httpStreamFrameAccepted:
+		if message.Flags&protocol.NatFlagEndStream != 0 {
+			return s.handleHTTPEnd(message)
+		}
+		return true
+	case httpStreamFrameClosed:
 		return true
 	case httpStreamFrameQueueFull:
 		s.resetOverloadedHTTPStream(message, stream)
@@ -433,10 +468,7 @@ func (s *clientSession) resetInvalidHTTPStream(
 		stream.Reset(8, reason)
 		return
 	}
-	_ = s.conn.Send(protocol.NatMessage{
-		Type: protocol.NatRST, StreamID: message.StreamID, Value: 8,
-		Metadata: map[string]any{"reason": reason},
-	})
+	s.resetTCPStream(message.StreamID, 8, reason)
 }
 
 func (s *clientSession) resetOverloadedHTTPStream(message protocol.NatMessage, stream *HTTPStream) {
@@ -447,11 +479,16 @@ func (s *clientSession) resetOverloadedHTTPStream(message protocol.NatMessage, s
 }
 
 func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) {
+	removed := false
 	s.mu.Lock()
 	if s.httpStreams[streamID] == expected {
 		delete(s.httpStreams, streamID)
+		removed = true
 	}
 	s.mu.Unlock()
+	if removed {
+		s.markStreamClosed(streamID)
+	}
 }
 
 // openWSStream 注册一条 WS 隧道流并发送带 source=ws metadata 的 OPEN 帧
@@ -459,6 +496,7 @@ func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) 
 func (s *clientSession) openWSStream(metadata map[string]any,
 	wsConn *websocket.Conn) (*directhttp.WebSocketSpecus, error) {
 	streamID := s.allocateStreamID()
+	s.markStreamOpened(streamID)
 	specus := directhttp.NewWebSocketSpecus(wsConn, streamID, s.conn.ClientName(),
 		func(frame []byte) error {
 			return s.conn.Send(protocol.NatMessage{
@@ -482,11 +520,16 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 }
 
 func (s *clientSession) removeWSStream(streamID uint32, expected *directhttp.WebSocketSpecus) {
+	removed := false
 	s.mu.Lock()
 	if s.wsStreams[streamID] == expected {
 		delete(s.wsStreams, streamID)
+		removed = true
 	}
 	s.mu.Unlock()
+	if removed {
+		s.markStreamClosed(streamID)
+	}
 }
 
 // handleWSData 把客户端回送的 SWS2 DATA 还原写回浏览器并返还接收信用
@@ -547,6 +590,7 @@ func (s *clientSession) acceptExternal(port int, netConn net.Conn) {
 		return
 	}
 	streamID := s.allocateStreamID()
+	s.markStreamOpened(streamID)
 	external := newExternalConn(netConn, s.conn, streamID, port,
 		s.limits.WriteBufferLowMark, s.limits.WriteBufferHighMark)
 	external.writeBackpressureUnsubscribe = external.writeBackpressure.AddListener(func(bool) {
@@ -570,17 +614,57 @@ func (s *clientSession) acceptExternal(port int, netConn net.Conn) {
 		return
 	}
 
-	external.pumpToClient(s.traffic, s.detail, s.detailOpts, s.conn.ClientName())
-	external.sendFin()
-	if external.markPublicFinished() {
+	if err := external.pumpToClient(s.traffic, s.detail, s.detailOpts, s.conn.ClientName()); err != nil {
+		if !external.cleanupHasStarted() {
+			s.resetExternal(external, 9, "read from external TCP stream failed")
+		}
+		return
+	}
+	complete, accepted := external.markPublicFinished()
+	if !accepted {
+		return
+	}
+	if err := external.sendFin(); err != nil {
+		s.cleanupExternal(external)
+		return
+	}
+	if complete {
 		s.cleanupExternal(external)
 	}
+}
+
+func (s *clientSession) resetExternal(external *externalConn, code uint32, reason string) {
+	if external == nil || external.cleanupHasStarted() {
+		return
+	}
+	s.resetTCPStream(external.streamID, code, reason)
+	s.cleanupExternal(external)
+}
+
+func (s *clientSession) resetTCPStream(streamID uint32, code uint32, reason string) {
+	s.markStreamClosed(streamID)
+	if s.conn == nil {
+		return
+	}
+	_ = s.conn.Send(protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: streamID, Value: code,
+		Metadata: map[string]any{"reason": reason},
+	})
+}
+
+func (s *clientSession) markStreamOpened(streamID uint32) {
+	s.recentlyClosedStreams.remove(streamID)
+}
+
+func (s *clientSession) markStreamClosed(streamID uint32) {
+	s.recentlyClosedStreams.add(streamID)
 }
 
 func (s *clientSession) cleanupExternal(external *externalConn) {
 	if !external.beginCleanup() {
 		return
 	}
+	s.markStreamClosed(external.streamID)
 	s.mu.Lock()
 	if current, ok := s.externals[external.streamID]; ok && current == external {
 		delete(s.externals, external.streamID)
@@ -589,7 +673,9 @@ func (s *clientSession) cleanupExternal(external *externalConn) {
 	external.stopBackpressureListener()
 	external.close()
 	s.releaseTCPStream(external.channelID)
-	s.updateControlReadForWritability()
+	if s.conn != nil {
+		s.updateControlReadForWritability()
+	}
 	s.release(external.port)
 }
 
@@ -641,7 +727,10 @@ func (s *clientSession) acquire(port int) bool {
 }
 
 func (s *clientSession) release(port int) {
-	tenantID := s.conn.TenantID()
+	tenantID := ""
+	if s.conn != nil {
+		tenantID = s.conn.TenantID()
+	}
 	s.mu.Lock()
 	if s.activeExternal > 0 {
 		s.activeExternal--
@@ -652,7 +741,9 @@ func (s *clientSession) release(port int) {
 		s.portCounts[port] = count - 1
 	}
 	s.mu.Unlock()
-	s.manager.ReleaseExternal(tenantID)
+	if s.manager != nil {
+		s.manager.ReleaseExternal(tenantID)
+	}
 }
 
 func (s *clientSession) dispose() {
@@ -812,18 +903,18 @@ func newExternalConn(netConn net.Conn, ctrl *control.Conn, streamID uint32,
 // External reads are paused when the control-channel write buffer is above its high water mark,
 // mirroring Java/Netty auto-read backpressure without dropping bytes.
 func (e *externalConn) pumpToClient(traffic *TrafficService, detail DetailRecorder,
-	detailOpts store.TrafficDetailOptions, clientName string) {
+	detailOpts store.TrafficDetailOptions, clientName string) error {
 	buffer := make([]byte, externalReadBuffer)
 	done := e.control.Context().Done()
 	for {
 		select {
 		case <-done:
-			return
+			return e.control.Context().Err()
 		default:
 		}
 		e.readGate.Wait(done)
 		if e.control.Context().Err() != nil {
-			return
+			return e.control.Context().Err()
 		}
 		read, err := e.netConn.Read(buffer)
 		if read > 0 {
@@ -847,29 +938,35 @@ func (e *externalConn) pumpToClient(traffic *TrafficService, detail DetailRecord
 				})
 			}
 			if !e.takeSendCredit(read) {
-				return
+				return errors.New("external TCP stream closed while waiting for send credit")
 			}
 			if sendErr := e.control.Send(protocol.NatMessage{
 				Type: protocol.NatData, StreamID: e.streamID, Data: payload,
 			}); sendErr != nil {
-				return
+				return sendErr
 			}
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }
 
-// write delivers client bytes to the external socket; returns false on failure (and closes).
-func (e *externalConn) write(data []byte) bool {
+// write delivers client bytes to the external socket.
+func (e *externalConn) write(data []byte) error {
 	trackedBytes := e.writeBackpressure.AddPending(len(data))
 	defer e.writeBackpressure.ReleasePending(trackedBytes)
-	if _, err := e.netConn.Write(data); err != nil {
-		e.close()
-		return false
+	written, err := e.netConn.Write(data)
+	if err != nil {
+		return err
 	}
-	return true
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func (e *externalConn) close() {
@@ -913,26 +1010,40 @@ func (e *externalConn) addSendCredit(credit uint32) bool {
 	return true
 }
 
-func (e *externalConn) shutdownWrite() {
+func (e *externalConn) shutdownWrite() error {
 	if tcp, ok := e.netConn.(*net.TCPConn); ok {
-		_ = tcp.CloseWrite()
-		return
+		return tcp.CloseWrite()
 	}
-	e.close()
+	if halfCloser, ok := e.netConn.(interface{ CloseWrite() error }); ok {
+		return halfCloser.CloseWrite()
+	}
+	return errors.New("external connection does not support half-close")
 }
 
-func (e *externalConn) markPublicFinished() bool {
+func (e *externalConn) markPublicFinished() (complete bool, accepted bool) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
+	if e.cleanupStarted || e.publicFinished {
+		return false, false
+	}
 	e.publicFinished = true
-	return e.clientFinished
+	return e.clientFinished, true
 }
 
-func (e *externalConn) markClientFinished() bool {
+func (e *externalConn) markClientFinished() (complete bool, accepted bool) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
+	if e.cleanupStarted || e.clientFinished {
+		return false, false
+	}
 	e.clientFinished = true
-	return e.publicFinished
+	return e.publicFinished, true
+}
+
+func (e *externalConn) canReceiveClientData() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return !e.cleanupStarted && !e.clientFinished
 }
 
 func (e *externalConn) beginCleanup() bool {
@@ -945,6 +1056,12 @@ func (e *externalConn) beginCleanup() bool {
 	return true
 }
 
+func (e *externalConn) cleanupHasStarted() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.cleanupStarted
+}
+
 func (e *externalConn) stopBackpressureListener() {
 	if e.writeBackpressureUnsubscribe != nil {
 		e.writeBackpressureUnsubscribe()
@@ -952,18 +1069,18 @@ func (e *externalConn) stopBackpressureListener() {
 	}
 }
 
-// sendFin notifies the client that the external connection reached EOF (best effort).
-func (e *externalConn) sendFin() {
+// sendFin notifies the client that the external connection reached EOF.
+func (e *externalConn) sendFin() error {
 	if e.control.Context().Err() != nil {
-		return
+		return e.control.Context().Err()
 	}
 	e.stateMu.Lock()
 	cleanupStarted := e.cleanupStarted
 	e.stateMu.Unlock()
 	if cleanupStarted {
-		return
+		return errors.New("external TCP stream is already closed")
 	}
-	_ = e.control.Send(protocol.NatMessage{
+	return e.control.Send(protocol.NatMessage{
 		Type: protocol.NatFin, StreamID: e.streamID,
 	})
 }

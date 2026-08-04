@@ -133,8 +133,13 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 
 func packetAllowedForRole(role string, packet protocol.Packet) bool {
 	if role == protocol.ConnectionRoleControl {
-		_, isNat := packet.(protocol.NatMessage)
-		return !isNat
+		switch packet.(type) {
+		case protocol.MessageRequest, protocol.HeartbeatRequest,
+			protocol.HeartbeatResponse, protocol.LogoutRequest:
+			return true
+		default:
+			return false
+		}
 	}
 	if role != protocol.ConnectionRoleData {
 		return false

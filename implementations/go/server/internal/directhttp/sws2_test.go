@@ -3,6 +3,10 @@ package directhttp
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -78,6 +82,40 @@ func TestSWS2EncodeRejectsInvalidFrames(t *testing.T) {
 		if _, err := encodeSWS2(tc.opcode, tc.fin, tc.rsv, tc.closeCode, tc.payload); err == nil {
 			t.Fatalf("%s: encodeSWS2 should fail", name)
 		}
+	}
+}
+
+func TestSWS2RejectsWireForbiddenCloseCodesFromCentralVector(t *testing.T) {
+	var vectors struct {
+		WebSocket struct {
+			WireForbiddenCloseCodes []uint16 `json:"wireForbiddenCloseCodes"`
+		} `json:"webSocket"`
+	}
+	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..",
+		"protocol", "test-vectors", "application-protocol-v2.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(contents, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.WebSocket.WireForbiddenCloseCodes) == 0 {
+		t.Fatal("central SWS2 vector has no wire-forbidden close codes")
+	}
+	for _, closeCode := range vectors.WebSocket.WireForbiddenCloseCodes {
+		t.Run(fmt.Sprintf("close-code-%d", closeCode), func(t *testing.T) {
+			if _, err := encodeSWS2(sws2OpcodeClose, true, 0, closeCode, nil); err == nil {
+				t.Fatal("wire-forbidden close code was encoded")
+			}
+			raw := make([]byte, sws2HeaderBytes)
+			binary.BigEndian.PutUint32(raw[0:4], sws2Magic)
+			raw[4] = sws2OpcodeClose
+			raw[5] = 1
+			binary.BigEndian.PutUint16(raw[6:8], closeCode)
+			if _, err := decodeSWS2(raw); err == nil {
+				t.Fatal("wire-forbidden close code was decoded")
+			}
+		})
 	}
 }
 

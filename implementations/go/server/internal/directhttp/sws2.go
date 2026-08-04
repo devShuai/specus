@@ -103,7 +103,8 @@ func validateSWS2(opcode byte, fin bool, rsv byte, closeCode uint16, payloadLeng
 		if payloadLength > sws2MaxCloseReasonBytes {
 			return errors.New("WebSocket close reason exceeds 123 bytes")
 		}
-		if closeCode != 0 && (closeCode < 1000 || closeCode >= 5000) {
+		if closeCode != 0 && (closeCode < 1000 || closeCode >= 5000 ||
+			isWireForbiddenCloseCode(closeCode)) {
 			return errors.New("invalid WebSocket close code")
 		}
 		if closeCode == 0 && payloadLength != 0 {
@@ -113,4 +114,8 @@ func validateSWS2(opcode byte, fin bool, rsv byte, closeCode uint16, payloadLeng
 		return errors.New("close code is only valid on CLOSE")
 	}
 	return nil
+}
+
+func isWireForbiddenCloseCode(closeCode uint16) bool {
+	return closeCode == 1004 || closeCode == 1005 || closeCode == 1006 || closeCode == 1015
 }

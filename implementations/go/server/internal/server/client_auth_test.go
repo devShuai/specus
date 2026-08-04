@@ -38,6 +38,9 @@ func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {
 	if decoded.ClientName == "" {
 		t.Fatal("clientName should be assigned")
 	}
+	if decoded.NettyTLS == nil || *decoded.NettyTLS {
+		t.Fatalf("nettyTls should be present and false for a plaintext listener, got %v", decoded.NettyTLS)
+	}
 	session := getClientSessionForTest(t, app, decoded.ClientSessionID)
 	if session.TenantID != "tenant-a" || session.Status != auth.StatusHTTPAuthenticated {
 		t.Fatalf("unexpected persisted http session: tenant=%q status=%q", session.TenantID, session.Status)
@@ -172,6 +175,7 @@ type clientAuthLoginForTestResponse struct {
 	AccessToken        string `json:"accessToken"`
 	TokenTTLSeconds    int64  `json:"tokenTtlSeconds"`
 	MaxOnlineInstances int    `json:"maxOnlineInstances"`
+	NettyTLS           *bool  `json:"nettyTls"`
 }
 
 func insertCredentialForTest(t *testing.T, app *App, tenantID, owner, apiKey, secret string, maxOnline int) {

@@ -58,6 +58,7 @@ type clientAuthLoginResponse struct {
 	TokenTTLSeconds      int64                `json:"tokenTtlSeconds"`
 	NettyHost            string               `json:"nettyHost"`
 	NettyPort            int                  `json:"nettyPort"`
+	NettyTLS             bool                 `json:"nettyTls"`
 	MaxOnlineInstances   int                  `json:"maxOnlineInstances"`
 	Policy               clientPolicy         `json:"policy"`
 	PeerMesh             peermesh.LoginConfig `json:"peerMesh"`
@@ -186,6 +187,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		TokenTTLSeconds:    int64(ttl / time.Second),
 		NettyHost:          a.nettyHost(r.Host),
 		NettyPort:          a.cfg.Netty.Port,
+		NettyTLS:           a.tlsConfig != nil,
 		MaxOnlineInstances: credential.MaxOnlineInstances,
 		Policy:             clientPolicy{Enabled: true, BillingStatus: "ACTIVE"},
 		PeerMesh:           peerMesh,
