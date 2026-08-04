@@ -49,6 +49,26 @@ public final class StreamFlowController {
 
     public CompletableFuture<Void> sendAsync(int streamId, byte[] data, Channel sourceChannel,
                                              Runnable overflowAction) {
+        return enqueueData(streamId, data, sourceChannel, overflowAction, false);
+    }
+
+    /**
+     * Queues one DATA payload that must stay intact on the NAT wire. This is required for
+     * application envelopes such as SWS2, whose decoder consumes exactly one complete envelope
+     * per NAT DATA packet. Unlike {@link #send}, an atomic payload waits until the stream has
+     * enough credit instead of being split across multiple DATA packets.
+     */
+    public void sendAtomic(int streamId, byte[] data, Channel sourceChannel, Runnable overflowAction) {
+        sendAtomicAsync(streamId, data, sourceChannel, overflowAction);
+    }
+
+    public CompletableFuture<Void> sendAtomicAsync(int streamId, byte[] data, Channel sourceChannel,
+                                                   Runnable overflowAction) {
+        return enqueueData(streamId, data, sourceChannel, overflowAction, true);
+    }
+
+    private CompletableFuture<Void> enqueueData(int streamId, byte[] data, Channel sourceChannel,
+                                                Runnable overflowAction, boolean atomic) {
         if (data == null || data.length == 0) {
             return CompletableFuture.completedFuture(null);
         }
@@ -59,6 +79,10 @@ public final class StreamFlowController {
                 return;
             }
             StreamState state = streams.computeIfAbsent(streamId, ignored -> new StreamState(sourceChannel));
+            if (atomic && data.length > MAX_DATA_FRAME_BYTES) {
+                failStream(streamId, state, overflowAction, "atomic DATA exceeds frame limit", completion);
+                return;
+            }
             if (state.finPending) {
                 failStream(streamId, state, overflowAction, "DATA after FIN", completion);
                 return;
@@ -67,7 +91,7 @@ public final class StreamFlowController {
                 failStream(streamId, state, overflowAction, "stream send queue exceeded", completion);
                 return;
             }
-            state.pending.addLast(new PendingData(data, completion));
+            state.pending.addLast(new PendingData(data, completion, atomic));
             state.pendingBytes += data.length;
             enqueueReady(streamId, state);
             drain();
@@ -204,7 +228,13 @@ public final class StreamFlowController {
     private boolean writeOne(int streamId, StreamState state) {
         PendingData current = state.pending.peekFirst();
         if (current != null && state.credit > 0) {
-            int length = (int) Math.min(Math.min(state.credit, MAX_DATA_FRAME_BYTES), current.remaining());
+            if (current.atomic && state.credit < current.remaining()) {
+                pauseSource(state);
+                return false;
+            }
+            int length = current.atomic
+                    ? current.remaining()
+                    : (int) Math.min(Math.min(state.credit, MAX_DATA_FRAME_BYTES), current.remaining());
             byte[] payload;
             if (current.offset == 0 && length == current.data.length) {
                 payload = current.data;
@@ -341,11 +371,13 @@ public final class StreamFlowController {
     private static final class PendingData {
         private final byte[] data;
         private final CompletableFuture<Void> completion;
+        private final boolean atomic;
         private int offset;
 
-        private PendingData(byte[] data, CompletableFuture<Void> completion) {
+        private PendingData(byte[] data, CompletableFuture<Void> completion, boolean atomic) {
             this.data = data;
             this.completion = completion;
+            this.atomic = atomic;
         }
 
         private int remaining() {

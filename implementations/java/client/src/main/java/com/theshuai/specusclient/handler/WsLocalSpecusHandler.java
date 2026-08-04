@@ -145,7 +145,7 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
             WebSocketSpecusFrame encoded = new WebSocketSpecusFrame(
                     chunkOpcode, finalFragment && last, first ? rsv : 0,
                     first ? closeCode : 0, chunk);
-            StreamFlowController.get(controlCtx.channel()).send(
+            StreamFlowController.get(controlCtx.channel()).sendAtomic(
                     streamId, encoded.encode(), localCtx.channel(), localCtx::close);
             first = false;
         } while (offset < payload.length);

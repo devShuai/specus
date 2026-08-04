@@ -29,6 +29,9 @@ import io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
 import io.netty.handler.codec.http.websocketx.WebSocketClientProtocolHandler;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.bytes.ByteArrayDecoder;
@@ -51,6 +54,8 @@ import java.util.concurrent.TimeUnit;
 
 @Slf4j
 public class NatClientHandler extends NatCommonHandler {
+
+    private static final SslContext LOCAL_WS_SSL_CONTEXT = buildLocalWsSslContext();
 
     private String remoteHost;
 
@@ -418,6 +423,11 @@ public class NatClientHandler extends NatCommonHandler {
                         WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                                 target, WebSocketVersion.V13, null, true,
                                 buildWsHandshakeHeaders(natMessagePacket), 65536);
+                        if ("wss".equalsIgnoreCase(target.getScheme())) {
+                            ch.pipeline().addLast(LOCAL_WS_SSL_CONTEXT.newHandler(
+                                    ch.alloc(), target.getHost(),
+                                    target.getPort() == -1 ? defaultPort(target.getScheme()) : target.getPort()));
+                        }
                         ch.pipeline().addLast(new HttpClientCodec());
                         ch.pipeline().addLast(new HttpObjectAggregator(65536));
                         ch.pipeline().addLast(new WebSocketClientProtocolHandler(handshaker));
@@ -482,6 +492,18 @@ public class NatClientHandler extends NatCommonHandler {
         return "wss".equalsIgnoreCase(scheme) ? 443 : 80;
     }
 
+    private static SslContext buildLocalWsSslContext() {
+        try {
+            // DirectHttpForwarder also trusts operator-managed LAN endpoints, where
+            // self-signed certificates are common. Keep HTTP and WebSocket behavior aligned.
+            return SslContextBuilder.forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to initialize local WebSocket TLS", e);
+        }
+    }
+
     private static String withoutQuery(URI uri) {
         return uri.getScheme() + "://" + uri.getHost() + ":" + (uri.getPort() == -1 ? defaultPort(uri.getScheme()) : uri.getPort()) + uri.getPath();
     }
@@ -517,38 +539,31 @@ public class NatClientHandler extends NatCommonHandler {
         if (targetBaseUrl == null || targetBaseUrl.isBlank()) {
             throw new IllegalArgumentException("未配置 HTTP route");
         }
-        String wsUrl = targetBaseUrl;
-        // http:// -> ws://，https:// -> wss://。本轮仅支持 ws://（明文）；遇 https 转 wss 但本
-        // 地 WS 客户端未配 TLS 上下文，握手会失败——这里先转，让握手阶段给出明确错误。
-        if (wsUrl.startsWith("http://")) {
-            wsUrl = "ws://" + wsUrl.substring("http://".length());
-        } else if (wsUrl.startsWith("https://")) {
-            wsUrl = "wss://" + wsUrl.substring("https://".length());
-        } else if (!wsUrl.startsWith("ws://") && !wsUrl.startsWith("wss://")) {
+        String baseUrl = targetBaseUrl.trim();
+        String lower = baseUrl.toLowerCase(Locale.ROOT);
+        String httpBaseUrl;
+        String targetScheme;
+        if (lower.startsWith("http://")) {
+            httpBaseUrl = "http://" + baseUrl.substring("http://".length());
+            targetScheme = "ws";
+        } else if (lower.startsWith("https://")) {
+            httpBaseUrl = "https://" + baseUrl.substring("https://".length());
+            targetScheme = "wss";
+        } else if (lower.startsWith("ws://")) {
+            httpBaseUrl = "http://" + baseUrl.substring("ws://".length());
+            targetScheme = "ws";
+        } else if (lower.startsWith("wss://")) {
+            httpBaseUrl = "https://" + baseUrl.substring("wss://".length());
+            targetScheme = "wss";
+        } else {
             throw new IllegalArgumentException("HTTP route 仅支持 http/https/ws/wss");
         }
-        URI base = URI.create(wsUrl);
-        if (base.getHost() == null) {
-            throw new IllegalArgumentException("HTTP route 地址无效");
+        if (relativePath != null && (relativePath.contains("\r") || relativePath.contains("\n"))) {
+            throw new IllegalArgumentException("relativePath 含有非法控制字符");
         }
-        if (base.getRawQuery() != null || base.getRawFragment() != null) {
-            throw new IllegalArgumentException("HTTP route 地址无效");
-        }
-        String basePath = base.getPath() == null || base.getPath().isEmpty() ? "" : base.getPath();
-        String tail = relativePath == null || relativePath.isBlank() ? "/" : relativePath;
-        String path;
-        if (basePath.endsWith("/") && tail.startsWith("/")) {
-            path = basePath + tail.substring(1);
-        } else if (!basePath.isEmpty() && !basePath.endsWith("/") && !tail.startsWith("/")) {
-            path = basePath + "/" + tail;
-        } else {
-            path = basePath + tail;
-        }
-        int authorityEnd = wsUrl.indexOf('/', wsUrl.indexOf("://") + 3);
-        String authority = authorityEnd < 0 ? wsUrl : wsUrl.substring(0, authorityEnd);
-        String full = authority + path
-                + (rawQuery == null || rawQuery.isBlank() ? "" : "?" + rawQuery);
-        return URI.create(full);
+        URI httpTarget = HttpRouteTargetResolver.buildTarget(httpBaseUrl, relativePath, rawQuery);
+        String targetText = httpTarget.toASCIIString();
+        return URI.create(targetScheme + targetText.substring(httpTarget.getScheme().length()));
     }
 
     private void processHttpOpen(NatMessagePacket packet) {

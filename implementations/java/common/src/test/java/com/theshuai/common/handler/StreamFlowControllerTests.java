@@ -10,6 +10,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StreamFlowControllerTests {
@@ -64,6 +65,43 @@ class StreamFlowControllerTests {
             assertEquals(7, fin.getStreamId());
         } finally {
             control.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldKeepAtomicPayloadInOneDataPacketAfterCreditResumes() {
+        EmbeddedChannel control = new EmbeddedChannel();
+        EmbeddedChannel source = new EmbeddedChannel();
+        try {
+            StreamFlowController flow = StreamFlowController.get(control);
+            flow.open(9, source);
+            flow.send(9, new byte[(int) StreamFlowController.INITIAL_WINDOW_BYTES], source, source::close);
+            control.runPendingTasks();
+            drain(control);
+
+            byte[] envelope = new byte[128];
+            flow.sendAtomic(9, envelope, source, source::close);
+            control.runPendingTasks();
+
+            assertNull(control.readOutbound());
+            assertFalse(source.config().isAutoRead());
+
+            flow.onWindowUpdate(9, envelope.length - 1L);
+            control.runPendingTasks();
+            assertNull(control.readOutbound());
+
+            flow.onWindowUpdate(9, 1);
+            control.runPendingTasks();
+            source.runPendingTasks();
+
+            NatMessagePacket packet = control.readOutbound();
+            assertEquals(NatMessageType.DATA, packet.getNatMessageType());
+            assertEquals(envelope.length, packet.getData().length);
+            assertNull(control.readOutbound());
+            assertTrue(source.config().isAutoRead());
+        } finally {
+            control.finishAndReleaseAll();
+            source.finishAndReleaseAll();
         }
     }
 

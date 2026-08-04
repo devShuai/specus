@@ -18,6 +18,7 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
@@ -50,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** WS 流在 CONNECTED metaData 里的 source 标记。 */
     static final String SOURCE_WS = "ws";
+    private static final int MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 
     private final WebSocketStreamRegistry registry;
     private final long timeoutMillis;
@@ -57,6 +59,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     private final Map<String, String> channelClientNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> channelStreamIds = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> fragmentOpcodes = new ConcurrentHashMap<>();
+    private final Map<Integer, ByteArrayOutputStream> fragmentPayloads = new ConcurrentHashMap<>();
 
     public WebSocketSpecusHandler(WebSocketStreamRegistry registry,
                                   @Value("${specus.http.timeout-ms:30000}") long timeoutMillis) {
@@ -155,7 +158,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             int chunkOpcode = first ? opcode : WebSocketSpecusFrame.OPCODE_CONTINUATION;
             byte[] framed = new WebSocketSpecusFrame(chunkOpcode, finalFragment && last,
                     first ? rsv : 0, first ? closeCode : 0, chunk).encode();
-            StreamFlowController.get(controlChannel).send(streamId, framed, null,
+            StreamFlowController.get(controlChannel).sendAtomic(streamId, framed, null,
                     () -> closeFromBrowser(channelId));
             first = false;
         } while (offset < payload.length);
@@ -196,24 +199,34 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             synchronized (session) {
                 switch (frame.opcode()) {
                     case WebSocketSpecusFrame.OPCODE_TEXT -> {
-                        if (!frame.finalFragment()) fragmentOpcodes.put(streamId, frame.opcode());
-                        session.sendMessage(new TextMessage(
-                                new String(framePayload, StandardCharsets.UTF_8), frame.finalFragment()));
+                        if (beginMessage(streamId, frame)) {
+                            session.sendMessage(new TextMessage(framePayload));
+                        }
                     }
                     case WebSocketSpecusFrame.OPCODE_BINARY -> {
-                        if (!frame.finalFragment()) fragmentOpcodes.put(streamId, frame.opcode());
-                        session.sendMessage(new BinaryMessage(framePayload, frame.finalFragment()));
+                        if (beginMessage(streamId, frame)) {
+                            session.sendMessage(new BinaryMessage(framePayload));
+                        }
                     }
                     case WebSocketSpecusFrame.OPCODE_CONTINUATION -> {
                         Integer original = fragmentOpcodes.get(streamId);
                         if (original == null) throw new IllegalArgumentException("orphan continuation frame");
-                        if (original == WebSocketSpecusFrame.OPCODE_TEXT) {
-                            session.sendMessage(new TextMessage(
-                                    new String(framePayload, StandardCharsets.UTF_8), frame.finalFragment()));
-                        } else {
-                            session.sendMessage(new BinaryMessage(framePayload, frame.finalFragment()));
+                        ByteArrayOutputStream fragments = fragmentPayloads.get(streamId);
+                        if (fragments == null) throw new IllegalArgumentException("missing fragmented message state");
+                        int totalBytes = Math.addExact(fragments.size(), framePayload.length);
+                        if (totalBytes > MAX_MESSAGE_BYTES) {
+                            throw new IllegalArgumentException("WebSocket message exceeds 16 MiB");
                         }
-                        if (frame.finalFragment()) fragmentOpcodes.remove(streamId);
+                        fragments.writeBytes(framePayload);
+                        if (frame.finalFragment()) {
+                            byte[] messagePayload = fragments.toByteArray();
+                            clearFragmentState(streamId);
+                            if (original == WebSocketSpecusFrame.OPCODE_TEXT) {
+                                session.sendMessage(new TextMessage(messagePayload));
+                            } else {
+                                session.sendMessage(new BinaryMessage(messagePayload));
+                            }
+                        }
                     }
                     case WebSocketSpecusFrame.OPCODE_PING ->
                             session.sendMessage(new PingMessage(ByteBuffer.wrap(framePayload)));
@@ -232,6 +245,26 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
     }
 
+    private boolean beginMessage(int streamId, WebSocketSpecusFrame frame) {
+        if (fragmentOpcodes.containsKey(streamId)) {
+            throw new IllegalArgumentException("new WebSocket message before fragmented message completed");
+        }
+        if (frame.finalFragment()) {
+            return true;
+        }
+        byte[] payload = frame.payload();
+        fragmentOpcodes.put(streamId, frame.opcode());
+        ByteArrayOutputStream fragments = new ByteArrayOutputStream(payload.length);
+        fragments.writeBytes(payload);
+        fragmentPayloads.put(streamId, fragments);
+        return false;
+    }
+
+    private void clearFragmentState(int streamId) {
+        fragmentOpcodes.remove(streamId);
+        fragmentPayloads.remove(streamId);
+    }
+
     /**
      * 由 {@code NatServerHandler} 调用：客户端发回 {@code DISCONNECTED(channelId)}。
      * 只关浏览器会话，不再向客户端回送 DISCONNECTED。
@@ -245,7 +278,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
         channelClientNames.remove(channelId);
         channelStreamIds.remove(channelId);
-        fragmentOpcodes.remove(streamId);
+        clearFragmentState(streamId);
         if (clientName != null) {
             Channel controlChannel = SessionUtil.getDataChannel(clientName);
             if (controlChannel != null) {
@@ -272,7 +305,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
         WebSocketSession session = registry.remove(channelId);
-        if (streamId != null) fragmentOpcodes.remove(streamId);
+        if (streamId != null) clearFragmentState(streamId);
         if (closeSession && session != null && session.isOpen()) {
             try {
                 session.close(status);
@@ -291,7 +324,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         byte[] close = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0,
                 status.getCode(), reason).encode();
         StreamFlowController flow = StreamFlowController.get(controlChannel);
-        flow.send(streamId, close, null, null);
+        flow.sendAtomic(streamId, close, null, null);
         flow.finish(streamId);
     }
 
