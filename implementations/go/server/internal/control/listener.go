@@ -6,15 +6,36 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"syscall"
 )
+
+type ListenerOptions struct {
+	MaxFrameSize        int
+	PreAuthMaxFrameSize int
+	WriteLowWaterMark   int
+	WriteHighWaterMark  int
+	BossThreads         int
+	WorkerThreads       int
+	SOBacklog           int
+	ReuseAddress        bool
+	KeepAlive           bool
+	TCPNoDelay          bool
+}
 
 // Listener accepts control-channel TCP connections and runs each through a Handler.
 type Listener struct {
-	maxFrameSize       int
-	writeLowWaterMark  int
-	writeHighWaterMark int
-	handler            Handler
-	tlsConfig          *tls.Config
+	maxFrameSize        int
+	preAuthMaxFrameSize int
+	writeLowWaterMark   int
+	writeHighWaterMark  int
+	handler             Handler
+	tlsConfig           *tls.Config
+	bossThreads         int
+	workerThreads       int
+	soBacklog           int
+	reuseAddress        bool
+	keepAlive           bool
+	tcpNoDelay          bool
 
 	mu        sync.Mutex
 	listener  net.Listener
@@ -22,12 +43,23 @@ type Listener struct {
 }
 
 // NewListener builds a control-channel listener that dispatches to handler.
-func NewListener(maxFrameSize, writeLowWaterMark, writeHighWaterMark int, handler Handler) *Listener {
+func NewListener(options ListenerOptions, handler Handler) *Listener {
+	bossThreads := options.BossThreads
+	if bossThreads < 1 {
+		bossThreads = 1
+	}
 	return &Listener{
-		maxFrameSize:       maxFrameSize,
-		writeLowWaterMark:  writeLowWaterMark,
-		writeHighWaterMark: writeHighWaterMark,
-		handler:            handler,
+		maxFrameSize:        options.MaxFrameSize,
+		preAuthMaxFrameSize: options.PreAuthMaxFrameSize,
+		writeLowWaterMark:   options.WriteLowWaterMark,
+		writeHighWaterMark:  options.WriteHighWaterMark,
+		bossThreads:         bossThreads,
+		workerThreads:       options.WorkerThreads,
+		soBacklog:           options.SOBacklog,
+		reuseAddress:        options.ReuseAddress,
+		keepAlive:           options.KeepAlive,
+		tcpNoDelay:          options.TCPNoDelay,
+		handler:             handler,
 	}
 }
 
@@ -38,7 +70,14 @@ func (l *Listener) SetTLS(config *tls.Config) { l.tlsConfig = config }
 // ephemeral port; BoundPort then reports the chosen port. When TLS is configured the accepted
 // connections are wrapped in a TLS server.
 func (l *Listener) Start(address string) error {
-	listener, err := net.Listen("tcp", address)
+	listenConfig := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
+		var optionErr error
+		if err := raw.Control(func(fd uintptr) { optionErr = setReuseAddress(fd, l.reuseAddress) }); err != nil {
+			return err
+		}
+		return optionErr
+	}}
+	listener, err := listenConfig.Listen(context.Background(), "tcp", address)
 	if err != nil {
 		return fmt.Errorf("bind control channel on %s: %w", address, err)
 	}
@@ -75,20 +114,38 @@ func (l *Listener) Serve(ctx context.Context) error {
 		listener.Close()
 	}()
 
+	var workers sync.WaitGroup
+	for range l.bossThreads {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			l.acceptLoop(ctx, listener)
+		}()
+	}
+	workers.Wait()
+	return nil
+}
+
+func (l *Listener) acceptLoop(ctx context.Context, listener net.Listener) {
 	for {
 		netConn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			// Transient accept errors: keep serving.
 			continue
 		}
-		if tcp, ok := netConn.(*net.TCPConn); ok {
-			_ = tcp.SetNoDelay(true)
-			_ = tcp.SetKeepAlive(true)
+		socketConn := netConn
+		if secureConn, ok := netConn.(*tls.Conn); ok {
+			socketConn = secureConn.NetConn()
 		}
-		conn := newConn(netConn, l.maxFrameSize, l.writeLowWaterMark, l.writeHighWaterMark, ctx)
+		if tcp, ok := socketConn.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(l.tcpNoDelay)
+			_ = tcp.SetKeepAlive(l.keepAlive)
+		}
+		conn := newConn(netConn, l.maxFrameSize, l.preAuthMaxFrameSize,
+			l.writeLowWaterMark, l.writeHighWaterMark, ctx)
 		go conn.run(l.handler)
 	}
 }

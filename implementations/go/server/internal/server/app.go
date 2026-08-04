@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/gorilla/websocket"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
@@ -71,6 +71,9 @@ type App struct {
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if cfg.Netty.MaxFrameSize < protocol.FrameHeaderSize {
 		return nil, fmt.Errorf("netty max frame size must be at least %d", protocol.FrameHeaderSize)
+	}
+	if err := security.ValidateTLSDeployment(cfg.TLS, cfg.Netty.BindAddress, cfg.ManagementAddr); err != nil {
+		return nil, err
 	}
 	db, err := store.Open(cfg.Database.Provider, cfg.ConnectionString)
 	if err != nil {
@@ -135,15 +138,26 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 
 	sessions := session.NewRegistry()
 	clientSessions := auth.NewSessionStore()
-	executor := control.NewLoginExecutor(cfg.Login.ExecutorMaxSize, cfg.Login.ExecutorQueueCapacity)
+	executor := control.NewLoginExecutor(cfg.Login.ExecutorCoreSize, cfg.Login.ExecutorMaxSize,
+		cfg.Login.ExecutorQueueCapacity)
 	authenticator := auth.NewAuthenticator(db, clientSessions, cfg.ClientAuth.PerMachineUserMaxInstances, sessions)
 	dispatcher := NewDispatcher(db, authenticator, sessions, executor, logger)
-	listener := control.NewListener(cfg.Netty.MaxFrameSize,
-		cfg.Netty.WriteBufferLowWaterMark, cfg.Netty.WriteBufferHighWaterMark, dispatcher)
+	listener := control.NewListener(control.ListenerOptions{
+		MaxFrameSize: cfg.Netty.MaxFrameSize, PreAuthMaxFrameSize: cfg.Netty.PreAuthMaxFrameSize,
+		WriteLowWaterMark:  cfg.Netty.WriteBufferLowWaterMark,
+		WriteHighWaterMark: cfg.Netty.WriteBufferHighWaterMark,
+		BossThreads:        cfg.Netty.BossThreads, WorkerThreads: cfg.Netty.WorkerThreads,
+		SOBacklog: cfg.Netty.SOBacklog, ReuseAddress: cfg.Netty.ReuseAddress,
+		KeepAlive: cfg.Netty.KeepAlive, TCPNoDelay: cfg.Netty.TCPNoDelay,
+	}, dispatcher)
 
 	traffic := nat.NewTrafficService(db, time.Duration(cfg.Traffic.FlushIntervalMs)*time.Millisecond, logger)
 	db.ConfigureTrafficDetailQueue(cfg.Traffic.CaptureMaxPending, cfg.Traffic.CaptureFlushBatchSize)
-	remotePorts := nat.NewRemotePortManager(cfg.Netty.MaxExternalConnections)
+	remotePorts := nat.NewRemotePortManagerWithOptions(cfg.Netty.MaxExternalConnections, nat.RemotePortOptions{
+		BossThreads: cfg.Netty.RemoteBossThreads, WorkerThreads: cfg.Netty.RemoteWorkerThreads,
+		SOBacklog: cfg.Netty.SOBacklog, ReuseAddress: cfg.Netty.ReuseAddress,
+		KeepAlive: cfg.Netty.KeepAlive, TCPNoDelay: cfg.Netty.TCPNoDelay,
+	})
 	limits := nat.Limits{
 		Global:              cfg.Netty.MaxExternalConnections,
 		PerClient:           cfg.Netty.MaxExternalConnectionsPerClient,
@@ -213,6 +227,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return mediaCapture.Open(ctx, clientName, route, method, sourceURL, statusCode, responseHeaders)
 	})
 	directHTTP.SetReconnectGrace(3 * time.Second)
+	directHTTP.SetRouteCacheTTL(time.Duration(cfg.HTTP.RouteCacheTTLms) * time.Millisecond)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
@@ -354,7 +369,7 @@ func (a *App) Close() error {
 // Run starts the background workers, binds and serves the control channel, and serves the
 // management HTTP surface until ctx is cancelled.
 func (a *App) Run(ctx context.Context) error {
-	a.executor.Start(ctx, a.cfg.Login.ExecutorMaxSize)
+	a.executor.Start(ctx)
 	go a.traffic.Run(ctx)
 	go a.peerMesh.Run(ctx)
 	go a.peerMesh.RunStunTurn(ctx)
@@ -366,7 +381,8 @@ func (a *App) Run(ctx context.Context) error {
 		func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
 	go runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord)
 
-	controlAddr := ":" + strconv.Itoa(a.cfg.Netty.Port)
+	controlAddr := net.JoinHostPort(strings.TrimSpace(a.cfg.Netty.BindAddress),
+		fmt.Sprint(a.cfg.Netty.Port))
 	if err := a.listener.Start(controlAddr); err != nil {
 		return err
 	}

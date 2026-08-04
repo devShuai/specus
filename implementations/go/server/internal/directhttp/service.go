@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/gorilla/websocket"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -100,6 +100,14 @@ type Service struct {
 	openMedia      OpenMediaCaptureFunc
 	rewriter       responseRewriter
 	reconnectGrace time.Duration
+	routeCacheTTL  time.Duration
+	routeCacheMu   sync.Mutex
+	routeCache     map[string]cachedRoutePolicy
+}
+
+type cachedRoutePolicy struct {
+	policy    *store.HTTPRouteAccessPolicy
+	expiresAt time.Time
 }
 
 func (s *Service) SetMediaCapture(opener OpenMediaCaptureFunc) { s.openMedia = opener }
@@ -121,6 +129,18 @@ func (s *Service) SetReconnectGrace(grace time.Duration) {
 		grace = 0
 	}
 	s.reconnectGrace = grace
+}
+
+// SetRouteCacheTTL configures the same short-lived route lookup cache exposed by Java's
+// specus.http.route-cache-ttl-ms. A non-positive duration disables caching.
+func (s *Service) SetRouteCacheTTL(ttl time.Duration) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	s.routeCacheMu.Lock()
+	s.routeCacheTTL = ttl
+	s.routeCache = make(map[string]cachedRoutePolicy)
+	s.routeCacheMu.Unlock()
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -379,13 +399,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, protected bool) {
 	clientName := r.PathValue("clientName")
 	route := r.PathValue("route")
-	// InsecureSkipVerify 跳过 Origin 校验，对齐 Java setAllowedOriginPatterns("*")。
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	// CheckOrigin mirrors Java setAllowedOriginPatterns("*"); route authentication remains the
+	// authorization boundary for protected tunnels.
+	conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	fail := func(reason string) {
-		_ = conn.Close(websocket.StatusInternalError, reason)
+		_ = closeWebSocket(conn, r.Context(), websocket.CloseInternalServerErr, reason)
 	}
 	if !s.clientOnline(r.Context(), clientName) {
 		fail(errOffline.Error() + ": " + clientName)
@@ -406,6 +427,12 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, protect
 		fail("WS 隧道请求发送失败")
 		return
 	}
+	// Keep Gorilla's RFC 6455 default PING handler: the server endpoint answers PONG with the
+	// same payload, matching Spring's endpoint behavior. Browser PONG frames remain observable
+	// and are carried back to the client as SWS2 PONG frames.
+	conn.SetPongHandler(func(payload string) error {
+		return specus.sendControlFrame(r.Context(), sws2OpcodePong, []byte(payload))
+	})
 	specus.ReadLoop(r.Context())
 }
 
@@ -476,7 +503,35 @@ func (s *Service) routePolicy(ctx context.Context, clientName, route string) (*s
 	if s.routes == nil {
 		return nil, nil
 	}
-	return s.routes.HTTPRouteAccessPolicy(ctx, clientName, route)
+	key := clientName + "\n" + route
+	now := time.Now()
+	s.routeCacheMu.Lock()
+	if cached, ok := s.routeCache[key]; ok && cached.expiresAt.After(now) {
+		policy := cloneRoutePolicy(cached.policy)
+		s.routeCacheMu.Unlock()
+		return policy, nil
+	}
+	ttl := s.routeCacheTTL
+	s.routeCacheMu.Unlock()
+	policy, err := s.routes.HTTPRouteAccessPolicy(ctx, clientName, route)
+	if err != nil || ttl <= 0 {
+		return policy, err
+	}
+	s.routeCacheMu.Lock()
+	if s.routeCache == nil {
+		s.routeCache = make(map[string]cachedRoutePolicy)
+	}
+	s.routeCache[key] = cachedRoutePolicy{policy: cloneRoutePolicy(policy), expiresAt: now.Add(ttl)}
+	s.routeCacheMu.Unlock()
+	return policy, nil
+}
+
+func cloneRoutePolicy(policy *store.HTTPRouteAccessPolicy) *store.HTTPRouteAccessPolicy {
+	if policy == nil {
+		return nil
+	}
+	copy := *policy
+	return &copy
 }
 
 func validProtectedRoutePolicy(policy *store.HTTPRouteAccessPolicy) bool {

@@ -114,6 +114,7 @@ func (s *stunTurnServer) run(ctx context.Context) {
 				"endpoint", endpoint.ID, "bind", endpoint.Bind, "err", err)
 			return
 		}
+		s.configureUDPSocket(conn)
 		sockets[endpoint.ID] = conn
 	}
 	s.sockets = sockets
@@ -407,10 +408,33 @@ func (s *stunTurnServer) bindRelaySocket() (*net.UDPConn, error) {
 		port := minPort + ((start + i) % capacity)
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 		if err == nil {
+			s.configureUDPSocket(conn)
 			return conn, nil
 		}
 	}
-	return net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	if err == nil {
+		s.configureUDPSocket(conn)
+	}
+	return conn, err
+}
+
+func (s *stunTurnServer) configureUDPSocket(conn *net.UDPConn) {
+	if receiveBytes := s.service.cfg.UDPReceiveBufferBytes; receiveBytes > 0 {
+		if err := conn.SetReadBuffer(max(65507, receiveBytes)); err != nil {
+			s.logger.Warn("[peer-mesh] unable to configure UDP receive buffer", "err", err)
+		}
+	}
+	if sendBytes := s.service.cfg.UDPSendBufferBytes; sendBytes > 0 {
+		if err := conn.SetWriteBuffer(max(65507, sendBytes)); err != nil {
+			s.logger.Warn("[peer-mesh] unable to configure UDP send buffer", "err", err)
+		}
+	}
+	if trafficClass := s.service.cfg.UDPTrafficClass; trafficClass >= 0 && trafficClass <= 255 {
+		if err := setUDPTrafficClass(conn, trafficClass); err != nil {
+			s.logger.Debug("[peer-mesh] UDP traffic class is not supported", "err", err)
+		}
+	}
 }
 
 func (s *stunTurnServer) refresh(request stunMessage, remote *net.UDPAddr) error {

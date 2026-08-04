@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	gorillaws "github.com/gorilla/websocket"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -49,11 +50,11 @@ func newWSHarness(t *testing.T) *wsHarness {
 }
 
 // dialWSPair 在 httptest 服务器上完成一次 WS 握手，返回服务器侧与浏览器侧连接。
-func dialWSPair(t *testing.T, ctx context.Context) (*websocket.Conn, *websocket.Conn) {
+func dialWSPair(t *testing.T, ctx context.Context) (*gorillaws.Conn, *websocket.Conn) {
 	t.Helper()
-	accepted := make(chan *websocket.Conn, 1)
+	accepted := make(chan *gorillaws.Conn, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		conn, err := (&gorillaws.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
@@ -88,8 +89,7 @@ func (h *wsHarness) nextFrame(t *testing.T) sws2Frame {
 	}
 }
 
-// readAsync 让浏览器侧先阻塞在 Read 上：coder/websocket 只有在读取中才会即时应答
-// 关闭握手，否则对端 Close 会空等 5 秒握手超时。
+// readAsync 让浏览器侧先阻塞在 Read 上，以处理服务器发来的控制帧和关闭握手。
 func (h *wsHarness) readAsync(ctx context.Context) <-chan error {
 	result := make(chan error, 1)
 	go func() {
@@ -108,7 +108,7 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 	// openWS 回调运行在 httptest 处理协程，握手返回先于回调执行，须经 channel 同步。
 	openedCh := make(chan map[string]any, 1)
 	service := NewService(onlineRegistry("Demo client"), nil,
-		func(clientName string, metadata map[string]any, conn *websocket.Conn) (*WebSocketSpecus, error) {
+		func(clientName string, metadata map[string]any, conn *gorillaws.Conn) (*WebSocketSpecus, error) {
 			openedCh <- metadata
 			return NewWebSocketSpecus(conn, 1, clientName,
 				func(frame []byte) error {
@@ -203,7 +203,7 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 func TestServeWebSocketRejectsMissingBasicAuthBeforeUpgrade(t *testing.T) {
 	opened := false
 	service := NewService(onlineRegistry("Demo client"), nil,
-		func(string, map[string]any, *websocket.Conn) (*WebSocketSpecus, error) {
+		func(string, map[string]any, *gorillaws.Conn) (*WebSocketSpecus, error) {
 			opened = true
 			return nil, nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
@@ -308,6 +308,118 @@ func TestWSSpecusWritesClientFramesToBrowser(t *testing.T) {
 	}
 	if typ != websocket.MessageText || string(payload) != "你好" {
 		t.Fatalf("browser message = %v/%q, want text/你好", typ, payload)
+	}
+}
+
+func TestWSSpecusWritesPingAndPongPayloadsToBrowser(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted := make(chan *gorillaws.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&gorillaws.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err == nil {
+			accepted <- conn
+		}
+	}))
+	defer server.Close()
+	pingPayloads := make(chan []byte, 1)
+	pongPayloads := make(chan []byte, 1)
+	browser, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+		OnPingReceived: func(_ context.Context, payload []byte) bool {
+			pingPayloads <- append([]byte(nil), payload...)
+			return false
+		},
+		OnPongReceived: func(_ context.Context, payload []byte) {
+			pongPayloads <- append([]byte(nil), payload...)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.CloseNow()
+	serverConn := <-accepted
+	specus := NewWebSocketSpecus(serverConn, 11, "client", func([]byte) error { return nil },
+		func() error { return nil }, nil)
+	defer specus.Close()
+	go func() {
+		for {
+			if _, _, err := browser.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	ping, _ := encodeSWS2(sws2OpcodePing, true, 0, 0, []byte("ping-payload"))
+	pong, _ := encodeSWS2(sws2OpcodePong, true, 0, 0, []byte("pong-payload"))
+	specus.WriteFrame(ctx, ping)
+	specus.WriteFrame(ctx, pong)
+	if got := <-pingPayloads; string(got) != "ping-payload" {
+		t.Fatalf("PING payload = %q", got)
+	}
+	if got := <-pongPayloads; string(got) != "pong-payload" {
+		t.Fatalf("PONG payload = %q", got)
+	}
+}
+
+func TestServeWebSocketAutoRepliesToPingAndForwardsBrowserPongPayload(t *testing.T) {
+	frames := make(chan []byte, 4)
+	opened := make(chan struct{}, 1)
+	service := NewService(onlineRegistry("Demo client"), nil,
+		func(clientName string, _ map[string]any, conn *gorillaws.Conn) (*WebSocketSpecus, error) {
+			opened <- struct{}{}
+			return NewWebSocketSpecus(conn, 12, clientName, func(frame []byte) error {
+				frames <- frame
+				return nil
+			}, func() error { return nil }, nil), nil
+		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true}},
+		nil, store.TrafficDetailOptions{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("clientName", "Demo client")
+		r.SetPathValue("route", "api")
+		service.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	browser, _, err := gorillaws.DefaultDialer.DialContext(ctx,
+		"ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+	<-opened
+	autoPong := make(chan string, 1)
+	browser.SetPongHandler(func(payload string) error {
+		autoPong <- payload
+		return nil
+	})
+	go func() {
+		_, _, _ = browser.ReadMessage()
+	}()
+	if err := browser.WriteControl(gorillaws.PingMessage, []byte("browser-ping"),
+		webSocketWriteDeadline(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case payload := <-autoPong:
+		if payload != "browser-ping" {
+			t.Fatalf("automatic PONG payload = %q, want browser-ping", payload)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for automatic PONG")
+	}
+	if err := browser.WriteControl(gorillaws.PongMessage, []byte("browser-pong"),
+		webSocketWriteDeadline(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-frames:
+		frame, err := decodeSWS2(raw)
+		if err != nil || frame.opcode != sws2OpcodePong || string(frame.payload) != "browser-pong" {
+			t.Fatalf("control frame = %+v err=%v, want PONG payload browser-pong", frame, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for SWS2 PONG frame")
 	}
 }
 
@@ -433,7 +545,7 @@ func TestWSSpecusBrowserCloseStopsWaitingWhenClientWithholdsCredit(t *testing.T)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	h.specus.closeFromBrowserContext(ctx, websocket.StatusNormalClosure, "done")
+	h.specus.closeFromBrowserContext(ctx, gorillaws.CloseNormalClosure, "done")
 
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("browser close waited too long for withheld credit: %s", elapsed)

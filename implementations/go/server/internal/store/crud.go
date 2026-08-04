@@ -90,6 +90,45 @@ func (db *DB) UpdateClient(ctx context.Context, account ClientAccount) error {
 	return err
 }
 
+// UpdateClientAndRenameReferences updates the account and every mutable denormalized client_name
+// in one database transaction. Historical connection/detail rows intentionally retain the name
+// captured at event time, matching Java ClientNameReferenceRepository.
+func (db *DB) UpdateClientAndRenameReferences(ctx context.Context, account ClientAccount, oldName string) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	accountUpdate := db.rebind(`UPDATE specus_client_account SET owner_username = ?, client_name = ?,
+		password_hash = ?, enabled = ?, connection_rate_limit_per_minute = ?, updated_at = ? WHERE id = ?`)
+	if _, err := tx.ExecContext(ctx, accountUpdate, defaultOwner(account.OwnerUsername), account.ClientName,
+		account.PasswordHash, boolToInt(account.Enabled), account.ConnectionRateLimitPerMinute,
+		formatTime(account.UpdatedAt), account.ID); err != nil {
+		return err
+	}
+	if account.ClientName != oldName {
+		updates := []struct {
+			query string
+			args  []any
+		}{
+			{`UPDATE specus_client_identity SET client_name = ? WHERE client_id = ?`, []any{account.ClientName, account.ID}},
+			{`UPDATE specus_mapping SET client_name = ?, updated_at = ? WHERE client_id = ?`, []any{account.ClientName, formatTime(account.UpdatedAt), account.ID}},
+			{`UPDATE http_route_mapping SET client_name = ?, updated_at = ? WHERE client_id = ?`, []any{account.ClientName, formatTime(account.UpdatedAt), account.ID}},
+			{`UPDATE peer_mesh_device SET client_name = ?, updated_at = ? WHERE client_id = ?`, []any{account.ClientName, formatTime(account.UpdatedAt), account.ID}},
+			{`UPDATE peer_mesh_acl SET source_client_name = ?, updated_at = ? WHERE source_client_id = ?`, []any{account.ClientName, formatTime(account.UpdatedAt), account.ID}},
+			{`UPDATE peer_mesh_acl SET target_client_name = ?, updated_at = ? WHERE target_client_id = ?`, []any{account.ClientName, formatTime(account.UpdatedAt), account.ID}},
+			{`UPDATE specus_traffic_usage SET client_name = ? WHERE client_id = ?`, []any{account.ClientName, account.ID}},
+			{`UPDATE specus_resource_traffic_usage SET client_name = ? WHERE client_id = ?`, []any{account.ClientName, account.ID}},
+		}
+		for _, update := range updates {
+			if _, err := tx.ExecContext(ctx, db.rebind(update.query), update.args...); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
 // DeleteClient removes a client account and its specus/http-route mappings.
 func (db *DB) DeleteClient(ctx context.Context, id int64) error {
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {

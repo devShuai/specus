@@ -108,13 +108,16 @@ type WebSocketTicket struct {
 
 // ManagementUser mirrors specus_management_user.
 type ManagementUser struct {
-	Username     string
-	TenantID     string
-	PasswordHash string
-	Role         string
-	Enabled      bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	Username        string
+	TenantID        string
+	PasswordHash    string
+	OIDCIssuer      string
+	OIDCSubject     string
+	OIDCIdentityKey string
+	Role            string
+	Enabled         bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type ManagementUserEmail struct {

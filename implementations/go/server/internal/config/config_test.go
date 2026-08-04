@@ -36,6 +36,53 @@ func TestLoadFromEnvMapsOidcTenantClaim(t *testing.T) {
 	}
 }
 
+func TestJavaNetworkAndTLSConfigurationSurface(t *testing.T) {
+	t.Setenv("SPECUS_NETTY_BIND_ADDRESS", "127.0.0.1")
+	t.Setenv("SPECUS_NETTY_BOSS_THREADS", "2")
+	t.Setenv("SPECUS_NETTY_WORKER_THREADS", "4")
+	t.Setenv("SPECUS_NETTY_REMOTE_BOSS_THREADS", "3")
+	t.Setenv("SPECUS_NETTY_REMOTE_WORKER_THREADS", "5")
+	t.Setenv("SPECUS_NETTY_SO_BACKLOG", "4096")
+	t.Setenv("SPECUS_NETTY_REUSE_ADDRESS", "false")
+	t.Setenv("SPECUS_NETTY_KEEP_ALIVE", "false")
+	t.Setenv("SPECUS_NETTY_TCP_NO_DELAY", "false")
+	t.Setenv("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE", "12000")
+	t.Setenv("SPECUS_LOGIN_EXECUTOR_CORE", "6")
+	t.Setenv("SPECUS_HTTP_ROUTE_CACHE_TTL_MS", "3456")
+	t.Setenv("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", "70000")
+	t.Setenv("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", "80000")
+	t.Setenv("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", "32")
+	t.Setenv("SPECUS_TLS_REQUIRE_ENCRYPTION", "true")
+	t.Setenv("SPECUS_TLS_TERMINATED_UPSTREAM", "true")
+	t.Setenv("SPECUS_OIDC_REGISTRATION_ENDPOINT", "https://certus.example/register")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Netty.BindAddress != "127.0.0.1" || cfg.Netty.BossThreads != 2 || cfg.Netty.WorkerThreads != 4 ||
+		cfg.Netty.RemoteBossThreads != 3 || cfg.Netty.RemoteWorkerThreads != 5 || cfg.Netty.SOBacklog != 4096 ||
+		cfg.Netty.ReuseAddress || cfg.Netty.KeepAlive || cfg.Netty.TCPNoDelay || cfg.Netty.PreAuthMaxFrameSize != 12000 ||
+		cfg.Login.ExecutorCoreSize != 6 || cfg.HTTP.RouteCacheTTLms != 3456 ||
+		cfg.PeerMesh.UDPReceiveBufferBytes != 70000 || cfg.PeerMesh.UDPSendBufferBytes != 80000 ||
+		cfg.PeerMesh.UDPTrafficClass != 32 || !cfg.TLS.RequireEncryption || !cfg.TLS.TerminatedUpstream ||
+		cfg.Oidc.RegistrationEndpoint != "https://certus.example/register" {
+		t.Fatalf("Java network configuration mapping mismatch: %+v", cfg)
+	}
+}
+
+func TestOIDCDefaultsMatchCertusJavaConfiguration(t *testing.T) {
+	cfg := Default().Oidc
+	if cfg.Issuer != "https://certus.devshuai.com" ||
+		cfg.JwkSetURI != "https://certus.devshuai.com/oauth2/jwks" ||
+		cfg.AuthorizationEndpoint != "https://certus.devshuai.com/oauth2/authorize" ||
+		cfg.RegistrationEndpoint != "https://certus.devshuai.com/register" ||
+		cfg.TokenEndpoint != "https://certus.devshuai.com/oauth2/token" ||
+		cfg.EndSessionEndpoint != "https://certus.devshuai.com/oauth2/logout" ||
+		cfg.Scope != "openid profile email" {
+		t.Fatalf("OIDC defaults differ from Java/Certus: %+v", cfg)
+	}
+}
+
 func TestLoadFromEnvMapsRegistrationSecurityOptions(t *testing.T) {
 	t.Setenv("SPECUS_AUTH_TURNSTILE_ENABLED", "true")
 	t.Setenv("SPECUS_AUTH_TURNSTILE_SITE_KEY", "site-key")
@@ -296,6 +343,7 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 
 func TestLoadAllowsHeaderOnlyFrameLimitAndRejectsSmaller(t *testing.T) {
 	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "11")
+	t.Setenv("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE", "11")
 	if cfg, err := Load(""); err != nil || cfg.Netty.MaxFrameSize != 11 {
 		t.Fatalf("11-byte full-frame limit rejected: cfg=%+v err=%v", cfg.Netty, err)
 	}

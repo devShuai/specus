@@ -189,9 +189,6 @@ func (s *LocalTokenService) ValidateClaims(token string) (Claims, bool) {
 		return Claims{}, false
 	}
 	role := normalizeRole(claims.Role)
-	if role == "USER" && strings.EqualFold(claims.Sub, s.auth.Username) {
-		role = "ADMIN"
-	}
 	return Claims{
 		Username: claims.Sub,
 		TenantID: normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),

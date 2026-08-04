@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +17,49 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"golang.org/x/crypto/pkcs12"
 )
+
+// ValidateTLSDeployment applies the Java production gate to both public listeners. Requiring
+// encryption rejects self-signed certificates and only permits disabled in-process TLS when a
+// trusted upstream terminates TLS and both Go listeners bind to private/loopback addresses.
+func ValidateTLSDeployment(cfg config.TLSConfig, controlBindAddress, managementAddress string) error {
+	if !cfg.RequireEncryption {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if mode == "self-signed" || mode == "selfsigned" {
+		return fmt.Errorf("production control channel cannot use a self-signed certificate")
+	}
+	if mode != "" && mode != "disabled" {
+		return nil
+	}
+	managementBindAddress, ok := hostFromListenAddress(managementAddress)
+	if !cfg.TerminatedUpstream || !isPrivateBindAddress(controlBindAddress) || !ok ||
+		!isPrivateBindAddress(managementBindAddress) {
+		return fmt.Errorf("production listeners require TLS, or trusted upstream TLS with private/loopback control and management bind addresses")
+	}
+	return nil
+}
+
+func hostFromListenAddress(value string) (string, bool) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "", false
+	}
+	return host, true
+}
+
+func isPrivateBindAddress(value string) bool {
+	addresses, err := net.LookupIP(strings.TrimSpace(value))
+	if err != nil || len(addresses) == 0 {
+		return false
+	}
+	for _, address := range addresses {
+		if address.IsUnspecified() || !(address.IsLoopback() || address.IsPrivate() || address.IsLinkLocalUnicast()) {
+			return false
+		}
+	}
+	return true
+}
 
 // LoadTLSConfig builds a *tls.Config from the configured TLS mode, or nil when disabled.
 // Supported modes: "disabled" (nil), "file" (PKCS12/PFX or PEM cert+key), "self-signed" (generated at startup).

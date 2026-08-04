@@ -59,6 +59,12 @@ func TestAdminNestedManifestUsesNestedCaptureAsAssetAnchor(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.InsertManagementUser(context.Background(), store.ManagementUser{
+		Username: "alice", TenantID: "tenant-a", PasswordHash: "test-password-hash",
+		Role: store.ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	storage := &manifestTestStorage{objects: map[string][]byte{
 		"master": []byte("#EXTM3U\nchild.m3u8\n"),
 		"child":  []byte("#EXTM3U\nsegment.ts\n#EXT-X-ENDLIST\n"),

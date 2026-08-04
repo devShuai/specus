@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/coder/websocket"
+	"github.com/gorilla/websocket"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/control"
 	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"

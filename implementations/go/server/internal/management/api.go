@@ -305,6 +305,11 @@ func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "未授权")
 		return
 	}
+	if principal.Issuer != security.Issuer {
+		writeError(w, http.StatusBadRequest, "OIDC 令牌不能通过该端点续期")
+		return
+	}
+	// authenticate already resolved the signed username against current config/DB state.
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 
@@ -323,6 +328,7 @@ func (a *API) authenticatePassword(ctx context.Context, username, password strin
 			Role:     store.ManagementRoleAdmin,
 			Admin:    true,
 			BuiltIn:  true,
+			Issuer:   security.Issuer,
 		}, true, nil
 	}
 	user, err := a.db.FindManagementUserByUsername(ctx, normalized)
@@ -339,6 +345,7 @@ func (a *API) authenticatePassword(ctx context.Context, username, password strin
 		Role:     role,
 		Admin:    role == store.ManagementRoleAdmin,
 		BuiltIn:  false,
+		Issuer:   security.Issuer,
 	}, true, nil
 }
 
@@ -352,6 +359,7 @@ func (a *API) handleOidcConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured":                configured,
 		"authorizationEndpoint":     a.oidc.AuthorizationEndpoint,
+		"registrationEndpoint":      a.oidc.RegistrationEndpoint,
 		"endSessionEndpoint":        a.oidc.EndSessionEndpoint,
 		"clientId":                  a.oidc.ClientID,
 		"redirectUri":               a.oidc.RedirectURI,
@@ -367,15 +375,16 @@ func (a *API) handleOidcConfig(w http.ResponseWriter, r *http.Request) {
 func (a *API) handleOidcToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code         string `json:"code"`
-		RedirectURI  string `json:"redirectUri"`
 		CodeVerifier string `json:"codeVerifier"`
+		Nonce        string `json:"nonce"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if strings.TrimSpace(req.Code) == "" {
-		writeError(w, http.StatusBadRequest, "缺少授权码")
+	if strings.TrimSpace(req.Code) == "" || strings.TrimSpace(req.CodeVerifier) == "" ||
+		strings.TrimSpace(req.Nonce) == "" {
+		writeError(w, http.StatusBadRequest, "缺少 code、code_verifier 或 nonce")
 		return
 	}
 	if a.oidcAuth == nil {
@@ -383,17 +392,49 @@ func (a *API) handleOidcToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := a.oidcAuth.Exchange(r.Context(), security.ExchangeRequest{
-		Code: req.Code, RedirectURI: req.RedirectURI, CodeVerifier: req.CodeVerifier,
+		Code: req.Code, CodeVerifier: req.CodeVerifier, Nonce: req.Nonce,
 	})
 	if err != nil {
 		if errors.Is(err, security.ErrOidcNotConfigured) {
 			writeError(w, http.StatusServiceUnavailable, "OIDC 未配置")
 			return
 		}
+		if errors.Is(err, security.ErrOidcInvalidExchange) {
+			writeError(w, http.StatusBadGateway, "OIDC ID Token 校验失败")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "令牌交换失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	identity := result.Identity
+	if len(identity.Issuer) > 255 || len(identity.Subject) > 255 {
+		writeError(w, http.StatusForbidden, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
+		return
+	}
+	username, usernameErr := normalizeUsername(identity.PreferredUsername)
+	if usernameErr != nil || strings.EqualFold(username, a.adminUsername()) {
+		writeError(w, http.StatusForbidden, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
+		return
+	}
+	identityKey := auth.HashPassword(identity.Issuer + "\x00" + identity.Subject)
+	user, resolveErr := a.db.ResolveOrProvisionOIDCUser(r.Context(), identity.Issuer, identity.Subject,
+		identityKey, username, a.defaultTenant(), auth.HashPassword(auth.GeneratePassword()), time.Now())
+	if resolveErr != nil {
+		if errors.Is(resolveErr, store.ErrOIDCIdentityConflict) ||
+			errors.Is(resolveErr, store.ErrManagementUserDisabled) {
+			writeError(w, http.StatusForbidden, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
+			return
+		}
+		a.logger.Warn("OIDC user provisioning failed", "err", resolveErr)
+		writeError(w, http.StatusBadGateway, "OIDC 账号绑定失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accessToken": a.tokens.IssueForUser(user.Username, user.TenantID, user.Role),
+		"idToken":     result.IDToken,
+		"tokenType":   result.TokenType,
+		"expiresIn":   a.tokens.TTLSeconds(),
+	})
 }
 
 // ---- users ---------------------------------------------------------------------------
@@ -796,9 +837,14 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	name := strings.TrimSpace(req.ClientName)
-	if name == "" {
-		a.fail(w, validation("clientName 不能为空"))
+	name, err := requireClientName(req.ClientName)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	rateLimit, err := normalizeConnectionRateLimit(req.ConnectionRateLimitPerMinute, 30)
+	if err != nil {
+		a.fail(w, err)
 		return
 	}
 	if existing, err := a.db.FindClientByName(r.Context(), name); err != nil {
@@ -816,7 +862,7 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		ClientName:                   name,
 		PasswordHash:                 auth.HashPassword(strconv.FormatInt(auth.NewClientID(), 10)),
 		Enabled:                      boolOr(req.Enabled, true),
-		ConnectionRateLimitPerMinute: intOr(req.ConnectionRateLimitPerMinute, 30),
+		ConnectionRateLimitPerMinute: rateLimit,
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
 	}
@@ -856,25 +902,47 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 	oldName := account.ClientName
 	wasEnabled := account.Enabled
 	if name := strings.TrimSpace(req.ClientName); name != "" {
-		account.ClientName = name
+		validatedName, validationErr := requireClientName(name)
+		if validationErr != nil {
+			a.fail(w, validationErr)
+			return
+		}
+		account.ClientName = validatedName
+	}
+	if account.ClientName != oldName {
+		existing, lookupErr := a.db.FindClientByName(r.Context(), account.ClientName)
+		if lookupErr != nil {
+			a.fail(w, lookupErr)
+			return
+		}
+		if existing != nil && existing.ID != account.ID {
+			a.fail(w, conflict("客户端名称已存在"))
+			return
+		}
 	}
 	if req.Enabled != nil {
 		account.Enabled = *req.Enabled
 	}
 	if req.ConnectionRateLimitPerMinute != nil {
-		account.ConnectionRateLimitPerMinute = *req.ConnectionRateLimitPerMinute
+		rateLimit, validationErr := normalizeConnectionRateLimit(req.ConnectionRateLimitPerMinute,
+			account.ConnectionRateLimitPerMinute)
+		if validationErr != nil {
+			a.fail(w, validationErr)
+			return
+		}
+		account.ConnectionRateLimitPerMinute = rateLimit
 	}
 	account.UpdatedAt = time.Now()
-	if err := a.db.UpdateClient(r.Context(), *account); err != nil {
+	if err := a.db.UpdateClientAndRenameReferences(r.Context(), *account, oldName); err != nil {
 		a.fail(w, err)
 		return
 	}
 
 	// Kick the live session if the account was renamed or disabled.
-	if oldName != account.ClientName {
+	if !account.Enabled && (wasEnabled || oldName != account.ClientName) {
+		a.kick(oldName, store.ReasonAdminDisabled)
+	} else if oldName != account.ClientName {
 		a.kick(oldName, store.ReasonAdminRenamed)
-	} else if wasEnabled && !account.Enabled {
-		a.kick(account.ClientName, store.ReasonAdminDisabled)
 	}
 
 	writeJSON(w, http.StatusOK, ClientResult{Client: a.clientView(r.Context(), *account)})
@@ -2245,6 +2313,7 @@ type managementPrincipal struct {
 	Role     string
 	Admin    bool
 	BuiltIn  bool
+	Issuer   string
 }
 
 func (p managementPrincipal) canAccessClient(account store.ClientAccount) bool {
@@ -2277,28 +2346,50 @@ func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 // authenticate validates a bearer token: local HS256 first, then OIDC RS256 as a fallback.
 func (a *API) authenticate(ctx context.Context, token string) (managementPrincipal, bool) {
 	if claims, ok := a.tokens.ValidateClaims(token); ok {
-		role := normalizeRole(claims.Role)
+		if normalizeRole(claims.Role) == store.ManagementRoleAdmin &&
+			strings.EqualFold(claims.Username, a.adminUsername()) {
+			if !a.tokens.PasswordLoginEnabled() {
+				return managementPrincipal{}, false
+			}
+			return managementPrincipal{
+				Username: a.adminUsername(), TenantID: a.defaultTenant(), Role: store.ManagementRoleAdmin,
+				Admin: true, BuiltIn: true, Issuer: security.Issuer,
+			}, true
+		}
+		user, err := a.db.FindManagementUserByUsername(ctx, claims.Username)
+		if err != nil {
+			a.logger.Warn("local bearer user lookup failed", "err", err)
+			return managementPrincipal{}, false
+		}
+		if user == nil || !user.Enabled {
+			return managementPrincipal{}, false
+		}
+		role := normalizeRole(user.Role)
 		return managementPrincipal{
-			Username: claims.Username,
-			TenantID: normalizeTenant(claims.TenantID),
-			Role:     role,
-			Admin:    role == store.ManagementRoleAdmin || strings.EqualFold(claims.Username, a.adminUsername()),
-			BuiltIn:  strings.EqualFold(claims.Username, a.adminUsername()),
+			Username: user.Username, TenantID: normalizeTenant(user.TenantID), Role: role,
+			Admin: role == store.ManagementRoleAdmin, BuiltIn: false, Issuer: security.Issuer,
 		}, true
 	}
 	if a.oidcAuth != nil {
 		if identity, ok := a.oidcAuth.ValidateIdentity(ctx, token); ok {
-			admin := strings.EqualFold(identity.Username, a.adminUsername())
-			role := store.ManagementRoleUser
-			if admin {
-				role = store.ManagementRoleAdmin
+			identityKey := auth.HashPassword(identity.Issuer + "\x00" + identity.Subject)
+			user, err := a.db.FindManagementUserByOIDCIdentity(ctx, identity.Issuer, identity.Subject,
+				identityKey)
+			if err != nil {
+				a.logger.Warn("OIDC bearer user lookup failed", "err", err)
+				return managementPrincipal{}, false
 			}
+			if user == nil || !user.Enabled {
+				return managementPrincipal{}, false
+			}
+			role := normalizeRole(user.Role)
 			return managementPrincipal{
-				Username: identity.Username,
-				TenantID: normalizeTenant(firstText(identity.TenantID, a.defaultTenant())),
+				Username: user.Username,
+				TenantID: normalizeTenant(user.TenantID),
 				Role:     role,
-				Admin:    admin,
-				BuiltIn:  admin,
+				Admin:    role == store.ManagementRoleAdmin,
+				BuiltIn:  false,
+				Issuer:   identity.Issuer,
 			}, true
 		}
 	}
@@ -2425,6 +2516,27 @@ func normalizeUsername(username string) (string, error) {
 		return "", validation("username is too long")
 	}
 	return normalized, nil
+}
+
+func requireClientName(value string) (string, error) {
+	name := strings.TrimSpace(value)
+	if name == "" {
+		return "", validation("clientName 不能为空")
+	}
+	if len(utf16.Encode([]rune(name))) > 120 {
+		return "", validation("clientName 长度不能超过 120")
+	}
+	return name, nil
+}
+
+func normalizeConnectionRateLimit(value *int, fallback int) (int, error) {
+	if value == nil {
+		return fallback, nil
+	}
+	if *value < 0 || *value > 10000 {
+		return 0, validation("connectionRateLimitPerMinute 必须在 0 到 10000 之间")
+	}
+	return *value, nil
 }
 
 func requirePassword(password string) (string, error) {

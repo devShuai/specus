@@ -110,12 +110,16 @@ CREATE TABLE IF NOT EXISTS specus_management_user (
   username VARCHAR(80) NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   password_hash VARCHAR(64) NOT NULL,
+  oidc_issuer VARCHAR(255) NULL,
+  oidc_subject VARCHAR(255) NULL,
+  oidc_identity_key VARCHAR(64) NULL,
   role VARCHAR(20) NOT NULL,
   enabled TINYINT(1) NOT NULL,
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
   KEY idx_management_user_tenant (tenant_id),
-  KEY idx_management_user_role (role)
+  KEY idx_management_user_role (role),
+  UNIQUE KEY uq_management_user_oidc_identity_key (oidc_identity_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS specus_management_user_email (

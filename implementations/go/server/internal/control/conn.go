@@ -44,9 +44,10 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	channelID     string
-	remoteAddress string
-	maxFrameSize  int
+	channelID           string
+	remoteAddress       string
+	maxFrameSize        int
+	preAuthMaxFrameSize int
 
 	ReadGate          *ReadGate
 	WriteBackpressure *WriteBackpressureGate
@@ -66,18 +67,20 @@ type Conn struct {
 	lastWriteUnixNano atomic.Int64
 }
 
-func newConn(netConn net.Conn, maxFrameSize, writeLowWaterMark, writeHighWaterMark int, parent context.Context) *Conn {
+func newConn(netConn net.Conn, maxFrameSize, preAuthMaxFrameSize, writeLowWaterMark,
+	writeHighWaterMark int, parent context.Context) *Conn {
 	ctx, cancel := context.WithCancel(parent)
 	conn := &Conn{
-		netConn:           netConn,
-		writer:            bufio.NewWriter(netConn),
-		ctx:               ctx,
-		cancel:            cancel,
-		channelID:         newChannelID(),
-		maxFrameSize:      maxFrameSize,
-		ReadGate:          NewReadGate(),
-		WriteBackpressure: NewWriteBackpressureGate(writeLowWaterMark, writeHighWaterMark),
-		priorityWrites:    make(chan queuedWrite, priorityWriteQueueCapacity),
+		netConn:             netConn,
+		writer:              bufio.NewWriter(netConn),
+		ctx:                 ctx,
+		cancel:              cancel,
+		channelID:           newChannelID(),
+		maxFrameSize:        maxFrameSize,
+		preAuthMaxFrameSize: preAuthMaxFrameSize,
+		ReadGate:            NewReadGate(),
+		WriteBackpressure:   NewWriteBackpressureGate(writeLowWaterMark, writeHighWaterMark),
+		priorityWrites:      make(chan queuedWrite, priorityWriteQueueCapacity),
 	}
 	if addr := netConn.RemoteAddr(); addr != nil {
 		conn.remoteAddress = addr.String()
@@ -263,7 +266,7 @@ func (c *Conn) run(handler Handler) {
 		frameLimit := c.maxFrameSize
 		preAuth := c.ClientName() == ""
 		if preAuth {
-			frameLimit = protocol.PreAuthMaxFrameSize
+			frameLimit = c.preAuthMaxFrameSize
 		}
 		command, body, err := protocol.ReadFrameLimit(reader, frameLimit)
 		if err != nil {

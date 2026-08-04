@@ -184,6 +184,9 @@ func (db *DB) ensureCompatibleColumns() error {
 		definition string
 	}{
 		{"specus_connection_record", "tenant_id", "VARCHAR(80)"},
+		{"specus_management_user", "oidc_issuer", "VARCHAR(255)"},
+		{"specus_management_user", "oidc_subject", "VARCHAR(255)"},
+		{"specus_management_user", "oidc_identity_key", "VARCHAR(64)"},
 		{"specus_connection_stat", "tenant_id", "VARCHAR(80)"},
 		{"specus_traffic_usage", "tenant_id", "VARCHAR(80)"},
 		{"specus_mapping", "detail_capture_enabled", boolType},
@@ -221,6 +224,10 @@ func (db *DB) ensureCompatibleColumns() error {
 		}
 	}
 	if err := db.ensurePostgresClientMessageCapabilityTypes(); err != nil {
+		return err
+	}
+	if err := db.ensureUniqueIndex("uq_management_user_oidc_identity_key",
+		"specus_management_user", "oidc_identity_key"); err != nil {
 		return err
 	}
 	if err := db.ensureIndex("idx_specus_connection_tenant", "specus_connection_record", "tenant_id"); err != nil {
@@ -356,6 +363,28 @@ func (db *DB) ensureIndex(indexName, table, columns string) error {
 	return nil
 }
 
+func (db *DB) ensureUniqueIndex(indexName, table, columns string) error {
+	if db.dialect == DialectMySQL {
+		var count int
+		query := `SELECT COUNT(*) FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`
+		if err := db.sql.QueryRow(query, table, indexName).Scan(&count); err != nil {
+			return fmt.Errorf("inspect unique index %s: %w", indexName, err)
+		}
+		if count > 0 {
+			return nil
+		}
+		if _, err := db.sql.Exec(fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s)", indexName, table, columns)); err != nil {
+			return fmt.Errorf("create unique index %s: %w", indexName, err)
+		}
+		return nil
+	}
+	if _, err := db.sql.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (%s)", indexName, table, columns)); err != nil {
+		return fmt.Errorf("create unique index %s: %w", indexName, err)
+	}
+	return nil
+}
+
 func (db *DB) ensureColumn(table, column, definition string) error {
 	exists, err := db.columnExists(table, column)
 	if err != nil {
@@ -396,14 +425,24 @@ func (db *DB) columnExists(table, column string) (bool, error) {
 			}
 		}
 		return false, rows.Err()
-	default:
+	case DialectPostgres:
 		query := db.rebind(`SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_name = ? AND column_name = ?`)
+			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`)
 		var count int
 		if err := db.sql.QueryRow(query, table, column).Scan(&count); err != nil {
 			return false, err
 		}
 		return count > 0, nil
+	case DialectMySQL:
+		query := db.rebind(`SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`)
+		var count int
+		if err := db.sql.QueryRow(query, table, column).Scan(&count); err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	default:
+		return false, fmt.Errorf("unsupported database dialect %q", db.dialect)
 	}
 }
 

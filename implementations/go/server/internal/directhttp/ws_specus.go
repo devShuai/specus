@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/gorilla/websocket"
 )
 
 // WS 流复用与 HTTPStream 相同的窗口尺寸（对齐 Java StreamFlowController 的默认值）。
@@ -51,7 +51,7 @@ type WebSocketSpecus struct {
 	sendOutstanding uint64
 	notifyWindow    chan struct{}
 
-	// 客户端->浏览器方向的分片重组状态：coder/websocket 只写完整消息，
+	// 客户端->浏览器方向的分片重组状态：gorilla/websocket 只写完整消息，
 	// 因此把 SWS2 分片缓冲到 FIN 后一次性写出，浏览器看到的仍是一条消息（与 Java 等价）。
 	fragmentOpcode int
 	fragmentBuffer []byte
@@ -59,8 +59,7 @@ type WebSocketSpecus struct {
 
 func NewWebSocketSpecus(conn *websocket.Conn, streamID uint32, clientName string,
 	sendData WSSendFunc, finish WSFinishFunc, onClosed WSClosedFunc) *WebSocketSpecus {
-	// coder/websocket 默认 32KB 读取上限会掐断大消息，放宽到与 Go client 一致的上限。
-	conn.SetReadLimit(wsMaxMessageBytes)
+	conn.SetReadLimit(int64(wsMaxMessageBytes))
 	return &WebSocketSpecus{
 		conn: conn, streamID: streamID, clientName: clientName,
 		sendData: sendData, finish: finish, onClosed: onClosed,
@@ -73,30 +72,30 @@ func NewWebSocketSpecus(conn *websocket.Conn, streamID uint32, clientName string
 func (t *WebSocketSpecus) StreamID() uint32 { return t.streamID }
 
 // ReadLoop 把浏览器 WS 消息封装成 SWS2 帧转发到客户端，直到任一端关闭后返回。
-// 浏览器的 ping/pong 由 coder/websocket 自动处理，不进入隧道。
+// Gorilla 端点自动以同 payload PONG 响应浏览器 PING；浏览器 PONG 由 read handler
+// 按原始 payload 编码为 SWS2 控制帧。
 func (t *WebSocketSpecus) ReadLoop(ctx context.Context) {
+	stopClose := context.AfterFunc(ctx, func() { _ = t.conn.Close() })
+	defer stopClose()
 	for {
-		typ, payload, err := t.conn.Read(ctx)
+		typ, payload, err := t.conn.ReadMessage()
 		if err != nil {
-			code := websocket.CloseStatus(err)
+			code := websocket.CloseInternalServerErr
 			reason := ""
-			var closeErr websocket.CloseError
+			var closeErr *websocket.CloseError
 			if errors.As(err, &closeErr) {
-				reason = closeErr.Reason
-			}
-			if code < 0 {
-				// 无关闭帧的传输错误，对齐 Java closeFromBrowser 的 SERVER_ERROR。
-				code = websocket.StatusInternalError
+				code = closeErr.Code
+				reason = closeErr.Text
 			}
 			t.closeFromBrowser(code, reason)
 			return
 		}
 		opcode := sws2OpcodeBinary
-		if typ == websocket.MessageText {
+		if typ == websocket.TextMessage {
 			opcode = sws2OpcodeText
 		}
 		if err := t.sendAppFrame(ctx, opcode, payload); err != nil {
-			t.closeFromBrowser(websocket.StatusInternalError, "")
+			t.closeFromBrowser(websocket.CloseInternalServerErr, "")
 			return
 		}
 	}
@@ -130,6 +129,17 @@ func (t *WebSocketSpecus) sendAppFrame(ctx context.Context, opcode byte, payload
 			return nil
 		}
 	}
+}
+
+func (t *WebSocketSpecus) sendControlFrame(ctx context.Context, opcode byte, payload []byte) error {
+	frame, err := encodeSWS2(opcode, true, 0, 0, append([]byte(nil), payload...))
+	if err != nil {
+		return err
+	}
+	if !t.takeSendCredit(ctx, len(frame)) {
+		return errWSSpecusClosed
+	}
+	return t.sendData(frame)
 }
 
 // WriteFrame 由 NAT 会话在收到客户端 DATA(streamID) 时调用：解码 SWS2、还原 WS 消息写回浏览器。
@@ -172,16 +182,15 @@ func (t *WebSocketSpecus) WriteFrame(ctx context.Context, data []byte) {
 			t.fragmentBuffer = nil
 		}
 	case sws2OpcodePing:
-		// coder/websocket 不支持自定义 ping payload，保留 ping 语义即可。
-		writeErr = t.conn.Ping(ctx)
+		writeErr = writeWebSocketControl(t.conn, ctx, sws2OpcodePing, frame.payload)
 	case sws2OpcodePong:
-		// 浏览器的 ping 由 coder/websocket 自动应答，不会产生需要转发的 PONG。
+		writeErr = writeWebSocketControl(t.conn, ctx, sws2OpcodePong, frame.payload)
 	case sws2OpcodeClose:
 		code := frame.closeCode
 		if code == 0 {
-			code = 1000
+			code = websocket.CloseNormalClosure
 		}
-		_ = t.conn.Close(websocket.StatusCode(code), string(frame.payload))
+		_ = closeWebSocket(t.conn, ctx, int(code), string(frame.payload))
 	default:
 		t.CloseFromClient()
 	}
@@ -191,10 +200,16 @@ func (t *WebSocketSpecus) WriteFrame(ctx context.Context, data []byte) {
 }
 
 func (t *WebSocketSpecus) writeMessage(ctx context.Context, opcode byte, payload []byte) error {
-	if opcode == sws2OpcodeText {
-		return t.conn.Write(ctx, websocket.MessageText, payload)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return t.conn.Write(ctx, websocket.MessageBinary, payload)
+	if err := t.conn.SetWriteDeadline(webSocketWriteDeadline(ctx)); err != nil {
+		return err
+	}
+	if opcode == sws2OpcodeText {
+		return t.conn.WriteMessage(websocket.TextMessage, payload)
+	}
+	return t.conn.WriteMessage(websocket.BinaryMessage, payload)
 }
 
 // CloseFromClient 客户端 FIN/RST：只关浏览器会话，不回送 FIN（对齐 Java closeFromClient）。
@@ -205,13 +220,13 @@ func (t *WebSocketSpecus) CloseFromClient() {
 
 // closeFromBrowser 浏览器侧关闭或写失败：向客户端发 SWS2 CLOSE + FIN 后关闭会话
 // （对齐 Java detachBrowser；close reason 截断到 123 字节）。
-func (t *WebSocketSpecus) closeFromBrowser(code websocket.StatusCode, reason string) {
+func (t *WebSocketSpecus) closeFromBrowser(code int, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), wsCloseSendTimeout)
 	defer cancel()
 	t.closeFromBrowserContext(ctx, code, reason)
 }
 
-func (t *WebSocketSpecus) closeFromBrowserContext(ctx context.Context, code websocket.StatusCode, reason string) {
+func (t *WebSocketSpecus) closeFromBrowserContext(ctx context.Context, code int, reason string) {
 	t.notifyOnce.Do(func() {
 		reasonBytes := []byte(reason)
 		if len(reasonBytes) > sws2MaxCloseReasonBytes {
@@ -232,7 +247,7 @@ func (t *WebSocketSpecus) Close() {
 	t.closeOnce.Do(func() {
 		close(t.done)
 		t.signalWindow()
-		_ = t.conn.Close(websocket.StatusGoingAway, "")
+		_ = closeWebSocket(t.conn, context.Background(), websocket.CloseGoingAway, "")
 		if t.onClosed != nil {
 			t.onClosed(t)
 		}

@@ -61,11 +61,14 @@ func (managementUserBitScanner) Scan(dest ...any) error {
 	*dest[0].(*string) = "test-user"
 	*dest[1].(*string) = "default"
 	*dest[2].(*string) = "hash"
-	*dest[3].(*string) = ManagementRoleUser
-	if err := dest[4].(sql.Scanner).Scan([]byte{1}); err != nil {
+	*dest[3].(*string) = ""
+	*dest[4].(*string) = ""
+	*dest[5].(*string) = ""
+	*dest[6].(*string) = ManagementRoleUser
+	if err := dest[7].(sql.Scanner).Scan([]byte{1}); err != nil {
 		return err
 	}
-	*dest[5].(*string) = "2026-07-23T00:00:00.0000000Z"
-	*dest[6].(*string) = "2026-07-23T00:00:00.0000000Z"
+	*dest[8].(*string) = "2026-07-23T00:00:00.0000000Z"
+	*dest[9].(*string) = "2026-07-23T00:00:00.0000000Z"
 	return nil
 }

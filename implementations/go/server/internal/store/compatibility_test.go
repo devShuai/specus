@@ -12,6 +12,40 @@ import (
 	"time"
 )
 
+func TestManagementUserOIDCColumnsUpgradeLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-management-user.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE specus_management_user (
+		username TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, password_hash TEXT NOT NULL,
+		role TEXT NOT NULL, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+	)`)
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("upgrade legacy management-user schema: %v", err)
+	}
+	defer db.Close()
+	for _, column := range []string{"oidc_issuer", "oidc_subject", "oidc_identity_key"} {
+		exists, err := db.columnExists("specus_management_user", column)
+		if err != nil || !exists {
+			t.Fatalf("OIDC column %s missing after upgrade: exists=%t err=%v", column, exists, err)
+		}
+	}
+	var indexCount int
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index' AND name = 'uq_management_user_oidc_identity_key'`).Scan(&indexCount); err != nil || indexCount != 1 {
+		t.Fatalf("OIDC identity unique index missing: count=%d err=%v", indexCount, err)
+	}
+}
+
 func TestClientAuthNonceSupportsLegacyJavaSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-java-nonce.db")
 	legacy, err := sql.Open("sqlite", path)

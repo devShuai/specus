@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -676,6 +677,38 @@ func (r *capturingTrafficRecorder) RecordHTTPDownload(_, _ string, bytes int64) 
 type staticRouteSettings struct {
 	policy *store.HTTPRouteAccessPolicy
 	err    error
+}
+
+type countingRouteSettings struct {
+	policy *store.HTTPRouteAccessPolicy
+	calls  atomic.Int32
+}
+
+func (s *countingRouteSettings) HTTPRouteAccessPolicy(context.Context, string, string) (*store.HTTPRouteAccessPolicy, error) {
+	s.calls.Add(1)
+	return s.policy, nil
+}
+
+func TestRoutePolicyCacheUsesConfiguredTTL(t *testing.T) {
+	routes := &countingRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true, PathRewriteEnabled: true}}
+	service := NewService(nil, nil, nil, time.Second, 1024, 1024, nil, routes, nil, store.TrafficDetailOptions{})
+	service.SetRouteCacheTTL(25 * time.Millisecond)
+	if _, err := service.routePolicy(context.Background(), "client", "route"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.routePolicy(context.Background(), "client", "route"); err != nil {
+		t.Fatal(err)
+	}
+	if got := routes.calls.Load(); got != 1 {
+		t.Fatalf("route lookup calls = %d, want 1 inside TTL", got)
+	}
+	time.Sleep(35 * time.Millisecond)
+	if _, err := service.routePolicy(context.Background(), "client", "route"); err != nil {
+		t.Fatal(err)
+	}
+	if got := routes.calls.Load(); got != 2 {
+		t.Fatalf("route lookup calls = %d, want refresh after TTL", got)
+	}
 }
 
 func (s *staticRouteSettings) HTTPRouteAccessPolicy(context.Context, string, string) (*store.HTTPRouteAccessPolicy, error) {

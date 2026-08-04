@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
@@ -24,6 +26,21 @@ func newDiagramTestServer(t *testing.T) (*httptest.Server, *security.LocalTokenS
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now()
+	for _, user := range []store.ManagementUser{
+		{Username: "alice", TenantID: "tenant-a"},
+		{Username: "bob", TenantID: "tenant-a"},
+		{Username: "carol", TenantID: "tenant-b"},
+	} {
+		user.PasswordHash = "test-password-hash"
+		user.Role = store.ManagementRoleUser
+		user.Enabled = true
+		user.CreatedAt = now
+		user.UpdatedAt = now
+		if err := db.InsertManagementUser(context.Background(), user); err != nil {
+			t.Fatal(err)
+		}
+	}
 	tokens := security.NewLocalTokenService(config.AuthConfig{JwtSecret: "diagram-test-secret"})
 	api := NewAPI(db, session.NewRegistry(), tokens, nil, nil, nil,
 		config.OidcConfig{}, config.AuthConfig{JwtSecret: "diagram-test-secret"},

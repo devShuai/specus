@@ -6,9 +6,11 @@ require (
 	github.com/andybalholm/brotli v1.2.1
 	github.com/coder/websocket v1.8.15
 	github.com/go-sql-driver/mysql v1.10.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/redis/go-redis/v9 v9.21.0
 	golang.org/x/crypto v0.49.0
+	golang.org/x/sys v0.42.0
 	golang.org/x/text v0.35.0
 	modernc.org/sqlite v1.52.0
 )
@@ -26,7 +28,6 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

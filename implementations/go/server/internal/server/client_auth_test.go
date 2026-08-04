@@ -54,6 +54,18 @@ func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {
 	}
 }
 
+func TestClientAuthAdvertisesTLSWhenTerminatedUpstream(t *testing.T) {
+	cfg := config.Default()
+	cfg.TLS.Mode = "disabled"
+	cfg.TLS.TerminatedUpstream = true
+	app, ts := newAPIServerWithConfig(t, cfg)
+	insertCredentialForTest(t, app, "default", "admin", "ck_upstream_tls", "tls-secret", 2)
+	decoded := clientAuthLoginForTest(t, ts.URL, "ck_upstream_tls", "tls-secret", "machine-tls", "alice")
+	if decoded.NettyTLS == nil || !*decoded.NettyTLS {
+		t.Fatalf("nettyTls should be true for trusted upstream termination, got %v", decoded.NettyTLS)
+	}
+}
+
 func TestClientAuthDatabaseFailureReturnsInternalServerError(t *testing.T) {
 	app, ts := newAPIServer(t)
 	if err := app.DB().Close(); err != nil {

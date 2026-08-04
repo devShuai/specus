@@ -1,11 +1,22 @@
 package nat
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
+
+type RemotePortOptions struct {
+	BossThreads   int
+	WorkerThreads int
+	SOBacklog     int
+	ReuseAddress  bool
+	KeepAlive     bool
+	TCPNoDelay    bool
+}
 
 // Limits captures the three-tier external-connection admission caps. A value <= 0 means
 // unlimited (matching the C# semantics).
@@ -22,6 +33,7 @@ type Limits struct {
 // including per-tenant active/rejected telemetry.
 type RemotePortManager struct {
 	globalMax int
+	options   RemotePortOptions
 
 	mu    sync.Mutex
 	ports map[int]*portListener
@@ -36,8 +48,18 @@ type RemotePortManager struct {
 
 // NewRemotePortManager builds a manager with the given global connection cap.
 func NewRemotePortManager(globalMax int) *RemotePortManager {
+	return NewRemotePortManagerWithOptions(globalMax, RemotePortOptions{
+		BossThreads: 1, SOBacklog: 8192, ReuseAddress: true, KeepAlive: true, TCPNoDelay: true,
+	})
+}
+
+func NewRemotePortManagerWithOptions(globalMax int, options RemotePortOptions) *RemotePortManager {
+	if options.BossThreads < 1 {
+		options.BossThreads = 1
+	}
 	return &RemotePortManager{
 		globalMax:        globalMax,
+		options:          options,
 		ports:            make(map[int]*portListener),
 		activeByTenant:   make(map[string]*atomic.Int64),
 		rejectedByTenant: make(map[string]*atomic.Int64),
@@ -54,11 +76,19 @@ func (m *RemotePortManager) Bind(port int, onAccept func(net.Conn)) (*portListen
 	}
 	m.mu.Unlock()
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	listenConfig := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
+		var optionErr error
+		if err := raw.Control(func(fd uintptr) { optionErr = setReuseAddress(fd, m.options.ReuseAddress) }); err != nil {
+			return err
+		}
+		return optionErr
+	}}
+	listener, err := listenConfig.Listen(context.Background(), "tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, fmt.Errorf("bind public port %d: %w", port, err)
 	}
-	pl := &portListener{port: port, listener: listener, onAccept: onAccept, done: make(chan struct{})}
+	pl := &portListener{port: port, listener: listener, onAccept: onAccept, done: make(chan struct{}),
+		bossThreads: m.options.BossThreads, keepAlive: m.options.KeepAlive, tcpNoDelay: m.options.TCPNoDelay}
 
 	m.mu.Lock()
 	if _, exists := m.ports[port]; exists {
@@ -69,7 +99,9 @@ func (m *RemotePortManager) Bind(port int, onAccept func(net.Conn)) (*portListen
 	m.ports[port] = pl
 	m.mu.Unlock()
 
-	go pl.acceptLoop()
+	for range pl.bossThreads {
+		go pl.acceptLoop()
+	}
 	return pl, nil
 }
 
@@ -206,11 +238,14 @@ func (m *RemotePortManager) RejectedExternalConnectionsByTenant(tenantID string)
 }
 
 type portListener struct {
-	port     int
-	listener net.Listener
-	onAccept func(net.Conn)
-	done     chan struct{}
-	once     sync.Once
+	port        int
+	listener    net.Listener
+	onAccept    func(net.Conn)
+	done        chan struct{}
+	once        sync.Once
+	bossThreads int
+	keepAlive   bool
+	tcpNoDelay  bool
 }
 
 func (pl *portListener) acceptLoop() {
@@ -225,8 +260,8 @@ func (pl *portListener) acceptLoop() {
 			}
 		}
 		if tcp, ok := conn.(*net.TCPConn); ok {
-			_ = tcp.SetNoDelay(true)
-			_ = tcp.SetKeepAlive(true)
+			_ = tcp.SetNoDelay(pl.tcpNoDelay)
+			_ = tcp.SetKeepAlive(pl.keepAlive)
 		}
 		go pl.onAccept(conn)
 	}

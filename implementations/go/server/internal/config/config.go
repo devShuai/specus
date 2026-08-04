@@ -37,17 +37,28 @@ type Config struct {
 
 // NettyConfig mirrors Specus:Netty.
 type NettyConfig struct {
-	Port                            int `json:"port"`
-	MaxFrameSize                    int `json:"maxFrameSize"`
-	WriteBufferLowWaterMark         int `json:"writeBufferLowWaterMark"`
-	WriteBufferHighWaterMark        int `json:"writeBufferHighWaterMark"`
-	MaxExternalConnections          int `json:"maxExternalConnections"`
-	MaxExternalConnectionsPerClient int `json:"maxExternalConnectionsPerClient"`
-	MaxExternalConnectionsPerPort   int `json:"maxExternalConnectionsPerPort"`
+	BindAddress                     string `json:"bindAddress"`
+	Port                            int    `json:"port"`
+	BossThreads                     int    `json:"bossThreads"`
+	WorkerThreads                   int    `json:"workerThreads"`
+	RemoteBossThreads               int    `json:"remoteBossThreads"`
+	RemoteWorkerThreads             int    `json:"remoteWorkerThreads"`
+	SOBacklog                       int    `json:"soBacklog"`
+	ReuseAddress                    bool   `json:"reuseAddress"`
+	KeepAlive                       bool   `json:"keepAlive"`
+	TCPNoDelay                      bool   `json:"tcpNoDelay"`
+	MaxFrameSize                    int    `json:"maxFrameSize"`
+	PreAuthMaxFrameSize             int    `json:"preAuthMaxFrameSize"`
+	WriteBufferLowWaterMark         int    `json:"writeBufferLowWaterMark"`
+	WriteBufferHighWaterMark        int    `json:"writeBufferHighWaterMark"`
+	MaxExternalConnections          int    `json:"maxExternalConnections"`
+	MaxExternalConnectionsPerClient int    `json:"maxExternalConnectionsPerClient"`
+	MaxExternalConnectionsPerPort   int    `json:"maxExternalConnectionsPerPort"`
 }
 
 // LoginConfig mirrors Specus:Login.
 type LoginConfig struct {
+	ExecutorCoreSize      int `json:"executorCoreSize"`
 	ExecutorMaxSize       int `json:"executorMaxSize"`
 	ExecutorQueueCapacity int `json:"executorQueueCapacity"`
 }
@@ -190,6 +201,7 @@ func ParseDataSizeBytes(value string, fallback int64) int64 {
 type DirectHTTPConfig struct {
 	TimeoutMs           int `json:"timeoutMs"`
 	MaxRequestBodySize  int `json:"maxRequestBodySize"`
+	RouteCacheTTLms     int `json:"routeCacheTtlMs"`
 	RewriteMaxBodyBytes int `json:"rewriteMaxBodyBytes"`
 }
 
@@ -267,6 +279,9 @@ type PeerMeshConfig struct {
 	RelayMaxPort                   int      `json:"relayMaxPort"`
 	RelayWorkerThreads             int      `json:"relayWorkerThreads"`
 	RelayWorkerQueueCapacity       int      `json:"relayWorkerQueueCapacity"`
+	UDPReceiveBufferBytes          int      `json:"udpReceiveBufferBytes"`
+	UDPSendBufferBytes             int      `json:"udpSendBufferBytes"`
+	UDPTrafficClass                int      `json:"udpTrafficClass"`
 	RelayTrafficFlushIntervalMs    int      `json:"relayTrafficFlushIntervalMs"`
 	TurnAuthRequired               bool     `json:"turnAuthRequired"`
 	TurnRealm                      string   `json:"turnRealm"`
@@ -327,6 +342,7 @@ type OidcConfig struct {
 	Issuer                string `json:"issuer"`
 	JwkSetURI             string `json:"jwkSetUri"`
 	AuthorizationEndpoint string `json:"authorizationEndpoint"`
+	RegistrationEndpoint  string `json:"registrationEndpoint"`
 	TokenEndpoint         string `json:"tokenEndpoint"`
 	EndSessionEndpoint    string `json:"endSessionEndpoint"`
 	ClientID              string `json:"clientId"`
@@ -339,27 +355,39 @@ type OidcConfig struct {
 
 // TLSConfig mirrors Specus:Tls. Mode is one of disabled|file|self-signed.
 type TLSConfig struct {
-	Mode             string `json:"mode"`
-	Keystore         string `json:"keystore"`
-	KeystorePassword string `json:"keystorePassword"`
-	CertFile         string `json:"certFile"`
-	KeyFile          string `json:"keyFile"`
-	KeyPassword      string `json:"keyPassword"`
+	Mode               string `json:"mode"`
+	Keystore           string `json:"keystore"`
+	KeystorePassword   string `json:"keystorePassword"`
+	CertFile           string `json:"certFile"`
+	KeyFile            string `json:"keyFile"`
+	KeyPassword        string `json:"keyPassword"`
+	RequireEncryption  bool   `json:"requireEncryption"`
+	TerminatedUpstream bool   `json:"terminatedUpstream"`
 }
 
 // Default returns the configuration with the same defaults as the C# appsettings.json.
 func Default() Config {
 	return Config{
 		Netty: NettyConfig{
+			BindAddress:                     "0.0.0.0",
 			Port:                            7010,
+			BossThreads:                     1,
+			WorkerThreads:                   0,
+			RemoteBossThreads:               1,
+			RemoteWorkerThreads:             0,
+			SOBacklog:                       8192,
+			ReuseAddress:                    true,
+			KeepAlive:                       true,
+			TCPNoDelay:                      true,
 			MaxFrameSize:                    32 * 1024 * 1024,
+			PreAuthMaxFrameSize:             16 * 1024,
 			WriteBufferLowWaterMark:         32 * 1024,
 			WriteBufferHighWaterMark:        64 * 1024,
 			MaxExternalConnections:          10000,
 			MaxExternalConnectionsPerClient: 10000,
 			MaxExternalConnectionsPerPort:   10000,
 		},
-		Login:    LoginConfig{ExecutorMaxSize: 32, ExecutorQueueCapacity: 20000},
+		Login:    LoginConfig{ExecutorCoreSize: 8, ExecutorMaxSize: 32, ExecutorQueueCapacity: 20000},
 		Database: DatabaseConfig{Provider: "sqlite", SeedDemoClient: true},
 		Auth: AuthConfig{
 			PasswordLoginEnabled: true,
@@ -412,6 +440,7 @@ func Default() Config {
 		HTTP: DirectHTTPConfig{
 			TimeoutMs:           30000,
 			MaxRequestBodySize:  16 * 1024 * 1024,
+			RouteCacheTTLms:     2000,
 			RewriteMaxBodyBytes: 10 * 1024 * 1024,
 		},
 		MediaCapture: MediaCaptureConfig{
@@ -439,6 +468,9 @@ func Default() Config {
 			RelayMinPort:                49152,
 			RelayMaxPort:                65535,
 			RelayWorkerQueueCapacity:    10000,
+			UDPReceiveBufferBytes:       4 * 1024 * 1024,
+			UDPSendBufferBytes:          4 * 1024 * 1024,
+			UDPTrafficClass:             16,
 			RelayTrafficFlushIntervalMs: 5000,
 			TurnAuthRequired:            true,
 			TurnRealm:                   "specus",
@@ -476,13 +508,14 @@ func Default() Config {
 			PairingCodeRedeemRateLimitWindowSeconds: 300,
 		},
 		Oidc: OidcConfig{
-			Issuer:                "https://gateway.toys.theshuai.com/auth",
-			JwkSetURI:             "https://gateway.toys.theshuai.com/auth/oauth2/jwks",
-			AuthorizationEndpoint: "https://gateway.toys.theshuai.com/auth/oauth2/authorize",
-			TokenEndpoint:         "https://gateway.toys.theshuai.com/auth/oauth2/token",
-			EndSessionEndpoint:    "https://gateway.toys.theshuai.com/auth/connect/logout",
+			Issuer:                "https://certus.devshuai.com",
+			JwkSetURI:             "https://certus.devshuai.com/oauth2/jwks",
+			AuthorizationEndpoint: "https://certus.devshuai.com/oauth2/authorize",
+			RegistrationEndpoint:  "https://certus.devshuai.com/register",
+			TokenEndpoint:         "https://certus.devshuai.com/oauth2/token",
+			EndSessionEndpoint:    "https://certus.devshuai.com/oauth2/logout",
 			RedirectURI:           "http://127.0.0.1:8088/",
-			Scope:                 "openid",
+			Scope:                 "openid profile email",
 			TenantClaim:           "tenant_id",
 		},
 		TLS:              TLSConfig{Mode: "disabled"},
@@ -508,6 +541,12 @@ func Load(path string) (Config, error) {
 	cfg.applyEnv(environMap())
 	if cfg.Netty.MaxFrameSize < 11 {
 		return Config{}, fmt.Errorf("netty.maxFrameSize must be at least the 11-byte frame header")
+	}
+	if cfg.Netty.PreAuthMaxFrameSize < 11 || cfg.Netty.PreAuthMaxFrameSize > cfg.Netty.MaxFrameSize {
+		return Config{}, fmt.Errorf("netty.preAuthMaxFrameSize must be between 11 and netty.maxFrameSize")
+	}
+	if cfg.Login.ExecutorCoreSize < 1 || cfg.Login.ExecutorMaxSize < cfg.Login.ExecutorCoreSize {
+		return Config{}, fmt.Errorf("login executor sizes must satisfy 1 <= coreSize <= maxSize")
 	}
 	if cfg.PublicTransfer.ClusterEnabled && strings.TrimSpace(cfg.PublicTransfer.RedisURI) == "" {
 		return Config{}, fmt.Errorf("publicTransfer.redisUri is required when clusterEnabled=true")
@@ -577,14 +616,26 @@ func (cfg *Config) applyEnv(env map[string]string) {
 		}
 	}
 
+	setStr("SPECUS_NETTY_BIND_ADDRESS", &cfg.Netty.BindAddress)
 	setInt("SPECUS_NETTY_PORT", &cfg.Netty.Port)
+	setInt("SPECUS_NETTY_BOSS_THREADS", &cfg.Netty.BossThreads)
+	setInt("SPECUS_NETTY_WORKER_THREADS", &cfg.Netty.WorkerThreads)
+	setInt("SPECUS_NETTY_REMOTE_BOSS_THREADS", &cfg.Netty.RemoteBossThreads)
+	setInt("SPECUS_NETTY_REMOTE_WORKER_THREADS", &cfg.Netty.RemoteWorkerThreads)
+	setInt("SPECUS_NETTY_SO_BACKLOG", &cfg.Netty.SOBacklog)
+	setBool("SPECUS_NETTY_REUSE_ADDRESS", &cfg.Netty.ReuseAddress)
+	setBool("SPECUS_NETTY_KEEP_ALIVE", &cfg.Netty.KeepAlive)
+	setBool("SPECUS_NETTY_TCP_NO_DELAY", &cfg.Netty.TCPNoDelay)
 	setInt("SPECUS_NETTY_MAX_FRAME_SIZE", &cfg.Netty.MaxFrameSize)
+	setInt("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE", &cfg.Netty.PreAuthMaxFrameSize)
 	setInt("SPECUS_NETTY_WRITE_BUFFER_LOW_WATER_MARK", &cfg.Netty.WriteBufferLowWaterMark)
 	setInt("SPECUS_NETTY_WRITE_BUFFER_HIGH_WATER_MARK", &cfg.Netty.WriteBufferHighWaterMark)
 	setInt("SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS", &cfg.Netty.MaxExternalConnections)
 	setInt("SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT", &cfg.Netty.MaxExternalConnectionsPerClient)
 	setInt("SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT", &cfg.Netty.MaxExternalConnectionsPerPort)
 
+	setInt("SPECUS_LOGIN_EXECUTOR_CORE_SIZE", &cfg.Login.ExecutorCoreSize)
+	setInt("SPECUS_LOGIN_EXECUTOR_CORE", &cfg.Login.ExecutorCoreSize)
 	setInt("SPECUS_LOGIN_EXECUTOR_MAX_SIZE", &cfg.Login.ExecutorMaxSize)
 	setInt("SPECUS_LOGIN_EXECUTOR_QUEUE_CAPACITY", &cfg.Login.ExecutorQueueCapacity)
 	setInt("SPECUS_LOGIN_EXECUTOR_MAX", &cfg.Login.ExecutorMaxSize)
@@ -649,6 +700,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 
 	setInt("SPECUS_HTTP_TIMEOUT_MS", &cfg.HTTP.TimeoutMs)
 	setInt("SPECUS_HTTP_MAX_REQUEST_BODY_SIZE", &cfg.HTTP.MaxRequestBodySize)
+	setInt("SPECUS_HTTP_ROUTE_CACHE_TTL_MS", &cfg.HTTP.RouteCacheTTLms)
 	setInt("SPECUS_HTTP_REWRITE_MAX_BODY_BYTES", &cfg.HTTP.RewriteMaxBodyBytes)
 
 	setBool("SPECUS_MEDIA_CAPTURE_ENABLED", &cfg.MediaCapture.Enabled)
@@ -693,6 +745,9 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("SPECUS_PEER_MESH_RELAY_MAX_PORT", &cfg.PeerMesh.RelayMaxPort)
 	setInt("SPECUS_PEER_MESH_RELAY_WORKER_THREADS", &cfg.PeerMesh.RelayWorkerThreads)
 	setInt("SPECUS_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", &cfg.PeerMesh.RelayWorkerQueueCapacity)
+	setInt("SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES", &cfg.PeerMesh.UDPReceiveBufferBytes)
+	setInt("SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES", &cfg.PeerMesh.UDPSendBufferBytes)
+	setInt("SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS", &cfg.PeerMesh.UDPTrafficClass)
 	setInt("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", &cfg.PeerMesh.RelayTrafficFlushIntervalMs)
 	setBool("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", &cfg.PeerMesh.TurnAuthRequired)
 	setStr("SPECUS_PEER_MESH_TURN_REALM", &cfg.PeerMesh.TurnRealm)
@@ -738,6 +793,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("SPECUS_OIDC_ISSUER", &cfg.Oidc.Issuer)
 	setStr("SPECUS_OIDC_JWK_SET_URI", &cfg.Oidc.JwkSetURI)
 	setStr("SPECUS_OIDC_AUTHORIZATION_ENDPOINT", &cfg.Oidc.AuthorizationEndpoint)
+	setStr("SPECUS_OIDC_REGISTRATION_ENDPOINT", &cfg.Oidc.RegistrationEndpoint)
 	setStr("SPECUS_OIDC_TOKEN_ENDPOINT", &cfg.Oidc.TokenEndpoint)
 	setStr("SPECUS_OIDC_END_SESSION_ENDPOINT", &cfg.Oidc.EndSessionEndpoint)
 	setStr("SPECUS_OIDC_CLIENT_ID", &cfg.Oidc.ClientID)
@@ -753,6 +809,8 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("SPECUS_TLS_CERT_FILE", &cfg.TLS.CertFile)
 	setStr("SPECUS_TLS_KEY_FILE", &cfg.TLS.KeyFile)
 	setStr("SPECUS_TLS_KEY_PASSWORD", &cfg.TLS.KeyPassword)
+	setBool("SPECUS_TLS_REQUIRE_ENCRYPTION", &cfg.TLS.RequireEncryption)
+	setBool("SPECUS_TLS_TERMINATED_UPSTREAM", &cfg.TLS.TerminatedUpstream)
 
 	setStr("SPECUS_PUBLIC_ADDRESS", &cfg.PublicAddress)
 	setStr("SPECUS_MANAGEMENT_ADDR", &cfg.ManagementAddr)

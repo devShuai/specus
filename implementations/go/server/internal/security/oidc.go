@@ -3,10 +3,12 @@ package security
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -17,8 +19,17 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
-// clockSkew is the allowed leeway when checking token exp/nbf.
-const clockSkew = 60 * time.Second
+const (
+	// clockSkew is the allowed leeway when checking token exp/nbf.
+	clockSkew = 60 * time.Second
+	// A JWKS is configuration data, not an unbounded download. One MiB leaves ample room for
+	// normal rotation sets while preventing a compromised endpoint from exhausting memory.
+	maxJWKSResponseBytes = 1 << 20
+	maxNegativeKids      = 4096
+	maxOIDCKeyIDBytes    = 256
+	jwksRefreshTimeout   = 10 * time.Second
+	jwksOverlapTTL       = 5 * time.Minute
+)
 
 // OidcValidator verifies RS256 access tokens against the IdP's JWKS, mirroring the C#
 // OidcTokenValidator. JWKS keys are cached and force-refreshed on a signature miss.
@@ -27,24 +38,73 @@ type OidcValidator struct {
 	httpClient *http.Client
 
 	mu       sync.Mutex
-	keys     map[string]*rsa.PublicKey
+	keys     oidcKeySet
 	fetched  time.Time
 	cacheTTL time.Duration
+
+	// overlapKeys retains only the immediately previous JWKS generation, and only for a
+	// fixed window. Re-fetching the same current generation must not extend this deadline.
+	overlapKeys    oidcKeySet
+	overlapExpires time.Time
+	overlapTTL     time.Duration
+
+	refreshDone     chan struct{}
+	lastRefresh     time.Time
+	refreshCooldown time.Duration
+	refreshTimeout  time.Duration
+	negativeKids    map[string]time.Time
+	negativeTTL     time.Duration
+}
+
+// oidcKeySet preserves duplicate and absent key IDs so missing-kid selection matches Nimbus:
+// a missing header kid considers every key, while a present kid (including "") matches exactly.
+type oidcKeySet struct {
+	byID      map[string][]*rsa.PublicKey
+	anonymous []*rsa.PublicKey
+	all       []*rsa.PublicKey
+}
+
+func newOIDCKeySet() oidcKeySet {
+	return oidcKeySet{byID: make(map[string][]*rsa.PublicKey)}
+}
+
+func (s *oidcKeySet) addNamed(kid string, key *rsa.PublicKey) {
+	s.byID[kid] = append(s.byID[kid], key)
+	s.all = append(s.all, key)
+}
+
+func (s *oidcKeySet) addAnonymous(key *rsa.PublicKey) {
+	s.anonymous = append(s.anonymous, key)
+	s.all = append(s.all, key)
 }
 
 // OidcIdentity is the normalized identity extracted from a verified OIDC token.
 type OidcIdentity struct {
-	Username string
-	TenantID string
+	// Username is deliberately the immutable JWT subject.  The Java resource-server
+	// path uses Jwt.getSubject() for authorization; preferred_username is only used
+	// when an authorization-code login is linked to a local management user.
+	Username          string
+	Subject           string
+	PreferredUsername string
+	Issuer            string
+	TenantID          string
+	Role              string
+	Nonce             string
 }
 
 // NewOidcValidator builds an OIDC validator.
 func NewOidcValidator(cfg config.OidcConfig) *OidcValidator {
 	return &OidcValidator{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		keys:       make(map[string]*rsa.PublicKey),
-		cacheTTL:   5 * time.Minute,
+		cfg:             cfg,
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		keys:            newOIDCKeySet(),
+		cacheTTL:        5 * time.Minute,
+		overlapKeys:     newOIDCKeySet(),
+		overlapTTL:      jwksOverlapTTL,
+		refreshCooldown: 10 * time.Second,
+		refreshTimeout:  jwksRefreshTimeout,
+		negativeKids:    make(map[string]time.Time),
+		negativeTTL:     30 * time.Second,
 	}
 }
 
@@ -62,6 +122,26 @@ func (v *OidcValidator) Validate(ctx context.Context, token string) (string, boo
 
 // ValidateIdentity verifies an RS256 token and returns the normalized username and tenant claim.
 func (v *OidcValidator) ValidateIdentity(ctx context.Context, token string) (OidcIdentity, bool) {
+	if strings.TrimSpace(v.cfg.Issuer) == "" || strings.TrimSpace(v.cfg.Audience) == "" {
+		return OidcIdentity{}, false
+	}
+	// Match Java's StringUtils.hasText gate followed by validators built with the original
+	// configuration value: surrounding whitespace makes a value present, but is significant.
+	return v.validateIdentity(ctx, token, v.cfg.Audience, "", false, false)
+}
+
+// ValidateIDToken verifies the ID token returned by the authorization-code flow.  In addition
+// to the resource-token checks it binds the response to the browser nonce and always requires the
+// OIDC client id as the ID-token audience. Multi-audience ID tokens must also carry a matching azp.
+func (v *OidcValidator) ValidateIDToken(ctx context.Context, token, expectedNonce string) (OidcIdentity, bool) {
+	if strings.TrimSpace(v.cfg.Issuer) == "" || strings.TrimSpace(v.cfg.ClientID) == "" {
+		return OidcIdentity{}, false
+	}
+	return v.validateIdentity(ctx, token, v.cfg.ClientID, expectedNonce, true, true)
+}
+
+func (v *OidcValidator) validateIdentity(ctx context.Context, token, expectedAudience, expectedNonce string,
+	requireNonce, requireAuthorizedParty bool) (OidcIdentity, bool) {
 	if !v.Configured() {
 		return OidcIdentity{}, false
 	}
@@ -73,7 +153,16 @@ func (v *OidcValidator) ValidateIdentity(ctx context.Context, token string) (Oid
 	if err != nil || header["alg"] != "RS256" {
 		return OidcIdentity{}, false
 	}
-	kid, _ := header["kid"].(string)
+	kid := ""
+	kidPresent := false
+	if rawKid, present := header["kid"]; present && rawKid != nil {
+		var ok bool
+		kid, ok = rawKid.(string)
+		if !ok {
+			return OidcIdentity{}, false
+		}
+		kidPresent = true
+	}
 
 	signingInput := parts[0] + "." + parts[1]
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
@@ -81,11 +170,11 @@ func (v *OidcValidator) ValidateIdentity(ctx context.Context, token string) (Oid
 		return OidcIdentity{}, false
 	}
 
-	key := v.lookupKey(ctx, kid, false)
-	if key == nil || !verifyRS256(key, signingInput, signature) {
+	keys := v.lookupKeys(ctx, kid, kidPresent, false)
+	if !verifyRS256Candidates(keys, signingInput, signature) {
 		// Force-refresh once in case of key rotation.
-		key = v.lookupKey(ctx, kid, true)
-		if key == nil || !verifyRS256(key, signingInput, signature) {
+		keys = v.lookupKeys(ctx, kid, kidPresent, true)
+		if !verifyRS256Candidates(keys, signingInput, signature) {
 			return OidcIdentity{}, false
 		}
 	}
@@ -94,31 +183,56 @@ func (v *OidcValidator) ValidateIdentity(ctx context.Context, token string) (Oid
 	if err != nil {
 		return OidcIdentity{}, false
 	}
-	if !v.validClaims(claims) {
+	if !v.validClaims(claims, expectedAudience, requireAuthorizedParty) {
 		return OidcIdentity{}, false
 	}
-	username := claimSubject(claims)
-	if username == "" {
+	subject := claimAsString(claims, "sub")
+	issuer := claimAsString(claims, "iss")
+	if subject == "" || issuer == "" {
+		return OidcIdentity{}, false
+	}
+	// nonce is an opaque browser binding value. Keep the signed claim and request bytes intact;
+	// trimming either side would accept a value that Java's exact comparison rejects.
+	nonce := claimAsRawString(claims, "nonce")
+	if requireNonce && !constantTimeStringEqual(expectedNonce, nonce) {
 		return OidcIdentity{}, false
 	}
 	return OidcIdentity{
-		Username: username,
-		TenantID: claimAsString(claims, tenantClaimName(v.cfg.TenantClaim)),
+		Username:          subject,
+		Subject:           subject,
+		PreferredUsername: claimAsString(claims, "preferred_username"),
+		Issuer:            issuer,
+		TenantID:          claimAsString(claims, tenantClaimName(v.cfg.TenantClaim)),
+		Role:              claimAsString(claims, "role"),
+		Nonce:             nonce,
 	}, true
 }
 
-func (v *OidcValidator) validClaims(claims map[string]any) bool {
-	if iss, _ := claims["iss"].(string); strings.TrimSpace(v.cfg.Issuer) != "" && iss != v.cfg.Issuer {
+func (v *OidcValidator) validClaims(claims map[string]any, expectedAudience string,
+	requireAuthorizedParty bool) bool {
+	if strings.TrimSpace(v.cfg.Issuer) == "" {
 		return false
 	}
-	if aud := strings.TrimSpace(v.cfg.Audience); aud != "" && !audienceContains(claims["aud"], aud) {
+	if iss, _ := claims["iss"].(string); iss != v.cfg.Issuer {
 		return false
 	}
-	now := time.Now()
-	if exp, ok := claims["exp"].(float64); ok {
-		if now.After(time.Unix(int64(exp), 0).Add(clockSkew)) {
+	if strings.TrimSpace(expectedAudience) == "" || !audienceContains(claims["aud"], expectedAudience) {
+		return false
+	}
+	if requireAuthorizedParty {
+		// Java treats a missing, empty, or whitespace-only azp as absent for a single-audience
+		// ID token. If azp has text, or if aud has multiple entries, comparison stays exact.
+		azp := claimAsRawString(claims, "azp")
+		multipleAudiences := audienceCount(claims["aud"]) > 1
+		if (multipleAudiences && azp != expectedAudience) ||
+			(strings.TrimSpace(azp) != "" && azp != expectedAudience) {
 			return false
 		}
+	}
+	now := time.Now()
+	exp, ok := claims["exp"].(float64)
+	if !ok || now.After(time.Unix(int64(exp), 0).Add(clockSkew)) {
+		return false
 	}
 	if nbf, ok := claims["nbf"].(float64); ok {
 		if now.Before(time.Unix(int64(nbf), 0).Add(-clockSkew)) {
@@ -129,54 +243,271 @@ func (v *OidcValidator) validClaims(claims map[string]any) bool {
 }
 
 func (v *OidcValidator) lookupKey(ctx context.Context, kid string, forceRefresh bool) *rsa.PublicKey {
-	v.mu.Lock()
-	stale := forceRefresh || time.Since(v.fetched) > v.cacheTTL || len(v.keys) == 0
-	if !stale {
-		key := v.keys[kid]
-		v.mu.Unlock()
-		return key
-	}
-	v.mu.Unlock()
-
-	keys, err := v.fetchJWKS(ctx)
-	if err != nil {
+	keys := v.lookupKeys(ctx, kid, true, forceRefresh)
+	if len(keys) == 0 {
 		return nil
 	}
-	v.mu.Lock()
-	v.keys = keys
-	v.fetched = time.Now()
-	key := v.keys[kid]
-	v.mu.Unlock()
-	return key
+	return keys[0]
 }
 
-func (v *OidcValidator) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKey, error) {
+func (v *OidcValidator) lookupKeys(ctx context.Context, kid string, kidPresent, forceRefresh bool) []*rsa.PublicKey {
+	// A missing kid intentionally selects every already-filtered RSA/RS256 signing key, matching
+	// Nimbus JWKMatcher.forJWSHeader. A present kid (including "") remains an exact match.
+	if kidPresent && len(kid) > maxOIDCKeyIDBytes {
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
+		now := time.Now()
+		v.mu.Lock()
+		v.pruneOverlapLocked(now)
+		keys := v.keyCandidatesLocked(kid, kidPresent)
+		stale := v.fetched.IsZero() || now.Sub(v.fetched) > v.cacheTTL || len(v.keys.all) == 0
+		if expires, found := v.negativeKids[kid]; kidPresent && found {
+			if len(keys) == 0 && now.Before(expires) && !stale {
+				v.mu.Unlock()
+				return nil
+			}
+			delete(v.negativeKids, kid)
+		}
+		if !forceRefresh && !stale {
+			v.mu.Unlock()
+			return keys
+		}
+		if v.refreshDone != nil {
+			done := v.refreshDone
+			v.mu.Unlock()
+			if !waitForJWKSRefresh(ctx, done) {
+				return nil
+			}
+			// Consume the completed shared refresh instead of starting a second one.
+			forceRefresh = false
+			continue
+		}
+		if !v.lastRefresh.IsZero() && now.Sub(v.lastRefresh) < v.refreshCooldown {
+			if kidPresent && len(keys) == 0 {
+				v.cacheNegativeKidLocked(kid, now)
+			}
+			v.mu.Unlock()
+			return keys
+		}
+		done := make(chan struct{})
+		v.refreshDone = done
+		v.mu.Unlock()
+
+		// The shared refresh has a server-owned bounded lifetime. The request that happened to
+		// win singleflight may disconnect without cancelling the refresh for every other waiter.
+		go v.refreshJWKS(done, kid, kidPresent)
+		if !waitForJWKSRefresh(ctx, done) {
+			return nil
+		}
+		forceRefresh = false
+	}
+}
+
+func waitForJWKSRefresh(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-done:
+		return true
+	}
+}
+
+func (v *OidcValidator) refreshJWKS(done chan struct{}, requestedKid string, requestedKidPresent bool) {
+	timeout := v.refreshTimeout
+	if timeout <= 0 {
+		timeout = jwksRefreshTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	keys, err := v.fetchJWKS(ctx)
+	cancel()
+	completed := time.Now()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	// lastRefresh is deliberately the completion time: a slow IdP request must receive a full
+	// cooldown after it finishes, while a cancelled HTTP caller cannot poison this timestamp.
+	v.lastRefresh = completed
+	if err == nil {
+		v.installJWKSLocked(keys, completed)
+		v.fetched = completed
+		v.negativeKids = make(map[string]time.Time)
+	}
+	v.pruneOverlapLocked(completed)
+	if requestedKidPresent && len(v.keyCandidatesLocked(requestedKid, true)) == 0 {
+		v.cacheNegativeKidLocked(requestedKid, completed)
+	}
+	if v.refreshDone == done {
+		v.refreshDone = nil
+	}
+	close(done)
+}
+
+func (v *OidcValidator) installJWKSLocked(keys oidcKeySet, now time.Time) {
+	v.pruneOverlapLocked(now)
+	if oidcKeySetsEqual(v.keys, keys) {
+		// A cache revalidation is not a new generation. Keep the original overlap deadline so
+		// unknown-kid traffic cannot keep retired signing keys alive indefinitely.
+		v.keys = keys
+		return
+	}
+	previous := previousOIDCKeyGeneration(v.keys, keys)
+	v.keys = keys
+	v.overlapKeys = previous
+	if len(previous.all) == 0 || v.overlapTTL <= 0 {
+		v.overlapKeys = newOIDCKeySet()
+		v.overlapExpires = time.Time{}
+		return
+	}
+	v.overlapExpires = now.Add(v.overlapTTL)
+}
+
+func (v *OidcValidator) keyCandidatesLocked(kid string, kidPresent bool) []*rsa.PublicKey {
+	if kidPresent {
+		if keys := v.keys.byID[kid]; len(keys) > 0 {
+			return append([]*rsa.PublicKey(nil), keys...)
+		}
+		return append([]*rsa.PublicKey(nil), v.overlapKeys.byID[kid]...)
+	}
+	keys := make([]*rsa.PublicKey, 0, len(v.keys.all)+len(v.overlapKeys.all))
+	// Current keys are always attempted before the bounded previous generation.
+	keys = append(keys, v.keys.all...)
+	keys = append(keys, v.overlapKeys.all...)
+	return keys
+}
+
+func verifyRS256Candidates(keys []*rsa.PublicKey, signingInput string, signature []byte) bool {
+	for _, key := range keys {
+		if verifyRS256(key, signingInput, signature) {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *OidcValidator) pruneOverlapLocked(now time.Time) {
+	if v.overlapExpires.IsZero() || now.Before(v.overlapExpires) {
+		return
+	}
+	v.overlapKeys = newOIDCKeySet()
+	v.overlapExpires = time.Time{}
+}
+
+func oidcKeySetsEqual(left, right oidcKeySet) bool {
+	if len(left.all) != len(right.all) {
+		return false
+	}
+	leftCounts := oidcKeyFingerprintCounts(left)
+	for fingerprint, count := range oidcKeyFingerprintCounts(right) {
+		if leftCounts[fingerprint] != count {
+			return false
+		}
+	}
+	return true
+}
+
+func previousOIDCKeyGeneration(current, next oidcKeySet) oidcKeySet {
+	previous := newOIDCKeySet()
+	for kid, keys := range current.byID {
+		if _, stillCurrent := next.byID[kid]; stillCurrent {
+			continue
+		}
+		for _, key := range keys {
+			previous.addNamed(kid, key)
+		}
+	}
+	nextAnonymous := make(map[string]int)
+	for _, key := range next.anonymous {
+		nextAnonymous[rsaKeyFingerprint(key)]++
+	}
+	for _, key := range current.anonymous {
+		fingerprint := rsaKeyFingerprint(key)
+		if nextAnonymous[fingerprint] > 0 {
+			nextAnonymous[fingerprint]--
+			continue
+		}
+		previous.addAnonymous(key)
+	}
+	return previous
+}
+
+func oidcKeyFingerprintCounts(keys oidcKeySet) map[string]int {
+	counts := make(map[string]int, len(keys.all))
+	for kid, candidates := range keys.byID {
+		for _, key := range candidates {
+			counts[fmt.Sprintf("named:%d:%s:%s", len(kid), kid, rsaKeyFingerprint(key))]++
+		}
+	}
+	for _, key := range keys.anonymous {
+		counts["anonymous:"+rsaKeyFingerprint(key)]++
+	}
+	return counts
+}
+
+func rsaKeyFingerprint(key *rsa.PublicKey) string {
+	if key == nil || key.N == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%x:%d", key.N.Bytes(), key.E)
+}
+
+func (v *OidcValidator) cacheNegativeKidLocked(kid string, now time.Time) {
+	if len(v.negativeKids) >= maxNegativeKids {
+		for cachedKid, expires := range v.negativeKids {
+			if !now.Before(expires) {
+				delete(v.negativeKids, cachedKid)
+			}
+		}
+		if len(v.negativeKids) >= maxNegativeKids {
+			return
+		}
+	}
+	v.negativeKids[kid] = now.Add(v.negativeTTL)
+}
+
+func (v *OidcValidator) fetchJWKS(ctx context.Context) (oidcKeySet, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.cfg.JwkSetURI, nil)
 	if err != nil {
-		return nil, err
+		return oidcKeySet{}, err
 	}
 	resp, err := v.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return oidcKeySet{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("jwks status %d", resp.StatusCode)
+		return oidcKeySet{}, fmt.Errorf("jwks status %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxJWKSResponseBytes {
+		return oidcKeySet{}, errors.New("jwks response exceeds size limit")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSResponseBytes+1))
+	if err != nil {
+		return oidcKeySet{}, err
+	}
+	if len(body) > maxJWKSResponseBytes {
+		return oidcKeySet{}, errors.New("jwks response exceeds size limit")
 	}
 	var jwks struct {
 		Keys []struct {
-			Kty string `json:"kty"`
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
+			Kty string  `json:"kty"`
+			Kid *string `json:"kid"`
+			Alg string  `json:"alg"`
+			Use string  `json:"use"`
+			N   string  `json:"n"`
+			E   string  `json:"e"`
 		} `json:"keys"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &jwks); err != nil {
+		return oidcKeySet{}, err
 	}
-	keys := make(map[string]*rsa.PublicKey)
+	keys := newOIDCKeySet()
 	for _, k := range jwks.Keys {
-		if k.Kty != "RSA" {
+		if k.Kty != "RSA" ||
+			(k.Alg != "" && k.Alg != "RS256") || (k.Use != "" && k.Use != "sig") {
 			continue
 		}
 		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
@@ -187,8 +518,24 @@ func (v *OidcValidator) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKe
 		if err != nil {
 			continue
 		}
-		key := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: int(new(big.Int).SetBytes(eBytes).Int64())}
-		keys[k.Kid] = key
+		modulus := new(big.Int).SetBytes(nBytes)
+		exponent := new(big.Int).SetBytes(eBytes)
+		if modulus.BitLen() < 2048 || !exponent.IsInt64() {
+			continue
+		}
+		e := exponent.Int64()
+		if e < 3 || e%2 == 0 || int64(int(e)) != e {
+			continue
+		}
+		key := &rsa.PublicKey{N: modulus, E: int(e)}
+		if k.Kid == nil {
+			keys.addAnonymous(key)
+		} else {
+			keys.addNamed(*k.Kid, key)
+		}
+	}
+	if len(keys.all) == 0 {
+		return oidcKeySet{}, errors.New("jwks contains no usable signing keys")
 	}
 	return keys, nil
 }
@@ -196,20 +543,24 @@ func (v *OidcValidator) fetchJWKS(ctx context.Context) (map[string]*rsa.PublicKe
 // ExchangeRequest carries the authorization-code exchange inputs.
 type ExchangeRequest struct {
 	Code         string
-	RedirectURI  string
 	CodeVerifier string
+	Nonce        string
 }
 
 // ExchangeResponse is the token-exchange result returned to the SPA.
 type ExchangeResponse struct {
-	AccessToken string `json:"accessToken"`
-	IDToken     string `json:"idToken,omitempty"`
-	TokenType   string `json:"tokenType"`
-	ExpiresIn   int64  `json:"expiresIn"`
+	AccessToken string       `json:"accessToken"`
+	IDToken     string       `json:"idToken,omitempty"`
+	TokenType   string       `json:"tokenType"`
+	ExpiresIn   int64        `json:"expiresIn"`
+	Identity    OidcIdentity `json:"-"`
 }
 
 // ErrOidcNotConfigured is returned when token exchange is attempted without configuration.
 var ErrOidcNotConfigured = errors.New("OIDC 未配置")
+
+// ErrOidcInvalidExchange is returned for malformed inputs or an unverifiable ID token.
+var ErrOidcInvalidExchange = errors.New("OIDC 授权响应无效")
 
 // Exchange performs the OAuth2 authorization_code token exchange against the IdP. Confidential
 // clients use HTTP Basic auth; public clients send client_id in the form. Mirrors the C#
@@ -218,17 +569,15 @@ func (v *OidcValidator) Exchange(ctx context.Context, request ExchangeRequest) (
 	if strings.TrimSpace(v.cfg.ClientID) == "" || strings.TrimSpace(v.cfg.TokenEndpoint) == "" {
 		return ExchangeResponse{}, ErrOidcNotConfigured
 	}
+	if strings.TrimSpace(request.Code) == "" || strings.TrimSpace(request.CodeVerifier) == "" ||
+		strings.TrimSpace(request.Nonce) == "" || strings.TrimSpace(v.cfg.RedirectURI) == "" {
+		return ExchangeResponse{}, ErrOidcInvalidExchange
+	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", request.Code)
-	redirect := request.RedirectURI
-	if redirect == "" {
-		redirect = v.cfg.RedirectURI
-	}
-	form.Set("redirect_uri", redirect)
-	if request.CodeVerifier != "" {
-		form.Set("code_verifier", request.CodeVerifier)
-	}
+	form.Set("redirect_uri", v.cfg.RedirectURI)
+	form.Set("code_verifier", request.CodeVerifier)
 	confidential := strings.TrimSpace(v.cfg.ClientSecret) != ""
 	if !confidential {
 		form.Set("client_id", v.cfg.ClientID)
@@ -249,7 +598,7 @@ func (v *OidcValidator) Exchange(ctx context.Context, request ExchangeRequest) (
 		return ExchangeResponse{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return ExchangeResponse{}, fmt.Errorf("token endpoint status %d", resp.StatusCode)
 	}
 	var body struct {
@@ -261,6 +610,13 @@ func (v *OidcValidator) Exchange(ctx context.Context, request ExchangeRequest) (
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return ExchangeResponse{}, err
 	}
+	if strings.TrimSpace(body.IDToken) == "" {
+		return ExchangeResponse{}, ErrOidcInvalidExchange
+	}
+	identity, ok := v.ValidateIDToken(ctx, body.IDToken, request.Nonce)
+	if !ok {
+		return ExchangeResponse{}, ErrOidcInvalidExchange
+	}
 	tokenType := body.TokenType
 	if tokenType == "" {
 		tokenType = "Bearer"
@@ -270,6 +626,7 @@ func (v *OidcValidator) Exchange(ctx context.Context, request ExchangeRequest) (
 		IDToken:     body.IDToken,
 		TokenType:   tokenType,
 		ExpiresIn:   body.ExpiresIn,
+		Identity:    identity,
 	}, nil
 }
 
@@ -299,13 +656,22 @@ func audienceContains(aud any, want string) bool {
 	return false
 }
 
-func claimSubject(claims map[string]any) string {
-	for _, key := range []string{"preferred_username", "name", "sub"} {
-		if value := claimAsString(claims, key); value != "" {
-			return value
+func audienceCount(aud any) int {
+	switch v := aud.(type) {
+	case string:
+		if v != "" {
+			return 1
 		}
+	case []any:
+		count := 0
+		for _, entry := range v {
+			if value, ok := entry.(string); ok && value != "" {
+				count++
+			}
+		}
+		return count
 	}
-	return ""
+	return 0
 }
 
 func tenantClaimName(value string) string {
@@ -315,16 +681,27 @@ func tenantClaimName(value string) string {
 	return "tenant_id"
 }
 
+func constantTimeStringEqual(expected, actual string) bool {
+	if expected == "" || actual == "" || len(expected) != len(actual) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+}
+
 func claimAsString(claims map[string]any, key string) string {
+	return strings.TrimSpace(claimAsRawString(claims, key))
+}
+
+func claimAsRawString(claims map[string]any, key string) string {
 	value, ok := claims[key]
 	if !ok || value == nil {
 		return ""
 	}
 	switch typed := value.(type) {
 	case string:
-		return strings.TrimSpace(typed)
+		return typed
 	case float64, bool:
-		return strings.TrimSpace(fmt.Sprint(typed))
+		return fmt.Sprint(typed)
 	default:
 		return ""
 	}
