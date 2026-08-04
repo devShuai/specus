@@ -31,6 +31,26 @@ public sealed class DirectHttpDispatcher
                 "HTTP 转发请求发送失败", ex);
         }
     }
+
+    internal async Task<WebSocketSpecusStream> OpenWebSocketAsync(string clientName,
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _nat.OpenWebSocketStreamAsync(clientName, metadata, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new DirectHttpSpecusException(StatusCodes.Status503ServiceUnavailable,
+                $"客户端不在线: {clientName}", ex);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new DirectHttpSpecusException(StatusCodes.Status502BadGateway,
+                "WebSocket 隧道请求发送失败", ex);
+        }
+    }
 }
 
 public sealed class DirectHttpSpecusException : Exception

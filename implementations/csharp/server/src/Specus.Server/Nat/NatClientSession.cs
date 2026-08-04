@@ -15,6 +15,8 @@ namespace Specus.Server.Nat;
 
 internal sealed class NatClientSession : IAsyncDisposable
 {
+    private const int MaximumClosedWebSocketStreamIds = 1024;
+
     private readonly SpecusConnectionContext _context;
     private readonly RemotePortServerManager _remotePorts;
     private readonly TrafficUsageService _traffic;
@@ -25,6 +27,9 @@ internal sealed class NatClientSession : IAsyncDisposable
     private readonly ConcurrentDictionary<int, RemotePortBinding> _bindings = new();
     private readonly ConcurrentDictionary<uint, ExternalConnection> _externalChannels = new();
     private readonly ConcurrentDictionary<uint, HttpSpecusStream> _httpStreams = new();
+    private readonly ConcurrentDictionary<uint, WebSocketSpecusStream> _webSocketStreams = new();
+    private readonly ConcurrentDictionary<uint, byte> _closedWebSocketStreamIds = new();
+    private readonly ConcurrentQueue<uint> _closedWebSocketStreamOrder = new();
     private readonly object _admissionLock = new();
     private readonly Dictionary<int, int> _portExternalCounts = new();
 
@@ -77,6 +82,24 @@ internal sealed class NatClientSession : IAsyncDisposable
                     }
                     return;
                 }
+                if (_webSocketStreams.TryGetValue(packet.StreamId, out var webSocketData))
+                {
+                    var result = webSocketData.OnData(packet.Data);
+                    if (result == WebSocketStreamIngestResult.FlowControlViolation)
+                    {
+                        ProtocolViolation("invalid WebSocket DATA");
+                    }
+                    else if (result == WebSocketStreamIngestResult.QueueFull)
+                    {
+                        await webSocketData.ResetAsync(31, "WebSocket browser is too slow",
+                            _context.Lifetime).ConfigureAwait(false);
+                    }
+                    return;
+                }
+                if (IsClosedWebSocketStream(packet.StreamId))
+                {
+                    return;
+                }
                 if (_registered)
                 {
                     await ProcessDataAsync(packet).ConfigureAwait(false);
@@ -96,6 +119,22 @@ internal sealed class NatClientSession : IAsyncDisposable
                     }
                     return;
                 }
+                if (_webSocketStreams.TryGetValue(packet.StreamId, out var webSocketEnd))
+                {
+                    if (packet.NatMessageType == NatMessageType.Rst)
+                    {
+                        webSocketEnd.OnReset(AsString(packet.MetaData, "reason"));
+                    }
+                    else
+                    {
+                        webSocketEnd.OnEnd();
+                    }
+                    return;
+                }
+                if (IsClosedWebSocketStream(packet.StreamId))
+                {
+                    return;
+                }
                 if (_registered)
                 {
                     await ProcessClosedAsync(packet).ConfigureAwait(false);
@@ -109,6 +148,18 @@ internal sealed class NatClientSession : IAsyncDisposable
                     {
                         ProtocolViolation("invalid HTTP WINDOW_UPDATE");
                     }
+                    return;
+                }
+                if (_webSocketStreams.TryGetValue(packet.StreamId, out var webSocketFlow))
+                {
+                    if (!webSocketFlow.AddSendCredit(packet.Value))
+                    {
+                        ProtocolViolation("invalid WebSocket WINDOW_UPDATE");
+                    }
+                    return;
+                }
+                if (IsClosedWebSocketStream(packet.StreamId))
+                {
                     return;
                 }
                 if (!_registered)
@@ -158,6 +209,33 @@ internal sealed class NatClientSession : IAsyncDisposable
         }
     }
 
+    internal async Task<WebSocketSpecusStream> OpenWebSocketStreamAsync(
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+    {
+        var streamId = AllocateStreamId();
+        var stream = new WebSocketSpecusStream(_context, streamId, RemoveWebSocketStream);
+        if (!_webSocketStreams.TryAdd(streamId, stream))
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("WebSocket stream id collision");
+        }
+        try
+        {
+            await _context.Writer.WriteAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Open,
+                StreamId = streamId,
+                MetaData = metadata,
+            }, cancellationToken).ConfigureAwait(false);
+            return stream;
+        }
+        catch
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         _context.WriteBackpressure.BackpressureChanged -= OnControlWriteBackpressureChanged;
@@ -182,6 +260,15 @@ internal sealed class NatClientSession : IAsyncDisposable
             stream.OnReset("control channel closed");
         }
         _httpStreams.Clear();
+        foreach (var stream in _webSocketStreams.Values)
+        {
+            stream.OnReset("control channel closed");
+        }
+        _webSocketStreams.Clear();
+        _closedWebSocketStreamIds.Clear();
+        while (_closedWebSocketStreamOrder.TryDequeue(out _))
+        {
+        }
     }
 
     private async Task ProcessRegisterAsync(NatMessagePacket packet)
@@ -453,8 +540,10 @@ internal sealed class NatClientSession : IAsyncDisposable
         {
             var streamId = unchecked((uint)Interlocked.Increment(ref _nextStreamId));
             if (streamId != 0 && !_externalChannels.ContainsKey(streamId)
-                              && !_httpStreams.ContainsKey(streamId))
+                              && !_httpStreams.ContainsKey(streamId)
+                              && !_webSocketStreams.ContainsKey(streamId))
             {
+                _closedWebSocketStreamIds.TryRemove(streamId, out _);
                 return streamId;
             }
         }
@@ -477,6 +566,27 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private void RemoveHttpStream(uint streamId, HttpSpecusStream expected) =>
         _httpStreams.TryRemove(new KeyValuePair<uint, HttpSpecusStream>(streamId, expected));
+
+    private void RemoveWebSocketStream(uint streamId, WebSocketSpecusStream expected)
+    {
+        if (!_webSocketStreams.TryRemove(
+                new KeyValuePair<uint, WebSocketSpecusStream>(streamId, expected)))
+        {
+            return;
+        }
+        if (_closedWebSocketStreamIds.TryAdd(streamId, 0))
+        {
+            _closedWebSocketStreamOrder.Enqueue(streamId);
+        }
+        while (_closedWebSocketStreamIds.Count > MaximumClosedWebSocketStreamIds
+               && _closedWebSocketStreamOrder.TryDequeue(out var expired))
+        {
+            _closedWebSocketStreamIds.TryRemove(expired, out _);
+        }
+    }
+
+    private bool IsClosedWebSocketStream(uint streamId) =>
+        _closedWebSocketStreamIds.ContainsKey(streamId);
 
     private void ProtocolViolation(string reason)
     {

@@ -12,8 +12,7 @@ internal static class HttpRouteBasicAuthenticator
     public static bool IsAuthorized(string? authorization, string? expectedUsername,
         string? expectedPasswordHash)
     {
-        if (string.IsNullOrWhiteSpace(expectedUsername)
-            || string.IsNullOrWhiteSpace(expectedPasswordHash)
+        if (!IsConfigured(expectedUsername, expectedPasswordHash)
             || !AuthenticationHeaderValue.TryParse(authorization, out var header)
             || !header.Scheme.Equals("Basic", StringComparison.OrdinalIgnoreCase)
             || string.IsNullOrWhiteSpace(header.Parameter))
@@ -38,9 +37,14 @@ internal static class HttpRouteBasicAuthenticator
         }
         var username = decoded[..separator];
         var password = decoded[(separator + 1)..];
-        return ConstantTimeEquals(expectedUsername, username)
-               & PasswordHasher.Matches(password, expectedPasswordHash);
+        return ConstantTimeEquals(expectedUsername!, username)
+               & PasswordHasher.Matches(password, expectedPasswordHash!);
     }
+
+    public static bool IsConfigured(string? expectedUsername, string? expectedPasswordHash) =>
+        !string.IsNullOrWhiteSpace(expectedUsername)
+        && expectedPasswordHash is { Length: 64 }
+        && expectedPasswordHash.All(Uri.IsHexDigit);
 
     private static bool ConstantTimeEquals(string expected, string actual)
     {

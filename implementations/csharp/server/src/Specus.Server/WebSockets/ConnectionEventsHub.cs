@@ -217,7 +217,6 @@ public static class ConnectionEventsWebSocketEndpoint
 {
     public static void MapConnectionEventsWebSocket(this WebApplication app)
     {
-        app.UseWebSockets();
         app.Map("/ws/connections", (HttpContext context, ConnectionEventsHub hub) =>
             hub.AcceptAsync(context));
     }

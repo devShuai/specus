@@ -1,10 +1,12 @@
 using System.Collections.Frozen;
+using System.Net.WebSockets;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Specus.Protocol;
 using Specus.Protocol.Packets;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
@@ -72,6 +74,16 @@ public static class DirectHttpEndpoints
         }
 
         if (accessPolicy.AuthEnabled
+            && !HttpRouteBasicAuthenticator.IsConfigured(accessPolicy.AuthUsername,
+                accessPolicy.AuthPasswordHash))
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            await WriteTextErrorAsync(context.Response, StatusCodes.Status503ServiceUnavailable,
+                "HTTP 路由认证配置暂时不可用").ConfigureAwait(false);
+            return;
+        }
+
+        if (accessPolicy.AuthEnabled
             && !HttpRouteBasicAuthenticator.IsAuthorized(context.Request.Headers.Authorization.ToString(),
                 accessPolicy.AuthUsername, accessPolicy.AuthPasswordHash))
         {
@@ -83,7 +95,14 @@ public static class DirectHttpEndpoints
             return;
         }
 
-        var requestHeaders = RequestHeaders(context.Request, accessPolicy.AuthEnabled);
+        if (context.WebSockets.IsWebSocketRequest)
+        {
+            await ForwardWebSocketAsync(context, clientName, route, relativePath, dispatcher,
+                accessPolicy.AuthEnabled).ConfigureAwait(false);
+            return;
+        }
+
+        var requestHeaders = RequestHeaders(context.Request, accessPolicy.AuthEnabled, false);
         var requestCapture = new LimitedCapture(64 * 1024);
         var responseCapture = new LimitedCapture(64 * 1024);
         var requestMetadata = new Dictionary<string, object?>
@@ -382,12 +401,14 @@ public static class DirectHttpEndpoints
             or ':'
             or '@';
 
-    private static List<string> RequestHeaders(HttpRequest request, bool stripAuthorization)
+    private static List<string> RequestHeaders(HttpRequest request, bool stripAuthorization,
+        bool webSocket)
     {
         var headers = new List<string>();
         foreach (var (name, values) in request.Headers)
         {
             if (!ShouldForward(name)
+                || (webSocket && WebSocketHandshakeHeaders.Contains(name))
                 || (stripAuthorization && name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
@@ -399,6 +420,385 @@ public static class DirectHttpEndpoints
             }
         }
         return headers;
+    }
+
+    private static async Task ForwardWebSocketAsync(HttpContext context, string clientName,
+        string route, string relativePath, DirectHttpDispatcher dispatcher, bool stripAuthorization)
+    {
+        var metadata = new Dictionary<string, object?>
+        {
+            ["source"] = "ws",
+            ["channelId"] = Guid.NewGuid().ToString(),
+            ["clientName"] = clientName,
+            ["route"] = route,
+            ["relativePath"] = relativePath,
+            ["rawQuery"] = context.Request.QueryString.HasValue
+                ? context.Request.QueryString.Value!.TrimStart('?')
+                : null,
+            ["headers"] = RequestHeaders(context.Request, stripAuthorization, true),
+            ["body"] = Array.Empty<byte>(),
+        };
+
+        using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
+        using var browserWriteLock = new SemaphoreSlim(1, 1);
+        var closeState = new WebSocketTunnelCloseState();
+        WebSocketSpecusStream stream;
+        try
+        {
+            stream = await dispatcher.OpenWebSocketAsync(clientName, metadata, context.RequestAborted)
+                .ConfigureAwait(false);
+        }
+        catch (DirectHttpSpecusException ex)
+        {
+            await SafeCloseOutputAsync(socket, browserWriteLock,
+                    WebSocketCloseStatus.InternalServerError, ex.Message)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await using var streamLifetime = stream;
+        using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        var browserToClient = PumpBrowserWebSocketAsync(socket, stream, browserWriteLock,
+            closeState, pumpCts.Token);
+        var clientToBrowser = PumpClientWebSocketAsync(socket, stream, browserWriteLock,
+            closeState, pumpCts.Token);
+        var completed = await Task.WhenAny(browserToClient, clientToBrowser).ConfigureAwait(false);
+        if (ReferenceEquals(completed, browserToClient) && closeState.ClientInitiated
+            && !clientToBrowser.IsCompleted)
+        {
+            var peerTerminal = await Task.WhenAny(clientToBrowser, Task.Delay(TimeSpan.FromSeconds(5),
+                context.RequestAborted)).ConfigureAwait(false);
+            if (ReferenceEquals(peerTerminal, clientToBrowser))
+            {
+                completed = clientToBrowser;
+            }
+        }
+        try
+        {
+            await completed.ConfigureAwait(false);
+        }
+        finally
+        {
+            pumpCts.Cancel();
+            await IgnoreTunnelCompletionAsync(browserToClient).ConfigureAwait(false);
+            await IgnoreTunnelCompletionAsync(clientToBrowser).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task PumpBrowserWebSocketAsync(WebSocket socket,
+        WebSocketSpecusStream stream, SemaphoreSlim browserWriteLock,
+        WebSocketTunnelCloseState closeState, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[WebSocketSpecusFrame.MaxPayloadBytes];
+        var firstFragment = true;
+        long messageBytes = 0;
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested
+                   && socket.State is WebSocketState.Open or WebSocketState.CloseSent)
+            {
+                var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken)
+                    .ConfigureAwait(false);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    var status = NormalizeCloseStatus(result.CloseStatus);
+                    var reason = result.CloseStatusDescription ?? string.Empty;
+                    if (!closeState.ClientInitiated)
+                    {
+                        await SendWebSocketCloseToClientAsync(stream, status, reason, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                messageBytes += result.Count;
+                if (messageBytes > WebSocketMaxMessageBytes)
+                {
+                    const string reason = "WebSocket message exceeds limit";
+                    await SendWebSocketCloseToClientAsync(stream, WebSocketCloseStatus.MessageTooBig,
+                        reason, cancellationToken).ConfigureAwait(false);
+                    await SafeCloseOutputAsync(socket, browserWriteLock,
+                            WebSocketCloseStatus.MessageTooBig, reason)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                var opcode = firstFragment
+                    ? result.MessageType == WebSocketMessageType.Text
+                        ? WebSocketSpecusFrame.OpcodeText
+                        : WebSocketSpecusFrame.OpcodeBinary
+                    : WebSocketSpecusFrame.OpcodeContinuation;
+                var frame = new WebSocketSpecusFrame(opcode, result.EndOfMessage, 0, 0,
+                    buffer.AsSpan(0, result.Count).ToArray());
+                await stream.SendDataAsync(frame.Encode(), cancellationToken).ConfigureAwait(false);
+
+                if (result.EndOfMessage)
+                {
+                    firstFragment = true;
+                    messageBytes = 0;
+                }
+                else
+                {
+                    firstFragment = false;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The opposite side ended the tunnel or the HTTP request was aborted.
+        }
+        catch (Exception ex) when (ex is WebSocketException or IOException)
+        {
+            if (stream.PeerTerminated)
+            {
+                closeState.MarkClientInitiated();
+                return;
+            }
+            await SendWebSocketCloseToClientAsync(stream, WebSocketCloseStatus.InternalServerError,
+                string.Empty, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task PumpClientWebSocketAsync(WebSocket socket,
+        WebSocketSpecusStream stream, SemaphoreSlim browserWriteLock,
+        WebSocketTunnelCloseState closeState, CancellationToken cancellationToken)
+    {
+        WebSocketMessageType? fragmentType = null;
+        long messageBytes = 0;
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var item = await stream.ReadAsync(cancellationToken).ConfigureAwait(false);
+                if (item.End)
+                {
+                    closeState.MarkClientInitiated();
+                    await SafeCloseOutputAsync(socket, browserWriteLock,
+                            WebSocketCloseStatus.EndpointUnavailable, string.Empty)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                var encoded = item.Data ?? Array.Empty<byte>();
+                var frame = WebSocketSpecusFrame.Decode(encoded);
+                if (frame.Rsv != 0)
+                {
+                    throw new InvalidDataException("RSV extensions are unavailable on the ASP.NET endpoint");
+                }
+
+                switch (frame.Opcode)
+                {
+                    case WebSocketSpecusFrame.OpcodeText:
+                    case WebSocketSpecusFrame.OpcodeBinary:
+                        {
+                            if (fragmentType is not null)
+                            {
+                                throw new InvalidDataException(
+                                    "new SWS2 message before fragmented message completed");
+                            }
+                            var messageType = frame.Opcode == WebSocketSpecusFrame.OpcodeText
+                                ? WebSocketMessageType.Text
+                                : WebSocketMessageType.Binary;
+                            messageBytes = frame.Payload.Length;
+                            EnsureWebSocketMessageSize(messageBytes);
+                            await SendBrowserFrameAsync(socket, browserWriteLock, frame.Payload,
+                                messageType, frame.FinalFragment, cancellationToken).ConfigureAwait(false);
+                            if (!frame.FinalFragment)
+                            {
+                                fragmentType = messageType;
+                            }
+                            break;
+                        }
+                    case WebSocketSpecusFrame.OpcodeContinuation:
+                        if (fragmentType is null)
+                        {
+                            throw new InvalidDataException("orphan SWS2 continuation frame");
+                        }
+                        messageBytes += frame.Payload.Length;
+                        EnsureWebSocketMessageSize(messageBytes);
+                        await SendBrowserFrameAsync(socket, browserWriteLock, frame.Payload,
+                            fragmentType.Value, frame.FinalFragment, cancellationToken).ConfigureAwait(false);
+                        if (frame.FinalFragment)
+                        {
+                            fragmentType = null;
+                            messageBytes = 0;
+                        }
+                        break;
+                    case WebSocketSpecusFrame.OpcodePing:
+                    case WebSocketSpecusFrame.OpcodePong:
+                        // System.Net.WebSockets handles browser control frames internally and exposes
+                        // no API for a custom pong payload. Keep the tunnel open for valid control frames.
+                        break;
+                    case WebSocketSpecusFrame.OpcodeClose:
+                        closeState.MarkClientInitiated();
+                        var status = NormalizeCloseStatus(frame.CloseCode == 0
+                            ? null
+                            : (WebSocketCloseStatus)frame.CloseCode);
+                        var reason = Encoding.UTF8.GetString(frame.Payload);
+                        if (!await SafeCloseOutputAsync(socket, browserWriteLock, status, reason)
+                                .ConfigureAwait(false))
+                        {
+                            return;
+                        }
+                        break;
+                }
+                await stream.ConsumeAsync(encoded.Length, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The browser side ended first.
+        }
+        catch (Exception ex) when (ex is InvalidDataException or ArgumentException)
+        {
+            await stream.ResetAsync(30, "invalid WebSocket SWS2 frame", CancellationToken.None)
+                .ConfigureAwait(false);
+            await SafeCloseOutputAsync(socket, browserWriteLock, WebSocketCloseStatus.ProtocolError,
+                "invalid WebSocket frame").ConfigureAwait(false);
+        }
+        catch (IOException)
+        {
+            closeState.MarkClientInitiated();
+            await SafeCloseOutputAsync(socket, browserWriteLock, WebSocketCloseStatus.InternalServerError,
+                "WebSocket tunnel reset").ConfigureAwait(false);
+        }
+    }
+
+    private static async Task SendWebSocketCloseToClientAsync(WebSocketSpecusStream stream,
+        WebSocketCloseStatus status, string reason, CancellationToken cancellationToken)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(reason);
+        if (reasonBytes.Length > 123)
+        {
+            reasonBytes = reasonBytes[..123];
+        }
+        var frame = new WebSocketSpecusFrame(WebSocketSpecusFrame.OpcodeClose, true, 0,
+            checked((ushort)status), reasonBytes);
+        using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        closeCts.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await stream.SendDataAsync(frame.Encode(), closeCts.Token).ConfigureAwait(false);
+            await stream.FinishAsync(closeCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException)
+        {
+            // DisposeAsync emits a bounded best-effort RST when CLOSE + FIN could not be delivered.
+        }
+    }
+
+    private static WebSocketCloseStatus NormalizeCloseStatus(WebSocketCloseStatus? status)
+    {
+        var code = (int)(status ?? WebSocketCloseStatus.NormalClosure);
+        return code is >= 1000 and < 5000
+               && code is not 1004 and not 1005 and not 1006 and not 1015
+            ? (WebSocketCloseStatus)code
+            : WebSocketCloseStatus.InternalServerError;
+    }
+
+    private static void EnsureWebSocketMessageSize(long bytes)
+    {
+        if (bytes > WebSocketMaxMessageBytes)
+        {
+            throw new InvalidDataException("WebSocket message exceeds limit");
+        }
+    }
+
+    private static async Task SendBrowserFrameAsync(WebSocket socket, SemaphoreSlim browserWriteLock,
+        ReadOnlyMemory<byte> payload, WebSocketMessageType messageType, bool endOfMessage,
+        CancellationToken cancellationToken)
+    {
+        await browserWriteLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (socket.State != WebSocketState.Open)
+            {
+                throw new WebSocketException("browser WebSocket is not open");
+            }
+            await socket.SendAsync(payload, messageType, endOfMessage, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            browserWriteLock.Release();
+        }
+    }
+
+    private static async Task<bool> SafeCloseOutputAsync(WebSocket socket,
+        SemaphoreSlim browserWriteLock, WebSocketCloseStatus status, string reason)
+    {
+        using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await browserWriteLock.WaitAsync(closeCts.Token).ConfigureAwait(false);
+            try
+            {
+                if (socket.State is not (WebSocketState.Open or WebSocketState.CloseReceived))
+                {
+                    return false;
+                }
+                await socket.CloseOutputAsync(status, TruncateCloseReason(reason), closeCts.Token)
+                    .ConfigureAwait(false);
+                return true;
+            }
+            finally
+            {
+                browserWriteLock.Release();
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or ArgumentException
+                                   or InvalidOperationException or ObjectDisposedException)
+        {
+            // The browser already disconnected.
+            return false;
+        }
+    }
+
+    private static string TruncateCloseReason(string reason)
+    {
+        if (Encoding.UTF8.GetByteCount(reason) <= 123)
+        {
+            return reason;
+        }
+        var builder = new StringBuilder();
+        var bytes = 0;
+        foreach (var rune in reason.EnumerateRunes())
+        {
+            if (bytes + rune.Utf8SequenceLength > 123)
+            {
+                break;
+            }
+            builder.Append(rune.ToString());
+            bytes += rune.Utf8SequenceLength;
+        }
+        return builder.ToString();
+    }
+
+    private static async Task IgnoreTunnelCompletionAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when the peer pump wins.
+        }
+        catch (Exception ex) when (ex is WebSocketException or IOException)
+        {
+            // Expected when either transport disappears during shutdown.
+        }
+    }
+
+    private sealed class WebSocketTunnelCloseState
+    {
+        private int _clientInitiated;
+
+        public bool ClientInitiated => Volatile.Read(ref _clientInitiated) != 0;
+
+        public void MarkClientInitiated() => Interlocked.Exchange(ref _clientInitiated, 1);
     }
 
     private static List<string> PlainErrorHeaders() => ["Content-Type:text/plain;charset=UTF-8"];
@@ -475,6 +875,17 @@ public static class DirectHttpEndpoints
         "text/html", "text/css", "text/javascript", "application/javascript",
         "application/x-javascript", "application/ecmascript", "text/ecmascript",
     }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly FrozenSet<string> WebSocketHandshakeHeaders = new[]
+    {
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+        "sec-websocket-accept",
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    private const int WebSocketMaxMessageBytes = 16 * 1024 * 1024;
 
     private static bool IsRewritable(IReadOnlyList<string>? headers)
     {

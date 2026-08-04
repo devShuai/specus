@@ -164,6 +164,7 @@ using (var scope = app.Services.CreateScope())
 app.UseManagementSecurityHeaders();
 app.UseAdminApiExceptionHandling();
 app.UseAdminApiAuthentication();
+app.UseWebSockets();
 
 // Management SPA: same static contract as Java's resources/static. Root redirects to the real
 // static asset so ASP.NET Core can still apply generated ETag/compression/fingerprint metadata.

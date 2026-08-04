@@ -60,6 +60,16 @@ public sealed class NatServerHandler
         return session.OpenHttpStreamAsync(metadata, cancellationToken);
     }
 
+    internal Task<WebSocketSpecusStream> OpenWebSocketStreamAsync(string clientName,
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+    {
+        if (!_sessionsByName.TryGetValue(clientName, out var session))
+        {
+            throw new InvalidOperationException($"client is offline: {clientName}");
+        }
+        return session.OpenWebSocketStreamAsync(metadata, cancellationToken);
+    }
+
     public async Task OnConnectionClosedAsync(SpecusConnectionContext context)
     {
         if (_sessions.TryRemove(context, out var session))
