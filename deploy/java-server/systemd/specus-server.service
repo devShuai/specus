@@ -17,9 +17,11 @@ Group=specus
 # 工作目录用于存放运行时产物（如 fallback 的 SQLite 文件、临时文件等）
 WorkingDirectory=/var/lib/specus-server
 
-# 默认 JVM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS。
+# 默认 JVM/APM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS。
+# ELASTIC_APM_AGENT_OPTS 由 install-elastic-apm-agent.sh 管理，保持独立以免覆盖堆参数。
 # Linux 默认同时写入滚动文件；EnvironmentFile 可覆盖 SPECUS_LOG_FILE。
 Environment=JAVA_OPTS=
+Environment=ELASTIC_APM_AGENT_OPTS=
 Environment=SPECUS_LOG_FILE=/var/log/specus-server/specus-server.log
 
 # 环境变量文件（前导的 - 表示文件不存在时不报错；建议把所有数据库 / 密钥配置写到这里）
@@ -28,8 +30,8 @@ EnvironmentFile=-/etc/specus-server/specus-server.env
 # 启动命令
 #   --enable-native-access=ALL-UNNAMED 与 spring-boot-maven-plugin 中的 jvmArguments 保持一致，
 #   消除 Java 21 关于 native access 的告警。
-#   通过环境变量 JAVA_OPTS 追加额外 JVM 参数（如 -Xmx512m）。
-ExecStart=/usr/bin/java $JAVA_OPTS --enable-native-access=ALL-UNNAMED -jar /opt/specus-server/specus-server.jar
+#   通过 JAVA_OPTS 追加通用 JVM 参数，通过 ELASTIC_APM_AGENT_OPTS 可选加载 APM Agent。
+ExecStart=/usr/bin/java $JAVA_OPTS $ELASTIC_APM_AGENT_OPTS --enable-native-access=ALL-UNNAMED -jar /opt/specus-server/specus-server.jar
 
 # 优雅停机：Spring Boot 默认监听 SIGTERM，给 30 秒处理在途连接
 KillSignal=SIGTERM

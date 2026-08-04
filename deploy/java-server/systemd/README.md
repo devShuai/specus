@@ -9,6 +9,7 @@
 | `specus-server.env.example` | 环境变量模板（**MySQL 连接、管理员密码、JWT 密钥都在这里**） |
 | `install.sh` | 一键安装：建用户、建目录、拷 jar、注册服务 |
 | `update.sh` | 滚动升级：备份 / 替换 jar / 健康检查 / 失败回滚，并同步最新 unit 与 env.example |
+| `install-elastic-apm-agent.sh` | 下载并校验 Elastic APM Java Agent，可选写入安全默认配置并重启服务 |
 
 ---
 
@@ -304,6 +305,67 @@ SPECUS_ELASTICSEARCH_TCP_MAX_STORE_SIZE=10GB
 
 > 多 ES 节点可用逗号分隔。`SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE` 默认限制 HTTP 明细索引到 100GB，`SPECUS_ELASTICSEARCH_TCP_MAX_STORE_SIZE` 默认限制 TCP payload 索引到 10GB；超过后服务端会定期删除最旧记录。若单节点部署出现 `yellow`，通常是副本分片无法分配，不影响单副本读写。
 
+### 4.10 Elastic APM（可选）
+
+Java 服务通过标准 `-javaagent` 无侵入接入 Elastic APM，不把 Agent 声明为应用
+Maven 依赖。先确认 APM Server 可达且返回 `publish_ready=true`：
+
+```bash
+curl -s http://127.0.0.1:8200/
+```
+
+然后安装并启用固定版本的 Agent：
+
+```bash
+sudo bash deploy/java-server/systemd/install-elastic-apm-agent.sh \
+  --enable --restart
+```
+
+脚本会执行以下操作：
+
+1. 下载 Elastic APM Java Agent `1.56.0`，使用仓库中固定的 SHA-256 校验。
+2. 安装到 `/opt/specus-server/elastic-apm-agent-1.56.0.jar`，并维护稳定软链接
+   `/opt/specus-server/elastic-apm-agent.jar`。
+3. 在真实 env 中启用独立的 `ELASTIC_APM_AGENT_OPTS`，不改写 `JAVA_OPTS` 中的
+   堆大小和 GC 参数。
+4. 默认采样 10%，关闭请求体、请求头与日志正文发送，并忽略 `/http/*`、媒体播放
+   票据、下载票据和 WebSocket 入口，避免第三方 `ApiKey`、房间 token 等进入 APM。
+5. 默认关闭高频 `@Scheduled` transaction 与 OpenTelemetry 桥接，避免 flush 任务和
+   MySQL Connector 的 `Ping/autocommit` 观测重复写入；HTTP 请求内 JDBC span 保留。
+6. APM Server 不可达或未 publish-ready 时拒绝启用。
+
+默认接收端为同机 `http://127.0.0.1:8200`。接收端启用认证时，通过环境变量把
+token 传给安装脚本，脚本不会把 token 写进命令行：
+
+```bash
+sudo env SPECUS_APM_SECRET_TOKEN='REPLACE_WITH_TOKEN' \
+  bash deploy/java-server/systemd/install-elastic-apm-agent.sh \
+  --enable --restart
+```
+
+远程 APM Server 必须使用 HTTPS；Elastic 官方明确说明 secret token 在没有 TLS
+时不能提供传输保密。可在执行脚本时覆盖接收端、环境和采样率：
+
+```bash
+sudo env \
+  SPECUS_APM_SERVER_URL=https://apm.example.com \
+  SPECUS_APM_ENVIRONMENT=staging \
+  SPECUS_APM_SAMPLE_RATE=0.05 \
+  bash deploy/java-server/systemd/install-elastic-apm-agent.sh \
+  --enable --restart
+```
+
+验证 JVM 已实际加载 Agent：
+
+```bash
+pid="$(systemctl show specus-server -p MainPID --value)"
+sudo xargs -0 -n1 < "/proc/$pid/cmdline" | grep -- '-javaagent:'
+sudo journalctl -u specus-server --since '-5 min' --no-pager \
+  | grep -E 'Elastic APM|elastic-apm'
+```
+
+`ELASTIC_APM_AGENT_OPTS` 留空即可禁用 Agent；修改 env 后需要重启服务。
+
 环境变量文件中**不需要也不能用 shell 展开**，必须填字面量。
 
 ## 5. 启动 / 验证
@@ -430,6 +492,7 @@ sudo groupdel specus
 deploy/java-server/systemd/
 ├── README.md                    # 本文件
 ├── install.sh                   # 一键安装脚本（root 执行，首次安装）
+├── install-elastic-apm-agent.sh # Elastic APM Java Agent 安装 / 启用脚本
 ├── update.sh                    # 滚动升级脚本（root 执行，备份 / 健康检查 / 失败回滚）
 ├── specus-server.service        # systemd unit
 └── specus-server.env.example    # 环境变量模板（含 MySQL 注释说明）
