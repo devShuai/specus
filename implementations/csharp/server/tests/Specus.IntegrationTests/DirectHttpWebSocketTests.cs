@@ -74,7 +74,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
             request.Headers["Authorization"] = BasicAuthorization();
             request.Headers["X-Upstream-Test"] = "kept";
         };
-        using var socket = await webSockets.ConnectAsync(WebSocketUri("chat/socket?x=%2F"),
+        using var socket = await webSockets.ConnectAsync(WebSocketUri("chat/socket??x=%2F"),
             cancellation.Token);
 
         var opened = await session.Writer.ReadAsync(
@@ -84,7 +84,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         Assert.Equal(ClientName, opened.MetaData["clientName"]);
         Assert.Equal(Route, opened.MetaData["route"]);
         Assert.Equal("/chat/socket", opened.MetaData["relativePath"]);
-        Assert.Equal("x=%2F", opened.MetaData["rawQuery"]);
+        Assert.Equal("?x=%2F", opened.MetaData["rawQuery"]);
         Assert.False(string.IsNullOrWhiteSpace(opened.MetaData["channelId"]?.ToString()));
         Assert.Empty(Assert.IsType<byte[]>(opened.MetaData["body"]));
 

@@ -19,7 +19,9 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
     private readonly Channel<HttpStreamEvent> _events = Channel.CreateBounded<HttpStreamEvent>(
         new BoundedChannelOptions(32)
         {
-            FullMode = BoundedChannelFullMode.DropWrite,
+            // TryWrite must report saturation. DropWrite reports success while discarding the
+            // new event, which can silently truncate an otherwise successful HTTP response.
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = false,
         });
@@ -152,8 +154,13 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
                 return false;
             }
             _responseHead = true;
+            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Head, Clone(metadata), null, null)))
+            {
+                return true;
+            }
+            _responseHead = false;
+            return false;
         }
-        return Enqueue(new HttpStreamEvent(HttpStreamEventKind.Head, Clone(metadata), null, null));
     }
 
     public bool OnResponseData(byte[]? data)
@@ -170,8 +177,14 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
             }
             _receiveCredit -= data.Length;
             _receiveOutstanding += data.Length;
+            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Data, null, data.ToArray(), null)))
+            {
+                return true;
+            }
+            _receiveCredit += data.Length;
+            _receiveOutstanding -= data.Length;
+            return false;
         }
-        return Enqueue(new HttpStreamEvent(HttpStreamEventKind.Data, null, data.ToArray(), null));
     }
 
     public bool OnResponseEnd(Dictionary<string, object?>? metadata)
@@ -183,8 +196,13 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
                 return false;
             }
             _responseEnded = true;
+            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null)))
+            {
+                return true;
+            }
+            _responseEnded = false;
+            return false;
         }
-        return Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null));
     }
 
     public bool OnReset(string? reason)

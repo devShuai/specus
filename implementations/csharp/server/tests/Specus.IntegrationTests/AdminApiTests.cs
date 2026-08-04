@@ -777,7 +777,7 @@ public sealed class AdminApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task DirectHttpSpecusPreservesEncodedRelativePathLikeJava()
+    public async Task DirectHttpSpecusAcceptsAnyMethodAndPreservesEncodedRelativePathLikeJava()
     {
         using var admin = await AuthenticatedClientAsync();
         var demo = await ReadDemoClientAsync(admin);
@@ -812,16 +812,21 @@ public sealed class AdminApiTests : IAsyncLifetime
         try
         {
             using var publicClient = _server.CreateClient();
-            using var request = new HttpRequestMessage(HttpMethod.Get,
-                $"/http/{Uri.EscapeDataString(demo.ClientName)}/encoded/%E4%BD%A0%2Fok?x=%2F");
+            using var request = new HttpRequestMessage(new HttpMethod("PROPFIND"),
+                $"/http/{Uri.EscapeDataString(demo.ClientName)}/encoded/%E4%BD%A0%2Fok?x=%2F")
+            {
+                Content = new UnknownLengthContent(Encoding.UTF8.GetBytes("payload")),
+            };
             request.Headers.Authorization = Basic("viewer", "route secret");
             request.Headers.Add("X-Upstream-Test", "kept");
             var response = await publicClient.SendAsync(request);
 
             response.EnsureSuccessStatusCode();
             Assert.NotNull(writer.Captured);
+            Assert.Equal("PROPFIND", writer.Captured!["method"]);
             Assert.Equal("/%E4%BD%A0%2Fok", writer.Captured!["relativePath"]);
             Assert.Equal("x=%2F", writer.Captured["rawQuery"]);
+            Assert.False(writer.Captured.ContainsKey("contentLength"));
             var headers = Assert.IsAssignableFrom<IEnumerable<string>>(writer.Captured["headers"]);
             Assert.Contains(headers, value => value.Equals("X-Upstream-Test:kept", StringComparison.OrdinalIgnoreCase));
             Assert.DoesNotContain(headers,
@@ -1251,6 +1256,18 @@ public sealed class AdminApiTests : IAsyncLifetime
     {
         public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default) =>
             ValueTask.FromException(new IOException("socket closed"));
+    }
+
+    private sealed class UnknownLengthContent(byte[] payload) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            stream.WriteAsync(payload).AsTask();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
     }
 
     private sealed record TokenBody(string AccessToken, string TokenType, long ExpiresIn);

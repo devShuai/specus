@@ -37,7 +37,9 @@ public static class DirectHttpEndpoints
         "upgrade",
     }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
-    private static readonly string[] Methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    // Empty HttpMethodMetadata means any method. The protocol intentionally exposes ANY /http/**
+    // so WebDAV and application-specific verbs are forwarded as-is.
+    private static readonly string[] Methods = [];
 
     public static void MapDirectHttpSpecus(this WebApplication app)
     {
@@ -112,19 +114,20 @@ public static class DirectHttpEndpoints
             ["method"] = context.Request.Method,
             ["route"] = route,
             ["relativePath"] = relativePath,
-            ["rawQuery"] = context.Request.QueryString.HasValue
-                ? context.Request.QueryString.Value!.TrimStart('?')
-                : null,
+            ["rawQuery"] = RawQuery(context.Request.QueryString),
             ["headers"] = requestHeaders,
-            ["contentLength"] = context.Request.ContentLength ?? -1L,
             ["trailerNames"] = DeclaredRequestTrailers(context.Request, accessPolicy.AuthEnabled),
         };
+        if (context.Request.ContentLength is { } contentLength)
+        {
+            requestMetadata["contentLength"] = contentLength;
+        }
         if (context.Request.ContentLength > options.Value.MaxRequestBodySize)
         {
             const string message = "HTTP 请求体超过限制";
             var responseBody = Encoding.UTF8.GetBytes(message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    context.Request.Method, relativePath, RawQuery(context.Request.QueryString),
                     requestHeaders, Array.Empty<byte>(),
                     StatusCodes.Status413PayloadTooLarge, PlainErrorHeaders(), responseBody, startedAt,
                     context.Connection.RemoteIpAddress?.ToString(), message), context.RequestAborted)
@@ -255,7 +258,7 @@ public static class DirectHttpEndpoints
                 pumpCts.Cancel();
             }
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    context.Request.Method, relativePath, RawQuery(context.Request.QueryString),
                     requestHeaders, requestCapture.Bytes(), context.Response.StatusCode,
                     originalResponseHeaders, responseCapture.Bytes(), startedAt,
                     context.Connection.RemoteIpAddress?.ToString(), null), context.RequestAborted)
@@ -265,7 +268,7 @@ public static class DirectHttpEndpoints
         {
             var responseBody = Encoding.UTF8.GetBytes(ex.Message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    context.Request.Method, relativePath, RawQuery(context.Request.QueryString),
                     requestHeaders, requestCapture.Bytes(),
                     ex.StatusCode, PlainErrorHeaders(), responseBody, startedAt, context.Connection.RemoteIpAddress?.ToString(),
                     ex.Message), CancellationToken.None)
@@ -432,9 +435,7 @@ public static class DirectHttpEndpoints
             ["clientName"] = clientName,
             ["route"] = route,
             ["relativePath"] = relativePath,
-            ["rawQuery"] = context.Request.QueryString.HasValue
-                ? context.Request.QueryString.Value!.TrimStart('?')
-                : null,
+            ["rawQuery"] = RawQuery(context.Request.QueryString),
             ["headers"] = RequestHeaders(context.Request, stripAuthorization, true),
             ["body"] = Array.Empty<byte>(),
         };
@@ -802,6 +803,9 @@ public static class DirectHttpEndpoints
     }
 
     private static List<string> PlainErrorHeaders() => ["Content-Type:text/plain;charset=UTF-8"];
+
+    private static string? RawQuery(QueryString queryString) =>
+        queryString.HasValue ? queryString.Value![1..] : null;
 
     private static void CopyHeaders(List<string>? source, HttpResponse response)
     {
