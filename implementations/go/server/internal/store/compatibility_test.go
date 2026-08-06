@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -284,6 +285,7 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 	ticket := WebSocketTicket{
 		TokenHash: "go-ticket", Scope: "public-transfer", RoomID: "room-a", RoomKey: "room:7",
 		RoomRole: "EDITOR", PeerID: "peer-a", DisplayName: "Go peer", SharedRoom: true,
+		Discoverable:      true,
 		RemoteAddressHash: "address-hash", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
 	}
 	if err := db.InsertWebSocketTicket(context.Background(), ticket); err != nil {
@@ -301,6 +303,9 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 	if attributes["roomId"] != ticket.RoomID || attributes["peerId"] != ticket.PeerID ||
 		attributes["sharedRoom"] != true {
 		t.Fatalf("unexpected Java attributes: %#v", attributes)
+	}
+	if attributes["discoverable"] != true {
+		t.Fatalf("Go-written ticket must carry discoverable in attributes_json: %#v", attributes)
 	}
 	consumed, err := db.ConsumeWebSocketTicket(context.Background(), ticket.TokenHash,
 		ticket.Scope, ticket.RemoteAddressHash, now)
@@ -324,6 +329,117 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 	if err != nil || consumed == nil || consumed.PeerID != "legacy-peer" ||
 		consumed.RoomRole != "VIEWER" || !consumed.SharedRoom {
 		t.Fatalf("consume legacy Java ticket: ticket=%+v err=%v", consumed, err)
+	}
+	if !consumed.Discoverable {
+		t.Fatalf("legacy Java ticket without discoverable must stay visible: %+v", consumed)
+	}
+}
+
+func TestWebSocketTicketDiscoverableRoundTrip(t *testing.T) {
+	db, err := Open("sqlite", filepath.Join(t.TempDir(), "discoverable.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 24, 6, 0, 0, 0, time.UTC)
+	for _, discoverable := range []bool{false, true} {
+		tokenHash := "ticket-" + strconv.FormatBool(discoverable)
+		ticket := WebSocketTicket{
+			TokenHash: tokenHash, Scope: "public-transfer", RoomID: "nearby", PeerID: "peer",
+			RoomRole: "EDITOR", Discoverable: discoverable,
+			RemoteAddressHash: "address", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+		}
+		if err := db.InsertWebSocketTicket(context.Background(), ticket); err != nil {
+			t.Fatalf("insert ticket: %v", err)
+		}
+		consumed, err := db.ConsumeWebSocketTicket(context.Background(), tokenHash,
+			"public-transfer", "address", now)
+		if err != nil || consumed == nil {
+			t.Fatalf("consume ticket: ticket=%+v err=%v", consumed, err)
+		}
+		if consumed.Discoverable != discoverable {
+			t.Fatalf("discoverable round trip = %v, want %v", consumed.Discoverable, discoverable)
+		}
+	}
+}
+
+func TestWebSocketTicketPublicRoomAttributesAlwaysWritten(t *testing.T) {
+	db, err := Open("sqlite", filepath.Join(t.TempDir(), "public-attributes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 5, 6, 0, 0, 0, time.UTC)
+
+	// Public-room ticket: attributes_json must always carry publicAddress and the
+	// address-derived roomKey, so Java nodes consuming Go tickets derive the same
+	// netId/groupId (aligned with the Java WebSocketTicketResource).
+	publicTicket := WebSocketTicket{
+		TokenHash: "public-ticket", Scope: "public-transfer", RoomID: "nearby",
+		RoomKey: "public:203.0.113.7", RoomRole: "EDITOR", PeerID: "peer-a", DisplayName: "web",
+		PublicAddress: "203.0.113.7", Discoverable: true,
+		RemoteAddressHash: "address-hash", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := db.InsertWebSocketTicket(context.Background(), publicTicket); err != nil {
+		t.Fatalf("insert public ticket: %v", err)
+	}
+	var attributesJSON string
+	if err := db.sql.QueryRow(`SELECT attributes_json FROM specus_websocket_ticket
+		WHERE token_hash = ?`, publicTicket.TokenHash).Scan(&attributesJSON); err != nil {
+		t.Fatalf("read public attributes_json: %v", err)
+	}
+	var attributes map[string]any
+	if err := json.Unmarshal([]byte(attributesJSON), &attributes); err != nil {
+		t.Fatalf("decode public attributes_json: %v", err)
+	}
+	if attributes["publicAddress"] != "203.0.113.7" || attributes["roomKey"] != "public:203.0.113.7" {
+		t.Fatalf("public ticket attributes = %#v, want publicAddress and address-derived roomKey", attributes)
+	}
+	consumed, err := db.ConsumeWebSocketTicket(context.Background(), publicTicket.TokenHash,
+		"public-transfer", "address-hash", now)
+	if err != nil || consumed == nil || consumed.PublicAddress != "203.0.113.7" ||
+		consumed.RoomKey != "public:203.0.113.7" {
+		t.Fatalf("consume public ticket: ticket=%+v err=%v", consumed, err)
+	}
+
+	// Shared-room ticket: roomKey stays the resolved room id; publicAddress is carried too.
+	sharedTicket := WebSocketTicket{
+		TokenHash: "shared-ticket", Scope: "public-transfer", RoomID: "room-x", RoomKey: "room:42",
+		RoomRole: "OWNER", PeerID: "peer-b", DisplayName: "web", PublicAddress: "203.0.113.7",
+		SharedRoom: true, Discoverable: true,
+		RemoteAddressHash: "address-hash", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := db.InsertWebSocketTicket(context.Background(), sharedTicket); err != nil {
+		t.Fatalf("insert shared ticket: %v", err)
+	}
+	if err := db.sql.QueryRow(`SELECT attributes_json FROM specus_websocket_ticket
+		WHERE token_hash = ?`, sharedTicket.TokenHash).Scan(&attributesJSON); err != nil {
+		t.Fatalf("read shared attributes_json: %v", err)
+	}
+	attributes = nil
+	if err := json.Unmarshal([]byte(attributesJSON), &attributes); err != nil {
+		t.Fatalf("decode shared attributes_json: %v", err)
+	}
+	if attributes["roomKey"] != "room:42" || attributes["publicAddress"] != "203.0.113.7" {
+		t.Fatalf("shared ticket attributes = %#v, want unchanged room key plus publicAddress", attributes)
+	}
+
+	// Tickets written before the two keys existed still consume with the legacy zero-value
+	// fallback; the discovery upgrade recomputes both fields (public_transfer_ws.go).
+	legacyAttributes := `{"roomId":"nearby","roomRole":"EDITOR","peerId":"legacy-peer",` +
+		`"displayName":"web","sharedRoom":false,"discoverable":true}`
+	_, err = db.sql.Exec(`INSERT INTO specus_websocket_ticket
+		(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		"legacy-ticket", "public-transfer", legacyAttributes, "address-hash",
+		formatTime(now), formatTime(now.Add(time.Minute)))
+	if err != nil {
+		t.Fatalf("insert legacy ticket: %v", err)
+	}
+	consumed, err = db.ConsumeWebSocketTicket(context.Background(), "legacy-ticket",
+		"public-transfer", "address-hash", now)
+	if err != nil || consumed == nil || consumed.PublicAddress != "" || consumed.RoomKey != "" {
+		t.Fatalf("consume legacy ticket: ticket=%+v err=%v", consumed, err)
 	}
 }
 

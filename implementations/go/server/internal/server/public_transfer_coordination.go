@@ -33,7 +33,20 @@ const (
 	clusterRevisionTTL               = 7 * 24 * time.Hour
 )
 
+// Cluster visibility is net-scoped ("merged LAN visibility"): participants behind the
+// same public egress address see each other across rooms and token rooms, while
+// same-roomKey members stay visible across nets. Presence/members stay keyed by
+// groupID; nets:<netID> indexes the groupIDs present on a net, and roster revisions are
+// the sum of the group and net counters so they stay monotonic whenever either
+// dimension of a recipient's merged roster changes. Aligned with the Java coordination
+// service: mixed old/new nodes (or nodes without the nets index and net-scoped
+// revisions) corrupt the keyspace, so deploy all cluster nodes together or bump
+// RedisKeyPrefix.
 var (
+	// KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group>
+	//       4=revision:<group> 5=revision:<net> 6=nets:<net>
+	// ARGV: 1=peerValue 2=nameValue 3=memberId 4=leaseMs 5=limit 6=presencePrefix(group)
+	//       7=revisionTtlMs 8=groupId 9=presenceBasePrefix
 	clusterRegisterScript = redis.NewScript(`
 local members = redis.call('SMEMBERS', KEYS[3])
 local count = 0
@@ -45,30 +58,47 @@ for _, member in ipairs(members) do
   end
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then return {-1, 0} end
+for _, group in ipairs(redis.call('SMEMBERS', KEYS[6])) do
+  if redis.call('EXISTS', ARGV[9] .. group .. ':' .. ARGV[3]) == 1 then return {-1, 0} end
+end
 if redis.call('EXISTS', KEYS[2]) == 1 then return {-2, 0} end
 if count >= tonumber(ARGV[5]) then return {-3, 0} end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[4])
 redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[4])
 redis.call('SADD', KEYS[3], ARGV[3])
 redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[4]) * 3)
-local revision = redis.call('INCR', KEYS[4])
+redis.call('SADD', KEYS[6], ARGV[8])
+redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[4]) * 3)
+local groupRevision = redis.call('INCR', KEYS[4])
 redis.call('PEXPIRE', KEYS[4], ARGV[7])
-return {1, revision}`)
+local netRevision = redis.call('INCR', KEYS[5])
+redis.call('PEXPIRE', KEYS[5], ARGV[7])
+return {1, groupRevision + netRevision}`)
+	// KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group> 4=nets:<net>
 	clusterRefreshScript = redis.NewScript(`
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
 redis.call('PEXPIRE', KEYS[1], ARGV[3])
 redis.call('PEXPIRE', KEYS[2], ARGV[3])
 redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[3]) * 3)
+redis.call('PEXPIRE', KEYS[4], tonumber(ARGV[3]) * 3)
 return 1`)
+	// KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group>
+	//       4=revision:<group> 5=revision:<net> 6=nets:<net>
+	// ARGV: 1=peerValue 2=nameValue 3=memberId 4=revisionTtlMs 5=groupId
 	clusterUnregisterScript = redis.NewScript(`
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 redis.call('DEL', KEYS[1])
 if redis.call('GET', KEYS[2]) == ARGV[2] then redis.call('DEL', KEYS[2]) end
 redis.call('SREM', KEYS[3], ARGV[3])
-local revision = redis.call('INCR', KEYS[4])
+if redis.call('SCARD', KEYS[3]) == 0 then redis.call('SREM', KEYS[6], ARGV[5]) end
+local groupRevision = redis.call('INCR', KEYS[4])
 redis.call('PEXPIRE', KEYS[4], ARGV[4])
-return revision`)
+local netRevision = redis.call('INCR', KEYS[5])
+redis.call('PEXPIRE', KEYS[5], ARGV[4])
+return groupRevision + netRevision`)
+	// KEYS: 1=members:<group> 2=revision:<group> 3=revision:<net> 4=nets:<net>
+	// ARGV: 1=presencePrefix(group) 2=revisionTtlMs 3=groupId
 	clusterCleanupScript = redis.NewScript(`
 local removed = 0
 local members = redis.call('SMEMBERS', KEYS[1])
@@ -78,12 +108,16 @@ for _, member in ipairs(members) do
     removed = removed + 1
   end
 end
-local revision = tonumber(redis.call('GET', KEYS[2]) or '0')
+if redis.call('SCARD', KEYS[1]) == 0 then redis.call('SREM', KEYS[4], ARGV[3]) end
+local groupRevision = tonumber(redis.call('GET', KEYS[2]) or '0')
+local netRevision = tonumber(redis.call('GET', KEYS[3]) or '0')
 if removed > 0 then
-  revision = redis.call('INCR', KEYS[2])
+  groupRevision = redis.call('INCR', KEYS[2])
   redis.call('PEXPIRE', KEYS[2], ARGV[2])
+  netRevision = redis.call('INCR', KEYS[3])
+  redis.call('PEXPIRE', KEYS[3], ARGV[2])
 end
-return {removed, revision}`)
+return {removed, groupRevision + netRevision}`)
 	clusterRateScript = redis.NewScript(`
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
@@ -115,6 +149,10 @@ type clusterParticipant struct {
 
 func (p clusterParticipant) groupID() string {
 	return publicTransferGroupID(p.RoomID, p.RoomKey)
+}
+
+func (p clusterParticipant) netID() string {
+	return publicTransferNetID(p.PublicAddress)
 }
 
 type clusterRegistration struct {
@@ -194,6 +232,7 @@ func (c *publicTransferCoordination) addListener(listener func(publicTransferClu
 func (c *publicTransferCoordination) register(ctx context.Context, participant clusterParticipant, configuredLimit int) (clusterRegistration, error) {
 	memberID := digestString(participant.PeerID)
 	groupID := participant.groupID()
+	netID := participant.netID()
 	peerValue, err := encodeClusterParticipant(participant)
 	if err != nil {
 		return clusterRegistration{}, err
@@ -201,9 +240,9 @@ func (c *publicTransferCoordination) register(ctx context.Context, participant c
 	nameValue := participant.LeaseID + "\n" + participant.PeerID
 	result, err := c.run(ctx, clusterRegisterScript, []string{
 		c.presenceKey(groupID, memberID), c.nameKey(participant.DisplayName),
-		c.membersKey(groupID), c.revisionKey(groupID),
+		c.membersKey(groupID), c.revisionKey(groupID), c.revisionKey(netID), c.netsKey(netID),
 	}, peerValue, nameValue, memberID, c.lease().Milliseconds(), maxInt(1, configuredLimit),
-		c.presencePrefix(groupID), clusterRevisionTTL.Milliseconds())
+		c.presencePrefix(groupID), clusterRevisionTTL.Milliseconds(), groupID, c.presenceBasePrefix())
 	if err != nil {
 		return clusterRegistration{}, err
 	}
@@ -239,6 +278,7 @@ func (c *publicTransferCoordination) refresh(ctx context.Context, participant cl
 	}
 	result, err := c.run(ctx, clusterRefreshScript, []string{
 		c.presenceKey(groupID, memberID), c.nameKey(participant.DisplayName), c.membersKey(groupID),
+		c.netsKey(participant.netID()),
 	}, peerValue, participant.LeaseID+"\n"+participant.PeerID, c.lease().Milliseconds())
 	if err != nil {
 		return false, err
@@ -256,9 +296,10 @@ func (c *publicTransferCoordination) unregister(ctx context.Context, participant
 	}
 	result, err := c.run(ctx, clusterUnregisterScript, []string{
 		c.presenceKey(groupID, memberID), c.nameKey(participant.DisplayName),
-		c.membersKey(groupID), c.revisionKey(groupID),
+		c.membersKey(groupID), c.revisionKey(groupID), c.revisionKey(participant.netID()),
+		c.netsKey(participant.netID()),
 	}, peerValue, participant.LeaseID+"\n"+participant.PeerID, memberID,
-		clusterRevisionTTL.Milliseconds())
+		clusterRevisionTTL.Milliseconds(), groupID)
 	if err != nil {
 		return 0, err
 	}
@@ -266,65 +307,178 @@ func (c *publicTransferCoordination) unregister(ctx context.Context, participant
 	return uint64(value), nil
 }
 
-func (c *publicTransferCoordination) roster(ctx context.Context, groupID string) (clusterRoster, error) {
-	removed, revision, err := c.cleanup(ctx, groupID)
+// roster reads the merged roster for recipient: everyone in the recipient's token room
+// plus everyone on the recipient's network (same public egress address, regardless of
+// roomID), deduplicated by peerID. The returned revision is the sum of the group and
+// net revision counters, so it increases monotonically whenever either dimension
+// changes.
+func (c *publicTransferCoordination) roster(ctx context.Context, recipient clusterParticipant) (clusterRoster, error) {
+	groupID := recipient.groupID()
+	netID := recipient.netID()
+	groups, err := c.netGroups(ctx, netID, groupID)
 	if err != nil {
 		return clusterRoster{}, err
 	}
-	if removed > 0 {
-		_ = c.publishRoster(ctx, groupID, revision)
+	// Hygiene pass: prune stale members of the own group and of every group on the net
+	// (also drops emptied groups from the nets index and bumps both revision counters so
+	// presence expiries surface to merged-roster recipients in a timely manner).
+	removedAny := false
+	var cleanupRevision uint64
+	for _, group := range groups {
+		removed, revision, err := c.cleanup(ctx, group, netID)
+		if err != nil {
+			return clusterRoster{}, err
+		}
+		if removed > 0 {
+			removedAny = true
+			cleanupRevision = revision
+		}
+	}
+	if removedAny {
+		_ = c.publishRoster(ctx, groupID, cleanupRevision)
+		_ = c.publishRoster(ctx, netID, cleanupRevision)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		before, err := c.revision(ctx, groupID)
+		beforeGroup, err := c.revision(ctx, groupID)
 		if err != nil {
 			return clusterRoster{}, err
 		}
-		members, err := c.client.SMembers(ctx, c.membersKey(groupID)).Result()
-		if err != nil {
-			return clusterRoster{}, c.wrap(err)
-		}
-		participants := make([]clusterParticipant, 0, len(members))
-		if len(members) > 0 {
-			keys := make([]string, 0, len(members))
-			for _, member := range members {
-				keys = append(keys, c.presenceKey(groupID, member))
-			}
-			values, err := c.client.MGet(ctx, keys...).Result()
-			if err != nil {
-				return clusterRoster{}, c.wrap(err)
-			}
-			for _, value := range values {
-				text, ok := value.(string)
-				if !ok {
-					continue
-				}
-				participant, ok := decodeClusterParticipant(text)
-				if ok && participant.groupID() == groupID {
-					participants = append(participants, participant)
-				}
-			}
-		}
-		after, err := c.revision(ctx, groupID)
+		beforeNet, err := c.revision(ctx, netID)
 		if err != nil {
 			return clusterRoster{}, err
 		}
-		if attempt == 1 || before == after {
+		groups, err := c.netGroups(ctx, netID, groupID)
+		if err != nil {
+			return clusterRoster{}, err
+		}
+		participants, err := c.readMergedParticipants(ctx, recipient, groups)
+		if err != nil {
+			return clusterRoster{}, err
+		}
+		afterGroup, err := c.revision(ctx, groupID)
+		if err != nil {
+			return clusterRoster{}, err
+		}
+		afterNet, err := c.revision(ctx, netID)
+		if err != nil {
+			return clusterRoster{}, err
+		}
+		if attempt == 1 || beforeGroup == afterGroup && beforeNet == afterNet {
 			sort.Slice(participants, func(i, j int) bool {
 				return participants[i].ConnectedAt < participants[j].ConnectedAt
 			})
-			return clusterRoster{revision: after, participants: participants}, nil
+			return clusterRoster{revision: afterGroup + afterNet, participants: participants}, nil
 		}
 	}
 	return clusterRoster{}, errors.New("could not read stable public transfer roster")
 }
 
-func (c *publicTransferCoordination) sweep(ctx context.Context, groupID string) error {
-	removed, revision, err := c.cleanup(ctx, groupID)
+// findPeer locates a visible peer by peerID within the recipient's merged visibility
+// domain (same room or same network). Directed messages are routed to the resolved
+// target's group; a nil result means the target is not visible to the recipient.
+func (c *publicTransferCoordination) findPeer(ctx context.Context, recipient clusterParticipant, peerID string) (*clusterParticipant, error) {
+	if strings.TrimSpace(peerID) == "" {
+		return nil, nil
+	}
+	groups, err := c.netGroups(ctx, recipient.netID(), recipient.groupID())
+	if err != nil {
+		return nil, err
+	}
+	participants, err := c.readMergedParticipants(ctx, recipient, groups)
+	if err != nil {
+		return nil, err
+	}
+	for _, participant := range participants {
+		if participant.PeerID == peerID {
+			resolved := participant
+			return &resolved, nil
+		}
+	}
+	return nil, nil
+}
+
+// netGroups lists the groups readable for one net: every group indexed under
+// nets:<netID>, plus groupID itself (a group always spans the nets of its members even
+// when the nets index entry aged out).
+func (c *publicTransferCoordination) netGroups(ctx context.Context, netID, groupID string) ([]string, error) {
+	groups, err := c.client.SMembers(ctx, c.netsKey(netID)).Result()
+	if err != nil {
+		return nil, c.wrap(err)
+	}
+	result := make([]string, 0, len(groups)+1)
+	seen := make(map[string]struct{}, len(groups)+1)
+	for _, group := range groups {
+		if _, ok := seen[group]; !ok {
+			seen[group] = struct{}{}
+			result = append(result, group)
+		}
+	}
+	if _, ok := seen[groupID]; !ok {
+		result = append(result, groupID)
+	}
+	return result, nil
+}
+
+// readMergedParticipants unions the live presence of the given groups and keeps only
+// records visible to recipient: same group (same roomID and roomKey) or same net (same
+// public egress address, regardless of roomID; the empty/"unknown" fallback address
+// never matches). The presence JSON carries roomKey/publicAddress, so visibility is
+// re-checked in memory rather than trusting the members sets (a group's members can
+// span nets).
+func (c *publicTransferCoordination) readMergedParticipants(ctx context.Context, recipient clusterParticipant,
+	groups []string) ([]clusterParticipant, error) {
+	participants := make([]clusterParticipant, 0)
+	seen := make(map[string]struct{})
+	for _, groupID := range groups {
+		members, err := c.client.SMembers(ctx, c.membersKey(groupID)).Result()
+		if err != nil {
+			return nil, c.wrap(err)
+		}
+		if len(members) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(members))
+		for _, member := range members {
+			keys = append(keys, c.presenceKey(groupID, member))
+		}
+		values, err := c.client.MGet(ctx, keys...).Result()
+		if err != nil {
+			return nil, c.wrap(err)
+		}
+		for _, value := range values {
+			text, ok := value.(string)
+			if !ok {
+				continue
+			}
+			participant, ok := decodeClusterParticipant(text)
+			if !ok || participant.groupID() != groupID {
+				continue
+			}
+			visible := participant.RoomID == recipient.RoomID && participant.RoomKey == recipient.RoomKey ||
+				publicAddressKnown(participant.PublicAddress) && participant.PublicAddress == recipient.PublicAddress
+			if !visible {
+				continue
+			}
+			if _, dup := seen[participant.PeerID]; dup {
+				continue
+			}
+			seen[participant.PeerID] = struct{}{}
+			participants = append(participants, participant)
+		}
+	}
+	return participants, nil
+}
+
+func (c *publicTransferCoordination) sweep(ctx context.Context, groupID, netID string) error {
+	removed, revision, err := c.cleanup(ctx, groupID, netID)
 	if err != nil {
 		return err
 	}
 	if removed > 0 {
-		return c.publishRoster(ctx, groupID, revision)
+		if err := c.publishRoster(ctx, groupID, revision); err != nil {
+			return err
+		}
+		return c.publishRoster(ctx, netID, revision)
 	}
 	return nil
 }
@@ -390,10 +544,13 @@ func (c *publicTransferCoordination) publish(ctx context.Context, event publicTr
 	return nil
 }
 
-func (c *publicTransferCoordination) cleanup(ctx context.Context, groupID string) (int64, uint64, error) {
+// cleanup removes expired members of one group and prunes the nets index entry when the
+// group empties. It returns the summed group+net revision (bumped when anything was
+// removed) so callers can fan a roster publish out to both audiences.
+func (c *publicTransferCoordination) cleanup(ctx context.Context, groupID, netID string) (int64, uint64, error) {
 	result, err := c.run(ctx, clusterCleanupScript,
-		[]string{c.membersKey(groupID), c.revisionKey(groupID)},
-		c.presencePrefix(groupID), clusterRevisionTTL.Milliseconds())
+		[]string{c.membersKey(groupID), c.revisionKey(groupID), c.revisionKey(netID), c.netsKey(netID)},
+		c.presencePrefix(groupID), clusterRevisionTTL.Milliseconds(), groupID)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -409,8 +566,8 @@ func (c *publicTransferCoordination) cleanup(ctx context.Context, groupID string
 	return removed, uint64(revision), nil
 }
 
-func (c *publicTransferCoordination) revision(ctx context.Context, groupID string) (uint64, error) {
-	value, err := c.client.Get(ctx, c.revisionKey(groupID)).Result()
+func (c *publicTransferCoordination) revision(ctx context.Context, id string) (uint64, error) {
+	value, err := c.client.Get(ctx, c.revisionKey(id)).Result()
 	if errors.Is(err, redis.Nil) {
 		return 0, nil
 	}
@@ -477,6 +634,10 @@ func (c *publicTransferCoordination) Close() error {
 	return closeErr
 }
 
+// keyPrefix namespaces every public-transfer key. The net-merged visibility indexes
+// (nets:<netID>, net-scoped revisions and routing) are incompatible with pre-merge
+// nodes: a mixed cluster reads and routes rosters inconsistently, so all nodes must
+// deploy together or RedisKeyPrefix must be bumped to force a clean keyspace.
 func (c *publicTransferCoordination) keyPrefix() string {
 	value := strings.TrimRight(strings.TrimSpace(c.cfg.RedisKeyPrefix), ":")
 	if value == "" {
@@ -486,8 +647,11 @@ func (c *publicTransferCoordination) keyPrefix() string {
 }
 
 func (c *publicTransferCoordination) eventChannel() string { return c.keyPrefix() + ":events" }
+func (c *publicTransferCoordination) presenceBasePrefix() string {
+	return c.keyPrefix() + ":presence:"
+}
 func (c *publicTransferCoordination) presencePrefix(groupID string) string {
-	return c.keyPrefix() + ":presence:" + groupID + ":"
+	return c.presenceBasePrefix() + groupID + ":"
 }
 func (c *publicTransferCoordination) presenceKey(groupID, memberID string) string {
 	return c.presencePrefix(groupID) + memberID
@@ -495,8 +659,11 @@ func (c *publicTransferCoordination) presenceKey(groupID, memberID string) strin
 func (c *publicTransferCoordination) membersKey(groupID string) string {
 	return c.keyPrefix() + ":members:" + groupID
 }
-func (c *publicTransferCoordination) revisionKey(groupID string) string {
-	return c.keyPrefix() + ":revision:" + groupID
+func (c *publicTransferCoordination) netsKey(netID string) string {
+	return c.keyPrefix() + ":nets:" + netID
+}
+func (c *publicTransferCoordination) revisionKey(id string) string {
+	return c.keyPrefix() + ":revision:" + id
 }
 func (c *publicTransferCoordination) nameKey(displayName string) string {
 	normalized := strings.ToLower(norm.NFC.String(strings.TrimSpace(displayName)))
@@ -517,6 +684,13 @@ func (c *publicTransferCoordination) wrap(err error) error {
 
 func publicTransferGroupID(roomID, roomKey string) string {
 	return digestString(roomID + "\x00" + roomKey)
+}
+
+// publicTransferNetID scopes the merged LAN visibility: everyone behind the same public
+// egress address, regardless of roomID. It travels in the opaque groupID field of STCE
+// events.
+func publicTransferNetID(publicAddress string) string {
+	return digestString(publicAddress)
 }
 
 func encodeClusterParticipant(participant clusterParticipant) (string, error) {

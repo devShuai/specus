@@ -21,6 +21,22 @@ func issuePublicTicket(t *testing.T, ts *httptest.Server, body map[string]string
 	if err != nil {
 		t.Fatal(err)
 	}
+	return postPublicTicket(t, ts, payload)
+}
+
+// issuePublicTicketJSON posts a public-transfer ws-ticket request with a raw JSON body
+// (for non-string fields such as discoverable) and returns the HTTP response.
+func issuePublicTicketJSON(t *testing.T, ts *httptest.Server, body map[string]any) *http.Response {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return postPublicTicket(t, ts, payload)
+}
+
+func postPublicTicket(t *testing.T, ts *httptest.Server, payload []byte) *http.Response {
+	t.Helper()
 	response, err := http.Post(ts.URL+"/api/public/transfer/ws-tickets", "application/json",
 		bytes.NewReader(payload))
 	if err != nil {
@@ -59,6 +75,9 @@ func TestPublicWebSocketTicketResolvesSharedRoomThroughRoomService(t *testing.T)
 		map[string]string{"roomId": "room-x", "roomToken": "owner-secret", "peerId": "peer-1"}))
 	if !owner.SharedRoom || !strings.HasPrefix(owner.RoomKey, "room:") {
 		t.Fatalf("owner claims: %+v", owner)
+	}
+	if owner.PublicAddress == "" {
+		t.Fatalf("shared-room ticket must carry the issuer public address: %+v", owner)
 	}
 	if owner.RoomRole != string(transfer.RoleOwner) {
 		t.Fatalf("owner roomRole = %q, want OWNER", owner.RoomRole)
@@ -106,10 +125,38 @@ func TestPublicWebSocketTicketWithoutTokenStaysAddressScoped(t *testing.T) {
 	app, ts := newAPIServer(t)
 	claims := consumePublicTicket(t, app, issuePublicTicket(t, ts,
 		map[string]string{"roomId": "nearby", "peerId": "peer-1"}))
-	if claims.SharedRoom || claims.RoomKey != "" {
+	if claims.SharedRoom {
 		t.Fatalf("unexpected shared-room claims: %+v", claims)
+	}
+	// 恒写 publicAddress 与派生 roomKey：跨端共库时 Java 节点消费 Go 票据能得到
+	// 与本地重算一致的 netId/groupId（对齐 Java WebSocketTicketResource）。
+	if claims.PublicAddress != "127.0.0.1" || claims.RoomKey != "public:127.0.0.1" {
+		t.Fatalf("public ticket claims = %+v, want address-scoped room key", claims)
 	}
 	if claims.RoomRole != string(transfer.RoleEditor) {
 		t.Fatalf("roomRole = %q, want EDITOR", claims.RoomRole)
+	}
+}
+
+func TestPublicWebSocketTicketParsesDiscoverable(t *testing.T) {
+	app, ts := newAPIServer(t)
+
+	// Absent discoverable keeps the legacy always-visible default.
+	visible := consumePublicTicket(t, app, issuePublicTicket(t, ts,
+		map[string]string{"roomId": "nearby", "peerId": "peer-1"}))
+	if !visible.Discoverable {
+		t.Fatalf("absent discoverable must default to true: %+v", visible)
+	}
+
+	explicit := consumePublicTicket(t, app, issuePublicTicketJSON(t, ts,
+		map[string]any{"roomId": "nearby", "peerId": "peer-2", "discoverable": true}))
+	if !explicit.Discoverable {
+		t.Fatalf("explicit discoverable=true was lost: %+v", explicit)
+	}
+
+	hidden := consumePublicTicket(t, app, issuePublicTicketJSON(t, ts,
+		map[string]any{"roomId": "nearby", "peerId": "peer-3", "discoverable": false}))
+	if hidden.Discoverable {
+		t.Fatalf("explicit discoverable=false was lost: %+v", hidden)
 	}
 }

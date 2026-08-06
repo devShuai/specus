@@ -39,6 +39,7 @@ type discoveryParticipant struct {
 	roomKey       string
 	roomRole      string
 	sharedRoom    bool
+	discoverable  bool
 	connectedAt   time.Time
 }
 
@@ -46,7 +47,23 @@ func (p discoveryParticipant) sameGroup(other discoveryParticipant) bool {
 	return p.roomID == other.roomID && p.roomKey == other.roomKey
 }
 
+// sameNet reports the LAN arm of merged visibility: participants behind the same public
+// egress address see each other regardless of roomID or roomKey. The empty/"unknown"
+// fallback address never forms a net, so clients without a usable address are not
+// grouped together.
+func (p discoveryParticipant) sameNet(other discoveryParticipant) bool {
+	return publicAddressKnown(p.publicAddress) && p.publicAddress == other.publicAddress
+}
+
+// sameScope is the merged visibility/reachability predicate: visible across rooms and
+// token rooms on the same net, and across nets inside the same token room.
+func (p discoveryParticipant) sameScope(other discoveryParticipant) bool {
+	return p.sameGroup(other) || p.sameNet(other)
+}
+
 func (p discoveryParticipant) groupID() string { return publicTransferGroupID(p.roomID, p.roomKey) }
+
+func (p discoveryParticipant) netID() string { return publicTransferNetID(p.publicAddress) }
 
 func (p discoveryParticipant) effectiveRoomRole() string {
 	if p.roomRole == "" {
@@ -81,7 +98,10 @@ type publicTransferDiscoveryHub struct {
 	startupErr   error
 	refreshStop  chan struct{}
 	closeOnce    sync.Once
-	revisions    map[string]*atomic.Uint64
+	// revisions keys local roster counters by netID: every roster push to a recipient
+	// carries a fresh tick of that recipient's own net counter, so a recipient never
+	// sees a regressing revision (aligned with the Java handler).
+	revisions map[string]*atomic.Uint64
 }
 
 type publicTransferClientNameAvailability struct {
@@ -168,6 +188,7 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 		roomKey:       claims.RoomKey,
 		roomRole:      claims.RoomRole,
 		sharedRoom:    claims.SharedRoom,
+		discoverable:  claims.Discoverable,
 		connectedAt:   time.Now().UTC(),
 	}
 	if !participant.sharedRoom {
@@ -227,6 +248,15 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 }
 
 func (h *publicTransferDiscoveryHub) register(ctx context.Context, participant discoveryParticipant) (string, uint64) {
+	if !participant.discoverable {
+		// Hidden peers never register presence and skip the duplicate/name/capacity
+		// checks (aligned with the Java handler): they still join the local session
+		// table, receive rosters and may initiate signaling.
+		h.mu.Lock()
+		h.participants[participant.socket] = participant
+		h.mu.Unlock()
+		return "", 0
+	}
 	if h.coordination.enabled() {
 		registration, err := h.coordination.register(ctx, participant.clusterParticipant(), h.cfg.MaxDiscoveryPeersPerRoom)
 		if err != nil {
@@ -248,21 +278,23 @@ func (h *publicTransferDiscoveryHub) register(ctx context.Context, participant d
 	}
 	count := 0
 	for _, existing := range h.participants {
-		if existing.sameGroup(participant) {
-			if existing.peerID == participant.peerID {
-				return duplicateDiscoveryPeerError, 0
-			}
-			count++
+		if existing.sameScope(participant) && existing.peerID == participant.peerID {
+			return duplicateDiscoveryPeerError, 0
 		}
 		if strings.EqualFold(existing.displayName, participant.displayName) {
 			return "client name is already in use", 0
+		}
+		// Room capacity stays scoped to the token room (sameGroup), matching the Java
+		// handler's roomPeerCount.
+		if existing.sameGroup(participant) {
+			count++
 		}
 	}
 	if count >= limit {
 		return "room is full", 0
 	}
 	h.participants[participant.socket] = participant
-	return "", h.nextLocalRevisionLocked(participant.groupID())
+	return "", h.nextLocalRevisionLocked(participant.netID())
 }
 
 func (h *publicTransferDiscoveryHub) unregister(socket *discoverySocket) {
@@ -270,18 +302,29 @@ func (h *publicTransferDiscoveryHub) unregister(socket *discoverySocket) {
 	participant, ok := h.participants[socket]
 	delete(h.participants, socket)
 	h.mu.Unlock()
-	if ok {
-		ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
-		defer cancel()
-		if h.coordination.enabled() {
-			revision, err := h.coordination.unregister(ctx, participant.clusterParticipant())
-			if err == nil && revision > 0 {
-				_ = h.coordination.publishRoster(ctx, participant.groupID(), revision)
-			}
-		} else {
-			h.broadcastRoster(ctx, participant, h.nextLocalRevision(participant.groupID()))
-		}
+	if !ok || !participant.discoverable {
+		// Hidden peers never registered presence nor appeared in rosters, so their
+		// departure cannot change anyone's roster.
+		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
+	defer cancel()
+	if h.coordination.enabled() {
+		revision, err := h.coordination.unregister(ctx, participant.clusterParticipant())
+		if err == nil && revision > 0 {
+			h.publishRosterPair(ctx, participant, revision)
+		}
+	} else {
+		h.broadcastRoster(ctx, participant, 0)
+	}
+}
+
+// publishRosterPair pushes a roster event to both audiences of a merged-scope change:
+// the participant's token room (groupID) and the participant's network (netID). The
+// event revision is only a hint; receivers re-read a consistent snapshot anyway.
+func (h *publicTransferDiscoveryHub) publishRosterPair(ctx context.Context, participant discoveryParticipant, revision uint64) {
+	_ = h.coordination.publishRoster(ctx, participant.groupID(), revision)
+	_ = h.coordination.publishRoster(ctx, participant.netID(), revision)
 }
 
 func (h *publicTransferDiscoveryHub) handleMessage(socket *discoverySocket, source discoveryParticipant, payload []byte) bool {
@@ -351,11 +394,23 @@ func (h *publicTransferDiscoveryHub) sendToPeer(source discoveryParticipant, tar
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
 		defer cancel()
-		_ = h.coordination.publishText(ctx, source.groupID(), targetPeerID, source.leaseID, false, encoded)
+		// Directed routing resolves the target inside the source's merged visibility
+		// domain and delivers to the target's group, exactly once (Java parity).
+		target, err := h.coordination.findPeer(ctx, source.clusterParticipant(), targetPeerID)
+		if err != nil {
+			return
+		}
+		// Hidden peers never register shared presence, so fall back to the source's
+		// group when the target does not resolve (keeps legacy same-group reachability).
+		route := source.groupID()
+		if target != nil {
+			route = target.groupID()
+		}
+		_ = h.coordination.publishText(ctx, route, targetPeerID, source.leaseID, false, encoded)
 		return
 	}
 	for _, participant := range h.snapshot() {
-		if participant.sameGroup(source) && participant.peerID == targetPeerID {
+		if participant.sameScope(source) && participant.peerID == targetPeerID {
 			_ = participant.socket.write(payload)
 			return
 		}
@@ -370,11 +425,20 @@ func (h *publicTransferDiscoveryHub) sendBinaryToPeer(source discoveryParticipan
 	if h.coordination.enabled() {
 		ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
 		defer cancel()
-		_ = h.coordination.publishBinary(ctx, source.groupID(), frame.targetPeerID, payload)
+		target, err := h.coordination.findPeer(ctx, source.clusterParticipant(), frame.targetPeerID)
+		if err != nil {
+			return
+		}
+		// Same fallback as sendToPeer: unresolved (hidden) targets go to the source group.
+		route := source.groupID()
+		if target != nil {
+			route = target.groupID()
+		}
+		_ = h.coordination.publishBinary(ctx, route, frame.targetPeerID, payload)
 		return
 	}
 	for _, participant := range h.snapshot() {
-		if participant.sameGroup(source) && participant.peerID == frame.targetPeerID {
+		if participant.sameScope(source) && participant.peerID == frame.targetPeerID {
 			_ = participant.socket.writeBinary(payload)
 			return
 		}
@@ -383,10 +447,10 @@ func (h *publicTransferDiscoveryHub) sendBinaryToPeer(source discoveryParticipan
 
 func (h *publicTransferDiscoveryHub) broadcastRoster(ctx context.Context, group discoveryParticipant, revision uint64) {
 	if h.coordination.enabled() {
-		_ = h.coordination.publishRoster(ctx, group.groupID(), revision)
+		h.publishRosterPair(ctx, group, revision)
 		return
 	}
-	h.emitRoster(ctx, group, revision)
+	h.emitRoster(ctx, group)
 }
 
 func (h *publicTransferDiscoveryHub) broadcast(group discoveryParticipant, payload any, excludeSource bool) {
@@ -412,45 +476,65 @@ func (h *publicTransferDiscoveryHub) broadcastLocal(group discoveryParticipant, 
 	}
 }
 
-func (h *publicTransferDiscoveryHub) emitRoster(ctx context.Context, group discoveryParticipant, eventRevision uint64) {
-	peers := make([]map[string]any, 0)
-	revision := eventRevision
-	if h.coordination.enabled() {
-		roster, err := h.coordination.roster(ctx, group.groupID())
-		if err != nil {
-			return
+// emitRoster builds the roster payload per recipient: sameRoom is relative to the
+// recipient and must never leak the peer's roomKey itself. Recipients are the merged
+// scope (same token room or same net) of the participant whose change triggered the
+// broadcast. Cluster roster reads are cached per recipient identity (groupID + netID).
+func (h *publicTransferDiscoveryHub) emitRoster(ctx context.Context, scope discoveryParticipant) {
+	snapshot := h.snapshot()
+	clusterRosters := make(map[string]clusterRoster)
+	for _, recipient := range snapshot {
+		if !recipient.sameScope(scope) {
+			continue
 		}
-		revision = roster.revision
-		for _, participant := range roster.participants {
-			peers = append(peers, clusterParticipantView(participant))
-		}
-	} else {
-		for _, participant := range h.snapshot() {
-			if participant.sameGroup(group) {
-				peers = append(peers, discoveryParticipantView(participant))
+		peers := make([]map[string]any, 0)
+		var revision uint64
+		if h.coordination.enabled() {
+			identity := recipient.groupID() + "\n" + recipient.netID()
+			roster, ok := clusterRosters[identity]
+			if !ok {
+				var err error
+				roster, err = h.coordination.roster(ctx, recipient.clusterParticipant())
+				if err != nil {
+					return
+				}
+				clusterRosters[identity] = roster
 			}
+			revision = roster.revision
+			for _, peer := range roster.participants {
+				peers = append(peers, clusterParticipantView(peer, recipient))
+			}
+		} else {
+			for _, peer := range snapshot {
+				if peer.discoverable && peer.sameScope(recipient) {
+					peers = append(peers, discoveryParticipantView(peer, recipient))
+				}
+			}
+			revision = h.nextLocalRevision(recipient.netID())
 		}
+		_ = recipient.socket.write(map[string]any{
+			"type": "roster", "roomId": recipient.roomID, "publicAddress": recipient.publicAddress,
+			"sharedRoom": recipient.sharedRoom, "rosterRevision": revision, "peers": peers,
+		})
 	}
-	h.broadcastLocal(group, map[string]any{
-		"type": "roster", "roomId": group.roomID, "publicAddress": group.publicAddress,
-		"sharedRoom": group.sharedRoom, "rosterRevision": revision, "peers": peers,
-	}, false, "")
 }
 
-func discoveryParticipantView(participant discoveryParticipant) map[string]any {
+func discoveryParticipantView(participant, recipient discoveryParticipant) map[string]any {
 	return map[string]any{
 		"peerId": participant.peerID, "displayName": participant.displayName,
 		"roomId": participant.roomID, "publicAddress": participant.publicAddress,
 		"sharedRoom": participant.sharedRoom, "roomRole": participant.effectiveRoomRole(),
+		"sameRoom":    participant.roomKey == recipient.roomKey,
 		"connectedAt": participant.connectedAt.Format(time.RFC3339Nano),
 	}
 }
 
-func clusterParticipantView(participant clusterParticipant) map[string]any {
+func clusterParticipantView(participant clusterParticipant, recipient discoveryParticipant) map[string]any {
 	return map[string]any{
 		"peerId": participant.PeerID, "displayName": participant.DisplayName,
 		"roomId": participant.RoomID, "publicAddress": participant.PublicAddress,
 		"sharedRoom": participant.SharedRoom, "roomRole": participant.RoomRole,
+		"sameRoom":    participant.RoomKey == recipient.roomKey,
 		"connectedAt": participant.ConnectedAt,
 	}
 }
@@ -477,39 +561,39 @@ func (h *publicTransferDiscoveryHub) allowMessage(ctx context.Context, socket *d
 	return err == nil && allowed
 }
 
+// handleClusterEvent matches events by net or by group: roster events are published to
+// both audiences of a change, targeted events are keyed by the resolved target's group,
+// and untargeted broadcasts stay group-keyed so net strangers never see room traffic.
+// The two hash namespaces cannot collide, so one dual check serves all kinds.
 func (h *publicTransferDiscoveryHub) handleClusterEvent(event publicTransferClusterEvent) {
-	var group discoveryParticipant
-	found := false
+	matched := make([]discoveryParticipant, 0)
 	for _, participant := range h.snapshot() {
-		if participant.groupID() == event.groupID {
-			group = participant
-			found = true
-			break
+		if participant.netID() == event.groupID || participant.groupID() == event.groupID {
+			matched = append(matched, participant)
 		}
 	}
-	if !found {
+	if len(matched) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
 	defer cancel()
 	switch event.kind {
 	case clusterEventKindRoster:
-		h.emitRoster(ctx, group, event.revision)
+		h.emitRoster(ctx, matched[0])
 	case clusterEventKindText:
 		if !json.Valid(event.payload) {
 			return
 		}
-		for _, participant := range h.snapshot() {
-			if participant.groupID() != event.groupID ||
-				event.targetPeerID != "" && participant.peerID != event.targetPeerID ||
+		for _, participant := range matched {
+			if event.targetPeerID != "" && participant.peerID != event.targetPeerID ||
 				event.excludeSource && participant.leaseID == event.sourceLeaseID {
 				continue
 			}
 			_ = participant.socket.writeRaw(websocket.MessageText, event.payload)
 		}
 	case clusterEventKindBinary:
-		for _, participant := range h.snapshot() {
-			if participant.groupID() == event.groupID && participant.peerID == event.targetPeerID {
+		for _, participant := range matched {
+			if participant.peerID == event.targetPeerID {
 				_ = participant.socket.writeBinary(event.payload)
 				return
 			}
@@ -530,9 +614,15 @@ func (h *publicTransferDiscoveryHub) refreshClusterPresence() {
 			if len(participants) == 0 {
 				continue
 			}
-			groups := make(map[string]struct{})
+			groupNets := make(map[string]discoveryParticipant)
+			nets := make(map[string]struct{})
 			failed := false
 			for _, participant := range participants {
+				nets[participant.netID()] = struct{}{}
+				if !participant.discoverable {
+					// Hidden peers never registered presence and have nothing to refresh.
+					continue
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
 				refreshed, err := h.coordination.refresh(ctx, participant.clusterParticipant())
 				cancel()
@@ -540,7 +630,7 @@ func (h *publicTransferDiscoveryHub) refreshClusterPresence() {
 					failed = true
 					break
 				}
-				groups[participant.groupID()] = struct{}{}
+				groupNets[participant.groupID()+"\n"+participant.netID()] = participant
 				if !refreshed {
 					h.removeLocal(participant.socket)
 					_ = participant.socket.conn.Close(websocket.StatusInternalError, "presence lease lost")
@@ -553,9 +643,17 @@ func (h *publicTransferDiscoveryHub) refreshClusterPresence() {
 				}
 				continue
 			}
-			for groupID := range groups {
+			for _, participant := range groupNets {
 				ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
-				_ = h.coordination.sweep(ctx, groupID)
+				_ = h.coordination.sweep(ctx, participant.groupID(), participant.netID())
+				cancel()
+			}
+			// Expired members' same-net cross-room audiences are outside the swept group's
+			// push scope, so top up with one roster publish per local net; the placeholder
+			// revision is fine because receivers re-read a consistent snapshot (Java parity).
+			for netID := range nets {
+				ctx, cancel := context.WithTimeout(context.Background(), h.commandTimeout())
+				_ = h.coordination.publishRoster(ctx, netID, 0)
 				cancel()
 			}
 		}
@@ -568,17 +666,17 @@ func (h *publicTransferDiscoveryHub) removeLocal(socket *discoverySocket) {
 	h.mu.Unlock()
 }
 
-func (h *publicTransferDiscoveryHub) nextLocalRevision(groupID string) uint64 {
+func (h *publicTransferDiscoveryHub) nextLocalRevision(netID string) uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.nextLocalRevisionLocked(groupID)
+	return h.nextLocalRevisionLocked(netID)
 }
 
-func (h *publicTransferDiscoveryHub) nextLocalRevisionLocked(groupID string) uint64 {
-	counter := h.revisions[groupID]
+func (h *publicTransferDiscoveryHub) nextLocalRevisionLocked(netID string) uint64 {
+	counter := h.revisions[netID]
 	if counter == nil {
 		counter = &atomic.Uint64{}
-		h.revisions[groupID] = counter
+		h.revisions[netID] = counter
 	}
 	return counter.Add(1)
 }
@@ -671,6 +769,15 @@ func truncateUTF16(value string, maxLength int) string {
 	return value
 }
 
+// unknownPublicAddress is trustedClientIP's fallback when no usable client address exists.
+const unknownPublicAddress = "unknown"
+
+// publicAddressKnown reports whether a public egress address can anchor net identity:
+// the empty string and trustedClientIP's "unknown" fallback must never group clients.
+func publicAddressKnown(publicAddress string) bool {
+	return publicAddress != "" && publicAddress != unknownPublicAddress
+}
+
 func trustedClientIP(r *http.Request) string {
 	if value := strings.TrimSpace(r.Header.Get("X-Real-IP")); value != "" {
 		return value
@@ -688,7 +795,7 @@ func trustedClientIP(r *http.Request) string {
 	if value := strings.TrimSpace(r.RemoteAddr); value != "" {
 		return value
 	}
-	return "unknown"
+	return unknownPublicAddress
 }
 
 func randomDiscoveryID() string {

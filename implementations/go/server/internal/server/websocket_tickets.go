@@ -21,6 +21,9 @@ type publicWebSocketTicketRequest struct {
 	RoomToken   string `json:"roomToken"`
 	PeerID      string `json:"peerId"`
 	DisplayName string `json:"displayName"`
+	// Discoverable mirrors the Java ticket resource: absent means visible. It must be
+	// declared here because decodeTicketRequest rejects unknown fields.
+	Discoverable *bool `json:"discoverable"`
 }
 
 func (a *App) handleAdminWebSocketTicket(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +75,12 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 		displayName = "web"
 	}
 	claims := security.WebSocketTicketClaims{RoomID: roomID, PeerID: peerID, DisplayName: displayName}
+	// 缺省可被发现：老客户端不带该字段时保持既有行为（对齐 Java WebSocketTicketResource）。
+	claims.Discoverable = request.Discoverable == nil || *request.Discoverable
+	// 恒写 publicAddress：取值链与 upgrade 时 trustedClientIP 的重算一致（ticket 已绑定
+	// remote-address，两处必然同值），使跨端共库时 Java 节点消费 Go 票据得到相同的
+	// netId/groupId（对齐 Java WebSocketTicketResource）。
+	claims.PublicAddress = trustedClientIP(r)
 	if roomToken != "" {
 		// Aligned with Java WebSocketTicketResource: resolve the room credential through the
 		// room service (creating the owner room on first use) instead of hashing the token.
@@ -84,6 +93,9 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 		claims.RoomKey = "room:" + strconv.FormatInt(access.RoomID, 10)
 		claims.RoomRole = string(access.Role)
 	} else {
+		// public 房间恒写 "public:"+publicAddress，与 upgrade 时 public_transfer_ws.go
+		// 的重算结果逐字节一致；upgrade 的重算逻辑保留以兼容旧票据。
+		claims.RoomKey = "public:" + claims.PublicAddress
 		claims.RoomRole = string(transfer.RoleEditor)
 	}
 	issued, err := a.webSocketTickets.Issue(r.Context(), security.WebSocketScopePublicTransfer,

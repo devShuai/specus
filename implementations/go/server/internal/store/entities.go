@@ -100,7 +100,9 @@ type WebSocketTicket struct {
 	RoomRole          string
 	PeerID            string
 	DisplayName       string
+	PublicAddress     string
 	SharedRoom        bool
+	Discoverable      bool
 	RemoteAddressHash string
 	CreatedAt         time.Time
 	ExpiresAt         time.Time

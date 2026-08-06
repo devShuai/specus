@@ -121,13 +121,69 @@ func TestPublicTransferClusterFrameMatchesCanonicalVector(t *testing.T) {
 }
 
 func TestDiscoveryParticipantViewPreservesRoomRole(t *testing.T) {
-	owner := discoveryParticipant{peerID: "owner", roomRole: "OWNER", connectedAt: time.Now()}
-	if got := discoveryParticipantView(owner)["roomRole"]; got != "OWNER" {
+	recipient := discoveryParticipant{peerID: "recipient", roomKey: "room:1", connectedAt: time.Now()}
+	owner := discoveryParticipant{peerID: "owner", roomKey: "room:1", roomRole: "OWNER", connectedAt: time.Now()}
+	view := discoveryParticipantView(owner, recipient)
+	if got := view["roomRole"]; got != "OWNER" {
 		t.Fatalf("owner roomRole = %#v, want OWNER", got)
 	}
-	editor := discoveryParticipant{peerID: "editor", connectedAt: time.Now()}
-	if got := discoveryParticipantView(editor)["roomRole"]; got != "EDITOR" {
+	if got := view["sameRoom"]; got != true {
+		t.Fatalf("same-room peer sameRoom = %#v, want true", got)
+	}
+	editor := discoveryParticipant{peerID: "editor", roomKey: "room:2", connectedAt: time.Now()}
+	editorView := discoveryParticipantView(editor, recipient)
+	if got := editorView["roomRole"]; got != "EDITOR" {
 		t.Fatalf("default roomRole = %#v, want EDITOR", got)
+	}
+	if got := editorView["sameRoom"]; got != false {
+		t.Fatalf("net-only peer sameRoom = %#v, want false", got)
+	}
+}
+
+func TestDiscoveryParticipantSameNetAndNetID(t *testing.T) {
+	base := discoveryParticipant{roomID: "room", publicAddress: "203.0.113.7", roomKey: "room:1"}
+	sameNetPeer := discoveryParticipant{roomID: "room", publicAddress: "203.0.113.7", roomKey: "room:2"}
+	if !base.sameNet(sameNetPeer) || !base.sameScope(sameNetPeer) || base.sameGroup(sameNetPeer) {
+		t.Fatal("same publicAddress across roomKeys must be sameNet but not sameGroup")
+	}
+	otherAddress := discoveryParticipant{roomID: "room", publicAddress: "198.51.100.9", roomKey: "room:1"}
+	if base.sameNet(otherAddress) || !base.sameGroup(otherAddress) || !base.sameScope(otherAddress) {
+		t.Fatal("same roomKey across public addresses must stay visible through sameGroup")
+	}
+	// Same egress address links devices across different roomIDs: renaming or recreating
+	// a room must not hide same-net peers.
+	otherRoom := discoveryParticipant{roomID: "other", publicAddress: "203.0.113.7", roomKey: "room:9"}
+	if !base.sameNet(otherRoom) || !base.sameScope(otherRoom) || base.sameGroup(otherRoom) {
+		t.Fatal("same publicAddress across roomIDs must be sameNet but not sameGroup")
+	}
+	stranger := discoveryParticipant{roomID: "other", publicAddress: "198.51.100.9", roomKey: "room:1"}
+	if base.sameScope(stranger) {
+		t.Fatal("different roomID and different publicAddress must stay invisible")
+	}
+	// The "unknown"/empty fallback address must never group clients into a net...
+	unknownA := discoveryParticipant{roomID: "room", publicAddress: "unknown", roomKey: "room:1"}
+	unknownB := discoveryParticipant{roomID: "room", publicAddress: "unknown", roomKey: "room:2"}
+	if unknownA.sameNet(unknownB) || unknownA.sameScope(unknownB) {
+		t.Fatal("the unknown fallback address must not form a net")
+	}
+	emptyA := discoveryParticipant{roomID: "room", publicAddress: "", roomKey: "room:1"}
+	emptyB := discoveryParticipant{roomID: "room", publicAddress: "", roomKey: "room:2"}
+	if emptyA.sameNet(emptyB) || emptyA.sameScope(emptyB) {
+		t.Fatal("an empty public address must not form a net")
+	}
+	// ...but same-group visibility does not depend on the address at all.
+	unknownRoommate := discoveryParticipant{roomID: "room", publicAddress: "unknown", roomKey: "room:1"}
+	if unknownA.sameNet(unknownRoommate) || !unknownA.sameGroup(unknownRoommate) || !unknownA.sameScope(unknownRoommate) {
+		t.Fatal("sameGroup must stay visible with an unusable public address")
+	}
+	if got, want := base.netID(), digestString("203.0.113.7"); got != want {
+		t.Fatalf("netID = %s, want %s", got, want)
+	}
+	if base.netID() == base.groupID() {
+		t.Fatal("netID and groupID must derive from different inputs")
+	}
+	if got := publicTransferNetID("203.0.113.7"); got != base.netID() {
+		t.Fatalf("publicTransferNetID = %s, want %s", got, base.netID())
 	}
 }
 
@@ -377,7 +433,15 @@ func discoveryTicketURL(t *testing.T, serverURL string, tickets *security.WebSoc
 func discoveryTicketURLWithDisplayName(t *testing.T, serverURL string, tickets *security.WebSocketTicketService,
 	roomID, roomToken, peerID, displayName, remoteAddress string) string {
 	t.Helper()
-	claims := security.WebSocketTicketClaims{RoomID: roomID, PeerID: peerID, DisplayName: displayName}
+	return discoveryTicketURLWithClaims(t, serverURL, tickets,
+		roomID, roomToken, peerID, displayName, remoteAddress, true)
+}
+
+func discoveryTicketURLWithClaims(t *testing.T, serverURL string, tickets *security.WebSocketTicketService,
+	roomID, roomToken, peerID, displayName, remoteAddress string, discoverable bool) string {
+	t.Helper()
+	claims := security.WebSocketTicketClaims{RoomID: roomID, PeerID: peerID, DisplayName: displayName,
+		Discoverable: discoverable}
 	if roomToken != "" {
 		digest := sha256.Sum256([]byte(roomToken))
 		claims.SharedRoom = true
@@ -452,4 +516,260 @@ func publicTransferTestAppFrame(appType byte, payload []byte) []byte {
 	binary.BigEndian.PutUint32(result[36:40], uint32(len(payload)))
 	copy(result[publicAppHeaderBytes:], payload)
 	return result
+}
+
+// readRosterUntil reads messages until a roster whose peer set (peerID -> sameRoom)
+// exactly matches want arrives. Intermediate rosters from earlier broadcasts are
+// skipped. Note: a read timeout closes a coder/websocket connection, so this must only
+// be used when a matching roster is guaranteed to arrive in time.
+func readRosterUntil(t *testing.T, conn *websocket.Conn, want map[string]bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Until(deadline))
+		messageType, payload, err := conn.Read(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("roster with peers %v never arrived: %v", want, err)
+		}
+		if messageType != websocket.MessageText {
+			continue
+		}
+		var value map[string]any
+		if json.Unmarshal(payload, &value) != nil || value["type"] != "roster" {
+			continue
+		}
+		if rosterPeersMatch(value, want) {
+			return value
+		}
+	}
+}
+
+func rosterPeersMatch(roster map[string]any, want map[string]bool) bool {
+	peers, ok := roster["peers"].([]any)
+	if !ok || len(peers) != len(want) {
+		return false
+	}
+	for _, item := range peers {
+		peer, ok := item.(map[string]any)
+		if !ok {
+			return false
+		}
+		peerID, _ := peer["peerId"].(string)
+		sameRoom, _ := peer["sameRoom"].(bool)
+		wantSameRoom, ok := want[peerID]
+		if !ok || wantSameRoom != sameRoom {
+			return false
+		}
+	}
+	return true
+}
+
+// expectNoDiscoveryMessage asserts the connection stays silent for wait. Beware: the
+// timing-out read closes the websocket connection, so only use this at the end of a test.
+func expectNoDiscoveryMessage(t *testing.T, conn *websocket.Conn, wait time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	messageType, payload, err := conn.Read(ctx)
+	if err == nil {
+		t.Fatalf("expected silence, got type=%v payload=%s", messageType, payload)
+	}
+}
+
+func TestPublicTransferDiscoveryMergesNetRosterAcrossGroups(t *testing.T) {
+	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               8,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	const ipX, ipY = "203.0.113.10", "198.51.100.10"
+	dial := func(roomID, token, peerID, ip string) *websocket.Conn {
+		conn := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, roomID, token, peerID, ip), ip)
+		readDiscoveryType(t, conn, "hello")
+		return conn
+	}
+	a := dial("room-m", "token-one", "a", ipX) // group one, net X
+	b := dial("room-n", "token-two", "b", ipX) // other roomID and token, net X (net-only peer of a)
+	c := dial("room-m", "token-one", "c", ipX) // group one, net X (roommate of a)
+	d := dial("room-m", "token-one", "d", ipY) // group one, net Y (remote roommate of a)
+	e := dial("room-o", "", "e", ipY)          // other roomID, no token, net Y (net-only peer of d)
+	defer a.CloseNow()
+	defer b.CloseNow()
+	defer c.CloseNow()
+	defer d.CloseNow()
+	defer e.CloseNow()
+
+	rosters := map[*websocket.Conn]map[string]any{}
+	rosters[a] = readRosterUntil(t, a, map[string]bool{"a": true, "b": false, "c": true, "d": true})
+	rosters[c] = readRosterUntil(t, c, map[string]bool{"a": true, "b": false, "c": true, "d": true})
+	// b shares no room with anyone; only net-X mates are visible (d/e are remote to b).
+	rosters[b] = readRosterUntil(t, b, map[string]bool{"a": false, "b": true, "c": false})
+	// d sees its roommates a/c across nets plus net-Y mate e; never b.
+	rosters[d] = readRosterUntil(t, d, map[string]bool{"a": true, "c": true, "d": true, "e": false})
+	// e is roomless: only the net-Y roommate d is visible.
+	rosters[e] = readRosterUntil(t, e, map[string]bool{"d": false, "e": true})
+}
+
+func TestPublicTransferDiscoveryTargetedSignalCrossesGroupsWithinNet(t *testing.T) {
+	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               8,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	const ipX, ipY = "203.0.113.11", "198.51.100.11"
+	dial := func(roomID, token, peerID, ip string) *websocket.Conn {
+		conn := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, roomID, token, peerID, ip), ip)
+		readDiscoveryType(t, conn, "hello")
+		return conn
+	}
+	a := dial("room-s", "token-one", "a", ipX)
+	b := dial("room-t", "token-two", "b", ipX) // different roomID and token, same net
+	c := dial("room-s", "token-one", "c", ipX)
+	d := dial("room-s", "token-one", "d", ipY)
+	defer a.CloseNow()
+	defer b.CloseNow()
+	defer c.CloseNow()
+	defer d.CloseNow()
+	// Synchronize on the final rosters so all joins are fully processed before signaling.
+	readRosterUntil(t, a, map[string]bool{"a": true, "b": false, "c": true, "d": true})
+	readRosterUntil(t, b, map[string]bool{"a": false, "b": true, "c": false})
+	readRosterUntil(t, c, map[string]bool{"a": true, "b": false, "c": true, "d": true})
+	readRosterUntil(t, d, map[string]bool{"a": true, "c": true, "d": true})
+
+	// Targeted signal reaches a same-net peer in another room (different roomID and
+	// token room), both ways.
+	if err := a.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"offer","targetPeerId":"b","payload":{"sdp":"x"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	offer := readDiscoveryType(t, b, "offer")
+	if offer["sourcePeerId"] != "a" || offer["targetPeerId"] != "b" {
+		t.Fatalf("unexpected cross-group offer: %#v", offer)
+	}
+	if err := b.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"answer","targetPeerId":"a","payload":{"sdp":"y"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	readDiscoveryType(t, a, "answer")
+
+	// Binary relay also reaches across groups within the net.
+	appFrame := publicTransferTestAppFrame(2, []byte("file-part"))
+	if err := a.Write(context.Background(), websocket.MessageBinary,
+		publicTransferTestClientRelay("b", appFrame)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	messageType, payload, err := b.Read(ctx)
+	cancel()
+	if err != nil || messageType != websocket.MessageBinary {
+		t.Fatalf("read cross-group binary relay: type=%v err=%v", messageType, err)
+	}
+	expected, err := encodePublicRelayServerFrame("b", "a", appFrame)
+	if err != nil || !bytes.Equal(payload, expected) {
+		t.Fatalf("cross-group binary relay mismatch: err=%v", err)
+	}
+
+	// Untargeted broadcast stays group-scoped: roommates c (same net) and d (remote)
+	// receive it, net-only peer b does not. The silence check runs last because the
+	// timing-out read closes b's connection.
+	if err := a.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"clipboard","payload":{"text":"hello"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	readDiscoveryType(t, c, "clipboard")
+	readDiscoveryType(t, d, "clipboard")
+	expectNoDiscoveryMessage(t, b, 400*time.Millisecond)
+}
+
+func TestPublicTransferDiscoveryRejectsDuplicatePeerIDAcrossNet(t *testing.T) {
+	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               4,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	const ipX = "203.0.113.12"
+	first := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, "room-d", "token-one", "dup", ipX), ipX)
+	defer first.CloseNow()
+	readDiscoveryType(t, first, "hello")
+
+	// Same peerID in a different token room but on the same net now collides.
+	duplicate := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, "room-d", "token-two", "dup", ipX), ipX)
+	defer duplicate.CloseNow()
+	errorMessage := readDiscoveryType(t, duplicate, "error")
+	if errorMessage["error"] != "peer id is already connected" {
+		t.Fatalf("unexpected duplicate-peer error: %#v", errorMessage)
+	}
+
+	// The same peerID on a different net stays allowed.
+	remote := dialDiscovery(t, discoveryTicketURLWithDisplayName(t, server.URL, tickets,
+		"room-d", "token-two", "dup", "dup-remote", "198.51.100.12"), "198.51.100.12")
+	defer remote.CloseNow()
+	readDiscoveryType(t, remote, "hello")
+}
+
+func TestPublicTransferDiscoveryHiddenParticipantStaysOutOfRoster(t *testing.T) {
+	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               4,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	const ipX = "203.0.113.13"
+	a := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, "room-h", "token-one", "a", ipX), ipX)
+	defer a.CloseNow()
+	readDiscoveryType(t, a, "hello")
+
+	hidden := dialDiscovery(t, discoveryTicketURLWithClaims(t, server.URL, tickets,
+		"room-h", "token-two", "ghost", "ghost", ipX, false), ipX)
+	defer hidden.CloseNow()
+	hello := readDiscoveryType(t, hidden, "hello")
+	if hello["rosterRevision"] != float64(0) {
+		t.Fatalf("hidden hello rosterRevision = %#v, want 0", hello["rosterRevision"])
+	}
+
+	// The hidden peer is nowhere in the visible peer's roster.
+	readRosterUntil(t, a, map[string]bool{"a": true})
+	// ...but still receives rosters itself and sees discoverable net-mates.
+	readRosterUntil(t, hidden, map[string]bool{"a": false})
+	// Drain the second roster a received from the hidden peer's join broadcast.
+	readRosterUntil(t, a, map[string]bool{"a": true})
+
+	// A hidden peer may still initiate and receive targeted signaling (Java parity).
+	if err := hidden.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"offer","targetPeerId":"a","payload":{"sdp":"h"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	offer := readDiscoveryType(t, a, "offer")
+	if offer["sourcePeerId"] != "ghost" {
+		t.Fatalf("unexpected hidden offer: %#v", offer)
+	}
+	if err := a.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"answer","targetPeerId":"ghost","payload":{"sdp":"a"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	readDiscoveryType(t, hidden, "answer")
+}
+
+func TestPublicTransferDiscoveryUnknownAddressNeverFormsNet(t *testing.T) {
+	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               8,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	// X-Real-IP "unknown" stands in for trustedClientIP's no-usable-address fallback.
+	dial := func(token, peerID string) *websocket.Conn {
+		conn := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, "room-u", token, peerID, "unknown"), "unknown")
+		readDiscoveryType(t, conn, "hello")
+		return conn
+	}
+	u1 := dial("token-one", "u1")
+	u2 := dial("token-two", "u2") // same "unknown" address, other token room: must stay invisible
+	u3 := dial("token-one", "u3") // same token room: visible through sameGroup despite the address
+	defer u1.CloseNow()
+	defer u2.CloseNow()
+	defer u3.CloseNow()
+
+	readRosterUntil(t, u1, map[string]bool{"u1": true, "u3": true})
+	readRosterUntil(t, u2, map[string]bool{"u2": true})
+	readRosterUntil(t, u3, map[string]bool{"u1": true, "u3": true})
 }

@@ -328,6 +328,10 @@ type PublicTransferConfig struct {
 	DiscoveryMessageRateLimitWindowSeconds  int64  `json:"discoveryMessageRateLimitWindowSeconds"`
 	ClusterEnabled                          bool   `json:"clusterEnabled"`
 	RedisURI                                string `json:"redisUri"`
+	// RedisKeyPrefix namespaces the coordination keys. The net-merged visibility
+	// indexes (nets/groupnets, global roster revision) are incompatible with
+	// pre-merge nodes: deploy all cluster nodes together, or bump this prefix so
+	// old and new nodes never share a keyspace.
 	RedisKeyPrefix                          string `json:"redisKeyPrefix"`
 	PresenceLeaseSeconds                    int64  `json:"presenceLeaseSeconds"`
 	PresenceRefreshIntervalMs               int64  `json:"presenceRefreshIntervalMs"`

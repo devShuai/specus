@@ -36,7 +36,14 @@ type WebSocketTicketClaims struct {
 	RoomRole    string
 	PeerID      string
 	DisplayName string
-	SharedRoom  bool
+	// PublicAddress is the issuer-visible client address (same chain as the discovery
+	// upgrade's trustedClientIP), persisted so Java nodes consuming Go tickets derive
+	// the same netId/roomKey (aligned with the Java WebSocketTicketResource).
+	PublicAddress string
+	SharedRoom    bool
+	// Discoverable defaults to true for tickets minted before the field existed
+	// (aligned with the Java discoverable attribute semantics).
+	Discoverable bool
 }
 
 // ExtractWebSocketTicket accepts only the v2 single-ticket query shape.
@@ -99,7 +106,9 @@ func (s *WebSocketTicketService) Issue(ctx context.Context, scope, remoteAddress
 		RoomRole:          strings.TrimSpace(claims.RoomRole),
 		PeerID:            strings.TrimSpace(claims.PeerID),
 		DisplayName:       strings.TrimSpace(claims.DisplayName),
+		PublicAddress:     strings.TrimSpace(claims.PublicAddress),
 		SharedRoom:        claims.SharedRoom,
+		Discoverable:      claims.Discoverable,
 		RemoteAddressHash: digestText(remoteAddress),
 		CreatedAt:         now,
 		ExpiresAt:         expiresAt,
@@ -121,7 +130,8 @@ func (s *WebSocketTicketService) Consume(ctx context.Context, ticket, scope, rem
 	return &WebSocketTicketClaims{
 		Username: record.Username, TenantID: record.TenantID, Admin: record.Admin,
 		RoomID: record.RoomID, RoomKey: record.RoomKey, RoomRole: record.RoomRole, PeerID: record.PeerID,
-		DisplayName: record.DisplayName, SharedRoom: record.SharedRoom,
+		DisplayName: record.DisplayName, PublicAddress: record.PublicAddress,
+		SharedRoom: record.SharedRoom, Discoverable: record.Discoverable,
 	}, nil
 }
 

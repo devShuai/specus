@@ -108,6 +108,9 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 		ticket.PeerID = peerID.String
 		ticket.DisplayName = displayName.String
 		ticket.SharedRoom = bool(sharedRoom)
+		// Rows without attributes_json predate the discoverable attribute; keep the
+		// legacy always-visible behavior (Java: !Boolean.FALSE.equals(...)).
+		ticket.Discoverable = true
 	}
 	ticket.RemoteAddressHash = storedAddressHash.String
 	ticket.CreatedAt = parseTime(createdAt)
@@ -148,14 +151,22 @@ type webSocketTicketAttributes struct {
 	RoomRole    string `json:"roomRole,omitempty"`
 	PeerID      string `json:"peerId,omitempty"`
 	DisplayName string `json:"displayName,omitempty"`
-	SharedRoom  bool   `json:"sharedRoom"`
+	// PublicAddress mirrors the Java ticket resource: always written for public-transfer
+	// tickets so cross-implementation consumers derive the same net identity.
+	PublicAddress string `json:"publicAddress,omitempty"`
+	SharedRoom    bool   `json:"sharedRoom"`
+	// Discoverable uses a pointer so tickets written before the attribute existed
+	// (or by older nodes) still decode to the Java default: visible.
+	Discoverable *bool `json:"discoverable,omitempty"`
 }
 
 func encodeWebSocketTicketAttributes(ticket WebSocketTicket) (string, error) {
+	discoverable := ticket.Discoverable
 	payload, err := json.Marshal(webSocketTicketAttributes{
 		Username: ticket.Username, TenantID: ticket.TenantID, Admin: ticket.Admin,
 		RoomID: ticket.RoomID, RoomKey: ticket.RoomKey, RoomRole: ticket.RoomRole,
-		PeerID: ticket.PeerID, DisplayName: ticket.DisplayName, SharedRoom: ticket.SharedRoom,
+		PeerID: ticket.PeerID, DisplayName: ticket.DisplayName, PublicAddress: ticket.PublicAddress,
+		SharedRoom: ticket.SharedRoom, Discoverable: &discoverable,
 	})
 	return string(payload), err
 }
@@ -173,7 +184,9 @@ func decodeWebSocketTicketAttributes(payload string, ticket *WebSocketTicket) er
 	ticket.RoomRole = attributes.RoomRole
 	ticket.PeerID = attributes.PeerID
 	ticket.DisplayName = attributes.DisplayName
+	ticket.PublicAddress = attributes.PublicAddress
 	ticket.SharedRoom = attributes.SharedRoom
+	ticket.Discoverable = attributes.Discoverable == nil || *attributes.Discoverable
 	return nil
 }
 
