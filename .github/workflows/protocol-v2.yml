@@ -65,7 +65,7 @@ jobs:
         run: >-
           mvn -pl implementations/java/server -am
           -DskipTests=false
-          -Dtest=PublicTransferCoordinationRedisIT,PublicTransferClusterFrameTests,ConnectionEventsWebSocketHandlerTests
+          -Dtest=PublicTransferCoordinationRedisIT,PublicTransferClusterFrameTests,ConnectionEventsWebSocketHandlerTests,PublicTransferDiscoveryWebSocketHandlerTests,PublicTransferCoordinationServiceTests
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dspecus.server.web.skip=true
           test
@@ -82,7 +82,7 @@ jobs:
         working-directory: implementations/go/server
         run: >-
           go test ./internal/server ./internal/wsevents
-          -run 'Test(PublicTransfer(CoordinationAcrossRedisInstances|ClusterFrameMatchesCanonicalVector)|HubPublishesAndDeliversClusterManagementEvents)'
+          -run 'Test(PublicTransfer(CoordinationAcrossRedisInstances|CoordinationMergesNetRoster|ClusterFrameMatchesCanonicalVector)|HubPublishesAndDeliversClusterManagementEvents)'
           -count=1
 
       - name: Set up .NET 10
@@ -98,7 +98,7 @@ jobs:
           implementations/csharp/server/tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj
           -p:SpecusServerWebSkip=true
           -p:NuGetAudit=false
-          --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests"
+          --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests|FullyQualifiedName~PublicTransferClusterFaultToleranceTests"
           --verbosity minimal
 
   c-linux:
