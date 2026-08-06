@@ -287,7 +287,8 @@ jobs:
           set -euo pipefail
           mkdir -p release-dist
           rm -f "release-dist/specus-desktop-$RELEASE_VERSION-win-x64.zip"
-          (cd out/specus-desktop && zip -q -r "$GITHUB_WORKSPACE/release-dist/specus-desktop-$RELEASE_VERSION-win-x64.zip" .)
+          # Windows runner 的 Git Bash 没有 zip；用系统自带 bsdtar 的 -a 按扩展名写 zip。
+          tar -a -cf "release-dist/specus-desktop-$RELEASE_VERSION-win-x64.zip" -C out/specus-desktop .
           (cd release-dist && sha256sum "specus-desktop-$RELEASE_VERSION-win-x64.zip" > "specus-desktop-$RELEASE_VERSION-win-x64.zip.sha256")
 
       - uses: actions/upload-artifact@v4
