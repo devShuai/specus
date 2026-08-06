@@ -236,6 +236,16 @@ internal static class RawRedis
         {
             configuration.Password = Uri.UnescapeDataString(uri.UserInfo.Split(':', 2)[^1]);
         }
+        // Honor the database index in the URI path like the coordination service does,
+        // or fault injections land in DB 0 while the service under test reads another
+        // database (pub/sub is the only database-agnostic part).
+        var path = uri.AbsolutePath.Trim('/');
+        if (path.Length > 0 && int.TryParse(path,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var database))
+        {
+            configuration.DefaultDatabase = database;
+        }
         return ConnectionMultiplexer.ConnectAsync(configuration);
     }
 }
