@@ -23,6 +23,7 @@ public class PeerDataFrameCodecBenchmark {
     private static final long SESSION_ID = 1001L;
     private static final long FROM_CLIENT_ID = 11L;
     private static final long TO_CLIENT_ID = 22L;
+    private static final String SENDER_KEY_EPOCH = "epoch-a";
 
     @org.openjdk.jmh.annotations.Param({"64", "512", "1200"})
     private int payloadBytes;
@@ -41,7 +42,7 @@ public class PeerDataFrameCodecBenchmark {
         }
         sessionKey = new SecretKeySpec(key, "AES");
         trafficKey = PeerDataFrameCodec.trafficKey(
-                sessionKey, SESSION_ID, FROM_CLIENT_ID, TO_CLIENT_ID);
+                sessionKey, SESSION_ID, FROM_CLIENT_ID, TO_CLIENT_ID, SENDER_KEY_EPOCH);
         payload = new byte[payloadBytes];
         for (int index = 0; index < payload.length; index++) {
             payload[index] = (byte) index;
