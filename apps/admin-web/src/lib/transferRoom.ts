@@ -1,6 +1,5 @@
 export const MAX_TRANSFER_ROOM_NAME_LENGTH = 120;
 export const MAX_TRANSFER_ROOM_TOKEN_LENGTH = 512;
-export type TransferNetworkMode = "lan" | "internet";
 
 export interface TransferRoomValidationOptions {
   roomTokenRequired?: boolean;
@@ -44,20 +43,6 @@ export function validateTransferRoomSettings(
   }
 
   return { roomId, roomToken, errors };
-}
-
-export function resolveTransferNetworkMode(
-  value: string | null | undefined,
-  roomToken: string | null | undefined,
-): TransferNetworkMode {
-  const normalized = value?.trim().toLowerCase();
-  if (normalized === "lan" || normalized === "local" || normalized === "intranet") {
-    return "lan";
-  }
-  if (normalized === "internet" || normalized === "external" || normalized === "wan") {
-    return "internet";
-  }
-  return roomToken?.trim() ? "internet" : "lan";
 }
 
 export function resolveTransferPeerSelection(

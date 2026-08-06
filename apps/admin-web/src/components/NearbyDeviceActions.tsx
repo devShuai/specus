@@ -2,9 +2,9 @@ import { Modal, ModalBody, ModalContent, ModalHeader } from "@heroui/react";
 import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 
 /**
- * 内网互传的设备操作面板。
+ * 设备列表的操作面板。
  *
- * 信息架构以「设备」为主体：先选人，再选做什么——这与 AirDrop 一致，也贴合内网互传的
+ * 信息架构以「设备」为主体：先选人，再选做什么——这与 AirDrop 一致，也贴合互传的
  * 真实心智（"发给客厅那台电脑"，而不是"打开文件工具再挑设备"）。三项能力共用一个面板，
  * 避免用户在顶部页签和设备列表之间来回切换。
  */
@@ -15,6 +15,8 @@ interface NearbyDeviceActionsProps {
   isOpen: boolean;
   deviceName: string;
   transportPath?: PeerTransportPath;
+  /** 与本机同一网络时按仅直连策略提示 */
+  sameLan?: boolean;
   /** 只读房间等场景下禁止发起写操作，但仍允许查看白板 */
   canSend: boolean;
   onClose: () => void;
@@ -38,6 +40,7 @@ export function NearbyDeviceActions({
   isOpen,
   deviceName,
   transportPath,
+  sameLan,
   canSend,
   onClose,
   onSelect,
@@ -58,7 +61,9 @@ export function NearbyDeviceActions({
               ? "经备用通道连接"
               : transportPath === "direct"
                 ? "设备直连"
-                : "同一网络中的设备"}
+                : sameLan
+                  ? "同一网络中的设备"
+                  : "远程设备"}
           </span>
         </ModalHeader>
         <ModalBody className="gap-2 pb-5">

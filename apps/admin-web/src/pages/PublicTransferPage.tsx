@@ -70,9 +70,7 @@ import {
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
   localizeTransferDiscoveryError,
   resolveTransferPeerSelection,
-  resolveTransferNetworkMode,
   validateTransferRoomSettings,
-  type TransferNetworkMode,
   type TransferRoomSettingsErrors,
 } from "../lib/transferRoom";
 import { sendWhiteboardWithFallback } from "../lib/whiteboardTransport";
@@ -125,6 +123,7 @@ interface DiscoveryPeer {
   publicAddress: string;
   connectedAt: string;
   roomRole?: PublicTransferRoomRole;
+  sameRoom?: boolean;
 }
 
 interface IncomingAttachment {
@@ -160,7 +159,7 @@ interface FileTransferTask {
   activityId: string;
   roomEpoch: number;
   roomGeneration: number;
-  networkMode: TransferNetworkMode;
+  targetSameLan: boolean;
   roomId: string;
   roomToken: string;
   targetPeerId: string;
@@ -173,7 +172,7 @@ interface QueuedFileTransfer {
   file: File;
   roomEpoch: number;
   roomGeneration: number;
-  networkMode: TransferNetworkMode;
+  targetSameLan: boolean;
   roomId: string;
   roomToken: string;
   targetPeerId: string;
@@ -347,8 +346,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [clientNameConnectionGeneration, setClientNameConnectionGeneration] = useState(0);
   const [roomSettingsOpen, setRoomSettingsOpen] = useState(false);
   const [roomGeneration, setRoomGeneration] = useState(0);
-  const [networkMode, setNetworkMode] = useState<TransferNetworkMode>(() => readInitialNetworkMode());
-  const [networkModeTransitionId, setNetworkModeTransitionId] = useState(0);
+  const [sharedRoomActive, setSharedRoomActive] = useState(() => Boolean(readInitialRoomToken()));
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [roomIdDraft, setRoomIdDraft] = useState(roomId);
@@ -361,7 +359,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [roomSettingsErrors, setRoomSettingsErrors] = useState<TransferRoomSettingsErrors>({});
   const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
   const [discoverable, setDiscoverable] = useState(() => loadDiscoverable());
-  // 内网模式以设备为主体：点设备先选中它，再从面板里挑要做的事。
+  // 设备列表以设备为主体：点设备先选中它，再从面板里挑要做的事。
   const [deviceActionPeerId, setDeviceActionPeerId] = useState("");
   const [qrVisible, setQrVisible] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
@@ -374,6 +372,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [peers, setPeers] = useState<DiscoveryPeer[]>([]);
+  const [selfPublicAddress, setSelfPublicAddress] = useState("");
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
   const [state, setState] = useState<UploadState>("idle");
   const [outgoingActivities, setOutgoingActivities] = useState<OutgoingTransferActivity[]>([]);
@@ -474,17 +473,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   useEffect(() => maintainTransferPeerIdentityLease(peerIdentity), [peerIdentity]);
 
-  useEffect(() => {
-    if (networkModeTransitionId === 0) {
-      return undefined;
-    }
-    const transitionId = networkModeTransitionId;
-    const timer = window.setTimeout(() => {
-      setNetworkModeTransitionId((current) => current === transitionId ? 0 : current);
-    }, 650);
-    return () => window.clearTimeout(timer);
-  }, [networkModeTransitionId]);
-
   usePageSeo({
     title: isDiagramWorkspace ? "专业流程图 · specus" : "互传 · specus",
     description: isDiagramWorkspace
@@ -492,19 +480,22 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       : "打开同一个房间链接，在电脑和手机之间互传文件、同步剪贴板和共享白板。",
     canonical: `https://specus.devshuai.com/#/${workspace}`,
   });
-  const isInternetMode = networkMode === "internet";
   const ossFallbackEnabled = authReady && authed;
-  const effectiveRoomRole: PublicTransferRoomRole = isInternetMode ? roomRole ?? "VIEWER" : "EDITOR";
-  const isRoomReadOnly = isInternetMode && effectiveRoomRole === "VIEWER";
+  const effectiveRoomRole: PublicTransferRoomRole = sharedRoomActive ? roomRole ?? "VIEWER" : "EDITOR";
+  const isRoomReadOnly = sharedRoomActive && effectiveRoomRole === "VIEWER";
   const inviteRequestContext = `${normalizeRoomId(roomId)}\u0000${roomToken.trim()}`;
   const inviteRequestContextRef = useRef(inviteRequestContext);
   const roomInviteRoleRef = useRef(roomInviteRole);
   inviteRequestContextRef.current = inviteRequestContext;
   roomInviteRoleRef.current = roomInviteRole;
-  const transferRoomScopeKey = `${networkMode}:${normalizeRoomId(roomId)}:${isInternetMode ? roomToken.trim() : "lan"}:${roomGeneration}`;
+  const transferRoomScopeKey = `${normalizeRoomId(roomId)}:${sharedRoomActive ? roomToken.trim() : "nearby"}:${roomGeneration}`;
   const diagramPeerDisplayNames = useMemo(() => Object.fromEntries(
     peers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]),
   ), [peers]);
+  // 同网判定：本机与对端公网出口 IP 一致；本机地址未知时一律视为非同网
+  const peerLanMap = useMemo<Record<string, boolean>>(() => Object.fromEntries(
+    peers.map((peer) => [peer.peerId, Boolean(selfPublicAddress) && peer.publicAddress === selfPublicAddress]),
+  ), [peers, selfPublicAddress]);
   const normalizedDisplayNameDraft = displayNameDraft.trim();
   const clientNameLocalError = !normalizedDisplayNameDraft
     ? "客户端名称不能为空"
@@ -518,10 +509,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     window.history.replaceState({}, "", buildTransferNavigationUrl({
       origin: window.location.origin,
       workspacePath: `/${workspace}`,
-      networkMode,
       roomId,
     }));
-  }, [networkMode, roomId, workspace]);
+  }, [roomId, workspace]);
 
   useEffect(() => {
     roomAccessSecretsRef.current.clear();
@@ -886,7 +876,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, [roomId]);
 
   useEffect(() => {
-    if (!isInternetMode || !sharedAttachmentId || !roomToken.trim() || !authReady) {
+    if (!sharedRoomActive || !sharedAttachmentId || !roomToken.trim() || !authReady) {
       return;
     }
     if (!authed) {
@@ -925,7 +915,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     return () => {
       active = false;
     };
-  }, [authReady, authed, isInternetMode, roomToken, sharedAttachmentId]);
+  }, [authReady, authed, roomToken, sharedRoomActive, sharedAttachmentId]);
 
   useEffect(() => {
     let active = true;
@@ -935,7 +925,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     let reconnectBlocked = false;
     let lastPongAt = Date.now();
     rosterRevisionRef.current = 0;
-    setRoomRole(isInternetMode ? null : "EDITOR");
+    setRoomRole(sharedRoomActive ? null : "EDITOR");
     setDiscoveryStatus("connecting");
 
     const clearHeartbeat = () => {
@@ -995,6 +985,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           peers?: DiscoveryPeer[];
           rosterRevision?: number;
           roomRole?: PublicTransferRoomRole;
+          publicAddress?: string;
           payload?: unknown;
         };
         if (message.type === "pong") {
@@ -1002,6 +993,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         } else if (message.type === "hello") {
           setClientNameStatus("available");
           setDiscoveryError(null);
+          setSelfPublicAddress(normalizeSelfPublicAddress(message.publicAddress));
           if (message.roomRole) {
             setRoomRole(message.roomRole);
           }
@@ -1118,7 +1110,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         const issued = await publicCreateTransferWebSocketTicket({
           roomId,
           peerId,
-          roomToken: isInternetMode ? roomToken : "",
+          roomToken: sharedRoomActive ? roomToken : "",
           displayName,
           discoverable,
         });
@@ -1189,10 +1181,10 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         socket.close();
       }
     };
-  }, [clientNameConnectionGeneration, discoverable, displayName, handleRelayPeerFrame, handleSignal, isDiagramWorkspace, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
+  }, [clientNameConnectionGeneration, discoverable, displayName, handleRelayPeerFrame, handleSignal, isDiagramWorkspace, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken, sharedRoomActive]);
 
   useEffect(() => {
-    if (!isInternetMode || roomRole !== "OWNER") {
+    if (!sharedRoomActive || roomRole !== "OWNER") {
       setRoomAccessTokens([]);
       setCreatedRoomAccess(null);
       return;
@@ -1212,7 +1204,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     return () => {
       active = false;
     };
-  }, [isInternetMode, peerId, roomId, roomRole, roomToken]);
+  }, [peerId, roomId, roomRole, roomToken, sharedRoomActive]);
 
   useEffect(() => {
     return () => {
@@ -1235,7 +1227,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, []);
 
   const safeRoomInviteToken = useMemo(() => selectSafeTransferInviteToken({
-    networkMode,
+    sharedRoom: sharedRoomActive,
     currentRole: roomRole,
     currentRoomToken: roomToken,
     explicitInvite: createdRoomAccess
@@ -1244,14 +1236,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       && isRoomAccessUsable(createdRoomAccess)
       ? { role: createdRoomAccess.access.role, token: createdRoomAccess.token }
       : undefined,
-  }), [createdRoomAccess, inviteRequestContext, networkMode, roomInviteRole, roomRole, roomToken]);
-  const roomJoinUrl = useMemo(() => buildTransferInviteUrl({
-    origin: window.location.origin,
-    workspacePath: `/${workspace}`,
-    networkMode,
-    roomId,
-    token: safeRoomInviteToken,
-  }), [networkMode, roomId, safeRoomInviteToken, workspace]);
+  }), [createdRoomAccess, inviteRequestContext, roomInviteRole, roomRole, roomToken, sharedRoomActive]);
+  const roomJoinUrl = useMemo(() => {
+    if (sharedRoomActive && !safeRoomInviteToken) {
+      return null;
+    }
+    return buildTransferInviteUrl({
+      origin: window.location.origin,
+      workspacePath: `/${workspace}`,
+      roomId,
+      token: safeRoomInviteToken,
+    });
+  }, [sharedRoomActive, roomId, safeRoomInviteToken, workspace]);
   const pairingJoinUrl = useMemo(() => pairingCode
     && pairingCodeContextRef.current === inviteRequestContext
     && pairingCode.role === roomInviteRole
@@ -1278,11 +1274,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const selectedFileDetail = selectedFiles.length === 0
     ? selectedPeer
       ? `将发送给 ${discoveryPeerDisplayName(selectedPeer)}`
-      : isInternetMode
-        ? ossFallbackEnabled
-          ? "未选择对方时会上传并生成分享链接"
-          : "匿名模式需先选择在线设备"
-        : "附近模式需先选择在线设备"
+      : ossFallbackEnabled
+        ? "未选择对方时会上传并生成分享链接"
+        : "需先选择一台在线设备"
     : selectedFiles.length === 1
       ? `${formatBytes(selectedFiles[0].size)} · ${selectedFiles[0].type || "未知类型"}`
       : `${formatBytes(selectedFilesSize)} · 批量顺序发送`;
@@ -1304,7 +1298,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       ? `发送目标已从 ${discoveryPeerDisplayName(currentPeer)} 切换为 ${discoveryPeerDisplayName(peer)}`
       : `已选择 ${discoveryPeerDisplayName(peer)}`);
   };
-  const fileTargetRequired = networkMode === "lan" || !ossFallbackEnabled;
+  const fileTargetRequired = !ossFallbackEnabled;
   const fileDropzoneTitle = isFileDragActive
     ? "松开即可发送"
     : fileTargetRequired && !selectedPeer
@@ -1316,11 +1310,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     ? `${selectedFileTitle} · ${selectedFileDetail}`
     : selectedPeer
       ? `选择后立即发送给 ${discoveryPeerDisplayName(selectedPeer)}`
-      : isInternetMode
-        ? ossFallbackEnabled
-          ? "未选择设备时会生成短期分享链接"
-          : "匿名使用需要先选择在线设备"
-        : peers.length === 0 ? "邀请同一网络中的设备加入房间" : "从设备列表选择接收方";
+      : ossFallbackEnabled
+        ? "未选择设备时会生成短期分享链接"
+        : peers.length === 0
+          ? "同一网络的设备会自动出现，远程设备通过邀请链接加入"
+          : "从设备列表选择接收方";
   const fileActivityCount = outgoingActivities.length + incoming.length + receivingTransfers.length + pendingTransfers.length;
   const fileInboxSignature = useMemo(() => {
     const keys = new Set<string>();
@@ -1440,28 +1434,23 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setRoomSettingsErrors((current) => ({ ...current, roomToken: undefined }));
   };
 
-  const updateNetworkMode = (nextMode: TransferNetworkMode) => {
-    if (nextMode === networkMode) {
-      return;
-    }
+  const enterSharedRoom = () => {
     requestRoomContextChange(
-      "切换连接范围？",
+      "创建共享房间？",
       isTransferBusy ? "正在发送的文件会被取消。" : "当前房间连接和未保存的接收文件会暂时离开。",
-      () => applyNetworkMode(nextMode),
+      applySharedRoom,
     );
   };
 
-  const applyNetworkMode = (nextMode: TransferNetworkMode) => {
+  const applySharedRoom = () => {
     let nextToken = roomToken.trim();
-    if (nextMode === "internet"
-      && validateTransferRoomSettings(roomId, nextToken).errors.roomToken) {
+    if (validateTransferRoomSettings(roomId, nextToken).errors.roomToken) {
       nextToken = createRoomToken();
     }
 
     resetTransferRoomState();
     clearIncomingItems();
-    setNetworkMode(nextMode);
-    setNetworkModeTransitionId((current) => current + 1);
+    setSharedRoomActive(true);
     setRoomToken(nextToken);
     setRoomTokenDraft(nextToken);
     setRoomSettingsErrors({});
@@ -1472,20 +1461,41 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     window.history.replaceState({}, "", buildTransferNavigationUrl({
       origin: window.location.origin,
       workspacePath: `/${workspace}`,
-      networkMode: nextMode,
       roomId,
     }));
-    setNotice(nextMode === "lan"
-      ? "已切换到附近模式，仅使用设备点对点传输"
-      : "已切换到远程模式，可使用中继和云端接力");
+    setNotice("已进入共享房间，可邀请远程设备加入");
+    setDiscoveryError(null);
+    setError(null);
+  };
+
+  const exitSharedRoom = () => {
+    requestRoomContextChange(
+      "退出共享房间？",
+      isTransferBusy ? "正在发送的文件会被取消。" : "当前房间连接和未保存的接收文件会暂时离开。",
+      applyExitSharedRoom,
+    );
+  };
+
+  const applyExitSharedRoom = () => {
+    resetTransferRoomState();
+    clearIncomingItems();
+    setSharedRoomActive(false);
+    setRoomSettingsErrors({});
+    setQrVisible(false);
+    window.history.replaceState({}, "", buildTransferNavigationUrl({
+      origin: window.location.origin,
+      workspacePath: `/${workspace}`,
+      roomId,
+    }));
+    setNotice("已退出共享房间，仅与同一网络的设备互传");
     setDiscoveryError(null);
     setError(null);
   };
 
   const commitRoomSettings = (validation: ReturnType<typeof validateTransferRoomSettings>) => {
-    const nextToken = isInternetMode ? validation.roomToken : roomToken;
+    const nextToken = sharedRoomActive ? validation.roomToken : roomToken;
     const changed = validation.roomId !== roomId
-      || (isInternetMode && nextToken !== roomToken);
+      || (sharedRoomActive && nextToken !== roomToken);
     if (changed) {
       resetTransferRoomState();
       clearIncomingItems();
@@ -1501,7 +1511,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     window.history.replaceState({}, "", buildTransferNavigationUrl({
       origin: window.location.origin,
       workspacePath: `/${workspace}`,
-      networkMode,
       roomId: validation.roomId,
     }));
     setRoomSettingsOpen(false);
@@ -1512,7 +1521,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   const applyRoomSettings = () => {
     const validation = validateTransferRoomSettings(roomIdDraft, roomTokenDraft, {
-      roomTokenRequired: isInternetMode,
+      roomTokenRequired: sharedRoomActive,
     });
     if (validation.errors.roomId || validation.errors.roomToken) {
       setRoomSettingsErrors(validation.errors);
@@ -1521,7 +1530,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
 
     const changed = validation.roomId !== roomId
-      || (isInternetMode && validation.roomToken !== roomToken);
+      || (sharedRoomActive && validation.roomToken !== roomToken);
     if (changed) {
       requestRoomContextChange(
         "保存并切换房间？",
@@ -1582,7 +1591,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     window.history.replaceState({}, "", buildTransferNavigationUrl({
       origin: window.location.origin,
       workspacePath: `/${workspace}`,
-      networkMode,
       roomId: nextRoom,
     }));
     setNotice("已创建新房间");
@@ -1596,7 +1604,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     label: string,
     force = false,
   ): Promise<PublicTransferCreatedAccessToken> => {
-    if (!isInternetMode || roomRole !== "OWNER") {
+    if (!sharedRoomActive || roomRole !== "OWNER") {
       throw new Error(roomRole === null ? "正在确认房间权限，请稍候" : "只有房主可以生成安全邀请");
     }
     const requestContext = inviteRequestContext;
@@ -1648,7 +1656,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   };
 
   const issuePairingCode = async (role: TransferInviteRole, force = false) => {
-    if (!isInternetMode || roomRole !== "OWNER") {
+    if (!sharedRoomActive || roomRole !== "OWNER") {
       throw new Error(roomRole === null ? "正在确认房间权限，请稍候" : "只有房主可以生成配对码");
     }
     const requestContext = inviteRequestContext;
@@ -1695,12 +1703,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
-  const resolveSafeRoomInviteUrl = async (role = roomInviteRole) => {
-    if (!isInternetMode) {
+  const resolveSafeRoomInviteUrl = async (role: TransferInviteRole) => {
+    if (!sharedRoomActive) {
       return buildTransferInviteUrl({
         origin: window.location.origin,
         workspacePath: `/${workspace}`,
-        networkMode,
         roomId,
       });
     }
@@ -1711,14 +1718,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     return buildTransferInviteUrl({
       origin: window.location.origin,
       workspacePath: `/${workspace}`,
-      networkMode,
       roomId,
       token: created.token,
     });
   };
 
-  const prepareSecureInvite = async (role = roomInviteRole) => {
-    if (!isInternetMode) return;
+  const prepareSecureInvite = async (role: TransferInviteRole) => {
+    if (!sharedRoomActive) return;
     setInviteError(null);
     try {
       await Promise.all([
@@ -1735,12 +1741,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setInviteOpen(true);
   };
 
-  const copyRoomLink = async () => {
+  const copyRoomLink = async (role: TransferInviteRole) => {
     try {
-      const url = await resolveSafeRoomInviteUrl();
-      if (!url) throw new Error("安全邀请尚未生成");
+      const url = await resolveSafeRoomInviteUrl(role);
       await copyText(url);
-      setNotice(isInternetMode ? "24 小时限权邀请已复制" : "附近房间链接已复制");
+      setNotice(sharedRoomActive ? "24 小时限权邀请已复制" : "房间链接已复制");
       setError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : "复制房间链接失败";
@@ -1749,14 +1754,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
-  const shareRoom = async () => {
+  const shareRoom = async (role: TransferInviteRole) => {
     try {
-      const url = await resolveSafeRoomInviteUrl();
-      if (!url) throw new Error("安全邀请尚未生成");
+      const url = await resolveSafeRoomInviteUrl(role);
       await shareOrCopy(
         {
           title: isDiagramWorkspace ? "加入 specus 流程图房间" : "加入 specus 互传房间",
-          text: `${isInternetMode ? "远程" : "附近"}房间：${transferRoomDisplayName(roomId)}`,
+          text: `${sharedRoomActive ? "共享" : "附近"}房间：${transferRoomDisplayName(roomId)}`,
           url,
         },
         url,
@@ -1773,11 +1777,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   const showRoomQr = () => {
     setQrVisible(true);
-    setNotice(isInternetMode
+    setNotice(sharedRoomActive
       ? "正在生成一次性扫码邀请"
       : "二维码已生成，请使用同一网络中的设备扫码");
     setError(null);
-    if (isInternetMode) void prepareSecureInvite();
+    if (sharedRoomActive) void prepareSecureInvite(roomInviteRole);
   };
 
   const createRoomAccess = (role: "EDITOR" | "VIEWER") => {
@@ -1832,11 +1836,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       const url = buildTransferInviteUrl({
         origin: window.location.origin,
         workspacePath: `/${workspace}`,
-        networkMode: "internet",
         roomId,
         token: createdRoomAccess.token,
       });
-      if (!url) throw new Error("邀请已失效，请重新生成");
       await copyText(url);
       setNotice("邀请链接已复制");
       setError(null);
@@ -1848,23 +1850,19 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const regeneratePairingCode = async () => {
     setInviteError(null);
     try {
-      await issuePairingCode(roomInviteRole, true);
+      await issuePairingCode("EDITOR", true);
     } catch (err) {
       setInviteError(err instanceof Error ? err.message : "生成配对码失败");
     }
   };
 
   const regenerateSecureInvite = async () => {
-    if (!isInternetMode) return;
+    if (!sharedRoomActive) return;
     setInviteError(null);
     try {
       await Promise.all([
-        issueRoomAccess(
-          roomInviteRole,
-          roomInviteRole === "EDITOR" ? "24 小时编辑邀请" : "24 小时只读邀请",
-          true,
-        ),
-        issuePairingCode(roomInviteRole, true),
+        issueRoomAccess("EDITOR", "24 小时编辑邀请", true),
+        issuePairingCode("EDITOR", true),
       ]);
     } catch (err) {
       setInviteError(err instanceof Error ? err.message : "重新生成邀请失败");
@@ -1884,8 +1882,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       const applyRedeemedRoom = () => {
         resetTransferRoomState();
         clearIncomingItems();
-        setNetworkMode("internet");
-        setNetworkModeTransitionId((current) => current + 1);
+        setSharedRoomActive(true);
         setRoomId(redeemed.roomId);
         setRoomToken(redeemed.roomToken);
         setRoomIdDraft(redeemed.roomId);
@@ -1898,7 +1895,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         window.history.replaceState({}, "", buildTransferNavigationUrl({
           origin: window.location.origin,
           workspacePath: `/${workspace}`,
-          networkMode: "internet",
           roomId: redeemed.roomId,
         }));
         setInviteOpen(false);
@@ -1908,7 +1904,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       };
       if (hasRecoverableRoomContent) {
         setTransferInterruptAction({
-          title: "加入新的远程房间？",
+          title: "加入新的共享房间？",
           description: "当前房间内容会保留为本地草稿，正在传输的文件将取消。",
           action: applyRedeemedRoom,
         });
@@ -1932,9 +1928,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, []);
 
   useEffect(() => {
-    if (!inviteOpen || !isInternetMode || roomRole !== "OWNER") return;
-    void prepareSecureInvite(roomInviteRole);
-  }, [inviteOpen, isInternetMode, roomId, roomInviteRole, roomRole, roomToken]);
+    if (!inviteOpen || !sharedRoomActive || roomRole !== "OWNER") return;
+    void prepareSecureInvite("EDITOR");
+  }, [inviteOpen, roomId, roomRole, roomToken, sharedRoomActive]);
 
   const resolveSafeFileShareUrl = async (attachment: TransferAttachment) => {
     const created = await issueRoomAccess("VIEWER", "24 小时文件查看邀请");
@@ -1961,7 +1957,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           setNotice("已打开系统文件分享");
         } else {
           const url = await resolveSafeRoomInviteUrl("EDITOR");
-          if (!url) throw new Error("安全邀请尚未生成");
           await copyText(url);
           setNotice("直连文件只在当前会话内可用；已复制房间链接");
         }
@@ -1994,7 +1989,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     try {
       if (item.direct) {
         const url = await resolveSafeRoomInviteUrl("EDITOR");
-        if (!url) throw new Error("安全邀请尚未生成");
         await copyText(url);
         setNotice("直连文件只在当前会话内可用；已复制房间链接");
       } else {
@@ -2031,13 +2025,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       setError("请选择要发送的文件");
       return;
     }
-    if (task.networkMode === "lan" && !task.targetPeerId) {
-      setState("failed");
-      const message = "请先选择一台在线设备";
-      setError(message);
-      failOutgoingActivity(task.activityId, message);
-      return;
-    }
     if (!task.ossFallbackAllowed && !task.targetPeerId) {
       setState("failed");
       const message = "请先选择一台在线设备";
@@ -2045,7 +2032,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       failOutgoingActivity(task.activityId, message);
       return;
     }
-    if (task.networkMode === "internet" && !task.roomToken.trim()) {
+    if (!task.targetSameLan && !task.roomToken.trim()) {
       const message = "请先在房间设置中填写口令";
       setError(message);
       failOutgoingActivity(task.activityId, message);
@@ -2069,7 +2056,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         let peerResult: DirectTransferResult | null = null;
         let peerTransferRejected = false;
         let peerTransferFatal = false;
-        const transportModes = task.networkMode === "lan"
+        const transportModes = task.targetSameLan
           ? (["direct"] as const)
           : (["direct", "relay"] as const);
         for (const transportMode of transportModes) {
@@ -2097,7 +2084,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               peerTransferRejected = true;
               break;
             }
-            if (transportMode === "direct" && task.networkMode === "internet") {
+            if (transportMode === "direct" && !task.targetSameLan) {
               setNotice("点对点连接未建立，正在尝试备用通道");
             }
           }
@@ -2130,7 +2117,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           failOutgoingActivity(task.activityId, message);
           continue;
         }
-        if (task.networkMode === "internet") {
+        if (!task.targetSameLan) {
           if (!task.ossFallbackAllowed) {
             setState("failed");
             const message = "设备连接未建立；登录后可使用云端接力";
@@ -2141,9 +2128,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           setNotice("设备连接未建立，正在改用云端接力");
         }
       }
-      if (task.networkMode === "lan") {
+      if (task.targetSameLan) {
         setState("failed");
-        const message = "附近传输未完成，请检查双方网络后重试";
+        const message = "同一网络传输未完成，请检查双方网络后重试";
         setError(message);
         failOutgoingActivity(task.activityId, message);
         continue;
@@ -2196,7 +2183,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (files.length === 0) {
       return;
     }
-    const targetRequired = networkMode === "lan" || !ossFallbackEnabled;
+    const targetRequired = !ossFallbackEnabled;
     if (targetRequired && !selectedPeer) {
       setActiveTool("files");
       setError(peers.length === 0 ? "还没有可接收的设备，请先邀请对方加入" : "请先选择接收设备");
@@ -2232,7 +2219,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           file,
           roomEpoch: roomEpochRef.current,
           roomGeneration: roomGenerationRef.current,
-          networkMode,
+          targetSameLan: Boolean(selectedPeerId && peerLanMap[selectedPeerId]),
           roomId,
           roomToken,
           targetPeerId: selectedPeerId,
@@ -2257,7 +2244,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       setError("当前为只读访客，不能向房间发送文件");
       return false;
     }
-    const targetRequired = networkMode === "lan" || !ossFallbackEnabled;
+    const targetRequired = !ossFallbackEnabled;
     if (targetRequired && !selectedPeer) {
       setError(peers.length === 0 ? "还没有可接收的设备，请先邀请对方加入" : "请先选择接收设备");
       return false;
@@ -2443,7 +2430,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       activityId: queued.activityId,
       roomEpoch: queued.roomEpoch,
       roomGeneration: queued.roomGeneration,
-      networkMode: queued.networkMode,
+      targetSameLan: queued.targetSameLan,
       roomId: queued.roomId,
       roomToken: queued.roomToken,
       targetPeerId: queued.targetPeerId,
@@ -2499,7 +2486,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       file: activity.file,
       roomEpoch: roomEpochRef.current,
       roomGeneration: roomGenerationRef.current,
-      networkMode,
+      targetSameLan: Boolean(activity.targetPeerId && peerLanMap[activity.targetPeerId]),
       roomId,
       roomToken,
       targetPeerId: activity.targetPeerId,
@@ -2683,6 +2670,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     const deliveries: Array<Promise<boolean>> = [];
     for (const peer of peers) {
       const targetPeerId = peer.peerId;
+      const targetSameLan = Boolean(peerLanMap[targetPeerId]);
       // Keep payloads ordered while avoiding a new ICE negotiation for every stroke after a path fails.
       const queueKey = JSON.stringify([sendRoomEpoch, targetPeerId]);
       const previous = whiteboardSendQueuesRef.current.get(queueKey) ?? Promise.resolve();
@@ -2715,7 +2703,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           return sent;
         };
 
-        if (networkMode === "lan") {
+        if (targetSameLan) {
           const sent = await sendDirectMessage();
           if (isTargetCurrent()) {
             whiteboardTransportRetryRef.current.set(queueKey, retryState);
@@ -2762,7 +2750,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       });
     }
     return Promise.all(deliveries).then((results) => results.every(Boolean));
-  }, [isPeerMessageTransportReady, isRoomReadOnly, networkMode, peers, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
+  }, [isPeerMessageTransportReady, isRoomReadOnly, peerLanMap, peers, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
 
   const sendClipboardPayload = useCallback(async (payload: ClipboardSyncPayload) => {
     if (isRoomReadOnly) {
@@ -2775,12 +2763,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (!target) {
       throw new Error("请选择一台在线设备后再同步剪贴板");
     }
+    const targetSameLan = Boolean(peerLanMap[target.peerId]);
     const sendRoomEpoch = roomEpochRef.current;
     const sentDirect = await sendPeerMessage(
       target.peerId,
       { messageType: "clipboard", payload },
       1600,
-      networkMode === "lan" ? "direct" : "auto",
+      targetSameLan ? "direct" : "auto",
     );
     if (roomEpochRef.current !== sendRoomEpoch || !currentRoomPeerIdsRef.current.has(target.peerId)) {
       throw new Error("房间或目标设备已变化，本次剪贴板同步已取消");
@@ -2788,8 +2777,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (sentDirect) {
       return;
     }
-    if (networkMode === "lan") {
-      throw new Error("附近模式仅允许设备直连；请检查设备连接或切换到远程模式");
+    if (targetSameLan) {
+      throw new Error("同一网络仅支持设备直连，请检查设备连接");
     }
     const sentRelay = await sendRelayPeerMessage(target.peerId,
       { messageType: "clipboard", payload },
@@ -2797,7 +2786,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (!sentRelay) {
       throw new Error("互传通道暂时不可用，请确认对方仍在线");
     }
-  }, [isRoomReadOnly, networkMode, peers, selectedPeerId, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
+  }, [isRoomReadOnly, peerLanMap, peers, selectedPeerId, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
 
   const selectTransferTool = useCallback((mode: TransferToolMode, focusContent = false) => {
     setActiveTool(mode);
@@ -2841,6 +2830,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           return peer ? discoveryPeerDisplayName(peer) : "";
         })()}
         transportPath={peerTransportPaths[deviceActionPeerId]}
+        sameLan={Boolean(peerLanMap[deviceActionPeerId])}
         canSend={!isRoomReadOnly}
         onClose={() => setDeviceActionPeerId("")}
         onSelect={runNearbyDeviceAction}
@@ -2910,7 +2900,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 <span className="diagram-collaboration-role">{collaborationRoleLabel}</span>
               </div>
               <div className="mt-0.5 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                {isInternetMode ? "远程协作房间" : "附近协作房间"} · {discoveryStatus === "reconnecting" ? "连接重连中" : discoveryStatus === "connecting" ? "正在连接" : peers.length > 0 ? "协作者在线" : "等待协作者加入"}
+                {sharedRoomActive ? "共享协作房间" : "附近协作房间"} · {discoveryStatus === "reconnecting" ? "连接重连中" : discoveryStatus === "connecting" ? "正在连接" : peers.length > 0 ? "协作者在线" : "等待协作者加入"}
               </div>
             </div>
           </div>
@@ -2920,28 +2910,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <section className="diagram-collaboration-section">
           <div className="diagram-collaboration-section-heading">
             <h3>连接与房间</h3>
-            <span>{isInternetMode ? "远程" : "附近"}</span>
-          </div>
-          <div className="diagram-collaboration-network" role="radiogroup" aria-label="流程图协作网络模式">
-            {([
-              ["lan", "附近", "同网协作"],
-              ["internet", "远程", "跨网协作"],
-            ] as const).map(([mode, label, detail]) => {
-              const active = networkMode === mode;
-              return (
-                <button
-                  key={mode}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  className={active ? "is-active" : ""}
-                  onClick={() => updateNetworkMode(mode)}
-                >
-                  <span>{label}</span>
-                  <small>{detail}</small>
-                </button>
-              );
-            })}
+            <span>{sharedRoomActive ? "共享房间" : "附近设备"}</span>
           </div>
           <div className="mt-2.5 space-y-2.5">
             <div className="diagram-collaboration-client-name">
@@ -2969,7 +2938,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               isInvalid={Boolean(roomSettingsErrors.roomId)}
               errorMessage={roomSettingsErrors.roomId}
             />
-            {isInternetMode ? (
+            {sharedRoomActive ? (
               <Input
                 className="diagram-collaboration-input-root"
                 classNames={{ inputWrapper: "diagram-collaboration-input" }}
@@ -2989,12 +2958,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 }
               />
             ) : null}
-            {isInternetMode ? (
+            {sharedRoomActive ? (
               <div className="diagram-collaboration-permissions">
                 <RoomPermissionSetting
                   compact
                   context="diagram"
-                  networkMode={networkMode}
                   currentRole={effectiveRoomRole}
                   inviteRole={roomInviteRole}
                   canManage={roomRole === "OWNER"}
@@ -3014,23 +2982,28 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <section className="diagram-collaboration-section">
           <div className="diagram-collaboration-section-heading">
             <h3>邀请协作者</h3>
-            <span>{isInternetMode ? "可跨网络加入" : "限同一网络"}</span>
+            <span>{sharedRoomActive ? "可跨网络加入" : "限同一网络"}</span>
           </div>
           <div className="mt-2 grid grid-cols-4 gap-1.5">
-            <Button className="diagram-collaboration-action is-primary" size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>分享</Button>
-            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink()}>复制链接</Button>
+            <Button className="diagram-collaboration-action is-primary" size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom(roomInviteRole)}>分享</Button>
+            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink(roomInviteRole)}>复制链接</Button>
             <Button className={`diagram-collaboration-action ${qrVisible ? "is-active" : ""}`} size="sm" radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
               {qrVisible ? "收起二维码" : "二维码"}
             </Button>
             <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
           </div>
+          {!sharedRoomActive ? (
+            <Button className="diagram-collaboration-action mt-1.5" size="sm" radius="sm" color="primary" variant="flat" onPress={enterSharedRoom}>
+              创建共享房间，邀请远程协作者
+            </Button>
+          ) : null}
           {qrVisible ? (
             <div className="diagram-collaboration-qr mt-2.5">
-              {(isInternetMode ? pairingJoinUrl : roomJoinUrl) ? (
+              {(sharedRoomActive ? pairingJoinUrl : roomJoinUrl) ? (
                 <>
-                  <RoomQrCode value={(isInternetMode ? pairingJoinUrl : roomJoinUrl) as string} />
+                  <RoomQrCode value={(sharedRoomActive ? pairingJoinUrl : roomJoinUrl) as string} />
                   <div className="mt-2 break-all text-center font-mono text-[9px] leading-4 text-zinc-500 dark:text-zinc-400">
-                    {isInternetMode ? "5 分钟一次性扫码邀请" : roomJoinUrl}
+                    {sharedRoomActive ? "5 分钟一次性扫码邀请" : roomJoinUrl}
                   </div>
                 </>
               ) : (
@@ -3040,7 +3013,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           ) : null}
         </section>
 
-        {isInternetMode && roomRole === "OWNER" ? (
+        {sharedRoomActive && roomRole === "OWNER" ? (
           <section className="diagram-collaboration-section">
             <div className="diagram-collaboration-section-heading">
               <h3>权限链接</h3>
@@ -3111,7 +3084,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             collaborationPanel={collaborationPanel}
             boardKey={transferRoomScopeKey}
             roomId={roomId}
-            roomToken={isInternetMode ? roomToken : ""}
+            roomToken={sharedRoomActive ? roomToken : ""}
             roomRole={effectiveRoomRole}
             peerId={peerId}
             peerCount={peers.length}
@@ -3129,12 +3102,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   return (
     <main
       className="app-apple-tool transfer-mode-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
-      data-network-mode={networkMode}
       onPaste={handlePagePaste}
     >
-      {networkModeTransitionId > 0 ? (
-        <div key={networkModeTransitionId} className="transfer-mode-transition" aria-hidden="true" />
-      ) : null}
       <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
         <AppLogo className="min-w-0 flex-1" label="specus" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
@@ -3204,7 +3173,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </Popover>
               </div>
               <div className="transfer-room-controls flex shrink-0 items-center gap-2">
-                <NetworkModeToggle activeMode={networkMode} onSelect={updateNetworkMode} />
                 {!isDiagramWorkspace ? (
                   <Button isIconOnly size="sm" radius="sm" variant="light" className="min-h-11 min-w-11 sm:min-h-8 sm:min-w-8" aria-label="打开帮助" title="帮助" onPress={() => setHelpOpen(true)}>
                     ?
@@ -3502,7 +3470,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             isActive={activeTool === "clipboard"}
             focusRequest={clipboardFocusRequest}
             canSend={!isRoomReadOnly}
-            fileTargetRequired={networkMode === "lan" || !ossFallbackEnabled}
+            fileTargetRequired={!ossFallbackEnabled}
             targetPeerId={selectedPeer?.peerId ?? ""}
             targetPeerLabel={selectedPeer ? discoveryPeerDisplayName(selectedPeer) : ""}
             events={clipboardEvents}
@@ -3610,7 +3578,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <LazySyncedDiagram
                 boardKey={transferRoomScopeKey}
                 roomId={roomId}
-                roomToken={isInternetMode ? roomToken : ""}
+                roomToken={sharedRoomActive ? roomToken : ""}
                 roomRole={effectiveRoomRole}
                 peerId={peerId}
                 peerCount={peers.length}
@@ -3626,104 +3594,63 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         {!isDiagramWorkspace ? <aside className="min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold">{isInternetMode ? "发送给谁" : "附近设备"}</h2>
+              <h2 className="text-lg font-semibold">发送给谁</h2>
               <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                {isInternetMode
-                  ? "对方打开远程邀请后会默认选中首台设备，也可以点名字切换。"
-                  : discoverable
-                    ? "同一网络中的设备会自动出现，点头像即可切换目标。"
-                    : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
+                {discoverable
+                  ? "同一网络的设备会自动出现；远程设备通过邀请链接加入。点头像即可切换目标。"
+                  : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
               </div>
             </div>
             <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
               {peers.length} 台
             </Chip>
           </div>
-          {!isInternetMode ? (
-            <div className="mt-3">
-              <NearbyDeviceGrid
-                devices={peers.map((peer) => ({
-                  peerId: peer.peerId,
-                  displayName: discoveryPeerDisplayName(peer),
-                }))}
-                selectedPeerId={selectedPeerId}
-                transportPaths={peerTransportPaths}
-                discoverable={discoverable}
-                onSelect={(device) => {
-                  const peer = peers.find((item) => item.peerId === device.peerId);
-                  if (!peer) return;
-                  selectTransferPeer(peer);
-                  setDeviceActionPeerId(peer.peerId);
-                }}
-                onOpenSettings={() => setRoomSettingsOpen(true)}
-              />
-            </div>
-          ) : (
-          <div className="mt-3 flex flex-col gap-2">
-            {peers.length === 0 ? (
-              <div className="rounded-lg glass glass-border border p-3 text-small text-zinc-500 dark:text-zinc-400">
-                还没有其它设备。发送邀请链接或二维码，对方打开后会出现在这里。
-              </div>
-            ) : peers.map((peer) => (
-              <button
-                key={peer.peerId}
-                type="button"
-                onClick={() => selectTransferPeer(peer)}
-                className={`app-apple-tool-peer px-3 py-2 text-left text-small transition-colors ${selectedPeerId === peer.peerId ? "is-selected" : ""}`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="min-w-0 truncate font-medium">{discoveryPeerDisplayName(peer)}</div>
-                  <div className="flex shrink-0 items-center gap-1">
-                    {peerTransportPaths[peer.peerId] && (
-                      <span
-                        className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                          peerTransportPaths[peer.peerId] === "turn"
-                            ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
-                            : "bg-emerald-500/15 text-emerald-700 dark:text-emerald-200"
-                        }`}
-                      >
-                        {transportPathLabel(peerTransportPaths[peer.peerId])}
-                      </span>
-                    )}
-                    {selectedPeerId === peer.peerId && (
-                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 dark:text-cyan-100">
-                        已选
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </button>
-            ))}
+          <div className="mt-3">
+            <NearbyDeviceGrid
+              devices={peers.map((peer) => ({
+                peerId: peer.peerId,
+                displayName: discoveryPeerDisplayName(peer),
+                sameLan: Boolean(peerLanMap[peer.peerId]),
+              }))}
+              selectedPeerId={selectedPeerId}
+              transportPaths={peerTransportPaths}
+              discoverable={discoverable}
+              onSelect={(device) => {
+                const peer = peers.find((item) => item.peerId === device.peerId);
+                if (!peer) return;
+                selectTransferPeer(peer);
+                setDeviceActionPeerId(peer.peerId);
+              }}
+              onOpenSettings={() => setRoomSettingsOpen(true)}
+            />
           </div>
-          )}
         </aside> : null}
       </section>
       <TransferInviteModal
         isOpen={inviteOpen}
         onClose={() => setInviteOpen(false)}
-        networkMode={networkMode}
+        sharedRoomActive={sharedRoomActive}
         roomId={roomId}
         currentRole={roomRole}
-        inviteRole={roomInviteRole}
-        onInviteRoleChange={setRoomInviteRole}
         inviteUrl={roomJoinUrl}
-        qrUrl={isInternetMode ? pairingJoinUrl : roomJoinUrl}
-        accessExpiresAt={createdRoomAccess?.access.role === roomInviteRole
+        qrUrl={sharedRoomActive ? pairingJoinUrl : roomJoinUrl}
+        accessExpiresAt={createdRoomAccess?.access.role === "EDITOR"
           ? createdRoomAccess.access.expiresAt
           : null}
-        pairingCode={pairingCode?.role === roomInviteRole ? pairingCode : null}
+        pairingCode={pairingCode?.role === "EDITOR" ? pairingCode : null}
         isPreparing={roomAccessLoading || pairingCodeLoading}
         isPairingCodeLoading={pairingCodeLoading}
         error={inviteError}
         canUseSystemShare={canUseSystemShare()}
-        onShare={() => void shareRoom()}
-        onCopy={() => void copyRoomLink()}
+        onShare={() => void shareRoom("EDITOR")}
+        onCopy={() => void copyRoomLink("EDITOR")}
         onRegenerate={() => void regenerateSecureInvite()}
         onRegeneratePairing={() => void regeneratePairingCode()}
         pairingCodeDraft={pairingCodeDraft}
         onPairingCodeDraftChange={setPairingCodeDraft}
         isRedeeming={pairingCodeRedeeming}
         onRedeem={() => void redeemPairingCode()}
+        onCreateSharedRoom={enterSharedRoom}
       />
       <Modal
         isOpen={roomSettingsOpen}
@@ -3739,7 +3666,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <>
               <ModalHeader className="flex items-center justify-between gap-3">
                 <span>房间设置</span>
-                <Chip size="sm" radius="sm" variant="flat">{isInternetMode ? "远程房间" : "附近房间"}</Chip>
+                <Chip size="sm" radius="sm" variant="flat">{sharedRoomActive ? "共享房间" : "附近设备"}</Chip>
               </ModalHeader>
               <ModalBody className="gap-5 pb-5">
                 <section className="grid gap-3 sm:grid-cols-2">
@@ -3756,55 +3683,24 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       onApply={() => void saveRoomSettings()}
                     />
                   </div>
-                  <Input
-                    label="房间名称"
-                    radius="sm"
-                    variant="bordered"
-                    value={roomIdDraft}
-                    onValueChange={updateRoomIdDraft}
-                    maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
-                    isInvalid={Boolean(roomSettingsErrors.roomId)}
-                    errorMessage={roomSettingsErrors.roomId}
-                  />
-                  {isInternetMode ? (
-                    <Input
-                      label="房间口令"
-                      radius="sm"
-                      variant="bordered"
-                      value={roomTokenDraft}
-                      onValueChange={updateRoomTokenDraft}
-                      maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
-                      isInvalid={Boolean(roomSettingsErrors.roomToken)}
-                      errorMessage={roomSettingsErrors.roomToken}
-                      endContent={(
-                        <Button size="sm" variant="light" onPress={() => updateRoomTokenDraft(createRoomToken())}>生成</Button>
-                      )}
-                    />
-                  ) : (
-                    <div className="rounded-md border border-black/[0.07] bg-black/[0.018] px-3 py-2.5 text-small text-zinc-600 dark:border-white/[0.08] dark:bg-white/[0.025] dark:text-zinc-300">
-                      附近房间会发现同一网络中的设备，不需要口令。
-                    </div>
-                  )}
                 </section>
 
-                {!isInternetMode ? (
-                  <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
-                    <div>
-                      <h3 className="text-small font-semibold text-zinc-900 dark:text-white">允许被发现</h3>
-                      <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                        {discoverable
-                          ? "同一网络中的设备可以看到这台设备并向你发送。"
-                          : "其它设备看不到你；你仍可以看到它们并主动发送。"}
-                      </p>
-                    </div>
-                    <Switch
-                      size="sm"
-                      aria-label="切换允许被发现"
-                      isSelected={discoverable}
-                      onValueChange={updateDiscoverable}
-                    />
-                  </section>
-                ) : null}
+                <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
+                  <div>
+                    <h3 className="text-small font-semibold text-zinc-900 dark:text-white">允许被发现</h3>
+                    <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                      {discoverable
+                        ? "同一网络中的设备可以看到这台设备并向你发送。"
+                        : "其它设备看不到你；你仍可以看到它们并主动发送。"}
+                    </p>
+                  </div>
+                  <Switch
+                    size="sm"
+                    aria-label="切换允许被发现"
+                    isSelected={discoverable}
+                    onValueChange={updateDiscoverable}
+                  />
+                </section>
 
                 {!isDiagramWorkspace ? (
                   <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
@@ -3822,51 +3718,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     />
                   </section>
                 ) : null}
-
-                {isInternetMode ? (
-                  <section className="border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
-                    <RoomPermissionSetting
-                      networkMode={networkMode}
-                      currentRole={effectiveRoomRole}
-                      inviteRole={roomInviteRole}
-                      canManage={roomRole === "OWNER"}
-                      isLoading={roomAccessLoading}
-                      onInviteRoleChange={setRoomInviteRole}
-                      onCreateInvite={() => void createRoomAccess(roomInviteRole)}
-                    />
-                  </section>
-                ) : null}
-
-                {isInternetMode && roomRole === "OWNER" ? (
-                  <section className="border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
-                    <div className="flex items-center justify-between gap-3">
-                      <h3 className="text-small font-semibold text-zinc-900 dark:text-white">邀请记录</h3>
-                      <Chip size="sm" radius="sm" variant="flat">{roomAccessTokens.length}</Chip>
-                    </div>
-                    {createdRoomAccess ? (
-                      <div className="mt-2 flex items-center justify-between gap-3 rounded-md border border-amber-500/25 bg-amber-50/80 px-3 py-2 dark:border-amber-300/20 dark:bg-amber-300/10">
-                        <span className="min-w-0 truncate text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 链接仅显示一次</span>
-                        <Button size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制</Button>
-                      </div>
-                    ) : null}
-                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                      {roomAccessTokens.length === 0 ? (
-                        <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无邀请记录"}</div>
-                      ) : roomAccessTokens.map((access) => (
-                        <div key={access.id} className="flex min-h-11 items-center justify-between gap-2 rounded-md border border-black/[0.07] px-3 py-2 dark:border-white/[0.08]">
-                          <div className="min-w-0">
-                            <div className="truncate text-tiny font-medium text-zinc-800 dark:text-zinc-200">{access.label}</div>
-                            <div className="truncate text-[11px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : isAccessTokenExpired(access) ? "已过期" : access.expiresAt ? formatInviteExpiry(access.expiresAt) : new Date(access.createdAt).toLocaleString()}</div>
-                          </div>
-                          <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>{access.revokedAt ? "已撤销" : "撤销"}</Button>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
               </ModalBody>
               <ModalFooter className="justify-between">
-                <Button color="danger" variant="light" radius="sm" onPress={createNewRoom}>创建新房间</Button>
+                <div className="flex items-center gap-2">
+                  {sharedRoomActive ? (
+                    <Button color="danger" variant="light" radius="sm" onPress={exitSharedRoom}>退出共享房间</Button>
+                  ) : null}
+                  <Button color="danger" variant="light" radius="sm" onPress={createNewRoom}>创建新房间</Button>
+                </div>
                 <div className="flex items-center gap-2">
                   <Button variant="light" radius="sm" onPress={onClose}>取消</Button>
                   <Button
@@ -3941,7 +3800,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <>
               <ModalHeader>互传帮助</ModalHeader>
               <ModalBody className="pb-5">
-                <TransferFaq iceConfig={iceConfig} networkMode={networkMode} ossFallbackEnabled={ossFallbackEnabled} />
+                <TransferFaq iceConfig={iceConfig} sharedRoom={sharedRoomActive} ossFallbackEnabled={ossFallbackEnabled} />
               </ModalBody>
               <ModalFooter><Button color="primary" radius="sm" onPress={onClose}>知道了</Button></ModalFooter>
             </>
@@ -4029,7 +3888,6 @@ function ClientNameSettings({
 function RoomPermissionSetting({
   compact = false,
   context = "transfer",
-  networkMode,
   currentRole,
   inviteRole,
   canManage,
@@ -4039,7 +3897,6 @@ function RoomPermissionSetting({
 }: {
   compact?: boolean;
   context?: "transfer" | "diagram";
-  networkMode: TransferNetworkMode;
   currentRole: PublicTransferRoomRole;
   inviteRole: TransferInviteRole;
   canManage: boolean;
@@ -4047,16 +3904,13 @@ function RoomPermissionSetting({
   onInviteRoleChange: (role: TransferInviteRole) => void;
   onCreateInvite: () => void;
 }) {
-  const isInternetMode = networkMode === "internet";
   const currentRoleLabel = currentRole === "OWNER" ? "房主" : currentRole === "EDITOR" ? "可编辑" : "只读";
   const displayedRole = canManage ? inviteRole : currentRole === "VIEWER" ? "VIEWER" : "EDITOR";
   const editorRoleDetail = context === "diagram" ? "编辑画布、评论和版本" : "发送文件、剪贴板和白板";
   const viewerRoleDetail = context === "diagram" ? "查看画布和协作更新" : "仅查看和接收房间内容";
-  const description = !isInternetMode
-    ? "附近房间默认允许编辑；切换到远程模式后，可以为邀请链接设置可编辑或只读权限。"
-    : canManage
-      ? "此设置作用于新生成的邀请链接，不会改变房主自身权限。"
-      : "当前权限由加入房间时使用的邀请链接决定，只有房主可以生成不同权限的链接。";
+  const description = canManage
+    ? "此设置作用于新生成的邀请链接，不会改变房主自身权限。"
+    : "当前权限由加入房间时使用的邀请链接决定，只有房主可以生成不同权限的链接。";
 
   if (compact) {
     return (
@@ -4162,29 +4016,6 @@ function RoomPermissionSetting({
         ) : null}
       </div>
       <p className="mt-2 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{description}</p>
-    </div>
-  );
-}
-
-function NetworkModeToggle({
-  activeMode,
-  onSelect,
-}: {
-  activeMode: TransferNetworkMode;
-  onSelect: (mode: TransferNetworkMode) => void;
-}) {
-  const isInternetMode = activeMode === "internet";
-  return (
-    <div className="transfer-network-toggle">
-      <span className={!isInternetMode ? "is-active" : ""}>附近</span>
-      <Switch
-        size="sm"
-        color="primary"
-        aria-label="切换附近或远程模式"
-        isSelected={isInternetMode}
-        onValueChange={(selected) => onSelect(selected ? "internet" : "lan")}
-      />
-      <span className={isInternetMode ? "is-active" : ""}>远程</span>
     </div>
   );
 }
@@ -4638,11 +4469,9 @@ function Preview({ record, onPreview }: { record: UploadRecord; onPreview: (targ
 function TransferInviteModal({
   isOpen,
   onClose,
-  networkMode,
+  sharedRoomActive,
   roomId,
   currentRole,
-  inviteRole,
-  onInviteRoleChange,
   inviteUrl,
   qrUrl,
   accessExpiresAt,
@@ -4659,14 +4488,13 @@ function TransferInviteModal({
   onPairingCodeDraftChange,
   isRedeeming,
   onRedeem,
+  onCreateSharedRoom,
 }: {
   isOpen: boolean;
   onClose: () => void;
-  networkMode: TransferNetworkMode;
+  sharedRoomActive: boolean;
   roomId: string;
   currentRole: PublicTransferRoomRole | null;
-  inviteRole: TransferInviteRole;
-  onInviteRoleChange: (role: TransferInviteRole) => void;
   inviteUrl: string | null;
   qrUrl: string | null;
   accessExpiresAt: string | null;
@@ -4683,10 +4511,10 @@ function TransferInviteModal({
   onPairingCodeDraftChange: (value: string) => void;
   isRedeeming: boolean;
   onRedeem: () => void;
+  onCreateSharedRoom: () => void;
 }) {
-  const isInternetMode = networkMode === "internet";
-  const canInvite = !isInternetMode || currentRole === "OWNER";
-  const rolePending = isInternetMode && currentRole === null;
+  const canInvite = !sharedRoomActive || currentRole === "OWNER";
+  const rolePending = sharedRoomActive && currentRole === null;
   const formattedPairingCode = pairingCode ? formatPairingCode(pairingCode.code) : "";
   const inviteExpiry = accessExpiresAt ? formatInviteExpiry(accessExpiresAt) : null;
   const pairingExpiry = pairingCode ? formatInviteExpiry(pairingCode.expiresAt) : null;
@@ -4707,12 +4535,12 @@ function TransferInviteModal({
         <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 py-4 pr-14 dark:border-white/[0.08] sm:px-7">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-lg font-semibold tracking-tight sm:text-xl">邀请对方加入</span>
-            <Chip size="sm" radius="sm" color={isInternetMode ? "primary" : "success"} variant="flat">
-              {isInternetMode ? "跨网络" : "同一网络"}
+            <Chip size="sm" radius="sm" color={sharedRoomActive ? "primary" : "success"} variant="flat">
+              {sharedRoomActive ? "跨网络" : "同一网络"}
             </Chip>
           </div>
           <p className="text-tiny font-normal leading-5 text-zinc-500 dark:text-zinc-400">
-            房间 {transferRoomDisplayName(roomId)} · {isInternetMode ? "邀请只包含限时权限，不包含房主凭证" : "扫码设备需连接同一网络"}
+            房间 {transferRoomDisplayName(roomId)} · {sharedRoomActive ? "邀请只包含限时权限，不包含房主凭证" : "同一网络的设备打开链接即加入"}
           </p>
         </ModalHeader>
         <ModalBody className="gap-0 overflow-y-auto px-5 pb-6 pt-5 sm:px-7">
@@ -4726,10 +4554,10 @@ function TransferInviteModal({
                       <RoomQrCode value={qrUrl} large />
                     </div>
                     <div className="mt-4 text-center text-small font-semibold text-zinc-900 dark:text-white">
-                      {isInternetMode ? "扫码立即配对" : "扫码加入房间"}
+                      {sharedRoomActive ? "扫码立即配对" : "扫码打开房间"}
                     </div>
                     <div className="mt-1 max-w-56 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                      {isInternetMode ? "二维码 5 分钟内单次有效，扫码后自动加入。" : "链接不携带 Token，只用于同网设备发现。"}
+                      {sharedRoomActive ? "二维码 5 分钟内单次有效，扫码后自动加入。" : "链接不携带口令，同一网络的设备打开即加入。"}
                     </div>
                   </>
                 ) : (
@@ -4746,29 +4574,6 @@ function TransferInviteModal({
               </div>
 
               <div className="order-1 flex min-w-0 flex-col md:order-2">
-                {isInternetMode ? (
-                  <div>
-                    <div className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">对方加入后可以</div>
-                    <div className="mt-2 grid grid-cols-2 gap-2" role="radiogroup" aria-label="邀请权限">
-                      {(["EDITOR", "VIEWER"] as const).map((role) => (
-                        <button
-                          key={role}
-                          type="button"
-                          role="radio"
-                          aria-checked={inviteRole === role}
-                          className={`rounded-xl border px-3 py-2.5 text-left transition-colors ${inviteRole === role
-                            ? "border-cyan-500/45 bg-cyan-500/10 text-cyan-800 dark:text-cyan-100"
-                            : "border-black/10 bg-black/[0.02] text-zinc-600 hover:border-black/20 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-300 dark:hover:border-white/20"}`}
-                          onClick={() => onInviteRoleChange(role)}
-                        >
-                          <span className="block text-small font-semibold">{role === "EDITOR" ? "互传与协作" : "只读查看"}</span>
-                          <span className="mt-0.5 block text-[10px] opacity-70">{role === "EDITOR" ? "可发文件、剪贴板与白板" : "只能接收和查看内容"}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-
                 <Button
                   className="mt-4 h-11 w-full bg-cyan-600 font-semibold text-white shadow-[0_10px_30px_rgba(8,145,178,0.22)] md:mt-5"
                   color="primary"
@@ -4786,7 +4591,19 @@ function TransferInviteModal({
                   </Button>
                 </div>
 
-                {isInternetMode ? (
+                {!sharedRoomActive ? (
+                  <Button
+                    className="mt-3 w-full"
+                    radius="lg"
+                    variant="flat"
+                    color="primary"
+                    onPress={onCreateSharedRoom}
+                  >
+                    创建共享房间，邀请远程设备
+                  </Button>
+                ) : null}
+
+                {sharedRoomActive ? (
                   <div className="mt-4 rounded-2xl border border-black/[0.07] bg-black/[0.025] px-4 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
                     <div className="flex items-center justify-between gap-3">
                       <div>
@@ -5166,14 +4983,13 @@ function TextFilePreview({
 
 function TransferFaq({
   iceConfig,
-  networkMode,
+  sharedRoom,
   ossFallbackEnabled,
 }: {
   iceConfig: PublicTransferIceConfig | null;
-  networkMode: TransferNetworkMode;
+  sharedRoom: boolean;
   ossFallbackEnabled: boolean;
 }) {
-  const isInternetMode = networkMode === "internet";
   const routeLabel = iceConfig?.turnAuthRequired ? "备用连接已启用" : "备用连接检测中";
 
   return (
@@ -5181,42 +4997,34 @@ function TransferFaq({
       <h2 className="text-base font-semibold text-zinc-950 dark:text-white">常见问题</h2>
       <div className="mt-2 divide-y divide-black/10 dark:divide-white/10">
         <FaqItem title="怎么把手机加进来？">
-          点上方“邀请 / 加入”，用手机相机扫二维码。{isInternetMode ? "远程模式允许手机使用其它网络。" : "附近模式要求手机连接同一网络。"}
+          点上方“邀请 / 加入”，用手机相机扫二维码，或输入 8 位配对码。{sharedRoom ? "共享房间允许手机使用其它网络。" : "手机连接同一网络后会自动出现在设备列表。"}
         </FaqItem>
         <FaqItem title="找不到对方怎么办？">
-          {isInternetMode
-            ? "先发送邀请链接；确认双方使用相同房间名称和口令。"
-            : "确认双方处于同一网络或公网出口，并使用相同房间名。"}
+          {sharedRoom
+            ? "先发送邀请链接，或让对方输入邀请弹窗里的 8 位配对码。"
+            : "确认双方处于同一网络；远程设备需要先发送邀请链接。"}
         </FaqItem>
         <FaqItem title="没有选对方也能发送吗？">
-          {isInternetMode
-            ? ossFallbackEnabled
-              ? "可以。登录用户可生成短期分享链接。"
-              : "不可以。匿名模式不会上传云端，需要先选择一台在线设备。"
-            : "不可以。附近模式不会上传云端，必须先选择一台在线设备。"}
+          {ossFallbackEnabled
+            ? "可以。登录用户可生成短期分享链接。"
+            : "不可以。未登录时不会上传云端，需要先选择一台在线设备。"}
         </FaqItem>
         <FaqItem title="文件会怎么传？">
-          {isInternetMode
-            ? ossFallbackEnabled
-              ? "优先直接连接对方设备；仍未完成时使用登录账号的短期云端链接。"
-              : "匿名用户只连接对方设备；连接失败后不会上传云端。"
-            : "只在设备之间直接传输，失败后不会上传云端。"}
+          {`同一网络的设备之间只直接传输；远程设备优先直连，仍未完成时${ossFallbackEnabled ? "改用登录账号的短期云端链接。" : "不会上传云端。"}`}
         </FaqItem>
         <FaqItem title="为什么有时需要手动写入系统剪贴板？">
           浏览器可能阻止网页在后台改写系统剪贴板。内容仍会保留在页面里，点击“写入系统剪贴板”即可重试。
         </FaqItem>
         <FaqItem title="谁能看到我发的文件？">
-          {isInternetMode
-            ? "直接发送的文件只到点选设备。云端文件要求登录，并由持有房间口令和文件链接的登录用户下载。"
-            : "文件只发送给你点选的附近设备，不创建云端副本或公开下载链接。"}
+          直接发送的文件只到点选设备，不创建云端副本。云端接力文件要求登录，并由持有房间口令和文件链接的登录用户下载。
         </FaqItem>
         <FaqItem title="云端额度是多少？">
           登录账号最多占用 1 GiB 有效附件存储，每个 UTC 自然月可使用 1 GiB 下载流量。生成链接不扣额度；首次打开并成功跳转时按文件完整大小计入，链接只能打开一次。
         </FaqItem>
         <FaqItem title="更多说明">
-          {isInternetMode
-            ? `远程房间通过口令隔离，文件地址短期有效。当前状态：${routeLabel}。`
-            : "附近模式使用服务端发现设备，但文件、剪贴板和白板内容只在设备之间传输。"}
+          {sharedRoom
+            ? `共享房间通过口令隔离，文件地址短期有效。当前状态：${routeLabel}。`
+            : "同一网络的设备通过服务端自动发现，文件、剪贴板和白板内容只在设备之间传输。"}
         </FaqItem>
       </div>
     </section>
@@ -5636,13 +5444,6 @@ function saveDiscoverable(value: boolean) {
   }
 }
 
-function readInitialNetworkMode(): TransferNetworkMode {
-  const params = readTransferParams();
-  const mode = params.get("mode") || params.get("networkMode");
-  const token = params.get("token") || params.get("roomToken");
-  return resolveTransferNetworkMode(mode, token);
-}
-
 function readInitialRoomId() {
   const params = readTransferParams();
   const room = params.get("room") || params.get("roomId") || sessionStorage.getItem("public-transfer-room-id");
@@ -5688,6 +5489,12 @@ function readTransferParams() {
   return params;
 }
 
+function normalizeSelfPublicAddress(value: string | undefined) {
+  const trimmed = value?.trim() ?? "";
+  // 服务端无法识别出口地址时上报 "unknown"/空，一律视为未知（不按同网处理）
+  return trimmed && trimmed.toLowerCase() !== "unknown" ? trimmed : "";
+}
+
 function normalizeRoomId(value: string | null) {
   const text = value?.trim();
   if (!text) {
@@ -5704,11 +5511,9 @@ function fileShareUrl(attachment: TransferAttachment, roomId: string, roomToken:
   const inviteUrl = buildTransferInviteUrl({
     origin: window.location.origin,
     workspacePath: "/transfer",
-    networkMode: "internet",
     roomId,
     token: roomToken,
   });
-  if (!inviteUrl) throw new Error("无法生成安全文件链接");
   const url = new URL(inviteUrl);
   url.searchParams.set("attachmentId", String(attachment.attachmentId));
   return url.toString();

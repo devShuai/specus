@@ -13,8 +13,7 @@ describe("transfer invitation URLs", () => {
   it("builds a credential-free navigation URL for the selected workspace", () => {
     const result = buildTransferNavigationUrl({
       origin: ORIGIN,
-      workspacePath: "/diagram?campaign=room&token=owner-secret&pair=87654321#token=fragment-secret",
-      networkMode: "internet",
+      workspacePath: "/diagram?campaign=room&token=owner-secret&pair=87654321&mode=internet#token=fragment-secret",
       roomId: "  设计评审  ",
     });
     const url = new URL(result);
@@ -22,7 +21,7 @@ describe("transfer invitation URLs", () => {
     expect(url.origin).toBe(ORIGIN);
     expect(url.pathname).toBe("/diagram");
     expect(url.searchParams.get("campaign")).toBe("room");
-    expect(url.searchParams.get("mode")).toBe("internet");
+    expect(url.searchParams.has("mode")).toBe(false);
     expect(url.searchParams.get("room")).toBe("设计评审");
     expect(url.searchParams.has("token")).toBe(false);
     expect(url.searchParams.has("roomToken")).toBe(false);
@@ -34,16 +33,14 @@ describe("transfer invitation URLs", () => {
     expect(() => buildTransferNavigationUrl({
       origin: ORIGIN,
       workspacePath: "https://attacker.example/transfer",
-      networkMode: "internet",
       roomId: "nearby",
     })).toThrow("workspacePath 必须与当前页面同源");
   });
 
-  it("puts an internet invitation token only in fragment parameters", () => {
+  it("keeps the invitation token only in fragment parameters", () => {
     const result = buildTransferInviteUrl({
       origin: ORIGIN,
       workspacePath: "/transfer",
-      networkMode: "internet",
       roomId: "nearby",
       token: " role token / 2026 ",
     });
@@ -52,35 +49,23 @@ describe("transfer invitation URLs", () => {
     const url = new URL(result!);
     const fragment = new URLSearchParams(url.hash.slice(1));
     expect(url.pathname).toBe("/transfer");
-    expect(url.searchParams.get("mode")).toBe("internet");
+    expect(url.searchParams.has("mode")).toBe(false);
     expect(url.searchParams.get("room")).toBe("nearby");
     expect(url.searchParams.has("token")).toBe(false);
     expect(url.searchParams.has("roomToken")).toBe(false);
     expect(fragment.get("token")).toBe("role token / 2026");
   });
 
-  it("requires a token for internet invitations", () => {
-    expect(buildTransferInviteUrl({
-      origin: ORIGIN,
-      workspacePath: "/transfer",
-      networkMode: "internet",
-      roomId: "nearby",
-      token: "   ",
-    })).toBeNull();
-  });
-
-  it("always returns a credential-free LAN URL", () => {
+  it("returns a credential-free entry URL when no token is supplied", () => {
     const result = buildTransferInviteUrl({
       origin: ORIGIN,
       workspacePath: "/transfer",
-      networkMode: "lan",
       roomId: "附近设备",
-      token: "must-not-leak",
     });
-    const url = new URL(result!);
+    const url = new URL(result);
 
-    expect(url.searchParams.get("mode")).toBe("lan");
     expect(url.searchParams.has("token")).toBe(false);
+    expect(url.searchParams.has("roomToken")).toBe(false);
     expect(url.hash).toBe("");
   });
 });
@@ -88,12 +73,12 @@ describe("transfer invitation URLs", () => {
 describe("safe transfer invitation token selection", () => {
   it("never falls back to the owner's current token", () => {
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "OWNER",
       currentRoomToken: "owner-secret",
     })).toBeNull();
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "OWNER",
       currentRoomToken: "owner-secret",
       allowCurrentRoleForwarding: true,
@@ -102,13 +87,13 @@ describe("safe transfer invitation token selection", () => {
 
   it("accepts an explicit EDITOR or VIEWER invitation token", () => {
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "OWNER",
       currentRoomToken: "owner-secret",
       explicitInvite: { role: "EDITOR", token: " editor-invite " },
     })).toBe("editor-invite");
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "OWNER",
       currentRoomToken: "owner-secret",
       explicitInvite: { role: "VIEWER", token: "viewer-invite" },
@@ -118,7 +103,7 @@ describe("safe transfer invitation token selection", () => {
   it("does not forward EDITOR or VIEWER credentials by default", () => {
     for (const currentRole of ["EDITOR", "VIEWER"] as const) {
       expect(selectSafeTransferInviteToken({
-        networkMode: "internet",
+        sharedRoom: true,
         currentRole,
         currentRoomToken: `${currentRole.toLowerCase()}-secret`,
       })).toBeNull();
@@ -127,13 +112,13 @@ describe("safe transfer invitation token selection", () => {
 
   it("forwards a non-owner credential only after explicit opt-in", () => {
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "EDITOR",
       currentRoomToken: " editor-secret ",
       allowCurrentRoleForwarding: true,
     })).toBe("editor-secret");
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: "VIEWER",
       currentRoomToken: "viewer-secret",
       allowCurrentRoleForwarding: true,
@@ -142,16 +127,16 @@ describe("safe transfer invitation token selection", () => {
 
   it("does not select any token before the server confirms a role", () => {
     expect(selectSafeTransferInviteToken({
-      networkMode: "internet",
+      sharedRoom: true,
       currentRole: null,
       currentRoomToken: "unconfirmed-secret",
       allowCurrentRoleForwarding: true,
     })).toBeNull();
   });
 
-  it("never selects a token for a LAN room", () => {
+  it("never selects a token outside a shared room", () => {
     expect(selectSafeTransferInviteToken({
-      networkMode: "lan",
+      sharedRoom: false,
       currentRole: "OWNER",
       currentRoomToken: "owner-secret",
       explicitInvite: { role: "EDITOR", token: "editor-invite" },

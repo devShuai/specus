@@ -1,7 +1,4 @@
-import {
-  MAX_TRANSFER_ROOM_NAME_LENGTH,
-  type TransferNetworkMode,
-} from "./transferRoom";
+import { MAX_TRANSFER_ROOM_NAME_LENGTH } from "./transferRoom";
 
 export type TransferInviteRoomRole = "OWNER" | "EDITOR" | "VIEWER";
 export type ShareableTransferInviteRole = Exclude<TransferInviteRoomRole, "OWNER">;
@@ -9,7 +6,6 @@ export type ShareableTransferInviteRole = Exclude<TransferInviteRoomRole, "OWNER
 export interface TransferNavigationUrlOptions {
   origin: string;
   workspacePath: string;
-  networkMode: TransferNetworkMode;
   roomId: string;
 }
 
@@ -29,7 +25,7 @@ export interface ExplicitTransferInviteToken {
 }
 
 export interface SafeTransferInviteTokenOptions {
-  networkMode: TransferNetworkMode;
+  sharedRoom: boolean;
   currentRole: TransferInviteRoomRole | null;
   currentRoomToken?: string | null;
   explicitInvite?: ExplicitTransferInviteToken | null;
@@ -47,7 +43,6 @@ export function buildTransferNavigationUrl(options: TransferNavigationUrlOptions
   const url = sameOriginWorkspaceUrl(options.origin, options.workspacePath);
 
   [...CREDENTIAL_QUERY_KEYS, ...ROOM_QUERY_KEYS].forEach((key) => url.searchParams.delete(key));
-  url.searchParams.set("mode", options.networkMode);
   url.searchParams.set("room", normalizeRoomId(options.roomId));
   url.hash = "";
   return url.toString();
@@ -68,18 +63,14 @@ export function buildTransferPairingUrl(options: TransferPairingUrlOptions): str
 
 /**
  * Builds a shareable invitation URL without putting the credential in the HTTP
- * query string. Internet invitations require a non-empty role token. LAN links
- * never include a credential, even if a token is accidentally supplied.
+ * query string. A shared-room invitation carries the role token in the fragment;
+ * without a token the link is a plain credential-free entry to the page.
  */
-export function buildTransferInviteUrl(options: TransferInviteUrlOptions): string | null {
+export function buildTransferInviteUrl(options: TransferInviteUrlOptions): string {
   const navigationUrl = buildTransferNavigationUrl(options);
-  if (options.networkMode === "lan") {
-    return navigationUrl;
-  }
-
   const token = options.token?.trim();
   if (!token) {
-    return null;
+    return navigationUrl;
   }
 
   const url = new URL(navigationUrl);
@@ -91,12 +82,12 @@ export function buildTransferInviteUrl(options: TransferInviteUrlOptions): strin
  * Chooses only credentials that are safe to share. An owner's current room
  * token is never a candidate. EDITOR and VIEWER tokens require an explicit
  * forwarding opt-in so opening an invite surface cannot redistribute them by
- * accident.
+ * accident. Nearby (non-shared) rooms never produce shareable credentials.
  */
 export function selectSafeTransferInviteToken(
   options: SafeTransferInviteTokenOptions,
 ): string | null {
-  if (options.networkMode === "lan") {
+  if (!options.sharedRoom) {
     return null;
   }
 

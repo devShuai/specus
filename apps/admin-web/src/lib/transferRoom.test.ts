@@ -4,7 +4,6 @@ import {
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
   localizeTransferDiscoveryError,
   resolveTransferPeerSelection,
-  resolveTransferNetworkMode,
   validateTransferRoomSettings,
 } from "./transferRoom";
 
@@ -34,19 +33,12 @@ describe("transfer room settings", () => {
     });
   });
 
-  it("allows an empty token for LAN rooms", () => {
+  it("allows an empty token for nearby rooms", () => {
     expect(validateTransferRoomSettings("附近设备", "", { roomTokenRequired: false })).toEqual({
       roomId: "附近设备",
       roomToken: "",
       errors: {},
     });
-  });
-
-  it("defaults to LAN while keeping old token links on internet mode", () => {
-    expect(resolveTransferNetworkMode(null, null)).toBe("lan");
-    expect(resolveTransferNetworkMode(null, "legacy-token")).toBe("internet");
-    expect(resolveTransferNetworkMode("lan", "ignored-in-lan")).toBe("lan");
-    expect(resolveTransferNetworkMode("external", null)).toBe("internet");
   });
 
   it("defaults to the first peer while retaining an available explicit target", () => {

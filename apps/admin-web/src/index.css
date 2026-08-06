@@ -3322,25 +3322,11 @@ body {
   --transfer-mode-wash: rgba(36, 138, 61, 0.12);
 }
 
-.transfer-mode-shell[data-network-mode="internet"] {
-  --transfer-mode-accent: #0066cc;
-  --transfer-mode-accent-soft: rgba(0, 102, 204, 0.1);
-  --transfer-mode-accent-ink: #0055a8;
-  --transfer-mode-wash: rgba(0, 102, 204, 0.12);
-}
-
 .dark .transfer-mode-shell {
   --transfer-mode-accent: #30d158;
   --transfer-mode-accent-soft: rgba(48, 209, 88, 0.13);
   --transfer-mode-accent-ink: #afffbd;
   --transfer-mode-wash: rgba(48, 209, 88, 0.11);
-}
-
-.dark .transfer-mode-shell[data-network-mode="internet"] {
-  --transfer-mode-accent: #2997ff;
-  --transfer-mode-accent-soft: rgba(41, 151, 255, 0.15);
-  --transfer-mode-accent-ink: #b9dcff;
-  --transfer-mode-wash: rgba(41, 151, 255, 0.12);
 }
 
 .app-apple-tool.transfer-mode-shell {
@@ -3365,41 +3351,6 @@ body {
 .transfer-mode-accent-copy {
   color: var(--transfer-mode-accent-ink);
   transition: color 360ms ease;
-}
-
-.transfer-mode-transition {
-  position: fixed;
-  inset: 0;
-  z-index: 35;
-  pointer-events: none;
-  background: var(--transfer-mode-wash);
-  transform: scaleX(0);
-  transform-origin: right center;
-  animation: transfer-mode-page-wipe 560ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.transfer-network-toggle {
-  display: inline-flex;
-  min-height: 44px;
-  align-items: center;
-  gap: 7px;
-  white-space: nowrap;
-}
-
-.transfer-network-toggle > span {
-  color: var(--app-apple-subtle);
-  font-size: 0.75rem;
-  font-weight: 500;
-  transition: color 360ms ease;
-}
-
-.transfer-network-toggle > span.is-active {
-  color: var(--transfer-mode-accent-ink);
-  font-weight: 600;
-}
-
-.transfer-network-toggle [data-slot="wrapper"] {
-  box-shadow: none !important;
 }
 
 .transfer-room-hub {
@@ -3484,20 +3435,6 @@ body {
   animation: transfer-mode-detail-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-@keyframes transfer-mode-page-wipe {
-  0% {
-    opacity: 0;
-    transform: scaleX(0);
-  }
-  38% {
-    opacity: 0.72;
-  }
-  100% {
-    opacity: 0;
-    transform: scaleX(1);
-  }
-}
-
 @keyframes transfer-mode-detail-in {
   from {
     opacity: 0;
@@ -3521,10 +3458,6 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .transfer-mode-transition {
-    display: none;
-  }
-
   .transfer-network-detail,
   .transfer-room-settings,
   .transfer-room-qr,

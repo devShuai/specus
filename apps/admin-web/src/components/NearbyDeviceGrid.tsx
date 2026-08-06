@@ -1,9 +1,9 @@
 import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 
 /**
- * 内网（附近设备）模式的 AirDrop 式设备选择。
+ * 互传设备列表的 AirDrop 式设备选择。
  *
- * 与互联网房间的列表不同，这里的设备是"同一网络里此刻在线"的物理设备，因此按头像网格呈现：
+ * 同一网络里此刻在线的设备会自动出现，远程设备通过邀请链接加入，统一按头像网格呈现：
  * 一眼看清有几台、点一下就选中。没有设备时显示扫描态而不是空列表——用户需要知道
  * "正在找"，而不是以为功能坏了。
  */
@@ -11,6 +11,8 @@ import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 export interface NearbyDevice {
   peerId: string;
   displayName: string;
+  /** 与本机同一公网出口（同一网络）时展示徽标，并按仅直连策略传输 */
+  sameLan?: boolean;
 }
 
 interface NearbyDeviceGridProps {
@@ -52,9 +54,9 @@ export function NearbyDeviceGrid({
       <div className="nearby-empty flex flex-col items-center gap-3 rounded-xl border border-black/[0.07] px-4 py-8 text-center dark:border-white/[0.08]">
         <span className="nearby-radar" aria-hidden="true" />
         <div>
-          <div className="text-small font-medium text-zinc-700 dark:text-zinc-200">正在查找附近设备…</div>
+          <div className="text-small font-medium text-zinc-700 dark:text-zinc-200">正在查找设备…</div>
           <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            让另一台设备连到同一网络并打开本页面，它会自动出现在这里。
+            同一网络的设备打开本页面会自动出现，远程设备可通过邀请链接加入。
           </p>
         </div>
         {!discoverable && onOpenSettings ? (
@@ -74,7 +76,7 @@ export function NearbyDeviceGrid({
     <div
       className="nearby-grid grid grid-cols-3 gap-x-2 gap-y-4 sm:grid-cols-4"
       role="radiogroup"
-      aria-label="附近设备"
+      aria-label="在线设备"
     >
       {devices.map((device) => {
         const selected = device.peerId === selectedPeerId;
@@ -99,6 +101,11 @@ export function NearbyDeviceGrid({
             <span className="w-full truncate text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
               {device.displayName}
             </span>
+            {device.sameLan ? (
+              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-200">
+                同一网络
+              </span>
+            ) : null}
             {path ? (
               <span className="text-[11px] text-zinc-400">
                 {path === "turn" ? "备用通道" : "直连"}
