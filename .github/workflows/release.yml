@@ -48,7 +48,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -126,7 +126,7 @@ jobs:
     needs: prep
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -135,19 +135,19 @@ jobs:
           cache-dependency-path: implementations/go/client/go.sum
 
       - name: Package Go client
-        run: bash implementations/go/client/scripts/package-release.sh "$VERSION"
+        run: bash implementations/go/client/scripts/package-release.sh "$RELEASE_VERSION"
 
       - uses: actions/upload-artifact@v4
         with:
           name: specus-client-go
-          path: implementations/go/client/out/release/${{ env.VERSION }}/*
+          path: implementations/go/client/out/release/${{ env.RELEASE_VERSION }}/*
 
   java:
     name: Java server / client / STUN
     needs: prep
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -176,9 +176,9 @@ jobs:
           set -euo pipefail
           dist="release-dist/java"
           mkdir -p "$dist"
-          cp implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar "$dist/specus-server-java-$VERSION.jar"
-          cp implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-exec.jar "$dist/specus-client-java-$VERSION.jar"
-          cp implementations/java/stun-server/target/stun-server.jar "$dist/specus-stun-server-java-$VERSION.jar"
+          cp implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar "$dist/specus-server-java-$RELEASE_VERSION.jar"
+          cp implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-exec.jar "$dist/specus-client-java-$RELEASE_VERSION.jar"
+          cp implementations/java/stun-server/target/stun-server.jar "$dist/specus-stun-server-java-$RELEASE_VERSION.jar"
           (cd "$dist" && sha256sum -- *.jar > SHA256SUMS.txt)
 
       - uses: actions/upload-artifact@v4
@@ -191,7 +191,7 @@ jobs:
     needs: prep
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -216,7 +216,7 @@ jobs:
       - name: Package archive
         run: |
           set -euo pipefail
-          pkg="specus-server-csharp-$VERSION-linux-x64"
+          pkg="specus-server-csharp-$RELEASE_VERSION-linux-x64"
           stage="out/$pkg"
           rm -rf "$stage" "release-dist/$pkg.tar.gz"
           mkdir -p "$stage" release-dist
@@ -235,7 +235,7 @@ jobs:
     needs: prep
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -250,7 +250,7 @@ jobs:
       - name: Package archive
         run: |
           set -euo pipefail
-          pkg="specus-client-csharp-$VERSION"
+          pkg="specus-client-csharp-$RELEASE_VERSION"
           mkdir -p release-dist
           rm -f "release-dist/$pkg.tar.gz"
           tar -czf "release-dist/$pkg.tar.gz" -C out/specus-client-csharp .
@@ -266,7 +266,7 @@ jobs:
     needs: prep
     runs-on: windows-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -286,9 +286,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-dist
-          rm -f "release-dist/specus-desktop-$VERSION-win-x64.zip"
-          (cd out/specus-desktop && zip -q -r "$GITHUB_WORKSPACE/release-dist/specus-desktop-$VERSION-win-x64.zip" .)
-          (cd release-dist && sha256sum "specus-desktop-$VERSION-win-x64.zip" > "specus-desktop-$VERSION-win-x64.zip.sha256")
+          rm -f "release-dist/specus-desktop-$RELEASE_VERSION-win-x64.zip"
+          (cd out/specus-desktop && zip -q -r "$GITHUB_WORKSPACE/release-dist/specus-desktop-$RELEASE_VERSION-win-x64.zip" .)
+          (cd release-dist && sha256sum "specus-desktop-$RELEASE_VERSION-win-x64.zip" > "specus-desktop-$RELEASE_VERSION-win-x64.zip.sha256")
 
       - uses: actions/upload-artifact@v4
         with:
@@ -300,7 +300,7 @@ jobs:
     needs: prep
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ needs.prep.outputs.version }}
+      RELEASE_VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -317,7 +317,7 @@ jobs:
       - name: Package archive
         run: |
           set -euo pipefail
-          pkg="specus-server-c-$VERSION-linux-x64"
+          pkg="specus-server-c-$RELEASE_VERSION-linux-x64"
           stage="out/$pkg"
           rm -rf "$stage" "release-dist/$pkg.tar.gz"
           mkdir -p "$stage" release-dist

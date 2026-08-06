@@ -39,7 +39,10 @@ zip_dir() {
   # zip_dir <srcDir> <destZip>：优先 zip，Windows 上回退 Compress-Archive
   local src="$1" dest="$2"
   if command -v zip >/dev/null 2>&1; then
-    (cd "${src}" && zip -q -r "$(cd "$(dirname "${dest}")" && pwd)/$(basename "${dest}")" .)
+    # 目标必须先解析为绝对路径：进入 src 之后相对路径的 dest 会解析不到。
+    local dest_abs
+    dest_abs="$(cd "$(dirname "${dest}")" && pwd)/$(basename "${dest}")"
+    (cd "${src}" && zip -q -r "${dest_abs}" .)
   elif command -v powershell.exe >/dev/null 2>&1; then
     powershell.exe -NoProfile -Command \
       "Compress-Archive -Path '$(cygpath -w "${src}")\\*' -DestinationPath '$(cygpath -w "${dest}")' -Force" >/dev/null
