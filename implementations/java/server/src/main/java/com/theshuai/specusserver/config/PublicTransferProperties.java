@@ -39,7 +39,9 @@ public class PublicTransferProperties {
     /** Redis URI，例如 redis://user:password@redis.internal:6379/0。 */
     private String redisUri = "";
 
-    /** Redis key/channel 前缀；多个环境共用 Redis 时必须不同。 */
+    /** Redis key/channel 前缀；多个环境共用 Redis 时必须不同。内网合并可见性改造新增了
+     * nets:<netId> 索引与 net 维度 revision,新旧节点混部会互相污染 roster 与路由,
+     * 集群必须全量同升,或为升级后的集群 bump 此前缀。 */
     private String redisKeyPrefix = "specus:v2:public-transfer";
 
     /** presence 租约 TTL；需显著大于刷新间隔。 */

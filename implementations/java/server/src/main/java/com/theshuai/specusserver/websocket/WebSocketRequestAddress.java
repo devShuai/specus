@@ -6,12 +6,15 @@ import org.springframework.http.server.ServletServerHttpRequest;
 import org.springframework.util.StringUtils;
 
 public final class WebSocketRequestAddress {
+    /** 无法解析客户端地址时的兜底值;互传"同网"判定显式排除该值,避免无地址客户端被聚为一组。 */
+    public static final String UNKNOWN = "unknown";
+
     public static String resolve(ServerHttpRequest request) {
         if (request instanceof ServletServerHttpRequest servletRequest) {
             return resolve(servletRequest.getServletRequest());
         }
         return request.getRemoteAddress() == null
-                ? "unknown"
+                ? UNKNOWN
                 : request.getRemoteAddress().getAddress().getHostAddress();
     }
 
@@ -24,7 +27,7 @@ public final class WebSocketRequestAddress {
         if (StringUtils.hasText(forwarded)) {
             return forwarded;
         }
-        return StringUtils.hasText(request.getRemoteAddr()) ? request.getRemoteAddr().trim() : "unknown";
+        return StringUtils.hasText(request.getRemoteAddr()) ? request.getRemoteAddr().trim() : UNKNOWN;
     }
 
     private static String lastForwarded(String value) {

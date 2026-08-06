@@ -27,19 +27,39 @@ import java.text.Normalizer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
-/** Redis-backed presence, Pub/Sub, room revision and fixed-window limits for public transfer. */
+/**
+ * Redis-backed presence, Pub/Sub, room revision and fixed-window limits for public transfer.
+ *
+ * <p>Roster visibility and directed routing are net-merged: a participant sees everyone in the
+ * same room ({@code roomId + roomKey}) plus everyone on the same network (same
+ * {@code publicAddress}, regardless of {@code roomId}), so presence/members stay keyed by
+ * groupID while {@code nets:<netID>} indexes the groupIDs present on a net and
+ * {@code revision:<netID>} versions the net dimension of the merged roster. Roster revisions
+ * are the sum of the group and net counters so they stay monotonic for every recipient.
+ *
+ * <p>Deployment constraint: old and new nodes sharing one keyspace would corrupt rosters and
+ * routing (the new {@code nets:<netID>} index and net-scoped revisions are maintained only by
+ * new nodes). Upgrade every cluster node together, or bump {@code RedisKeyPrefix} for the new
+ * fleet.
+ */
 @Component
 public class PublicTransferCoordinationService implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(PublicTransferCoordinationService.class);
     private static final long REVISION_TTL_MILLIS = Duration.ofDays(7).toMillis();
+    // KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group>
+    //       4=revision:<group> 5=revision:<net> 6=nets:<net>
+    // ARGV: 1=peerValue 2=nameValue 3=memberId 4=leaseMs 5=limit 6=presencePrefix(group)
+    //       7=revisionTtlMs 8=groupId 9=presenceBasePrefix
     private static final String REGISTER_SCRIPT = """
             local members = redis.call('SMEMBERS', KEYS[3])
             local count = 0
@@ -51,33 +71,51 @@ public class PublicTransferCoordinationService implements AutoCloseable {
               end
             end
             if redis.call('EXISTS', KEYS[1]) == 1 then return {-1, 0} end
+            local netGroups = redis.call('SMEMBERS', KEYS[6])
+            for _, group in ipairs(netGroups) do
+              if redis.call('EXISTS', ARGV[9] .. group .. ':' .. ARGV[3]) == 1 then return {-1, 0} end
+            end
             if redis.call('EXISTS', KEYS[2]) == 1 then return {-2, 0} end
             if count >= tonumber(ARGV[5]) then return {-3, 0} end
             redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[4])
             redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[4])
             redis.call('SADD', KEYS[3], ARGV[3])
             redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[4]) * 3)
-            local revision = redis.call('INCR', KEYS[4])
+            redis.call('SADD', KEYS[6], ARGV[8])
+            redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[4]) * 3)
+            local groupRevision = redis.call('INCR', KEYS[4])
             redis.call('PEXPIRE', KEYS[4], ARGV[7])
-            return {1, revision}
+            local netRevision = redis.call('INCR', KEYS[5])
+            redis.call('PEXPIRE', KEYS[5], ARGV[7])
+            return {1, groupRevision + netRevision}
             """;
+    // KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group> 4=nets:<net>
     private static final String REFRESH_SCRIPT = """
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
             if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
             redis.call('PEXPIRE', KEYS[1], ARGV[3])
             redis.call('PEXPIRE', KEYS[2], ARGV[3])
             redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[3]) * 3)
+            redis.call('PEXPIRE', KEYS[4], tonumber(ARGV[3]) * 3)
             return 1
             """;
+    // KEYS: 1=presence:<group>:<member> 2=name:<digest> 3=members:<group>
+    //       4=revision:<group> 5=revision:<net> 6=nets:<net>
+    // ARGV: 1=peerValue 2=nameValue 3=memberId 4=revisionTtlMs 5=groupId
     private static final String UNREGISTER_SCRIPT = """
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
             redis.call('DEL', KEYS[1])
             if redis.call('GET', KEYS[2]) == ARGV[2] then redis.call('DEL', KEYS[2]) end
             redis.call('SREM', KEYS[3], ARGV[3])
-            local revision = redis.call('INCR', KEYS[4])
+            if redis.call('SCARD', KEYS[3]) == 0 then redis.call('SREM', KEYS[6], ARGV[5]) end
+            local groupRevision = redis.call('INCR', KEYS[4])
             redis.call('PEXPIRE', KEYS[4], ARGV[4])
-            return revision
+            local netRevision = redis.call('INCR', KEYS[5])
+            redis.call('PEXPIRE', KEYS[5], ARGV[4])
+            return groupRevision + netRevision
             """;
+    // KEYS: 1=members:<group> 2=revision:<group> 3=revision:<net> 4=nets:<net>
+    // ARGV: 1=presencePrefix(group) 2=revisionTtlMs 3=groupId
     private static final String CLEANUP_SCRIPT = """
             local removed = 0
             local members = redis.call('SMEMBERS', KEYS[1])
@@ -87,12 +125,16 @@ public class PublicTransferCoordinationService implements AutoCloseable {
                 removed = removed + 1
               end
             end
-            local revision = tonumber(redis.call('GET', KEYS[2]) or '0')
+            if redis.call('SCARD', KEYS[1]) == 0 then redis.call('SREM', KEYS[4], ARGV[3]) end
+            local groupRevision = tonumber(redis.call('GET', KEYS[2]) or '0')
+            local netRevision = tonumber(redis.call('GET', KEYS[3]) or '0')
             if removed > 0 then
-              revision = redis.call('INCR', KEYS[2])
+              groupRevision = redis.call('INCR', KEYS[2])
               redis.call('PEXPIRE', KEYS[2], ARGV[2])
+              netRevision = redis.call('INCR', KEYS[3])
+              redis.call('PEXPIRE', KEYS[3], ARGV[2])
             end
-            return {removed, revision}
+            return {removed, groupRevision + netRevision}
             """;
     private static final String RATE_SCRIPT = """
             local count = redis.call('INCR', KEYS[1])
@@ -179,6 +221,7 @@ public class PublicTransferCoordinationService implements AutoCloseable {
     public Registration register(Participant participant, int configuredLimit) {
         requireEnabled();
         String groupId = participant.groupId();
+        String netId = participant.netId();
         String memberId = digest(participant.peerId());
         String nameValue = participant.leaseId() + "\n" + participant.peerId();
         String peerValue = encodeParticipant(participant);
@@ -186,14 +229,17 @@ public class PublicTransferCoordinationService implements AutoCloseable {
                 REGISTER_SCRIPT,
                 ScriptOutputType.MULTI,
                 new String[]{presenceKey(groupId, memberId), nameKey(participant.displayName()),
-                        membersKey(groupId), revisionKey(groupId)},
+                        membersKey(groupId), revisionKey(groupId), revisionKey(netId),
+                        netsKey(netId)},
                 peerValue,
                 nameValue,
                 memberId,
                 Long.toString(leaseMillis()),
                 Integer.toString(Math.max(1, configuredLimit)),
                 presencePrefix(groupId),
-                Long.toString(REVISION_TTL_MILLIS)));
+                Long.toString(REVISION_TTL_MILLIS),
+                groupId,
+                presenceBasePrefix()));
         long code = number(result, 0);
         long revision = number(result, 1);
         return switch ((int) code) {
@@ -213,7 +259,7 @@ public class PublicTransferCoordinationService implements AutoCloseable {
                 REFRESH_SCRIPT,
                 ScriptOutputType.INTEGER,
                 new String[]{presenceKey(groupId, memberId), nameKey(participant.displayName()),
-                        membersKey(groupId)},
+                        membersKey(groupId), netsKey(participant.netId())},
                 encodeParticipant(participant),
                 participant.leaseId() + "\n" + participant.peerId(),
                 Long.toString(leaseMillis())));
@@ -228,52 +274,138 @@ public class PublicTransferCoordinationService implements AutoCloseable {
                 UNREGISTER_SCRIPT,
                 ScriptOutputType.INTEGER,
                 new String[]{presenceKey(groupId, memberId), nameKey(participant.displayName()),
-                        membersKey(groupId), revisionKey(groupId)},
+                        membersKey(groupId), revisionKey(groupId), revisionKey(participant.netId()),
+                        netsKey(participant.netId())},
                 encodeParticipant(participant),
                 participant.leaseId() + "\n" + participant.peerId(),
                 memberId,
-                Long.toString(REVISION_TTL_MILLIS)));
+                Long.toString(REVISION_TTL_MILLIS),
+                groupId));
         return revision == null ? 0 : revision;
     }
 
-    public Roster roster(String groupId) {
+    /**
+     * Reads the merged roster for {@code recipient}: everyone in the recipient's room plus
+     * everyone on the recipient's network (same {@code publicAddress}, regardless of
+     * {@code roomId}), deduplicated by peerId. The returned revision is the sum of the group
+     * and net revision counters, so it increases monotonically whenever either dimension of
+     * the roster changes.
+     */
+    public Roster roster(Participant recipient) {
         requireEnabled();
-        Cleanup cleanup = cleanup(groupId);
-        if (cleanup.removed() > 0) {
-            publishRoster(groupId, cleanup.revision());
+        String groupId = recipient.groupId();
+        String netId = recipient.netId();
+        // Hygiene pass: prune stale members of the own group and of every group on the net
+        // (also drops emptied groups from the nets index and bumps both revision counters so
+        // presence expiries surface to merged-roster recipients). Reads below self-heal anyway,
+        // this pass is what makes expiries visible to push recipients in a timely manner.
+        List<String> groups = netGroups(netId, groupId);
+        boolean removedAny = false;
+        long cleanupRevision = 0;
+        for (String group : groups) {
+            Cleanup cleanup = cleanup(group, netId);
+            removedAny |= cleanup.removed() > 0;
+            cleanupRevision = cleanup.revision();
+        }
+        if (removedAny) {
+            publishRoster(groupId, cleanupRevision);
+            publishRoster(netId, cleanupRevision);
         }
         for (int attempt = 0; attempt < 2; attempt++) {
-            long before = revision(groupId);
-            List<String> members = new ArrayList<>(command(() -> state.smembers(membersKey(groupId))));
-            List<Participant> participants = new ArrayList<>(members.size());
-            if (!members.isEmpty()) {
-                String[] keys = members.stream()
-                        .map(member -> presenceKey(groupId, member))
-                        .toArray(String[]::new);
-                List<KeyValue<String, String>> values = command(() -> state.mget(keys));
-                for (KeyValue<String, String> value : values) {
-                    if (value.hasValue()) {
-                        Participant participant = decodeParticipant(value.getValue());
-                        if (participant != null && participant.groupId().equals(groupId)) {
-                            participants.add(participant);
-                        }
-                    }
-                }
-            }
-            long after = revision(groupId);
-            if (attempt == 1 || before == after) {
+            long beforeGroup = revision(groupId);
+            long beforeNet = revision(netId);
+            List<Participant> participants = readMergedParticipants(recipient,
+                    netGroups(netId, groupId));
+            long afterGroup = revision(groupId);
+            long afterNet = revision(netId);
+            if (attempt == 1 || (beforeGroup == afterGroup && beforeNet == afterNet)) {
                 participants.sort(Comparator.comparing(Participant::connectedAt));
-                return new Roster(after, List.copyOf(participants));
+                return new Roster(afterGroup + afterNet, List.copyOf(participants));
             }
         }
         throw new IllegalStateException("could not read stable public transfer roster");
     }
 
-    public long sweep(String groupId) {
+    /**
+     * Locates a visible peer by peerId within the recipient's merged visibility domain
+     * (same room or same network). Used to route directed messages cross-room on one network;
+     * returns {@code null} when the target is not visible to the recipient.
+     */
+    public Participant findPeer(Participant recipient, String peerId) {
         requireEnabled();
-        Cleanup cleanup = cleanup(groupId);
+        if (!StringUtils.hasText(peerId)) {
+            return null;
+        }
+        for (String group : netGroups(recipient.netId(), recipient.groupId())) {
+            List<String> members = new ArrayList<>(command(() -> state.smembers(membersKey(group))));
+            if (members.isEmpty()) {
+                continue;
+            }
+            String[] keys = members.stream()
+                    .map(member -> presenceKey(group, member))
+                    .toArray(String[]::new);
+            for (KeyValue<String, String> value : command(() -> state.mget(keys))) {
+                if (!value.hasValue()) {
+                    continue;
+                }
+                Participant participant = decodeParticipant(value.getValue());
+                // 内存复核:同房间需 roomId+roomKey 一致;同网只看 publicAddress(与 roomId 无关)。
+                if (participant != null && participant.peerId().equals(peerId)
+                        && ((participant.roomId().equals(recipient.roomId())
+                                && participant.roomKey().equals(recipient.roomKey()))
+                                || sameNetAddress(participant.publicAddress(),
+                                        recipient.publicAddress()))) {
+                    return participant;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<String> netGroups(String netId, String groupId) {
+        List<String> groups = new ArrayList<>(command(() -> state.smembers(netsKey(netId))));
+        // 自身 group 排首位:定向路由查找与 roster 读取都以同房间目标为主,可提前命中。
+        groups.remove(groupId);
+        groups.add(0, groupId);
+        return groups;
+    }
+
+    private List<Participant> readMergedParticipants(Participant recipient, List<String> groups) {
+        Map<String, Participant> participantsByPeerId = new LinkedHashMap<>();
+        for (String group : groups) {
+            List<String> members = new ArrayList<>(command(() -> state.smembers(membersKey(group))));
+            if (members.isEmpty()) {
+                continue;
+            }
+            String[] keys = members.stream()
+                    .map(member -> presenceKey(group, member))
+                    .toArray(String[]::new);
+            List<KeyValue<String, String>> values = command(() -> state.mget(keys));
+            for (KeyValue<String, String> value : values) {
+                if (!value.hasValue()) {
+                    continue;
+                }
+                Participant participant = decodeParticipant(value.getValue());
+                // 内存复核:合并可见域 = 同房间(roomId+roomKey)或同网(publicAddress 可辨识且
+                // 相等,与 roomId 无关);"unknown"/空地址不构成同网。
+                if (participant != null
+                        && ((participant.roomId().equals(recipient.roomId())
+                                && participant.roomKey().equals(recipient.roomKey()))
+                                || sameNetAddress(participant.publicAddress(),
+                                        recipient.publicAddress()))) {
+                    participantsByPeerId.putIfAbsent(participant.peerId(), participant);
+                }
+            }
+        }
+        return new ArrayList<>(participantsByPeerId.values());
+    }
+
+    public long sweep(String groupId, String netId) {
+        requireEnabled();
+        Cleanup cleanup = cleanup(groupId, netId);
         if (cleanup.removed() > 0) {
             publishRoster(groupId, cleanup.revision());
+            publishRoster(netId, cleanup.revision());
         }
         return cleanup.revision();
     }
@@ -353,24 +485,43 @@ public class PublicTransferCoordinationService implements AutoCloseable {
         return digest(tenantId == null ? "" : tenantId.trim());
     }
 
+    /**
+     * 同网标识:仅由公网地址 digest 得出(sha256 UTF-8 小写 hex),不含 roomId 分量——
+     * 同网设备无论房间名如何都互相自动发现。
+     */
+    public static String netId(String publicAddress) {
+        return digest(publicAddress == null ? "" : publicAddress);
+    }
+
+    /**
+     * 同网判定:公网地址相等且可辨识。空串与 {@link WebSocketRequestAddress#UNKNOWN} 兜底值
+     * 不构成同网,避免地址解析失败的客户端被异常聚为一组。
+     */
+    public static boolean sameNetAddress(String left, String right) {
+        return left != null && !left.isBlank() && !WebSocketRequestAddress.UNKNOWN.equals(left)
+                && left.equals(right);
+    }
+
     private void publish(PublicTransferClusterFrame.Event event) {
         requireEnabled();
         byte[] encoded = PublicTransferClusterFrame.encode(event);
         command(() -> eventPublishConnection.sync().publish(eventChannel(), encoded));
     }
 
-    private Cleanup cleanup(String groupId) {
+    private Cleanup cleanup(String groupId, String netId) {
         List<?> result = command(() -> state.eval(
                 CLEANUP_SCRIPT,
                 ScriptOutputType.MULTI,
-                new String[]{membersKey(groupId), revisionKey(groupId)},
+                new String[]{membersKey(groupId), revisionKey(groupId), revisionKey(netId),
+                        netsKey(netId)},
                 presencePrefix(groupId),
-                Long.toString(REVISION_TTL_MILLIS)));
+                Long.toString(REVISION_TTL_MILLIS),
+                groupId));
         return new Cleanup(number(result, 0), number(result, 1));
     }
 
-    private long revision(String groupId) {
-        String value = command(() -> state.get(revisionKey(groupId)));
+    private long revision(String id) {
+        String value = command(() -> state.get(revisionKey(id)));
         if (!StringUtils.hasText(value)) {
             return 0;
         }
@@ -404,7 +555,11 @@ public class PublicTransferCoordinationService implements AutoCloseable {
     }
 
     private String presencePrefix(String groupId) {
-        return keyPrefix() + ":presence:" + groupId + ":";
+        return presenceBasePrefix() + groupId + ":";
+    }
+
+    private String presenceBasePrefix() {
+        return keyPrefix() + ":presence:";
     }
 
     private String presenceKey(String groupId, String memberId) {
@@ -415,8 +570,12 @@ public class PublicTransferCoordinationService implements AutoCloseable {
         return keyPrefix() + ":members:" + groupId;
     }
 
-    private String revisionKey(String groupId) {
-        return keyPrefix() + ":revision:" + groupId;
+    private String netsKey(String netId) {
+        return keyPrefix() + ":nets:" + netId;
+    }
+
+    private String revisionKey(String id) {
+        return keyPrefix() + ":revision:" + id;
     }
 
     private String nameKey(String displayName) {
@@ -529,6 +688,10 @@ public class PublicTransferCoordinationService implements AutoCloseable {
             String connectedAt) {
         public String groupId() {
             return PublicTransferCoordinationService.groupId(roomId, roomKey);
+        }
+
+        public String netId() {
+            return PublicTransferCoordinationService.netId(publicAddress);
         }
     }
 

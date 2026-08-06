@@ -103,7 +103,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                     joinError = "room is full";
                 } else {
                     addLocalParticipant(session, participant);
-                    rosterRevision = nextLocalRosterRevision(participant.groupId());
+                    rosterRevision = nextLocalRosterRevision(participant.netId());
                 }
             }
         }
@@ -210,13 +210,15 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                 try {
                     long revision = coordination.unregister(removed.coordinationParticipant());
                     if (revision > 0) {
+                        // 注销影响同房间与同网两个维度的 roster,两个 audience 都要推送。
                         coordination.publishRoster(removed.groupId(), revision);
+                        coordination.publishRoster(removed.netId(), revision);
                     }
                 } catch (IllegalStateException exception) {
                     log.warn("public transfer cluster unregister failed: {}", exception.toString());
                 }
             } else {
-                broadcastRoster(removed, nextLocalRosterRevision(removed.groupId()));
+                broadcastRoster(removed, nextLocalRosterRevision(removed.netId()));
             }
         }
     }
@@ -232,11 +234,18 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         if (!coordination.enabled() || participantsBySession.isEmpty()) {
             return;
         }
-        Set<String> groups = ConcurrentHashMap.newKeySet();
+        Set<String> groupNets = ConcurrentHashMap.newKeySet();
+        Set<String> nets = ConcurrentHashMap.newKeySet();
         try {
             for (Map.Entry<String, Participant> entry : List.copyOf(participantsBySession.entrySet())) {
                 Participant participant = entry.getValue();
-                groups.add(participant.groupId());
+                if (!participant.discoverable()) {
+                    // 隐身端不注册集群 presence,无需续期(否则 refresh 必然失败,每个周期都会被
+                    // dropLocal 踢掉);其本地会话由 WebSocket 本身保活。
+                    continue;
+                }
+                groupNets.add(participant.groupId() + "\n" + participant.netId());
+                nets.add(participant.netId());
                 if (!coordination.refresh(participant.coordinationParticipant())) {
                     WebSocketSession session = sessions.stream()
                             .filter(candidate -> candidate.getId().equals(entry.getKey()))
@@ -247,7 +256,14 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                     }
                 }
             }
-            groups.forEach(coordination::sweep);
+            // presence 过期清扫保持按 group(groupId/netId 均为 sha256 hex,"\n" 仅作本地分隔)。
+            groupNets.forEach(groupNet -> {
+                int separator = groupNet.indexOf('\n');
+                coordination.sweep(groupNet.substring(0, separator), groupNet.substring(separator + 1));
+            });
+            // 过期成员的同网跨房间 audience 不在被清扫 group 的推送范围内,补一次按 net 的 roster
+            // 推送;事件 revision 仅作占位,接收端会按 netId 重新读取一致快照与单调 revision。
+            nets.forEach(netId -> coordination.publishRoster(netId, 0));
         } catch (IllegalStateException exception) {
             log.warn("public transfer Redis coordination unavailable; closing local discovery sockets: {}",
                     exception.toString());
@@ -256,8 +272,11 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
     }
 
     private void handleCoordinationEvent(PublicTransferClusterFrame.Event event) {
+        // 事件的 group 字段是不透明标识:roster 事件可能是 groupId 或 netId,定向事件恒为目标
+        // 所在 groupId;两种标识都不可能与另一维度撞名(sha256 域分离由内容保证),合并匹配即可。
         Participant group = participantsBySession.values().stream()
-                .filter(participant -> participant.groupId().equals(event.groupId()))
+                .filter(participant -> participant.groupId().equals(event.groupId())
+                        || participant.netId().equals(event.groupId()))
                 .findFirst()
                 .orElse(null);
         if (group == null) {
@@ -265,7 +284,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         }
         try {
             switch (event.kind()) {
-                case PublicTransferClusterFrame.KIND_ROSTER -> emitRoster(group, event.revision());
+                case PublicTransferClusterFrame.KIND_ROSTER -> emitRoster(group);
                 case PublicTransferClusterFrame.KIND_TEXT -> {
                     JsonNode payload = objectMapper.readTree(event.payload());
                     deliverClusterText(group, event, payload);
@@ -283,7 +302,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                                     JsonNode payload) {
         for (WebSocketSession session : sessions) {
             Participant target = participantsBySession.get(session.getId());
-            if (target == null || !target.groupId().equals(event.groupId())) {
+            if (target == null || !(target.groupId().equals(event.groupId())
+                    || target.netId().equals(event.groupId()))) {
                 continue;
             }
             if (StringUtils.hasText(event.targetPeerId())
@@ -301,7 +321,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         for (WebSocketSession session : sessions) {
             Participant target = participantsBySession.get(session.getId());
             if (target != null
-                    && target.groupId().equals(event.groupId())
+                    && (target.groupId().equals(event.groupId())
+                            || target.netId().equals(event.groupId()))
                     && target.peerId().equals(event.targetPeerId())) {
                 sendBinary(session, event.payload());
                 return;
@@ -322,8 +343,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         closeQuietly(session, status);
     }
 
-    private long nextLocalRosterRevision(String groupId) {
-        return localRosterRevisions.computeIfAbsent(groupId, ignored -> new AtomicLong()).incrementAndGet();
+    private long nextLocalRosterRevision(String netId) {
+        return localRosterRevisions.computeIfAbsent(netId, ignored -> new AtomicLong()).incrementAndGet();
     }
 
     private byte[] encodeJson(Object payload) {
@@ -334,19 +355,22 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         }
     }
 
-    private Map<String, Object> participantView(Participant peer) {
+    private Map<String, Object> participantView(Participant peer, Participant recipient) {
         return participantView(peer.peerId(), peer.displayName(), peer.roomId(), peer.publicAddress(),
-                peer.sharedRoom(), peer.roomRole(), peer.connectedAt());
+                peer.sharedRoom(), peer.roomRole(), peer.connectedAt(),
+                peer.roomKey().equals(recipient.roomKey()));
     }
 
-    private Map<String, Object> participantView(PublicTransferCoordinationService.Participant peer) {
+    private Map<String, Object> participantView(PublicTransferCoordinationService.Participant peer,
+                                                Participant recipient) {
         return participantView(peer.peerId(), peer.displayName(), peer.roomId(), peer.publicAddress(),
-                peer.sharedRoom(), peer.roomRole(), peer.connectedAt());
+                peer.sharedRoom(), peer.roomRole(), peer.connectedAt(),
+                peer.roomKey().equals(recipient.roomKey()));
     }
 
     private Map<String, Object> participantView(String peerId, String displayName, String roomId,
                                                 String publicAddress, boolean sharedRoom,
-                                                String roomRole, String connectedAt) {
+                                                String roomRole, String connectedAt, boolean sameRoom) {
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("peerId", peerId);
         view.put("displayName", displayName);
@@ -355,18 +379,29 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         view.put("sharedRoom", sharedRoom);
         view.put("roomRole", roomRole);
         view.put("connectedAt", connectedAt);
+        // 逐接收者标注"同房间"(roomKey 相等),替代暴露 roomKey 本体(房间数字 ID 不外泄)。
+        view.put("sameRoom", sameRoom);
         return view;
     }
 
     private void sendToPeer(Participant source, String targetPeerId, Object payload) {
         if (coordination.enabled()) {
-            coordination.publishText(source.groupId(), targetPeerId, source.leaseId(), false,
-                    encodeJson(payload));
+            // 定向路由的可见域是同房间+同网:在合并 roster 内解析目标,按目标所在 group 投递。
+            // 同房间目标解析到的就是 source 所在 group,与旧行为一致;事件格式不变。
+            PublicTransferCoordinationService.Participant target =
+                    coordination.findPeer(source.coordinationParticipant(), targetPeerId);
+            // 回退语义:隐身端(discoverable=false)不注册共享 presence,findPeer 解析不到;
+            // 此时退回按 source 所在 group 投递,使同 group 隐身端仍能收到定向应答(例如隐身端
+            // 先发起 offer 后,对端的 answer 必须可达)——与改造前的集群行为一致。跨房间同网的
+            // 隐身端依旧不可达,这也与旧行为一致。
+            coordination.publishText(target == null ? source.groupId() : target.groupId(),
+                    targetPeerId, source.leaseId(), false, encodeJson(payload));
             return;
         }
         for (WebSocketSession session : sessions) {
             Participant target = participantsBySession.get(session.getId());
-            if (target != null && target.sameGroup(source) && target.peerId().equals(targetPeerId)) {
+            if (target != null && (target.sameGroup(source) || target.sameNet(source))
+                    && target.peerId().equals(targetPeerId)) {
                 send(session, payload);
                 return;
             }
@@ -377,12 +412,18 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         byte[] envelope = PublicTransferRelayFrame.encodeServer(
                 frame.targetPeerId(), source.peerId(), frame.appFrame());
         if (coordination.enabled()) {
-            coordination.publishBinary(source.groupId(), frame.targetPeerId(), envelope);
+            // 与 sendToPeer 同理,按目标所在 group 单次投递,避免双发造成的 relay 帧重复;
+            // 隐身端目标不在共享 presence,解析不到时退回按 source group 投递(同 group 可达)。
+            PublicTransferCoordinationService.Participant target =
+                    coordination.findPeer(source.coordinationParticipant(), frame.targetPeerId());
+            coordination.publishBinary(target == null ? source.groupId() : target.groupId(),
+                    frame.targetPeerId(), envelope);
             return;
         }
         for (WebSocketSession session : sessions) {
             Participant target = participantsBySession.get(session.getId());
-            if (target != null && target.sameGroup(source) && target.peerId().equals(frame.targetPeerId())) {
+            if (target != null && (target.sameGroup(source) || target.sameNet(source))
+                    && target.peerId().equals(frame.targetPeerId())) {
                 sendBinary(session, envelope);
                 return;
             }
@@ -391,35 +432,56 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
 
     private void broadcastRoster(Participant group, long revision) {
         if (coordination.enabled()) {
+            // roster 变更影响同房间与同网两个 audience;事件 revision 仅作占位,
+            // 接收端会重新读取一致快照并带上单调 revision。
             coordination.publishRoster(group.groupId(), revision);
+            coordination.publishRoster(group.netId(), revision);
             return;
         }
-        emitRoster(group, revision);
+        emitRoster(group);
     }
 
-    private void emitRoster(Participant group, long eventRevision) {
-        List<Map<String, Object>> peers;
-        long revision = eventRevision;
-        if (coordination.enabled()) {
-            PublicTransferCoordinationService.Roster roster = coordination.roster(group.groupId());
-            revision = roster.revision();
-            peers = roster.participants().stream().map(this::participantView).toList();
-        } else {
-            peers = participantsBySession.values().stream()
-                    .filter(peer -> peer.sameGroup(group))
-                    .filter(Participant::discoverable)
-                    .sorted(Comparator.comparing(Participant::connectedAt))
-                    .map(this::participantView)
-                    .toList();
+    private void emitRoster(Participant group) {
+        // 逐接收者构造 payload:sameRoom 是接收者相对的;每个接收者的 roster revision 按其
+        // 所在 net 单调递增(集群模式下为 revision:<group> + revision:<net> 的一致快照)。
+        Map<String, PublicTransferCoordinationService.Roster> clusterRosters = new LinkedHashMap<>();
+        List<WebSocketSession> dead = new ArrayList<>();
+        for (WebSocketSession session : sessions) {
+            Participant recipient = participantsBySession.get(session.getId());
+            if (recipient == null || !(recipient.sameGroup(group) || recipient.sameNet(group))) {
+                continue;
+            }
+            List<Map<String, Object>> peers;
+            long revision;
+            if (coordination.enabled()) {
+                PublicTransferCoordinationService.Roster roster = clusterRosters.computeIfAbsent(
+                        recipient.groupId() + "\n" + recipient.netId(),
+                        ignored -> coordination.roster(recipient.coordinationParticipant()));
+                revision = roster.revision();
+                peers = roster.participants().stream()
+                        .map(peer -> participantView(peer, recipient))
+                        .toList();
+            } else {
+                peers = participantsBySession.values().stream()
+                        .filter(peer -> peer.sameGroup(recipient) || peer.sameNet(recipient))
+                        .filter(Participant::discoverable)
+                        .sorted(Comparator.comparing(Participant::connectedAt))
+                        .map(peer -> participantView(peer, recipient))
+                        .toList();
+                revision = nextLocalRosterRevision(recipient.netId());
+            }
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("type", "roster");
+            payload.put("roomId", recipient.roomId());
+            payload.put("publicAddress", recipient.publicAddress());
+            payload.put("sharedRoom", recipient.sharedRoom());
+            payload.put("rosterRevision", revision);
+            payload.put("peers", peers);
+            if (!send(session, payload)) {
+                dead.add(session);
+            }
         }
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("type", "roster");
-        payload.put("roomId", group.roomId());
-        payload.put("publicAddress", group.publicAddress());
-        payload.put("sharedRoom", group.sharedRoom());
-        payload.put("rosterRevision", revision);
-        payload.put("peers", peers);
-        broadcastLocal(group, payload, false, "");
+        dropDeadSessions(dead);
     }
 
     private long roomPeerCount(Participant group) {
@@ -429,8 +491,10 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
     }
 
     private boolean hasConnectedPeerId(Participant participant) {
+        // 定向路由按合并可见域(同房间或同网)投递,peerId 必须在该域内唯一,否则跨房间同 peerId 会互抢信令。
         return participantsBySession.values().stream()
-                .anyMatch(peer -> peer.sameGroup(participant) && peer.peerId().equals(participant.peerId()));
+                .anyMatch(peer -> (peer.sameGroup(participant) || peer.sameNet(participant))
+                        && peer.peerId().equals(participant.peerId()));
     }
 
     private boolean hasConnectedDisplayName(String displayName) {
@@ -513,6 +577,10 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                 dead.add(session);
             }
         }
+        dropDeadSessions(dead);
+    }
+
+    private void dropDeadSessions(List<WebSocketSession> dead) {
         dead.forEach(deadSession -> {
             sessions.remove(deadSession);
             participantsBySession.remove(deadSession.getId());
@@ -590,7 +658,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                     stringAttr(attrs, "peerId", "web-" + UUID.randomUUID().toString().substring(0, 8)),
                     stringAttr(attrs, "displayName", "web"),
                     stringAttr(attrs, "roomId", "nearby"),
-                    stringAttr(attrs, "publicAddress", "unknown"),
+                    stringAttr(attrs, "publicAddress", WebSocketRequestAddress.UNKNOWN),
                     stringAttr(attrs, "roomKey", "public:unknown"),
                     stringAttr(attrs, "roomRole", "EDITOR"),
                     Boolean.TRUE.equals(attrs.get("sharedRoom")),
@@ -619,8 +687,18 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
             return roomId.equals(other.roomId) && roomKey.equals(other.roomKey);
         }
 
+        private boolean sameNet(Participant other) {
+            // 同网只看公网地址(与 roomId 无关):前端改房间名不影响同网自动发现。
+            // 兜底地址("unknown"/空)不构成同网,避免无地址客户端被异常聚为一组。
+            return PublicTransferCoordinationService.sameNetAddress(publicAddress, other.publicAddress);
+        }
+
         private String groupId() {
             return PublicTransferCoordinationService.groupId(roomId, roomKey);
+        }
+
+        private String netId() {
+            return PublicTransferCoordinationService.netId(publicAddress);
         }
 
         private PublicTransferCoordinationService.Participant coordinationParticipant() {
