@@ -77,6 +77,12 @@ jobs:
           go-version-file: implementations/go/server/go.mod
           cache-dependency-path: implementations/go/server/go.sum
 
+      - name: Create placeholder web assets for go:embed
+        if: matrix.runtime == 'go'
+        run: |
+          mkdir -p implementations/go/server/web/static
+          printf '<!doctype html><title>ci-placeholder</title>\n' > implementations/go/server/web/static/index.html
+
       - name: Test Go cluster protocol
         if: matrix.runtime == 'go'
         working-directory: implementations/go/server
