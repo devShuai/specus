@@ -39,11 +39,15 @@ export interface WhiteboardPoint {
   y: number;
 }
 
+export type WhiteboardBrushKind = "pen" | "marker" | "pencil" | "brush";
+
 export interface WhiteboardStroke {
   strokeId: string;
   sourcePeerId: string;
   color: string;
   width: number;
+  /** 画笔种类，缺省按 "pen"（钢笔）渲染，旧客户端没有该字段。 */
+  brush?: WhiteboardBrushKind;
   points: WhiteboardPoint[];
   updatedAt: number;
 }
@@ -94,6 +98,7 @@ export type WhiteboardPayload =
       strokeId: string;
       color: string;
       width: number;
+      brush?: WhiteboardBrushKind;
       point: WhiteboardPoint;
       createdAt: number;
     }
@@ -196,16 +201,28 @@ interface FlowLabelDraft {
 
 const WHITEBOARD_COLORS = [
   { label: "墨色", value: "#172033" },
+  { label: "灰色", value: "#6b7280" },
   { label: "蓝色", value: "#2563eb" },
+  { label: "青色", value: "#0891b2" },
   { label: "绿色", value: "#059669" },
+  { label: "黄色", value: "#ca8a04" },
   { label: "橙色", value: "#ea580c" },
   { label: "红色", value: "#dc2626" },
+  { label: "粉色", value: "#db2777" },
+  { label: "紫色", value: "#7c3aed" },
 ];
 const WHITEBOARD_WIDTHS = [
-  { label: "细", value: 3 },
-  { label: "中", value: 6 },
-  { label: "粗", value: 10 },
-  { label: "很粗", value: 16 },
+  { label: "极细", value: 2 },
+  { label: "细", value: 4 },
+  { label: "中", value: 7 },
+  { label: "粗", value: 12 },
+  { label: "特粗", value: 20 },
+];
+const WHITEBOARD_BRUSHES: { label: string; shortLabel: string; value: WhiteboardBrushKind }[] = [
+  { label: "钢笔", shortLabel: "钢笔", value: "pen" },
+  { label: "荧光笔", shortLabel: "荧光", value: "marker" },
+  { label: "铅笔", shortLabel: "铅笔", value: "pencil" },
+  { label: "毛笔", shortLabel: "毛笔", value: "brush" },
 ];
 const WHITEBOARD_SYNC_INTERVAL_MS = 220;
 const MIN_POINT_DISTANCE = 0.0025;
@@ -240,10 +257,15 @@ interface WhiteboardRenderTheme {
 
 const DARK_INK_BY_LIGHT: Record<string, string> = {
   "#172033": "#e2e8f0",
+  "#6b7280": "#9ca3af",
   "#2563eb": "#60a5fa",
+  "#0891b2": "#22d3ee",
   "#059669": "#34d399",
+  "#ca8a04": "#facc15",
   "#ea580c": "#fb923c",
   "#dc2626": "#f87171",
+  "#db2777": "#f472b6",
+  "#7c3aed": "#a78bfa",
 };
 
 const LIGHT_BOARD_THEME: WhiteboardRenderTheme = {
@@ -319,6 +341,7 @@ export function SyncedWhiteboard({
   const [objects, setObjects] = useState<WhiteboardObject[]>([]);
   const [selectedColor, setSelectedColor] = useState(WHITEBOARD_COLORS[0].value);
   const [selectedWidth, setSelectedWidth] = useState(WHITEBOARD_WIDTHS[1].value);
+  const [selectedBrush, setSelectedBrush] = useState<WhiteboardBrushKind>("pen");
   const [selectedTool, setSelectedTool] = useState<WhiteboardTool>(() => (
     typeof window !== "undefined"
       && typeof window.matchMedia === "function"
@@ -340,6 +363,7 @@ export function SyncedWhiteboard({
   canvasZoomRef.current = canvasZoom;
 
   const activeColor = selectedTool === "eraser" ? ERASER_COLOR : selectedColor;
+  const activeBrush = selectedTool === "eraser" ? undefined : selectedBrush;
   const totalPeers = peerCount + 1;
 
   const selectTool = useCallback((tool: WhiteboardTool) => {
@@ -524,6 +548,7 @@ export function SyncedWhiteboard({
             sourcePeerId,
             color: WHITEBOARD_COLORS[0].value,
             width: WHITEBOARD_WIDTHS[1].value,
+            brush: "pen",
             points: trimStrokePoints(points),
             updatedAt: Date.now(),
           },
@@ -559,6 +584,7 @@ export function SyncedWhiteboard({
             sourcePeerId: event.sourcePeerId,
             color: payload.color,
             width: payload.width,
+            brush: payload.brush ?? "pen",
             points: trimStrokePoints(points),
             updatedAt: Math.max(stroke.updatedAt, payload.createdAt),
           };
@@ -571,6 +597,7 @@ export function SyncedWhiteboard({
             sourcePeerId: event.sourcePeerId,
             color: payload.color,
             width: payload.width,
+            brush: payload.brush ?? "pen",
             points: [payload.point],
             updatedAt: payload.createdAt,
           },
@@ -820,6 +847,7 @@ export function SyncedWhiteboard({
       sourcePeerId: peerId,
       color: activeColor,
       width: selectedWidth,
+      brush: activeBrush,
       points: [point],
       updatedAt: Date.now(),
     };
@@ -832,10 +860,11 @@ export function SyncedWhiteboard({
       strokeId,
       color: activeColor,
       width: selectedWidth,
+      brush: activeBrush,
       point,
       createdAt: stroke.updatedAt,
     });
-  }, [activeColor, onSend, peerId, selectedWidth, updateStrokes]);
+  }, [activeBrush, activeColor, onSend, peerId, selectedWidth, updateStrokes]);
 
   const moveStroke = useCallback((point: WhiteboardPoint) => {
     const strokeId = activeStrokeIdRef.current;
@@ -1552,8 +1581,11 @@ export function SyncedWhiteboard({
   const selectedFlowNode = objects.find((object): object is WhiteboardFlowNodeObject => (
     object.objectId === selectedObjectId && object.kind === "flow-node"
   ));
-  const selectedColorOption = WHITEBOARD_COLORS.find((color) => color.value === selectedColor) ?? WHITEBOARD_COLORS[0];
+  const selectedColorOption = WHITEBOARD_COLORS.find((color) => color.value === selectedColor)
+    ?? { label: "自定义", value: selectedColor };
+  const isCustomColor = !WHITEBOARD_COLORS.some((color) => color.value === selectedColor);
   const selectedWidthOption = WHITEBOARD_WIDTHS.find((width) => width.value === selectedWidth) ?? WHITEBOARD_WIDTHS[1];
+  const selectedBrushOption = WHITEBOARD_BRUSHES.find((brush) => brush.value === selectedBrush) ?? WHITEBOARD_BRUSHES[0];
   const insertMenuLabel = isFlowchartOpen
     ? "流程图"
     : selectedTool === "text"
@@ -1687,8 +1719,8 @@ export function SyncedWhiteboard({
                 <button
                   type="button"
                   className="flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
-                  aria-label={`样式：${selectedColorOption.label}，${selectedWidthOption.label}线条`}
-                  title="颜色与线条粗细"
+                  aria-label={`样式：${selectedBrushOption.label}，${selectedColorOption.label}，${selectedWidthOption.label}线条`}
+                  title="画笔、颜色与线条粗细"
                 >
                   <span
                     className="h-4 w-4 rounded-full border border-black/15 shadow-sm dark:border-white/20"
@@ -1709,10 +1741,40 @@ export function SyncedWhiteboard({
                 <div className="w-full space-y-4">
                   <div>
                     <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
+                      <span>画笔</span>
+                      <span className="font-normal text-zinc-500 dark:text-zinc-400">{selectedBrushOption.label}</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1.5" aria-label="画笔种类">
+                      {WHITEBOARD_BRUSHES.map((brush) => (
+                        <button
+                          key={brush.value}
+                          type="button"
+                          aria-pressed={selectedBrush === brush.value}
+                          className={
+                            "flex h-9 items-center justify-center rounded-md text-tiny transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+                            + (selectedBrush === brush.value
+                              ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
+                              : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
+                          }
+                          title={brush.label}
+                          onClick={() => {
+                            setSelectedBrush(brush.value);
+                            if (selectedTool === "eraser") {
+                              setSelectedTool("pen");
+                            }
+                          }}
+                        >
+                          {brush.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
                       <span>颜色</span>
                       <span className="font-normal text-zinc-500 dark:text-zinc-400">{selectedColorOption.label}</span>
                     </div>
-                    <div className="flex items-center gap-2" aria-label="画笔颜色">
+                    <div className="grid grid-cols-6 gap-2" aria-label="画笔颜色">
                       {WHITEBOARD_COLORS.map((color) => (
                         <button
                           key={color.value}
@@ -1734,6 +1796,33 @@ export function SyncedWhiteboard({
                           style={{ backgroundColor: color.value }}
                         />
                       ))}
+                      <label
+                        className={
+                          "relative block h-8 w-8 cursor-pointer overflow-hidden rounded-full border transition-transform focus-within:ring-2 focus-within:ring-cyan-400 "
+                          + (isCustomColor && selectedTool !== "eraser"
+                            ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
+                            : "border-black/15 dark:border-white/20")
+                        }
+                        title="自定义颜色"
+                        style={{
+                          background: isCustomColor
+                            ? selectedColor
+                            : "conic-gradient(#dc2626, #ca8a04, #059669, #2563eb, #7c3aed, #dc2626)",
+                        }}
+                      >
+                        <input
+                          type="color"
+                          aria-label="选择自定义颜色"
+                          className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                          value={selectedColor}
+                          onChange={(event) => {
+                            setSelectedColor(event.currentTarget.value);
+                            if (selectedTool === "eraser") {
+                              setSelectedTool("pen");
+                            }
+                          }}
+                        />
+                      </label>
                     </div>
                   </div>
                   <div>
@@ -1741,7 +1830,7 @@ export function SyncedWhiteboard({
                       <span>线条粗细</span>
                       <span className="font-normal text-zinc-500 dark:text-zinc-400">{selectedWidthOption.label}</span>
                     </div>
-                    <div className="grid grid-cols-4 gap-1.5" aria-label="线条宽度">
+                    <div className="grid grid-cols-5 gap-1.5" aria-label="线条宽度">
                       {WHITEBOARD_WIDTHS.map((width) => (
                         <button
                           key={width.value}
@@ -2067,6 +2156,30 @@ export function SyncedWhiteboard({
               </div>
 
               <div className="h-px w-10 shrink-0 bg-black/10 dark:bg-white/10" />
+              <div className="grid grid-cols-2 gap-1" aria-label="画笔种类">
+                {WHITEBOARD_BRUSHES.map((brush) => (
+                  <button
+                    key={brush.value}
+                    type="button"
+                    aria-label={brush.label}
+                    title={brush.label}
+                    onClick={() => {
+                      setSelectedBrush(brush.value);
+                      if (selectedTool === "eraser") {
+                        setSelectedTool("pen");
+                      }
+                    }}
+                    className={
+                      "flex h-7 w-7 items-center justify-center rounded-md text-[9px] transition focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      + (selectedBrush === brush.value
+                        ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
+                        : "bg-black/5 text-zinc-700 dark:bg-white/10 dark:text-zinc-200")
+                    }
+                  >
+                    {brush.shortLabel}
+                  </button>
+                ))}
+              </div>
               <div className="grid grid-cols-2 gap-1" aria-label="画笔颜色">
                 {WHITEBOARD_COLORS.map((color) => (
                   <button
@@ -2089,6 +2202,33 @@ export function SyncedWhiteboard({
                     style={{ backgroundColor: color.value }}
                   />
                 ))}
+                <label
+                  className={
+                    "relative block h-5 w-5 cursor-pointer overflow-hidden rounded-full border transition-transform focus-within:ring-2 focus-within:ring-cyan-400 "
+                    + (isCustomColor && selectedTool !== "eraser"
+                      ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
+                      : "border-black/15 dark:border-white/20")
+                  }
+                  title="自定义颜色"
+                  style={{
+                    background: isCustomColor
+                      ? selectedColor
+                      : "conic-gradient(#dc2626, #ca8a04, #059669, #2563eb, #7c3aed, #dc2626)",
+                  }}
+                >
+                  <input
+                    type="color"
+                    aria-label="选择自定义颜色"
+                    className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                    value={selectedColor}
+                    onChange={(event) => {
+                      setSelectedColor(event.currentTarget.value);
+                      if (selectedTool === "eraser") {
+                        setSelectedTool("pen");
+                      }
+                    }}
+                  />
+                </label>
               </div>
               <div className="grid grid-cols-2 gap-1" aria-label="线条宽度">
                 {WHITEBOARD_WIDTHS.map((width) => (
@@ -2522,6 +2662,7 @@ export function isWhiteboardPayload(value: unknown): value is WhiteboardPayload 
     return typeof value.strokeId === "string"
       && isColor(value.color)
       && isWidth(value.width)
+      && (value.brush === undefined || isWhiteboardBrushKind(value.brush))
       && isPoint(value.point)
       && typeof value.createdAt === "number";
   }
@@ -2846,12 +2987,32 @@ function drawStroke(context: CanvasRenderingContext2D, stroke: WhiteboardStroke,
   if (stroke.points.length === 0) {
     return;
   }
+  const brush = stroke.brush ?? "pen";
   context.save();
   context.strokeStyle = theme.ink(stroke.color);
-  context.lineWidth = stroke.width;
   context.lineCap = "round";
   context.lineJoin = "round";
   context.globalCompositeOperation = "source-over";
+  if (brush === "marker") {
+    // 荧光笔：更粗且半透明，反复涂抹会加深叠色。
+    context.globalAlpha = 0.4;
+    context.lineWidth = stroke.width * 2.2;
+    drawStrokePath(context, stroke, width, height);
+  } else if (brush === "pencil") {
+    // 铅笔：更细且略透明。
+    context.globalAlpha = 0.8;
+    context.lineWidth = Math.max(1, stroke.width * 0.45);
+    drawStrokePath(context, stroke, width, height);
+  } else if (brush === "brush") {
+    drawBrushStroke(context, stroke, width, height);
+  } else {
+    context.lineWidth = stroke.width;
+    drawStrokePath(context, stroke, width, height);
+  }
+  context.restore();
+}
+
+function drawStrokePath(context: CanvasRenderingContext2D, stroke: WhiteboardStroke, width: number, height: number) {
   const first = stroke.points[0];
   context.beginPath();
   context.moveTo(first.x * width, first.y * height);
@@ -2863,7 +3024,32 @@ function drawStroke(context: CanvasRenderingContext2D, stroke: WhiteboardStroke,
     }
   }
   context.stroke();
-  context.restore();
+}
+
+/**
+ * 毛笔：以段长为运笔速度代理逐段变速宽（运笔越快笔迹越细），
+ * 公式只依赖 points 和 width，保证各端渲染结果一致；单点退化为圆点。
+ */
+function drawBrushStroke(context: CanvasRenderingContext2D, stroke: WhiteboardStroke, width: number, height: number) {
+  const first = stroke.points[0];
+  if (stroke.points.length === 1) {
+    context.beginPath();
+    context.lineWidth = stroke.width * 1.4;
+    context.moveTo(first.x * width, first.y * height);
+    context.lineTo(first.x * width + 0.1, first.y * height + 0.1);
+    context.stroke();
+    return;
+  }
+  for (let index = 1; index < stroke.points.length; index += 1) {
+    const from = stroke.points[index - 1];
+    const to = stroke.points[index];
+    const segmentLength = Math.hypot(to.x - from.x, to.y - from.y);
+    context.beginPath();
+    context.lineWidth = stroke.width * clamp(1.4 - segmentLength * 18, 0.35, 1.4);
+    context.moveTo(from.x * width, from.y * height);
+    context.lineTo(to.x * width, to.y * height);
+    context.stroke();
+  }
 }
 
 function drawBoardObject(
@@ -3229,6 +3415,10 @@ function isColor(value: unknown): value is string {
 
 function isWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 32;
+}
+
+function isWhiteboardBrushKind(value: unknown): value is WhiteboardBrushKind {
+  return value === "pen" || value === "marker" || value === "pencil" || value === "brush";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

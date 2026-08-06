@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH } from "../lib/whiteboardImageCompression";
+import { createWhiteboardDocument, parseWhiteboardDocument } from "../lib/whiteboardDocument";
 import { isWhiteboardPayload } from "./SyncedWhiteboard";
 
 const baseObject = {
@@ -117,5 +118,76 @@ describe("isWhiteboardPayload", () => {
       requestId: "peer-a-sync-1",
       createdAt: 109,
     })).toBe(true);
+  });
+});
+
+const strokeStartPayload = (extra: Record<string, unknown>) => ({
+  type: "STWB1",
+  kind: "stroke-start",
+  strokeId: "peer-stroke-1",
+  color: "#2563eb",
+  width: 7,
+  point: { x: 0.1, y: 0.2 },
+  createdAt: 110,
+  ...extra,
+});
+
+describe("whiteboard brush styles", () => {
+  it("accepts every brush kind and defaults a missing brush to pen", () => {
+    for (const brush of ["pen", "marker", "pencil", "brush"]) {
+      expect(isWhiteboardPayload(strokeStartPayload({ brush }))).toBe(true);
+    }
+    // 旧客户端的 stroke-start 不带 brush 字段，仍需通过校验并按钢笔渲染。
+    expect(isWhiteboardPayload(strokeStartPayload({}))).toBe(true);
+    expect(isWhiteboardPayload(strokeStartPayload({ brush: "spray" }))).toBe(false);
+  });
+
+  it("accepts custom colors and the new width presets", () => {
+    expect(isWhiteboardPayload(strokeStartPayload({ color: "#12ab34" }))).toBe(true);
+    for (const width of [2, 4, 7, 12, 20]) {
+      expect(isWhiteboardPayload(strokeStartPayload({ width }))).toBe(true);
+    }
+  });
+
+  it("keeps brush on snapshot strokes", () => {
+    expect(isWhiteboardPayload({
+      type: "STWB1",
+      kind: "snapshot",
+      strokes: [{
+        strokeId: "peer-stroke-2",
+        sourcePeerId: "peer-a",
+        color: "#db2777",
+        width: 12,
+        brush: "marker",
+        points: [{ x: 0.1, y: 0.2 }, { x: 0.3, y: 0.4 }],
+        updatedAt: 111,
+      }],
+      createdAt: 112,
+    })).toBe(true);
+  });
+
+  it("preserves brush through document export and import", () => {
+    const strokes = [{
+      strokeId: "stroke-brush",
+      sourcePeerId: "peer-a",
+      color: "#2563eb",
+      width: 7,
+      brush: "brush" as const,
+      points: [{ x: 0.1, y: 0.2 }],
+      updatedAt: 113,
+    }, {
+      strokeId: "stroke-legacy",
+      sourcePeerId: "peer-a",
+      color: "#12ab34",
+      width: 2,
+      points: [{ x: 0.2, y: 0.3 }],
+      updatedAt: 114,
+    }];
+    const exported = createWhiteboardDocument(strokes, [], { width: 720, height: 1280 });
+    const imported = parseWhiteboardDocument(JSON.stringify(exported));
+
+    expect(imported.strokes[0].brush).toBe("brush");
+    // 旧文件没有 brush 字段，导入后保持缺省（渲染时按钢笔处理）。
+    expect(imported.strokes[1].brush).toBeUndefined();
   });
 });
