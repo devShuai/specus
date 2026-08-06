@@ -339,6 +339,8 @@ jobs:
     needs: [prep, go-server, go-client, java, csharp-server, csharp-client, csharp-desktop, c-server]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: "*"
