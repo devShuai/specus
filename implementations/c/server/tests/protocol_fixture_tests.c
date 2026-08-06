@@ -47,7 +47,7 @@ static int test_message_response_decode(void)
     }
     int ok = strcmp(response.client_name, "admin") == 0
         && strcmp(response.to_client_name, "Demo client") == 0
-        && response.message_type == 3
+        && response.message_type == ST_MESSAGE_TYPE_NAT_CONTROL
         && strcmp(response.message, "{\"clientName\":\"Demo client\",\"remotePort\":7010}") == 0;
     if (!ok) {
         fprintf(stderr, "message response content mismatch\n");

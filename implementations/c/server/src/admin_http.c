@@ -3439,7 +3439,7 @@ static int handle_peer_mesh_device_update(const st_admin_context *context,
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 503, "Service Unavailable", "{\"error\":\"database is not configured\"}");
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh device not found\"}");
     }
     st_storage_client client;
     if (!admin_load_accessible_client(database_path, context, client_id, &client)) {
@@ -4136,7 +4136,15 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
         free(query);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http exchange list failed\"}");
     }
-    st_storage_http_exchange items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
+    st_storage_http_exchange *items =
+        (st_storage_http_exchange *)calloc(ST_ADMIN_MAX_CONNECTIONS_PAGE, sizeof(*items));
+    if (items == NULL) {
+        free(route);
+        free(response_body_type);
+        free(field);
+        free(query);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http exchange list failed\"}");
+    }
     size_t item_count = 0;
     long long total_count = 0;
     int rc = st_storage_list_http_exchanges_visible(database_path,
@@ -4159,6 +4167,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     free(field);
     free(query);
     if (rc != 0) {
+        free(items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http exchange list failed\"}");
     }
     long long total_pages = total_count <= 0 ? 0 : (total_count + size - 1) / size;
@@ -4179,10 +4188,12 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
                               total_pages);
     }
     if (rc != 0 || builder.data == NULL) {
+        free(items);
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http exchange response failed\"}");
     }
     int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(items);
     free(builder.data);
     return response_len;
 }
