@@ -239,6 +239,11 @@ public sealed class PublicTransferOptions
     public long DiscoveryMessageRateLimitWindowSeconds { get; set; } = 60;
     public bool ClusterEnabled { get; set; }
     public string RedisUri { get; set; } = string.Empty;
+    /// <summary>
+    /// Redis keyspace prefix. Net-scoped discovery (nets:&lt;netId&gt; index, net-scoped
+    /// revisions/routing) changed the keyspace semantics: old and new nodes must never share
+    /// one keyspace — upgrade every cluster node together, or bump this prefix for the new fleet.
+    /// </summary>
     public string RedisKeyPrefix { get; set; } = "specus:v2:public-transfer";
     public long PresenceLeaseSeconds { get; set; } = 30;
     public long PresenceRefreshIntervalMs { get; set; } = 10_000;

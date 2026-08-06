@@ -206,9 +206,11 @@ public sealed class PublicTransferDiscoveryHub
         }
         lock (_participantsGate)
         {
-            var group = _participants.Values.Where(peer => peer.SameGroup(participant)).ToArray();
-            if (group.Any(peer => string.Equals(peer.PeerId, participant.PeerId,
-                    StringComparison.Ordinal)))
+            // Peer IDs must be unique across the merged scope (same token room or same
+            // net), so neither cross-room nor cross-net signals can be stolen.
+            if (_participants.Values.Any(peer => peer.SameScope(participant)
+                    && string.Equals(peer.PeerId, participant.PeerId,
+                        StringComparison.Ordinal)))
             {
                 return new PublicTransferClusterRegistration(DuplicatePeerIdError, 0);
             }
@@ -217,13 +219,15 @@ public sealed class PublicTransferDiscoveryHub
             {
                 return new PublicTransferClusterRegistration("client name is already in use", 0);
             }
-            if (group.Length >= Math.Max(1, _options.MaxDiscoveryPeersPerRoom))
+            // The room capacity cap stays group-scoped (same room + same room key).
+            var groupSize = _participants.Values.Count(peer => peer.SameGroup(participant));
+            if (groupSize >= Math.Max(1, _options.MaxDiscoveryPeersPerRoom))
             {
                 return new PublicTransferClusterRegistration("room is full", 0);
             }
             _participants[participant.Id] = participant;
             return new PublicTransferClusterRegistration(null,
-                NextLocalRosterRevision(participant.GroupId));
+                NextLocalRosterRevision(participant.NetId));
         }
     }
 
@@ -257,7 +261,7 @@ public sealed class PublicTransferDiscoveryHub
         {
             return 0;
         }
-        return NextLocalRosterRevision(participant.GroupId);
+        return NextLocalRosterRevision(participant.NetId);
     }
 
     private async Task HandleMessageAsync(Participant source, string json,
@@ -307,12 +311,32 @@ public sealed class PublicTransferDiscoveryHub
         {
             if (_coordination.Enabled)
             {
-                await _coordination.PublishTextAsync(source.GroupId, targetPeerId,
-                    source.LeaseId, false, JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions),
-                    cancellationToken).ConfigureAwait(false);
+                // Resolve the target inside the source's merged visibility domain and
+                // deliver to the target's group, exactly once; unresolved (hidden)
+                // targets fall back to the source's group, keeping legacy reachability.
+                // A routing failure drops only this message (as the Java handler does):
+                // the source connection stays alive and is told the message failed.
+                try
+                {
+                    var resolved = await _coordination.FindPeerAsync(source.ToCluster(),
+                        targetPeerId, cancellationToken).ConfigureAwait(false);
+                    await _coordination.PublishTextAsync(resolved?.GroupId ?? source.GroupId,
+                        targetPeerId, source.LeaseId, false,
+                        JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                    or RedisException)
+                {
+                    _logger.LogWarning(exception,
+                        "public transfer directed message routing failed: peer={Peer}",
+                        source.PeerId);
+                    await source.SendAsync(new { type = "error", error = "invalid message" },
+                        cancellationToken).ConfigureAwait(false);
+                }
                 return;
             }
-            var target = _participants.Values.FirstOrDefault(peer => peer.SameGroup(source)
+            var target = _participants.Values.FirstOrDefault(peer => peer.SameScope(source)
                 && string.Equals(peer.PeerId, targetPeerId, StringComparison.Ordinal));
             if (target is not null)
             {
@@ -320,6 +344,8 @@ public sealed class PublicTransferDiscoveryHub
             }
             return;
         }
+        // Untargeted messages stay room-scoped: same-net strangers only see the roster and
+        // can exchange directed messages, never another token room's broadcasts.
         if (_coordination.Enabled)
         {
             await _coordination.PublishTextAsync(source.GroupId, string.Empty, source.LeaseId,
@@ -345,11 +371,15 @@ public sealed class PublicTransferDiscoveryHub
             frame.TargetPeerId, source.PeerId, frame.AppFrame);
         if (_coordination.Enabled)
         {
-            await _coordination.PublishBinaryAsync(source.GroupId, frame.TargetPeerId, envelope,
-                cancellationToken).ConfigureAwait(false);
+            // Same routing as directed text: resolve the target's group once, fall back
+            // to the source's group for unresolved (hidden) targets.
+            var resolved = await _coordination.FindPeerAsync(source.ToCluster(),
+                frame.TargetPeerId, cancellationToken).ConfigureAwait(false);
+            await _coordination.PublishBinaryAsync(resolved?.GroupId ?? source.GroupId,
+                frame.TargetPeerId, envelope, cancellationToken).ConfigureAwait(false);
             return;
         }
-        var target = _participants.Values.FirstOrDefault(peer => peer.SameGroup(source)
+        var target = _participants.Values.FirstOrDefault(peer => peer.SameScope(source)
             && string.Equals(peer.PeerId, frame.TargetPeerId, StringComparison.Ordinal));
         if (target is null)
         {
@@ -367,48 +397,72 @@ public sealed class PublicTransferDiscoveryHub
         }
     }
 
-    private async Task BroadcastRosterAsync(Participant group, ulong revision,
+    private async Task BroadcastRosterAsync(Participant scope, ulong revision,
         CancellationToken cancellationToken)
     {
         if (_coordination.Enabled)
         {
-            await _coordination.PublishRosterAsync(group.GroupId, revision, cancellationToken)
+            // A merged-scope change has two audiences: the token room and the network.
+            // The event revision is only a hint; receivers re-read a consistent snapshot.
+            await _coordination.PublishRosterAsync(scope.GroupId, revision, cancellationToken)
+                .ConfigureAwait(false);
+            await _coordination.PublishRosterAsync(scope.NetId, revision, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
-        await EmitRosterAsync(group, revision, cancellationToken).ConfigureAwait(false);
+        await EmitRosterAsync(scope, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task EmitRosterAsync(Participant group, ulong eventRevision,
-        CancellationToken cancellationToken)
+    // Roster visibility is the merged scope (same token room or same net). The payload is
+    // built per recipient: the peer list is recipient-relative (sameRoom compares against
+    // the viewer's own room key — the key itself is never exposed), and the revision is
+    // the recipient's own roster revision. Cluster roster reads are cached per recipient
+    // identity (groupId + netId).
+    private async Task EmitRosterAsync(Participant scope, CancellationToken cancellationToken)
     {
-        IReadOnlyList<object> peers;
-        var revision = eventRevision;
-        if (_coordination.Enabled)
+        var snapshot = _participants.Values.ToArray();
+        var clusterRosters = new Dictionary<string, PublicTransferClusterRoster>(
+            StringComparer.Ordinal);
+        foreach (var recipient in snapshot)
         {
-            var roster = await _coordination.RosterAsync(group.GroupId, cancellationToken)
-                .ConfigureAwait(false);
-            revision = roster.Revision;
-            peers = roster.Participants.Select(ClusterParticipantView).ToList();
+            if (!recipient.SameScope(scope))
+            {
+                continue;
+            }
+            IReadOnlyList<object> peers;
+            ulong revision;
+            if (_coordination.Enabled)
+            {
+                var identity = recipient.GroupId + "\n" + recipient.NetId;
+                if (!clusterRosters.TryGetValue(identity, out var roster))
+                {
+                    roster = await _coordination.RosterAsync(recipient.ToCluster(),
+                        cancellationToken).ConfigureAwait(false);
+                    clusterRosters[identity] = roster;
+                }
+                revision = roster.Revision;
+                peers = roster.Participants
+                    .Select(peer => ClusterParticipantView(peer, recipient)).ToList();
+            }
+            else
+            {
+                peers = snapshot
+                    .Where(peer => peer.Discoverable && peer.SameScope(recipient))
+                    .OrderBy(peer => peer.ConnectedAt, StringComparer.Ordinal)
+                    .Select(peer => ParticipantView(peer, recipient))
+                    .ToList();
+                revision = NextLocalRosterRevision(recipient.NetId);
+            }
+            await SendOrRemoveAsync(recipient, new
+            {
+                type = "roster",
+                roomId = recipient.RoomId,
+                publicAddress = recipient.PublicAddress,
+                sharedRoom = recipient.SharedRoom,
+                rosterRevision = revision,
+                peers,
+            }, cancellationToken).ConfigureAwait(false);
         }
-        else
-        {
-            peers = _participants.Values
-                .Where(peer => peer.SameGroup(group))
-                .Where(peer => peer.Discoverable)
-                .OrderBy(peer => peer.ConnectedAt, StringComparer.Ordinal)
-                .Select(ParticipantView)
-                .ToList();
-        }
-        await BroadcastAsync(group, new
-        {
-            type = "roster",
-            roomId = group.RoomId,
-            publicAddress = group.PublicAddress,
-            sharedRoom = group.SharedRoom,
-            rosterRevision = revision,
-            peers,
-        }, excludeSource: false, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task BroadcastAsync(Participant group, object payload, bool excludeSource,
@@ -445,12 +499,18 @@ public sealed class PublicTransferDiscoveryHub
         {
             return;
         }
-        var groups = new HashSet<string>(StringComparer.Ordinal);
+        // Presence and sweeping stay group-scoped; sweeping is paired with the net so a
+        // cleanup reaches both audiences of the merged scope. Hidden peers never
+        // registered presence, so they have nothing to refresh (and are never dropped
+        // over a failed refresh).
+        var groupNets = new Dictionary<string, (string GroupId, string NetId)>(
+            StringComparer.Ordinal);
+        var nets = new HashSet<string>(StringComparer.Ordinal);
         try
         {
             foreach (var participant in _participants.Values.ToArray())
             {
-                groups.Add(participant.GroupId);
+                nets.Add(participant.NetId);
                 if (!participant.Discoverable)
                 {
                     continue;
@@ -459,11 +519,23 @@ public sealed class PublicTransferDiscoveryHub
                         .ConfigureAwait(false))
                 {
                     await DropParticipantAsync(participant, cancellationToken).ConfigureAwait(false);
+                    continue;
                 }
+                groupNets[participant.GroupId + "\n" + participant.NetId] =
+                    (participant.GroupId, participant.NetId);
             }
-            foreach (var groupId in groups)
+            foreach (var (groupId, netId) in groupNets.Values)
             {
-                await _coordination.SweepAsync(groupId, cancellationToken).ConfigureAwait(false);
+                await _coordination.SweepAsync(groupId, netId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            // Expired members' same-net cross-room audiences are outside the swept group's
+            // push scope, so top up with one roster publish per local net; the placeholder
+            // revision is fine because receivers re-read a consistent snapshot.
+            foreach (var netId in nets)
+            {
+                await _coordination.PublishRosterAsync(netId, 0, cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
         catch (Exception exception) when (exception is InvalidOperationException or RedisException)
@@ -526,9 +598,16 @@ public sealed class PublicTransferDiscoveryHub
 
     private async Task HandleCoordinationEventAsync(PublicTransferClusterEvent clusterEvent)
     {
+        // Roster events are published to both the changed participant's groupID and its
+        // netID; directed text/binary events carry the resolved target's groupID;
+        // untargeted room broadcasts carry the source groupID. All ride in the legacy
+        // group field, so matching either scope delivers each kind to its audience
+        // (digests never collide in practice).
         var local = _participants.Values
-            .Where(participant => string.Equals(participant.GroupId, clusterEvent.GroupId,
-                StringComparison.Ordinal))
+            .Where(participant => string.Equals(participant.NetId, clusterEvent.GroupId,
+                    StringComparison.Ordinal)
+                || string.Equals(participant.GroupId, clusterEvent.GroupId,
+                    StringComparison.Ordinal))
             .ToArray();
         if (local.Length == 0)
         {
@@ -538,17 +617,16 @@ public sealed class PublicTransferDiscoveryHub
         {
             try
             {
-                await EmitRosterAsync(local[0], clusterEvent.Revision, CancellationToken.None)
+                await EmitRosterAsync(local[0], CancellationToken.None)
                     .ConfigureAwait(false);
             }
-            catch (InvalidOperationException exception)
+            catch (Exception exception) when (exception is InvalidOperationException
+                or RedisException)
             {
-                _logger.LogWarning(exception, "public transfer cluster roster refresh failed");
-                foreach (var participant in local)
-                {
-                    await DropParticipantAsync(participant, CancellationToken.None)
-                        .ConfigureAwait(false);
-                }
+                // A failed refresh discards only this event (as the Java handler does):
+                // participants stay connected and the next roster event retries.
+                _logger.LogWarning(exception,
+                    "discarding public transfer cluster roster event: {Message}", exception.Message);
             }
             return;
         }
@@ -608,10 +686,10 @@ public sealed class PublicTransferDiscoveryHub
         }
     }
 
-    private ulong NextLocalRosterRevision(string groupId) => checked((ulong)
-        _localRosterRevisions.AddOrUpdate(groupId, 1, (_, revision) => checked(revision + 1)));
+    private ulong NextLocalRosterRevision(string netId) => checked((ulong)
+        _localRosterRevisions.AddOrUpdate(netId, 1, (_, revision) => checked(revision + 1)));
 
-    private static object ParticipantView(Participant peer) => new
+    private static object ParticipantView(Participant peer, Participant recipient) => new
     {
         peerId = peer.PeerId,
         displayName = peer.DisplayName,
@@ -619,10 +697,12 @@ public sealed class PublicTransferDiscoveryHub
         publicAddress = peer.PublicAddress,
         sharedRoom = peer.SharedRoom,
         roomRole = peer.RoomRole,
+        sameRoom = string.Equals(peer.RoomKey, recipient.RoomKey, StringComparison.Ordinal),
         connectedAt = peer.ConnectedAt,
     };
 
-    private static object ClusterParticipantView(PublicTransferClusterParticipant peer) => new
+    private static object ClusterParticipantView(PublicTransferClusterParticipant peer,
+        Participant recipient) => new
     {
         peerId = peer.PeerId,
         displayName = peer.DisplayName,
@@ -630,6 +710,7 @@ public sealed class PublicTransferDiscoveryHub
         publicAddress = peer.PublicAddress,
         sharedRoom = peer.SharedRoom,
         roomRole = peer.RoomRole,
+        sameRoom = string.Equals(peer.RoomKey, recipient.RoomKey, StringComparison.Ordinal),
         connectedAt = peer.ConnectedAt,
     };
 
@@ -760,12 +841,27 @@ public sealed class PublicTransferDiscoveryHub
         public bool Discoverable { get; }
         public string ConnectedAt { get; }
         public string GroupId => PublicTransferCoordinationService.GroupId(RoomId, RoomKey);
+        public string NetId => PublicTransferCoordinationService.NetId(PublicAddress);
         public FixedRateWindow RateWindow { get; } = new();
         private SemaphoreSlim SendLock { get; } = new(1, 1);
 
         public bool SameGroup(Participant other) =>
             string.Equals(RoomId, other.RoomId, StringComparison.Ordinal)
             && string.Equals(RoomKey, other.RoomKey, StringComparison.Ordinal);
+
+        // Same public egress address, regardless of room id or room key: renaming or
+        // recreating a room must not split same-net devices. Peers whose address could
+        // not be resolved (blank or the "unknown" fallback) are never grouped into a
+        // net, so an address-resolution failure cannot lump strangers together.
+        public bool SameNet(Participant other) =>
+            PublicAddress.Length > 0
+            && !string.Equals(PublicAddress, PublicTransferCoordinationService.UnknownPublicAddress,
+                StringComparison.Ordinal)
+            && string.Equals(PublicAddress, other.PublicAddress, StringComparison.Ordinal);
+
+        // Merged visibility/reachability: visible across rooms on the same net,
+        // and visible across nets inside the same token room.
+        public bool SameScope(Participant other) => SameGroup(other) || SameNet(other);
 
         public async Task SendAsync(object payload, CancellationToken cancellationToken)
         {
@@ -844,7 +940,8 @@ public sealed class PublicTransferDiscoveryHub
                     return last;
                 }
             }
-            return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            return context.Connection.RemoteIpAddress?.ToString()
+                ?? PublicTransferCoordinationService.UnknownPublicAddress;
         }
 
         public void Dispose() => SendLock.Dispose();

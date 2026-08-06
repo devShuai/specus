@@ -55,6 +55,338 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PublicDiscoveryHidesNonDiscoverablePeerAcrossSameNetTokenRooms()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var visible = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "hidden-net-room", "hidden-net-a", "net-visible", publicAddress: "203.0.113.66");
+        _ = await ReceiveTextAsync(visible, cts.Token);
+        _ = await ReceiveTextAsync(visible, cts.Token);
+
+        using var hidden = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "hidden-net-room", "hidden-net-b", "net-hidden", discoverable: false,
+            publicAddress: "203.0.113.66");
+        using var hello = JsonDocument.Parse(await ReceiveTextAsync(hidden, cts.Token));
+        Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
+        using var hiddenRoster = JsonDocument.Parse(await ReceiveTextAsync(hidden, cts.Token));
+        var onlyVisible = Assert.Single(hiddenRoster.RootElement.GetProperty("peers")
+            .EnumerateArray());
+        Assert.Equal("net-visible", onlyVisible.GetProperty("peerId").GetString());
+
+        using var visibleRoster = JsonDocument.Parse(await ReceiveTextAsync(visible, cts.Token));
+        var visiblePeers = visibleRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.DoesNotContain(visiblePeers,
+            peer => peer.GetProperty("peerId").GetString() == "net-hidden");
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryMergesSameNetRosterAcrossTokenRoomsWithSameRoomFlag()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        const string lanAddress = "203.0.113.77";
+        const string remoteAddress = "198.51.100.9";
+
+        using var first = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "merge-room", "token-a", "peer-1", publicAddress: lanAddress);
+        using var firstHello = JsonDocument.Parse(await ReceiveTextAsync(first, cts.Token));
+        Assert.Equal("hello", firstHello.RootElement.GetProperty("type").GetString());
+        Assert.Equal(lanAddress, firstHello.RootElement.GetProperty("publicAddress").GetString());
+        _ = await ReceiveTextAsync(first, cts.Token);
+
+        using var second = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "merge-room", "token-a", "peer-2", publicAddress: lanAddress);
+        _ = await ReceiveTextAsync(second, cts.Token);
+        _ = await ReceiveTextAsync(second, cts.Token);
+
+        // Same net, different token room: mutually visible, flagged sameRoom=false.
+        using var third = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "merge-room", "token-b", "peer-3", publicAddress: lanAddress);
+        _ = await ReceiveTextAsync(third, cts.Token);
+        using var thirdRoster = JsonDocument.Parse(await ReceiveTextAsync(third, cts.Token));
+        var thirdPeers = thirdRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.Equal(["peer-1", "peer-2", "peer-3"],
+            thirdPeers.Select(peer => peer.GetProperty("peerId").GetString()));
+        Assert.All(thirdPeers, peer => Assert.Equal(lanAddress,
+            peer.GetProperty("publicAddress").GetString()));
+        Assert.False(thirdPeers[0].GetProperty("sameRoom").GetBoolean());
+        Assert.False(thirdPeers[1].GetProperty("sameRoom").GetBoolean());
+        Assert.True(thirdPeers[2].GetProperty("sameRoom").GetBoolean());
+
+        // Same token room from another network: stays visible (merged scope), and the
+        // cross-room net peers stay visible to the room members.
+        using var remote = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "merge-room", "token-a", "peer-remote", publicAddress: remoteAddress);
+        _ = await ReceiveTextAsync(remote, cts.Token);
+        using var remoteRoster = JsonDocument.Parse(await ReceiveTextAsync(remote, cts.Token));
+        var remotePeers = remoteRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.Equal(["peer-1", "peer-2", "peer-remote"],
+            remotePeers.Select(peer => peer.GetProperty("peerId").GetString()));
+        Assert.All(remotePeers, peer => Assert.True(peer.GetProperty("sameRoom").GetBoolean()));
+
+        _ = await ReceiveTextAsync(first, cts.Token);
+        _ = await ReceiveTextAsync(first, cts.Token);
+        using var firstRoster = JsonDocument.Parse(await ReceiveTextAsync(first, cts.Token));
+        var firstPeers = firstRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.Equal(["peer-1", "peer-2", "peer-3", "peer-remote"],
+            firstPeers.Select(peer => peer.GetProperty("peerId").GetString()));
+        Assert.True(firstPeers[0].GetProperty("sameRoom").GetBoolean());
+        Assert.True(firstPeers[1].GetProperty("sameRoom").GetBoolean());
+        Assert.False(firstPeers[2].GetProperty("sameRoom").GetBoolean());
+        Assert.True(firstPeers[3].GetProperty("sameRoom").GetBoolean());
+        Assert.Equal(remoteAddress, firstPeers[3].GetProperty("publicAddress").GetString());
+
+        _ = await ReceiveTextAsync(second, cts.Token);
+        using var secondRoster = JsonDocument.Parse(await ReceiveTextAsync(second, cts.Token));
+        var secondPeers = secondRoster.RootElement.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.Equal(["peer-1", "peer-2", "peer-3", "peer-remote"],
+            secondPeers.Select(peer => peer.GetProperty("peerId").GetString()));
+        Assert.False(secondPeers[2].GetProperty("sameRoom").GetBoolean());
+
+        // peer-3 (cross-room) and the remote peer share neither room nor net: no update.
+        using var noUpdateThird = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(third, noUpdateThird.Token));
+
+        // A different room id on the same address is the same net: mutually visible,
+        // flagged sameRoom=false because the room key follows the resolved room.
+        using var otherRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "merge-room-other", "token-a", "peer-elsewhere", publicAddress: lanAddress);
+        _ = await ReceiveTextAsync(otherRoom, cts.Token);
+        using var otherRoomRoster = JsonDocument.Parse(await ReceiveTextAsync(otherRoom, cts.Token));
+        var otherRoomPeers = otherRoomRoster.RootElement.GetProperty("peers").EnumerateArray()
+            .ToArray();
+        Assert.Equal(["peer-1", "peer-2", "peer-3", "peer-elsewhere"],
+            otherRoomPeers.Select(peer => peer.GetProperty("peerId").GetString()));
+        Assert.False(otherRoomPeers[0].GetProperty("sameRoom").GetBoolean());
+        Assert.False(otherRoomPeers[1].GetProperty("sameRoom").GetBoolean());
+        Assert.False(otherRoomPeers[2].GetProperty("sameRoom").GetBoolean());
+        Assert.True(otherRoomPeers[3].GetProperty("sameRoom").GetBoolean());
+
+        // The cross-room-id join is a same-net change for the LAN peers: first updates.
+        using var firstUpdated = JsonDocument.Parse(await ReceiveTextAsync(first, cts.Token));
+        Assert.Equal(["peer-1", "peer-2", "peer-3", "peer-remote", "peer-elsewhere"],
+            firstUpdated.RootElement.GetProperty("peers").EnumerateArray()
+                .Select(peer => peer.GetProperty("peerId").GetString()));
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryDirectedSignalReachesSameNetPeerAcrossTokenRooms()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "signal-room", "signal-a", "signal-sender", publicAddress: "203.0.113.88");
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        using var observer = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "signal-room", "signal-a", "signal-observer", publicAddress: "203.0.113.88");
+        _ = await ReceiveTextAsync(observer, cts.Token);
+        _ = await ReceiveTextAsync(observer, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        using var crossRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "signal-room", "signal-b", "signal-target", publicAddress: "203.0.113.88");
+        _ = await ReceiveTextAsync(crossRoom, cts.Token);
+        _ = await ReceiveTextAsync(crossRoom, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(observer, cts.Token);
+
+        await sender.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"signal\",\"targetPeerId\":\"signal-target\",\"payload\":{\"offer\":true}}"),
+            WebSocketMessageType.Text, true, cts.Token);
+
+        using var signal = JsonDocument.Parse(await ReceiveTextAsync(crossRoom, cts.Token));
+        Assert.Equal("signal", signal.RootElement.GetProperty("type").GetString());
+        Assert.Equal("signal-sender", signal.RootElement.GetProperty("sourcePeerId").GetString());
+        Assert.Equal("signal-target", signal.RootElement.GetProperty("targetPeerId").GetString());
+        Assert.True(signal.RootElement.GetProperty("payload").GetProperty("offer").GetBoolean());
+
+        using var noCopy = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(observer, noCopy.Token));
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryDirectedSignalReachesSameNetPeerAcrossRoomIds()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "rename-room-a", "rename-token-a", "rename-sender", publicAddress: "203.0.113.122");
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        // Same public address but a different room id (e.g. the room was renamed):
+        // still the same net, so the rosters merge and directed signals route.
+        using var target = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "rename-room-b", "rename-token-b", "rename-target", publicAddress: "203.0.113.122");
+        _ = await ReceiveTextAsync(target, cts.Token);
+        using var targetRoster = JsonDocument.Parse(await ReceiveTextAsync(target, cts.Token));
+        Assert.Equal(["rename-sender", "rename-target"],
+            targetRoster.RootElement.GetProperty("peers").EnumerateArray()
+                .Select(peer => peer.GetProperty("peerId").GetString()));
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        await sender.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"signal\",\"targetPeerId\":\"rename-target\",\"payload\":{\"offer\":true}}"),
+            WebSocketMessageType.Text, true, cts.Token);
+
+        using var signal = JsonDocument.Parse(await ReceiveTextAsync(target, cts.Token));
+        Assert.Equal("signal", signal.RootElement.GetProperty("type").GetString());
+        Assert.Equal("rename-sender", signal.RootElement.GetProperty("sourcePeerId").GetString());
+        Assert.Equal("rename-target", signal.RootElement.GetProperty("targetPeerId").GetString());
+        Assert.True(signal.RootElement.GetProperty("payload").GetProperty("offer").GetBoolean());
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryDoesNotGroupUnresolvedPublicAddressesIntoNet()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        // No X-Real-IP and no remote IP in the test host: every connection here resolves
+        // to the "unknown" fallback address, which must never form a net.
+        using var first = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "unresolved-room", "unresolved-a", "unresolved-first");
+        _ = await ReceiveTextAsync(first, cts.Token);
+        _ = await ReceiveTextAsync(first, cts.Token);
+
+        using var second = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "unresolved-room", "unresolved-b", "unresolved-second");
+        _ = await ReceiveTextAsync(second, cts.Token);
+        using var secondRoster = JsonDocument.Parse(await ReceiveTextAsync(second, cts.Token));
+        Assert.Equal(["unresolved-second"], secondRoster.RootElement.GetProperty("peers")
+            .EnumerateArray().Select(peer => peer.GetProperty("peerId").GetString()));
+
+        using var noUpdate = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(first, noUpdate.Token));
+
+        // Directed signals do not route between unresolved addresses either.
+        await first.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"signal\",\"targetPeerId\":\"unresolved-second\",\"payload\":{\"offer\":true}}"),
+            WebSocketMessageType.Text, true, cts.Token);
+        using var noSignal = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(second, noSignal.Token));
+
+        // Group visibility is unaffected: the same token room still merges.
+        using var sameRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "unresolved-room", "unresolved-a", "unresolved-third");
+        _ = await ReceiveTextAsync(sameRoom, cts.Token);
+        using var sameRoomRoster = JsonDocument.Parse(await ReceiveTextAsync(sameRoom, cts.Token));
+        Assert.Equal(["unresolved-first", "unresolved-third"],
+            sameRoomRoster.RootElement.GetProperty("peers").EnumerateArray()
+                .Select(peer => peer.GetProperty("peerId").GetString()));
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryDirectedSignalReachesRemoteSameRoomPeer()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "remote-signal-room", "remote-signal-a", "remote-signal-sender",
+            publicAddress: "203.0.113.89");
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        using var observer = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "remote-signal-room", "remote-signal-b", "remote-signal-observer",
+            publicAddress: "203.0.113.89");
+        _ = await ReceiveTextAsync(observer, cts.Token);
+        _ = await ReceiveTextAsync(observer, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        // Same token room as the sender but on another network: reachable by directed
+        // signal through the merged scope.
+        using var remote = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "remote-signal-room", "remote-signal-a", "remote-signal-target",
+            publicAddress: "198.51.100.10");
+        _ = await ReceiveTextAsync(remote, cts.Token);
+        _ = await ReceiveTextAsync(remote, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        await sender.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"signal\",\"targetPeerId\":\"remote-signal-target\"," +
+            "\"payload\":{\"answer\":true}}"), WebSocketMessageType.Text, true, cts.Token);
+
+        using var signal = JsonDocument.Parse(await ReceiveTextAsync(remote, cts.Token));
+        Assert.Equal("signal", signal.RootElement.GetProperty("type").GetString());
+        Assert.Equal("remote-signal-sender",
+            signal.RootElement.GetProperty("sourcePeerId").GetString());
+        Assert.True(signal.RootElement.GetProperty("payload").GetProperty("answer").GetBoolean());
+
+        using var noCopy = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(observer, noCopy.Token));
+    }
+
+    [Fact]
+    public async Task PublicDiscoveryBroadcastStaysInsideTokenRoomAcrossSameNet()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "broadcast-room", "broadcast-a", "broadcast-sender", publicAddress: "203.0.113.99");
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        using var sameRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "broadcast-room", "broadcast-a", "broadcast-peer", publicAddress: "203.0.113.99");
+        _ = await ReceiveTextAsync(sameRoom, cts.Token);
+        _ = await ReceiveTextAsync(sameRoom, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+
+        using var crossRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "broadcast-room", "broadcast-b", "broadcast-outsider", publicAddress: "203.0.113.99");
+        _ = await ReceiveTextAsync(crossRoom, cts.Token);
+        _ = await ReceiveTextAsync(crossRoom, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sameRoom, cts.Token);
+
+        // Same token room on another network: room broadcasts still reach it.
+        using var remote = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "broadcast-room", "broadcast-a", "broadcast-remote", publicAddress: "198.51.100.11");
+        _ = await ReceiveTextAsync(remote, cts.Token);
+        _ = await ReceiveTextAsync(remote, cts.Token);
+        _ = await ReceiveTextAsync(sender, cts.Token);
+        _ = await ReceiveTextAsync(sameRoom, cts.Token);
+
+        await sender.SendAsync(Encoding.UTF8.GetBytes(
+            "{\"type\":\"clipboard\",\"payload\":{\"text\":\"room-only\"}}"),
+            WebSocketMessageType.Text, true, cts.Token);
+
+        using var clipboard = JsonDocument.Parse(await ReceiveTextAsync(sameRoom, cts.Token));
+        Assert.Equal("clipboard", clipboard.RootElement.GetProperty("type").GetString());
+        Assert.Equal("broadcast-sender",
+            clipboard.RootElement.GetProperty("sourcePeerId").GetString());
+
+        using var remoteClipboard = JsonDocument.Parse(await ReceiveTextAsync(remote, cts.Token));
+        Assert.Equal("clipboard", remoteClipboard.RootElement.GetProperty("type").GetString());
+        Assert.Equal("broadcast-sender",
+            remoteClipboard.RootElement.GetProperty("sourcePeerId").GetString());
+
+        using var noBroadcast = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ReceiveTextAsync(crossRoom, noBroadcast.Token));
+    }
+
+    [Fact]
+    public void PublicTransferNetIdIsSha256OfPublicAddress()
+    {
+        var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes("203.0.113.77"))).ToLowerInvariant();
+        Assert.Equal(expected, PublicTransferCoordinationService.NetId("203.0.113.77"));
+        Assert.Equal(PublicTransferCoordinationService.NetId("203.0.113.77"),
+            PublicTransferCoordinationService.NetId("203.0.113.77"));
+        Assert.NotEqual(PublicTransferCoordinationService.NetId("203.0.113.77"),
+            PublicTransferCoordinationService.NetId("203.0.113.78"));
+    }
+
+    [Fact]
     public async Task PublicDiscoveryHidesNonDiscoverablePeerFromRoster()
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
@@ -115,17 +447,18 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task PublicDiscoveryRejectsDuplicatePeerIdInSameGroup()
+    public async Task PublicDiscoveryRejectsDuplicatePeerIdAcrossSameNetTokenRooms()
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        const string lanAddress = "203.0.113.111";
         using var first = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "duplicate-room", "secret", "reused");
+            "duplicate-room", "secret", "reused", publicAddress: lanAddress);
         _ = await ReceiveTextAsync(first, cts.Token);
         _ = await ReceiveTextAsync(first, cts.Token);
 
         using var duplicate = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "duplicate-room", "secret", "reused");
+            "duplicate-room", "secret", "reused", publicAddress: lanAddress);
         using var error = JsonDocument.Parse(await ReceiveTextAsync(duplicate, cts.Token));
         Assert.Equal("error", error.RootElement.GetProperty("type").GetString());
         Assert.Equal("peer id is already connected", error.RootElement.GetProperty("error").GetString());
@@ -135,9 +468,38 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         Assert.Equal(WebSocketCloseStatus.PolicyViolation, close.CloseStatus);
         Assert.Equal("peer id is already connected", close.CloseStatusDescription);
 
-        using var otherGroup = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "duplicate-room", "other", "reused", "reused-other-group");
-        using var hello = JsonDocument.Parse(await ReceiveTextAsync(otherGroup, cts.Token));
+        // Duplicate peer IDs are now rejected across the whole net (same public address),
+        // even when the second connection uses another token room.
+        using var otherRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room", "other", "reused", "reused-other-room", publicAddress: lanAddress);
+        using var otherError = JsonDocument.Parse(await ReceiveTextAsync(otherRoom, cts.Token));
+        Assert.Equal("error", otherError.RootElement.GetProperty("type").GetString());
+        Assert.Equal("peer id is already connected",
+            otherError.RootElement.GetProperty("error").GetString());
+
+        // Same token room from another network: still the merged scope, still rejected.
+        using var remoteRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room", "secret", "reused", "reused-remote-net",
+            publicAddress: "198.51.100.12");
+        using var remoteError = JsonDocument.Parse(await ReceiveTextAsync(remoteRoom, cts.Token));
+        Assert.Equal("error", remoteError.RootElement.GetProperty("type").GetString());
+        Assert.Equal("peer id is already connected",
+            remoteError.RootElement.GetProperty("error").GetString());
+
+        // A different room id on the same address is the same net: still rejected.
+        using var otherNet = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room-elsewhere", "secret", "reused", "reused-other-net",
+            publicAddress: lanAddress);
+        using var otherNetError = JsonDocument.Parse(await ReceiveTextAsync(otherNet, cts.Token));
+        Assert.Equal("error", otherNetError.RootElement.GetProperty("type").GetString());
+        Assert.Equal("peer id is already connected",
+            otherNetError.RootElement.GetProperty("error").GetString());
+
+        // A different room id on another address is outside the net: reuse is allowed.
+        using var otherNetRemote = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room-elsewhere", "secret", "reused", "reused-other-net-remote",
+            publicAddress: "192.0.2.55");
+        using var hello = JsonDocument.Parse(await ReceiveTextAsync(otherNetRemote, cts.Token));
         Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
     }
 
@@ -620,9 +982,15 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
 
     private async Task<WebSocket> ConnectPublicDiscoveryAsync(WebSocketClient webSockets,
         CancellationToken cancellationToken, string roomId, string roomToken, string peerId,
-        string? displayName = null, bool? discoverable = null)
+        string? displayName = null, bool? discoverable = null, string? publicAddress = null)
     {
         using var http = _server!.CreateClient();
+        if (publicAddress is not null)
+        {
+            // The ticket is bound to the request address, so the WebSocket connect below
+            // must present the same X-Real-IP.
+            http.DefaultRequestHeaders.TryAddWithoutValidation("X-Real-IP", publicAddress);
+        }
         using var response = await http.PostAsJsonAsync("/api/public/transfer/ws-tickets", new
         {
             roomId,
@@ -635,6 +1003,9 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         var ticket = await response.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(
             cancellationToken: cancellationToken);
         Assert.NotNull(ticket);
+        webSockets.ConfigureRequest = publicAddress is null
+            ? null
+            : request => request.Headers["X-Real-IP"] = publicAddress;
         return await webSockets.ConnectAsync(new Uri(
             "ws://localhost/ws/public-transfer/discovery?ticket="
             + Uri.EscapeDataString(ticket!.Ticket)), cancellationToken);
