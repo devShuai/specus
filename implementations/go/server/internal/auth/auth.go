@@ -89,6 +89,20 @@ func (s *SessionStore) CreateForClient(account store.ClientAccount, credentialID
 	return session
 }
 
+// Discard removes a session that was registered in memory but whose persistence failed. Without it
+// a failed login would leave a usable in-memory token that no database row backs.
+func (s *SessionStore) Discard(sessionID int64) {
+	if sessionID <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if hash, ok := s.tokenHashBySessionID[sessionID]; ok {
+		delete(s.byTokenHash, hash)
+		delete(s.tokenHashBySessionID, sessionID)
+	}
+	s.mu.Unlock()
+}
+
 func (s *SessionStore) Find(sessionID int64, accessToken string) (Session, bool) {
 	if sessionID <= 0 || accessToken == "" {
 		return Session{}, false

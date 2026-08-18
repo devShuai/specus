@@ -121,6 +121,24 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if ttl <= 0 {
 		ttl = 8 * time.Hour
 	}
+	specusMappings, err := a.db.ListEnabledSpecusMappings(r.Context(), account.ID)
+	if err != nil {
+		a.failClientAuthInternal(w, "load-tcp-mappings", "加载 TCP 映射失败", err)
+		return
+	}
+	routes, err := a.db.ListEnabledHTTPRoutes(r.Context(), account.ID)
+	if err != nil {
+		a.failClientAuthInternal(w, "load-http-routes", "加载 HTTP 路由失败", err)
+		return
+	}
+	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host)
+	if err != nil {
+		a.failClientAuthInternal(w, "load-peer-mesh", "加载私有组网配置失败", err)
+		return
+	}
+	// Every read below can fail, and a session created before them would linger in the database
+	// holding an online-instance slot while the client never receives its token. Load the
+	// configuration first, then mint the session as the last fallible step.
 	machineFingerprint := limit(strings.TrimSpace(request.Environment.MachineFingerprint), 160)
 	osUser := limit(strings.TrimSpace(request.Environment.OSUser), 120)
 	if _, err := a.db.CloseHTTPAuthenticatedClientSessions(r.Context(), credential.ID,
@@ -160,22 +178,9 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		HTTPLoginAt:                now,
 		ExpiresAt:                  session.ExpiresAt,
 	}); err != nil {
+		// The token is already live in memory; drop it so a failed login leaves nothing usable.
+		a.clientAuth.Discard(session.ID)
 		a.failClientAuthInternal(w, "save-session", "保存客户端会话失败", err)
-		return
-	}
-	specusMappings, err := a.db.ListEnabledSpecusMappings(r.Context(), account.ID)
-	if err != nil {
-		a.failClientAuthInternal(w, "load-tcp-mappings", "加载 TCP 映射失败", err)
-		return
-	}
-	routes, err := a.db.ListEnabledHTTPRoutes(r.Context(), account.ID)
-	if err != nil {
-		a.failClientAuthInternal(w, "load-http-routes", "加载 HTTP 路由失败", err)
-		return
-	}
-	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host)
-	if err != nil {
-		a.failClientAuthInternal(w, "load-peer-mesh", "加载私有组网配置失败", err)
 		return
 	}
 	response := clientAuthLoginResponse{
