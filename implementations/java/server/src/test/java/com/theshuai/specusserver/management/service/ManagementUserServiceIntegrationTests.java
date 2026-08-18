@@ -52,7 +52,8 @@ class ManagementUserServiceIntegrationTests {
         assertThat(first.role()).isEqualTo(ManagementRole.USER);
         assertThat(renamed.username()).isEqualTo("first-name");
         assertThat(repository.count()).isEqualTo(1);
-        assertThat(repository.findById("first-name").orElseThrow().getOidcIdentityKey())
+        assertThat(repository.findByTenantIdAndLoginNameNormalized("default", "first-name")
+                .orElseThrow().getOidcIdentityKey())
                 .matches("[0-9a-f]{64}");
     }
 
@@ -108,10 +109,48 @@ class ManagementUserServiceIntegrationTests {
         assertThat(repository.findById("bob")).isEmpty();
     }
 
+    @Test
+    void tenantsCanCreateTheSameLoginNameWithoutEnumeration() {
+        ManagementContext tenantAAdmin =
+                new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        ManagementContext tenantBAdmin =
+                new ManagementContext(new TenantContext("tenant-b"), "admin-b", true);
+        var request = new ManagementUserService.UserMutation(
+                "Shared", "secret-password", ManagementRole.USER, true);
+
+        assertThat(service.createUser(tenantAAdmin, request).tenantId()).isEqualTo("tenant-a");
+        assertThat(service.createUser(tenantBAdmin, request).tenantId()).isEqualTo("tenant-b");
+        assertThat(repository.findByTenantIdAndLoginNameNormalized("tenant-a", "shared")).isPresent();
+        assertThat(repository.findByTenantIdAndLoginNameNormalized("tenant-b", "shared")).isPresent();
+        assertThat(service.listUsers(tenantAAdmin).stream().filter(view -> view.username().equals("Shared")))
+                .hasSize(1)
+                .allMatch(view -> view.tenantId().equals("tenant-a"));
+        assertThat(service.listUsers(tenantBAdmin).stream().filter(view -> view.username().equals("Shared")))
+                .hasSize(1)
+                .allMatch(view -> view.tenantId().equals("tenant-b"));
+    }
+
+    @Test
+    void tenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant() {
+        ManagementContext tenantAAdmin =
+                new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        service.createUser(tenantAAdmin, new ManagementUserService.UserMutation(
+                "alice", "secret-password", ManagementRole.USER, true));
+
+        assertThat(service.authenticate("alice", "secret-password", "tenant-a"))
+                .get().extracting(ManagementUserService.LoginUser::tenantId).isEqualTo("tenant-a");
+        assertThat(service.authenticate("alice", "secret-password", "tenant-b")).isEmpty();
+        assertThat(service.authenticate("alice", "secret-password")).isEmpty();
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a")).isPresent();
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-b")).isEmpty();
+    }
+
     private void seedUser(String username, String tenantId) {
         String now = Instant.now().toString();
         ManagementUser user = new ManagementUser();
         user.setUsername(username);
+        user.setLoginName(username);
+        user.setLoginNameNormalized(username.toLowerCase(java.util.Locale.ROOT));
         user.setTenantId(tenantId);
         user.setPasswordHash("0".repeat(64));
         user.setRole(ManagementRole.USER);

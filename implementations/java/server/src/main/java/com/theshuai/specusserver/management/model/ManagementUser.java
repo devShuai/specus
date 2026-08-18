@@ -16,6 +16,10 @@ import lombok.Setter;
                 @Index(name = "idx_management_user_tenant", columnList = "tenant_id"),
                 @Index(name = "idx_management_user_role", columnList = "role"),
                 @Index(
+                        name = "uq_management_user_tenant_login_name",
+                        columnList = "tenant_id,login_name_normalized",
+                        unique = true),
+                @Index(
                         name = "uq_management_user_oidc_identity_key",
                         columnList = "oidc_identity_key",
                         unique = true)
@@ -26,6 +30,17 @@ public class ManagementUser {
     @Id
     @Column(length = 80)
     private String username;
+
+    /**
+     * Tenant-scoped name shown by the management API and used for interactive login. The historic
+     * {@code username} primary key is retained as an opaque account key so existing rows and
+     * ownership columns do not need a destructive primary-key migration.
+     */
+    @Column(name = "login_name", length = 80)
+    private String loginName;
+
+    @Column(name = "login_name_normalized", length = 80)
+    private String loginNameNormalized;
 
     @Column(name = "tenant_id", nullable = false, length = 80)
     private String tenantId;

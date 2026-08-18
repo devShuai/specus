@@ -10,9 +10,11 @@ import java.util.List;
 import java.util.Optional;
 
 public interface ManagementUserRepository extends JpaRepository<ManagementUser, String> {
-    Optional<ManagementUser> findByUsernameIgnoreCase(String username);
+    List<ManagementUser> findAllByUsernameIgnoreCase(String username);
 
-    Optional<ManagementUser> findByUsernameIgnoreCaseAndTenantId(String username, String tenantId);
+    Optional<ManagementUser> findByTenantIdAndLoginNameNormalized(String tenantId, String loginNameNormalized);
+
+    boolean existsByTenantIdAndLoginNameNormalized(String tenantId, String loginNameNormalized);
 
     Optional<ManagementUser> findByOidcIdentityKey(String oidcIdentityKey);
 
@@ -28,19 +30,17 @@ public interface ManagementUserRepository extends JpaRepository<ManagementUser, 
                    user.oidcSubject = :subject,
                    user.oidcIdentityKey = :identityKey,
                    user.updatedAt = :updatedAt
-             where lower(user.username) = lower(:username)
+             where user.username = :accountKey
                and user.enabled = true
                and (user.oidcIssuer is null or user.oidcIssuer = '')
                and (user.oidcSubject is null or user.oidcSubject = '')
                and (user.oidcIdentityKey is null or user.oidcIdentityKey = '')
             """)
-    int bindOidcIdentityIfUnbound(@Param("username") String username,
+    int bindOidcIdentityIfUnbound(@Param("accountKey") String accountKey,
                                   @Param("issuer") String issuer,
                                   @Param("subject") String subject,
                                   @Param("identityKey") String identityKey,
                                   @Param("updatedAt") String updatedAt);
 
-    boolean existsByUsernameIgnoreCase(String username);
-
-    List<ManagementUser> findByTenantIdOrderByUsernameAsc(String tenantId);
+    List<ManagementUser> findByTenantIdOrderByLoginNameAsc(String tenantId);
 }

@@ -49,8 +49,8 @@ class ManagementContextResolverTests {
     @Test
     void localTokenClaimsCannotPreserveRevokedRole() {
         Jwt jwt = jwt(LocalTokenService.ISSUER, "alice",
-                Map.of("role", "ADMIN", "tenant_id", "stale-tenant"));
-        when(users.resolveLocalTokenUser("alice"))
+                Map.of("role", "ADMIN", "tenant_id", "current-tenant"));
+        when(users.resolveLocalTokenUser("alice", "current-tenant"))
                 .thenReturn(Optional.of(new LoginUser(
                         "alice", "current-tenant", ManagementRole.USER, false)));
 

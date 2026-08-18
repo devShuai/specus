@@ -29,6 +29,7 @@ public class DatabaseInitializer {
     private final ClientCredentialRepository clientCredentialRepository;
     private final ClientAuthProperties clientAuthProperties;
     private final JdbcTemplate jdbcTemplate;
+    private final ManagementUserSchemaMigrator managementUserSchemaMigrator;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
@@ -38,6 +39,7 @@ public class DatabaseInitializer {
                                ClientCredentialRepository clientCredentialRepository,
                                ClientAuthProperties clientAuthProperties,
                                JdbcTemplate jdbcTemplate,
+                               ManagementUserSchemaMigrator managementUserSchemaMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
@@ -47,6 +49,7 @@ public class DatabaseInitializer {
         this.clientCredentialRepository = clientCredentialRepository;
         this.clientAuthProperties = clientAuthProperties;
         this.jdbcTemplate = jdbcTemplate;
+        this.managementUserSchemaMigrator = managementUserSchemaMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
@@ -66,9 +69,10 @@ public class DatabaseInitializer {
 
     @Transactional
     public synchronized Map<String, Object> initialize(TenantContext tenant) {
+        backfillDefaultTenant();
+        managementUserSchemaMigrator.migrate();
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
-        backfillDefaultTenant();
         backfillDefaultOwner();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
@@ -113,6 +117,7 @@ public class DatabaseInitializer {
         for (String table : List.of(
                 "specus_client_account",
                 "specus_client_credential",
+                "specus_management_user",
                 "specus_client_identity",
                 "specus_client_session",
                 "specus_mapping",

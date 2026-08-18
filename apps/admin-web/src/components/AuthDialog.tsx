@@ -29,6 +29,7 @@ export function AuthDialog() {
   } = useAuth();
   const [tab, setTab] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
+  const [tenantId, setTenantId] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -54,6 +55,7 @@ export function AuthDialog() {
 
   const resetForm = useCallback(() => {
     setUsername("");
+    setTenantId("");
     setEmail("");
     setPassword("");
     setConfirmPassword("");
@@ -175,7 +177,7 @@ export function AuthDialog() {
       } else if (isRegister) {
         applyChallenge(await register(username.trim(), email.trim(), password));
       } else {
-        await passwordLogin(username.trim(), password);
+        await passwordLogin(username.trim(), password, tenantId.trim() || undefined);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : isRegister ? "注册失败" : "登录失败");
@@ -336,6 +338,20 @@ export function AuthDialog() {
                 </>
               ) : (
                 <>
+                  {!isRegister && (
+                    <label className="auth-dialog-field">
+                      <span>租户 ID（非默认租户填写）</span>
+                      <input
+                        className="auth-dialog-input"
+                        value={tenantId}
+                        onChange={(event) => setTenantId(event.target.value)}
+                        autoComplete="organization"
+                        inputMode="text"
+                        spellCheck={false}
+                        maxLength={80}
+                      />
+                    </label>
+                  )}
                   <label className="auth-dialog-field">
                     <span>用户名</span>
                     <input

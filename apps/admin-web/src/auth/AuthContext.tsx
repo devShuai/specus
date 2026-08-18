@@ -44,7 +44,7 @@ interface AuthState {
   loginInitialTab: "login" | "register";
   expireSession: () => void;
   reloadProfile: () => Promise<ManagementUser>;
-  passwordLogin: (username: string, password: string) => Promise<void>;
+  passwordLogin: (username: string, password: string, tenantId?: string) => Promise<void>;
   register: (username: string, email: string, password: string) => Promise<RegistrationChallengeResponse>;
   verifyRegistration: (registrationId: string, code: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
@@ -154,9 +154,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const passwordLogin = useCallback(
-    async (username: string, password: string) => {
+    async (username: string, password: string, tenantId?: string) => {
       const turnstileToken = await executeTurnstile(oidcConfig, "login");
-      await completePasswordAuth(await apiPasswordLogin(username, password, turnstileToken));
+      await completePasswordAuth(await apiPasswordLogin(username, password, turnstileToken, tenantId));
     },
     [completePasswordAuth, oidcConfig],
   );

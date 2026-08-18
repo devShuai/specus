@@ -9,6 +9,7 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,6 +25,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 @Slf4j
 @Service
@@ -39,24 +41,52 @@ public class ManagementUserService {
 
     @Transactional(readOnly = true)
     public Optional<LoginUser> authenticate(String username, String password) {
+        return authenticate(username, password, null);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> authenticate(String username, String password, String tenantId) {
         if (!StringUtils.hasText(username) || password == null) {
             return Optional.empty();
         }
         String normalized = normalizeUsername(username);
-        if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
-            if (!isAdminPasswordLoginEnabled() || !constantTimeEquals(authProperties.getPassword(), password)) {
+        String requestedTenant = null;
+        if (StringUtils.hasText(tenantId)) {
+            try {
+                requestedTenant = TenantContext.normalize(tenantId);
+            } catch (IllegalArgumentException invalidTenant) {
+                return Optional.empty();
+            }
+        }
+        String defaultTenant = TenantContext.normalize(authProperties.getTenantId());
+        if (normalized.equalsIgnoreCase(authProperties.getUsername())
+                && (requestedTenant == null || requestedTenant.equals(defaultTenant))) {
+            if (!isAdminPasswordLoginEnabled()
+                    || !constantTimeEquals(authProperties.getPassword(), password)) {
                 return Optional.empty();
             }
             return Optional.of(new LoginUser(
                     authProperties.getUsername(),
-                    TenantContext.normalize(authProperties.getTenantId()),
+                    defaultTenant,
                     ManagementRole.ADMIN,
-                    true));
+                    true,
+                    authProperties.getUsername()));
         }
-        return repository.findByUsernameIgnoreCase(normalized)
+        Optional<ManagementUser> candidate;
+        if (requestedTenant != null) {
+            candidate = repository.findByTenantIdAndLoginNameNormalized(requestedTenant, loginNameKey(normalized));
+        } else {
+            // Keep the default-tenant login flow unchanged for existing clients. Only fall back to
+            // the legacy global account key when no default-tenant alias exists; non-default
+            // tenants must be selected explicitly, so a tenant cannot probe another tenant here.
+            candidate = repository.findByTenantIdAndLoginNameNormalized(
+                            defaultTenant, loginNameKey(normalized))
+                    .or(() -> uniqueLegacyAccountCandidate(normalized));
+        }
+        return candidate
                 .filter(ManagementUser::isEnabled)
                 .filter(user -> PasswordService.matches(password, user.getPasswordHash()))
-                .map(user -> new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false));
+                .map(this::toLoginUser);
     }
 
     /**
@@ -97,7 +127,9 @@ public class ManagementUserService {
             return bound.filter(ManagementUser::isEnabled).map(this::toLoginUser);
         }
 
-        Optional<ManagementUser> existing = repository.findByUsernameIgnoreCase(normalized);
+        String tenantId = TenantContext.normalize(authProperties.getTenantId());
+        Optional<ManagementUser> existing = repository.findByTenantIdAndLoginNameNormalized(
+                tenantId, loginNameKey(normalized));
         if (existing.isPresent()) {
             ManagementUser user = existing.get();
             if (!user.isEnabled()) {
@@ -110,14 +142,14 @@ public class ManagementUserService {
                         : Optional.empty();
             }
             repository.bindOidcIdentityIfUnbound(
-                    normalized,
+                    user.getUsername(),
                     normalizedIssuer,
                     normalizedSubject,
                     identityKey,
                     Instant.now().toString());
             // Whether this request won the conditional update or another request got there first,
             // re-read the committed binding and accept only the exact immutable identity.
-            return repository.findByUsernameIgnoreCase(normalized)
+            return repository.findById(user.getUsername())
                     .filter(ManagementUser::isEnabled)
                     .filter(current -> sameOidcIdentity(current, normalizedIssuer, normalizedSubject))
                     .map(this::toLoginUser);
@@ -125,8 +157,10 @@ public class ManagementUserService {
 
         String now = Instant.now().toString();
         ManagementUser user = new ManagementUser();
-        user.setUsername(normalized);
-        user.setTenantId(TenantContext.normalize(authProperties.getTenantId()));
+        user.setUsername(newAccountKey());
+        user.setLoginName(normalized);
+        user.setLoginNameNormalized(loginNameKey(normalized));
+        user.setTenantId(tenantId);
         user.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
         user.setOidcIssuer(normalizedIssuer);
         user.setOidcSubject(normalizedSubject);
@@ -162,6 +196,11 @@ public class ManagementUserService {
      */
     @Transactional(readOnly = true)
     public Optional<LoginUser> resolveLocalTokenUser(String username) {
+        return resolveLocalTokenUser(username, null);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> resolveLocalTokenUser(String username, String tenantId) {
         if (!StringUtils.hasText(username)) {
             return Optional.empty();
         }
@@ -171,17 +210,36 @@ public class ManagementUserService {
         } catch (IllegalArgumentException ignored) {
             return Optional.empty();
         }
-        if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
+        String requestedTenant = null;
+        if (StringUtils.hasText(tenantId)) {
+            try {
+                requestedTenant = TenantContext.normalize(tenantId);
+            } catch (IllegalArgumentException invalidTenant) {
+                return Optional.empty();
+            }
+        }
+        String defaultTenant = TenantContext.normalize(authProperties.getTenantId());
+        if (normalized.equalsIgnoreCase(authProperties.getUsername())
+                && (requestedTenant == null || requestedTenant.equals(defaultTenant))) {
             if (!isAdminPasswordLoginEnabled()) {
                 return Optional.empty();
             }
             return Optional.of(new LoginUser(
                     authProperties.getUsername(),
-                    TenantContext.normalize(authProperties.getTenantId()),
+                    defaultTenant,
                     ManagementRole.ADMIN,
-                    true));
+                    true,
+                    authProperties.getUsername()));
         }
-        return repository.findByUsernameIgnoreCase(normalized)
+        Optional<ManagementUser> candidate;
+        if (requestedTenant != null) {
+            candidate = repository.findByTenantIdAndLoginNameNormalized(requestedTenant, loginNameKey(normalized));
+        } else {
+            // Legacy local tokens store the immutable account key as sub, so this lookup is exact
+            // and cannot become ambiguous when two tenants share a case-insensitive login name.
+            candidate = repository.findById(normalized);
+        }
+        return candidate
                 .filter(ManagementUser::isEnabled)
                 .map(this::toLoginUser);
     }
@@ -200,7 +258,8 @@ public class ManagementUserService {
                     now,
                     now);
         }
-        return repository.findByUsernameIgnoreCase(context.username())
+        return repository.findByTenantIdAndLoginNameNormalized(
+                        context.tenant().tenantId(), loginNameKey(context.username()))
                 .map(this::toView)
                 .orElse(new ManagementUserView(
                         context.username(),
@@ -227,7 +286,7 @@ public class ManagementUserService {
                 true,
                 now,
                 now));
-        repository.findByTenantIdOrderByUsernameAsc(context.tenant().tenantId()).stream()
+        repository.findByTenantIdOrderByLoginNameAsc(context.tenant().tenantId()).stream()
                 .map(this::toView)
                 .forEach(views::add);
         return views.stream()
@@ -241,24 +300,26 @@ public class ManagementUserService {
         if (isReservedUsername(username)) {
             throw new IllegalArgumentException("该用户名不可用");
         }
-        if (repository.existsByUsernameIgnoreCase(username)) {
+        String tenantId = TenantContext.normalize(authProperties.getTenantId());
+        if (repository.existsByTenantIdAndLoginNameNormalized(tenantId, loginNameKey(username))) {
             throw new IllegalArgumentException("用户名已存在: " + username);
         }
         if (!StringUtils.hasText(passwordHash) || !passwordHash.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException("密码摘要无效");
         }
-        String tenantId = TenantContext.normalize(authProperties.getTenantId());
         String now = Instant.now().toString();
         ManagementUser user = new ManagementUser();
-        user.setUsername(username);
+        user.setUsername(newAccountKey());
+        user.setLoginName(username);
+        user.setLoginNameNormalized(loginNameKey(username));
         user.setTenantId(tenantId);
         user.setPasswordHash(passwordHash);
         user.setRole(ManagementRole.USER);
         user.setEnabled(true);
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
-        ManagementUser saved = repository.save(user);
-        return new LoginUser(saved.getUsername(), saved.getTenantId(), saved.getRole(), false);
+        ManagementUser saved = repository.saveAndFlush(user);
+        return toLoginUser(saved);
     }
 
     boolean isReservedUsername(String username) {
@@ -272,20 +333,30 @@ public class ManagementUserService {
         if (username.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能重复创建");
         }
-        if (repository.existsByUsernameIgnoreCase(username)) {
-            throw new IllegalArgumentException("用户名已存在: " + username);
+        String tenantId = context.tenant().tenantId();
+        String loginNameNormalized = loginNameKey(username);
+        if (repository.existsByTenantIdAndLoginNameNormalized(tenantId, loginNameNormalized)) {
+            auditCreateConflict(context, username);
+            throw new IllegalArgumentException("用户名不可用");
         }
         String password = requirePassword(request.password());
         String now = Instant.now().toString();
         ManagementUser user = new ManagementUser();
-        user.setUsername(username);
-        user.setTenantId(context.tenant().tenantId());
+        user.setUsername(newAccountKey());
+        user.setLoginName(username);
+        user.setLoginNameNormalized(loginNameNormalized);
+        user.setTenantId(tenantId);
         user.setPasswordHash(PasswordService.hash(password));
         user.setRole(request.role() == null ? ManagementRole.USER : request.role());
         user.setEnabled(request.enabled() == null || request.enabled());
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
-        return toView(repository.save(user));
+        try {
+            return toView(repository.saveAndFlush(user));
+        } catch (DataIntegrityViolationException conflict) {
+            auditCreateConflict(context, username);
+            throw new IllegalArgumentException("用户名不可用", conflict);
+        }
     }
 
     @Transactional
@@ -325,12 +396,18 @@ public class ManagementUserService {
      * cannot probe tenant-B usernames; the rejected attempt is still recorded for auditing.
      */
     private ManagementUser requireMutableUserInTenant(ManagementContext context, String normalized, String action) {
-        return repository.findByUsernameIgnoreCaseAndTenantId(normalized, context.tenant().tenantId())
+        return repository.findByTenantIdAndLoginNameNormalized(
+                        context.tenant().tenantId(), loginNameKey(normalized))
                 .orElseThrow(() -> {
                     log.warn("管理用户{}被拒绝: actor={}, tenant={}, target={}, reason=目标不在当前租户或不存在",
                             action, context.username(), context.tenant().tenantId(), normalized);
                     return new IllegalArgumentException("用户不存在: " + normalized);
                 });
+    }
+
+    private void auditCreateConflict(ManagementContext context, String loginName) {
+        log.warn("管理用户create被拒绝: actor={}, tenant={}, target={}, reason=当前租户登录名冲突",
+                context.username(), context.tenant().tenantId(), loginName);
     }
 
     public void requireAdmin(ManagementContext context) {
@@ -346,7 +423,7 @@ public class ManagementUserService {
     private ManagementUserView toView(ManagementUser user) {
         boolean admin = user.getRole() == ManagementRole.ADMIN;
         return new ManagementUserView(
-                user.getUsername(),
+                loginName(user),
                 TenantContext.normalize(user.getTenantId()),
                 user.getRole(),
                 admin,
@@ -357,7 +434,24 @@ public class ManagementUserService {
     }
 
     private LoginUser toLoginUser(ManagementUser user) {
-        return new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false);
+        return new LoginUser(loginName(user), user.getTenantId(), user.getRole(), false, user.getUsername());
+    }
+
+    private Optional<ManagementUser> uniqueLegacyAccountCandidate(String username) {
+        List<ManagementUser> matches = repository.findAllByUsernameIgnoreCase(username);
+        return matches.size() == 1 ? Optional.of(matches.getFirst()) : Optional.empty();
+    }
+
+    private String loginName(ManagementUser user) {
+        return StringUtils.hasText(user.getLoginName()) ? user.getLoginName() : user.getUsername();
+    }
+
+    String loginNameKey(String loginName) {
+        return loginName.trim().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private String newAccountKey() {
+        return UUID.randomUUID().toString();
     }
 
     private boolean sameOidcIdentity(ManagementUser user, String issuer, String subject) {
@@ -407,7 +501,15 @@ public class ManagementUserService {
                 actual.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    public record LoginUser(String username, String tenantId, ManagementRole role, boolean builtInAdmin) {
+    public record LoginUser(
+            String username,
+            String tenantId,
+            ManagementRole role,
+            boolean builtInAdmin,
+            String accountKey) {
+        public LoginUser(String username, String tenantId, ManagementRole role, boolean builtInAdmin) {
+            this(username, tenantId, role, builtInAdmin, username);
+        }
     }
 
     public record UserMutation(String username, String password, ManagementRole role, Boolean enabled) {

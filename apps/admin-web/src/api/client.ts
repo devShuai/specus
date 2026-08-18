@@ -173,11 +173,12 @@ export async function passwordLogin(
   username: string,
   password: string,
   turnstileToken: string,
+  tenantId?: string,
 ): Promise<TokenResponse> {
   const response = await fetch("/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password, turnstileToken }),
+    body: JSON.stringify({ username, password, turnstileToken, tenantId: tenantId?.trim() || undefined }),
   });
   const body = (await response.json()) as TokenResponse;
   if (!response.ok) {

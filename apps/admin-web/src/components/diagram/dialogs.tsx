@@ -37,6 +37,7 @@ export function DiagramAccountDialog({
     startOidcRegistration,
   } = useAuth();
   const [username, setUsername] = useState("");
+  const [tenantId, setTenantId] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +49,7 @@ export function DiagramAccountDialog({
     setSubmitting(true);
     setError(null);
     try {
-      await passwordLogin(username, password);
+      await passwordLogin(username, password, tenantId.trim() || undefined);
       setPassword("");
       onLoggedIn();
     } catch (loginError) {
@@ -81,6 +82,13 @@ export function DiagramAccountDialog({
         <ModalBody className="gap-3 px-5 py-4">
           {passwordEnabled ? (
             <form id="diagram-account-form" className="grid gap-3" onSubmit={(event) => void submit(event)}>
+              <Input
+                label="租户 ID（非默认租户填写）"
+                value={tenantId}
+                autoComplete="organization"
+                isDisabled={submitting}
+                onValueChange={setTenantId}
+              />
               <Input
                 label="用户名"
                 value={username}

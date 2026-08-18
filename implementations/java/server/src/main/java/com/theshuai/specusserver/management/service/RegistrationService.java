@@ -8,6 +8,7 @@ import com.theshuai.specusserver.management.repository.ManagementRegistrationCha
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
+import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
@@ -85,7 +86,9 @@ public class RegistrationService {
         }
         String password = managementUserService.requirePassword(rawPassword);
         String email = normalizeEmail(rawEmail);
-        if (userRepository.existsByUsernameIgnoreCase(username)) {
+        String tenantId = TenantContext.normalize(authProperties.getTenantId());
+        if (userRepository.existsByTenantIdAndLoginNameNormalized(
+                tenantId, managementUserService.loginNameKey(username))) {
             throw new IllegalArgumentException("用户名已存在: " + username);
         }
         if (userEmailRepository.existsByEmailIgnoreCase(email)) {
@@ -166,7 +169,9 @@ public class RegistrationService {
             }
             throw invalidCode();
         }
-        if (userRepository.existsByUsernameIgnoreCase(challenge.getUsername())) {
+        String tenantId = TenantContext.normalize(authProperties.getTenantId());
+        if (userRepository.existsByTenantIdAndLoginNameNormalized(
+                tenantId, managementUserService.loginNameKey(challenge.getUsername()))) {
             throw new IllegalArgumentException("用户名已存在: " + challenge.getUsername());
         }
         if (userEmailRepository.existsByEmailIgnoreCase(challenge.getEmail())) {
@@ -176,7 +181,7 @@ public class RegistrationService {
         LoginUser user = managementUserService.registerVerifiedUser(
                 challenge.getUsername(), challenge.getPasswordHash());
         ManagementUserEmail userEmail = new ManagementUserEmail();
-        userEmail.setUsername(user.username());
+        userEmail.setUsername(user.accountKey());
         userEmail.setEmail(challenge.getEmail());
         userEmail.setVerifiedAt(now.toString());
         userEmail.setCreatedAt(now.toString());

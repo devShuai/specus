@@ -45,7 +45,7 @@ class AuthControllerRefreshTests {
     @Test
     void refreshUsesCurrentDatabaseTenantAndRole() {
         Jwt jwt = jwt(LocalTokenService.ISSUER, "alice");
-        when(users.resolveLocalTokenUser("alice"))
+        when(users.resolveLocalTokenUser("alice", "current-tenant"))
                 .thenReturn(Optional.of(new LoginUser(
                         "alice", "current-tenant", ManagementRole.USER, false)));
         when(tokens.issueToken("alice", "current-tenant", ManagementRole.USER))
@@ -62,7 +62,7 @@ class AuthControllerRefreshTests {
     @Test
     void refreshRejectsDisabledOrDeletedLocalUser() {
         Jwt jwt = jwt(LocalTokenService.ISSUER, "alice");
-        when(users.resolveLocalTokenUser("alice")).thenReturn(Optional.empty());
+        when(users.resolveLocalTokenUser("alice", "current-tenant")).thenReturn(Optional.empty());
 
         assertThat(controller.refresh(jwt).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         verify(tokens, never()).issueToken(
@@ -76,7 +76,7 @@ class AuthControllerRefreshTests {
         Jwt jwt = jwt("https://issuer.example", "alice");
 
         assertThat(controller.refresh(jwt).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        verify(users, never()).resolveLocalTokenUser("alice");
+        verify(users, never()).resolveLocalTokenUser("alice", "current-tenant");
     }
 
     private Jwt jwt(String issuer, String subject) {
@@ -85,7 +85,7 @@ class AuthControllerRefreshTests {
         when(jwt.getClaims()).thenReturn(Map.of(
                 "iss", issuer,
                 "sub", subject,
-                "tenant_id", "stale-tenant",
+                "tenant_id", "current-tenant",
                 "role", "ADMIN"));
         return jwt;
     }

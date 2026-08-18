@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -37,13 +38,15 @@ class ManagementUserServiceTests {
         service = new ManagementUserService(repository, properties);
         when(repository.save(any(ManagementUser.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
+        when(repository.saveAndFlush(any(ManagementUser.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
     }
 
     @Test
     void provisionsNewCertusIdentityAsLeastPrivilegedUser() {
         when(repository.findByOidcIdentityKey(any()))
                 .thenReturn(Optional.empty());
-        when(repository.findByUsernameIgnoreCase("new-user"))
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "new-user"))
                 .thenReturn(Optional.empty());
 
         ManagementUserService.LoginUser login = service.resolveOrProvisionOidcUser(
@@ -60,6 +63,9 @@ class ManagementUserServiceTests {
         verify(repository).save(captor.capture());
         ManagementUser saved = captor.getValue();
         assertThat(saved.getOidcIssuer()).isEqualTo(ISSUER);
+        assertThat(saved.getUsername()).isNotEqualTo("new-user");
+        assertThat(saved.getLoginName()).isEqualTo("new-user");
+        assertThat(saved.getLoginNameNormalized()).isEqualTo("new-user");
         assertThat(saved.getOidcSubject()).isEqualTo("subject-new");
         assertThat(saved.getOidcIdentityKey()).matches("[0-9a-f]{64}");
         assertThat(saved.getPasswordHash()).matches("[0-9a-f]{64}");
@@ -83,7 +89,7 @@ class ManagementUserServiceTests {
                 "alice-renamed").orElseThrow();
 
         assertThat(login.username()).isEqualTo("alice");
-        verify(repository, never()).findByUsernameIgnoreCase(any());
+        verify(repository, never()).findAllByUsernameIgnoreCase(any());
         verify(repository, never()).save(any());
     }
 
@@ -92,7 +98,7 @@ class ManagementUserServiceTests {
         ManagementUser existing = user("alice", ManagementRole.ADMIN, true);
         when(repository.findByOidcIdentityKey(any()))
                 .thenReturn(Optional.empty());
-        when(repository.findByUsernameIgnoreCase("alice"))
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "alice"))
                 .thenReturn(Optional.of(existing));
         when(repository.bindOidcIdentityIfUnbound(
                 eq("alice"), eq(ISSUER), eq("subject-alice"), anyString(), anyString()))
@@ -103,6 +109,7 @@ class ManagementUserServiceTests {
                     existing.setUpdatedAt(invocation.getArgument(4));
                     return 1;
                 });
+        when(repository.findById("alice")).thenReturn(Optional.of(existing));
 
         ManagementUserService.LoginUser login = service.resolveOrProvisionOidcUser(
                 ISSUER,
@@ -135,7 +142,7 @@ class ManagementUserServiceTests {
         conflicting.setOidcIdentityKey(identityKey(ISSUER, "other-subject"));
         when(repository.findByOidcIdentityKey(identityKey(ISSUER, "subject-alice")))
                 .thenReturn(Optional.empty());
-        when(repository.findByUsernameIgnoreCase("alice"))
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "alice"))
                 .thenReturn(Optional.of(conflicting));
         assertThat(service.resolveOrProvisionOidcUser(
                 ISSUER,
@@ -163,8 +170,9 @@ class ManagementUserServiceTests {
         winner.setOidcIdentityKey(identityKey(ISSUER, "other-subject"));
         when(repository.findByOidcIdentityKey(identityKey(ISSUER, "subject-alice")))
                 .thenReturn(Optional.empty());
-        when(repository.findByUsernameIgnoreCase("alice"))
-                .thenReturn(Optional.of(initiallyUnbound), Optional.of(winner));
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "alice"))
+                .thenReturn(Optional.of(initiallyUnbound));
+        when(repository.findById("alice")).thenReturn(Optional.of(winner));
         when(repository.bindOidcIdentityIfUnbound(
                 eq("alice"), eq(ISSUER), eq("subject-alice"), anyString(), anyString()))
                 .thenReturn(0);
@@ -183,7 +191,7 @@ class ManagementUserServiceTests {
         bound.setOidcIdentityKey(identityKey(ISSUER, "subject-alice"));
         when(repository.findByOidcIdentityKey(bound.getOidcIdentityKey()))
                 .thenReturn(Optional.of(bound));
-        when(repository.findByUsernameIgnoreCase("alice"))
+        when(repository.findById("alice"))
                 .thenReturn(Optional.of(bound));
 
         assertThat(service.resolveBoundOidcUser(ISSUER, "subject-alice"))
@@ -202,9 +210,25 @@ class ManagementUserServiceTests {
     }
 
     @Test
+    void bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous() {
+        ManagementUser tenantA = user("Alice", ManagementRole.USER, true);
+        tenantA.setTenantId("tenant-a");
+        ManagementUser tenantB = user("alice", ManagementRole.USER, true);
+        tenantB.setTenantId("tenant-b");
+        tenantA.setPasswordHash(PasswordService.hash("secret-password"));
+        tenantB.setPasswordHash(PasswordService.hash("secret-password"));
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "alice"))
+                .thenReturn(Optional.empty());
+        when(repository.findAllByUsernameIgnoreCase("alice"))
+                .thenReturn(List.of(tenantA, tenantB));
+
+        assertThat(service.authenticate("alice", "secret-password")).isEmpty();
+    }
+
+    @Test
     void mutationLookupsAreTenantScopedAndDoNotRevealForeignUsers() {
         ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
-        when(repository.findByUsernameIgnoreCaseAndTenantId("bob", "tenant-a"))
+        when(repository.findByTenantIdAndLoginNameNormalized("tenant-a", "bob"))
                 .thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.updateUser(tenantAAdmin, "bob",
@@ -215,7 +239,7 @@ class ManagementUserServiceTests {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("用户不存在: bob");
 
-        verify(repository, never()).findByUsernameIgnoreCase(any());
+        verify(repository, never()).findAllByUsernameIgnoreCase(any());
         verify(repository, never()).save(any());
         verify(repository, never()).delete(any());
     }
@@ -225,7 +249,7 @@ class ManagementUserServiceTests {
         ManagementUser bob = user("bob", ManagementRole.USER, true);
         bob.setTenantId("tenant-a");
         ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
-        when(repository.findByUsernameIgnoreCaseAndTenantId("bob", "tenant-a"))
+        when(repository.findByTenantIdAndLoginNameNormalized("tenant-a", "bob"))
                 .thenReturn(Optional.of(bob));
 
         var view = service.updateUser(tenantAAdmin, "bob",
@@ -239,9 +263,29 @@ class ManagementUserServiceTests {
         verify(repository).delete(bob);
     }
 
+    @Test
+    void createsSameLoginNameInDifferentTenantWithoutGlobalLookup() {
+        ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        when(repository.existsByTenantIdAndLoginNameNormalized("tenant-a", "bob")).thenReturn(false);
+
+        ManagementUserService.UserMutation request = new ManagementUserService.UserMutation(
+                "Bob", "secret-password", ManagementRole.USER, true);
+        var created = service.createUser(tenantAAdmin, request);
+
+        assertThat(created.username()).isEqualTo("Bob");
+        assertThat(created.tenantId()).isEqualTo("tenant-a");
+        ArgumentCaptor<ManagementUser> captor = ArgumentCaptor.forClass(ManagementUser.class);
+        verify(repository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getUsername()).matches("[0-9a-f-]{36}");
+        assertThat(captor.getValue().getLoginNameNormalized()).isEqualTo("bob");
+        verify(repository, never()).findAllByUsernameIgnoreCase(anyString());
+    }
+
     private ManagementUser user(String username, ManagementRole role, boolean enabled) {
         ManagementUser user = new ManagementUser();
         user.setUsername(username);
+        user.setLoginName(username);
+        user.setLoginNameNormalized(username.toLowerCase(java.util.Locale.ROOT));
         user.setTenantId("default");
         user.setPasswordHash("0".repeat(64));
         user.setRole(role);

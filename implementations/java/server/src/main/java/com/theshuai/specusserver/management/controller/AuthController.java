@@ -53,11 +53,12 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "用户名或密码错误"));
         }
         // 限流先于验证码与凭据校验:关闭 Turnstile 的部署同样受尝试次数约束。
-        loginRateLimiter.checkLoginAttempt(clientIp(httpRequest), request.username());
+        String loginIdentity = loginIdentity(request.tenantId(), request.username());
+        loginRateLimiter.checkLoginAttempt(clientIp(httpRequest), loginIdentity);
         turnstileVerifier.verify(request.turnstileToken(), TurnstileVerifier.LOGIN_ACTION);
-        return managementUserService.authenticate(request.username(), request.password())
+        return managementUserService.authenticate(request.username(), request.password(), request.tenantId())
                 .<ResponseEntity<?>>map(user -> {
-                    loginRateLimiter.recordSuccess(request.username());
+                    loginRateLimiter.recordSuccess(loginIdentity);
                     return ResponseEntity.ok(buildTokenBody(user));
                 })
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -105,7 +106,7 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", "OIDC 令牌不能通过该端点续期"));
         }
-        return managementUserService.resolveLocalTokenUser(jwt.getSubject())
+        return managementUserService.resolveLocalTokenUser(jwt.getSubject(), claimAsString(jwt, "tenant_id"))
                 .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(Map.of("error", "账号已禁用、不存在或不再允许本地登录")));
@@ -119,7 +120,13 @@ public class AuthController {
         return body;
     }
 
-    public record LoginRequest(String username, String password, String turnstileToken) {
+    private static String loginIdentity(String tenantId, String username) {
+        String tenant = tenantId == null ? "" : tenantId.trim().toLowerCase(java.util.Locale.ROOT);
+        String user = username == null ? "" : username.trim().toLowerCase(java.util.Locale.ROOT);
+        return tenant + '\u0000' + user;
+    }
+
+    public record LoginRequest(String username, String password, String turnstileToken, String tenantId) {
     }
 
     public record RegistrationRequest(String username, String email, String password, String turnstileToken) {

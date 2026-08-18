@@ -30,7 +30,7 @@ public class ManagementContextResolver {
         }
         String issuer = claimAsString(jwt, "iss");
         Optional<LoginUser> resolved = LocalTokenService.ISSUER.equals(issuer)
-                ? managementUserService.resolveLocalTokenUser(jwt.getSubject())
+                ? managementUserService.resolveLocalTokenUser(jwt.getSubject(), claimAsString(jwt, "tenant_id"))
                 : managementUserService.resolveBoundOidcUser(issuer, jwt.getSubject());
         LoginUser user = resolved.orElseThrow(() -> new ResponseStatusException(
                 HttpStatus.FORBIDDEN,
