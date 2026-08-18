@@ -606,8 +606,8 @@ function isSafeConfiguredDownloadUrl(rawUrl: string): boolean {
 }
 
 /**
- * Reads the server-hosted version catalog first. GitHub Releases fills targets that have not been
- * uploaded yet and remains a bounded fallback during a catalog outage.
+ * Reads the server version catalog first (external Release assets or hosted packages). GitHub's
+ * API fills targets not yet catalogued and remains a bounded fallback during a catalog outage.
  */
 export async function fetchPublicClientDownloads(options: { refresh?: boolean } = {}): Promise<ClientDownloadLink[]> {
   if (!options.refresh && cachedGithubClientDownloads && cachedGithubClientDownloads.expiresAt > Date.now()) {

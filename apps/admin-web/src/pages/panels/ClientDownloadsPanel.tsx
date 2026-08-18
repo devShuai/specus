@@ -23,7 +23,7 @@ const IMPLEMENTATION_ORDER: ClientImplementation[] = ["go", "csharp", "android",
 
 /**
  * 客户端下载面板（只读）。优先读取服务端版本编目，按 implementation 分组展示；
- * GitHub Releases 只补齐尚未托管的目标并在服务端不可用时回退。
+ * 编目可直接指向 GitHub Release 或服务端托管包，GitHub API 只补齐缺少的目标。
  */
 export function ClientDownloadsPanel() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);

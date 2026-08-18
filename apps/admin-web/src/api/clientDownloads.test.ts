@@ -156,6 +156,17 @@ describe("fetchPublicClientDownloads", () => {
     await expect(fetchPublicClientDownloads()).resolves.toEqual([hosted]);
   });
 
+  it("hides older versions when a target has an explicit latest release", async () => {
+    const oldVersion = link(50, "go", "linux", "x64", { version: "1.0.0", isLatest: false });
+    const latestVersion = link(51, "go", "linux", "x64", { version: "1.1.0", isLatest: true });
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [oldVersion, latestVersion] })
+      .mockRejectedValueOnce(new Error("GitHub offline")));
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).resolves.toEqual([latestVersion]);
+  });
+
   it("keeps a recent successful cache when both refresh sources fail", async () => {
     const configured = completeConfiguredRelease();
     const fetchMock = vi.fn()

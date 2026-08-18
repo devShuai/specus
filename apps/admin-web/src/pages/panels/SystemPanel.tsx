@@ -152,7 +152,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     });
   };
 
-  // ---- 客户端版本编目与服务端托管发布包 ----
+  // ---- 客户端版本编目与可选的服务端托管发布包 ----
   const [downloadLinks, setDownloadLinks] = useState<ClientDownloadLink[]>([]);
   const [loadingDownloads, setLoadingDownloads] = useState(false);
   const [editingLink, setEditingLink] = useState<ClientDownloadLink | null>(null);
@@ -192,7 +192,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
       return;
     }
     setPendingLinkIds((prev) => new Set(prev).add(link.id));
-    setDownloadLinks((prev) => prev.map((item) => (item.id === link.id ? { ...item, enabled: !link.enabled } : item)));
+    const nextLatest = link.enabled ? false : link.isLatest;
+    setDownloadLinks((prev) => prev.map((item) => (item.id === link.id
+      ? { ...item, enabled: !link.enabled, isLatest: nextLatest }
+      : item)));
     try {
       await adminApi.updateClientDownload(link.id, {
         implementation: link.implementation,
@@ -204,7 +207,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         displayOrder: link.displayOrder,
         enabled: !link.enabled,
         version: link.version,
-        isLatest: link.isLatest,
+        isLatest: nextLatest,
         changelogUrl: link.changelogUrl,
         minSupportedVersion: link.minSupportedVersion,
       });
@@ -234,7 +237,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
   const deleteLink = (link: ClientDownloadLink) => {
     setConfirm({
       title: "删除下载链接",
-      description: `确定删除「${link.displayName}」吗？删除后 GitHub Releases 不可用时将无法回退到该链接。`,
+      description: `确定删除「${link.displayName}」吗？删除后公开下载和版本检查将不再返回该条目。`,
       confirmLabel: "删除",
       danger: true,
       action: async () => {
@@ -464,21 +467,21 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     </div>
 
     <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-      <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
+      <CardHeader className="flex flex-col items-stretch gap-4 px-5 pb-2 pt-5 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold text-foreground">客户端发布</h2>
           <p className="mt-1 text-small text-default-500">
             上传受校验的发布包，按实现、平台与架构维护版本轨道。
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
           <Button radius="sm" variant="flat" isLoading={loadingDownloads} onPress={() => void loadDownloadLinks()}>
             刷新
           </Button>
           <Button radius="sm" variant="bordered" onPress={openCreateLink}>
             新增外链
           </Button>
-          <Button radius="sm" color="primary" onPress={packageModal.onOpen}>
+          <Button className="col-span-2 sm:col-span-1" radius="sm" color="primary" onPress={packageModal.onOpen}>
             上传发布包
           </Button>
         </div>
@@ -802,7 +805,7 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
   const [description, setDescription] = useState("");
   const [changelogUrl, setChangelogUrl] = useState("");
   const [minSupportedVersion, setMinSupportedVersion] = useState("");
-  const [isLatest, setIsLatest] = useState(true);
+  const [isLatest, setIsLatest] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [dragging, setDragging] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -815,7 +818,7 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
     setDescription("");
     setChangelogUrl("");
     setMinSupportedVersion("");
-    setIsLatest(true);
+    setIsLatest(false);
     setEnabled(true);
   }, [disclosure.isOpen]);
 
@@ -829,11 +832,16 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
     }
   };
 
+  const selectPackageFile = (nextFile: File) => {
+    setDisplayName((current) => !current.trim() || current === file?.name ? nextFile.name : current);
+    setFile(nextFile);
+  };
+
   const acceptDroppedFile = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
     setDragging(false);
     const dropped = event.dataTransfer.files.item(0);
-    if (dropped) setFile(dropped);
+    if (dropped) selectPackageFile(dropped);
   };
 
   const upload = async () => {
@@ -846,11 +854,11 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
       implementation,
       platform,
       arch,
-      version: version.trim().replace(/^v/i, ""),
+      version: version.trim().replace(/^v/, ""),
       displayName: displayName.trim(),
       description: description.trim() || null,
       changelogUrl: changelogUrl.trim() || null,
-      minSupportedVersion: minSupportedVersion.trim().replace(/^v/i, "") || null,
+      minSupportedVersion: minSupportedVersion.trim().replace(/^v/, "") || null,
       enabled,
       isLatest,
     };
@@ -869,7 +877,7 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
 
   return (
     <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange} size="2xl" scrollBehavior="inside">
-      <ModalContent>
+      <ModalContent className="bg-content1">
         {(onClose) => (
           <>
             <ModalHeader className="flex flex-col items-start gap-1">
@@ -889,7 +897,10 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
                   id="client-package-file"
                   className="sr-only"
                   type="file"
-                  onChange={(event) => setFile(event.target.files?.item(0) ?? null)}
+                  onChange={(event) => {
+                    const selected = event.target.files?.item(0);
+                    if (selected) selectPackageFile(selected);
+                  }}
                 />
                 <span className="font-medium text-foreground">{file ? file.name : "拖入发布包，或点击选择文件"}</span>
                 <span className="mt-1 text-tiny text-default-500">{file ? formatBytes(file.size) : "APK、JAR、ZIP、tar.gz 均按二进制原样托管"}</span>
@@ -913,7 +924,7 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
                   <SelectItem key="windows">Windows</SelectItem>
                   <SelectItem key="linux">Linux</SelectItem>
                   <SelectItem key="macos">macOS</SelectItem>
-                  <SelectItem key="android">Android</SelectItem>
+                  <SelectItem key="android" isDisabled={implementation !== "android"}>Android</SelectItem>
                 </Select>
                 <Select isDisabled={implementation === "android"} label="架构" selectedKeys={[arch]} onSelectionChange={(keys) => {
                   const value = Array.from(keys)[0]?.toString() as ClientArch | undefined;
@@ -926,15 +937,18 @@ function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageMo
               </div>
 
               <div className="grid gap-3 sm:grid-cols-2">
-                <Input isRequired label="版本号" placeholder="1.4.0" value={version} onValueChange={setVersion} />
+                <Input isRequired label="版本号" maxLength={32} placeholder="1.4.0" value={version} onValueChange={setVersion} />
                 <Input isRequired label="显示名称" placeholder="Android 客户端 1.4.0" value={displayName} onValueChange={setDisplayName} />
-                <Input label="最低支持版本（可选）" placeholder="1.2.0" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
+                <Input label="最低支持版本（可选）" maxLength={32} placeholder="1.2.0" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
                 <Input label="更新说明 URL（可选）" placeholder="https://…" value={changelogUrl} onValueChange={setChangelogUrl} />
               </div>
               <Textarea label="版本说明（可选）" maxRows={3} value={description} onValueChange={setDescription} />
               <div className="flex flex-wrap gap-5 rounded-md border border-default-200 bg-default-50 p-3">
-                <Switch isSelected={isLatest} onValueChange={setIsLatest}>设为此目标的最新版本</Switch>
-                <Switch isSelected={enabled} onValueChange={setEnabled}>公开下载</Switch>
+                <Switch isDisabled={!enabled} isSelected={isLatest} onValueChange={setIsLatest}>设为此目标的最新版本</Switch>
+                <Switch isSelected={enabled} onValueChange={(value) => {
+                  setEnabled(value);
+                  if (!value) setIsLatest(false);
+                }}>公开下载</Switch>
               </div>
             </ModalBody>
             <ModalFooter>
@@ -960,6 +974,8 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
   const [arch, setArch] = useState<ClientArch>("any");
   const [displayName, setDisplayName] = useState("");
   const [downloadUrl, setDownloadUrl] = useState("");
+  const [sha256, setSha256] = useState("");
+  const [fileSize, setFileSize] = useState("");
   const [description, setDescription] = useState("");
   const [displayOrder, setDisplayOrder] = useState("0");
   const [enabled, setEnabled] = useState(true);
@@ -979,6 +995,8 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       setArch(link.arch);
       setDisplayName(link.displayName);
       setDownloadUrl(link.downloadUrl);
+      setSha256(link.sha256 ?? "");
+      setFileSize(link.fileSize ? String(link.fileSize) : "");
       setDescription(link.description ?? "");
       setDisplayOrder(String(link.displayOrder));
       setEnabled(link.enabled);
@@ -992,6 +1010,8 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       setArch("any");
       setDisplayName("");
       setDownloadUrl("");
+      setSha256("");
+      setFileSize("");
       setDescription("");
       setDisplayOrder("0");
       setEnabled(true);
@@ -1002,9 +1022,34 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
     }
   }, [disclosure.isOpen, link]);
 
+  const chooseImplementation = (value: ClientImplementation) => {
+    setImplementation(value);
+    if (value === "android") {
+      setPlatform("android");
+      setArch("any");
+    } else if (platform === "android") {
+      setPlatform("any");
+    }
+  };
+
   const save = async () => {
     if (!displayName.trim() || !downloadUrl.trim() || !version.trim()) {
       notify("请填写版本号、名称和下载 URL", "error");
+      return;
+    }
+    const normalizedSha256 = sha256.trim().toLowerCase();
+    const normalizedFileSize = fileSize.trim() ? Number(fileSize) : null;
+    if (!link?.hosted && normalizedSha256 && !/^[0-9a-f]{64}$/.test(normalizedSha256)) {
+      notify("SHA-256 必须是 64 位十六进制字符", "error");
+      return;
+    }
+    if (!link?.hosted && normalizedFileSize !== null
+      && (!Number.isSafeInteger(normalizedFileSize) || normalizedFileSize <= 0)) {
+      notify("文件字节数必须是正整数", "error");
+      return;
+    }
+    if (!link?.hosted && isLatest && (!normalizedSha256 || normalizedFileSize === null)) {
+      notify("发布外部最新版本前，请填写 Release 资产的 SHA-256 和文件字节数", "error");
       return;
     }
     setSaving(true);
@@ -1017,10 +1062,14 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       description: description.trim() || null,
       displayOrder: Number(displayOrder) || 0,
       enabled,
-      version: version.trim().replace(/^v/i, ""),
+      version: version.trim().replace(/^v/, ""),
+      ...(!link?.hosted ? {
+        sha256: normalizedSha256 || null,
+        fileSize: normalizedFileSize,
+      } : {}),
       isLatest,
       changelogUrl: changelogUrl.trim() || null,
-      minSupportedVersion: minSupportedVersion.trim().replace(/^v/i, "") || null,
+      minSupportedVersion: minSupportedVersion.trim().replace(/^v/, "") || null,
     };
     try {
       if (link) {
@@ -1052,7 +1101,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   selectedKeys={[implementation]}
                   onSelectionChange={(keys) => {
                     const value = Array.from(keys)[0]?.toString() as ClientImplementation | undefined;
-                    if (value) setImplementation(value);
+                    if (value) chooseImplementation(value);
                   }}
                 >
                   <SelectItem key="java">Java</SelectItem>
@@ -1061,6 +1110,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   <SelectItem key="android">Android</SelectItem>
                 </Select>
                 <Select
+                  isDisabled={implementation === "android"}
                   label="操作系统"
                   selectedKeys={[platform]}
                   onSelectionChange={(keys) => {
@@ -1072,9 +1122,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   <SelectItem key="windows">Windows</SelectItem>
                   <SelectItem key="linux">Linux</SelectItem>
                   <SelectItem key="macos">macOS</SelectItem>
-                  <SelectItem key="android">Android</SelectItem>
+                  <SelectItem key="android" isDisabled={implementation !== "android"}>Android</SelectItem>
                 </Select>
                 <Select
+                  isDisabled={implementation === "android"}
                   label="架构"
                   selectedKeys={[arch]}
                   onSelectionChange={(keys) => {
@@ -1091,7 +1142,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                 label="版本号"
                 value={version}
                 onValueChange={setVersion}
-                maxLength={64}
+                maxLength={32}
                 isRequired
                 placeholder="1.4.0"
               />
@@ -1104,6 +1155,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                 placeholder="例如：Java 客户端 1.2.0"
               />
               <Input
+                isDisabled={link?.hosted === true}
                 label="下载 URL"
                 value={downloadUrl}
                 onValueChange={setDownloadUrl}
@@ -1111,6 +1163,30 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                 isRequired
                 placeholder="https://..."
               />
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                <Input
+                  isDisabled={link?.hosted === true}
+                  label="SHA-256"
+                  value={sha256}
+                  onValueChange={setSha256}
+                  maxLength={64}
+                  placeholder="Release 资产的 64 位摘要"
+                />
+                <Input
+                  isDisabled={link?.hosted === true}
+                  label="文件字节数"
+                  type="number"
+                  min={1}
+                  value={fileSize}
+                  onValueChange={setFileSize}
+                  placeholder="例如 18432000"
+                />
+              </div>
+              <p className="text-tiny text-default-500">
+                {link?.hosted
+                  ? "托管包的地址、摘要和大小由服务端计算，不能手动修改。"
+                  : "GitHub Release 外链标记为最新版本时，摘要和字节数必填；客户端会在安装前校验。"}
+              </p>
               <Textarea
                 label="说明（可选）"
                 value={description}
@@ -1119,7 +1195,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                 placeholder="哈希值、签名说明等"
               />
               <div className="grid gap-3 sm:grid-cols-2">
-                <Input label="最低支持版本（可选）" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
+                <Input label="最低支持版本（可选）" maxLength={32} value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
                 <Input label="更新说明 URL（可选）" value={changelogUrl} onValueChange={setChangelogUrl} />
               </div>
               <div className="grid gap-3 sm:grid-cols-[120px_1fr] sm:items-center">
@@ -1130,8 +1206,11 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   onValueChange={setDisplayOrder}
                 />
                 <div className="flex flex-wrap gap-4">
-                  <Switch isSelected={enabled} onValueChange={setEnabled}>启用</Switch>
-                  <Switch isSelected={isLatest} onValueChange={setIsLatest}>最新版本</Switch>
+                  <Switch isSelected={enabled} onValueChange={(value) => {
+                    setEnabled(value);
+                    if (!value) setIsLatest(false);
+                  }}>启用</Switch>
+                  <Switch isDisabled={!enabled} isSelected={isLatest} onValueChange={setIsLatest}>最新版本</Switch>
                 </div>
               </div>
             </ModalBody>

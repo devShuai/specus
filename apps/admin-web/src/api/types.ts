@@ -729,7 +729,7 @@ export interface HttpRouteMutation {
   pathRewriteEnabled?: boolean;
 }
 
-// 客户端版本编目 —— 服务端托管包优先；GitHub Releases 仅补齐或故障回退。
+// 客户端版本编目 —— GitHub Release 外链为默认；服务端托管包用于内网/离线分发。
 export type ClientImplementation = "java" | "go" | "csharp" | "android";
 export type ClientPlatform = "windows" | "linux" | "macos" | "android" | "any";
 export type ClientArch = "x64" | "arm64" | "any";
@@ -766,6 +766,8 @@ export interface ClientDownloadLinkMutation {
   displayOrder?: number;
   enabled?: boolean;
   version?: string | null;
+  sha256?: string | null;
+  fileSize?: number | null;
   isLatest?: boolean;
   changelogUrl?: string | null;
   minSupportedVersion?: string | null;
