@@ -1,6 +1,6 @@
 import { HeaderMenu } from "./HeaderMenu";
 
-export type PublicToolKey = "transfer" | "diagram" | "nat-detect";
+export type PublicToolKey = "transfer" | "diagram" | "nat-detect" | "download";
 
 type PublicToolIconName = PublicToolKey | "console";
 
@@ -8,6 +8,7 @@ const PUBLIC_TOOLS: Array<{ key: PublicToolIconName; label: string; detail: stri
   { key: "transfer", label: "互传", detail: "文件、剪贴板与白板" },
   { key: "diagram", label: "专业流程图", detail: "独立协作编辑器" },
   { key: "nat-detect", label: "NAT 检测", detail: "检测网络连通类型" },
+  { key: "download", label: "客户端下载", detail: "自动匹配当前平台" },
   { key: "console", label: "控制台", detail: "登录并管理隧道服务" },
 ];
 
@@ -61,6 +62,8 @@ function PublicToolIcon({ name }: { name: PublicToolIconName }) {
     paths = <><rect x="3.5" y="4" width="6" height="5" rx="1" /><rect x="14.5" y="15" width="6" height="5" rx="1" /><path d="M9.5 6.5h3a4 4 0 0 1 4 4V15" /></>;
   } else if (name === "nat-detect") {
     paths = <><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.3 2.4 3.5 5.2 3.5 8.5S14.3 18.1 12 20.5M12 3.5C9.7 5.9 8.5 8.7 8.5 12s1.2 6.1 3.5 8.5" /></>;
+  } else if (name === "download") {
+    paths = <><path d="M12 3.5v11M8.5 11l3.5 3.5 3.5-3.5" /><path d="M4.5 16.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2" /></>;
   } else {
     paths = <><rect x="3.5" y="3.5" width="7" height="7" rx="1.5" /><rect x="13.5" y="3.5" width="7" height="4.5" rx="1.5" /><rect x="3.5" y="13.5" width="7" height="7" rx="1.5" /><rect x="13.5" y="10.5" width="7" height="10" rx="1.5" /></>;
   }

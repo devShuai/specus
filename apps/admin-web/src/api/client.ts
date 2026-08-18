@@ -491,20 +491,84 @@ export const adminApi = {
 
 const GITHUB_DOWNLOAD_CACHE_TTL_MS = 5 * 60_000;
 const GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS = 60_000;
+const GITHUB_DOWNLOAD_MAX_STALE_MS = 24 * 60 * 60_000;
+export const CONFIGURED_DOWNLOAD_REQUEST_TIMEOUT_MS = 8_000;
 
-let cachedGithubClientDownloads: { links: ClientDownloadLink[]; expiresAt: number } | null = null;
+let cachedGithubClientDownloads: {
+  links: ClientDownloadLink[];
+  expiresAt: number;
+  staleUntil: number;
+} | null = null;
 let githubClientDownloadsRequest: Promise<ClientDownloadLink[]> | null = null;
 
 async function fetchConfiguredClientDownloads(): Promise<ClientDownloadLink[]> {
-  const response = await fetch(`/api/public/client-downloads`);
-  if (!response.ok) {
-    throw new Error(`备用客户端下载接口请求失败（HTTP ${response.status}）`);
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), CONFIGURED_DOWNLOAD_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`/api/public/client-downloads`, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`备用客户端下载接口请求失败（HTTP ${response.status}）`);
+    }
+    const body: unknown = await response.json();
+    if (!Array.isArray(body)) {
+      throw new Error("备用客户端下载接口返回了无效数据");
+    }
+    return body.flatMap((value) => {
+      const link = parseConfiguredClientDownload(value);
+      return link ? [link] : [];
+    });
+  } finally {
+    globalThis.clearTimeout(timeout);
   }
-  const body: unknown = await response.json();
-  if (!Array.isArray(body)) {
-    throw new Error("备用客户端下载接口返回了无效数据");
+}
+
+function parseConfiguredClientDownload(value: unknown): ClientDownloadLink | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const link = value as Record<string, unknown>;
+  const implementation = link.implementation;
+  const platform = link.platform;
+  const arch = link.arch;
+  const displayName = link.displayName;
+  const downloadUrl = link.downloadUrl;
+  const description = link.description;
+  if (!Number.isSafeInteger(link.id)
+    || !Number.isSafeInteger(link.displayOrder)
+    || (implementation !== "java" && implementation !== "go" && implementation !== "csharp")
+    || (platform !== "windows" && platform !== "linux" && platform !== "macos" && platform !== "any")
+    || (arch !== "x64" && arch !== "arm64" && arch !== "any")
+    || typeof displayName !== "string" || !displayName.trim()
+    || typeof downloadUrl !== "string" || !isSafeConfiguredDownloadUrl(downloadUrl)
+    || (description !== undefined && description !== null && typeof description !== "string")
+    || typeof link.enabled !== "boolean"
+    || typeof link.createdAt !== "string"
+    || typeof link.updatedAt !== "string") {
+    return null;
   }
-  return body as ClientDownloadLink[];
+  return {
+    id: link.id as number,
+    implementation,
+    platform,
+    arch,
+    displayName: displayName.trim(),
+    downloadUrl,
+    description: description as string | null | undefined,
+    displayOrder: link.displayOrder as number,
+    enabled: link.enabled,
+    createdAt: link.createdAt,
+    updatedAt: link.updatedAt,
+  };
+}
+
+function isSafeConfiguredDownloadUrl(rawUrl: string): boolean {
+  if (rawUrl !== rawUrl.trim()) return false;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol === "https:") return true;
+    return url.protocol === "http:"
+      && (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -519,7 +583,10 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
     return githubClientDownloadsRequest;
   }
 
-  const previousDownloads = cachedGithubClientDownloads?.links ?? [];
+  const now = Date.now();
+  const previousDownloads = cachedGithubClientDownloads && cachedGithubClientDownloads.staleUntil > now
+    ? cachedGithubClientDownloads.links
+    : [];
   const request = (async () => {
     try {
       const githubLinks = await fetchLatestGithubClientDownloads();
@@ -532,7 +599,12 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
           // because the optional configured fallback is temporarily unavailable.
         }
       }
-      cachedGithubClientDownloads = { links, expiresAt: Date.now() + GITHUB_DOWNLOAD_CACHE_TTL_MS };
+      const cachedAt = Date.now();
+      cachedGithubClientDownloads = {
+        links,
+        expiresAt: cachedAt + GITHUB_DOWNLOAD_CACHE_TTL_MS,
+        staleUntil: cachedAt + GITHUB_DOWNLOAD_MAX_STALE_MS,
+      };
       return links;
     } catch (githubError) {
       let configured: ClientDownloadLink[] = [];
@@ -545,9 +617,14 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
         ? mergePreferredClientDownloads(configured, previousDownloads)
         : configured;
       if (links.length > 0) {
+        const cachedAt = Date.now();
         cachedGithubClientDownloads = {
           links,
-          expiresAt: Date.now() + GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS,
+          expiresAt: cachedAt + GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS,
+          // Do not slide the stale window forward when old links merely survive another outage.
+          staleUntil: previousDownloads.length > 0 && cachedGithubClientDownloads
+            ? cachedGithubClientDownloads.staleUntil
+            : cachedAt + GITHUB_DOWNLOAD_MAX_STALE_MS,
         };
         return links;
       }

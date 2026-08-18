@@ -51,14 +51,19 @@ export function ClientDownloadsPanel() {
 
   return (
     <div className="mt-4 flex flex-col gap-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold">客户端下载</h2>
           <p className="text-small text-default-500">macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包</p>
         </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
-          刷新
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button as="a" href="/download" rel="noopener noreferrer" size="sm" target="_blank" variant="bordered">
+            打开公开下载页 ↗
+          </Button>
+          <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
+            刷新
+          </Button>
+        </div>
       </div>
 
       <MacosInstallGuide />

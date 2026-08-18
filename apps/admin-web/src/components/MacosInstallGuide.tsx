@@ -54,14 +54,14 @@ export function MacosInstallGuide({ landing = false }: { landing?: boolean }) {
 
 function CommandRow({ command, label }: { command: string; label: string }) {
   return (
-    <div className="flex min-w-0 items-center gap-2 rounded-md border border-default-200 bg-default-50 p-2 dark:bg-default-100/10">
-      <span className="w-8 shrink-0 text-center text-tiny font-medium text-default-500">{label}</span>
-      <code className="min-w-0 flex-1 break-all font-mono text-tiny text-foreground sm:overflow-x-auto sm:whitespace-nowrap">
+    <div className="macos-command-row grid min-w-0 items-center gap-2 rounded-md border border-default-200 bg-default-50 p-2 dark:bg-default-100/10">
+      <span className="macos-command-label text-center text-tiny font-medium text-default-500">{label}</span>
+      <code className="macos-command-code min-w-0 overflow-x-auto whitespace-nowrap font-mono text-tiny text-foreground">
         <span className="select-none text-default-400" aria-hidden="true">$ </span>{command}
       </code>
       <button
         aria-label={`复制${label}命令`}
-        className="shrink-0 rounded-md px-2 py-1 text-tiny font-medium text-primary transition hover:bg-primary-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-primary-500/10"
+        className="macos-command-copy shrink-0 rounded-md px-2 text-tiny font-medium text-primary transition hover:bg-primary-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-primary-500/10"
         type="button"
         onClick={() => void copyTextWithFeedback(command, `${label}命令已复制`)}
       >

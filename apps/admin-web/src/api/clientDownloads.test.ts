@@ -4,6 +4,8 @@ import type { ClientDownloadLink } from "./types";
 const tagName = "v1.2.3";
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.resetModules();
   vi.unstubAllGlobals();
 });
@@ -72,7 +74,11 @@ describe("fetchPublicClientDownloads", () => {
 
     const links = await fetchPublicClientDownloads();
     expect(links).toContainEqual(configuredLinuxArm);
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/public/client-downloads");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/public/client-downloads",
+      expect.objectContaining({ signal: expect.any(Object) }),
+    );
   });
 
   it("keeps partial GitHub assets when the configured fallback is unavailable", async () => {
@@ -150,6 +156,8 @@ describe("fetchPublicClientDownloads", () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => completeRelease() })
       .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockRejectedValueOnce(new Error("fallback offline"))
+      .mockRejectedValueOnce(new Error("GitHub still offline"))
       .mockRejectedValueOnce(new Error("fallback offline"));
     vi.stubGlobal("fetch", fetchMock);
     const { fetchPublicClientDownloads } = await import("./client");
@@ -159,6 +167,63 @@ describe("fetchPublicClientDownloads", () => {
     expect(recovered).toHaveLength(cached.length);
     expect(recovered).toEqual(expect.arrayContaining(cached));
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not reuse a successful cache beyond the maximum stale window", async () => {
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => completeRelease() })
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockRejectedValueOnce(new Error("fallback offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await fetchPublicClientDownloads();
+    now = 24 * 60 * 60_000 - 2 * 60_000;
+    await expect(fetchPublicClientDownloads({ refresh: true })).resolves.toHaveLength(9);
+    now = 24 * 60 * 60_000 + 1;
+    await expect(fetchPublicClientDownloads({ refresh: true })).rejects.toThrow(
+      "无法从 GitHub Releases 或备用接口获取客户端下载链接",
+    );
+  });
+
+  it("filters unsafe or malformed configured download links", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [
+          configuredLinuxArm,
+          { ...configuredLinuxArm, id: 901, downloadUrl: "http://downloads.example.test/client.tar.gz" },
+          { ...configuredLinuxArm, id: 902, downloadUrl: "javascript:alert(1)" },
+          { ...configuredLinuxArm, id: 903, platform: "android" },
+          { ...configuredLinuxArm, id: 904, displayName: "" },
+        ],
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).resolves.toEqual([configuredLinuxArm]);
+  });
+
+  it("times out a hanging configured fallback request", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockImplementationOnce((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { CONFIGURED_DOWNLOAD_REQUEST_TIMEOUT_MS, fetchPublicClientDownloads } = await import("./client");
+
+    const result = fetchPublicClientDownloads();
+    const assertion = expect(result).rejects.toThrow(
+      "无法从 GitHub Releases 或备用接口获取客户端下载链接",
+    );
+    await vi.advanceTimersByTimeAsync(CONFIGURED_DOWNLOAD_REQUEST_TIMEOUT_MS);
+    await assertion;
   });
 
   it("deduplicates concurrent forced refreshes", async () => {

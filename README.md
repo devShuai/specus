@@ -210,6 +210,7 @@ brew upgrade --cask specus-client
 ```
 
 Homebrew Cask 源码位于 [`devShuai/homebrew-specus`](https://github.com/devShuai/homebrew-specus)。网站的 macOS Release 压缩包仍可用于手动安装。
+公开的 [Specus Client 下载页](https://specus.devshuai.com/download) 会按访问设备优先推荐 macOS Homebrew、Windows 桌面版或对应架构的 Go 客户端，并可展开查看全部平台与实现。
 
 从源码启动 Java 客户端：
 

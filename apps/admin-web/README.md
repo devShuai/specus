@@ -71,7 +71,7 @@ npm run typecheck    # tsc --noEmit
 当前主要能力：
 
 - 登录:用户名/密码 + OIDC(PKCE S256);token 存 `sessionStorage`,密码登录自动续期,401 统一登出。
-- 概览、客户端/凭证、端口映射、HTTP 路由、客户端应用包下载和系统管理；macOS Go 客户端展示 Homebrew Cask 安装入口（`brew install --cask devshuai/specus/specus-client`），GitHub Release 链接保留为手动下载方式并由数据库配置提供故障回退。
+- 概览、客户端/凭证、端口映射、HTTP 路由、客户端应用包下载和系统管理；公开 `/download` 页面自动识别访问平台与架构，优先给出 macOS Homebrew、Windows 桌面版或对应架构的 Go 客户端，并可展开全部 GitHub Release 下载方式。数据库配置继续作为 GitHub 故障回退。
 - 客户端消息与附件、免登录房间互传（文件、剪贴板、同步白板；Token 房间支持 OWNER/EDITOR/VIEWER 角色邀请和撤销；白板包含自由绘制与基于 maxGraph + Yjs 的专业流程图模式，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标、服务端版本历史和只读访客；支持 `.stwb` / `.stdg` / 多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg` / `.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件传送优先 WebRTC 直连、OSS 分享兜底）。
 - 连接记录:筛选 + 分页 + WebSocket 实时(created/updated)+ 活动连接 1Hz 时长刷新。
 - 流量观测:客户端 / TCP 映射 / HTTP 路由聚合，HTTP 协议记录和 TCP 数据帧分页查看。
@@ -89,8 +89,8 @@ src/
 ├── api/{client.ts,types.ts}                       # fetch 封装 + DTO
 ├── auth/AuthContext.tsx                           # token / 刷新 / OIDC PKCE / 401
 ├── hooks/{useConnectionsFeed,useNowTick,useClients,useDirectTransfer}.ts
-├── lib/{format,nat,pkce,qr,seo,sha256,transferPreview}.ts
+├── lib/{format,nat,pkce,platformDownloads,publicRoute,qr,seo,sha256,transferPreview}.ts
 ├── components/{Sidebar,EmptyState,ClientDetailDrawer,...}.tsx
-└── pages/{LoginPage,Dashboard,PublicTransferPage}.tsx
+└── pages/{LoginPage,Dashboard,PublicDownloadPage,PublicTransferPage}.tsx
     └── panels/{Overview,Clients,AdminMessages,SpecusMappings,HttpRoutes,Connections,Traffic,PeerMesh,ClientDownloads,System,Help,NatDetection}Panel.tsx
 ```

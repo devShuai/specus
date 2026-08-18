@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useLayoutEffect, useState, type ReactNode } 
 import { useAuth } from "./auth/AuthContext";
 import { tokenStore } from "./api/client";
 import { AuthDialog } from "./components/AuthDialog";
+import { readPublicRoute, type PublicRoute } from "./lib/publicRoute";
 
 const LazyLoginPage = lazy(() => import("./pages/LoginPage").then((module) => ({ default: module.LoginPage })));
 const LazyDashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
@@ -18,25 +19,9 @@ const LazyPublicDiagramPage = lazy(() =>
 const LazyDiagramEmbedPage = lazy(() =>
   import("./pages/DiagramEmbedPage").then((module) => ({ default: module.DiagramEmbedPage })),
 );
-
-function readPublicRoute() {
-  const hash = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
-  const path = window.location.pathname.replace(/^\/+/, "").split(/[/?#]/, 1)[0];
-  const queryPanel = new URLSearchParams(window.location.search).get("panel");
-  if (hash === "nat-detect" || path === "nat-detect" || queryPanel === "nat-detect") {
-    return "nat-detect";
-  }
-  if (hash === "transfer" || path === "transfer" || queryPanel === "transfer") {
-    return "transfer";
-  }
-  if (hash === "diagram-embed" || path === "diagram-embed" || queryPanel === "diagram-embed") {
-    return "diagram-embed";
-  }
-  if (hash === "diagram" || path === "diagram" || queryPanel === "diagram") {
-    return "diagram";
-  }
-  return null;
-}
+const LazyPublicDownloadPage = lazy(() =>
+  import("./pages/PublicDownloadPage").then((module) => ({ default: module.PublicDownloadPage })),
+);
 
 function hasOidcCallback() {
   const params = new URLSearchParams(window.location.search);
@@ -45,10 +30,10 @@ function hasOidcCallback() {
 
 export function App() {
   const { ready, authed } = useAuth();
-  const [publicRoute, setPublicRoute] = useState<string | null>(() => readPublicRoute());
+  const [publicRoute, setPublicRoute] = useState<PublicRoute | null>(() => readPublicRoute(window.location));
 
   useEffect(() => {
-    const syncPublicRoute = () => setPublicRoute(readPublicRoute());
+    const syncPublicRoute = () => setPublicRoute(readPublicRoute(window.location));
     window.addEventListener("hashchange", syncPublicRoute);
     window.addEventListener("popstate", syncPublicRoute);
     return () => {
@@ -87,6 +72,8 @@ export function App() {
     content = <LazyPublicDiagramPage />;
   } else if (publicRoute === "diagram-embed") {
     content = <LazyDiagramEmbedPage />;
+  } else if (publicRoute === "download") {
+    content = <LazyPublicDownloadPage />;
   } else {
     const canShowGuestShell = !ready && !tokenStore.valid() && !hasOidcCallback();
     if (!ready && !canShowGuestShell) {

@@ -3170,6 +3170,376 @@ body {
   background: var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1)) !important;
 }
 
+/* Public client download page: one device-matched boarding pass before the full catalog. */
+.download-page {
+  background: var(--landing-canvas) !important;
+}
+
+.download-hero {
+  min-height: 760px;
+  background: var(--landing-canvas);
+}
+
+.download-channel-lines {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.download-channel-lines::before,
+.download-channel-lines::after {
+  position: absolute;
+  content: "";
+  left: 50%;
+  width: min(1100px, 92vw);
+  height: 520px;
+  border: 1px solid color-mix(in srgb, var(--landing-action) 15%, transparent);
+  border-radius: 50%;
+  transform: translateX(-50%);
+}
+
+.download-channel-lines::before {
+  top: 158px;
+}
+
+.download-channel-lines::after {
+  top: 196px;
+  width: min(930px, 80vw);
+  border-color: color-mix(in srgb, var(--landing-action) 9%, transparent);
+}
+
+.download-title {
+  font-family: "SF Pro Display", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: clamp(2.35rem, 6vw, 4.5rem);
+  line-height: 1.04;
+  letter-spacing: -0.045em;
+}
+
+.download-recommendation {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--landing-hairline);
+  border-radius: 20px;
+  background: var(--landing-surface);
+  box-shadow: 0 24px 70px rgba(29, 29, 31, 0.11);
+}
+
+.dark .download-recommendation {
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.48);
+}
+
+.download-recommendation-head,
+.download-device-chooser {
+  background: var(--landing-surface-soft);
+}
+
+.download-device-mark {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--landing-action);
+  background: var(--landing-action-soft);
+}
+
+.download-device-mark svg,
+.download-release-icon svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.macos-command-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.macos-command-label {
+  width: 2rem;
+}
+
+.macos-command-copy {
+  min-height: 32px;
+}
+
+.download-change-device {
+  width: fit-content;
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  color: var(--landing-action);
+  background: transparent;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.download-change-device:hover,
+.download-change-device[aria-expanded="true"] {
+  background: var(--landing-action-soft);
+}
+
+.download-change-device:focus-visible,
+.download-device-choice:focus-visible,
+.download-device-reset:focus-visible,
+.download-arch-choice:focus-visible,
+.download-release-row:focus-visible {
+  outline: 2px solid var(--landing-action);
+  outline-offset: 2px;
+}
+
+.download-device-choice,
+.download-device-reset {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--landing-hairline);
+  border-radius: 10px;
+  padding: 7px 10px;
+  color: var(--landing-ink);
+  background: var(--landing-surface);
+  font-size: 0.75rem;
+}
+
+.download-device-choice span,
+.download-device-reset {
+  color: var(--landing-muted);
+}
+
+.download-device-choice:hover,
+.download-device-choice[aria-pressed="true"],
+.download-device-reset:hover {
+  border-color: color-mix(in srgb, var(--landing-action) 38%, var(--landing-hairline));
+  color: var(--landing-action);
+  background: var(--landing-action-soft);
+}
+
+.download-device-choice[aria-pressed="true"] span {
+  color: inherit;
+}
+
+.download-match-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: #067647;
+  background: rgba(18, 183, 106, 0.12);
+  font-size: 0.6875rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.dark .download-match-badge {
+  color: #6ce9a6;
+  background: rgba(50, 213, 131, 0.13);
+}
+
+.download-match-badge-neutral {
+  color: var(--landing-muted);
+  background: color-mix(in srgb, var(--landing-ink) 7%, transparent);
+}
+
+.download-meta-chip {
+  border: 1px solid var(--landing-hairline);
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: var(--landing-surface-soft);
+}
+
+.download-arch-choice {
+  display: flex;
+  min-height: 76px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid var(--landing-hairline);
+  border-radius: 12px;
+  padding: 14px 16px;
+  color: var(--landing-ink);
+  background: var(--landing-surface-soft);
+  text-align: left;
+}
+
+.download-arch-choice span {
+  color: var(--landing-muted);
+  font-size: 0.75rem;
+}
+
+.download-arch-choice:hover {
+  border-color: color-mix(in srgb, var(--landing-action) 42%, var(--landing-hairline));
+  background: var(--landing-action-soft);
+}
+
+.download-steps {
+  overflow: hidden;
+  border: 1px solid var(--landing-hairline);
+  border-radius: 14px;
+  background: var(--landing-canvas);
+}
+
+.download-step + .download-step {
+  border-top: 1px solid var(--landing-hairline);
+}
+
+.download-page .landing-primary-button,
+.download-page .landing-secondary-button,
+.landing-download-entry .landing-primary-button {
+  width: fit-content;
+}
+
+.download-page .landing-primary-button,
+.download-page .landing-secondary-button {
+  min-height: 44px;
+  border-radius: 999px !important;
+  font-weight: 500;
+}
+
+.download-all {
+  animation: download-reveal 220ms ease-out;
+}
+
+@keyframes download-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.download-group {
+  border-radius: 14px !important;
+}
+
+.download-release-row {
+  display: flex;
+  min-height: 72px;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 11px 12px;
+  color: var(--landing-ink);
+  text-decoration: none;
+  transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
+}
+
+.download-release-row:hover {
+  border-color: var(--landing-hairline);
+  background: var(--landing-surface-soft);
+  transform: translateY(-1px);
+}
+
+.download-release-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--landing-action);
+  background: var(--landing-action-soft);
+}
+
+.download-inline-alert {
+  border: 1px solid color-mix(in srgb, #d97706 32%, var(--landing-hairline));
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: var(--landing-muted);
+  background: color-mix(in srgb, #f59e0b 8%, var(--landing-surface));
+  font-size: 0.8125rem;
+}
+
+@media (min-width: 640px) {
+  .download-step + .download-step {
+    border-top: 0;
+    border-left: 1px solid var(--landing-hairline);
+  }
+}
+
+@media (max-width: 639px) {
+  .download-hero {
+    min-height: 0;
+  }
+
+  .download-title {
+    font-size: clamp(2.1rem, 10.2vw, 2.5rem);
+    line-height: 1.08;
+  }
+
+  .download-channel-lines::before,
+  .download-channel-lines::after {
+    top: 190px;
+    width: 150vw;
+  }
+
+  .download-channel-lines::after {
+    top: 224px;
+    width: 125vw;
+  }
+
+  .download-recommendation {
+    border-radius: 16px;
+  }
+
+  .download-page .landing-primary-button,
+  .download-page .landing-secondary-button,
+  .landing-download-entry .landing-primary-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 420px) {
+  .macos-command-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .macos-command-label {
+    grid-column: 1;
+    grid-row: 1;
+    width: auto;
+    text-align: left;
+  }
+
+  .macos-command-code {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    min-height: 32px;
+    padding: 7px 6px;
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--landing-ink, currentColor) 4%, transparent);
+  }
+
+  .macos-command-copy {
+    grid-column: 2;
+    grid-row: 1;
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .download-all {
+    animation: none;
+  }
+
+  .download-release-row,
+  .download-page .transition-transform {
+    transition: none !important;
+  }
+}
+
 /* Apple-style public tools: NAT detection and device transfer share one quiet workspace shell. */
 .app-apple-tool {
   min-height: 100vh;

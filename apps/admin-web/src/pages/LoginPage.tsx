@@ -1,12 +1,9 @@
-import { useEffect, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
-import { MacosInstallGuide } from "../components/MacosInstallGuide";
 import { SpecusAqueduct } from "../components/SpecusAqueduct";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { UserMenuButton } from "../components/UserMenuButton";
-import { fetchPublicClientDownloads } from "../api/client";
-import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
 
 const metrics = [
@@ -159,6 +156,9 @@ function LoginPageContent() {
                 <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
                   登录管理台
                 </button>
+                <a className="landing-secondary-button" href="/download">
+                  下载客户端
+                </a>
                 {(certusRegistrationEnabled || registrationEnabled) && (
                   <button
                     type="button"
@@ -324,7 +324,7 @@ function LoginPageContent() {
             </p>
           </div>
 
-          <ClientDownloadsSection />
+          <ClientDownloadEntry />
         </div>
       </section>
 
@@ -529,138 +529,24 @@ function MobileTopologyEdge({ label, tone }: { label: string; tone: "peer" | "re
   );
 }
 
-const IMPL_LABELS: Record<ClientImplementation, string> = {
-  java: "Java 客户端",
-  go: "Go 客户端",
-  csharp: ".NET 客户端",
-};
-
-const IMPL_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
-
-function ClientDownloadsSection() {
-  const [links, setLinks] = useState<ClientDownloadLink[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    let cancelScheduledLoad = () => {};
-    const load = async () => {
-      try {
-        const data = await fetchPublicClientDownloads();
-        if (!cancelled) {
-          setLinks(data);
-          setLoadFailed(false);
-        }
-      } catch {
-        if (!cancelled) {
-          setLinks([]);
-          setLoadFailed(true);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoaded(true);
-        }
-      }
-    };
-    if ("requestIdleCallback" in window && "cancelIdleCallback" in window) {
-      const handle = window.requestIdleCallback(() => void load(), { timeout: 2200 });
-      cancelScheduledLoad = () => window.cancelIdleCallback(handle);
-    } else {
-      const handle = globalThis.setTimeout(() => void load(), 1200);
-      cancelScheduledLoad = () => globalThis.clearTimeout(handle);
-    }
-    return () => {
-      cancelled = true;
-      cancelScheduledLoad();
-    };
-  }, []);
-
-  const grouped = IMPL_ORDER
-    .map((impl) => ({ implementation: impl, items: links.filter((l) => l.implementation === impl) }))
-    .filter((g) => g.items.length > 0);
-
+function ClientDownloadEntry() {
   return (
-    <div className="mt-10">
-      <div className="mb-6 max-w-2xl">
-        <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">获取客户端</h2>
-        <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-          macOS 推荐通过 Homebrew 安装 Go 客户端；其他平台与实现可从 GitHub Releases 下载。所有实现共享同一份 JSON 配置格式。
-        </p>
-      </div>
-      <MacosInstallGuide landing />
-      {!loaded ? (
-        <p className="mt-4 text-small text-zinc-600 dark:text-zinc-400" role="status">正在加载手动下载链接…</p>
-      ) : grouped.length > 0 ? (
-        <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {grouped.map(({ implementation, items }) => (
-            <section
-              key={implementation}
-              className="app-apple-landing-surface glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
-            >
-              <div className="grid gap-3 p-4">
-                <span className="w-fit rounded-md bg-primary-100 px-2 py-1 text-tiny text-primary-700 dark:bg-primary-500/15 dark:text-primary-300">
-                  {IMPL_LABELS[implementation]}
-                </span>
-                <div className="flex flex-col gap-2">
-                  {items.map((link) => (
-                    <a
-                      key={link.id}
-                      className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-primary-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
-                      href={link.downloadUrl}
-                      rel="noopener noreferrer"
-                      target="_blank"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-small font-medium text-zinc-950 group-hover:text-primary-700 dark:text-white dark:group-hover:text-primary-400">
-                          {link.displayName}
-                        </div>
-                        <div className="mt-1 flex flex-wrap gap-1 text-tiny text-zinc-600 dark:text-zinc-400">
-                          <span>{shortPlatform(link.platform)}</span>
-                          <span>·</span>
-                          <span>{shortArch(link.arch)}</span>
-                        </div>
-                      </div>
-                      <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-primary-700 dark:group-hover:text-primary-400">↗</span>
-                    </a>
-                  ))}
-                </div>
-              </div>
-            </section>
-          ))}
+    <section className="app-apple-landing-surface landing-download-entry mt-10 overflow-hidden p-5 sm:p-7">
+      <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
+        <div className="max-w-2xl">
+          <span className="landing-apple-kicker text-tiny font-semibold">CLIENT DOWNLOAD</span>
+          <h2 className="mt-2 text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">为这台设备选择客户端</h2>
+          <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            独立下载页会识别 macOS、Windows 或 Linux 与处理器架构，优先给出最合适的安装方式；也可展开查看全部平台与实现。
+          </p>
         </div>
-      ) : (
-        <p
-          aria-live="polite"
-          className="mt-4 text-small text-zinc-600 dark:text-zinc-400"
-          role="status"
-        >
-          {loadFailed
-            ? "手动下载链接暂时无法加载；macOS 仍可使用上方 Homebrew 命令安装。"
-            : "当前没有可用的手动下载链接。"}
-        </p>
-      )}
-    </div>
+        <a className="landing-primary-button shrink-0 px-6" href="/download">
+          打开下载页
+          <span aria-hidden="true" className="ml-2">→</span>
+        </a>
+      </div>
+    </section>
   );
-}
-
-function shortPlatform(platform: string): string {
-  switch (platform) {
-    case "windows": return "Windows";
-    case "linux": return "Linux";
-    case "macos": return "macOS";
-    case "any": return "跨平台";
-    default: return platform;
-  }
-}
-
-function shortArch(arch: string): string {
-  switch (arch) {
-    case "x64": return "x86_64";
-    case "arm64": return "ARM64";
-    case "any": return "跨架构";
-    default: return arch;
-  }
 }
 
 function PrincipleCard({
