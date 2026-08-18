@@ -6,7 +6,8 @@ import org.springframework.stereotype.Component;
 /**
  * Local username/password login for the management UI, as an alternative to OIDC. A successful
  * login mints a short-lived HS256 JWT that the admin API accepts alongside the gateway's RS256
- * tokens. Defaults to {@code admin/admin} for local development — change it before exposing.
+ * tokens. The password is empty by default, which disables this login until an operator sets one;
+ * see {@link SecurityBaselineValidator} for the production checks applied to configured values.
  */
 @Component
 @ConfigurationProperties(prefix = "specus.auth")
@@ -15,7 +16,8 @@ public class AuthProperties {
     /** Allow visitors to self-register USER-role accounts in the default tenant. */
     private boolean registrationEnabled = true;
     private String username = "admin";
-    private String password = "admin";
+    private String password = "";
+    private final LoginRateLimit loginRateLimit = new LoginRateLimit();
     /** Default tenant used by local password-login and existing default-tenant data. */
     private String tenantId = "default";
     /** HS256 signing secret; when blank a random key is generated at startup (tokens reset on restart). */
@@ -76,5 +78,52 @@ public class AuthProperties {
 
     public void setTokenTtlSeconds(long tokenTtlSeconds) {
         this.tokenTtlSeconds = tokenTtlSeconds;
+    }
+
+    public LoginRateLimit getLoginRateLimit() {
+        return loginRateLimit;
+    }
+
+    /**
+     * Application-level login throttling. It applies independently of the captcha so deployments
+     * that run without Turnstile still bound credential stuffing.
+     */
+    public static class LoginRateLimit {
+        private boolean enabled = true;
+        private int perIp = 20;
+        private int perAccount = 10;
+        private long windowSeconds = 300;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getPerIp() {
+            return perIp;
+        }
+
+        public void setPerIp(int perIp) {
+            this.perIp = perIp;
+        }
+
+        public int getPerAccount() {
+            return perAccount;
+        }
+
+        public void setPerAccount(int perAccount) {
+            this.perAccount = perAccount;
+        }
+
+        public long getWindowSeconds() {
+            return windowSeconds;
+        }
+
+        public void setWindowSeconds(long windowSeconds) {
+            this.windowSeconds = windowSeconds;
+        }
     }
 }

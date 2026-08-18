@@ -29,6 +29,14 @@ func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
 	cfg.Netty.Port = 0
 	cfg.ManagementAddr = "127.0.0.1:0"
 	cfg.ConnectionString = filepath.Join(t.TempDir(), "test.db")
+	// Tests rely on the demo client/credential seed and on the weak built-in password; both are
+	// only permitted outside prod.
+	if cfg.Env == "" {
+		cfg.Env = "test"
+	}
+	if cfg.Auth.Password == "" {
+		cfg.Auth.Password = "admin"
+	}
 
 	app, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

@@ -102,7 +102,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger.Info("traffic detail store: database")
 	}
 
-	if cfg.Database.SeedDemoClient {
+	if cfg.SeedDemoDataEnabled() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		cancel()

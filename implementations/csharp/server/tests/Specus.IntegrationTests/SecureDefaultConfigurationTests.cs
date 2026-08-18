@@ -28,7 +28,14 @@ public sealed class SecureDefaultConfigurationTests
         Assert.False(auth.GetProperty("TurnstileEnabled").GetBoolean());
         Assert.False(auth.GetProperty("EmailVerificationEnabled").GetBoolean());
         Assert.Equal("admin", auth.GetProperty("Username").GetString());
-        Assert.Equal("admin", auth.GetProperty("Password").GetString());
+        // The shipped configuration must not carry a usable password; operators opt in explicitly.
+        Assert.Equal(string.Empty, auth.GetProperty("Password").GetString());
+        Assert.True(auth.GetProperty("LoginRateLimitEnabled").GetBoolean());
+        Assert.True(auth.GetProperty("LoginRateLimitPerIp").GetInt32() > 0);
+        Assert.True(auth.GetProperty("LoginRateLimitPerAccount").GetInt32() > 0);
+        // Unset environment resolves to prod, which refuses demo data and default credentials.
+        Assert.Equal(DeploymentEnvironment.Prod,
+            DeploymentEnvironments.Parse(specus.GetProperty("Env").GetString()));
         Assert.Equal(string.Empty, auth.GetProperty("TurnstileSecretKey").GetString());
         Assert.Equal(string.Empty, auth.GetProperty("SmtpPassword").GetString());
 
@@ -37,7 +44,7 @@ public sealed class SecureDefaultConfigurationTests
     }
 
     [Fact]
-    public void AuthOptionFallbackMatchesJavaDevelopmentDefaults()
+    public void AuthOptionFallbackShipsNoUsablePasswordCredential()
     {
         var options = new AuthOptions();
 
@@ -46,6 +53,8 @@ public sealed class SecureDefaultConfigurationTests
         Assert.False(options.TurnstileEnabled);
         Assert.False(options.EmailVerificationEnabled);
         Assert.Equal("admin", options.Username);
-        Assert.Equal("admin", options.Password);
+        // Blank keeps password login disabled until an operator sets a unique value.
+        Assert.Equal(string.Empty, options.Password);
+        Assert.True(options.LoginRateLimitEnabled);
     }
 }

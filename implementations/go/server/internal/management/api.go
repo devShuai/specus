@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -47,6 +48,7 @@ type API struct {
 	rooms        *transfer.RoomService
 	mediaCapture *media.Service
 	turnstile    *security.TurnstileVerifier
+	loginLimiter *security.LoginRateLimiter
 	registration *registrationService
 	logger       *slog.Logger
 }
@@ -72,6 +74,7 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
 		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
+		loginLimiter: security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
 		registration: registration, logger: logger}
 }
 
@@ -229,10 +232,29 @@ func (a *API) ValidateConnectionWebSocketToken(token string) (wsevents.Access, b
 
 // ---- auth ----------------------------------------------------------------------------
 
+// loginClientIP returns the connection peer address. Forwarded headers are not consulted: without a
+// trusted-proxy boundary they are attacker-controlled and would let a client reset its own quota.
+func loginClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	// Throttle before the captcha and credential check so deployments without Turnstile are still
+	// bounded. Connection peer only: forwarded headers are not trusted for quota decisions.
+	if allowed, retryAfter := a.loginLimiter.Allow(loginClientIP(r), req.Username); !allowed {
+		w.Header().Set("Retry-After", strconv.FormatInt(int64(retryAfter.Seconds()), 10))
+		writeError(w, http.StatusTooManyRequests, security.LoginRateLimitedMessage)
 		return
 	}
 	if err := a.turnstile.Verify(r.Context(), req.TurnstileToken, security.TurnstileActionLogin); err != nil {
@@ -249,6 +271,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	a.loginLimiter.RecordSuccess(req.Username)
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 

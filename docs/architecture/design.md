@@ -246,7 +246,7 @@ HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后
 | MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` |
 | PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` |
 
-`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `SPECUS_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。
+`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `SPECUS_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。该开关只在 `SPECUS_ENV=dev` / `test` 下生效：`prod`（默认，含未设置和未知值）无条件跳过演示数据，并在启动时拒绝已知默认管理口令。三端（Java / Go / .NET）共用同一套环境判定、默认口令清单与登录限速语义。
 
 ## 9. 并发与线程模型
 

@@ -135,6 +135,9 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
         {
             config.AddInMemoryCollection(new Dictionary<string, string?>
             {
+                // Integration tests rely on the demo client/credential seed and on the weak built-in
+                // password; both are only permitted outside prod.
+                ["Specus:Env"] = "test",
                 // Listen on an ephemeral TCP control port so we can run in parallel.
                 ["Specus:Netty:Port"] = "0",
                 ["Specus:Auth:PasswordLoginEnabled"] = "true",

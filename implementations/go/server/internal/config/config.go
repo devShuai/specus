@@ -29,6 +29,9 @@ type Config struct {
 	PublicTransfer   PublicTransferConfig   `json:"publicTransfer"`
 	Oidc             OidcConfig             `json:"oidc"`
 	TLS              TLSConfig              `json:"tls"`
+	// Env is the deployment environment: prod (default) | dev | test. Unset or unknown values
+	// resolve to prod so a typo never disables a production guard.
+	Env              string                 `json:"env"`
 	PublicAddress    string                 `json:"publicAddress"`
 	ConnectionString string                 `json:"connectionString"`
 	// ManagementAddr is the listen address for the admin/HTTP surface (default :8088).
@@ -80,6 +83,16 @@ type AuthConfig struct {
 	TokenTTLSeconds      int64                   `json:"tokenTtlSeconds"`
 	Turnstile            TurnstileConfig         `json:"turnstile"`
 	EmailVerification    EmailVerificationConfig `json:"emailVerification"`
+	LoginRateLimit       LoginRateLimitConfig    `json:"loginRateLimit"`
+}
+
+// LoginRateLimitConfig bounds login attempts independently of the captcha, so deployments that run
+// without Turnstile still limit credential stuffing.
+type LoginRateLimitConfig struct {
+	Enabled       bool  `json:"enabled"`
+	PerIP         int   `json:"perIp"`
+	PerAccount    int   `json:"perAccount"`
+	WindowSeconds int64 `json:"windowSeconds"`
 }
 
 type TurnstileConfig struct {
@@ -397,9 +410,16 @@ func Default() Config {
 			PasswordLoginEnabled: true,
 			RegistrationEnabled:  true,
 			Username:             "admin",
-			Password:             "admin",
-			TenantID:             "default",
-			TokenTTLSeconds:      28800,
+			// Blank by default: password login stays disabled until an operator sets one.
+			Password:        "",
+			TenantID:        "default",
+			TokenTTLSeconds: 28800,
+			LoginRateLimit: LoginRateLimitConfig{
+				Enabled:       true,
+				PerIP:         20,
+				PerAccount:    10,
+				WindowSeconds: 300,
+			},
 			Turnstile: TurnstileConfig{
 				VerifyURL: "https://challenges.cloudflare.com/turnstile/v0/siteverify",
 			},
@@ -543,6 +563,9 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.applyEnv(environMap())
+	if err := cfg.validateSecurityBaseline(); err != nil {
+		return Config{}, err
+	}
 	if cfg.Netty.MaxFrameSize < 11 {
 		return Config{}, fmt.Errorf("netty.maxFrameSize must be at least the 11-byte frame header")
 	}
@@ -645,6 +668,8 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("SPECUS_LOGIN_EXECUTOR_MAX", &cfg.Login.ExecutorMaxSize)
 	setInt("SPECUS_LOGIN_EXECUTOR_QUEUE", &cfg.Login.ExecutorQueueCapacity)
 
+	setStr("SPECUS_ENV", &cfg.Env)
+
 	setStr("SPECUS_DB_PROVIDER", &cfg.Database.Provider)
 	setBool("SPECUS_DB_SEED_DEMO_CLIENT", &cfg.Database.SeedDemoClient)
 
@@ -655,6 +680,10 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("SPECUS_AUTH_TENANT_ID", &cfg.Auth.TenantID)
 	setStr("SPECUS_AUTH_JWT_SECRET", &cfg.Auth.JwtSecret)
 	setInt64("SPECUS_AUTH_TOKEN_TTL_SECONDS", &cfg.Auth.TokenTTLSeconds)
+	setBool("SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED", &cfg.Auth.LoginRateLimit.Enabled)
+	setInt("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP", &cfg.Auth.LoginRateLimit.PerIP)
+	setInt("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT", &cfg.Auth.LoginRateLimit.PerAccount)
+	setInt64("SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS", &cfg.Auth.LoginRateLimit.WindowSeconds)
 	setBool("SPECUS_AUTH_TURNSTILE_ENABLED", &cfg.Auth.Turnstile.Enabled)
 	setStr("SPECUS_AUTH_TURNSTILE_SITE_KEY", &cfg.Auth.Turnstile.SiteKey)
 	setStr("SPECUS_AUTH_TURNSTILE_SECRET_KEY", &cfg.Auth.Turnstile.SecretKey)

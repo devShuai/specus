@@ -65,7 +65,12 @@ logging:
       clean-history-on-start: ${SPECUS_LOG_CLEAN_HISTORY_ON_START:true}
 
 specus:
+  # Deployment environment: prod (default) | dev | test. Unset or unknown values resolve to prod so
+  # a typo never disables a production guard. prod refuses known default passwords at startup and
+  # never seeds demo data.
+  env: ${SPECUS_ENV:}
   database:
+    # Demo client/credential seeding. Honoured only in dev/test; prod ignores it.
     seed-demo-client: ${SPECUS_DB_SEED_DEMO_CLIENT:true}
   netty:
     port: ${SPECUS_NETTY_PORT:7010}
@@ -182,15 +187,23 @@ specus:
     token-ttl-seconds: ${SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS:28800}
   auth:
     # Local username/password login for the management UI (alternative to OIDC). A successful login
-    # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. Change the
-    # default admin/admin before exposing the server. Set password to blank to disable this login.
+    # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. The password is
+    # blank by default, which keeps this login disabled until an operator sets SPECUS_AUTH_PASSWORD;
+    # prod refuses to start when the configured value is a known default.
     password-login-enabled: ${SPECUS_AUTH_PASSWORD_LOGIN_ENABLED:true}
     # Allow visitors to self-register USER-role accounts in the default tenant from the login
     # dialog. Requires password login. Disable on deployments that only want admin-managed users.
     registration-enabled: ${SPECUS_AUTH_REGISTRATION_ENABLED:true}
     username: ${SPECUS_AUTH_USERNAME:admin}
-    password: ${SPECUS_AUTH_PASSWORD:admin}
+    password: ${SPECUS_AUTH_PASSWORD:}
     tenant-id: ${SPECUS_AUTH_TENANT_ID:default}
+    # Application-level login throttling, independent of Turnstile. Counts every attempt per source
+    # IP and per target account; either dimension exceeding its budget returns 429 + Retry-After.
+    login-rate-limit:
+      enabled: ${SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED:true}
+      per-ip: ${SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP:20}
+      per-account: ${SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT:10}
+      window-seconds: ${SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS:300}
     jwt-secret: ${SPECUS_AUTH_JWT_SECRET:}
     token-ttl-seconds: ${SPECUS_AUTH_TOKEN_TTL_SECONDS:28800}
     turnstile:

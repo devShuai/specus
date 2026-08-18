@@ -143,7 +143,9 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台支持用户名/密码与 OIDC 登录，管理 API 校验 Bearer JWT，详见[管理后台登录](#管理后台登录)。
 
-服务端默认使用当前工作目录下的 SQLite 数据库 `specus.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client` 与启动凭证 `apiKey=demo-client / secret=test1234`（可通过 `SPECUS_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+服务端默认使用当前工作目录下的 SQLite 数据库 `specus.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构。演示客户端 `Demo client` 与启动凭证 `apiKey=demo-client / secret=test1234` 只在 `SPECUS_ENV=dev` 或 `test` 且 `SPECUS_DB_SEED_DEMO_CLIENT=true`（默认）时创建；`SPECUS_ENV` 未设置时按 `prod` 处理，不会写入任何演示数据。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+
+生产部署清单：设置 `SPECUS_ENV=prod`（或留空，默认即 prod）；用 `SPECUS_AUTH_PASSWORD` 配置唯一强口令，或保持留空改用 OIDC 登录。若在 prod 下把密码设为已知默认口令，服务会拒绝启动并提示更换。登录接口默认按来源 IP 与账号双维度限速，与 Turnstile 相互独立。
 
 如需在端口映射日志中显示服务端公网地址，可设置 `SPECUS_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
 
@@ -349,10 +351,15 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
+| `SPECUS_ENV` | `prod` | 部署环境：`prod` / `dev` / `test`；留空或未知值一律按 `prod` 处理 |
 | `SPECUS_AUTH_USERNAME` | `admin` | 管理用户名 |
-| `SPECUS_AUTH_PASSWORD` | `admin` | 管理密码；留空则禁用密码登录 |
+| `SPECUS_AUTH_PASSWORD` | （空） | 管理密码；默认留空即禁用密码登录。`prod` 下配置为已知默认口令（如 `admin`、`test1234`、`changeme`）会拒绝启动 |
 | `SPECUS_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |
 | `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED` | `true` | 登录尝试限速总开关，独立于验证码 |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP` | `20` | 单来源 IP 在一个窗口内允许的登录尝试次数 |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | 单账号在一个窗口内允许的登录尝试次数（跨来源 IP 累计） |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `300` | 限速窗口长度（秒）；超限返回 `429` 与 `Retry-After` |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `true` | 自助注册总开关；还依赖密码登录、Turnstile、邮箱验证和 SMTP |
 | `SPECUS_AUTH_JWT_SECRET` | （空） | HS256 签名密钥；留空则启动时随机生成（重启后旧令牌失效，需重新登录） |
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | 密码登录令牌有效期（秒），默认 8 小时 |

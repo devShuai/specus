@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
                 "spring.jpa.hibernate.ddl-auto=create-drop",
                 "specus.netty.port=0",
                 "specus.database.seed-demo-client=false",
+                // Exercises the weak built-in credential on purpose; prod would refuse to start.
+                "specus.env=dev",
                 "specus.auth.username=admin",
                 "specus.auth.password=admin"
         }

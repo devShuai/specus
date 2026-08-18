@@ -89,14 +89,26 @@ public static class AdminApiEndpoints
 
     public static void MapAdminApi(this WebApplication app)
     {
-        app.MapPost("/auth/login", async (AdminLoginRequest? request, LocalTokenService tokens,
-            ManagementUserService users, ITurnstileVerifier turnstile,
-            CancellationToken cancellationToken) =>
+        app.MapPost("/auth/login", async (AdminLoginRequest? request, HttpContext httpContext,
+            LocalTokenService tokens, ManagementUserService users, ITurnstileVerifier turnstile,
+            LoginRateLimiter loginRateLimiter, CancellationToken cancellationToken) =>
         {
             if (request is null)
             {
                 return Results.Json(new { error = "用户名或密码错误" },
                     statusCode: StatusCodes.Status401Unauthorized);
+            }
+            // Throttle before the captcha and credential check so deployments without Turnstile are
+            // still bounded. Connection peer only: forwarded headers are not trusted for quotas.
+            if (!loginRateLimiter.TryAcquire(
+                    httpContext.Connection.RemoteIpAddress?.ToString(),
+                    request.Username,
+                    out var retryAfterSeconds))
+            {
+                httpContext.Response.Headers.RetryAfter =
+                    retryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return Results.Json(new { error = LoginRateLimiter.RateLimitedMessage },
+                    statusCode: StatusCodes.Status429TooManyRequests);
             }
             await turnstile.VerifyAsync(request.TurnstileToken, TurnstileVerifier.LoginAction,
                     cancellationToken)
@@ -109,6 +121,7 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
+            loginRateLimiter.RecordSuccess(request.Username);
             return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 

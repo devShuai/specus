@@ -24,17 +24,25 @@ public sealed class DatabaseInitializer
     private readonly IServiceProvider _services;
     private readonly IOptions<DatabaseOptions> _options;
     private readonly IOptions<ClientAuthOptions> _clientAuth;
+    private readonly IOptions<SpecusOptions> _specus;
     private readonly ILogger<DatabaseInitializer> _logger;
 
     public DatabaseInitializer(IServiceProvider services, IOptions<DatabaseOptions> options,
         IOptions<ClientAuthOptions> clientAuth,
+        IOptions<SpecusOptions> specus,
         ILogger<DatabaseInitializer> logger)
     {
         _services = services;
         _options = options;
         _clientAuth = clientAuth;
+        _specus = specus;
         _logger = logger;
     }
+
+    /// <summary>Demo data is convenience-only; prod never seeds it regardless of the requested flag.</summary>
+    private bool SeedDemoDataEnabled =>
+        _options.Value.SeedDemoClient
+        && DeploymentEnvironments.Parse(_specus.Value.Env).AllowsDemoData();
 
     public async Task<DatabaseInitializeResult> InitializeAsync(CancellationToken cancellationToken,
         string? tenantId = null, string? ownerUsername = null)
@@ -56,7 +64,7 @@ public sealed class DatabaseInitializer
         await EnsureTrafficDetailTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsurePeerMeshTablesAsync(db, cancellationToken).ConfigureAwait(false);
 
-        if (_options.Value.SeedDemoClient)
+        if (SeedDemoDataEnabled)
         {
             await SeedDemoClientAsync(db, normalizedTenant, normalizedOwner, cancellationToken).ConfigureAwait(false);
         }

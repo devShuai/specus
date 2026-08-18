@@ -85,6 +85,12 @@ public sealed class SpecusOptions
 {
     public const string SectionName = "Specus";
 
+    /// <summary>
+    /// Deployment environment: prod (default) | dev | test. Unset or unknown values resolve to prod
+    /// so a typo never disables a production guard.
+    /// </summary>
+    public string? Env { get; set; }
+
     public string? PublicAddress { get; set; }
 }
 
@@ -95,10 +101,23 @@ public sealed class AuthOptions
     public bool PasswordLoginEnabled { get; set; } = true;
     public bool RegistrationEnabled { get; set; } = true;
     public string Username { get; set; } = "admin";
-    public string Password { get; set; } = "admin";
+    /// <summary>
+    /// Blank by default: password login stays disabled until an operator sets one. Production
+    /// refuses to start when the configured value is a known default credential.
+    /// </summary>
+    public string Password { get; set; } = string.Empty;
     public string TenantId { get; set; } = "default";
     public string? JwtSecret { get; set; }
     public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
+
+    /// <summary>
+    /// Application-level login throttling, independent of the captcha. Every attempt is counted per
+    /// source IP and per target account; either dimension exceeding its budget answers 429.
+    /// </summary>
+    public bool LoginRateLimitEnabled { get; set; } = true;
+    public int LoginRateLimitPerIp { get; set; } = 20;
+    public int LoginRateLimitPerAccount { get; set; } = 10;
+    public long LoginRateLimitWindowSeconds { get; set; } = 300;
 
     public bool TurnstileEnabled { get; set; } = false;
     public string TurnstileSiteKey { get; set; } = string.Empty;

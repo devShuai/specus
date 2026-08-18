@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.database;
 
 import com.theshuai.specusserver.config.ClientAuthProperties;
+import com.theshuai.specusserver.config.DeploymentEnvironment;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.ClientCredential;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
@@ -38,6 +39,7 @@ public class DatabaseInitializer {
                                ClientAuthProperties clientAuthProperties,
                                JdbcTemplate jdbcTemplate,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
+                               @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
                                @Value("${specus.auth.tenant-id:default}") String defaultTenantId,
                                @Value("${specus.auth.username:admin}") String adminUsername) {
@@ -45,7 +47,8 @@ public class DatabaseInitializer {
         this.clientCredentialRepository = clientCredentialRepository;
         this.clientAuthProperties = clientAuthProperties;
         this.jdbcTemplate = jdbcTemplate;
-        this.seedDemoClient = seedDemoClient;
+        // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
+        this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
         this.defaultTenantId = TenantContext.normalize(defaultTenantId);
         this.adminUsername = normalizeAdminUsername(adminUsername);

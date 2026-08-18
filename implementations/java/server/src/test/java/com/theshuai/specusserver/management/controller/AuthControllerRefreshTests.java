@@ -4,7 +4,9 @@ import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
+import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.security.LocalTokenService;
+import com.theshuai.specusserver.security.LoginRateLimiter;
 import com.theshuai.specusserver.security.TurnstileVerifier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,7 +35,8 @@ class AuthControllerRefreshTests {
                 tokens,
                 users,
                 mock(RegistrationService.class),
-                mock(TurnstileVerifier.class));
+                mock(TurnstileVerifier.class),
+                new LoginRateLimiter(new AuthProperties()));
     }
 
     @Test

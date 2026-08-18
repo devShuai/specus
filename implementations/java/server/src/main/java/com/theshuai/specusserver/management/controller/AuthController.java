@@ -4,7 +4,9 @@ import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
 import com.theshuai.specusserver.security.LocalTokenService;
+import com.theshuai.specusserver.security.LoginRateLimiter;
 import com.theshuai.specusserver.security.TurnstileVerifier;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -26,27 +28,43 @@ public class AuthController {
     private final ManagementUserService managementUserService;
     private final RegistrationService registrationService;
     private final TurnstileVerifier turnstileVerifier;
+    private final LoginRateLimiter loginRateLimiter;
 
     public AuthController(LocalTokenService localTokenService,
                           ManagementUserService managementUserService,
                           RegistrationService registrationService,
-                          TurnstileVerifier turnstileVerifier) {
+                          TurnstileVerifier turnstileVerifier,
+                          LoginRateLimiter loginRateLimiter) {
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
         this.registrationService = registrationService;
         this.turnstileVerifier = turnstileVerifier;
+        this.loginRateLimiter = loginRateLimiter;
     }
 
     @PostMapping("/auth/login")
-    public ResponseEntity<?> login(@RequestBody(required = false) LoginRequest request) {
+    public ResponseEntity<?> login(@RequestBody(required = false) LoginRequest request,
+                                   HttpServletRequest httpRequest) {
         if (request == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "用户名或密码错误"));
         }
+        // 限流先于验证码与凭据校验:关闭 Turnstile 的部署同样受尝试次数约束。
+        loginRateLimiter.checkLoginAttempt(clientIp(httpRequest), request.username());
         turnstileVerifier.verify(request.turnstileToken(), TurnstileVerifier.LOGIN_ACTION);
         return managementUserService.authenticate(request.username(), request.password())
-                .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
+                .<ResponseEntity<?>>map(user -> {
+                    loginRateLimiter.recordSuccess(request.username());
+                    return ResponseEntity.ok(buildTokenBody(user));
+                })
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(Map.of("error", "用户名或密码错误")));
+    }
+
+    /**
+     * 限流只使用连接对端地址。转发头在建立统一 trusted-proxy 边界前不可信,不参与配额判定。
+     */
+    private String clientIp(HttpServletRequest request) {
+        return request == null ? null : request.getRemoteAddr();
     }
 
     /**

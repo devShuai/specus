@@ -38,7 +38,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(RateLimitedException.class)
     public ResponseEntity<Map<String, String>> handleRateLimited(RateLimitedException exception) {
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", exception.getMessage()));
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS);
+        if (exception.getRetryAfterSeconds() > 0) {
+            response.header("Retry-After", Long.toString(exception.getRetryAfterSeconds()));
+        }
+        return response.body(Map.of("error", exception.getMessage()));
     }
 
     @ExceptionHandler(IllegalStateException.class)

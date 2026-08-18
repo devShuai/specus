@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.ControlChannel;
@@ -111,6 +112,7 @@ builder.Services.AddScoped<PublicTransferRoomService>();
 builder.Services.AddScoped<RegistrationService>();
 builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSender>();
 builder.Services.AddSingleton<ITurnstileVerifier, TurnstileVerifier>();
+builder.Services.AddSingleton<LoginRateLimiter>();
 builder.Services.AddHostedService<RegistrationChallengeCleanupService>();
 builder.Services.AddSingleton<TurnCredentialService>();
 builder.Services.AddScoped<PeerMeshService>();
@@ -178,6 +180,24 @@ builder.Services.AddSingleton<ControlChannelListener>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ControlChannelListener>());
 
 var app = builder.Build();
+
+// Refuse to start a production deployment that still carries a shipped default credential.
+{
+    var specusOptions = app.Services.GetRequiredService<IOptions<SpecusOptions>>().Value;
+    var authOptions = app.Services.GetRequiredService<IOptions<AuthOptions>>().Value;
+    var environment = DeploymentEnvironments.Parse(specusOptions.Env);
+    var violation = DeploymentEnvironments.DescribeSecurityBaselineViolation(
+        environment, authOptions.PasswordLoginEnabled, authOptions.Password);
+    if (violation is not null)
+    {
+        throw new InvalidOperationException(violation);
+    }
+    if (DeploymentEnvironments.IsKnownDefaultPassword(authOptions.Password))
+    {
+        app.Logger.LogWarning(
+            "[security-baseline] Specus:Auth:Password is a known default credential; prod would refuse to start");
+    }
+}
 
 // Boot-time DB migration + demo seed.
 using (var scope = app.Services.CreateScope())
