@@ -14,5 +14,12 @@
   },
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
-  "peerMeshMtu": 1280
+  "peerMeshMtu": 1280,
+  // Phase one only checks and opens the download guide; it never replaces the running jar.
+  "updateCheckEnabled": true,
+  // Shared-schema compatibility only: Java phase one never self-replaces, even when true.
+  "autoUpdate": false,
+  // Checked once at startup, then every 1..168 hours (values outside the range are clamped).
+  "updateCheckIntervalHours": 24,
+  "openUpdatePage": true
 }

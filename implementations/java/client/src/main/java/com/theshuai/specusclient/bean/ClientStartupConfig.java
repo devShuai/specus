@@ -14,6 +14,8 @@ public class ClientStartupConfig {
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;
     /** Startup + periodic catalogue check. Java phase one only notifies; it never replaces the jar. */
     private boolean updateCheckEnabled = true;
+    /** Accepted for the shared cross-client schema; Java phase one deliberately never self-updates. */
+    private boolean autoUpdate;
     private long updateCheckIntervalHours = 24;
     private boolean openUpdatePage = true;
 }

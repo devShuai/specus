@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -14,6 +15,7 @@ using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.DirectHttp;
 using Specus.Client.Runtime;
+using Specus.Client.Updates;
 
 namespace Specus.Client.Desktop;
 
@@ -33,6 +35,8 @@ public partial class MainWindow : Window
 
     private readonly UiSpecusObserver _observer;
     private readonly FileTransferManager _transferManager = FileTransferManager.Instance;
+    private readonly ClientUpdateService _updateService = new();
+    private readonly CancellationTokenSource _updateCts = new();
     private CancellationTokenSource? _clientCts;
     private SpecusControlClient? _client;
     private Task? _clientTask;
@@ -48,6 +52,8 @@ public partial class MainWindow : Window
     private bool _closing;
     private bool _logExpanded;
     private bool _clientLoggedIn;
+    private bool _updateRestarting;
+    private int _updateCheckActive;
 
     public ObservableCollection<TcpRouteSnapshot> TcpRoutes { get; } = new();
 
@@ -70,6 +76,7 @@ public partial class MainWindow : Window
         _observer = new UiSpecusObserver(this);
         _transferManager.TransferEvent += OnTransferEvent;
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
+        Loaded += MainWindow_Loaded;
         LoadSettingsIntoForm();
         ApplyConfiguredTheme();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
@@ -77,6 +84,9 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _updateCts.Cancel();
+        _updateCts.Dispose();
+        _updateService.Dispose();
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
         _transferManager.TransferEvent -= OnTransferEvent;
         base.OnClosed(e);
@@ -110,6 +120,17 @@ public partial class MainWindow : Window
         {
             MessageBox.Show(this, ex.Message, "保存配置失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
+    }
+
+    private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        Loaded -= MainWindow_Loaded;
+        await RunUpdateLoopAsync(_updateCts.Token);
+    }
+
+    private async void CheckUpdateButton_Click(object sender, RoutedEventArgs e)
+    {
+        await CheckForUpdateAsync(showUpToDate: true, _updateCts.Token);
     }
 
     private void ThemeModeButton_Click(object sender, RoutedEventArgs e)
@@ -324,6 +345,10 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(CancelEventArgs e)
     {
+        if (!_updateRestarting)
+        {
+            _updateCts.Cancel();
+        }
         if (_running && !_closing)
         {
             e.Cancel = true;
@@ -332,6 +357,147 @@ public partial class MainWindow : Window
             return;
         }
         base.OnClosing(e);
+    }
+
+    private async Task RunUpdateLoopAsync(CancellationToken cancellationToken)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SPECUS_SKIP_UPDATE_ONCE"), "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (UpdateCheckEnabledCheckBox.IsChecked == true)
+            {
+                await CheckForUpdateAsync(showUpToDate: false, cancellationToken);
+            }
+            try
+            {
+                await Task.Delay(TimeSpan.FromHours(ParseUpdateIntervalHours()), cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task CheckForUpdateAsync(bool showUpToDate, CancellationToken cancellationToken)
+    {
+        if (Interlocked.Exchange(ref _updateCheckActive, 1) != 0)
+        {
+            return;
+        }
+        CheckUpdateButton.IsEnabled = false;
+        CheckUpdateButton.Content = "检查中…";
+        try
+        {
+            var serverText = ServerBaseUrlBox.Text.Trim();
+            if (!Uri.TryCreate(serverText, UriKind.Absolute, out var serverUri))
+            {
+                if (showUpToDate)
+                {
+                    MessageBox.Show(this, "请先填写有效的服务端地址。", "检查更新",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                return;
+            }
+            var update = await _updateService.CheckAsync(serverUri, ClientUpdateTarget.CSharpDesktop,
+                ClientVersion.Current, cancellationToken);
+            if (!update.UpdateAvailable)
+            {
+                if (showUpToDate)
+                {
+                    MessageBox.Show(this, $"当前已是最新版本（{ClientVersion.Current}）。", "检查更新",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                return;
+            }
+
+            var install = AutoUpdateCheckBox.IsChecked == true;
+            if (!install)
+            {
+                var mandatoryText = update.Mandatory
+                    ? "这是必须更新；当前版本低于服务端支持的最低版本。\n\n"
+                    : string.Empty;
+                var changelog = string.IsNullOrWhiteSpace(update.ChangelogUrl)
+                    ? string.Empty
+                    : $"\n更新说明：{ClientUpdateDisplay.Sanitize(update.ChangelogUrl)}";
+                install = MessageBox.Show(this,
+                    $"{mandatoryText}发现新版本 {update.LatestVersion}（{FormatBytes(update.FileSize)}）。" +
+                    $"{changelog}\n\n下载并安装后，客户端将自动重启。",
+                    "发现客户端更新", MessageBoxButton.YesNo,
+                    update.Mandatory ? MessageBoxImage.Warning : MessageBoxImage.Information) ==
+                    MessageBoxResult.Yes;
+            }
+            if (!install)
+            {
+                return;
+            }
+
+            var progress = new Progress<ClientUpdateProgress>(value =>
+            {
+                var percent = value.TotalBytes <= 0 ? 0 : value.BytesReceived * 100 / value.TotalBytes;
+                CheckUpdateButton.Content = $"下载 {percent}%";
+            });
+            var request = ClientUpdateRuntime.CreateCurrentProcessRequest();
+            var plan = await _updateService.DownloadAndPrepareAsync(update, request, progress,
+                cancellationToken);
+            try
+            {
+                ClientUpdateService.LaunchPreparedUpdate(plan);
+            }
+            catch
+            {
+                ClientUpdateService.CleanupPreparedUpdate(plan);
+                throw;
+            }
+
+            _updateRestarting = true;
+            _closing = true;
+            AppendLog(LogLevel.Information, "desktop",
+                $"更新 {update.LatestVersion} 已校验，退出后将原子替换并保留 .bak", null);
+            if (_running)
+            {
+                await StopClientAsync("安装客户端更新");
+            }
+            Application.Current.Shutdown();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppendLog(LogLevel.Warning, "desktop", $"检查或安装更新失败: {ex.Message}", ex);
+            if (showUpToDate)
+            {
+                MessageBox.Show(this, ex.Message, "更新失败", MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _updateCheckActive, 0);
+            if (!_updateRestarting)
+            {
+                CheckUpdateButton.IsEnabled = true;
+                CheckUpdateButton.Content = "检查更新";
+            }
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024 * 1024)
+        {
+            return $"{bytes / 1024d / 1024d:F1} MiB";
+        }
+        if (bytes >= 1024)
+        {
+            return $"{bytes / 1024d:F1} KiB";
+        }
+        return $"{bytes} B";
     }
 
     private async Task StopAndCloseAsync()
@@ -500,6 +666,9 @@ public partial class MainWindow : Window
                 : PeerMeshDeviceBox.Text,
             PeerMeshTunName = TunNameBox.Text,
             PeerMeshMtu = mtu,
+            UpdateEnabled = UpdateCheckEnabledCheckBox.IsChecked == true,
+            UpdateCheckIntervalHours = ParseUpdateIntervalHours(),
+            AutoUpdate = AutoUpdateCheckBox.IsChecked == true,
         };
         config.Normalize();
         return config;
@@ -513,6 +682,10 @@ public partial class MainWindow : Window
         ApiKeyBox.Text = settings.ApiKey;
         SecretBox.Password = settings.Secret;
         PeerMeshDeviceBox.Text = settings.PeerMeshDevice;
+        UpdateCheckEnabledCheckBox.IsChecked = settings.UpdateCheckEnabled;
+        UpdateCheckIntervalHoursBox.Text = settings.UpdateCheckIntervalHours.ToString(
+            System.Globalization.CultureInfo.InvariantCulture);
+        AutoUpdateCheckBox.IsChecked = settings.AutoUpdate;
         _themeMode = NormalizeThemeMode(settings.ThemeMode);
         UpdateThemeModeButton();
         TunNameBox.Text = settings.PeerMeshTunName;
@@ -531,7 +704,7 @@ public partial class MainWindow : Window
         {
             var settings = JsonSerializer.Deserialize<DesktopClientSettings>(
                 File.ReadAllText(path), SettingsJsonOptions);
-            return settings ?? DesktopClientSettings.Default();
+            return (settings ?? DesktopClientSettings.Default()).Normalize();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -553,6 +726,9 @@ public partial class MainWindow : Window
             ThemeMode = NormalizeThemeMode(_themeMode),
             PeerMeshTunName = config?.PeerMeshTunName ?? TunNameBox.Text.Trim(),
             PeerMeshMtu = config?.PeerMeshMtu ?? ParseMtuOrDefault(),
+            UpdateCheckEnabled = UpdateCheckEnabledCheckBox.IsChecked == true,
+            UpdateCheckIntervalHours = ParseUpdateIntervalHours(),
+            AutoUpdate = AutoUpdateCheckBox.IsChecked == true,
         };
         var path = SettingsPath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -564,6 +740,14 @@ public partial class MainWindow : Window
         return int.TryParse(MtuBox.Text.Trim(), out var mtu)
             ? mtu
             : SpecusClientConfig.DefaultPeerMeshMtu;
+    }
+
+    private int ParseUpdateIntervalHours()
+    {
+        return int.TryParse(UpdateCheckIntervalHoursBox.Text.Trim(), out var hours)
+            ? Math.Clamp(hours, SpecusClientConfig.MinUpdateCheckIntervalHours,
+                SpecusClientConfig.MaxUpdateCheckIntervalHours)
+            : SpecusClientConfig.DefaultUpdateCheckIntervalHours;
     }
 
     private static string SettingsPath()
@@ -1086,34 +1270,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private sealed class DesktopClientSettings
-    {
-        public string ServerBaseUrl { get; set; } = "";
-
-        public string ApiKey { get; set; } = "";
-
-        public string Secret { get; set; } = "";
-
-        public string PeerMeshDevice { get; set; } = "";
-
-        public string ThemeMode { get; set; } = ThemeModeSystem;
-
-        public string PeerMeshTunName { get; set; } = "";
-
-        public int PeerMeshMtu { get; set; }
-
-        public static DesktopClientSettings Default()
-        {
-            return new DesktopClientSettings
-            {
-                ServerBaseUrl = "https://specus.devshuai.com",
-                PeerMeshDevice = "auto",
-                ThemeMode = ThemeModeSystem,
-                PeerMeshTunName = SpecusClientConfig.DefaultPeerMeshTunName,
-                PeerMeshMtu = SpecusClientConfig.DefaultPeerMeshMtu,
-            };
-        }
-    }
 }
 
 public sealed record LogLine(string Text);

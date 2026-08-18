@@ -32,6 +32,28 @@
       "minLength": 1,
       "description": "客户端凭证明文，只在创建或重置时展示一次。"
     },
+    "updateCheckEnabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "是否在启动时及运行期间检查服务端客户端版本编目。"
+    },
+    "autoUpdate": {
+      "type": "boolean",
+      "default": false,
+      "description": "Go 与 .NET 客户端是否在校验包大小和 SHA-256 后无人值守安装；默认仍由用户确认。"
+    },
+    "updateCheckIntervalHours": {
+      "type": "integer",
+      "default": 24,
+      "minimum": 1,
+      "maximum": 168,
+      "description": "支持可配置周期的客户端检查间隔；其它客户端固定使用不超过每天一次的策略。"
+    },
+    "openUpdatePage": {
+      "type": "boolean",
+      "default": true,
+      "description": "Java 桌面客户端发现更新时是否尝试打开下载页；无桌面环境时仍记录清晰提示。"
+    },
     "controlTls": {
       "type": "object",
       "additionalProperties": false,

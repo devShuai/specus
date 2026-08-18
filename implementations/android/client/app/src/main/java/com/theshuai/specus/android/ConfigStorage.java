@@ -92,6 +92,7 @@ final class ConfigStorage {
                 + "  \"serverBaseUrl\": \"https://specus.devshuai.com\",\n"
                 + "  \"apiKey\": \"YOUR_CLIENT_API_KEY\",\n"
                 + "  \"secret\": \"YOUR_CLIENT_SECRET\",\n"
+                + "  \"updateCheckEnabled\": true,\n"
                 + "  \"peerMeshDevice\": \"noop\",\n"
                 + "  \"peerMeshTunName\": \"specus0\",\n"
                 + "  \"peerMeshMtu\": 1280\n"

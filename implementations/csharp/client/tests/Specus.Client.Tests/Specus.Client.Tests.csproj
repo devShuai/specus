@@ -17,6 +17,8 @@
          plain BCL code. Compile it here so its receive path is covered on any host. -->
     <Compile Include="..\..\src\Specus.Client.Desktop\FileTransferManager.cs"
              Link="Desktop\FileTransferManager.cs" />
+    <Compile Include="..\..\src\Specus.Client.Desktop\DesktopClientSettings.cs"
+             Link="Desktop\DesktopClientSettings.cs" />
   </ItemGroup>
 
   <ItemGroup>

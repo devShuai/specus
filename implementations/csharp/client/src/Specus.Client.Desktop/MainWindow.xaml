@@ -137,6 +137,28 @@
                                         <TextBox x:Name="MtuBox" Margin="0,4,0,0" />
                                     </StackPanel>
                                 </Grid>
+
+                                <CheckBox x:Name="UpdateCheckEnabledCheckBox"
+                                          Content="自动检查客户端更新"
+                                          Margin="0,12,0,0" />
+                                <Grid Margin="0,8,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="78" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="检查间隔（小时）"
+                                               Style="{StaticResource FieldLabelTextStyle}"
+                                               VerticalAlignment="Center" />
+                                    <TextBox x:Name="UpdateCheckIntervalHoursBox"
+                                             Grid.Column="1"
+                                             Text="24"
+                                             ToolTip="1–168 小时" />
+                                </Grid>
+                                <CheckBox x:Name="AutoUpdateCheckBox"
+                                          Content="自动安装已验证更新"
+                                          Margin="0,8,0,0"
+                                          ToolTip="仅安装由服务端提供、且通过 SHA-256 校验的 HTTPS 更新包" />
                             </StackPanel>
                         </Border>
 
@@ -212,6 +234,7 @@
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center">
                             <TextBlock Text="运行视图"
@@ -250,8 +273,17 @@
                                            Foreground="{DynamicResource PrimaryHoverBrush}" />
                             </Grid>
                         </Border>
-                        <Button x:Name="ThemeModeButton"
+                        <Button x:Name="CheckUpdateButton"
                                 Grid.Column="2"
+                                Content="检查更新"
+                                Height="32"
+                                Margin="0,0,8,0"
+                                Padding="12,0"
+                                VerticalAlignment="Center"
+                                Style="{StaticResource SecondaryButtonStyle}"
+                                Click="CheckUpdateButton_Click" />
+                        <Button x:Name="ThemeModeButton"
+                                Grid.Column="3"
                                 Width="32"
                                 Height="32"
                                 MinHeight="32"

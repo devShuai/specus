@@ -59,11 +59,35 @@ public sealed class SpecusClientConfigLoaderTests
             Assert.Equal(SpecusClientConfig.DefaultPeerMeshDevice, config.PeerMeshDevice);
             Assert.Equal(SpecusClientConfig.DefaultPeerMeshTunName, config.PeerMeshTunName);
             Assert.Equal(SpecusClientConfig.DefaultPeerMeshMtu, config.PeerMeshMtu);
+            Assert.True(config.UpdateEnabled);
+            Assert.False(config.AutoUpdate);
+            Assert.Equal(SpecusClientConfig.DefaultUpdateCheckIntervalHours,
+                config.UpdateCheckIntervalHours);
         }
         finally
         {
             File.Delete(path);
         }
+    }
+
+    [Fact]
+    public void UnifiedUpdateFieldsAreLoadedAndIntervalIsBounded()
+    {
+        var config = LoadJson("""
+        {
+          "serverBaseUrl": "https://specus.example",
+          "apiKey": "demo-client",
+          "secret": "test1234",
+          "updateCheckEnabled": false,
+          "autoUpdate": true,
+          "updateCheckIntervalHours": 999
+        }
+        """);
+
+        Assert.False(config.UpdateEnabled);
+        Assert.True(config.AutoUpdate);
+        Assert.Equal(SpecusClientConfig.MaxUpdateCheckIntervalHours,
+            config.UpdateCheckIntervalHours);
     }
 
     [Theory]
@@ -142,6 +166,7 @@ public sealed class SpecusClientConfigLoaderTests
         Assert.False(environment.ClientMessageCapabilities.Attachments);
         Assert.False(environment.ClientMessageCapabilities.MediaPreview);
         Assert.Equal(0L, environment.ClientMessageCapabilities.MaxAttachmentBytes);
+        Assert.Equal(ClientVersion.Current, environment.ClientVersion);
 
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(environment));
         var capabilities = json.RootElement.GetProperty("clientMessageCapabilities");

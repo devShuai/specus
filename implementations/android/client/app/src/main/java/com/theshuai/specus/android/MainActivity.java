@@ -153,16 +153,18 @@ public class MainActivity extends Activity {
     }
 
     private void maybeCheckForUpdate() {
-        long claimedAt = System.currentTimeMillis();
-        if (!ConfigStorage.claimUpdateCheck(this, claimedAt)) {
-            return;
-        }
         final String serverBaseUrl;
         try {
-            serverBaseUrl = ConfigStorage.parseConfig(ConfigStorage.loadConfig(this))
-                    .optString("serverBaseUrl", "");
+            JSONObject config = ConfigStorage.parseConfig(ConfigStorage.loadConfig(this));
+            if (!config.optBoolean("updateCheckEnabled", true)) {
+                return;
+            }
+            serverBaseUrl = config.optString("serverBaseUrl", "");
         } catch (Exception ignored) {
-            ConfigStorage.releaseUpdateCheck(this, claimedAt);
+            return;
+        }
+        long claimedAt = System.currentTimeMillis();
+        if (!ConfigStorage.claimUpdateCheck(this, claimedAt)) {
             return;
         }
         updateExecutor.execute(() -> {

@@ -4,6 +4,8 @@
   "serverBaseUrl": "https://specus.devshuai.com",
   "apiKey": "YOUR_CLIENT_API_KEY",
   "secret": "YOUR_CLIENT_SECRET",
+  // Check the server catalogue on app startup and at most once every 24 hours.
+  "updateCheckEnabled": true,
   "controlTls": {
     // Omit enabled to follow login response nettyTls. Any non-empty TLS option also enables TLS.
     "enabled": null,

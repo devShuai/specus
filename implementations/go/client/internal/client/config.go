@@ -11,21 +11,36 @@ import (
 )
 
 type Config struct {
-	ServerBaseURL      string           `json:"serverBaseUrl"`
-	APIKey             string           `json:"apiKey"`
-	Secret             string           `json:"secret"`
-	ControlTLS         ControlTLSConfig `json:"controlTls"`
-	PeerMeshDevice     string           `json:"peerMeshDevice"`
-	PeerMeshTunName    string           `json:"peerMeshTunName"`
-	PeerMeshMTU        int              `json:"peerMeshMtu"`
-	UpdateCheckEnabled *bool            `json:"updateCheckEnabled"`
-	AutoUpdate         bool             `json:"autoUpdate"`
+	ServerBaseURL            string           `json:"serverBaseUrl"`
+	APIKey                   string           `json:"apiKey"`
+	Secret                   string           `json:"secret"`
+	ControlTLS               ControlTLSConfig `json:"controlTls"`
+	PeerMeshDevice           string           `json:"peerMeshDevice"`
+	PeerMeshTunName          string           `json:"peerMeshTunName"`
+	PeerMeshMTU              int              `json:"peerMeshMtu"`
+	UpdateCheckEnabled       *bool            `json:"updateCheckEnabled"`
+	AutoUpdate               bool             `json:"autoUpdate"`
+	UpdateCheckIntervalHours int              `json:"updateCheckIntervalHours"`
 }
 
 // UpdatesEnabled defaults to true so packaged clients participate without requiring a config
 // migration. Operators can explicitly disable polling in service-managed environments.
 func (config Config) UpdatesEnabled() bool {
 	return config.UpdateCheckEnabled == nil || *config.UpdateCheckEnabled
+}
+
+func (config Config) UpdateCheckInterval() time.Duration {
+	hours := config.UpdateCheckIntervalHours
+	if hours <= 0 {
+		hours = DefaultUpdateCheckIntervalHours
+	}
+	if hours < MinUpdateCheckIntervalHours {
+		hours = MinUpdateCheckIntervalHours
+	}
+	if hours > MaxUpdateCheckIntervalHours {
+		hours = MaxUpdateCheckIntervalHours
+	}
+	return time.Duration(hours) * time.Hour
 }
 
 type ControlTLSConfig struct {
@@ -36,12 +51,15 @@ type ControlTLSConfig struct {
 }
 
 const (
-	DefaultConfigFileName  = "client.jsonc"
-	DefaultPeerMeshDevice  = "noop"
-	DefaultPeerMeshTunName = "specus0"
-	DefaultPeerMeshMTU     = 1280
-	MinPeerMeshMTU         = 576
-	MaxPeerMeshMTU         = 1280
+	DefaultConfigFileName           = "client.jsonc"
+	DefaultPeerMeshDevice           = "noop"
+	DefaultPeerMeshTunName          = "specus0"
+	DefaultPeerMeshMTU              = 1280
+	MinPeerMeshMTU                  = 576
+	MaxPeerMeshMTU                  = 1280
+	DefaultUpdateCheckIntervalHours = 24
+	MinUpdateCheckIntervalHours     = 1
+	MaxUpdateCheckIntervalHours     = 168
 )
 
 type SpecusConfig struct {
@@ -135,6 +153,13 @@ func (config *Config) Validate() error {
 		config.PeerMeshMTU = MinPeerMeshMTU
 	} else if config.PeerMeshMTU > MaxPeerMeshMTU {
 		config.PeerMeshMTU = MaxPeerMeshMTU
+	}
+	if config.UpdateCheckIntervalHours <= 0 {
+		config.UpdateCheckIntervalHours = DefaultUpdateCheckIntervalHours
+	} else if config.UpdateCheckIntervalHours < MinUpdateCheckIntervalHours {
+		config.UpdateCheckIntervalHours = MinUpdateCheckIntervalHours
+	} else if config.UpdateCheckIntervalHours > MaxUpdateCheckIntervalHours {
+		config.UpdateCheckIntervalHours = MaxUpdateCheckIntervalHours
 	}
 
 	if config.ServerBaseURL == "" {

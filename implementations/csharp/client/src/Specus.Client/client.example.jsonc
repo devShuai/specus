@@ -14,4 +14,8 @@
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,
+  // 启动时检查一次，此后默认每 24 小时检查。autoUpdate=false 时会先询问。
+  "updateCheckEnabled": true,
+  "autoUpdate": false,
+  "updateCheckIntervalHours": 24,
 }

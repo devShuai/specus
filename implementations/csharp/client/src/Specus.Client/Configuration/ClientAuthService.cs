@@ -216,7 +216,7 @@ public sealed class ClientEnvironmentInfo
             OsName = Environment.OSVersion.Platform.ToString(),
             OsVersion = Environment.OSVersion.VersionString,
             OsArch = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture.ToString(),
-            ClientVersion = typeof(ClientEnvironmentInfo).Assembly.GetName().Version?.ToString(),
+            ClientVersion = Specus.Client.Configuration.ClientVersion.Current,
             JavaVersion = "",
             PeerPublicKey = PeerKeyStore.PublicKeyBase64(logger),
             ClientMessageCapabilities = (messageCapabilities ?? ClientMessageCapabilities.TextOnlyDefault()).Copy(),

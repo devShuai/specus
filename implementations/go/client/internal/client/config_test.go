@@ -65,6 +65,11 @@ func TestLoadConfigDefaultsPeerMeshOptions(t *testing.T) {
 	if !config.UpdatesEnabled() {
 		t.Fatal("update checks should default to enabled")
 	}
+	if config.UpdateCheckIntervalHours != DefaultUpdateCheckIntervalHours ||
+		config.UpdateCheckInterval() != 24*time.Hour {
+		t.Fatalf("update interval default mismatch: hours=%d duration=%s",
+			config.UpdateCheckIntervalHours, config.UpdateCheckInterval())
+	}
 }
 
 func TestLoadConfigCanDisableUpdateChecksAndEnableAutomaticUpdates(t *testing.T) {
@@ -79,6 +84,37 @@ func TestLoadConfigCanDisableUpdateChecksAndEnableAutomaticUpdates(t *testing.T)
 	}
 	if config.UpdatesEnabled() || !config.AutoUpdate {
 		t.Fatalf("update options not loaded: enabled=%t auto=%t", config.UpdatesEnabled(), config.AutoUpdate)
+	}
+}
+
+func TestLoadConfigClampsUpdateCheckInterval(t *testing.T) {
+	tests := []struct {
+		name, value string
+		want        int
+	}{
+		{"zero defaults", "0", DefaultUpdateCheckIntervalHours},
+		{"negative defaults", "-1", DefaultUpdateCheckIntervalHours},
+		{"minimum", "1", MinUpdateCheckIntervalHours},
+		{"maximum clamp", "999", MaxUpdateCheckIntervalHours},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "client.jsonc")
+			content := `{"serverBaseUrl":"https://specus.example.com","apiKey":"demo","secret":"test1234",` +
+				`"updateCheckIntervalHours":` + test.value + `}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			config, err := LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.UpdateCheckIntervalHours != test.want ||
+				config.UpdateCheckInterval() != time.Duration(test.want)*time.Hour {
+				t.Fatalf("interval hours=%d duration=%s, want %d hours",
+					config.UpdateCheckIntervalHours, config.UpdateCheckInterval(), test.want)
+			}
+		})
 	}
 }
 

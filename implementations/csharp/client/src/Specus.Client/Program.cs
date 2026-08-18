@@ -4,8 +4,11 @@ using Microsoft.Extensions.Logging;
 using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.DirectHttp;
+using Specus.Client.Updates;
 
 string? overridePath = null;
+bool? autoUpdateOverride = null;
+var hostArgs = new List<string>();
 for (var i = 0; i < args.Length; i++)
 {
     if ((args[i] == "-c" || args[i] == "--config") && i + 1 < args.Length)
@@ -16,11 +19,28 @@ for (var i = 0; i < args.Length; i++)
     {
         overridePath = args[i]["--config=".Length..];
     }
+    else if (args[i] == "--auto-update")
+    {
+        autoUpdateOverride = true;
+    }
+    else if (args[i] == "--no-update")
+    {
+        autoUpdateOverride = false;
+    }
+    else
+    {
+        hostArgs.Add(args[i]);
+    }
 }
 
 var config = SpecusClientConfigLoader.Load(overridePath);
+if (autoUpdateOverride is { } updateOverride)
+{
+    config.UpdateEnabled = updateOverride;
+    config.AutoUpdate = updateOverride;
+}
 
-var builder = Host.CreateApplicationBuilder(args);
+var builder = Host.CreateApplicationBuilder(hostArgs.ToArray());
 builder.Logging.AddSimpleConsole(options =>
 {
     options.IncludeScopes = false;
@@ -41,7 +61,11 @@ builder.Services.AddSingleton(sp => new SpecusControlClient(
     sp.GetRequiredService<ClientAuthService>(),
     sp.GetRequiredService<DirectHttpForwarder>(),
     sp.GetRequiredService<ILoggerFactory>()));
+builder.Services.AddSingleton<ClientUpdateService>();
+builder.Services.AddSingleton<IClientUpdateService>(sp =>
+    sp.GetRequiredService<ClientUpdateService>());
 builder.Services.AddHostedService<SpecusClientHostedService>();
+builder.Services.AddHostedService<ClientUpdateHostedService>();
 
 var host = builder.Build();
 host.Services.GetRequiredService<ILoggerFactory>()

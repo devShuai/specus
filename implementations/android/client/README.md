@@ -59,12 +59,16 @@ Release builds receive both Android version fields from the release pipeline:
 .\gradlew.bat :app:assembleRelease -PreleaseVersion=1.4.0 -PreleaseVersionCode=1400
 ```
 
-Signed release builds read `SPECUS_ANDROID_KEYSTORE`, `SPECUS_ANDROID_KEYSTORE_PASSWORD`,
-`SPECUS_ANDROID_KEY_ALIAS`, and `SPECUS_ANDROID_KEY_PASSWORD`. GitHub Actions restores the keystore
-from the `SPECUS_ANDROID_KEYSTORE_BASE64` secret and refuses to publish an unsigned APK. Keep the
+Local signed builds read `SPECUS_ANDROID_KEYSTORE`, `SPECUS_ANDROID_KEYSTORE_PASSWORD`,
+`SPECUS_ANDROID_KEY_ALIAS`, and `SPECUS_ANDROID_KEY_PASSWORD`. GitHub Actions first builds and tests
+an unsigned APK without any signing secrets, then moves signing to the separate `release-signing`
+environment. Configure that environment with approval protection and the four key secrets plus
+`SPECUS_ANDROID_CERT_SHA256`; the signing job rejects any certificate whose SHA-256 fingerprint is
+not the protected value. The internal unsigned artifact is excluded from GitHub Releases. Keep the
 same signing key for every release so Android can install upgrades over an existing app.
 
-The app queries the configured server's anonymous `/api/public/client-version-check` endpoint with
+Unless `updateCheckEnabled` is set to `false`, the app queries the configured server's anonymous
+`/api/public/client-version-check` endpoint at startup and at most once every 24 hours with
 `implementation=android`, `platform=android`, and `arch=any`. It accepts only HTTPS downloads (or
 loopback HTTP for development) and opens the returned URL through Android's normal download/install
 confirmation; the application itself never bypasses package verification.
@@ -75,7 +79,7 @@ Run the local JVM protocol suite with:
 .\gradlew.bat clean test --no-problems-report
 ```
 
-Current local JVM result: 121/121 tests across 14 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, TLS timeout/cancellation, and state-machine behavior. `assembleDebug` and `lintDebug` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
+Current local JVM result: 153/153 tests across 16 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
 
 ## Run
 

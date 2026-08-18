@@ -10,6 +10,9 @@ namespace Specus.Client.Configuration;
 /// </summary>
 public sealed class SpecusClientConfig
 {
+    public const int DefaultUpdateCheckIntervalHours = 24;
+    public const int MinUpdateCheckIntervalHours = 1;
+    public const int MaxUpdateCheckIntervalHours = 168;
     public const string DefaultPeerMeshDevice = "noop";
     public const string DefaultPeerMeshTunName = "specus0";
     public const int DefaultPeerMeshMtu = 1280;
@@ -37,6 +40,15 @@ public sealed class SpecusClientConfig
     [JsonPropertyName("peerMeshMtu")]
     public int PeerMeshMtu { get; set; } = DefaultPeerMeshMtu;
 
+    [JsonPropertyName("updateCheckEnabled")]
+    public bool UpdateEnabled { get; set; } = true;
+
+    [JsonPropertyName("autoUpdate")]
+    public bool AutoUpdate { get; set; }
+
+    [JsonPropertyName("updateCheckIntervalHours")]
+    public int UpdateCheckIntervalHours { get; set; } = DefaultUpdateCheckIntervalHours;
+
     public void Normalize()
     {
         ServerBaseUrl = ServerBaseUrl.Trim();
@@ -53,6 +65,9 @@ public sealed class SpecusClientConfig
         PeerMeshMtu = PeerMeshMtu <= 0
             ? DefaultPeerMeshMtu
             : Math.Clamp(PeerMeshMtu, MinPeerMeshMtu, MaxPeerMeshMtu);
+        UpdateCheckIntervalHours = UpdateCheckIntervalHours <= 0
+            ? DefaultUpdateCheckIntervalHours
+            : Math.Clamp(UpdateCheckIntervalHours, MinUpdateCheckIntervalHours, MaxUpdateCheckIntervalHours);
     }
 }
 

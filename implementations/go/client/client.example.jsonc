@@ -4,10 +4,12 @@
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "replace-with-client-api-key",
   "secret": "replace-with-client-secret",
-  // Check this server's package catalog on startup and every 24 hours.
+  // Check this server's package catalog on startup and periodically while running.
   "updateCheckEnabled": true,
   // Service deployments may opt in to unattended replacement. Interactive use asks first.
   "autoUpdate": false,
+  // Periodic checks are clamped to 1..168 hours; omitted/invalid values default to 24.
+  "updateCheckIntervalHours": 24,
   "controlTls": {
     // null follows serverBaseUrl: HTTPS enables TLS, HTTP disables it.
     "enabled": null,
