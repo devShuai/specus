@@ -39,13 +39,15 @@ public final class PeerKeyStore {
                     return new KeyMaterial(existingPublic, existingPrivate);
                 }
             }
-            Files.createDirectories(directory);
+            SecretFileWriter.createPrivateDirectory(directory);
             KeyPairGenerator generator = KeyPairGenerator.getInstance("X25519");
             KeyPair keyPair = generator.generateKeyPair();
             String encodedPublic = Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
             String encodedPrivate = Base64.getEncoder().encodeToString(keyPair.getPrivate().getEncoded());
-            Files.writeString(publicKey, encodedPublic, StandardCharsets.UTF_8);
-            Files.writeString(privateKey, encodedPrivate, StandardCharsets.UTF_8);
+            // The private key is written atomically and owner-only: a truncated key would cost this
+            // client its peer identity, and a world-readable one would hand it to any local account.
+            SecretFileWriter.writeSecret(privateKey, encodedPrivate);
+            SecretFileWriter.writeSecret(publicKey, encodedPublic);
             return new KeyMaterial(encodedPublic, encodedPrivate);
         } catch (Exception e) {
             log.warn("生成 peer mesh X25519 公钥失败: {}", e.getMessage());

@@ -39,7 +39,9 @@ func loadPeerPrivateKey() (*ecdh.PrivateKey, error) {
 		return nil, fmt.Errorf("create config dir: %w", err)
 	}
 	encoded := base64.StdEncoding.EncodeToString(key.Bytes())
-	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+	// Atomic and owner-only: a truncated key would cost this client its peer identity, and
+	// mode bits alone leave the file readable by other accounts on Windows.
+	if err := writeSecretFile(path, []byte(encoded+"\n")); err != nil {
 		return nil, fmt.Errorf("write peer private key: %w", err)
 	}
 	return key, nil

@@ -43,10 +43,12 @@ internal static class PeerKeyStore
                 }
             }
 
-            Directory.CreateDirectory(directory);
+            SecretFileWriter.CreatePrivateDirectory(directory);
             var keyMaterial = PeerCrypto.GenerateKeyMaterial();
-            File.WriteAllText(publicKeyPath, keyMaterial.PublicKeyBase64, Encoding.UTF8);
-            File.WriteAllText(privateKeyPath, keyMaterial.PrivateKeyBase64, Encoding.UTF8);
+            // Atomic and owner-only: a truncated key would cost this client its peer identity, and
+            // a world-readable one would hand it to any other local account.
+            SecretFileWriter.WriteSecret(privateKeyPath, keyMaterial.PrivateKeyBase64);
+            SecretFileWriter.WriteSecret(publicKeyPath, keyMaterial.PublicKeyBase64);
             return keyMaterial;
         }
     }
