@@ -249,19 +249,65 @@ func reconnectDelayForAttempt(attempt int) time.Duration {
 	return delay
 }
 
-func (client *Client) runOnce(ctx context.Context) error {
-	runtime, err := client.login(ctx)
-	if err != nil {
-		return err
+// reusableRuntimeMinRemaining keeps a reused token from expiring mid-handshake.
+const reusableRuntimeMinRemaining = 60 * time.Second
+
+// reusableRuntime returns the cached runtime when its access token is still valid for long enough
+// to complete a login. A server that has forgotten the session answers the control login with a
+// failure, which invalidates the cache and forces a fresh HTTP login on the next attempt.
+func (client *Client) reusableRuntime() (RuntimeConfig, bool) {
+	client.runtimeMu.RLock()
+	runtime := client.runtime
+	client.runtimeMu.RUnlock()
+	if strings.TrimSpace(runtime.AccessToken) == "" || runtime.ClientSessionID <= 0 {
+		return RuntimeConfig{}, false
 	}
-	if previous := client.consumeHTTPLoginBackoffReset(); previous > 0 {
-		client.logger.Printf("client access token refreshed, reconnect backoff reset (was attempt %d)", previous)
+	if strings.TrimSpace(runtime.NettyHost) == "" || runtime.NettyPort < 1 {
+		return RuntimeConfig{}, false
+	}
+	// A runtime without an expiry carries no proof of freshness, so it is not reused.
+	if runtime.TokenExpiresAt.IsZero() {
+		return RuntimeConfig{}, false
+	}
+	if time.Until(runtime.TokenExpiresAt) <= reusableRuntimeMinRemaining {
+		return RuntimeConfig{}, false
+	}
+	return runtime, true
+}
+
+// invalidateRuntimeSession drops the cached token so the next connection attempt logs in again.
+func (client *Client) invalidateRuntimeSession() {
+	client.runtimeMu.Lock()
+	client.runtime.AccessToken = ""
+	client.runtime.ClientSessionID = 0
+	client.runtime.TokenExpiresAt = time.Time{}
+	client.runtimeMu.Unlock()
+}
+
+func (client *Client) runOnce(ctx context.Context) error {
+	// A control-channel drop does not invalidate the runtime session. Reusing a token that is still
+	// comfortably valid avoids a full HTTP login (and a new server-side session row) on every
+	// reconnect; the server keeps accepting the existing clientSessionId.
+	runtime, reused := client.reusableRuntime()
+	if !reused {
+		fresh, err := client.login(ctx)
+		if err != nil {
+			return err
+		}
+		runtime = fresh
+		if previous := client.consumeHTTPLoginBackoffReset(); previous > 0 {
+			client.logger.Printf("client access token refreshed, reconnect backoff reset (was attempt %d)", previous)
+		}
 	}
 	client.applyRuntime(runtime)
 	address := net.JoinHostPort(runtime.NettyHost, strconv.Itoa(runtime.NettyPort))
 	controlConnection, err := client.dialServerConnection(
 		ctx, address, serverConnectionTimeout, runtime.NettyTLS)
 	if err != nil {
+		if reused {
+			// The cached endpoint may be stale; the next attempt logs in again.
+			client.invalidateRuntimeSession()
+		}
 		return fmt.Errorf("connect %s: %w", address, err)
 	}
 	client.logger.Printf("control connection established to %s", address)
@@ -533,6 +579,9 @@ func (client *Client) handleLoginResponse(connection net.Conn, packet protocol.P
 		return fmt.Errorf("decode login response: %w", err)
 	}
 	if !response.Success {
+		// The cached runtime token is what we just presented; drop it so the next attempt performs a
+		// fresh HTTP login instead of replaying a session the server no longer accepts.
+		client.invalidateRuntimeSession()
 		return newControlLoginRejectedError(response.Reason)
 	}
 	client.logger.Printf("login succeeded as %q", response.ClientName)

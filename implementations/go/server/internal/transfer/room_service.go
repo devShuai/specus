@@ -466,41 +466,61 @@ func (s *RoomService) RedeemPairingCode(ctx context.Context,
 	}
 	codeHash := s.tokens.PairingCodeHash(plainCode)
 	now := time.Now().UTC()
-	consumed, err := s.db.ConsumePublicTransferPairingCode(ctx, codeHash, now)
-	if err != nil {
-		return RedeemPairingCodeResponse{}, internalError(err)
-	}
-	if !consumed {
-		return RedeemPairingCodeResponse{}, invalidPairingCode()
-	}
-	pairingCode, err := s.db.GetPublicTransferPairingCodeByHash(ctx, codeHash)
-	if err != nil {
-		return RedeemPairingCodeResponse{}, internalError(err)
-	}
-	if pairingCode == nil {
-		return RedeemPairingCodeResponse{}, invalidPairingCode()
-	}
-	role, err := parseInviteRole(pairingCode.Role)
-	if err != nil {
-		return RedeemPairingCodeResponse{}, err
-	}
-	room, err := s.db.GetPublicTransferRoomByID(ctx, pairingCode.RoomID)
-	if err != nil {
-		return RedeemPairingCodeResponse{}, internalError(err)
-	}
-	if room == nil {
-		return RedeemPairingCodeResponse{}, invalidPairingCode()
-	}
-	if err := s.requireAccessTokenCapacity(ctx, room.ID); err != nil {
-		return RedeemPairingCodeResponse{}, err
-	}
 	expiresAt := now.Add(pairingAccessTokenTTLSeconds * time.Second)
-	created, err := s.issueAccessToken(ctx, *room, role, pairingCode.Label, now, &expiresAt)
+
+	// Read the code first to learn its role, then allocate the id and token, and only then open the
+	// transaction. Everything the callback needs is precomputed: a query inside the transaction
+	// would wait on the write lock the transaction itself holds.
+	pending, err := s.db.GetPublicTransferPairingCodeByHash(ctx, codeHash)
+	if err != nil {
+		return RedeemPairingCodeResponse{}, internalError(err)
+	}
+	if pending == nil {
+		return RedeemPairingCodeResponse{}, invalidPairingCode()
+	}
+	role, err := parseInviteRole(pending.Role)
 	if err != nil {
 		return RedeemPairingCodeResponse{}, err
+	}
+	accessID, err := s.newUniqueID(ctx, s.db.PublicTransferRoomAccessExists)
+	if err != nil {
+		return RedeemPairingCodeResponse{}, err
+	}
+	plainToken := newAccessToken(role)
+
+	// Consuming the code and issuing the token must commit together. Consuming first and failing
+	// later would permanently burn one use and hand the caller nothing back.
+	room, _, _, err := s.db.RedeemPairingCode(ctx, store.RedeemPairingCodeRequest{
+		CodeHash:               codeHash,
+		Now:                    now,
+		MaxAccessTokensPerRoom: maxAccessTokensPerRoom,
+		NewAccess: func(room store.PublicTransferRoom,
+			code store.PublicTransferRoomPairingCode) (store.PublicTransferRoomAccess, error) {
+			// The role is re-checked against the committed row: a code edited between the read and
+			// the transaction must not hand out a token for the wrong role.
+			if code.Role != string(role) {
+				return store.PublicTransferRoomAccess{}, store.ErrPairingCodeUnusable
+			}
+			return store.PublicTransferRoomAccess{
+				ID: accessID, RoomID: room.ID, TokenHash: tokenHash(plainToken),
+				Role: string(role), Label: code.Label, CreatedAt: now, ExpiresAt: &expiresAt,
+			}, nil
+		},
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrPairingCodeUnusable):
+			return RedeemPairingCodeResponse{}, invalidPairingCode()
+		case errors.Is(err, store.ErrAccessTokenCapacity):
+			return RedeemPairingCodeResponse{}, conflict("房间有效邀请 Token 已达到 20 个上限")
+		case errors.Is(err, ErrValidation), errors.Is(err, ErrConflict):
+			return RedeemPairingCodeResponse{}, err
+		default:
+			return RedeemPairingCodeResponse{}, internalError(err)
+		}
 	}
 	return RedeemPairingCodeResponse{
-		RoomID: room.RoomName, Role: role, RoomToken: created.Token,
+		RoomID: room.RoomName, Role: role, RoomToken: plainToken,
 		ExpiresAt: roomFormatTime(expiresAt),
 	}, nil
 }
