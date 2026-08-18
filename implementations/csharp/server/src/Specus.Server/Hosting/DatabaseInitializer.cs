@@ -64,6 +64,16 @@ public sealed class DatabaseInitializer
         await EnsureTrafficDetailTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsurePeerMeshTablesAsync(db, cancellationToken).ConfigureAwait(false);
 
+        var environment = DeploymentEnvironments.Parse(_specus.Value.Env);
+        var cleanup = await DisableLegacyDemoCredentialsAsync(db, environment, cancellationToken)
+            .ConfigureAwait(false);
+        if (cleanup.ClientAccounts > 0 || cleanup.ClientCredentials > 0)
+        {
+            _logger.LogWarning(
+                "[security-baseline] disabled legacy demo credentials: accounts={Accounts}, credentials={Credentials}",
+                cleanup.ClientAccounts, cleanup.ClientCredentials);
+        }
+
         if (SeedDemoDataEnabled)
         {
             await SeedDemoClientAsync(db, normalizedTenant, normalizedOwner, cancellationToken).ConfigureAwait(false);
@@ -129,6 +139,80 @@ public sealed class DatabaseInitializer
     }
 
     private static int NormalizeDefaultMaxOnlineInstances(int value) => value is < 1 or > 10_000 ? 2 : value;
+
+    /// <summary>
+    /// Disables only the credentials shipped by older releases. Both the public identifier and
+    /// the original secret digest must still match, so operator-rotated and unrelated rows remain
+    /// untouched. The two updates share one transaction; any database failure aborts startup and
+    /// rolls back both changes.
+    /// </summary>
+    internal static async Task<LegacyDemoCredentialCleanupResult> DisableLegacyDemoCredentialsAsync(
+        SpecusDbContext db,
+        DeploymentEnvironment environment,
+        CancellationToken cancellationToken)
+    {
+        if (!environment.IsProd())
+        {
+            return LegacyDemoCredentialCleanupResult.None;
+        }
+
+        var legacyHash = PasswordHasher.Hash(DemoCredentialSecret);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Query by all persisted selectors, then retain ordinal checks so a database configured
+        // with a case-insensitive collation cannot turn a near-match into a security migration.
+        var accountCandidates = await db.ClientAccounts
+            .Where(row => row.Enabled
+                          && row.ClientName == DemoClientName
+                          && row.PasswordHash == legacyHash)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var credentialCandidates = await db.ClientCredentials
+            .Where(row => row.Enabled
+                          && row.ApiKey == DemoCredentialApiKey
+                          && row.SecretHash == legacyHash)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var now = DateTimeOffset.UtcNow;
+        var accounts = 0;
+        foreach (var account in accountCandidates)
+        {
+            if (!string.Equals(account.ClientName, DemoClientName, StringComparison.Ordinal)
+                || !string.Equals(account.PasswordHash, legacyHash, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            account.Enabled = false;
+            account.UpdatedAt = now;
+            accounts++;
+        }
+
+        var credentials = 0;
+        foreach (var credential in credentialCandidates)
+        {
+            if (!string.Equals(credential.ApiKey, DemoCredentialApiKey, StringComparison.Ordinal)
+                || !string.Equals(credential.SecretHash, legacyHash, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            credential.Enabled = false;
+            credential.UpdatedAt = now;
+            credentials++;
+        }
+
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new LegacyDemoCredentialCleanupResult(accounts, credentials);
+    }
+
+    internal readonly record struct LegacyDemoCredentialCleanupResult(
+        int ClientAccounts,
+        int ClientCredentials)
+    {
+        internal static LegacyDemoCredentialCleanupResult None => new(0, 0);
+    }
 
     private static Task EnsureManagementUserTableAsync(SpecusDbContext db, CancellationToken cancellationToken) =>
         db.Database.ExecuteSqlRawAsync("""

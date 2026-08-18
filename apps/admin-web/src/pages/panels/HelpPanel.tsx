@@ -149,8 +149,8 @@ function QuickStartSection() {
     <div className="mt-4 flex flex-col gap-4">
       <DocCard title="1. 登录管理后台">
         <p>
-          默认账号 <Inline>admin / admin</Inline>，部署前请务必在「系统管理 → 用户管理」修改密码或添加新用户。
-          支持本地用户名密码登录与 OIDC 单点登录，二者可同时启用。
+          生产模板默认关闭本地密码登录，也不提供可用默认密码。推荐配置 OIDC；如需本地登录，请先在服务端生成独立强口令和稳定 JWT
+          密钥，再显式开启登录开关。本地登录与 OIDC 可同时启用。
         </p>
       </DocCard>
 
@@ -589,16 +589,16 @@ const SAMPLE_CONFIG = `{
   "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
   "serverBaseUrl": "https://specus.example.com",
-  "apiKey": "demo-client",
-  "secret": "your-client-secret",
+  "apiKey": "your-api-key",
+  "secret": "paste-the-one-time-secret-here",
 }`;
 
 const PEER_MESH_CONFIG = `{
   "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
   "serverBaseUrl": "https://specus.example.com",
-  "apiKey": "demo-client",
-  "secret": "your-client-secret",
+  "apiKey": "your-api-key",
+  "secret": "paste-the-one-time-secret-here",
   "peerMeshDevice": "auto",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,

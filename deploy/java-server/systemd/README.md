@@ -60,9 +60,15 @@ sudo bash /tmp/systemd/install.sh /tmp/specus-server-1.0-SNAPSHOT.jar
 4. 把 `specus-server.env.example` 拷贝为 `/etc/specus-server/specus-server.env`（已存在则不覆盖），并始终同步一份最新模板到 `/etc/specus-server/specus-server.env.example`
 5. `systemctl daemon-reload && systemctl enable specus-server`
 
+安装器不会启动或重启服务，也不会覆盖已有的 `specus-server.env`。生产模板显式使用 `SPECUS_ENV=prod`，关闭 demo seed 和本地密码登录，并且不包含可用的管理密码或 JWT 密钥。
+
+### 从旧版本升级
+
+升级后的第一次 `prod` 启动会分别停用两类启用中的 legacy demo 记录：名称精确为 `Demo client` 且密码摘要仍对应历史值 `test1234` 的客户端账户，以及 API Key 精确为 `demo-client` 且 secret 摘要仍对应 `test1234` 的启动凭据。已轮换密码或 secret、仅名称或 key 相同但摘要不同、以及本来已停用的记录都不会被修改。这里的历史值只用于迁移识别，不是生产凭据示例；该清理幂等，生产环境也不会重新 seed 演示数据。
+
 ## 4. 配置环境变量
 
-编辑 `/etc/specus-server/specus-server.env`，**至少修改 3 类字段**：
+编辑 `/etc/specus-server/specus-server.env`。必须先填写数据库连接；本地密码登录默认关闭，只有在生成独立强口令与稳定 JWT 密钥后才启用：
 
 ```bash
 sudo vim /etc/specus-server/specus-server.env
@@ -101,8 +107,8 @@ openssl rand -base64 48
 SPECUS_AUTH_PASSWORD_LOGIN_ENABLED=true
 SPECUS_AUTH_REGISTRATION_ENABLED=false
 SPECUS_AUTH_USERNAME=admin
-SPECUS_AUTH_PASSWORD=YourStrongAdminPassword
-SPECUS_AUTH_JWT_SECRET=粘贴上一步生成的随机值
+SPECUS_AUTH_PASSWORD=<独立强口令>
+SPECUS_AUTH_JWT_SECRET=<粘贴上一步生成的随机值>
 SPECUS_AUTH_TENANT_ID=default
 ```
 

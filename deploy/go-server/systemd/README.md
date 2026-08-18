@@ -49,6 +49,21 @@ the embedded management SPA and diagram stencil library.
 sudo bash deploy/go-server/systemd/install.sh /path/to/specus-server
 ```
 
+安装器只注册并 enable systemd unit，不会启动或重启服务，也不会覆盖已有的
+`/etc/specus-server-go/specus-server.env`。模板显式使用 `SPECUS_ENV=prod`，关闭 demo seed
+和本地密码登录，管理密码与 JWT 密钥保持为空。需要本地登录时，先生成独立强口令和稳定
+JWT 密钥，再写入受保护的 env 并启用登录开关。
+
+### Upgrading from an older release
+
+On the first `prod` startup after upgrading, two enabled legacy rows are matched and disabled
+independently: the client account whose exact name is `Demo client` and whose password digest still
+matches historical value `test1234`, and the credential whose exact API key is `demo-client` and
+whose secret digest still matches `test1234`. Rotated credentials, rows that only share the name/key
+but have another digest, and already-disabled rows are unchanged. These historical values describe
+migration matching, not production credential examples. The cleanup is idempotent, and production
+never re-seeds demo data.
+
 ## Rolling Update
 
 ```bash
@@ -77,13 +92,15 @@ The same `SPECUS_*` naming as Java server. Key variables:
 | `SPECUS_NETTY_PORT` | `7010` | Control channel TCP port |
 | `SPECUS_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | Database provider |
 | `SPECUS_CONNECTIONSTRINGS_SPECUS` | `host=...` | Database connection string |
+| `SPECUS_ENV` | `prod` | Deployment environment; empty or unknown values are treated as production |
+| `SPECUS_DB_SEED_DEMO_CLIENT` | `false` | Production template never seeds demo credentials |
 | `SPECUS_PEER_MESH_ENABLED` | `true` | Peer mesh toggle |
-| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | Enable or disable local password login |
+| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `false` | Local password login is safe-off in the production template |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` in deploy template | Enable verified self-registration after Turnstile and SMTP are configured |
 | `SPECUS_AUTH_USERNAME` | `admin` | Management UI local-login username |
-| `SPECUS_AUTH_PASSWORD` | `change-me` | Management UI local-login plaintext password; protect the env file and change it before exposure |
+| `SPECUS_AUTH_PASSWORD` | empty | Management UI local-login password; generate a unique strong value before enabling login |
 | `SPECUS_AUTH_TENANT_ID` | `default` | Tenant id for the built-in administrator |
-| `SPECUS_AUTH_JWT_SECRET` | long random value | Stable HS256 signing secret; if omitted, a random in-memory key invalidates tokens after every restart |
+| `SPECUS_AUTH_JWT_SECRET` | empty | Generate a stable HS256 secret before enabling login; an empty value uses an in-memory key and invalidates tokens after restart |
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management JWT lifetime |
 | `SPECUS_AUTH_TURNSTILE_ENABLED` | `false` | Require Cloudflare Turnstile for local password login; must be enabled for self-registration |
 | `SPECUS_AUTH_TURNSTILE_SITE_KEY` / `SPECUS_AUTH_TURNSTILE_SECRET_KEY` | provider values | Browser site key and server-only verification secret |

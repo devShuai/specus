@@ -17,7 +17,7 @@ SSH 配置中的 `ali2`，也可以通过 `-HostName` 或 `GO_SERVER_DEPLOY_HOST
 ```
 
 真实环境文件不要提交到 Git。未传 `-EnvFile` 时，首次安装只生成
-`/etc/specus-server-go/specus-server.env` 模板，不会启动带默认密码的服务。
+`/etc/specus-server-go/specus-server.env` 模板，不会启动服务；模板本身关闭密码登录且不包含可用凭据。
 
 ## 滚动更新
 

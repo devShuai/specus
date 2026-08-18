@@ -35,6 +35,21 @@ Publish output:
 sudo bash deploy/csharp-server/systemd/install.sh /path/to/publish-output
 ```
 
+The installer registers and enables the systemd unit but does not start or restart it, and it never
+overwrites an existing `/etc/specus-server-csharp/specus-server.env`. The production template sets
+`SPECUS_ENV=prod`, disables demo seeding and local password login, and leaves the password and JWT
+secret empty. Generate strong, deployment-specific credentials before enabling local login.
+
+### Upgrading from an older release
+
+On the first `prod` startup after upgrading, two enabled legacy rows are matched and disabled
+independently: the client account whose exact name is `Demo client` and whose password digest still
+matches historical value `test1234`, and the credential whose exact API key is `demo-client` and
+whose secret digest still matches `test1234`. Rotated credentials, rows that only share the name/key
+but have another digest, and already-disabled rows are unchanged. These historical values describe
+migration matching, not production credential examples. The cleanup is idempotent, and production
+never re-seeds demo data.
+
 ## Rolling Update
 
 ```bash
@@ -71,13 +86,15 @@ and SMTP. The C# server supports implicit TLS on port 465 and STARTTLS on port 5
 | `SPECUS_NETTY_MAX_FRAME_SIZE` | `33554432` | Complete control-frame cap including the 11-byte header (max body `33554421`) |
 | `SPECUS_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | Database provider |
 | `SPECUS_CONNECTIONSTRINGS_SPECUS` | `host=...` | Database connection string |
+| `SPECUS_ENV` | `prod` | Deployment environment; empty or unknown values are treated as production |
+| `SPECUS_DB_SEED_DEMO_CLIENT` | `false` | Production template never seeds demo credentials |
 | `SPECUS_PEER_MESH_ENABLED` | `true` | Peer mesh toggle |
 | `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `false` | Enable or disable local password login; template default is safe-off |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` | Enable verified-email self-service registration after all dependencies are configured |
 | `SPECUS_AUTH_USERNAME` | `admin` | Management UI local-login username |
-| `SPECUS_AUTH_PASSWORD` | `change-me` | Management UI local-login plaintext password; protect the env file and change it before exposure |
+| `SPECUS_AUTH_PASSWORD` | empty | Management UI local-login password; generate a unique strong value before enabling login |
 | `SPECUS_AUTH_TENANT_ID` | `default` | Tenant id for the built-in administrator |
-| `SPECUS_AUTH_JWT_SECRET` | long random value | Stable HS256 signing secret; if omitted, a random in-memory key invalidates tokens after every restart |
+| `SPECUS_AUTH_JWT_SECRET` | empty | Generate a stable HS256 secret before enabling login; an empty value uses an in-memory key and invalidates tokens after restart |
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management JWT lifetime |
 | `SPECUS_AUTH_TURNSTILE_*` | disabled | Cloudflare site key, server secret, Siteverify URL, and exact hostname allowlist |
 | `SPECUS_AUTH_EMAIL_*` | disabled | Verification sender, code TTL, attempt limit, resend cooldown, and cleanup interval |

@@ -68,8 +68,12 @@ type App struct {
 	addressResolver         *security.ClientAddressResolver
 }
 
-// New opens the database, applies the schema, seeds the demo client, and builds the app.
+// New opens the database, applies the schema, sanitizes production defaults, seeds allowed demo
+// data, and builds the app.
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
+	if err := cfg.ValidateSecurityBaseline(); err != nil {
+		return nil, err
+	}
 	if cfg.Netty.MaxFrameSize < protocol.FrameHeaderSize {
 		return nil, fmt.Errorf("netty max frame size must be at least %d", protocol.FrameHeaderSize)
 	}
@@ -79,6 +83,20 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	db, err := store.Open(cfg.Database.Provider, cfg.ConnectionString)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Environment().IsProd() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		result, cleanupErr := db.DisableLegacyDemoCredentials(ctx)
+		cancel()
+		if cleanupErr != nil {
+			db.Close()
+			return nil, cleanupErr
+		}
+		if result.ClientAccounts > 0 || result.ClientCredentials > 0 {
+			logger.Warn("disabled legacy demo credentials at production startup",
+				"clientAccounts", result.ClientAccounts,
+				"clientCredentials", result.ClientCredentials)
+		}
 	}
 	if cfg.Elasticsearch.Configured() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -234,6 +252,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	directHTTP.SetRouteCacheTTL(time.Duration(cfg.HTTP.RouteCacheTTLms) * time.Millisecond)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
+			if !cfg.SeedDemoDataEnabled() {
+				return nil
+			}
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)

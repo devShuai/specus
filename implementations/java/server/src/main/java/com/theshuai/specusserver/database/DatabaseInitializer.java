@@ -30,6 +30,7 @@ public class DatabaseInitializer {
     private final ClientAuthProperties clientAuthProperties;
     private final JdbcTemplate jdbcTemplate;
     private final ManagementUserSchemaMigrator managementUserSchemaMigrator;
+    private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
@@ -40,6 +41,7 @@ public class DatabaseInitializer {
                                ClientAuthProperties clientAuthProperties,
                                JdbcTemplate jdbcTemplate,
                                ManagementUserSchemaMigrator managementUserSchemaMigrator,
+                               LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
@@ -50,6 +52,7 @@ public class DatabaseInitializer {
         this.clientAuthProperties = clientAuthProperties;
         this.jdbcTemplate = jdbcTemplate;
         this.managementUserSchemaMigrator = managementUserSchemaMigrator;
+        this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
@@ -74,6 +77,7 @@ public class DatabaseInitializer {
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();
+        legacyDemoCredentialSanitizer.sanitize();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
             String now = Instant.now().toString();

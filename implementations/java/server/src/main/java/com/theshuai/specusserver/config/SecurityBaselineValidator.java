@@ -19,7 +19,11 @@ import java.util.Set;
 public class SecurityBaselineValidator {
     /** Values published in the repository, docs and demo data, plus the usual throwaway passwords. */
     private static final Set<String> KNOWN_DEFAULT_PASSWORDS = Set.of(
-            "admin", "password", "123456", "12345678", "changeme", "specus", "test1234", "demo");
+            "admin", "password", "123456", "12345678", "changeme", "change-me",
+            "change_me_admin_password", "change-me-before-exposure",
+            "specus", "test1234", "demo");
+    private static final Set<String> KNOWN_DEFAULT_JWT_SECRETS = Set.of(
+            "replace-with-a-long-random-secret");
 
     private final AuthProperties authProperties;
     private final DeploymentEnvironment environment;
@@ -51,6 +55,15 @@ public class SecurityBaselineValidator {
             log.warn("[security-baseline] {}", message);
         }
 
+        if (isKnownDefaultJwtSecret(authProperties.getJwtSecret())) {
+            String message = "specus.auth.jwt-secret 使用了公开占位值，禁止在 " + environment
+                    + " 环境启动；请设置随机 SPECUS_AUTH_JWT_SECRET 或置空以使用临时密钥";
+            if (environment.isProd()) {
+                throw new IllegalStateException(message);
+            }
+            log.warn("[security-baseline] {}", message);
+        }
+
         if (environment.isProd() && seedDemoClientRequested) {
             log.warn("[security-baseline] prod 环境忽略 specus.database.seed-demo-client=true，不会创建演示客户端与演示凭据");
         }
@@ -62,5 +75,10 @@ public class SecurityBaselineValidator {
 
     private boolean isKnownDefaultPassword(String password) {
         return KNOWN_DEFAULT_PASSWORDS.contains(password.trim().toLowerCase(Locale.ROOT));
+    }
+
+    private boolean isKnownDefaultJwtSecret(String secret) {
+        return StringUtils.hasText(secret)
+                && KNOWN_DEFAULT_JWT_SECRETS.contains(secret.trim().toLowerCase(Locale.ROOT));
     }
 }

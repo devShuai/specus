@@ -1,7 +1,10 @@
 using System.Reflection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Specus.Server.Authentication;
+using Specus.Server.Configuration;
 using Specus.Server.Data;
+using Specus.Server.Data.Entities;
 using Specus.Server.Hosting;
 
 namespace Specus.IntegrationTests;
@@ -59,6 +62,114 @@ public sealed class DatabaseInitializerTests
         Assert.Equal("OUTBOUND", await command.ExecuteScalarAsync());
     }
 
+    [Fact]
+    public async Task ProdDisablesOnlyExactLegacyDemoCredentialsAndIsIdempotent()
+    {
+        await using var connection = await OpenDatabaseAsync();
+        await using var db = CreateContext(connection);
+        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var now = DateTimeOffset.UtcNow;
+        db.AddRange(
+            ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),
+            ClientAccount(2, "Unrelated client", legacyHash, now),
+            ClientCredential(3, DatabaseInitializer.DemoCredentialApiKey, legacyHash, now),
+            ClientCredential(4, "unrelated-key", legacyHash, now));
+        await db.SaveChangesAsync();
+
+        var first = await DatabaseInitializer.DisableLegacyDemoCredentialsAsync(
+            db, DeploymentEnvironment.Prod, CancellationToken.None);
+
+        Assert.Equal(1, first.ClientAccounts);
+        Assert.Equal(1, first.ClientCredentials);
+        db.ChangeTracker.Clear();
+        Assert.False((await db.ClientAccounts.SingleAsync(row => row.Id == 1)).Enabled);
+        Assert.True((await db.ClientAccounts.SingleAsync(row => row.Id == 2)).Enabled);
+        Assert.False((await db.ClientCredentials.SingleAsync(row => row.Id == 3)).Enabled);
+        Assert.True((await db.ClientCredentials.SingleAsync(row => row.Id == 4)).Enabled);
+
+        var second = await DatabaseInitializer.DisableLegacyDemoCredentialsAsync(
+            db, DeploymentEnvironment.Prod, CancellationToken.None);
+
+        Assert.Equal(0, second.ClientAccounts);
+        Assert.Equal(0, second.ClientCredentials);
+    }
+
+    [Fact]
+    public async Task ProdPreservesRotatedAndNearMatchDemoCredentials()
+    {
+        await using var connection = await OpenDatabaseAsync();
+        await using var db = CreateContext(connection);
+        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var rotatedHash = PasswordHasher.Hash("operator-rotated-secret");
+        var now = DateTimeOffset.UtcNow;
+        db.AddRange(
+            ClientAccount(1, DatabaseInitializer.DemoClientName, rotatedHash, now),
+            ClientAccount(2, "demo client", legacyHash, now),
+            ClientCredential(3, DatabaseInitializer.DemoCredentialApiKey, rotatedHash, now),
+            ClientCredential(4, "Demo-Client", legacyHash, now));
+        await db.SaveChangesAsync();
+
+        var result = await DatabaseInitializer.DisableLegacyDemoCredentialsAsync(
+            db, DeploymentEnvironment.Prod, CancellationToken.None);
+
+        Assert.Equal(0, result.ClientAccounts);
+        Assert.Equal(0, result.ClientCredentials);
+        Assert.All(await db.ClientAccounts.ToListAsync(), row => Assert.True(row.Enabled));
+        Assert.All(await db.ClientCredentials.ToListAsync(), row => Assert.True(row.Enabled));
+    }
+
+    [Theory]
+    [InlineData(DeploymentEnvironment.Dev)]
+    [InlineData(DeploymentEnvironment.Test)]
+    public async Task NonProdPreservesExactLegacyDemoCredentials(DeploymentEnvironment environment)
+    {
+        await using var connection = await OpenDatabaseAsync();
+        await using var db = CreateContext(connection);
+        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var now = DateTimeOffset.UtcNow;
+        db.AddRange(
+            ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),
+            ClientCredential(2, DatabaseInitializer.DemoCredentialApiKey, legacyHash, now));
+        await db.SaveChangesAsync();
+
+        var result = await DatabaseInitializer.DisableLegacyDemoCredentialsAsync(
+            db, environment, CancellationToken.None);
+
+        Assert.Equal(0, result.ClientAccounts);
+        Assert.Equal(0, result.ClientCredentials);
+        Assert.True((await db.ClientAccounts.SingleAsync()).Enabled);
+        Assert.True((await db.ClientCredentials.SingleAsync()).Enabled);
+    }
+
+    [Fact]
+    public async Task ProdCleanupRollsBackBothRowsAndPropagatesDatabaseFailure()
+    {
+        await using var connection = await OpenDatabaseAsync();
+        await using var db = CreateContext(connection);
+        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var now = DateTimeOffset.UtcNow;
+        db.AddRange(
+            ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),
+            ClientCredential(2, DatabaseInitializer.DemoCredentialApiKey, legacyHash, now));
+        await db.SaveChangesAsync();
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TRIGGER reject_demo_credential_update
+            BEFORE UPDATE OF enabled ON specus_client_credential
+            WHEN OLD.api_key = 'demo-client'
+            BEGIN
+              SELECT RAISE(ABORT, 'forced cleanup failure');
+            END;
+            """);
+
+        await Assert.ThrowsAsync<DbUpdateException>(() =>
+            DatabaseInitializer.DisableLegacyDemoCredentialsAsync(
+                db, DeploymentEnvironment.Prod, CancellationToken.None));
+
+        db.ChangeTracker.Clear();
+        Assert.True((await db.ClientAccounts.AsNoTracking().SingleAsync()).Enabled);
+        Assert.True((await db.ClientCredentials.AsNoTracking().SingleAsync()).Enabled);
+    }
+
     private static string BuildConnectionStatTenantBackfillSql(string providerName)
     {
         var method = typeof(DatabaseInitializer).GetMethod(
@@ -67,4 +178,46 @@ public sealed class DatabaseInitializerTests
         Assert.NotNull(method);
         return Assert.IsType<string>(method.Invoke(null, [providerName]));
     }
+
+    private static async Task<SqliteConnection> OpenDatabaseAsync()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = CreateContext(connection);
+        await db.Database.EnsureCreatedAsync();
+        return connection;
+    }
+
+    private static SpecusDbContext CreateContext(SqliteConnection connection) =>
+        new(new DbContextOptionsBuilder<SpecusDbContext>()
+            .UseSqlite(connection)
+            .Options);
+
+    private static ClientAccount ClientAccount(long id, string name, string passwordHash,
+        DateTimeOffset now) => new()
+    {
+        Id = id,
+        TenantId = "default",
+        OwnerUsername = "admin",
+        ClientName = name,
+        PasswordHash = passwordHash,
+        Enabled = true,
+        ConnectionRateLimitPerMinute = 30,
+        CreatedAt = now,
+        UpdatedAt = now,
+    };
+
+    private static ClientCredential ClientCredential(long id, string apiKey, string secretHash,
+        DateTimeOffset now) => new()
+    {
+        Id = id,
+        TenantId = "default",
+        OwnerUsername = "admin",
+        ApiKey = apiKey,
+        SecretHash = secretHash,
+        Enabled = true,
+        MaxOnlineInstances = 2,
+        CreatedAt = now,
+        UpdatedAt = now,
+    };
 }

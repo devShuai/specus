@@ -39,7 +39,7 @@ fi
 
 # Create directories
 install -d -m 0755 "$INSTALL_DIR"
-install -d -m 0750 "$CONFIG_DIR"
+install -d -m 0750 -o root -g "$GROUP" "$CONFIG_DIR"
 install -d -m 0750 "$DATA_DIR" -o "$USER" -g "$GROUP"
 install -d -m 0750 "$LOG_DIR" -o "$USER" -g "$GROUP"
 
@@ -58,8 +58,11 @@ cp "$SCRIPT_DIR/specus-server.env.example" "$CONFIG_DIR/specus-server.env.exampl
 if [[ ! -f "$CONFIG_DIR/specus-server.env" ]]; then
   cp "$SCRIPT_DIR/specus-server.env.example" "$CONFIG_DIR/specus-server.env"
   chmod 0640 "$CONFIG_DIR/specus-server.env"
-  chown "$USER:$GROUP" "$CONFIG_DIR/specus-server.env"
+  chown "root:$GROUP" "$CONFIG_DIR/specus-server.env"
   echo "已创建 $CONFIG_DIR/specus-server.env — 请编辑后启动服务"
+  echo "如需密码登录，请先生成独立强口令和稳定 JWT 密钥，再启用 PASSWORD_LOGIN_ENABLED"
+else
+  echo "已存在 $CONFIG_DIR/specus-server.env，不覆盖；最新模板见 specus-server.env.example"
 fi
 
 # Install systemd unit
@@ -70,4 +73,5 @@ systemctl enable "$SERVICE_NAME"
 echo "C# server 安装完成"
 echo "  - 安装目录: $INSTALL_DIR"
 echo "  - 配置:     $CONFIG_DIR/specus-server.env"
+echo "  - 状态:     已注册并设为开机自启，本次安装未启动服务"
 echo "  - 启动:     sudo systemctl start $SERVICE_NAME"

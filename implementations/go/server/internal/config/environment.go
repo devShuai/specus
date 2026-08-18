@@ -17,14 +17,21 @@ const (
 // knownDefaultPasswords lists values published in the repository, docs and demo data, plus the
 // usual throwaway passwords. Production refuses to start while one of them is configured.
 var knownDefaultPasswords = map[string]struct{}{
-	"admin":    {},
-	"password": {},
-	"123456":   {},
-	"12345678": {},
-	"changeme": {},
-	"specus":   {},
-	"test1234": {},
-	"demo":     {},
+	"admin":                     {},
+	"password":                  {},
+	"123456":                    {},
+	"12345678":                  {},
+	"changeme":                  {},
+	"change_me_admin_password":  {},
+	"change-me-before-exposure": {},
+	"change-me":                 {},
+	"specus":                    {},
+	"test1234":                  {},
+	"demo":                      {},
+}
+
+var knownDefaultJWTSecrets = map[string]struct{}{
+	"replace-with-a-long-random-secret": {},
 }
 
 // ParseEnvironment resolves the configured environment name. Unset or unknown values resolve to
@@ -60,19 +67,23 @@ func (c Config) SeedDemoDataEnabled() bool {
 	return c.Database.SeedDemoClient && c.Environment().AllowsDemoData()
 }
 
-// validateSecurityBaseline fails startup when a production deployment still carries credentials
+// ValidateSecurityBaseline fails startup when a production deployment still carries credentials
 // that ship with the project or are trivially guessable.
-func (c Config) validateSecurityBaseline() error {
+func (c Config) ValidateSecurityBaseline() error {
 	if !c.Environment().IsProd() {
 		return nil
 	}
 	password := strings.TrimSpace(c.Auth.Password)
-	if !c.Auth.PasswordLoginEnabled || password == "" {
-		return nil
+	if c.Auth.PasswordLoginEnabled && password != "" {
+		if _, known := knownDefaultPasswords[strings.ToLower(password)]; known {
+			return fmt.Errorf(
+				"auth.password is a known default credential and is refused in prod; set SPECUS_AUTH_PASSWORD to a unique value or leave it blank to disable password login")
+		}
 	}
-	if _, known := knownDefaultPasswords[strings.ToLower(password)]; known {
+	jwtSecret := strings.TrimSpace(c.Auth.JwtSecret)
+	if _, known := knownDefaultJWTSecrets[strings.ToLower(jwtSecret)]; known {
 		return fmt.Errorf(
-			"auth.password is a known default credential and is refused in prod; set SPECUS_AUTH_PASSWORD to a unique value or leave it blank to disable password login")
+			"auth.jwtSecret is a published placeholder and is refused in prod; set SPECUS_AUTH_JWT_SECRET to a unique random value or leave it blank to use an ephemeral key")
 	}
 	return nil
 }

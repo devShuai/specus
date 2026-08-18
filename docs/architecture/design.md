@@ -262,7 +262,7 @@ HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后
 | MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` |
 | PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` |
 
-`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `SPECUS_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。该开关只在 `SPECUS_ENV=dev` / `test` 下生效：`prod`（默认，含未设置和未知值）无条件跳过演示数据，并在启动时拒绝已知默认管理口令。三端（Java / Go / .NET）共用同一套环境判定、默认口令清单与登录限速语义。
+数据库初始化器负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `SPECUS_DB_SEED_DEMO_CLIENT` 控制开发/测试演示凭据种子。该开关只在 `SPECUS_ENV=dev` / `test` 下生效：`prod`（默认，含未设置和未知值）无条件跳过演示数据，并在启动时拒绝已知弱管理口令。升级后的第一次 `prod` 启动会分别停用两类启用中的 legacy demo 记录：名称精确为 `Demo client` 且密码摘要对应历史值 `test1234` 的客户端账户，以及 API Key 精确为 `demo-client` 且 secret 摘要对应 `test1234` 的启动凭据。两类记录独立匹配；已轮换凭据、仅名称或 key 相同但摘要不同、以及已停用的记录不受影响。这里的历史值是迁移条件而非生产示例。三端（Java / Go / .NET）共用同一套环境判定、生产清理和登录限速语义。
 
 ## 9. 并发与线程模型
 
@@ -300,12 +300,13 @@ control 连接失败后，`NettyClient` 使用 `2s → 4s → 8s → 16s → 32s
 | Control | `SPECUS_NETTY_PORT` | `7010` |
 | Frame | `SPECUS_NETTY_MAX_FRAME_SIZE` | `33554432`（32 MiB） |
 | DB | `SPECUS_DB_URL` / `SPECUS_DB_POOL_SIZE` / `SPECUS_DB_BATCH_SIZE` | SQLite / `1` / `50` |
-| Seed | `SPECUS_DB_SEED_DEMO_CLIENT` | `true` |
+| Environment | `SPECUS_ENV` | `prod`（空值或未知值同样按 prod） |
+| Seed | `SPECUS_DB_SEED_DEMO_CLIENT` | `true`（仅 dev/test 生效；systemd 模板为 false） |
 | Client token | `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` |
 | Traffic | `SPECUS_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` |
 | Archive | `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` / `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `60` / `3600000` |
 | HTTP | `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` / `SPECUS_HTTP_TIMEOUT_MS` | `16777216` / `30000` |
-| Admin auth | `SPECUS_AUTH_USERNAME` / `_PASSWORD` / `_TOKEN_TTL_SECONDS` | `admin` / `admin` / `28800` |
+| Admin auth | `SPECUS_AUTH_USERNAME` / `_PASSWORD` / `_TOKEN_TTL_SECONDS` | `admin` / 空 / `28800`（systemd 模板关闭密码登录） |
 | Peer Mesh | `SPECUS_PEER_MESH_ENABLED` / `_STUN_TURN_PORT` / `_NAT_PROBE_ALTERNATE_PORT` | `false` / `3478` / `3479` |
 | TLS | `SPECUS_TLS_MODE` | `disabled` |
 

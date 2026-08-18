@@ -58,6 +58,9 @@ if [[ ! -f "$CONFIG_DIR/specus-server.env" ]]; then
   install -m 0640 -o root -g "$GROUP" \
     "$SCRIPT_DIR/specus-server.env.example" "$CONFIG_DIR/specus-server.env"
   echo "已创建 $CONFIG_DIR/specus-server.env — 请编辑后启动服务"
+  echo "如需密码登录，请先生成独立强口令和稳定 JWT 密钥，再启用 PASSWORD_LOGIN_ENABLED"
+else
+  echo "已存在 $CONFIG_DIR/specus-server.env，不覆盖；最新模板见 specus-server.env.example"
 fi
 
 # Install systemd unit
@@ -72,4 +75,5 @@ echo "Go server 安装完成"
 echo "  - 二进制: $INSTALL_DIR/specus-server"
 echo "  - 配置:   $CONFIG_DIR/specus-server.env"
 echo "  - 日志:   $LOG_DIR/specus-server.log"
+echo "  - 状态:   已注册并设为开机自启，本次安装未启动服务"
 echo "  - 启动:   sudo systemctl start $SERVICE_NAME"

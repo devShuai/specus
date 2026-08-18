@@ -82,13 +82,27 @@ public sealed class LoginRateLimiterTests
         Assert.Equal(expected, DeploymentEnvironments.Parse(value));
     }
 
-    [Fact]
-    public void ProdRefusesKnownDefaultPasswordsOnly()
+    [Theory]
+    [InlineData("admin")]
+    [InlineData("password")]
+    [InlineData("123456")]
+    [InlineData("12345678")]
+    [InlineData(" test1234 ")]
+    [InlineData("changeme")]
+    [InlineData("change_me_admin_password")]
+    [InlineData("change-me-before-exposure")]
+    [InlineData("change-me")]
+    [InlineData("specus")]
+    [InlineData("demo")]
+    public void ProdRefusesKnownDefaultPasswords(string password)
     {
         Assert.NotNull(DeploymentEnvironments.DescribeSecurityBaselineViolation(
-            DeploymentEnvironment.Prod, true, "admin"));
-        Assert.NotNull(DeploymentEnvironments.DescribeSecurityBaselineViolation(
-            DeploymentEnvironment.Prod, true, " test1234 "));
+            DeploymentEnvironment.Prod, true, password));
+    }
+
+    [Fact]
+    public void ProdAcceptsOnlyNonDefaultOrDisabledPasswordLogin()
+    {
         // Strong password, blank password and disabled password login are all acceptable.
         Assert.Null(DeploymentEnvironments.DescribeSecurityBaselineViolation(
             DeploymentEnvironment.Prod, true, "8Qb!x2s7Lm#4pTz"));
@@ -99,6 +113,17 @@ public sealed class LoginRateLimiterTests
         // Non-prod only warns.
         Assert.Null(DeploymentEnvironments.DescribeSecurityBaselineViolation(
             DeploymentEnvironment.Dev, true, "admin"));
+    }
+
+    [Fact]
+    public void ProdRefusesPublishedJwtPlaceholderEvenWhenPasswordLoginIsDisabled()
+    {
+        Assert.NotNull(DeploymentEnvironments.DescribeSecurityBaselineViolation(
+            DeploymentEnvironment.Prod, false, string.Empty, " replace-with-a-long-random-secret "));
+        Assert.Null(DeploymentEnvironments.DescribeSecurityBaselineViolation(
+            DeploymentEnvironment.Prod, false, string.Empty, "unique-random-deployment-secret"));
+        Assert.Null(DeploymentEnvironments.DescribeSecurityBaselineViolation(
+            DeploymentEnvironment.Test, false, string.Empty, "replace-with-a-long-random-secret"));
     }
 
     [Fact]

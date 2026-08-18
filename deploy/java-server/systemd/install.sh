@@ -14,10 +14,10 @@
 #        /var/lib/specus-server      —— 工作目录（fallback SQLite / 临时数据）
 #        /var/log/specus-server      —— 应用滚动日志（同时保留 journald）
 #   4) 拷贝 jar、systemd unit、env 模板
-#   5) systemctl daemon-reload + enable
+#   5) systemctl daemon-reload + enable（不自动启动）
 #
 # 不会自动启动服务 —— 需要先编辑 /etc/specus-server/specus-server.env
-# 填好 MySQL 连接信息、管理员密码、JWT 密钥和可选 ES 配置后再执行：
+# 填好 MySQL 连接信息；如需密码登录，先生成强口令和 JWT 密钥，再执行：
 #   systemctl start specus-server
 #   systemctl status specus-server
 #   journalctl -u specus-server -f
@@ -97,7 +97,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   install -m 0640 -o root -g "$APP_GROUP" \
           "$SCRIPT_DIR/specus-server.env.example" "$ENV_FILE"
   echo "[OK] 环境变量模板已部署到 $ENV_FILE"
-  echo "     ⚠️  请编辑该文件，填好 MySQL 连接信息、管理员密码、JWT 密钥后再启动服务"
+  echo "     ⚠️  请编辑该文件；如需密码登录，先生成独立强口令和稳定 JWT 密钥再启用"
 else
   echo "[--] 已存在 $ENV_FILE，不覆盖"
   echo "     可用 diff 对比新增变量：diff -u $ENV_FILE $ENV_EXAMPLE_FILE"
@@ -115,11 +115,12 @@ cat <<EOF
 
   1. 编辑环境变量：
        sudo vim $ENV_FILE
-     至少修改：
+     至少修改数据库连接：
        SPECUS_DB_URL / SPECUS_DB_USERNAME / SPECUS_DB_PASSWORD
-       SPECUS_AUTH_PASSWORD
-       SPECUS_AUTH_JWT_SECRET   (openssl rand -base64 48)
      可选修改：
+       SPECUS_AUTH_PASSWORD_LOGIN_ENABLED=true（仅在下列两项已配置后）
+       SPECUS_AUTH_PASSWORD             （独立强口令）
+       SPECUS_AUTH_JWT_SECRET            (openssl rand -base64 48)
        SPECUS_PUBLIC_ADDRESS
        SPECUS_ELASTICSEARCH_URIS / SPECUS_ELASTICSEARCH_USERNAME / SPECUS_ELASTICSEARCH_PASSWORD
        SPECUS_AUTH_TENANT_ID / SPECUS_OIDC_TENANT_CLAIM

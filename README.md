@@ -143,9 +143,11 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台支持用户名/密码与 OIDC 登录，管理 API 校验 Bearer JWT，详见[管理后台登录](#管理后台登录)。
 
-服务端默认使用当前工作目录下的 SQLite 数据库 `specus.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构。演示客户端 `Demo client` 与启动凭证 `apiKey=demo-client / secret=test1234` 只在 `SPECUS_ENV=dev` 或 `test` 且 `SPECUS_DB_SEED_DEMO_CLIENT=true`（默认）时创建；`SPECUS_ENV` 未设置时按 `prod` 处理，不会写入任何演示数据。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+服务端默认使用当前工作目录下的 SQLite 数据库 `specus.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构。演示客户端和启动凭证只在 `SPECUS_ENV=dev` 或 `test` 且 `SPECUS_DB_SEED_DEMO_CLIENT=true` 时创建；三套 systemd 生产模板都显式设置 `SPECUS_ENV=prod` 与 `SPECUS_DB_SEED_DEMO_CLIENT=false`。`SPECUS_ENV` 未设置时也按 `prod` 处理，不会写入演示数据。
 
-生产部署清单：设置 `SPECUS_ENV=prod`（或留空，默认即 prod）；用 `SPECUS_AUTH_PASSWORD` 配置唯一强口令，或保持留空改用 OIDC 登录。若在 prod 下把密码设为已知默认口令，服务会拒绝启动并提示更换。登录接口默认按来源 IP 与账号双维度限速，与 Turnstile 相互独立。
+生产部署清单：显式设置 `SPECUS_ENV=prod`；保持本地密码登录关闭并使用 OIDC，或先生成唯一强口令和稳定 JWT 密钥，再开启 `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED`。若在 prod 下配置已知弱口令，服务会拒绝启动并提示更换。登录接口默认按来源 IP 与账号双维度限速，与 Turnstile 相互独立。
+
+从旧版本升级后，第一次以 `prod` 启动会分别检查两类启用中的 legacy demo 记录：名称精确为 `Demo client` 且密码摘要仍对应历史值 `test1234` 的客户端账户，以及 API Key 精确为 `demo-client` 且 secret 摘要仍对应 `test1234` 的启动凭据；命中的记录各自停用。已轮换密码或 secret、仅名称或 key 相同但摘要不同、以及本来已停用的记录都不会被修改。这里的历史值仅用于说明迁移识别条件，不是生产凭据示例；该清理可重复执行且不会重新创建演示数据。
 
 如需在端口映射日志中显示服务端公网地址，可设置 `SPECUS_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
 
@@ -176,8 +178,8 @@ Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP �
   "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
   "serverBaseUrl": "http://127.0.0.1:8088",
-  "apiKey": "demo-client",
-  "secret": "test1234",
+  "apiKey": "your-api-key",
+  "secret": "paste-the-one-time-secret-here",
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280
@@ -268,10 +270,10 @@ Java/Go/C# 客户端登录成功后收到服务端返回的初始映射快照，
 也可以直接调用管理 API（`/api/admin/**` 需携带 Bearer JWT，详见[管理后台登录](#管理后台登录)）。先换取一个令牌：
 
 ```bash
-# 用户名/密码登录换取 HS256 JWT（默认 admin / admin，请务必修改）
+# 仅在已配置本地登录时，用部署时创建的管理员凭据换取 HS256 JWT
 TOKEN=$(curl -s -X POST http://127.0.0.1:8088/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin"}' | jq -r .accessToken)
+  -d '{"username":"<ADMIN_USERNAME>","password":"<STRONG_PASSWORD>"}' | jq -r .accessToken)
 ```
 
 ```bash
@@ -345,7 +347,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 ### 用户名/密码登录
 
-页面在提交用户名和密码前执行 Cloudflare Turnstile `login` action，再把短期 token 一并发到 `POST /auth/login`；服务端通过 Siteverify 校验 success、action 和 hostname 后才验证密码。注册分两步：`POST /auth/register` 通过 Turnstile `register` action 后发送邮箱验证码，`POST /auth/register/verify` 校验验证码并原子创建默认租户普通用户。验证码只保存 HMAC 摘要，验证前不会创建账号。Java、Go、C# 三套服务端遵循相同接口与安全校验。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
+页面在提交用户名和密码前执行 Cloudflare Turnstile `login` action，再把短期 token 一并发到 `POST /auth/login`；服务端通过 Siteverify 校验 success、action 和 hostname 后才验证密码。注册分两步：`POST /auth/register` 通过 Turnstile `register` action 后发送邮箱验证码，`POST /auth/register/verify` 校验验证码并原子创建默认租户普通用户。验证码只保存 HMAC 摘要，验证前不会创建账号。Java、Go、C# 三套服务端遵循相同接口与安全校验。生产模板不提供可用默认密码并关闭本地密码登录；使用该方式前必须生成独立强口令和稳定 JWT 密钥。
 
 自助注册只有在注册开关、Turnstile、hostname 白名单、邮箱验证、SMTP 和发件地址全部配置完成时才会显示。Turnstile secret 和 SMTP 密码只保留在服务端；浏览器只读取公开 site key。OIDC 登录由外部身份提供方完成，不经过本地密码登录端点。
 
@@ -356,7 +358,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | `SPECUS_AUTH_USERNAME` | `admin` | 管理用户名 |
 | `SPECUS_AUTH_PASSWORD` | （空） | 管理密码；默认留空即禁用密码登录。`prod` 下配置为已知默认口令（如 `admin`、`test1234`、`changeme`）会拒绝启动 |
 | `SPECUS_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |
-| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
+| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true`（systemd 模板为 `false`） | 是否启用密码登录；口令为空时仍不可登录 |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED` | `true` | 登录尝试限速总开关，独立于验证码 |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP` | `20` | 单来源 IP 在一个窗口内允许的登录尝试次数 |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | 单账号在一个窗口内允许的登录尝试次数（跨来源 IP 累计） |

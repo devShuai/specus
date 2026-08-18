@@ -33,8 +33,10 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 
 - v2 隧道监听默认使用 `7010`，每个客户端会话在该监听上分别建立 `control` 与 `data` 连接。
 - 管理后台 + HTTP/WebSocket 流式入口默认监听 `:8088`，浏览器访问 `http://127.0.0.1:8088/`。
-- 默认 seed 演示客户端账号 `Demo client` 和启动凭证 `apiKey=demo-client / secret=test1234`(可关)。
-- 管理后台默认账号 `admin / admin`；内置 admin 之外的管理用户保存到 `specus_management_user`。
+- `prod`（含未设置或未知的环境值）不创建演示客户端；仅 `dev` / `test` 可显式开启 demo seed。
+- 本地密码登录没有可用的默认密码；生产 systemd 模板默认关闭该入口。内置管理员之外的管理用户保存到 `specus_management_user`。
+
+旧库升级后第一次以 `prod` 启动时，服务端会分别停用两类启用中的 legacy demo 记录：名称精确为 `Demo client` 且密码摘要仍对应历史值 `test1234` 的客户端账户，以及 API Key 精确为 `demo-client` 且 secret 摘要仍对应 `test1234` 的启动凭据。已轮换密码或 secret、仅名称或 key 相同但摘要不同、以及本来已停用的记录都不会被修改；这里的历史值只用于迁移识别，不是生产凭据示例。
 
 ## 配置
 
@@ -54,10 +56,11 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `SPECUS_LOG_FILE` | 独立运行时可选的日志文件绝对路径；配置后与标准输出双写。systemd 部署直接捕获完整 stdout/stderr 并强制留空，避免重复日志 | - |
 | `SPECUS_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | sqlite |
 | `SPECUS_CONNECTIONSTRINGS_SPECUS` | 数据库连接串 | `./specus.db` |
-| `SPECUS_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端 | true |
-| `SPECUS_AUTH_USERNAME` / `SPECUS_AUTH_PASSWORD` | 管理后台账号 | admin / admin |
+| `SPECUS_ENV` | 部署环境；空值或未知值按 `prod` 处理 | prod |
+| `SPECUS_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端；只在 `dev` / `test` 生效，生产模板显式关闭 | true（systemd 模板为 false） |
+| `SPECUS_AUTH_USERNAME` / `SPECUS_AUTH_PASSWORD` | 管理后台账号；密码留空时不可登录 | admin / 空 |
 | `SPECUS_AUTH_TENANT_ID` | 本地密码登录默认租户 | default |
-| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` / `SPECUS_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册总开关；注册还要求 Turnstile 与 SMTP | true / true（验证配置默认关闭） |
+| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` / `SPECUS_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册总开关；注册还要求 Turnstile 与 SMTP | true / true（systemd 模板均为 false） |
 | `SPECUS_AUTH_TURNSTILE_*` | Cloudflare Turnstile site key、secret、Siteverify 地址与 hostname 白名单 | disabled |
 | `SPECUS_AUTH_EMAIL_*` / `SPECUS_AUTH_SMTP_*` | 注册邮箱验证码与 SMTP 参数 | disabled |
 | `SPECUS_AUTH_JWT_SECRET` | 本地 JWT 签名密钥(空则随机,重启失效) | - |

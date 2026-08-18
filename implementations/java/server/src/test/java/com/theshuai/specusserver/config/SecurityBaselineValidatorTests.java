@@ -26,13 +26,15 @@ class SecurityBaselineValidatorTests {
 
     @Test
     void prodRefusesToStartWithKnownDefaultPassword() {
-        assertThatThrownBy(() -> validator("prod", "admin").validate())
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("已知默认口令");
-        assertThatThrownBy(() -> validator("", "test1234").validate())
-                .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> validator("prod", " ChangeMe ").validate())
-                .isInstanceOf(IllegalStateException.class);
+        for (String password : new String[]{
+                "admin", "password", "123456", "12345678", "test1234", " ChangeMe ", "change-me",
+                "CHANGE_ME_ADMIN_PASSWORD", "change-me-before-exposure", "specus", "demo"
+        }) {
+            assertThatThrownBy(() -> validator("prod", password).validate())
+                    .as("historical default %s", password)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("已知默认口令");
+        }
     }
 
     @Test
@@ -51,6 +53,20 @@ class SecurityBaselineValidatorTests {
     void nonProdOnlyWarnsAboutWeakDefaults() {
         assertThatCode(() -> validator("dev", "admin").validate()).doesNotThrowAnyException();
         assertThatCode(() -> validator("test", "admin").validate()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void prodRefusesPublishedJwtPlaceholderEvenWhenPasswordLoginIsDisabled() {
+        AuthProperties properties = properties("");
+        properties.setJwtSecret(" Replace-With-A-Long-Random-Secret ");
+        assertThatThrownBy(() -> new SecurityBaselineValidator(properties, "prod", false).validate())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("公开占位值");
+        assertThatCode(() -> new SecurityBaselineValidator(properties, "dev", false).validate())
+                .doesNotThrowAnyException();
+        properties.setJwtSecret("unique-random-deployment-secret");
+        assertThatCode(() -> new SecurityBaselineValidator(properties, "prod", false).validate())
+                .doesNotThrowAnyException();
     }
 
     private SecurityBaselineValidator validator(String environmentName, String password) {

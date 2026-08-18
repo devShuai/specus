@@ -566,7 +566,7 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.applyEnv(environMap())
-	if err := cfg.validateSecurityBaseline(); err != nil {
+	if err := cfg.ValidateSecurityBaseline(); err != nil {
 		return Config{}, err
 	}
 	if cfg.Netty.MaxFrameSize < 11 {

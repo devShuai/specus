@@ -188,7 +188,7 @@ var app = builder.Build();
     var authOptions = app.Services.GetRequiredService<IOptions<AuthOptions>>().Value;
     var environment = DeploymentEnvironments.Parse(specusOptions.Env);
     var violation = DeploymentEnvironments.DescribeSecurityBaselineViolation(
-        environment, authOptions.PasswordLoginEnabled, authOptions.Password);
+        environment, authOptions.PasswordLoginEnabled, authOptions.Password, authOptions.JwtSecret);
     if (violation is not null)
     {
         throw new InvalidOperationException(violation);
@@ -197,6 +197,11 @@ var app = builder.Build();
     {
         app.Logger.LogWarning(
             "[security-baseline] Specus:Auth:Password is a known default credential; prod would refuse to start");
+    }
+    if (DeploymentEnvironments.IsKnownDefaultJwtSecret(authOptions.JwtSecret))
+    {
+        app.Logger.LogWarning(
+            "[security-baseline] Specus:Auth:JwtSecret is a known placeholder; prod would refuse to start");
     }
 }
 
