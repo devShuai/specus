@@ -13,6 +13,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The desktop app targets net10.0-windows for WPF, but the transfer state machine itself is
+         plain BCL code. Compile it here so its receive path is covered on any host. -->
+    <Compile Include="..\..\src\Specus.Client.Desktop\FileTransferManager.cs"
+             Link="Desktop\FileTransferManager.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />

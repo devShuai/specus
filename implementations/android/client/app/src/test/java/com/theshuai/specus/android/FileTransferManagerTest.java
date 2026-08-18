@@ -92,4 +92,56 @@ public class FileTransferManagerTest {
         assertEquals("1.0 KB", FileTransferManager.formatBytes(1024));
         assertEquals("10 MB", FileTransferManager.formatBytes(10 * 1024 * 1024));
     }
+
+    @Test
+    public void offerCarriesWholeFileDigestWhenAvailable() throws Exception {
+        String body = FileTransferManager.buildOffer("id-d", "a.bin", 3L, "application/octet-stream", 1,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+        JSONObject parsed = FileTransferManager.parseTransfer(body);
+        assertNotNull(parsed);
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                parsed.getString("sha256"));
+
+        // Peers that predate the digest simply omit the field.
+        JSONObject legacy = FileTransferManager.parseTransfer(
+                FileTransferManager.buildOffer("id-l", "a.bin", 3L, "application/octet-stream", 1));
+        assertNotNull(legacy);
+        assertFalse(legacy.has("sha256"));
+    }
+
+    @Test
+    public void sanitizeNameReducesPeerInputToABareFileName() {
+        assertEquals("escape.txt", FileTransferManager.sanitizeName("../../escape.txt"));
+        assertEquals("escape.txt", FileTransferManager.sanitizeName("..\\..\\escape.txt"));
+        assertEquals("passwd", FileTransferManager.sanitizeName("/etc/passwd"));
+        assertEquals("evil.so", FileTransferManager.sanitizeName("/data/data/other.app/files/evil.so"));
+        assertEquals("file", FileTransferManager.sanitizeName(".."));
+        assertEquals("file", FileTransferManager.sanitizeName("   "));
+        assertEquals("file", FileTransferManager.sanitizeName(null));
+        // Characters that would confuse the filesystem are replaced rather than kept.
+        assertEquals("a_b.txt", FileTransferManager.sanitizeName("a:b.txt"));
+    }
+
+    @Test
+    public void fileDigestMatchesKnownSha256() throws Exception {
+        java.io.File file = java.io.File.createTempFile("specus-digest", ".bin");
+        file.deleteOnExit();
+        try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+            out.write("abc".getBytes(StandardCharsets.UTF_8));
+        }
+
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                FileTransferManager.fileDigest(file));
+    }
+
+    @Test
+    public void zeroByteOfferCarriesNoChunks() throws Exception {
+        JSONObject parsed = FileTransferManager.parseTransfer(
+                FileTransferManager.buildOffer("id-0", "empty.txt", 0L, "text/plain", 0));
+
+        assertNotNull(parsed);
+        assertEquals(0L, parsed.getLong("size"));
+        assertEquals(0, parsed.getInt("chunks"));
+    }
 }

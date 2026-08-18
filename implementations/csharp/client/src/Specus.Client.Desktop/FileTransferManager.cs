@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -8,19 +9,34 @@ namespace Specus.Client.Desktop;
 /// STXFER1 chunked file transfer on top of the client message channel
 /// (peer mesh first, server fallback). Wire-compatible with the Android client:
 /// every frame is a text message prefixed with "STXFER1\n" carrying a JSON body.
+///
+/// <para>The receive path treats the peer as untrusted: sessions are keyed by the authenticated
+/// sender plus the transfer id, the remote id never reaches the filesystem, chunks are tracked in a
+/// bitmap so retries are idempotent, and completion requires every chunk plus a matching digest.
+/// Because the transport falls back to the server when a peer ACK is lost, duplicate deliveries are
+/// expected and must not corrupt or prematurely complete a file.</para>
 /// </summary>
 internal sealed class FileTransferManager
 {
     internal const string Prefix = "STXFER1\n";
     internal const int ChunkBytes = 600;
     internal const long MaxFileBytes = 8L * 1024 * 1024;
+    /// <summary>Concurrent inbound sessions across all peers.</summary>
+    internal const int MaxConcurrentSessions = 16;
+    /// <summary>Total bytes reserved on disk by in-flight inbound sessions.</summary>
+    internal const long MaxPendingBytes = 64L * 1024 * 1024;
     private static readonly TimeSpan SessionTtl = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(15);
     private const int ProgressEveryChunks = 32;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly object _gate = new();
     private readonly Dictionary<string, IncomingSession> _incoming = new(StringComparer.Ordinal);
+    /// <summary>Sessions finished recently, so a replayed "done" is ignored instead of re-delivered.</summary>
+    private readonly Dictionary<string, DateTime> _completed = new(StringComparer.Ordinal);
+    private readonly Timer _sweepTimer;
+    private long _pendingBytes;
 
     public static FileTransferManager Instance { get; } = new();
 
@@ -29,7 +45,19 @@ internal sealed class FileTransferManager
 
     private FileTransferManager()
     {
+        // Expiry must not depend on the next inbound message: a stalled sender would otherwise pin
+        // the temp file and its reserved bytes indefinitely.
+        _sweepTimer = new Timer(_ => SweepExpired(), null, SweepInterval, SweepInterval);
     }
+
+    /// <summary>Test seam: builds an instance whose downloads land under <paramref name="rootDirectory"/>.</summary>
+    internal FileTransferManager(string rootDirectory)
+    {
+        RootDirectoryOverride = rootDirectory;
+        _sweepTimer = new Timer(_ => SweepExpired(), null, SweepInterval, SweepInterval);
+    }
+
+    internal string? RootDirectoryOverride { get; }
 
     public static bool IsTransferMessage(string? body)
         => body is not null && body.StartsWith(Prefix, StringComparison.Ordinal);
@@ -38,7 +66,6 @@ internal sealed class FileTransferManager
     {
         if (!IsTransferMessage(body))
         {
-            SweepExpired();
             return false;
         }
         TransferFrame? frame;
@@ -54,28 +81,31 @@ internal sealed class FileTransferManager
         {
             return true;
         }
+        // The envelope's own sender field is peer-controlled and must never override the
+        // authenticated sender the transport gives us.
+        var sessionKey = SessionKey(from, frame.Id!);
 
         try
         {
             switch (frame.Type)
             {
                 case "offer":
-                    HandleOffer(from, frame);
+                    HandleOffer(sessionKey, from, frame);
                     break;
                 case "chunk":
-                    HandleChunk(from, frame);
+                    HandleChunk(sessionKey, from, frame);
                     break;
                 case "done":
-                    HandleDone(from, frame);
+                    HandleDone(sessionKey, from, frame);
                     break;
                 case "abort":
-                    HandleAbort(from, frame);
+                    HandleAbort(sessionKey, from, frame);
                     break;
             }
         }
         catch (Exception ex)
         {
-            DropSession(frame.Id);
+            DropSession(sessionKey);
             Emit("IN", from, $"文件接收失败 · {ex.Message}");
         }
         return true;
@@ -102,10 +132,13 @@ internal sealed class FileTransferManager
         var id = Guid.NewGuid().ToString("N");
         var name = fileInfo.Name;
         var total = fileInfo.Length;
-        var chunks = (int)Math.Max(1, (total + ChunkBytes - 1) / ChunkBytes);
+        // A zero-byte file carries no chunks at all; the digest still proves the transfer.
+        var chunks = (int)((total + ChunkBytes - 1) / ChunkBytes);
         try
         {
-            await sendAsync(target, BuildOffer(id, name, total, chunks), cancellationToken).ConfigureAwait(false);
+            var digest = await ComputeFileDigestAsync(filePath, cancellationToken).ConfigureAwait(false);
+            await sendAsync(target, BuildOffer(id, name, total, chunks, digest), cancellationToken)
+                .ConfigureAwait(false);
             Emit("OUT", target, $"发送中 {name} · {FormatBytes(total)}");
 
             var buffer = new byte[ChunkBytes];
@@ -113,7 +146,7 @@ internal sealed class FileTransferManager
                 filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
             for (var seq = 0; seq < chunks; seq++)
             {
-                var read = await stream.ReadAsync(buffer.AsMemory(0, ChunkBytes), cancellationToken).ConfigureAwait(false);
+                var read = await ReadChunkAsync(stream, buffer, cancellationToken).ConfigureAwait(false);
                 if (read <= 0)
                 {
                     throw new IOException("文件读取提前结束");
@@ -143,7 +176,7 @@ internal sealed class FileTransferManager
         }
     }
 
-    internal static string BuildOffer(string id, string name, long size, int chunks)
+    internal static string BuildOffer(string id, string name, long size, int chunks, string? sha256 = null)
         => Prefix + JsonSerializer.Serialize(new TransferFrame
         {
             Type = "offer",
@@ -152,6 +185,7 @@ internal sealed class FileTransferManager
             Size = size,
             Mime = "application/octet-stream",
             Chunks = chunks,
+            Sha256 = sha256,
         }, JsonOptions);
 
     internal static string BuildChunk(string id, int seq, byte[] data, int length)
@@ -169,41 +203,61 @@ internal sealed class FileTransferManager
     internal static string BuildAbort(string id, string reason)
         => Prefix + JsonSerializer.Serialize(new TransferFrame { Type = "abort", Id = id, Reason = reason }, JsonOptions);
 
-    private void HandleOffer(string from, TransferFrame frame)
+    private void HandleOffer(string sessionKey, string from, TransferFrame frame)
     {
-        if (frame.Size < 0 || frame.Size > MaxFileBytes || frame.Chunks <= 0 || frame.Chunks > MaxFileBytes / ChunkBytes + 1)
+        var expectedChunks = (int)((frame.Size + ChunkBytes - 1) / ChunkBytes);
+        if (frame.Size < 0 || frame.Size > MaxFileBytes || frame.Chunks < 0 || frame.Chunks != expectedChunks)
         {
             throw new ArgumentException("invalid offer");
         }
-        DropSession(frame.Id!);
-
-        var dir = Path.Combine(Path.GetTempPath(), "specus-transfers");
-        Directory.CreateDirectory(dir);
-        var temp = Path.Combine(dir, frame.Id + ".part");
-        var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, useAsync: false);
-        stream.SetLength(frame.Size);
-
-        var session = new IncomingSession
+        if (frame.Sha256 is not null && !IsHexDigest(frame.Sha256))
         {
-            Id = frame.Id!,
-            Name = SanitizeName(frame.Name),
-            From = from,
-            Size = frame.Size,
-            Chunks = frame.Chunks,
-            TempPath = temp,
-            Stream = stream,
-            LastTouchedAt = DateTime.UtcNow,
-        };
+            throw new ArgumentException("invalid digest");
+        }
+        // A repeated offer for the same sender+id restarts the transfer; it must not leak the
+        // previous temp file or its reserved bytes.
+        DropSession(sessionKey);
+
+        var directory = TempDirectory();
+        Directory.CreateDirectory(directory);
+        // The remote id never reaches the filesystem: the temp name is locally generated and the
+        // resolved path is verified to stay inside our own directory.
+        var temp = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".part");
+        EnsureContained(directory, temp);
+
         lock (_gate)
         {
-            _incoming[session.Id] = session;
+            if (_incoming.Count >= MaxConcurrentSessions)
+            {
+                throw new InvalidOperationException("接收会话过多");
+            }
+            if (_pendingBytes + frame.Size > MaxPendingBytes)
+            {
+                throw new InvalidOperationException("接收缓冲已满");
+            }
+            var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                64 * 1024, useAsync: false);
+            stream.SetLength(frame.Size);
+            _incoming[sessionKey] = new IncomingSession
+            {
+                Name = SanitizeName(frame.Name),
+                From = from,
+                Size = frame.Size,
+                Chunks = frame.Chunks,
+                Sha256 = frame.Sha256,
+                TempPath = temp,
+                Stream = stream,
+                ReceivedChunks = new bool[frame.Chunks],
+                LastTouchedAt = DateTime.UtcNow,
+            };
+            _pendingBytes += frame.Size;
         }
-        Emit("IN", from, $"接收中 {session.Name} · {FormatBytes(session.Size)}");
+        Emit("IN", from, $"接收中 {SanitizeName(frame.Name)} · {FormatBytes(frame.Size)}");
     }
 
-    private void HandleChunk(string from, TransferFrame frame)
+    private void HandleChunk(string sessionKey, string from, TransferFrame frame)
     {
-        var session = GetSession(frame.Id!);
+        var session = GetSession(sessionKey);
         if (session is null)
         {
             return;
@@ -214,71 +268,110 @@ internal sealed class FileTransferManager
         }
         var data = Convert.FromBase64String(frame.Data ?? "");
         var offset = (long)frame.Seq * ChunkBytes;
-        if (offset + data.Length > session.Size)
+        // Every chunk but the last must be exactly ChunkBytes, so a short chunk cannot silently
+        // leave a hole that the bitmap would still count as received.
+        var expected = (int)Math.Min(ChunkBytes, session.Size - offset);
+        if (data.Length != expected)
         {
-            throw new ArgumentException("chunk out of range");
+            throw new ArgumentException("chunk length mismatch");
         }
+
+        var progress = 0;
         lock (session)
         {
+            session.LastTouchedAt = DateTime.UtcNow;
+            if (session.ReceivedChunks[frame.Seq])
+            {
+                // Duplicate delivery (peer retry or server fallback): writing again is harmless but
+                // the completion count must stay unchanged.
+                return;
+            }
             session.Stream.Position = offset;
             session.Stream.Write(data, 0, data.Length);
-            session.Received++;
-            session.LastTouchedAt = DateTime.UtcNow;
-            if (session.Received % ProgressEveryChunks == 0)
-            {
-                var percent = (int)(session.Received * 100L / session.Chunks);
-                Emit("IN", from, $"接收中 {session.Name} · {percent}%");
-            }
+            session.ReceivedChunks[frame.Seq] = true;
+            session.ReceivedCount++;
+            session.ReceivedBytes += data.Length;
+            progress = session.ReceivedCount;
+        }
+        if (progress > 0 && progress % ProgressEveryChunks == 0)
+        {
+            var percent = (int)(progress * 100L / Math.Max(1, session.Chunks));
+            Emit("IN", from, $"接收中 {session.Name} · {percent}%");
         }
     }
 
-    private void HandleDone(string from, TransferFrame frame)
+    private void HandleDone(string sessionKey, string from, TransferFrame frame)
     {
         IncomingSession? session;
         lock (_gate)
         {
-            _incoming.Remove(frame.Id!, out session);
+            if (_completed.ContainsKey(sessionKey))
+            {
+                // The sender retried "done" after its ACK was lost; the file is already delivered.
+                return;
+            }
+            if (_incoming.Remove(sessionKey, out session) && session is not null)
+            {
+                _pendingBytes = Math.Max(0, _pendingBytes - session.Size);
+            }
         }
         if (session is null)
         {
             return;
         }
         session.Stream.Dispose();
-        if (session.Received != session.Chunks)
+        if (session.ReceivedCount != session.Chunks || session.ReceivedBytes != session.Size)
         {
             TryDelete(session.TempPath);
-            Emit("IN", from, $"文件不完整 · {session.Name} ({session.Received}/{session.Chunks})");
+            Emit("IN", from, $"文件不完整 · {session.Name} ({session.ReceivedCount}/{session.Chunks})");
             return;
+        }
+        if (session.Sha256 is not null)
+        {
+            var actual = ComputeFileDigest(session.TempPath);
+            if (!string.Equals(actual, session.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                TryDelete(session.TempPath);
+                Emit("IN", from, $"文件校验失败 · {session.Name}");
+                return;
+            }
         }
 
         var target = UniqueTargetPath(session.Name);
         File.Move(session.TempPath, target);
+        lock (_gate)
+        {
+            _completed[sessionKey] = DateTime.UtcNow;
+        }
         Emit("IN", from, $"已接收 {session.Name} · {FormatBytes(session.Size)}\n保存到 {target}");
     }
 
-    private void HandleAbort(string from, TransferFrame frame)
+    private void HandleAbort(string sessionKey, string from, TransferFrame frame)
     {
-        var session = DropSession(frame.Id!);
+        var session = DropSession(sessionKey);
         if (session is not null)
         {
             Emit("IN", from, $"对方取消发送 · {session.Name}");
         }
     }
 
-    private IncomingSession? GetSession(string id)
+    private IncomingSession? GetSession(string sessionKey)
     {
         lock (_gate)
         {
-            return _incoming.TryGetValue(id, out var session) ? session : null;
+            return _incoming.TryGetValue(sessionKey, out var session) ? session : null;
         }
     }
 
-    private IncomingSession? DropSession(string id)
+    private IncomingSession? DropSession(string sessionKey)
     {
         IncomingSession? session;
         lock (_gate)
         {
-            _incoming.Remove(id, out session);
+            if (_incoming.Remove(sessionKey, out session) && session is not null)
+            {
+                _pendingBytes = Math.Max(0, _pendingBytes - session.Size);
+            }
         }
         if (session is not null)
         {
@@ -288,7 +381,7 @@ internal sealed class FileTransferManager
         return session;
     }
 
-    private void SweepExpired()
+    internal void SweepExpired()
     {
         var now = DateTime.UtcNow;
         List<string> expired;
@@ -298,10 +391,17 @@ internal sealed class FileTransferManager
                 .Where(pair => now - pair.Value.LastTouchedAt > SessionTtl)
                 .Select(pair => pair.Key)
                 .ToList();
+            foreach (var key in _completed
+                         .Where(pair => now - pair.Value > SessionTtl)
+                         .Select(pair => pair.Key)
+                         .ToList())
+            {
+                _completed.Remove(key);
+            }
         }
-        foreach (var id in expired)
+        foreach (var key in expired)
         {
-            var session = DropSession(id);
+            var session = DropSession(key);
             if (session is not null)
             {
                 Emit("IN", session.From, $"接收超时 · {session.Name}");
@@ -309,15 +409,72 @@ internal sealed class FileTransferManager
         }
     }
 
-    private static string UniqueTargetPath(string name)
+    /// <summary>Sessions are per authenticated sender, so peers cannot collide on transfer ids.</summary>
+    private static string SessionKey(string from, string id) => from + " " + id;
+
+    private string TempDirectory()
+        => Path.Combine(RootDirectoryOverride ?? Path.GetTempPath(), "specus-transfers");
+
+    /// <summary>Rejects any candidate that resolves outside the directory we own.</summary>
+    private static void EnsureContained(string directory, string candidate)
     {
-        var downloads = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "Downloads",
-            "specus");
+        var root = Path.GetFullPath(directory);
+        if (!root.EndsWith(Path.DirectorySeparatorChar))
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+        var resolved = Path.GetFullPath(candidate);
+        if (!resolved.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("resolved path escapes the transfer directory");
+        }
+    }
+
+    private static async Task<int> ReadChunkAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        var read = 0;
+        while (read < buffer.Length)
+        {
+            var current = await stream.ReadAsync(buffer.AsMemory(read, buffer.Length - read), cancellationToken)
+                .ConfigureAwait(false);
+            if (current <= 0)
+            {
+                break;
+            }
+            read += current;
+        }
+        return read;
+    }
+
+    private static async Task<string> ComputeFileDigestAsync(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            64 * 1024, useAsync: true);
+        var digest = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    private static string ComputeFileDigest(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static bool IsHexDigest(string value) =>
+        value.Length == 64 && value.All(Uri.IsHexDigit);
+
+    private string UniqueTargetPath(string name)
+    {
+        var downloads = RootDirectoryOverride is null
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads",
+                "specus")
+            : Path.Combine(RootDirectoryOverride, "downloads");
         Directory.CreateDirectory(downloads);
 
         var candidate = Path.Combine(downloads, name);
+        EnsureContained(downloads, candidate);
         if (!File.Exists(candidate))
         {
             return candidate;
@@ -335,14 +492,41 @@ internal sealed class FileTransferManager
         return Path.Combine(downloads, $"{DateTimeOffset.Now.ToUnixTimeMilliseconds()}-{name}");
     }
 
-    private static string SanitizeName(string? name)
+    /// <summary>
+    /// Reduces a peer-supplied name to a bare file name. Separators, traversal segments, reserved
+    /// device names and invalid characters are all removed before the name reaches the filesystem.
+    /// </summary>
+    internal static string SanitizeName(string? name)
     {
-        var value = string.IsNullOrWhiteSpace(name) ? "file" : name.Trim();
+        var value = string.IsNullOrWhiteSpace(name) ? "" : name.Trim();
+        // Strip any directory component the peer tried to smuggle in, using both separators so a
+        // POSIX-style path is handled on Windows too.
+        var lastSeparator = value.LastIndexOfAny(['/', '\\']);
+        if (lastSeparator >= 0)
+        {
+            value = value[(lastSeparator + 1)..];
+        }
         foreach (var invalid in Path.GetInvalidFileNameChars())
         {
             value = value.Replace(invalid, '_');
         }
-        return value;
+        value = value.Trim().TrimEnd('.', ' ');
+        if (value.Length == 0 || value == "." || value == "..")
+        {
+            return "file";
+        }
+        var stem = Path.GetFileNameWithoutExtension(value);
+        string[] reserved =
+        [
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if (reserved.Contains(stem, StringComparer.OrdinalIgnoreCase))
+        {
+            value = "_" + value;
+        }
+        return value.Length > 180 ? value[^180..] : value;
     }
 
     internal static string FormatBytes(long bytes)
@@ -380,12 +564,14 @@ internal sealed class FileTransferManager
 
     private sealed class IncomingSession
     {
-        public string Id { get; init; } = "";
         public string Name { get; init; } = "";
         public string From { get; init; } = "";
         public long Size { get; init; }
         public int Chunks { get; init; }
-        public int Received { get; set; }
+        public string? Sha256 { get; init; }
+        public bool[] ReceivedChunks { get; init; } = [];
+        public int ReceivedCount { get; set; }
+        public long ReceivedBytes { get; set; }
         public string TempPath { get; init; } = "";
         public FileStream Stream { get; init; } = null!;
         public DateTime LastTouchedAt { get; set; }
@@ -419,5 +605,9 @@ internal sealed class FileTransferManager
 
         [JsonPropertyName("reason")]
         public string? Reason { get; set; }
+
+        /// <summary>Whole-file digest; absent for peers that predate the check.</summary>
+        [JsonPropertyName("sha256")]
+        public string? Sha256 { get; set; }
     }
 }
