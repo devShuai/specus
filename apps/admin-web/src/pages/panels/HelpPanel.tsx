@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
 import { copyTextWithFeedback } from "../../lib/clipboard";
+import {
+  MACOS_CLIENT_START_COMMAND,
+  MACOS_HOMEBREW_INSTALL_COMMAND,
+  MACOS_HOMEBREW_UPGRADE_COMMAND,
+} from "../../lib/macosInstall";
 import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
 
 const HELP_TABS = [
@@ -215,6 +220,17 @@ function GoSection() {
         <p>无需额外运行时，单二进制部署。各操作系统/架构有独立产物。</p>
       </DocCard>
 
+      <DocCard title="macOS 安装（推荐）">
+        <p className="mb-2 text-small">
+          使用 Homebrew Cask 安装，自动选择 Apple Silicon 或 Intel 版本：
+        </p>
+        <CodeBlock language="bash" code={MACOS_HOMEBREW_INSTALL_COMMAND} />
+        <p className="mb-2 mt-3 text-small">指定配置文件启动：</p>
+        <CodeBlock language="bash" code={MACOS_CLIENT_START_COMMAND} />
+        <p className="mb-2 mt-3 text-small">升级到最新版本：</p>
+        <CodeBlock language="bash" code={MACOS_HOMEBREW_UPGRADE_COMMAND} />
+      </DocCard>
+
       <DocCard title="配置文件 client.jsonc">
         <p className="mb-2 text-small">放在二进制同目录或工作目录下：</p>
         <CodeBlock language="jsonc" code={SAMPLE_CONFIG} />
@@ -224,9 +240,9 @@ function GoSection() {
       </DocCard>
 
       <DocCard title="启动命令">
-        <p className="mb-2 text-small">Linux / macOS：</p>
+        <p className="mb-2 text-small">Linux / macOS 手动下载包：</p>
         <CodeBlock language="bash" code={`chmod +x specus-client
-./specus-client`} />
+./specus-client -config ./client.jsonc`} />
         <p className="mb-2 mt-3 text-small">Windows：</p>
         <CodeBlock language="powershell" code={`.\\specus-client.exe`} />
       </DocCard>

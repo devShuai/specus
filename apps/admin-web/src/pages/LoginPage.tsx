@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
+import { MacosInstallGuide } from "../components/MacosInstallGuide";
 import { SpecusAqueduct } from "../components/SpecusAqueduct";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { UserMenuButton } from "../components/UserMenuButton";
@@ -539,15 +540,27 @@ const IMPL_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
 function ClientDownloadsSection() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     let cancelScheduledLoad = () => {};
     const load = async () => {
-      const data = await fetchPublicClientDownloads();
-      if (!cancelled) {
-        setLinks(data);
-        setLoaded(true);
+      try {
+        const data = await fetchPublicClientDownloads();
+        if (!cancelled) {
+          setLinks(data);
+          setLoadFailed(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setLinks([]);
+          setLoadFailed(true);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoaded(true);
+        }
       }
     };
     if ("requestIdleCallback" in window && "cancelIdleCallback" in window) {
@@ -563,11 +576,6 @@ function ClientDownloadsSection() {
     };
   }, []);
 
-  // 未加载完不渲染；加载完无数据也不渲染，避免空白 section 干扰未登录用户
-  if (!loaded || links.length === 0) {
-    return null;
-  }
-
   const grouped = IMPL_ORDER
     .map((impl) => ({ implementation: impl, items: links.filter((l) => l.implementation === impl) }))
     .filter((g) => g.items.length > 0);
@@ -577,46 +585,61 @@ function ClientDownloadsSection() {
       <div className="mb-6 max-w-2xl">
         <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">获取客户端</h2>
         <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-          从 GitHub Releases 下载最新客户端。所有实现共享同一份 JSON 配置格式，详细启动方法见登录后的「帮助文档」。
+          macOS 推荐通过 Homebrew 安装 Go 客户端；其他平台与实现可从 GitHub Releases 下载。所有实现共享同一份 JSON 配置格式。
         </p>
       </div>
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {grouped.map(({ implementation, items }) => (
-          <section
-            key={implementation}
-            className="app-apple-landing-surface glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
-          >
-            <div className="grid gap-3 p-4">
-              <span className="w-fit rounded-md bg-primary-100 px-2 py-1 text-tiny text-primary-700 dark:bg-primary-500/15 dark:text-primary-300">
-                {IMPL_LABELS[implementation]}
-              </span>
-              <div className="flex flex-col gap-2">
-                {items.map((link) => (
-                  <a
-                    key={link.id}
-                    className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-primary-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
-                    href={link.downloadUrl}
-                    rel="noopener noreferrer"
-                    target="_blank"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-small font-medium text-zinc-950 group-hover:text-primary-700 dark:text-white dark:group-hover:text-primary-400">
-                        {link.displayName}
+      <MacosInstallGuide landing />
+      {!loaded ? (
+        <p className="mt-4 text-small text-zinc-600 dark:text-zinc-400" role="status">正在加载手动下载链接…</p>
+      ) : grouped.length > 0 ? (
+        <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {grouped.map(({ implementation, items }) => (
+            <section
+              key={implementation}
+              className="app-apple-landing-surface glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
+            >
+              <div className="grid gap-3 p-4">
+                <span className="w-fit rounded-md bg-primary-100 px-2 py-1 text-tiny text-primary-700 dark:bg-primary-500/15 dark:text-primary-300">
+                  {IMPL_LABELS[implementation]}
+                </span>
+                <div className="flex flex-col gap-2">
+                  {items.map((link) => (
+                    <a
+                      key={link.id}
+                      className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-primary-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
+                      href={link.downloadUrl}
+                      rel="noopener noreferrer"
+                      target="_blank"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-small font-medium text-zinc-950 group-hover:text-primary-700 dark:text-white dark:group-hover:text-primary-400">
+                          {link.displayName}
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1 text-tiny text-zinc-600 dark:text-zinc-400">
+                          <span>{shortPlatform(link.platform)}</span>
+                          <span>·</span>
+                          <span>{shortArch(link.arch)}</span>
+                        </div>
                       </div>
-                      <div className="mt-1 flex flex-wrap gap-1 text-tiny text-zinc-600 dark:text-zinc-400">
-                        <span>{shortPlatform(link.platform)}</span>
-                        <span>·</span>
-                        <span>{shortArch(link.arch)}</span>
-                      </div>
-                    </div>
-                    <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-primary-700 dark:group-hover:text-primary-400">↗</span>
-                  </a>
-                ))}
+                      <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-primary-700 dark:group-hover:text-primary-400">↗</span>
+                    </a>
+                  ))}
+                </div>
               </div>
-            </div>
-          </section>
-        ))}
-      </div>
+            </section>
+          ))}
+        </div>
+      ) : (
+        <p
+          aria-live="polite"
+          className="mt-4 text-small text-zinc-600 dark:text-zinc-400"
+          role="status"
+        >
+          {loadFailed
+            ? "手动下载链接暂时无法加载；macOS 仍可使用上方 Homebrew 命令安装。"
+            : "当前没有可用的手动下载链接。"}
+        </p>
+      )}
     </div>
   );
 }

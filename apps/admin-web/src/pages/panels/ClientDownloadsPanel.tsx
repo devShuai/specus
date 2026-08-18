@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Spinner } from "@heroui/react";
 import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
+import { MacosInstallGuide } from "../../components/MacosInstallGuide";
 import { formatDateTime } from "../../lib/format";
 
 const IMPLEMENTATION_LABELS: Record<ClientImplementation, string> = {
@@ -53,15 +54,20 @@ export function ClientDownloadsPanel() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">客户端下载</h2>
-          <p className="text-small text-default-500">从 GitHub Releases 获取最新客户端产物</p>
+          <p className="text-small text-default-500">macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包</p>
         </div>
         <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
           刷新
         </Button>
       </div>
 
+      <MacosInstallGuide />
+
       {error ? (
-        <div className="flex flex-col items-center gap-3 rounded-md border border-danger-200 bg-danger-50 px-4 py-8 text-center dark:border-danger-400/30 dark:bg-danger-500/10">
+        <div
+          className="flex flex-col items-center gap-3 rounded-md border border-danger-200 bg-danger-50 px-4 py-8 text-center dark:border-danger-400/30 dark:bg-danger-500/10"
+          role="alert"
+        >
           <p className="text-small text-danger">下载链接加载失败：{error}</p>
           <Button color="danger" size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
             重试
@@ -80,7 +86,7 @@ export function ClientDownloadsPanel() {
               <CardBody className="gap-3 px-5 pb-5 pt-2">
                 {implLinks.length === 0 ? (
                   <p className="rounded-md border border-default-200 bg-default-50 p-3 text-tiny text-default-500">
-                    最新 GitHub Release 暂无对应产物，也没有可用的备用链接
+                    当前未获取到对应产物，请稍后刷新
                   </p>
                 ) : (
                   implLinks.map((link) => <DownloadCard key={link.id} link={link} />)
