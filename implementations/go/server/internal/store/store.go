@@ -203,6 +203,7 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_client_session", "message_attachments_capable", clientCapabilityBoolType},
 		{"specus_client_session", "message_media_preview_capable", clientCapabilityBoolType},
 		{"specus_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
+		{"transfer_attachment", "public_transfer_room_id", "BIGINT"},
 		{"peer_mesh_device", "nat_mapping_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_filtering_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_behavior_discovery", "VARCHAR(40)"},

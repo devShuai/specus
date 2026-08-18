@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS transfer_attachment (
   scope VARCHAR(40) NOT NULL,
   room_id VARCHAR(120),
   room_token_hash VARCHAR(64),
+  public_transfer_room_id BIGINT,
   owner_username VARCHAR(80),
   target_client_id BIGINT,
   object_key VARCHAR(512) NOT NULL,

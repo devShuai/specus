@@ -203,6 +203,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			}
 			return publicTransferDiscovery.coordination.allowRate(ctx, bucket, identity, limit, window)
 		}))
+	// Public attachments authorize against the persistent room and role.
+	attachments.SetRoomService(rooms)
 	mediaStorage := media.NewRustFSStorage(cfg.MediaCapture)
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

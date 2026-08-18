@@ -160,24 +160,27 @@ type ClientDownloadLink struct {
 
 // TransferAttachment mirrors transfer_attachment used by public transfers and admin messages.
 type TransferAttachment struct {
-	ID              int64
-	TenantID        *string
-	Scope           string
-	RoomID          *string
-	RoomTokenHash   *string
-	OwnerUsername   *string
-	TargetClientID  *int64
-	ObjectKey       string
-	FileName        string
-	MimeType        string
-	SizeBytes       int64
-	SHA256          *string
-	Status          string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	UploadExpiresAt time.Time
-	ExpiresAt       time.Time
-	UploadedAt      *time.Time
+	ID            int64
+	TenantID      *string
+	Scope         string
+	RoomID        *string
+	RoomTokenHash *string
+	// PublicTransferRoomID binds the attachment to the persistent room row rather than to one
+	// room token, so rotating or revoking a token keeps room membership authoritative.
+	PublicTransferRoomID *int64
+	OwnerUsername        *string
+	TargetClientID       *int64
+	ObjectKey            string
+	FileName             string
+	MimeType             string
+	SizeBytes            int64
+	SHA256               *string
+	Status               string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	UploadExpiresAt      time.Time
+	ExpiresAt            time.Time
+	UploadedAt           *time.Time
 }
 
 // TransferAttachmentDownloadGrant stores only the hash of a single-use download token.

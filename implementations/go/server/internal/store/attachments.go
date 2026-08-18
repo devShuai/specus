@@ -10,12 +10,13 @@ import (
 
 func (db *DB) InsertTransferAttachment(ctx context.Context, item TransferAttachment) error {
 	query := db.rebind(`INSERT INTO transfer_attachment
-		(id, tenant_id, scope, room_id, room_token_hash, owner_username, target_client_id,
-		 object_key, file_name, mime_type, size_bytes, sha256, status, created_at, updated_at,
-		 upload_expires_at, expires_at, uploaded_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(id, tenant_id, scope, room_id, room_token_hash, public_transfer_room_id, owner_username,
+		 target_client_id, object_key, file_name, mime_type, size_bytes, sha256, status, created_at,
+		 updated_at, upload_expires_at, expires_at, uploaded_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, item.ID, item.TenantID, item.Scope, item.RoomID,
-		item.RoomTokenHash, item.OwnerUsername, item.TargetClientID, item.ObjectKey, item.FileName,
+		item.RoomTokenHash, item.PublicTransferRoomID, item.OwnerUsername, item.TargetClientID,
+		item.ObjectKey, item.FileName,
 		item.MimeType, item.SizeBytes, item.SHA256, item.Status, formatTime(item.CreatedAt),
 		formatTime(item.UpdatedAt), formatTime(item.UploadExpiresAt), formatTime(item.ExpiresAt),
 		nullableTime(item.UploadedAt))
@@ -56,8 +57,22 @@ func (db *DB) GetTenantTransferAttachment(ctx context.Context, id int64, tenantI
 	return scanTransferAttachmentOrNil(db.sql.QueryRowContext(ctx, query, id, defaultTenant(tenantID), scope))
 }
 
+// CountPendingTransferAttachmentsByRoom counts a persistent room's pending uploads, so the quota
+// follows room membership instead of a single room token.
+func (db *DB) CountPendingTransferAttachmentsByRoom(ctx context.Context, scope string,
+	publicTransferRoomID int64, status string) (int64, error) {
+	query := db.rebind(`SELECT COUNT(*) FROM transfer_attachment
+		WHERE scope = ? AND public_transfer_room_id = ? AND status = ?`)
+	var count int64
+	err := db.sql.QueryRowContext(ctx, query, scope, publicTransferRoomID, status).Scan(&count)
+	return count, err
+}
+
+// CountPendingTransferAttachments keeps the token-hash based count for rows created before the
+// persistent room binding existed.
 func (db *DB) CountPendingTransferAttachments(ctx context.Context, scope, roomTokenHash, status string) (int64, error) {
-	query := db.rebind(`SELECT COUNT(*) FROM transfer_attachment WHERE scope = ? AND room_token_hash = ? AND status = ?`)
+	query := db.rebind(`SELECT COUNT(*) FROM transfer_attachment
+		WHERE scope = ? AND room_token_hash = ? AND status = ? AND public_transfer_room_id IS NULL`)
 	var count int64
 	err := db.sql.QueryRowContext(ctx, query, scope, roomTokenHash, status).Scan(&count)
 	return count, err
@@ -195,8 +210,8 @@ func (db *DB) ListExpiredTransferAttachments(ctx context.Context, before time.Ti
 }
 
 const transferAttachmentSelect = `SELECT id, tenant_id, scope, room_id, room_token_hash,
-	owner_username, target_client_id, object_key, file_name, mime_type, size_bytes, sha256,
-	status, created_at, updated_at, upload_expires_at, expires_at, uploaded_at
+	public_transfer_room_id, owner_username, target_client_id, object_key, file_name, mime_type,
+	size_bytes, sha256, status, created_at, updated_at, upload_expires_at, expires_at, uploaded_at
 	FROM transfer_attachment`
 
 type transferAttachmentScanner interface{ Scan(...any) error }
@@ -215,9 +230,10 @@ func scanTransferAttachmentOrNil(scanner transferAttachmentScanner) (*TransferAt
 func scanTransferAttachment(scanner transferAttachmentScanner) (TransferAttachment, error) {
 	var item TransferAttachment
 	var tenantID, roomID, roomTokenHash, ownerUsername, sha256Value, uploadedAt sql.NullString
-	var targetClientID sql.NullInt64
+	var targetClientID, publicTransferRoomID sql.NullInt64
 	var createdAt, updatedAt, uploadExpiresAt, expiresAt string
-	err := scanner.Scan(&item.ID, &tenantID, &item.Scope, &roomID, &roomTokenHash, &ownerUsername,
+	err := scanner.Scan(&item.ID, &tenantID, &item.Scope, &roomID, &roomTokenHash,
+		&publicTransferRoomID, &ownerUsername,
 		&targetClientID, &item.ObjectKey, &item.FileName, &item.MimeType, &item.SizeBytes,
 		&sha256Value, &item.Status, &createdAt, &updatedAt, &uploadExpiresAt, &expiresAt, &uploadedAt)
 	if err != nil {
@@ -228,6 +244,10 @@ func scanTransferAttachment(scanner transferAttachmentScanner) (TransferAttachme
 	item.RoomTokenHash = nullStringPtr(roomTokenHash)
 	item.OwnerUsername = nullStringPtr(ownerUsername)
 	item.SHA256 = nullStringPtr(sha256Value)
+	if publicTransferRoomID.Valid {
+		roomRowID := publicTransferRoomID.Int64
+		item.PublicTransferRoomID = &roomRowID
+	}
 	if targetClientID.Valid {
 		value := targetClientID.Int64
 		item.TargetClientID = &value
