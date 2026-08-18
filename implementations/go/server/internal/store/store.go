@@ -224,6 +224,17 @@ func (db *DB) ensureCompatibleColumns() error {
 			return err
 		}
 	}
+	// This index must be created after ensureColumn. Embedded schema statements run before the
+	// compatibility pass, so putting the index there would make an old table without the nullable
+	// room column fail before it can be upgraded.
+	if err := db.ensureIndex("idx_transfer_attachment_public_room", "transfer_attachment",
+		"scope, public_transfer_room_id, id"); err != nil {
+		return err
+	}
+	if err := db.ensureIndex("idx_transfer_attachment_public_room_status", "transfer_attachment",
+		"scope, public_transfer_room_id, status"); err != nil {
+		return err
+	}
 	if err := db.ensurePostgresClientMessageCapabilityTypes(); err != nil {
 		return err
 	}

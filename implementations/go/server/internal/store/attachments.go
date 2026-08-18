@@ -6,21 +6,134 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	moderncsqlite "modernc.org/sqlite"
 )
 
 func (db *DB) InsertTransferAttachment(ctx context.Context, item TransferAttachment) error {
+	return db.insertTransferAttachment(ctx, db.sql, item)
+}
+
+type transferAttachmentExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (db *DB) insertTransferAttachment(ctx context.Context, exec transferAttachmentExecer,
+	item TransferAttachment) error {
 	query := db.rebind(`INSERT INTO transfer_attachment
 		(id, tenant_id, scope, room_id, room_token_hash, public_transfer_room_id, owner_username,
 		 target_client_id, object_key, file_name, mime_type, size_bytes, sha256, status, created_at,
 		 updated_at, upload_expires_at, expires_at, uploaded_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, item.ID, item.TenantID, item.Scope, item.RoomID,
+	_, err := exec.ExecContext(ctx, query, item.ID, item.TenantID, item.Scope, item.RoomID,
 		item.RoomTokenHash, item.PublicTransferRoomID, item.OwnerUsername, item.TargetClientID,
 		item.ObjectKey, item.FileName,
 		item.MimeType, item.SizeBytes, item.SHA256, item.Status, formatTime(item.CreatedAt),
 		formatTime(item.UpdatedAt), formatTime(item.UploadExpiresAt), formatTime(item.ExpiresAt),
 		nullableTime(item.UploadedAt))
 	return err
+}
+
+// InsertTransferAttachmentWithinRoomPendingLimit serializes the room-level pending quota in the
+// database. SQLite uses a no-op UPDATE to take its write lock; MySQL/PostgreSQL lock the persistent
+// room row with SELECT ... FOR UPDATE. Another server instance therefore cannot count the same
+// pre-insert state and exceed the configured limit. A false result is a quota rejection; no
+// attachment row was inserted.
+func (db *DB) InsertTransferAttachmentWithinRoomPendingLimit(ctx context.Context,
+	item TransferAttachment, maxPending int, pendingStatus string) (bool, error) {
+	if item.PublicTransferRoomID == nil {
+		return false, errors.New("persistent public transfer room id is required")
+	}
+	if maxPending < 1 {
+		maxPending = 1
+	}
+
+	const maxSQLiteAttempts = 6
+	attempts := 1
+	if db.dialect == DialectSQLite {
+		attempts = maxSQLiteAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		inserted, err := db.insertTransferAttachmentWithinRoomPendingLimitOnce(ctx, item,
+			maxPending, pendingStatus)
+		if err == nil || db.dialect != DialectSQLite || !isSQLiteBusy(err) {
+			return inserted, err
+		}
+		lastErr = err
+		if attempt+1 == attempts {
+			break
+		}
+		delay := time.Duration(5*(1<<attempt)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return false, lastErr
+}
+
+func (db *DB) insertTransferAttachmentWithinRoomPendingLimitOnce(ctx context.Context,
+	item TransferAttachment, maxPending int, pendingStatus string) (inserted bool, err error) {
+	var options *sql.TxOptions
+	if db.dialect != DialectSQLite {
+		// A fresh snapshot after the room-row lock is acquired must observe the previous
+		// transaction's insert. This is also the common default used by PostgreSQL deployments.
+		options = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	}
+	tx, err := db.sql.BeginTx(ctx, options)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if db.dialect == DialectSQLite {
+		// SQLite does not support SELECT ... FOR UPDATE. A write, even one that leaves the value
+		// unchanged, obtains its single-writer lock before the count is evaluated.
+		lockQuery := db.rebind(`UPDATE public_transfer_room SET updated_at = updated_at WHERE id = ?`)
+		if _, err := tx.ExecContext(ctx, lockQuery, *item.PublicTransferRoomID); err != nil {
+			return false, err
+		}
+	}
+	roomQuery := `SELECT id FROM public_transfer_room WHERE id = ?`
+	if db.dialect != DialectSQLite {
+		roomQuery += ` FOR UPDATE`
+	}
+	var lockedRoomID int64
+	if err := tx.QueryRowContext(ctx, db.rebind(roomQuery), *item.PublicTransferRoomID).
+		Scan(&lockedRoomID); errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	} else if err != nil {
+		return false, err
+	}
+
+	countQuery := db.rebind(`SELECT COUNT(*) FROM transfer_attachment
+		WHERE scope = ? AND public_transfer_room_id = ? AND status = ?`)
+	var count int64
+	if err := tx.QueryRowContext(ctx, countQuery, item.Scope, *item.PublicTransferRoomID,
+		pendingStatus).Scan(&count); err != nil {
+		return false, err
+	}
+	if count >= int64(maxPending) {
+		return false, nil
+	}
+	if err := db.insertTransferAttachment(ctx, tx, item); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteErr *moderncsqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 5
 }
 
 func (db *DB) UpdateTransferAttachment(ctx context.Context, item TransferAttachment) error {

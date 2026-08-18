@@ -13,6 +13,126 @@ import (
 	"time"
 )
 
+func TestTransferAttachmentRoomBindingUpgradeAndRollbackCompatibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-transfer-attachment.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE transfer_attachment (
+		id INTEGER PRIMARY KEY,
+		tenant_id TEXT,
+		scope TEXT NOT NULL,
+		room_id TEXT,
+		room_token_hash TEXT,
+		owner_username TEXT,
+		target_client_id INTEGER,
+		object_key TEXT NOT NULL UNIQUE,
+		file_name TEXT NOT NULL,
+		mime_type TEXT NOT NULL,
+		size_bytes INTEGER NOT NULL,
+		sha256 TEXT,
+		status TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		upload_expires_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		uploaded_at TEXT
+	)`)
+	if err == nil {
+		_, err = legacy.Exec(`INSERT INTO transfer_attachment
+			(id, tenant_id, scope, room_id, room_token_hash, owner_username, target_client_id,
+			 object_key, file_name, mime_type, size_bytes, sha256, status, created_at, updated_at,
+			 upload_expires_at, expires_at, uploaded_at)
+			VALUES (9001, 'default', 'PUBLIC_TRANSFER', 'legacy-room', 'legacy-token-hash',
+			 'alice', NULL, 'legacy/one.txt', 'one.txt', 'text/plain', 3, NULL, 'PENDING',
+			 '2026-08-18T00:00:00.0000000Z', '2026-08-18T00:00:00.0000000Z',
+			 '2026-08-18T01:00:00.0000000Z', '2026-08-19T00:00:00.0000000Z', NULL)`)
+	}
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare legacy transfer attachment schema: %v", err)
+	}
+
+	upgraded, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("upgrade legacy transfer attachment schema: %v", err)
+	}
+	exists, err := upgraded.columnExists("transfer_attachment", "public_transfer_room_id")
+	if err != nil || !exists {
+		_ = upgraded.Close()
+		t.Fatalf("public room column missing after upgrade: exists=%t err=%v", exists, err)
+	}
+	for _, indexName := range []string{
+		"idx_transfer_attachment_public_room",
+		"idx_transfer_attachment_public_room_status",
+	} {
+		var indexCount int
+		if err := upgraded.sql.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+			WHERE type = 'index' AND name = ?`, indexName).Scan(&indexCount); err != nil || indexCount != 1 {
+			_ = upgraded.Close()
+			t.Fatalf("room index %s missing after upgrade: count=%d err=%v",
+				indexName, indexCount, err)
+		}
+	}
+	item, err := upgraded.GetTransferAttachment(context.Background(), 9001, "PUBLIC_TRANSFER")
+	if err != nil || item == nil {
+		_ = upgraded.Close()
+		t.Fatalf("read upgraded legacy attachment: item=%+v err=%v", item, err)
+	}
+	if item.PublicTransferRoomID != nil || item.RoomTokenHash == nil ||
+		*item.RoomTokenHash != "legacy-token-hash" {
+		_ = upgraded.Close()
+		t.Fatalf("legacy attachment binding changed during upgrade: %+v", item)
+	}
+	if err := upgraded.Close(); err != nil {
+		t.Fatalf("close upgraded database: %v", err)
+	}
+
+	// Simulate rolling the binary back: the old reader omits the additive column and the old
+	// writer explicitly lists only legacy columns. Both must continue to work after the upgrade.
+	rollback, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyID int64
+	var legacyTokenHash, legacyStatus string
+	if err = rollback.QueryRow(`SELECT id, room_token_hash, status
+		FROM transfer_attachment WHERE id = 9001`).Scan(&legacyID, &legacyTokenHash, &legacyStatus); err == nil {
+		_, err = rollback.Exec(`INSERT INTO transfer_attachment
+			(id, tenant_id, scope, room_id, room_token_hash, owner_username, target_client_id,
+			 object_key, file_name, mime_type, size_bytes, sha256, status, created_at, updated_at,
+			 upload_expires_at, expires_at, uploaded_at)
+			VALUES (9002, 'default', 'PUBLIC_TRANSFER', 'legacy-room', 'second-token-hash',
+			 'bob', NULL, 'legacy/two.txt', 'two.txt', 'text/plain', 3, NULL, 'PENDING',
+			 '2026-08-18T00:00:00.0000000Z', '2026-08-18T00:00:00.0000000Z',
+			 '2026-08-18T01:00:00.0000000Z', '2026-08-19T00:00:00.0000000Z', NULL)`)
+	}
+	if closeErr := rollback.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("legacy read/write after upgrade: %v", err)
+	}
+	if legacyID != 9001 || legacyTokenHash != "legacy-token-hash" || legacyStatus != "PENDING" {
+		t.Fatalf("legacy SELECT returned id=%d token=%q status=%q",
+			legacyID, legacyTokenHash, legacyStatus)
+	}
+
+	reopened, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen database after legacy writer: %v", err)
+	}
+	defer reopened.Close()
+	second, err := reopened.GetTransferAttachment(context.Background(), 9002, "PUBLIC_TRANSFER")
+	if err != nil || second == nil || second.PublicTransferRoomID != nil ||
+		second.RoomTokenHash == nil || *second.RoomTokenHash != "second-token-hash" {
+		t.Fatalf("read attachment inserted by rolled-back writer: item=%+v err=%v", second, err)
+	}
+}
+
 func TestManagementUserOIDCColumnsUpgradeLegacySchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-management-user.db")
 	legacy, err := sql.Open("sqlite", path)

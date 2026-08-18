@@ -154,8 +154,9 @@ type Service struct {
 	maxTrackedSources int
 	sharedRateLimiter SharedRateLimiter
 	quotaLocks        [64]sync.Mutex
-	// rooms resolves the persistent public-transfer room and the caller's role. It is optional so
-	// admin-only deployments and older tests can build a Service without the room subsystem.
+	roomQuotaLocks    [64]sync.Mutex
+	// rooms resolves the persistent public-transfer room and the caller's role. Admin-only
+	// deployments may omit it, but new public uploads and bound attachments fail closed without it.
 	rooms *RoomService
 }
 
@@ -241,36 +242,28 @@ func (s *Service) CreatePublicUpload(ctx context.Context, tenantID, username str
 	if err != nil {
 		return PresignUploadResponse{}, err
 	}
+	if access == nil {
+		return PresignUploadResponse{}, internalError(errors.New("public transfer room service is unavailable"))
+	}
 	maxPending := s.publicCfg.MaxPendingUploadsPerRoom
 	if maxPending < 1 {
 		maxPending = 1
 	}
-	var count int64
-	if access != nil {
-		if !access.Role.CanEdit() {
-			return PresignUploadResponse{}, forbidden("访客不能上传文件")
-		}
-		count, err = s.db.CountPendingTransferAttachmentsByRoom(ctx, ScopePublicTransfer,
-			access.RoomID, StatusPending)
-	} else {
-		count, err = s.db.CountPendingTransferAttachments(ctx, ScopePublicTransfer, hash, StatusPending)
+	if !access.Role.CanEdit() {
+		return PresignUploadResponse{}, forbidden("访客不能上传文件")
 	}
-	if err != nil {
-		return PresignUploadResponse{}, internalError(err)
-	}
-	if count >= int64(maxPending) {
-		return PresignUploadResponse{}, rateLimited("当前房间待上传文件过多,请稍后再试")
-	}
+	// This lock only reduces same-process contention. The transactional store operation remains
+	// the authoritative quota gate across server instances.
+	roomLock := s.roomQuotaLock(access.RoomID)
+	roomLock.Lock()
+	defer roomLock.Unlock()
 	lock := s.quotaLock(tenantID, username)
 	lock.Lock()
 	defer lock.Unlock()
-	var publicRoomID *int64
-	if access != nil {
-		roomRowID := access.RoomID
-		publicRoomID = &roomRowID
-	}
+	roomRowID := access.RoomID
+	publicRoomID := &roomRowID
 	return s.createUpload(ctx, ScopePublicTransfer, &tenantID, &roomID, &hash, &username, nil,
-		publicRoomID, request)
+		publicRoomID, maxPending, request)
 }
 
 func (s *Service) CreateAdminUpload(ctx context.Context, tenantID, username string, targetClientID int64,
@@ -285,7 +278,7 @@ func (s *Service) CreateAdminUpload(ctx context.Context, tenantID, username stri
 	lock.Lock()
 	defer lock.Unlock()
 	return s.createUpload(ctx, ScopeAdminClientMessage, &tenantID, nil, nil, &username,
-		&targetClientID, nil, request)
+		&targetClientID, nil, 0, request)
 }
 
 func (s *Service) CompletePublic(ctx context.Context, id int64, roomToken, tenantID,
@@ -420,7 +413,7 @@ func (s *Service) expire(ctx context.Context) error {
 
 func (s *Service) createUpload(ctx context.Context, scope string, tenantID, roomID, roomTokenHash,
 	ownerUsername *string, targetClientID *int64, publicTransferRoomID *int64,
-	request PresignUploadRequest) (PresignUploadResponse, error) {
+	maxPending int, request PresignUploadRequest) (PresignUploadResponse, error) {
 	if !s.storage.Enabled() {
 		return PresignUploadResponse{}, conflict("object storage is not configured")
 	}
@@ -466,9 +459,20 @@ func (s *Service) createUpload(ctx context.Context, scope string, tenantID, room
 			ObjectKey: objectKey, FileName: fileName, MimeType: mimeType, SizeBytes: sizeBytes,
 			SHA256: shaValue, Status: StatusPending, CreatedAt: now, UpdatedAt: now,
 			UploadExpiresAt: presigned.ExpiresAt, ExpiresAt: now.Add(retention)}
-		if err := s.db.InsertTransferAttachment(ctx, item); err != nil {
-			lastErr = err
+		inserted := true
+		var insertErr error
+		if publicTransferRoomID != nil {
+			inserted, insertErr = s.db.InsertTransferAttachmentWithinRoomPendingLimit(ctx, item,
+				maxPending, StatusPending)
+		} else {
+			insertErr = s.db.InsertTransferAttachment(ctx, item)
+		}
+		if insertErr != nil {
+			lastErr = insertErr
 			continue
+		}
+		if !inserted {
+			return PresignUploadResponse{}, rateLimited("当前房间待上传文件过多,请稍后再试")
 		}
 		return PresignUploadResponse{AttachmentID: id, ObjectID: fmt.Sprint(id), ObjectKey: objectKey,
 			UploadURL: presigned.URL, UploadHeaders: presigned.Headers,
@@ -726,6 +730,12 @@ func (s *Service) quotaLock(tenantID, username string) *sync.Mutex {
 	return &s.quotaLocks[int(hash.Sum32())%len(s.quotaLocks)]
 }
 
+func (s *Service) roomQuotaLock(roomID int64) *sync.Mutex {
+	value := uint64(roomID)
+	value ^= value >> 32
+	return &s.roomQuotaLocks[int(value%uint64(len(s.roomQuotaLocks)))]
+}
+
 func normalizeAccount(tenantID, username string) (string, string, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	username = strings.TrimSpace(username)
@@ -761,9 +771,9 @@ func attachmentView(item store.TransferAttachment) AttachmentView {
 		ExpiresAt: item.ExpiresAt.Format(time.RFC3339Nano)}
 }
 
-// resolveRoomAccess resolves the persistent room and role for a public attachment operation.
-// It returns nil when the room subsystem is unavailable, so callers fall back to the legacy
-// token-hash comparison used by rows created before rooms were persisted.
+// resolveRoomAccess resolves the persistent room and role for a new public attachment. A nil
+// result means the room subsystem is unavailable and the caller must fail closed. Legacy fallback
+// applies only when authorizing an existing row whose PublicTransferRoomID is nil.
 func (s *Service) resolveRoomAccess(ctx context.Context, roomID, roomToken,
 	peerID string) (*RoomAccess, error) {
 	if s.rooms == nil {
@@ -781,14 +791,17 @@ func (s *Service) resolveRoomAccess(ctx context.Context, roomID, roomToken,
 // binding keep the legacy room-token comparison.
 func (s *Service) requireRoomAccess(ctx context.Context, item store.TransferAttachment,
 	roomToken string, requireEdit bool) error {
-	if item.PublicTransferRoomID == nil || s.rooms == nil {
+	if item.PublicTransferRoomID == nil {
 		return matchingRoomToken(item, roomToken)
+	}
+	if s.rooms == nil {
+		return internalError(errors.New("public transfer room service is unavailable"))
 	}
 	roomName := ""
 	if item.RoomID != nil {
 		roomName = *item.RoomID
 	}
-	access, err := s.rooms.Resolve(ctx, roomName, roomToken, "attachment-access")
+	access, err := s.rooms.ResolveExisting(ctx, roomName, roomToken, "attachment-access")
 	if err != nil {
 		return err
 	}

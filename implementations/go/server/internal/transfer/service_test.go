@@ -32,6 +32,7 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 		MaxAttachmentBytes: 20,
 	}
 	service := NewService(db, objectCfg, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})
+	setTestRoomService(service, db)
 	var mu sync.Mutex
 	methods := make([]string, 0)
 	service.storage.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -155,6 +156,7 @@ func TestPublicAttachmentRateAndPendingLimits(t *testing.T) {
 	}, config.PublicTransferConfig{
 		PresignRateLimitPerIP: 1, PresignRateLimitWindowSeconds: 60, MaxPendingUploadsPerRoom: 1,
 	})
+	setTestRoomService(service, db)
 	if err := service.CheckPresignIP("203.0.113.8"); err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +185,7 @@ func TestAttachmentStorageQuotaIsScopedToAuthenticatedAccount(t *testing.T) {
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
 		PerUserStorageQuotaBytes: 10,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	setTestRoomService(service, db)
 	firstSize := int64(5)
 	if _, err := service.CreatePublicUpload(context.Background(), "default", "alice",
 		PresignUploadRequest{FileName: "first.bin", SizeBytes: &firstSize, RoomToken: "room"}); err != nil {
@@ -212,6 +215,7 @@ func TestAttachmentDownloadQuotaIsChargedWhenOneTimeLinkIsConsumed(t *testing.T)
 		MaxAttachmentBytes: 100, PerUserStorageQuotaBytes: 100,
 		PerUserMonthlyDownloadQuotaBytes: 10,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	setTestRoomService(service, db)
 	service.storage.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		header := make(http.Header)
 		if request.Method == http.MethodHead {
@@ -264,6 +268,7 @@ func TestVerifiedOssCallbackCompletesUploadAndClientCompleteIsIdempotent(t *test
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
 		PerUserStorageQuotaBytes: 100,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	setTestRoomService(service, db)
 	size := int64(10)
 	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice",
 		PresignUploadRequest{FileName: "callback.bin", SizeBytes: &size, RoomToken: "room"})
@@ -301,6 +306,7 @@ func TestCompleteRejectsAndDeletesObjectWhoseActualSizeExceedsLimit(t *testing.T
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 5,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})
+	setTestRoomService(service, db)
 	deleted := false
 	service.storage.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		header := make(http.Header)
@@ -414,6 +420,7 @@ func TestRetentionHoursKeepsJavaMinimumOfOneHour(t *testing.T) {
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 0, MaxAttachmentBytes: 10,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})
+	setTestRoomService(service, db)
 	size := int64(1)
 	before := time.Now().Add(59 * time.Minute)
 	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice", PresignUploadRequest{
@@ -492,5 +499,62 @@ func TestCompleteSkipsHeadWhenObjectStorageIsDisabledLikeJava(t *testing.T) {
 	}
 	if completed.Status != StatusUploaded || completed.SizeBytes != item.SizeBytes {
 		t.Fatalf("completed attachment = %+v", completed)
+	}
+}
+
+func TestPublicUploadFailsClosedWithoutRoomService(t *testing.T) {
+	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "missing-room-service.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewService(db, config.ObjectStorageConfig{
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
+		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
+		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
+	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 1})
+	size := int64(1)
+	_, err = service.CreatePublicUpload(context.Background(), "default", "alice",
+		PresignUploadRequest{RoomID: "room", RoomToken: "owner-token", FileName: "a.txt",
+			SizeBytes: &size})
+	if !errors.Is(err, ErrInternal) {
+		t.Fatalf("upload without room service err = %v, want internal fail-closed", err)
+	}
+	pending, err := db.CountPendingTransferAttachments(context.Background(), ScopePublicTransfer,
+		tokenHash("owner-token"), StatusPending)
+	if err != nil || pending != 0 {
+		t.Fatalf("upload without room service persisted %d attachments, err=%v", pending, err)
+	}
+}
+
+func TestBoundAttachmentFailsClosedWithoutRoomService(t *testing.T) {
+	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "bound-missing-room-service.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	roomRowID := int64(42)
+	roomID := "room"
+	hash := tokenHash("owner-token")
+	item := store.TransferAttachment{
+		ID: 34567, Scope: ScopePublicTransfer, RoomID: &roomID, RoomTokenHash: &hash,
+		PublicTransferRoomID: &roomRowID, ObjectKey: "prefix/public-transfer/bound.txt",
+		FileName: "bound.txt", MimeType: "text/plain", SizeBytes: 7, Status: StatusPending,
+		CreatedAt: now, UpdatedAt: now, UploadExpiresAt: now.Add(time.Hour),
+		ExpiresAt: now.Add(2 * time.Hour),
+	}
+	if err := db.InsertTransferAttachment(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(db, config.ObjectStorageConfig{Provider: "disabled"},
+		config.PublicTransferConfig{})
+	if _, err := service.CompletePublic(context.Background(), item.ID, "owner-token",
+		"default", "alice"); !errors.Is(err, ErrInternal) {
+		t.Fatalf("bound complete without room service err = %v, want internal fail-closed", err)
+	}
+	if _, err := service.CreatePublicDownload(context.Background(), item.ID, "owner-token",
+		"default", "alice"); !errors.Is(err, ErrInternal) {
+		t.Fatalf("bound download without room service err = %v, want internal fail-closed", err)
 	}
 }

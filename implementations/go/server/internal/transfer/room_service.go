@@ -195,20 +195,12 @@ func (s *RoomService) Resolve(ctx context.Context, roomNameValue, tokenValue, pe
 		return RoomAccess{}, err
 	}
 	hash := tokenHash(token)
-
-	ownerRoom, err := s.db.GetPublicTransferRoomByNameAndOwnerTokenHash(ctx, roomName, hash)
+	access, found, err := s.resolveStoredCredential(ctx, roomName, hash)
 	if err != nil {
-		return RoomAccess{}, internalError(err)
+		return RoomAccess{}, err
 	}
-	if ownerRoom != nil {
-		return RoomAccess{RoomID: ownerRoom.ID, Role: RoleOwner, RoomName: roomName}, nil
-	}
-	invited, err := s.db.GetPublicTransferRoomAccessByTokenHash(ctx, hash)
-	if err != nil {
-		return RoomAccess{}, internalError(err)
-	}
-	if invited != nil {
-		return s.requireUsableInvite(ctx, roomName, invited)
+	if found {
+		return access, nil
 	}
 	if isInviteToken(token) {
 		return RoomAccess{}, forbidden("房间凭证无效")
@@ -232,6 +224,53 @@ func (s *RoomService) Resolve(ctx context.Context, roomNameValue, tokenValue, pe
 		return RoomAccess{}, internalError(err)
 	}
 	return RoomAccess{RoomID: room.ID, Role: RoleOwner, RoomName: roomName}, nil
+}
+
+// ResolveExisting authenticates an existing owner or invitation without creating an owner room.
+// Existing attachments must use this path so a typo or hostile token cannot leave shadow rooms as
+// a side effect of a completion or download authorization check.
+func (s *RoomService) ResolveExisting(ctx context.Context, roomNameValue, tokenValue,
+	peerIDValue string) (RoomAccess, error) {
+	roomName, err := roomRequireText(roomNameValue, "roomId", 120)
+	if err != nil {
+		return RoomAccess{}, err
+	}
+	token, err := roomRequireText(tokenValue, "roomToken", 512)
+	if err != nil {
+		return RoomAccess{}, err
+	}
+	if _, err := roomNormalizeText(peerIDValue, "web", 120); err != nil {
+		return RoomAccess{}, err
+	}
+	access, found, err := s.resolveStoredCredential(ctx, roomName, tokenHash(token))
+	if err != nil {
+		return RoomAccess{}, err
+	}
+	if !found {
+		return RoomAccess{}, forbidden("房间凭证无效")
+	}
+	return access, nil
+}
+
+func (s *RoomService) resolveStoredCredential(ctx context.Context, roomName,
+	hash string) (RoomAccess, bool, error) {
+
+	ownerRoom, err := s.db.GetPublicTransferRoomByNameAndOwnerTokenHash(ctx, roomName, hash)
+	if err != nil {
+		return RoomAccess{}, false, internalError(err)
+	}
+	if ownerRoom != nil {
+		return RoomAccess{RoomID: ownerRoom.ID, Role: RoleOwner, RoomName: roomName}, true, nil
+	}
+	invited, err := s.db.GetPublicTransferRoomAccessByTokenHash(ctx, hash)
+	if err != nil {
+		return RoomAccess{}, false, internalError(err)
+	}
+	if invited != nil {
+		access, err := s.requireUsableInvite(ctx, roomName, invited)
+		return access, true, err
+	}
+	return RoomAccess{}, false, nil
 }
 
 // CheckPairingCodeRedeem enforces the per-IP fixed-window limit for pairing-code redemption
