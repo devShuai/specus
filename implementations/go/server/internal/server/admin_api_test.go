@@ -256,6 +256,10 @@ func TestSecurityHeadersLeaveHTTPSpecusPolicyToUpstream(t *testing.T) {
 	if got := portal.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
 		t.Fatalf("portal CSP = %q, want strict portal policy", got)
 	}
+	if got := portal.Header().Get("Content-Security-Policy"); !strings.Contains(got,
+		"connect-src 'self' ws: wss: https://api.github.com") {
+		t.Fatalf("portal CSP = %q, want GitHub Releases API in connect-src", got)
+	}
 }
 
 func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {

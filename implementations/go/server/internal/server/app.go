@@ -499,7 +499,7 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		"img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"media-src 'self' blob: data:" + ossSuffix + "; " +
 		"object-src 'self' blob:; frame-src 'self' blob: https://challenges.cloudflare.com; font-src 'self' data:; " +
-		"connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
+		"connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// HTTP specus responses belong to the target application. Adding the portal

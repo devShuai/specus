@@ -40,6 +40,16 @@ class SecurityRulesTests {
     }
 
     @Test
+    void managementPageAllowsGithubReleaseApiInContentSecurityPolicy() throws Exception {
+        HttpResponse<String> response = get("/", null);
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.headers().firstValue("Content-Security-Policy"))
+                .hasValueSatisfying(policy -> assertThat(policy).contains(
+                        "connect-src 'self' ws: wss: https://api.github.com"));
+    }
+
+    @Test
     void cloudDiagramApiRequiresAuthentication() throws Exception {
         assertThat(get("/api/admin/diagrams", null).statusCode()).isEqualTo(401);
     }

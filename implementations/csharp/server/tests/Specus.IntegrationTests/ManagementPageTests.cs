@@ -45,6 +45,9 @@ public sealed class ManagementPageTests : IAsyncLifetime
             "'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='",
             contentSecurityPolicy);
         Assert.Contains("frame-src 'self' https://challenges.cloudflare.com", contentSecurityPolicy);
+        Assert.Contains(
+            "connect-src 'self' ws: wss: https://api.github.com",
+            contentSecurityPolicy);
 
         // The React build references hashed bundles under /assets/; fetch the JS bundle.
         var match = System.Text.RegularExpressions.Regex.Match(html, "/assets/[^\"']+\\.js");

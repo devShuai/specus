@@ -4,7 +4,8 @@ namespace Specus.Server.Management;
 /// Security headers for the management SPA and API responses. The directives mirror Java's
 /// <c>SecurityConfig</c> CSP. Scripts stay same-origin (Vite emits external module bundles);
 /// <c>'unsafe-inline'</c> is allowed for styles because the React/HeroUI bundle sets inline
-/// style attributes (framer-motion). WebSocket connects target the same origin.
+/// style attributes (framer-motion). WebSocket connects target the same origin, while the public
+/// GitHub API supplies the latest client release metadata.
 /// </summary>
 public static class ManagementPageSecurityHeaders
 {
@@ -19,7 +20,7 @@ public static class ManagementPageSecurityHeaders
         + "object-src 'self' blob:; "
         + "font-src 'self' data:; "
         + "frame-src 'self' https://challenges.cloudflare.com; "
-        + "connect-src 'self' ws: wss: https://www.google-analytics.com "
+        + "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com "
         + "https://*.analytics.google.com https://*.googletagmanager.com; "
         + "form-action 'self'; "
         + "frame-ancestors 'none'; "

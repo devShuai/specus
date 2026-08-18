@@ -86,7 +86,8 @@ public class SecurityConfig {
                  * - media-src 允许 blob:/data: 供直连视频/音频预览
                  * - object-src / frame-src 允许 blob: 供 PDF 预览
                  * - font-src 允许 data:
-                 * - connect-src 允许 ws:/wss: 供 /ws/connections,以及 GA4 /g/collect 上报域
+                 * - connect-src 允许 ws:/wss: 供 /ws/connections、api.github.com 读取最新客户端 Release，
+                 *     以及 GA4 /g/collect 上报域
                  * - form-action 'self' 阻止跨站表单提交;frame-ancestors 'none' 防 clickjacking
                  *
                  * 同时加 Referrer-Policy: strict-origin-when-cross-origin（同源带完整 referrer
@@ -102,7 +103,7 @@ public class SecurityConfig {
                                 + "object-src 'self' blob:; "
                                 + "frame-src 'self' blob: https://challenges.cloudflare.com; "
                                 + "font-src 'self' data:; "
-                                + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
+                                + "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "form-action 'self'; "
                                 + "frame-ancestors 'none'; "
                                 + "base-uri 'self'"))
