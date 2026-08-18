@@ -2,6 +2,8 @@ package com.theshuai.specusserver.management.model;
 
 import org.brotli.dec.BrotliInputStream;
 
+import com.theshuai.specusserver.http.DecompressionLimits;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -69,36 +71,34 @@ public final class HttpBodyDataCodec {
 
     private static byte[] gunzip(byte[] data) throws IOException {
         try (GZIPInputStream input = new GZIPInputStream(new ByteArrayInputStream(data))) {
-            return readAll(input);
+            return readAll(input, data.length);
         }
     }
 
     private static byte[] inflate(byte[] data) throws IOException {
         try {
             try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data))) {
-                return readAll(input);
+                return readAll(input, data.length);
             }
         } catch (IOException first) {
             try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data), new Inflater(true))) {
-                return readAll(input);
+                return readAll(input, data.length);
             }
         }
     }
 
     private static byte[] brotli(byte[] data) throws IOException {
         try (BrotliInputStream input = new BrotliInputStream(new ByteArrayInputStream(data))) {
-            return readAll(input);
+            return readAll(input, data.length);
         }
     }
 
-    private static byte[] readAll(java.io.InputStream input) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int read;
-        while ((read = input.read(buffer)) >= 0) {
-            output.write(buffer, 0, read);
-        }
-        return output.toByteArray();
+    /**
+     * Reading a decompressor to EOF lets a few kilobytes of crafted input cost gigabytes of heap,
+     * so both an absolute size and an expansion ratio are enforced.
+     */
+    private static byte[] readAll(java.io.InputStream input, int compressedSize) throws IOException {
+        return DecompressionLimits.readAllBounded(input, compressedSize);
     }
 
     private static String dataUrl(String mediaType, byte[] bodyData) {

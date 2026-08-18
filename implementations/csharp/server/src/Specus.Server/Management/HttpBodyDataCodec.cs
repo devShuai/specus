@@ -91,13 +91,15 @@ internal static partial class HttpBodyDataCodec
         return null;
     }
 
+    /// <summary>
+    /// Reading a decompressor to the end lets a few kilobytes of crafted input cost gigabytes of
+    /// memory, so both an absolute size and an expansion ratio are enforced.
+    /// </summary>
     private static byte[] ReadDecoded(byte[] data, Func<Stream, Stream> decoderFactory)
     {
         using var source = new MemoryStream(data);
         using var decoder = decoderFactory(source);
-        using var output = new MemoryStream();
-        decoder.CopyTo(output);
-        return output.ToArray();
+        return Specus.Server.Http.DecompressionLimits.ReadAllBounded(decoder, data.Length);
     }
 
     private static string? HeaderValue(string? headers, string name)

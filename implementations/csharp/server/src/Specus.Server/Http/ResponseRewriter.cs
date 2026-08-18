@@ -215,11 +215,12 @@ internal static partial class ResponseRewriter
         {
             using var input = new MemoryStream(body);
             using var compressed = create(input);
-            using var output = new MemoryStream(body.Length * 2);
-            compressed.CopyTo(output);
-            return output.ToArray();
+            // Bounded: this is the most exposed decompression path in the server, and copying an
+            // upstream decompressor to the end lets a few kilobytes of crafted gzip cost gigabytes.
+            return DecompressionLimits.ReadAllBounded(compressed, body.Length);
         }
-        catch (InvalidDataException)
+        catch (Exception error) when (error is InvalidDataException
+                                          or DecompressionLimits.LimitExceededException)
         {
             return null;
         }

@@ -339,14 +339,11 @@ public class ResponseRewriter {
         try {
             ByteArrayInputStream in = new ByteArrayInputStream(compressed);
             java.io.InputStream decompressor = gzip ? new GZIPInputStream(in) : new InflaterInputStream(in);
-            ByteArrayOutputStream out = new ByteArrayOutputStream(compressed.length * 2);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = decompressor.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
+            // Bounded: this is the most exposed decompression path in the server, and reading an
+            // upstream decompressor to EOF lets a few kilobytes of crafted gzip cost gigabytes.
+            byte[] plain = DecompressionLimits.readAllBounded(decompressor, compressed.length);
             decompressor.close();
-            return out.toByteArray();
+            return plain;
         } catch (IOException e) {
             log.debug("[rewrite] decompress failed: {}", e.toString());
             return null;

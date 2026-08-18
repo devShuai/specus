@@ -5,7 +5,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
-	"io"
 	"net/url"
 	"regexp"
 	"strings"
@@ -283,7 +282,7 @@ func decompressIfNeeded(body []byte, headers []string) ([]byte, bool) {
 			return nil, false
 		}
 		defer reader.Close()
-		plain, err := io.ReadAll(reader)
+		plain, err := readDecompressedLimited(reader, len(body))
 		return plain, err == nil
 	case "deflate":
 		if plain, ok := readZlib(body); ok {
@@ -291,7 +290,7 @@ func decompressIfNeeded(body []byte, headers []string) ([]byte, bool) {
 		}
 		reader := flate.NewReader(bytes.NewReader(body))
 		defer reader.Close()
-		plain, err := io.ReadAll(reader)
+		plain, err := readDecompressedLimited(reader, len(body))
 		return plain, err == nil
 	default:
 		return body, true
@@ -304,7 +303,7 @@ func readZlib(body []byte) ([]byte, bool) {
 		return nil, false
 	}
 	defer reader.Close()
-	plain, err := io.ReadAll(reader)
+	plain, err := readDecompressedLimited(reader, len(body))
 	return plain, err == nil
 }
 
