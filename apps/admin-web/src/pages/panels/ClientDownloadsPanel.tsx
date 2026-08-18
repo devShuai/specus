@@ -19,19 +19,19 @@ const IMPLEMENTATION_DESCRIPTIONS: Record<ClientImplementation, string> = {
 const IMPLEMENTATION_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
 
 /**
- * 客户端下载面板（只读）。读公开接口 {@code /api/public/client-downloads}，按 implementation 分组展示。
- * 管理员维护入口在「系统管理」面板里。
+ * 客户端下载面板（只读）。优先读取最新 GitHub Release，按 implementation 分组展示；
+ * 管理员维护的公开接口仅在 GitHub 不可用时作为回退。
  */
 export function ClientDownloadsPanel() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (refresh = false) => {
     setLoading(true);
     setError(null);
     try {
-      setLinks(await fetchPublicClientDownloads());
+      setLinks(await fetchPublicClientDownloads({ refresh }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "加载下载链接失败");
     } finally {
@@ -53,9 +53,9 @@ export function ClientDownloadsPanel() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">客户端下载</h2>
-          <p className="text-small text-default-500">按实现选择对应平台与架构的客户端</p>
+          <p className="text-small text-default-500">从 GitHub Releases 获取最新客户端产物</p>
         </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
           刷新
         </Button>
       </div>
@@ -80,7 +80,7 @@ export function ClientDownloadsPanel() {
               <CardBody className="gap-3 px-5 pb-5 pt-2">
                 {implLinks.length === 0 ? (
                   <p className="rounded-md border border-default-200 bg-default-50 p-3 text-tiny text-default-500">
-                    暂无下载链接，请管理员在「系统管理」配置
+                    最新 GitHub Release 暂无对应产物，也没有可用的备用链接
                   </p>
                 ) : (
                   implLinks.map((link) => <DownloadCard key={link.id} link={link} />)
@@ -100,6 +100,7 @@ function DownloadCard({ link }: { link: ClientDownloadLink }) {
       className="group block rounded-md border border-default-200 bg-content1 p-3 transition hover:border-primary hover:shadow-sm"
       href={link.downloadUrl}
       rel="noopener noreferrer"
+      target="_blank"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">

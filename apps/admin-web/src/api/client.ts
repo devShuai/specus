@@ -65,6 +65,11 @@ import type {
   UserDiagramDocumentMutation,
   WebSocketTicket,
 } from "./types";
+import {
+  fetchLatestGithubClientDownloads,
+  hasCompleteGithubClientDownloadSet,
+  mergeGithubAndConfiguredDownloads,
+} from "../lib/githubReleaseDownloads";
 
 const ADMIN_PREFIX = "/api/admin";
 
@@ -483,10 +488,13 @@ export const adminApi = {
 
 // ---- public API（默认免登录；公开互传附件单独要求 Bearer）-----------------------------
 
-/**
- * 公开下载列表。任何端点失败/异常都返回空数组（登录页应静默降级，不打扰未登录用户）。
- */
-export async function fetchPublicClientDownloads(): Promise<ClientDownloadLink[]> {
+const GITHUB_DOWNLOAD_CACHE_TTL_MS = 5 * 60_000;
+const GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS = 60_000;
+
+let cachedGithubClientDownloads: { links: ClientDownloadLink[]; expiresAt: number } | null = null;
+let githubClientDownloadsRequest: Promise<ClientDownloadLink[]> | null = null;
+
+async function fetchConfiguredClientDownloads(): Promise<ClientDownloadLink[]> {
   try {
     const response = await fetch(`/api/public/client-downloads`);
     if (!response.ok) {
@@ -496,6 +504,51 @@ export async function fetchPublicClientDownloads(): Promise<ClientDownloadLink[]
     return Array.isArray(body) ? body : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * Reads the latest release assets directly from GitHub. The configured public endpoint remains
+ * a quiet fallback for rate limits or temporary GitHub outages.
+ */
+export async function fetchPublicClientDownloads(options: { refresh?: boolean } = {}): Promise<ClientDownloadLink[]> {
+  if (!options.refresh && cachedGithubClientDownloads && cachedGithubClientDownloads.expiresAt > Date.now()) {
+    return cachedGithubClientDownloads.links;
+  }
+  if (githubClientDownloadsRequest) {
+    return githubClientDownloadsRequest;
+  }
+
+  const previousDownloads = cachedGithubClientDownloads?.links ?? [];
+  const request = (async () => {
+    try {
+      const githubLinks = await fetchLatestGithubClientDownloads();
+      const links = hasCompleteGithubClientDownloadSet(githubLinks)
+        ? githubLinks
+        : mergeGithubAndConfiguredDownloads(githubLinks, await fetchConfiguredClientDownloads());
+      cachedGithubClientDownloads = { links, expiresAt: Date.now() + GITHUB_DOWNLOAD_CACHE_TTL_MS };
+      return links;
+    } catch {
+      const configured = await fetchConfiguredClientDownloads();
+      const links = previousDownloads.length > 0
+        ? mergeGithubAndConfiguredDownloads(previousDownloads, configured)
+        : configured;
+      if (links.length > 0) {
+        cachedGithubClientDownloads = {
+          links,
+          expiresAt: Date.now() + GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS,
+        };
+      }
+      return links;
+    }
+  })();
+  githubClientDownloadsRequest = request;
+  try {
+    return await request;
+  } finally {
+    if (githubClientDownloadsRequest === request) {
+      githubClientDownloadsRequest = null;
+    }
   }
 }
 

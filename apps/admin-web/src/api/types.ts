@@ -728,7 +728,7 @@ export interface HttpRouteMutation {
   pathRewriteEnabled?: boolean;
 }
 
-// 客户端下载链接 —— 管理员维护、登录页/Dashboard 展示。仅存 URL 字符串，不托管二进制。
+// 客户端下载链接 —— 登录页/Dashboard 优先映射 GitHub Release；管理员数据作为故障回退。
 export type ClientImplementation = "java" | "go" | "csharp";
 export type ClientPlatform = "windows" | "linux" | "macos" | "any";
 export type ClientArch = "x64" | "arm64" | "any";

@@ -151,7 +151,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     });
   };
 
-  // ---- 客户端下载链接管理 ----
+  // ---- GitHub Releases 不可用时的备用下载链接管理 ----
   const [downloadLinks, setDownloadLinks] = useState<ClientDownloadLink[]>([]);
   const [loadingDownloads, setLoadingDownloads] = useState(false);
   const [editingLink, setEditingLink] = useState<ClientDownloadLink | null>(null);
@@ -217,7 +217,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
   const deleteLink = (link: ClientDownloadLink) => {
     setConfirm({
       title: "删除下载链接",
-      description: `确定删除「${link.displayName}」吗？删除后登录页与客户端下载面板不再展示。`,
+      description: `确定删除「${link.displayName}」吗？删除后 GitHub Releases 不可用时将无法回退到该链接。`,
       confirmLabel: "删除",
       danger: true,
       action: async () => {
@@ -449,9 +449,9 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
       <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">客户端下载链接</h2>
+          <h2 className="text-lg font-semibold text-foreground">备用下载链接</h2>
           <p className="mt-1 text-small text-default-500">
-            配置后展示在登录页与「客户端下载」面板。仅存 URL，不托管二进制。
+            站点默认读取 GitHub Releases；仅在 GitHub 不可用时使用这里的链接。
           </p>
         </div>
         <div className="flex gap-2">
@@ -469,7 +469,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           <MobileListCardList
             items={downloadLinks}
             isLoading={loadingDownloads}
-            emptyContent={<EmptyState icon="generic" title="暂无下载链接" description="新增后展示在登录页与客户端下载面板" />}
+            emptyContent={<EmptyState icon="generic" title="暂无备用链接" description="GitHub Releases 不可用时将显示空状态" />}
             renderCard={(raw) => {
               const link = raw as ClientDownloadLink;
               const pending = pendingLinkIds.has(link.id);
@@ -550,7 +550,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
               <TableColumn>启用</TableColumn>
               <TableColumn className="text-right">操作</TableColumn>
             </TableHeader>
-            <TableBody emptyContent={<EmptyState icon="generic" title="暂无下载链接" description="新增后展示在登录页与客户端下载面板" />} isLoading={loadingDownloads} items={downloadLinks}>
+            <TableBody emptyContent={<EmptyState icon="generic" title="暂无备用链接" description="GitHub Releases 不可用时将显示空状态" />} isLoading={loadingDownloads} items={downloadLinks}>
               {(link) => {
                 const pending = pendingLinkIds.has(link.id);
                 return (

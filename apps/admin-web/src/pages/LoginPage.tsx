@@ -4,6 +4,7 @@ import { AppLogo } from "../components/AppLogo";
 import { SpecusAqueduct } from "../components/SpecusAqueduct";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { UserMenuButton } from "../components/UserMenuButton";
+import { fetchPublicClientDownloads } from "../api/client";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
 
@@ -535,19 +536,6 @@ const IMPL_LABELS: Record<ClientImplementation, string> = {
 
 const IMPL_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
 
-async function fetchLandingClientDownloads(): Promise<ClientDownloadLink[]> {
-  try {
-    const response = await fetch("/api/public/client-downloads");
-    if (!response.ok) {
-      return [];
-    }
-    const data = await response.json();
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
-  }
-}
-
 function ClientDownloadsSection() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -556,7 +544,7 @@ function ClientDownloadsSection() {
     let cancelled = false;
     let cancelScheduledLoad = () => {};
     const load = async () => {
-      const data = await fetchLandingClientDownloads();
+      const data = await fetchPublicClientDownloads();
       if (!cancelled) {
         setLinks(data);
         setLoaded(true);
@@ -589,7 +577,7 @@ function ClientDownloadsSection() {
       <div className="mb-6 max-w-2xl">
         <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">获取客户端</h2>
         <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-          选择对应的实现下载，所有客户端共享同一份 JSON 配置格式。详细启动方法见登录后的「帮助文档」。
+          从 GitHub Releases 下载最新客户端。所有实现共享同一份 JSON 配置格式，详细启动方法见登录后的「帮助文档」。
         </p>
       </div>
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
