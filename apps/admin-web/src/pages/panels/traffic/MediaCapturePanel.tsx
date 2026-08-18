@@ -18,8 +18,6 @@ import {
   TableRow,
   Tooltip,
 } from "@heroui/react";
-import Hls from "hls.js";
-import * as dashjs from "dashjs";
 import {
   Gauge,
   LoaderCircle,
@@ -716,37 +714,63 @@ function MediaPlayer({
     setBufferedEnd(0);
     setOfflineNotice("");
     initialOfflinePositionAppliedRef.current = false;
-    let hls: Hls | null = null;
-    let dash: dashjs.MediaPlayerClass | null = null;
+    let disposed = false;
+    let hls: import("hls.js").default | null = null;
+    let dash: import("dashjs").MediaPlayerClass | null = null;
 
-    if (capture.mediaKind === "HLS_MANIFEST") {
-      if (element.canPlayType("application/vnd.apple.mpegurl")) {
-        element.src = ticket.manifestUrl;
-      } else if (Hls.isSupported()) {
-        hls = new Hls({ enableWorker: true, lowLatencyMode: capture.liveStream });
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (data.fatal) {
-            setWaiting(false);
-            setError(data.details || "HLS 播放失败");
+    const initializePlayer = async () => {
+      try {
+        if (capture.mediaKind === "HLS_MANIFEST") {
+          if (element.canPlayType("application/vnd.apple.mpegurl")) {
+            element.src = ticket.manifestUrl;
+            return;
           }
-        });
-        hls.loadSource(ticket.manifestUrl);
-        hls.attachMedia(element);
-      } else {
-        setError("当前浏览器不支持 HLS 播放");
+          const { default: Hls } = await import("hls.js");
+          if (disposed) {
+            return;
+          }
+          if (!Hls.isSupported()) {
+            setWaiting(false);
+            setError("当前浏览器不支持 HLS 播放");
+            return;
+          }
+          hls = new Hls({ enableWorker: true, lowLatencyMode: capture.liveStream });
+          hls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) {
+              setWaiting(false);
+              setError(data.details || "HLS 播放失败");
+            }
+          });
+          hls.loadSource(ticket.manifestUrl);
+          hls.attachMedia(element);
+          return;
+        }
+        if (capture.mediaKind === "DASH_MANIFEST") {
+          const dashjs = await import("dashjs");
+          if (disposed) {
+            return;
+          }
+          dash = dashjs.MediaPlayer().create();
+          dash.on(dashjs.MediaPlayer.events.ERROR, (event: { error?: { message?: string } }) => {
+            setWaiting(false);
+            setError(event?.error?.message || "DASH 播放失败");
+          });
+          dash.initialize(element, ticket.manifestUrl, true);
+          return;
+        }
+        element.src = ticket.playUrl;
+      } catch {
+        if (!disposed) {
+          setWaiting(false);
+          setError("媒体播放组件加载失败，请刷新后重试");
+        }
       }
-    } else if (capture.mediaKind === "DASH_MANIFEST") {
-      dash = dashjs.MediaPlayer().create();
-      dash.on(dashjs.MediaPlayer.events.ERROR, (event: { error?: { message?: string } }) => {
-        setWaiting(false);
-        setError(event?.error?.message || "DASH 播放失败");
-      });
-      dash.initialize(element, ticket.manifestUrl, true);
-    } else {
-      element.src = ticket.playUrl;
-    }
+    };
+
+    void initializePlayer();
 
     return () => {
+      disposed = true;
       hls?.destroy();
       dash?.destroy();
       element.pause();

@@ -1,5 +1,83 @@
-import { defineConfig, loadEnv } from "vite";
+import { Buffer } from "node:buffer";
+import type { OutputChunk } from "rollup";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+
+const DEFAULT_CHUNK_BUDGET_KIB = 500;
+const CHUNK_BUDGETS_KIB = new Map([
+  // These packages publish their browser player as one pre-bundled ESM module. They are
+  // loaded only after the user starts the matching media type, so splitting them further
+  // would only add artificial request boundaries without reducing transferred code.
+  ["media-dash", 900],
+  ["media-hls", 550],
+]);
+// Guard the static transitive graph too: several medium chunks can regress a route even when
+// every individual file remains below the default limit.
+const STATIC_ROUTE_BUDGETS = [
+  { facadeSuffix: "/src/pages/PublicDownloadPage.tsx", budgetKib: 300 },
+];
+
+function staticChunkGraphBytes(entry: OutputChunk, chunks: Map<string, OutputChunk>): number {
+  const pending = [entry.fileName];
+  const visited = new Set<string>();
+  let bytes = 0;
+  while (pending.length > 0) {
+    const fileName = pending.pop();
+    if (!fileName || visited.has(fileName)) {
+      continue;
+    }
+    visited.add(fileName);
+    const chunk = chunks.get(fileName);
+    if (!chunk) {
+      continue;
+    }
+    bytes += Buffer.byteLength(chunk.code, "utf8");
+    pending.push(...chunk.imports);
+  }
+  return bytes;
+}
+
+function enforceChunkBudgets(): Plugin {
+  return {
+    name: "specus-chunk-budgets",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const chunks = Object.values(bundle).filter((output): output is OutputChunk => output.type === "chunk");
+      for (const output of chunks) {
+        const budgetKib = CHUNK_BUDGETS_KIB.get(output.name) ?? DEFAULT_CHUNK_BUDGET_KIB;
+        const bytes = Buffer.byteLength(output.code, "utf8");
+        if (bytes > budgetKib * 1024) {
+          this.error(
+            `${output.fileName} is ${(bytes / 1024).toFixed(2)} KiB; `
+              + `the budget for ${output.name} is ${budgetKib} KiB.`,
+          );
+        }
+      }
+      const chunksByFileName = new Map(chunks.map((chunk) => [chunk.fileName, chunk]));
+      const isApplicationBundle = chunks.some((chunk) =>
+        chunk.isEntry && chunk.facadeModuleId?.replace(/\\/g, "/").endsWith("/index.html"),
+      );
+      for (const { facadeSuffix, budgetKib } of STATIC_ROUTE_BUDGETS) {
+        const entry = chunks.find((chunk) =>
+          chunk.facadeModuleId?.replace(/\\/g, "/").endsWith(facadeSuffix),
+        );
+        if (!entry) {
+          if (isApplicationBundle) {
+            this.error(`Cannot enforce the static route budget: ${facadeSuffix} was not emitted.`);
+          }
+          continue;
+        }
+        const bytes = staticChunkGraphBytes(entry, chunksByFileName);
+        if (bytes > budgetKib * 1024) {
+          this.error(
+            `${facadeSuffix} has ${(bytes / 1024).toFixed(2)} KiB of static JavaScript; `
+              + `the route budget is ${budgetKib} KiB.`,
+          );
+        }
+      }
+    },
+  };
+}
 
 // Dev server proxies the backend admin/control HTTP surface so `npm run dev` works against a
 // locally running specus-server (Go/C#/Java). Override the target with VITE_API_TARGET.
@@ -10,7 +88,7 @@ export default defineConfig(({ mode }) => {
     Object.fromEntries(paths.map((path) => [path, { target, changeOrigin: true, ws }]));
 
   return {
-    plugins: [react()],
+    plugins: [react(), enforceChunkBudgets()],
     base: "/",
     server: {
       port: 5173,
@@ -23,6 +101,9 @@ export default defineConfig(({ mode }) => {
       outDir: "dist",
       // Keep asset paths stable under /assets so any static file server can serve the SPA.
       assetsDir: "assets",
+      // Vite has one global warning threshold. The stricter per-chunk policy above still
+      // enforces 500 KiB by default while allowing audited, lazy, atomic dependencies.
+      chunkSizeWarningLimit: 900,
       modulePreload: {
         resolveDependencies(_filename, deps) {
           return deps.filter((dep) => dep.includes("react-vendor"));
@@ -52,23 +133,17 @@ export default defineConfig(({ mode }) => {
             if (normalized.includes("/node_modules/pako/")) {
               return "diagram-compression";
             }
-            if (
-              normalized.includes("/node_modules/jspdf/")
-              || normalized.includes("/node_modules/fflate/")
-              || normalized.includes("/node_modules/fast-png/")
-              || normalized.includes("/node_modules/canvg/")
-              || normalized.includes("/node_modules/html2canvas/")
-              || normalized.includes("/node_modules/dompurify/")
-              || normalized.includes("/node_modules/core-js/")
-              || normalized.includes("/node_modules/regenerator-runtime/")
-              || normalized.includes("/node_modules/raf/")
-              || normalized.includes("/node_modules/rgbcolor/")
-              || normalized.includes("/node_modules/stackblur-canvas/")
-              || normalized.includes("/node_modules/svg-pathdata/")
-              || normalized.includes("/node_modules/css-line-break/")
-              || normalized.includes("/node_modules/text-segmentation/")
-            ) {
-              return "diagram-pdf";
+            if (normalized.includes("/node_modules/fflate/")) {
+              return "diagram-archive";
+            }
+            if (normalized.includes("/node_modules/hls.js/")) {
+              return "media-hls";
+            }
+            if (normalized.includes("/node_modules/dashjs/")) {
+              return "media-dash";
+            }
+            if (normalized.includes("/node_modules/mp4box/")) {
+              return "media-mp4";
             }
 
             if (
@@ -100,7 +175,9 @@ export default defineConfig(({ mode }) => {
             if (normalized.includes("/node_modules/@floating-ui/")) {
               return "floating-ui";
             }
-            return "vendor";
+            // Let Rollup keep remaining dependencies with their actual route or dynamic
+            // importer. A generic vendor bucket couples unrelated, rarely used features.
+            return undefined;
           },
         },
       },

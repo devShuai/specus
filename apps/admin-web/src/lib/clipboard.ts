@@ -1,5 +1,3 @@
-import { notify } from "../components/toast";
-
 /**
  * 复制文本到剪贴板，带完整失败兜底：
  * - 优先 navigator.clipboard（需要安全上下文）
@@ -34,10 +32,17 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 /** 复制并 toast 反馈结果；失败时提示用户手动复制。 */
 export async function copyTextWithFeedback(text: string, successMessage = "已复制"): Promise<boolean> {
   const ok = await copyTextToClipboard(text);
-  if (ok) {
-    notify(successMessage);
-  } else {
-    notify("复制失败，请手动选择文本复制", "error");
+  // Most public pages do not otherwise need HeroUI. Load its toast runtime only for callers
+  // that explicitly request global feedback, and only after the copy action happens.
+  try {
+    const { notify } = await import("../components/toast");
+    if (ok) {
+      notify(successMessage);
+    } else {
+      notify("复制失败，请手动选择文本复制", "error");
+    }
+  } catch {
+    // Copy success/failure remains authoritative even if a lazy feedback chunk cannot load.
   }
   return ok;
 }

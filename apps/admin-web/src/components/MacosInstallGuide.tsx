@@ -1,4 +1,5 @@
-import { copyTextWithFeedback } from "../lib/clipboard";
+import { useEffect, useRef, useState } from "react";
+import { copyTextToClipboard } from "../lib/clipboard";
 import {
   MACOS_CLIENT_START_COMMAND,
   MACOS_HOMEBREW_INSTALL_COMMAND,
@@ -53,6 +54,24 @@ export function MacosInstallGuide({ landing = false }: { landing?: boolean }) {
 }
 
 function CommandRow({ command, label }: { command: string; label: string }) {
+  const [copyStatus, setCopyStatus] = useState<"idle" | "success" | "error">("idle");
+  const resetTimer = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimer.current !== null) {
+      globalThis.clearTimeout(resetTimer.current);
+    }
+  }, []);
+
+  const copyCommand = async () => {
+    const copied = await copyTextToClipboard(command);
+    setCopyStatus(copied ? "success" : "error");
+    if (resetTimer.current !== null) {
+      globalThis.clearTimeout(resetTimer.current);
+    }
+    resetTimer.current = globalThis.setTimeout(() => setCopyStatus("idle"), 2_500);
+  };
+
   return (
     <div className="macos-command-row grid min-w-0 items-center gap-2 rounded-md border border-default-200 bg-default-50 p-2 dark:bg-default-100/10">
       <span className="macos-command-label text-center text-tiny font-medium text-default-500">{label}</span>
@@ -63,10 +82,17 @@ function CommandRow({ command, label }: { command: string; label: string }) {
         aria-label={`复制${label}命令`}
         className="macos-command-copy shrink-0 rounded-md px-2 text-tiny font-medium text-primary transition hover:bg-primary-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-primary-500/10"
         type="button"
-        onClick={() => void copyTextWithFeedback(command, `${label}命令已复制`)}
+        onClick={() => void copyCommand()}
       >
-        复制
+        {copyStatus === "success" ? "已复制" : copyStatus === "error" ? "复制失败" : "复制"}
       </button>
+      <span aria-live="polite" className="sr-only">
+        {copyStatus === "success"
+          ? `${label}命令已复制`
+          : copyStatus === "error"
+            ? "复制失败，请手动选择文本复制"
+            : ""}
+      </span>
     </div>
   );
 }

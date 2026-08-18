@@ -1,4 +1,14 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Button,
   Card,
@@ -82,7 +92,10 @@ import {
   type TcpPayloadAnalysis,
 } from "./traffic/tcpPayload";
 import { isHttpImageBody, resolveHttpImageDataUrl } from "./traffic/httpBodyPreview";
-import { MediaCapturePanel } from "./traffic/MediaCapturePanel";
+
+const LazyMediaCapturePanel = lazy(() =>
+  import("./traffic/MediaCapturePanel").then((module) => ({ default: module.MediaCapturePanel })),
+);
 
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
@@ -447,7 +460,13 @@ export function TrafficPanel() {
           />
         </div>
       )}
-      {trafficView === "media" && <MediaCapturePanel />}
+      {trafficView === "media" && (
+        <MediaCaptureLoadBoundary>
+          <Suspense fallback={<MediaCaptureLoading />}>
+            <LazyMediaCapturePanel />
+          </Suspense>
+        </MediaCaptureLoadBoundary>
+      )}
       <HttpExchangeModal row={selectedHttpExchange} onClose={() => setSelectedHttpExchange(null)} />
       <TcpFrameModal row={selectedTcpFrame} onClose={() => setSelectedTcpFrame(null)} />
       <TcpStreamModal
@@ -456,6 +475,51 @@ export function TrafficPanel() {
         onClose={() => setSelectedTcpStream(null)}
         onPageChange={changeTcpStreamPage}
       />
+    </div>
+  );
+}
+
+class MediaCaptureLoadBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (!this.state.failed) {
+      return this.props.children;
+    }
+    return (
+      <div
+        className="rounded-large border border-danger-200 bg-danger-50 px-4 py-6 text-center dark:bg-danger-50/10"
+        role="alert"
+      >
+        <p className="text-small font-medium text-danger">媒体采集模块加载失败</p>
+        <p className="mt-1 text-tiny text-default-500">网络可能中断，或站点刚刚完成版本更新。</p>
+        <button
+          className="mt-3 rounded-medium bg-danger px-3 py-2 text-small font-medium text-danger-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
+          type="button"
+          onClick={() => window.location.reload()}
+        >
+          重新加载页面
+        </button>
+      </div>
+    );
+  }
+}
+
+function MediaCaptureLoading() {
+  return (
+    <div
+      aria-live="polite"
+      className="rounded-large border border-default-200 bg-content1 px-4 py-8 text-center text-small text-default-500"
+      role="status"
+    >
+      正在加载媒体采集模块…
     </div>
   );
 }
