@@ -182,15 +182,9 @@ export function PublicDownloadPage() {
         <div className="relative z-10 mx-auto mt-14 w-full max-w-[1120px] px-5 sm:mt-20 sm:px-8">
           <div className="mx-auto max-w-3xl text-center">
             <span className="landing-apple-eyebrow text-small font-semibold">SPECUS CLIENT</span>
-            <h1 className="download-title mt-4 font-semibold text-zinc-950 dark:text-white">
-              把正确的客户端，交给这台设备。
-            </h1>
-            <p className="mx-auto mt-5 max-w-2xl text-base leading-7 text-zinc-600 dark:text-zinc-300 sm:text-lg">
-              我们先识别操作系统与处理器，只突出最合适的安装方式。需要其他平台、架构或实现时，再展开完整列表。
-            </p>
           </div>
 
-          <section className="download-recommendation mx-auto mt-10 max-w-4xl" aria-labelledby="recommended-download-title">
+          <section className="download-recommendation mx-auto mt-5 max-w-4xl" aria-labelledby="recommended-download-title">
             <div className="download-recommendation-head flex flex-col gap-4 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="download-device-mark" aria-hidden="true"><DeviceIcon device={device} /></span>
