@@ -2,15 +2,16 @@
 # 打包 Go 客户端为 macOS / Linux / Windows 可运行包。
 #
 # 用法:
-#   scripts/package-release.sh [version]
-#   version 缺省时取 `git describe --tags --always`（无 tag 时为短 commit hash）。
+#   scripts/package-release.sh [artifact-version] [build-version]
+#   artifact-version 缺省时取 `git describe --tags --always`；commit 名会映射成合法的
+#   `0.0.0-commit.<hash>` build-version，归档名仍保留原 commit。
 #
 # 产物: out/release/<version>/specus-client-go-<version>-<platform>-<arch>.{tar.gz|zip}
 #   - 二进制为静态交叉编译（CGO_ENABLED=0），wintun.dll 已 go:embed 进 Windows 二进制，
 #     无需随包携带；包内附 client.example.jsonc，Windows 包附 Wintun LICENSE。
 #   - platform/arch 命名与管理台「客户端下载」的 platform(windows|linux|macos) /
 #     arch(x64|arm64) 枚举一致，可直接登记为下载链接。
-#   - 同目录生成 SHA256SUMS.txt。
+#   - 同目录生成 SHA256SUMS-go.txt（名称全局唯一，避免 Release 合并产物时被覆盖）。
 #
 # 依赖: go、tar；zip 可选（缺失且在 Windows 上时回退 PowerShell Compress-Archive）。
 set -euo pipefail
@@ -18,6 +19,36 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${1:-$(git describe --tags --always 2>/dev/null || echo dev)}"
+SEMVER_RE='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+if [[ "${VERSION}" =~ ${SEMVER_RE} ]]; then
+  NORMALIZED_VERSION="${VERSION#v}"
+  [ "${#NORMALIZED_VERSION}" -le 32 ] || { echo "error: version 不能超过 32 个字符" >&2; exit 1; }
+  CORE_AND_PRE="${NORMALIZED_VERSION%%+*}"
+  if [[ "${CORE_AND_PRE}" == *-* ]]; then
+    PRERELEASE="${CORE_AND_PRE#*-}"
+    IFS='.' read -ra IDENTIFIERS <<<"${PRERELEASE}"
+    for IDENTIFIER in "${IDENTIFIERS[@]}"; do
+      if [[ "${IDENTIFIER}" =~ ^[0-9]+$ && "${IDENTIFIER}" == 0[0-9]* ]]; then
+        echo "error: 数字预发布标识不能包含前导零" >&2
+        exit 1
+      fi
+    done
+  fi
+elif ! [[ "${VERSION}" =~ ^[0-9a-f]{7,40}$ ]]; then
+  echo "error: version 必须是 SemVer（可带 v 前缀）或 git commit hash" >&2
+  exit 1
+fi
+if [ "$#" -ge 2 ]; then
+  BUILD_VERSION="$2"
+elif [[ "${VERSION}" =~ ^[0-9a-f]{7,40}$ ]]; then
+  BUILD_VERSION="0.0.0-commit.${VERSION:0:12}"
+else
+  BUILD_VERSION="${VERSION#v}"
+fi
+if ! [[ "${BUILD_VERSION}" =~ ${SEMVER_RE} ]] || [ "${#BUILD_VERSION}" -gt 32 ]; then
+  echo "error: build-version 必须是最长 32 字符的 SemVer" >&2
+  exit 1
+fi
 BINARY="specus-client"
 OUT_ROOT="out/release/${VERSION}"
 STAGE_ROOT="out/stage"
@@ -65,7 +96,7 @@ for target in "${TARGETS[@]}"; do
   # The release tag is the single source of truth for the version: inject it instead of
   # committing it, so `--version` and the login handshake report the packaged build.
   CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-    go build -trimpath -ldflags "-s -w -X main.version=${VERSION#v}" \
+    go build -trimpath -ldflags "-s -w -X main.version=${BUILD_VERSION#v}" \
     -o "${stage}/${bin}" ./cmd/specus-client
 
   cp client.example.jsonc "${stage}/"
@@ -97,9 +128,9 @@ rm -rf "${STAGE_ROOT}"
 (
   cd "${OUT_ROOT}"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -- * >SHA256SUMS.txt
+    sha256sum -- * >SHA256SUMS-go.txt
   else
-    shasum -a 256 -- * >SHA256SUMS.txt
+    shasum -a 256 -- * >SHA256SUMS-go.txt
   fi
 )
 

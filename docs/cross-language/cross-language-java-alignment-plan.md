@@ -33,7 +33,7 @@
   - 新增 `specus_management_user` schema 与 store CRUD。
   - 本地 JWT 写入 `tenant_id` / `role`；每次管理请求和刷新都会按当前配置或数据库重新解析账号，禁用、删除、降权或迁租后旧 token 不再保留旧权限。
   - 新增 `/api/admin/me`、`/api/admin/users`。
-  - 新增 Java-shaped 客户端应用包下载链接管理：`GET /api/public/client-downloads` 返回启用项，`GET/POST /api/admin/client-downloads`、`PUT/DELETE /api/admin/client-downloads/{id}` 仅 admin 可维护。
+  - 客户端版本编目同时支持 GitHub Release 外链与服务端托管包：公开接口提供 latest 下载列表、包流式下载和版本检查；admin 保留 JSON 外链 CRUD，并可通过 multipart 上传、显式切换 latest 和删除托管包。外链具备权威大小/SHA-256 后可参与升级，托管文件的大小与摘要由服务端计算。
   - OIDC Authorization Code + PKCE 强制服务端回调地址、verifier、nonce、ID Token `client_id` audience 与多 audience `azp`；按不可变 `issuer + subject` CAS 绑定本地普通用户，竞争绑定后会重新读取并只接受完全一致的身份，不能映射内置 admin。直接 RS256 Bearer 必须同时配置 issuer 与资源 audience，并命中已绑定且启用的本地账号；权限始终采用数据库当前 tenant/role，不信任外部同名 claim。JWKS 已补响应/键数量上限、请求合并与独立超时、刷新冷却、未知 kid 负缓存、旧 key 短时重叠，以及 Nimbus 对缺失/空/重复 kid 的选键语义。
   - `/api/admin/database/initialize` 响应已补齐 Java-shaped `tenantId`，`clients` 按当前管理租户统计。
   - HTTP 启动登录响应的 `tenantId` 已改为返回凭证所属租户，避免非 default 租户客户端拿到错误运行时上下文。
@@ -55,7 +55,7 @@
   - 新增 `Specus:ClientAuth` / `SPECUS_CLIENT_AUTH_*` 配置组：HTTP 启动登录 token TTL、同机用户在线实例上限和凭证默认最大在线数均从该组读取；`SPECUS_LOGIN_EXECUTOR_CORE`、`SPECUS_LOGIN_EXECUTOR_MAX`、`SPECUS_LOGIN_EXECUTOR_QUEUE` 已显式映射到 .NET 配置键。
   - 新增 `Specus:ConnectionRecord` / `SPECUS_CONNECTION_*` 配置组与 `ConnectionArchiveService` 后台任务：按 Java 语义把早于保留窗口的连接明细聚合到 `specus_connection_stat` 后删除，默认保留 60 天、每小时执行一次，保留天数小于等于 0 时关闭归档。
   - `/api/admin/database/initialize` 会使用当前 admin 管理上下文执行幂等初始化，响应包含 `tenantId`，`clients` 按当前租户统计。
-  - 新增 Java-shaped 客户端应用包下载链接管理：公开启用项列表不需要登录，admin CRUD 使用 EF Core 持久化并补齐 SQLite / MySQL / PostgreSQL migration。
+  - 客户端版本编目同时支持 GitHub Release 外链与服务端托管包：公开接口提供 latest 下载列表、包流式下载和版本检查；admin 保留 JSON 外链 CRUD，并可通过 multipart 上传、显式切换 latest 和删除托管包。权威外链可参与升级；托管元数据、唯一 latest 约束和旧库回填已补齐 SQLite / MySQL / PostgreSQL migration。
   - `specus_traffic_usage` EF model、启动兼容补列、flush 写入和管理查询已补齐 `tenant_id`；旧库空租户行会在后续 flush 时归属到客户端租户。
   - `specus_connection_record` EF model、provider snapshot、启动兼容补列、写入和管理查询已补齐 `tenant_id`；`/ws/connections` 事件携带 Java-shaped `tenantId`，并按租户与 owner 权限过滤订阅者。
   - `specus_connection_stat` EF model、provider snapshot、启动兼容补列、历史行回填和管理查询已补齐 `tenant_id`；fresh migration 后由启动兼容 SQL 幂等补列，旧库按 clientId / clientName 回填到客户端所属租户。
