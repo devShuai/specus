@@ -4,6 +4,9 @@ import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.model.ManagementUser;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
+import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.tenant.TenantContext;
+import com.theshuai.specusserver.security.PasswordService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -11,6 +14,7 @@ import org.mockito.ArgumentCaptor;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -195,6 +199,44 @@ class ManagementUserServiceTests {
         bound.setEnabled(false);
         assertThat(service.resolveBoundOidcUser(ISSUER, "subject-alice")).isEmpty();
         assertThat(service.resolveLocalTokenUser("alice")).isEmpty();
+    }
+
+    @Test
+    void mutationLookupsAreTenantScopedAndDoNotRevealForeignUsers() {
+        ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        when(repository.findByUsernameIgnoreCaseAndTenantId("bob", "tenant-a"))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.updateUser(tenantAAdmin, "bob",
+                new ManagementUserService.UserMutation("bob", "new-password", ManagementRole.ADMIN, false)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("用户不存在: bob");
+        assertThatThrownBy(() -> service.deleteUser(tenantAAdmin, "bob"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("用户不存在: bob");
+
+        verify(repository, never()).findByUsernameIgnoreCase(any());
+        verify(repository, never()).save(any());
+        verify(repository, never()).delete(any());
+    }
+
+    @Test
+    void updatesPasswordRoleEnabledAndDeletesInsideActingTenant() {
+        ManagementUser bob = user("bob", ManagementRole.USER, true);
+        bob.setTenantId("tenant-a");
+        ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        when(repository.findByUsernameIgnoreCaseAndTenantId("bob", "tenant-a"))
+                .thenReturn(Optional.of(bob));
+
+        var view = service.updateUser(tenantAAdmin, "bob",
+                new ManagementUserService.UserMutation("bob", "new-password", ManagementRole.ADMIN, false));
+
+        assertThat(view.role()).isEqualTo(ManagementRole.ADMIN);
+        assertThat(view.enabled()).isFalse();
+        assertThat(PasswordService.matches("new-password", bob.getPasswordHash())).isTrue();
+
+        service.deleteUser(tenantAAdmin, "bob");
+        verify(repository).delete(bob);
     }
 
     private ManagementUser user(String username, ManagementRole role, boolean enabled) {

@@ -8,6 +8,7 @@ import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,6 +25,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
 
+@Slf4j
 @Service
 public class ManagementUserService {
     private final ManagementUserRepository repository;
@@ -293,8 +295,7 @@ public class ManagementUserService {
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户只能通过配置文件修改");
         }
-        ManagementUser user = repository.findByUsernameIgnoreCase(normalized)
-                .orElseThrow(() -> new IllegalArgumentException("用户不存在: " + normalized));
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "update");
         if (StringUtils.hasText(request.password())) {
             user.setPasswordHash(PasswordService.hash(request.password().trim()));
         }
@@ -315,9 +316,21 @@ public class ManagementUserService {
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
-        ManagementUser user = repository.findByUsernameIgnoreCase(normalized)
-                .orElseThrow(() -> new IllegalArgumentException("用户不存在: " + normalized));
-        repository.delete(user);
+        repository.delete(requireMutableUserInTenant(context, normalized, "delete"));
+    }
+
+    /**
+     * Mutation targets must belong to the acting administrator's tenant. Missing users and users
+     * that only exist in another tenant are indistinguishable to the caller so a tenant-A admin
+     * cannot probe tenant-B usernames; the rejected attempt is still recorded for auditing.
+     */
+    private ManagementUser requireMutableUserInTenant(ManagementContext context, String normalized, String action) {
+        return repository.findByUsernameIgnoreCaseAndTenantId(normalized, context.tenant().tenantId())
+                .orElseThrow(() -> {
+                    log.warn("管理用户{}被拒绝: actor={}, tenant={}, target={}, reason=目标不在当前租户或不存在",
+                            action, context.username(), context.tenant().tenantId(), normalized);
+                    return new IllegalArgumentException("用户不存在: " + normalized);
+                });
     }
 
     public void requireAdmin(ManagementContext context) {
