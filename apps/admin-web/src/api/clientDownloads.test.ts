@@ -75,6 +75,92 @@ describe("fetchPublicClientDownloads", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/public/client-downloads");
   });
 
+  it("keeps partial GitHub assets when the configured fallback is unavailable", async () => {
+    const partial = completeRelease();
+    partial.assets = partial.assets.filter((asset) => !asset.name.includes("linux-arm64"));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => partial })
+      .mockRejectedValueOnce(new Error("fallback offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).resolves.toHaveLength(8);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a failure when neither GitHub nor the configured fallback has a download", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [] });
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).rejects.toThrow(
+      "无法从 GitHub Releases 或备用接口获取客户端下载链接",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a failure when both download sources are unreachable", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockRejectedValueOnce(new Error("fallback offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).rejects.toThrow(
+      "无法从 GitHub Releases 或备用接口获取客户端下载链接",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses and short-caches a configured fallback when GitHub is unavailable", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [configuredLinuxArm] });
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await expect(fetchPublicClientDownloads()).resolves.toEqual([configuredLinuxArm]);
+    await expect(fetchPublicClientDownloads()).resolves.toEqual([configuredLinuxArm]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("prefers a freshly configured target over the same target in stale cache", async () => {
+    const replacement = {
+      ...configuredLinuxArm,
+      id: 901,
+      downloadUrl: "https://downloads.example.test/specus-linux-arm64-new.tar.gz",
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => completeRelease() })
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [replacement] });
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    await fetchPublicClientDownloads();
+    const refreshed = await fetchPublicClientDownloads({ refresh: true });
+    expect(refreshed).toHaveLength(9);
+    expect(refreshed.find((link) => link.platform === "linux" && link.arch === "arm64"))
+      .toEqual(replacement);
+  });
+
+  it("keeps a recent successful cache when both refresh sources fail", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => completeRelease() })
+      .mockRejectedValueOnce(new Error("GitHub offline"))
+      .mockRejectedValueOnce(new Error("fallback offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchPublicClientDownloads } = await import("./client");
+
+    const cached = await fetchPublicClientDownloads();
+    const recovered = await fetchPublicClientDownloads({ refresh: true });
+    expect(recovered).toHaveLength(cached.length);
+    expect(recovered).toEqual(expect.arrayContaining(cached));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("deduplicates concurrent forced refreshes", async () => {
     let resolveFetch: ((value: unknown) => void) | undefined;
     const fetchMock = vi.fn().mockImplementation(() => new Promise((resolve) => {

@@ -69,6 +69,7 @@ import {
   fetchLatestGithubClientDownloads,
   hasCompleteGithubClientDownloadSet,
   mergeGithubAndConfiguredDownloads,
+  mergePreferredClientDownloads,
 } from "../lib/githubReleaseDownloads";
 
 const ADMIN_PREFIX = "/api/admin";
@@ -495,16 +496,15 @@ let cachedGithubClientDownloads: { links: ClientDownloadLink[]; expiresAt: numbe
 let githubClientDownloadsRequest: Promise<ClientDownloadLink[]> | null = null;
 
 async function fetchConfiguredClientDownloads(): Promise<ClientDownloadLink[]> {
-  try {
-    const response = await fetch(`/api/public/client-downloads`);
-    if (!response.ok) {
-      return [];
-    }
-    const body = (await response.json()) as ClientDownloadLink[];
-    return Array.isArray(body) ? body : [];
-  } catch {
-    return [];
+  const response = await fetch(`/api/public/client-downloads`);
+  if (!response.ok) {
+    throw new Error(`备用客户端下载接口请求失败（HTTP ${response.status}）`);
   }
+  const body: unknown = await response.json();
+  if (!Array.isArray(body)) {
+    throw new Error("备用客户端下载接口返回了无效数据");
+  }
+  return body as ClientDownloadLink[];
 }
 
 /**
@@ -523,23 +523,37 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
   const request = (async () => {
     try {
       const githubLinks = await fetchLatestGithubClientDownloads();
-      const links = hasCompleteGithubClientDownloadSet(githubLinks)
-        ? githubLinks
-        : mergeGithubAndConfiguredDownloads(githubLinks, await fetchConfiguredClientDownloads());
+      let links = githubLinks;
+      if (!hasCompleteGithubClientDownloadSet(githubLinks)) {
+        try {
+          links = mergeGithubAndConfiguredDownloads(githubLinks, await fetchConfiguredClientDownloads());
+        } catch {
+          // A partial GitHub Release is still more useful than hiding every available asset
+          // because the optional configured fallback is temporarily unavailable.
+        }
+      }
       cachedGithubClientDownloads = { links, expiresAt: Date.now() + GITHUB_DOWNLOAD_CACHE_TTL_MS };
       return links;
-    } catch {
-      const configured = await fetchConfiguredClientDownloads();
+    } catch (githubError) {
+      let configured: ClientDownloadLink[] = [];
+      try {
+        configured = await fetchConfiguredClientDownloads();
+      } catch {
+        // A recent successful response can still keep the download page usable.
+      }
       const links = previousDownloads.length > 0
-        ? mergeGithubAndConfiguredDownloads(previousDownloads, configured)
+        ? mergePreferredClientDownloads(configured, previousDownloads)
         : configured;
       if (links.length > 0) {
         cachedGithubClientDownloads = {
           links,
           expiresAt: Date.now() + GITHUB_DOWNLOAD_FAILURE_CACHE_TTL_MS,
         };
+        return links;
       }
-      return links;
+      throw new Error("无法从 GitHub Releases 或备用接口获取客户端下载链接", {
+        cause: githubError,
+      });
     }
   })();
   githubClientDownloadsRequest = request;

@@ -93,10 +93,19 @@ export function mergeGithubAndConfiguredDownloads(
   githubLinks: ClientDownloadLink[],
   configuredLinks: ClientDownloadLink[],
 ): ClientDownloadLink[] {
-  const githubTargets = new Set(githubLinks.map((link) => targetKey(link)));
+  return mergePreferredClientDownloads(githubLinks, configuredLinks);
+}
+
+/** Preferred links replace the same target in fallback; fallback only fills missing slots. */
+export function mergePreferredClientDownloads(
+  preferredLinks: ClientDownloadLink[],
+  fallbackLinks: ClientDownloadLink[],
+): ClientDownloadLink[] {
+  const preferred = preferredLinks.filter((link) => link.enabled);
+  const preferredTargets = new Set(preferred.map((link) => targetKey(link)));
   return [
-    ...githubLinks,
-    ...configuredLinks.filter((link) => link.enabled && !githubTargets.has(targetKey(link))),
+    ...preferred,
+    ...fallbackLinks.filter((link) => link.enabled && !preferredTargets.has(targetKey(link))),
   ].sort((left, right) => left.displayOrder - right.displayOrder || left.id - right.id);
 }
 
