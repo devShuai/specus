@@ -382,13 +382,24 @@ func (a *App) Traffic() *nat.TrafficService { return a.traffic }
 // Tokens exposes the local token service (used by tests).
 func (a *App) Tokens() *security.LocalTokenService { return a.tokens }
 
+// shutdownFlushTimeout bounds the final flush so a stuck database cannot block process exit.
+const shutdownFlushTimeout = 10 * time.Second
+
 // Close releases resources.
+//
+// Traffic counters and HTTP/TCP detail records are buffered in memory and written by periodic
+// flushes, so the database must not be closed until one final flush has run. Otherwise a SIGTERM
+// silently drops everything accumulated since the previous tick.
 func (a *App) Close() error {
+	flushErr := a.flushPendingWrites()
 	mediaCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	mediaErr := a.mediaCapture.Close(mediaCtx)
 	cancel()
 	coordinationErr := a.publicTransferDiscovery.Close()
 	databaseErr := a.db.Close()
+	if flushErr != nil {
+		return flushErr
+	}
 	if mediaErr != nil {
 		return mediaErr
 	}
@@ -396,6 +407,24 @@ func (a *App) Close() error {
 		return coordinationErr
 	}
 	return databaseErr
+}
+
+// flushPendingWrites drains the in-memory write buffers while the database is still open. It is
+// bounded so a stuck database cannot hold shutdown open indefinitely.
+func (a *App) flushPendingWrites() error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+	defer cancel()
+	if a.traffic != nil {
+		a.traffic.Flush(ctx)
+	}
+	if a.db == nil {
+		return nil
+	}
+	if err := a.db.FlushTrafficDetails(ctx); err != nil {
+		a.logger.Error("final traffic detail flush failed at shutdown", "err", err)
+		return err
+	}
+	return nil
 }
 
 // Run starts the background workers, binds and serves the control channel, and serves the

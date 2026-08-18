@@ -4,14 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/stunserver"
@@ -73,6 +76,102 @@ type stunTurnServer struct {
 	sockets              map[stunserver.EndpointID]*net.UDPConn
 	binding              *stunserver.BindingService
 	relayTasks           chan func()
+	datagramLimiter      *datagramRateLimiter
+}
+
+// Largest datagram we will look at. STUN/TURN control traffic and relayed payloads both stay far
+// below this; anything larger is dropped before parsing.
+const maxStunDatagramBytes = 8192
+
+const (
+	// Fixed-window budgets. A single source cannot spend the whole budget, and the global ceiling
+	// keeps a distributed flood from saturating the handler.
+	maxDatagramsPerSourcePerWindow = 400
+	maxDatagramsPerWindow          = 20_000
+	maxTrackedDatagramSources      = 50_000
+	datagramRateWindow             = time.Second
+)
+
+type datagramWindow struct {
+	started time.Time
+	count   int
+}
+
+// datagramRateLimiter is deliberately bounded: when the source table is full an unseen source is
+// denied rather than letting an attacker grow server memory without limit.
+type datagramRateLimiter struct {
+	mu          sync.Mutex
+	sources     map[string]datagramWindow
+	windowStart time.Time
+	windowCount int
+	now         func() time.Time
+}
+
+func newDatagramRateLimiter() *datagramRateLimiter {
+	return &datagramRateLimiter{sources: make(map[string]datagramWindow), now: time.Now}
+}
+
+func (limiter *datagramRateLimiter) allow(remote *net.UDPAddr) bool {
+	if limiter == nil {
+		return true
+	}
+	key := "unknown"
+	if remote != nil && remote.IP != nil {
+		key = remote.IP.String()
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	now := limiter.now()
+	if limiter.windowStart.IsZero() || now.Sub(limiter.windowStart) >= datagramRateWindow {
+		limiter.windowStart = now
+		limiter.windowCount = 0
+		limiter.sources = make(map[string]datagramWindow, len(limiter.sources))
+	}
+	limiter.windowCount++
+	if limiter.windowCount > maxDatagramsPerWindow {
+		return false
+	}
+	window, exists := limiter.sources[key]
+	if !exists {
+		if len(limiter.sources) >= maxTrackedDatagramSources {
+			return false
+		}
+		window = datagramWindow{started: now}
+	}
+	if now.Sub(window.started) >= datagramRateWindow {
+		window = datagramWindow{started: now}
+	}
+	window.count++
+	limiter.sources[key] = window
+	return window.count <= maxDatagramsPerSourcePerWindow
+}
+
+// transientReceiveError reports whether a read error describes one datagram rather than the socket.
+// On UDP an ICMP unreachable surfaces here, and killing the loop for it would silently take the
+// advertised STUN/TURN port out of service.
+func transientReceiveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var syscallErr *os.SyscallError
+		if errors.As(opErr.Err, &syscallErr) {
+			switch {
+			case errors.Is(syscallErr.Err, syscall.ECONNRESET),
+				errors.Is(syscallErr.Err, syscall.ECONNREFUSED),
+				errors.Is(syscallErr.Err, syscall.EHOSTUNREACH),
+				errors.Is(syscallErr.Err, syscall.ENETUNREACH),
+				errors.Is(syscallErr.Err, syscall.EMSGSIZE):
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type turnAuth struct {
@@ -121,6 +220,7 @@ func (s *stunTurnServer) run(ctx context.Context) {
 	s.primary = sockets[stunserver.Primary]
 	s.binding = stunserver.NewBindingService(
 		topology, stunTurnSoftware, !topology.SupportsRFC5780(), stunMaxPaddingResponseBytes)
+	s.datagramLimiter = newDatagramRateLimiter()
 	s.startRelayWorkers(ctx)
 
 	var wg sync.WaitGroup
@@ -234,20 +334,43 @@ func (s *stunTurnServer) resolvePrimaryAdvertisedIP(bind net.IP) net.IP {
 	return s.advertisedIP(&net.UDPAddr{IP: bind})
 }
 
+// receiveLoop reads datagrams until the context ends. A malformed or hostile datagram must only be
+// dropped: this loop is the only thing keeping the advertised STUN/TURN port alive, so it never
+// exits on a packet-level failure.
 func (s *stunTurnServer) receiveLoop(ctx context.Context, conn *net.UDPConn, incoming stunserver.EndpointID) {
-	buf := make([]byte, 65507)
+	buf := make([]byte, maxStunDatagramBytes+1)
 	for {
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			if ctx.Err() == nil {
-				s.logger.Debug("[peer-mesh] STUN/TURN receive failed", "err", err)
+			if ctx.Err() != nil {
+				return
 			}
+			if transientReceiveError(err) {
+				s.logger.Debug("[peer-mesh] STUN/TURN transient receive error ignored", "err", err)
+				continue
+			}
+			s.logger.Warn("[peer-mesh] STUN/TURN receive failed", "endpoint", incoming, "err", err)
 			return
 		}
-		payload := append([]byte(nil), buf[:n]...)
-		if err := s.handle(ctx, conn, incoming, payload, remote); err != nil {
-			s.logger.Debug("[peer-mesh] STUN/TURN packet handling failed", "err", err)
+		if n > maxStunDatagramBytes || !s.datagramLimiter.allow(remote) {
+			continue
 		}
+		payload := append([]byte(nil), buf[:n]...)
+		s.handleDatagram(ctx, conn, incoming, payload, remote)
+	}
+}
+
+// handleDatagram isolates one datagram: a panic from a malformed packet must not unwind the loop.
+func (s *stunTurnServer) handleDatagram(ctx context.Context, conn *net.UDPConn,
+	incoming stunserver.EndpointID, payload []byte, remote *net.UDPAddr) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("[peer-mesh] STUN/TURN packet handling panicked",
+				"remote", remote, "panic", recovered)
+		}
+	}()
+	if err := s.handle(ctx, conn, incoming, payload, remote); err != nil {
+		s.logger.Debug("[peer-mesh] STUN/TURN packet handling failed", "err", err)
 	}
 }
 

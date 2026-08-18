@@ -203,6 +203,10 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 	}
 }
 
+// errTooManyNatStreams is returned to the HTTP/WebSocket entry point when the session already holds
+// its budget of NAT streams; the caller answers the visitor rather than queueing unbounded work.
+var errTooManyNatStreams = errors.New("client has too many concurrent NAT streams")
+
 func (s *clientSession) protocolViolation(message protocol.NatMessage, detail string) error {
 	if s.logger != nil && s.conn != nil {
 		s.logger.Warn("NAT protocol violation",
@@ -375,6 +379,11 @@ func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, er
 	s.markStreamOpened(streamID)
 	stream := newHTTPStream(s.conn, streamID, s.removeHTTPStream)
 	s.mu.Lock()
+	if s.natStreamLimitReachedLocked() {
+		s.mu.Unlock()
+		stream.Close()
+		return nil, errTooManyNatStreams
+	}
 	s.httpStreams[streamID] = stream
 	s.mu.Unlock()
 	if err := s.conn.Send(protocol.NatMessage{
@@ -508,6 +517,10 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 		},
 		func(specus *directhttp.WebSocketSpecus) { s.removeWSStream(streamID, specus) })
 	s.mu.Lock()
+	if s.natStreamLimitReachedLocked() {
+		s.mu.Unlock()
+		return nil, errTooManyNatStreams
+	}
 	s.wsStreams[streamID] = specus
 	s.mu.Unlock()
 	if err := s.conn.Send(protocol.NatMessage{
@@ -811,6 +824,15 @@ func (s *clientSession) updateControlReadForWritability() {
 		return
 	}
 	s.conn.ReadGate.Pause()
+}
+
+// natStreamLimitReachedLocked bounds the NAT streams a single control channel can hold open.
+// Raw TCP connections are already capped by the external-connection budget; HTTP and WebSocket
+// streams enter through /http/** and would otherwise grow without limit, so they share the same
+// per-client ceiling. Callers must hold s.mu.
+func (s *clientSession) natStreamLimitReachedLocked() bool {
+	total := s.activeExternal + len(s.httpStreams) + len(s.wsStreams)
+	return reached(total, s.limits.PerClient)
 }
 
 func reached(current, max int) bool { return max > 0 && current >= max }
