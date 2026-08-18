@@ -38,6 +38,9 @@ public class ClientPackageStorage {
         if (source == null) {
             throw new IllegalArgumentException("file cannot be empty");
         }
+        if (declaredSize < 0) {
+            throw new IllegalArgumentException("declared file size cannot be negative");
+        }
         if (declaredSize > maxPackageBytes) {
             throw new IllegalArgumentException("file exceeds max package size of " + maxPackageBytes + " bytes");
         }
@@ -78,20 +81,47 @@ public class ClientPackageStorage {
     }
 
     public Path publish(StagedPackage staged, long packageId) {
+        Path source = requireStaged(staged);
         Path destination = pathFor(packageId);
         if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
             throw new IllegalStateException("package file already exists: " + packageId);
         }
         try {
             try {
-                Files.move(staged.path(), destination, StandardCopyOption.ATOMIC_MOVE);
+                Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
             } catch (AtomicMoveNotSupportedException exception) {
-                Files.move(staged.path(), destination);
+                Files.move(source, destination);
             }
             return destination;
         } catch (IOException exception) {
             throw new IllegalStateException("cannot publish client package", exception);
         }
+    }
+
+    private Path requireStaged(StagedPackage staged) {
+        if (staged == null || staged.path() == null) {
+            throw new IllegalArgumentException("staged package is required");
+        }
+        Path source = staged.path().toAbsolutePath().normalize();
+        String fileName = source.getFileName() == null ? "" : source.getFileName().toString();
+        if (!packageRoot.equals(source.getParent())
+                || !fileName.startsWith(".upload-")
+                || !fileName.endsWith(".tmp")
+                || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("staged package must be a regular upload inside data/packages");
+        }
+        if (staged.fileSize() <= 0 || staged.fileSize() > maxPackageBytes
+                || staged.sha256() == null || !staged.sha256().matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("staged package metadata is invalid");
+        }
+        try {
+            if (Files.size(source) != staged.fileSize()) {
+                throw new IllegalArgumentException("staged package size does not match its metadata");
+            }
+        } catch (IOException exception) {
+            throw new IllegalStateException("cannot inspect staged client package", exception);
+        }
+        return source;
     }
 
     public Path requireReadable(long packageId) {

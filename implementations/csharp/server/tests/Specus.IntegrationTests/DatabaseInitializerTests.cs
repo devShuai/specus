@@ -112,6 +112,71 @@ public sealed class DatabaseInitializerTests
     }
 
     [Fact]
+    public async Task StartupCompatibilityUpgradesLegacyClientDownloadsAndRepairsLatestSlots()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = CreateContext(connection);
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE client_download_link (
+              id INTEGER PRIMARY KEY,
+              implementation TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              arch TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              download_url TEXT NOT NULL,
+              description TEXT,
+              display_order INTEGER NOT NULL DEFAULT 0,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT INTO client_download_link (
+              id, implementation, platform, arch, display_name, download_url,
+              display_order, enabled, created_at, updated_at
+            ) VALUES
+              (1, 'csharp', 'windows', 'x64', 'one.zip', 'https://example/one', 0, 1, 'now', 'now'),
+              (2, 'csharp', 'windows', 'x64', 'two.zip', 'https://example/two', 0, 1, 'now', 'now'),
+              (3, 'csharp', 'windows', 'x64', 'disabled.zip', 'https://example/disabled', 0, 0, 'now', 'now');
+            """);
+
+        await DatabaseInitializer.EnsureClientDownloadLinkTableAsync(db, CancellationToken.None);
+        await db.Database.ExecuteSqlRawAsync("""
+            UPDATE client_download_link
+            SET version = CASE id WHEN 1 THEN '1.0.0' WHEN 2 THEN '2.0.0' ELSE '3.0.0' END,
+                is_latest = 1,
+                latest_slot = NULL;
+            """);
+
+        await DatabaseInitializer.EnsureClientDownloadLinkTableAsync(db, CancellationToken.None);
+        await db.Database.ExecuteSqlRawAsync("""
+            UPDATE client_download_link SET latest_slot = 'stale-slot' WHERE id = 1;
+            """);
+        await DatabaseInitializer.EnsureClientDownloadLinkTableAsync(db, CancellationToken.None);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id, is_latest, latest_slot
+            FROM client_download_link
+            ORDER BY id
+            """;
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1, reader.GetInt64(0));
+        Assert.Equal(0, reader.GetInt64(1));
+        Assert.True(reader.IsDBNull(2));
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(2, reader.GetInt64(0));
+        Assert.Equal(1, reader.GetInt64(1));
+        Assert.Equal("csharp/windows/x64", reader.GetString(2));
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(3, reader.GetInt64(0));
+        Assert.Equal(0, reader.GetInt64(1));
+        Assert.True(reader.IsDBNull(2));
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
     public async Task ProdDisablesOnlyExactLegacyDemoCredentialsAndIsIdempotent()
     {
         await using var connection = await OpenDatabaseAsync();

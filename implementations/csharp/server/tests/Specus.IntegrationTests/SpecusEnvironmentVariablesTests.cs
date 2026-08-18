@@ -62,6 +62,9 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_PEER_MESH_TURN_REALM"] = "specus",
             ["SPECUS_PEER_MESH_TURN_SHARED_SECRET"] = "test-secret",
             ["SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS"] = "3600",
+            ["SPECUS_CLIENT_PACKAGES_DATA_DIRECTORY"] = "/srv/specus-data",
+            ["SPECUS_CLIENT_PACKAGES_MAX_PACKAGE_BYTES"] = "2097152",
+            ["SPECUS_CLIENT_PACKAGES_PUBLIC_REQUESTS_PER_IP"] = "90",
             ["SPECUS_OBJECT_STORAGE_PROVIDER"] = "aliyun-oss",
             ["SPECUS_OBJECT_STORAGE_REGION"] = "cn-shanghai",
             ["SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL"] = "https://specus.example/api/public/transfer/oss-callback",
@@ -142,6 +145,9 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("specus", mapped["Specus:PeerMesh:TurnRealm"]);
         Assert.Equal("test-secret", mapped["Specus:PeerMesh:TurnSharedSecret"]);
         Assert.Equal("3600", mapped["Specus:PeerMesh:TurnCredentialTtlSeconds"]);
+        Assert.Equal("/srv/specus-data", mapped["Specus:ClientPackages:DataDirectory"]);
+        Assert.Equal("2097152", mapped["Specus:ClientPackages:MaxPackageBytes"]);
+        Assert.Equal("90", mapped["Specus:ClientPackages:PublicRequestsPerIp"]);
         Assert.Equal("aliyun-oss", mapped["Specus:ObjectStorage:Provider"]);
         Assert.Equal("cn-shanghai", mapped["Specus:ObjectStorage:Region"]);
         Assert.Equal("https://specus.example/api/public/transfer/oss-callback",

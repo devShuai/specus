@@ -12,6 +12,8 @@
     <name>specus-server</name>
     <description>specus-server</description>
     <properties>
+        <!-- Kept in lockstep with the client module; release builds override it with -Drevision. -->
+        <revision>1.0.0-SNAPSHOT</revision>
         <java.version>21</java.version>
         <npm.executable>npm</npm.executable>
         <specus.server.web.skip>false</specus.server.web.skip>
@@ -106,7 +108,7 @@
         <dependency>
             <groupId>com.theshuai</groupId>
             <artifactId>specus-client</artifactId>
-            <version>1.0.0-SNAPSHOT</version>
+            <version>${revision}</version>
             <scope>test</scope>
         </dependency>
         <dependency>

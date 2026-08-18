@@ -236,6 +236,11 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("tinyint(1)")
                         .HasColumnName("is_latest");
 
+                    b.Property<string>("LatestSlot")
+                        .HasMaxLength(104)
+                        .HasColumnType("varchar(104)")
+                        .HasColumnName("latest_slot");
+
                     b.Property<string>("MinSupportedVersion")
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
@@ -277,6 +282,10 @@ namespace Specus.Server.Data.MySql.Migrations
                     b.HasIndex("Implementation", "Platform", "Arch", "Version")
                         .IsUnique()
                         .HasDatabaseName("uq_client_download_version");
+
+                    b.HasIndex("LatestSlot")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_latest_slot");
 
                     b.ToTable("client_download_link", (string)null);
                 });

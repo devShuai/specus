@@ -42,6 +42,53 @@ class SecurityRulesTests {
     }
 
     @Test
+    void clientPackageAdministrationRequiresAuthenticationWhilePublicChecksRemainReadOnly() throws Exception {
+        HttpRequest anonymousUpload = HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + port + "/api/admin/client-packages"))
+                .header("Content-Type", "multipart/form-data; boundary=specus-test")
+                .POST(HttpRequest.BodyPublishers.ofString("--specus-test--\r\n"))
+                .build();
+        assertThat(httpClient.send(anonymousUpload, HttpResponse.BodyHandlers.ofString()).statusCode())
+                .isEqualTo(401);
+
+        HttpResponse<String> check = get(
+                "/api/public/client-version-check?implementation=android&platform=android&arch=any&current=1.0.0",
+                null);
+        assertThat(check.statusCode()).isEqualTo(200);
+        JsonNode body = JsonUtil.readString(check.body());
+        assertThat(body.path("updateAvailable").asBoolean()).isFalse();
+        assertThat(body.path("latestVersion").isNull()).isTrue();
+        assertThat(body.path("packageId").isNull()).isTrue();
+
+        assertThat(get("/api/public/client-packages/999999/download", null).statusCode())
+                .isEqualTo(404);
+    }
+
+    @Test
+    void clientPackageAdministrationRequiresAdminRole() throws Exception {
+        String username = "package-user-" + System.nanoTime();
+        String password = "Package-user-password-42";
+        HttpResponse<String> adminLogin = postJson(
+                "/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        String adminToken = JsonUtil.readString(adminLogin.body()).path("accessToken").asText();
+        HttpResponse<String> created = sendJson(
+                "POST",
+                "/api/admin/users",
+                "{\"username\":\"" + username + "\",\"password\":\"" + password
+                        + "\",\"role\":\"USER\",\"enabled\":true}",
+                adminToken);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+
+        HttpResponse<String> userLogin = postJson(
+                "/auth/login", "{\"username\":\"" + username + "\",\"password\":\""
+                        + password + "\"}");
+        String userToken = JsonUtil.readString(userLogin.body()).path("accessToken").asText();
+
+        HttpResponse<String> forbidden = get("/api/admin/client-downloads", userToken);
+        assertThat(forbidden.statusCode()).as(forbidden.body()).isEqualTo(403);
+    }
+
+    @Test
     void managementPageAllowsGithubReleaseApiInContentSecurityPolicy() throws Exception {
         HttpResponse<String> response = get("/", null);
 

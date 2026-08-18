@@ -13,13 +13,10 @@ public interface ClientDownloadLinkRepository extends JpaRepository<ClientDownlo
     /** 管理面用：返回全量（含禁用），按 displayOrder + id 排序。 */
     List<ClientDownloadLink> findAllByOrderByDisplayOrderAscIdAsc();
 
-    /** 公开接口用：仅返回 enabled，按 implementation 分组展示。 */
-    List<ClientDownloadLink> findByEnabledTrueOrderByImplementationAscDisplayOrderAscIdAsc();
+    /** 公开编目筛选用：必须查看禁用版本，避免停用版本后旧外链被意外重新公开。 */
+    List<ClientDownloadLink> findAllByOrderByImplementationAscDisplayOrderAscIdAsc();
 
-    Optional<ClientDownloadLink> findByImplementationAndPlatformAndArchAndLatestTrueAndEnabledTrue(
-            String implementation, String platform, String arch);
-
-    List<ClientDownloadLink> findByImplementationAndPlatformInAndArchInAndEnabledTrueAndHostedTrue(
+    List<ClientDownloadLink> findByImplementationAndPlatformInAndArchInAndEnabledTrue(
             String implementation, List<String> platforms, List<String> arches);
 
     Optional<ClientDownloadLink> findByIdAndEnabledTrueAndHostedTrue(Long id);

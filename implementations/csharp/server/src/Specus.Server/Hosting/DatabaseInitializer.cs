@@ -269,7 +269,7 @@ public sealed class DatabaseInitializer
             .ConfigureAwait(false);
     }
 
-    private static async Task EnsureClientDownloadLinkTableAsync(SpecusDbContext db,
+    internal static async Task EnsureClientDownloadLinkTableAsync(SpecusDbContext db,
         CancellationToken cancellationToken)
     {
         var dialect = DatabaseDialect(db.Database.ProviderName);
@@ -315,12 +315,49 @@ public sealed class DatabaseInitializer
             cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "client_download_link", "is_latest", latestType, cancellationToken)
             .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "latest_slot", "VARCHAR(104)",
+            cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "client_download_link", "changelog_url", "VARCHAR(1024)",
             cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "client_download_link", "min_supported_version", "VARCHAR(32)",
             cancellationToken).ConfigureAwait(false);
+        var latestValue = dialect == "postgresql" ? "TRUE" : "1";
+        var notLatestValue = dialect == "postgresql" ? "FALSE" : "0";
+        await ExecuteSchemaSqlAsync(db, $"""
+            UPDATE client_download_link
+            SET is_latest = {notLatestValue}, latest_slot = NULL
+            WHERE is_latest = {latestValue} AND enabled = {notLatestValue}
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, $"""
+            UPDATE client_download_link
+            SET is_latest = {notLatestValue}, latest_slot = NULL
+            WHERE is_latest = {latestValue}
+              AND id NOT IN (
+                SELECT keep_id FROM (
+                  SELECT MAX(id) AS keep_id
+                  FROM client_download_link
+                  WHERE is_latest = {latestValue}
+                  GROUP BY implementation, platform, arch
+                ) AS latest_rows
+              )
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, $"""
+            UPDATE client_download_link
+            SET latest_slot = NULL
+            WHERE is_latest = {notLatestValue}
+            """, cancellationToken).ConfigureAwait(false);
+        var latestSlotExpression = dialect == "mysql"
+            ? "CONCAT(implementation, '/', platform, '/', arch)"
+            : "implementation || '/' || platform || '/' || arch";
+        await ExecuteSchemaSqlAsync(db, $"""
+            UPDATE client_download_link
+            SET latest_slot = {latestSlotExpression}
+            WHERE is_latest = {latestValue}
+            """, cancellationToken).ConfigureAwait(false);
         await EnsureUniqueIndexAsync(db, "uq_client_download_version", "client_download_link",
             "implementation, platform, arch, version", cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uq_client_download_latest_slot", "client_download_link",
+            "latest_slot", cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_client_download_latest", "client_download_link",
             "implementation, platform, arch, is_latest, enabled", cancellationToken).ConfigureAwait(false);
     }

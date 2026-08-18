@@ -239,6 +239,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("is_latest");
 
+                    b.Property<string>("LatestSlot")
+                        .HasMaxLength(104)
+                        .HasColumnType("character varying(104)")
+                        .HasColumnName("latest_slot");
+
                     b.Property<string>("MinSupportedVersion")
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
@@ -280,6 +285,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.HasIndex("Implementation", "Platform", "Arch", "Version")
                         .IsUnique()
                         .HasDatabaseName("uq_client_download_version");
+
+                    b.HasIndex("LatestSlot")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_latest_slot");
 
                     b.ToTable("client_download_link", (string)null);
                 });

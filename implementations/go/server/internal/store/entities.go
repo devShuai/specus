@@ -149,7 +149,7 @@ type ClientDownloadLink struct {
 	Implementation      string
 	Platform            string
 	Arch                string
-	Version             string
+	Version             *string
 	DisplayName         string
 	DownloadURL         string
 	Description         *string

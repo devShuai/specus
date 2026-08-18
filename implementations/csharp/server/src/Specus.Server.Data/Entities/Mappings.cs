@@ -171,6 +171,11 @@ public sealed class ClientDownloadLink
     public string? Sha256 { get; set; }
     public long FileSize { get; set; }
     public bool IsLatest { get; set; }
+    /// <summary>
+    /// Nullable uniqueness guard for the latest row of one implementation/platform/arch target.
+    /// It is null for historical rows and the normalized target key for the latest row.
+    /// </summary>
+    public string? LatestSlot { get; set; }
     public string? ChangelogUrl { get; set; }
     public string? MinSupportedVersion { get; set; }
     public int DisplayOrder { get; set; }

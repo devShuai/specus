@@ -9,6 +9,12 @@ namespace Specus.Server.Management;
 
 public static class AdminApiEndpoints
 {
+    private static readonly HashSet<string> ClientPackageUploadFields = new(StringComparer.Ordinal)
+    {
+        "implementation", "platform", "arch", "displayName", "version", "description",
+        "displayOrder", "enabled", "isLatest", "changelogUrl", "minSupportedVersion",
+    };
+
     public static WebApplication UseAdminApiExceptionHandling(this WebApplication app)
     {
         app.Use(async (context, next) =>
@@ -226,7 +232,7 @@ public static class AdminApiEndpoints
             {
                 if (!AcquireClientPackageRead(context, limiter, addresses))
                 {
-                    return Results.Empty;
+                    return ClientPackageRateLimitResult();
                 }
                 return Results.Ok(await service.ListPublicClientDownloadsAsync(cancellationToken)
                     .ConfigureAwait(false));
@@ -239,25 +245,27 @@ public static class AdminApiEndpoints
             {
                 if (!AcquireClientPackageRead(context, limiter, addresses))
                 {
-                    return Results.Empty;
+                    return ClientPackageRateLimitResult();
                 }
+                context.Response.Headers.CacheControl = "no-store";
                 return Results.Ok(await service.CheckVersionAsync(implementation, platform, arch, current,
                     cancellationToken).ConfigureAwait(false));
             });
 
-        app.MapGet("/api/public/client-packages/{id:long}/download",
+        app.MapMethods("/api/public/client-packages/{id:long}/download", ["GET", "HEAD"],
             async (HttpContext context, long id, ClientPackageService service,
                 ClientPackagePublicRateLimiter limiter, ClientAddressResolver addresses,
                 CancellationToken cancellationToken) =>
             {
                 if (!AcquireClientPackageRead(context, limiter, addresses))
                 {
-                    return Results.Empty;
+                    return ClientPackageRateLimitResult();
                 }
                 var package = await service.OpenDownloadAsync(id, cancellationToken).ConfigureAwait(false);
                 context.Response.Headers.ETag = $"\"sha256-{package.Sha256}\"";
                 context.Response.Headers.XContentTypeOptions = "nosniff";
-                context.Response.Headers.CacheControl = "public, max-age=3600, immutable";
+                context.Response.Headers.CacheControl = "no-store";
+                context.Response.ContentLength = package.FileSize;
                 return Results.File(package.Stream, "application/octet-stream", package.FileName,
                     package.LastModified, entityTag: null, enableRangeProcessing: true);
             });
@@ -841,18 +849,32 @@ public static class AdminApiEndpoints
         return false;
     }
 
-    private static ClientPackageUploadMutation ParseClientPackageUpload(IFormCollection form) => new(
-        Text(form, "implementation"),
-        Text(form, "platform"),
-        Text(form, "arch"),
-        Text(form, "displayName"),
-        Text(form, "version"),
-        Text(form, "description"),
-        ParseInt(form, "displayOrder"),
-        ParseBool(form, "enabled"),
-        ParseBool(form, "isLatest"),
-        Text(form, "changelogUrl"),
-        Text(form, "minSupportedVersion"));
+    private static IResult ClientPackageRateLimitResult() => Results.Json(new
+    {
+        error = "rate_limited",
+        message = "too many client package requests",
+    }, statusCode: StatusCodes.Status429TooManyRequests);
+
+    private static ClientPackageUploadMutation ParseClientPackageUpload(IFormCollection form)
+    {
+        var unknown = form.Keys.FirstOrDefault(key => !ClientPackageUploadFields.Contains(key));
+        if (unknown is not null)
+        {
+            throw new ArgumentException($"unknown multipart field '{unknown}'");
+        }
+        return new ClientPackageUploadMutation(
+            Text(form, "implementation"),
+            Text(form, "platform"),
+            Text(form, "arch"),
+            Text(form, "displayName"),
+            Text(form, "version"),
+            Text(form, "description"),
+            ParseInt(form, "displayOrder"),
+            ParseBool(form, "enabled"),
+            ParseBool(form, "isLatest"),
+            Text(form, "changelogUrl"),
+            Text(form, "minSupportedVersion"));
+    }
 
     private static string? Text(IFormCollection form, string key)
     {

@@ -234,6 +234,11 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("is_latest");
 
+                    b.Property<string>("LatestSlot")
+                        .HasMaxLength(104)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("latest_slot");
+
                     b.Property<string>("MinSupportedVersion")
                         .HasMaxLength(32)
                         .HasColumnType("TEXT")
@@ -275,6 +280,10 @@ namespace Specus.Server.Data.Migrations
                     b.HasIndex("Implementation", "Platform", "Arch", "Version")
                         .IsUnique()
                         .HasDatabaseName("uq_client_download_version");
+
+                    b.HasIndex("LatestSlot")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_latest_slot");
 
                     b.ToTable("client_download_link", (string)null);
                 });

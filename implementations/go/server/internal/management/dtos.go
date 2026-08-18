@@ -80,15 +80,15 @@ type ClientDownloadLinkView struct {
 	Implementation      string  `json:"implementation"`
 	Platform            string  `json:"platform"`
 	Arch                string  `json:"arch"`
-	Version             string  `json:"version"`
+	Version             *string `json:"version"`
 	DisplayName         string  `json:"displayName"`
 	DownloadURL         string  `json:"downloadUrl"`
 	Description         *string `json:"description,omitempty"`
-	SHA256              string  `json:"sha256"`
+	SHA256              *string `json:"sha256"`
 	FileSize            int64   `json:"fileSize"`
 	IsLatest            bool    `json:"isLatest"`
-	ChangelogURL        *string `json:"changelogUrl,omitempty"`
-	MinSupportedVersion *string `json:"minSupportedVersion,omitempty"`
+	ChangelogURL        *string `json:"changelogUrl"`
+	MinSupportedVersion *string `json:"minSupportedVersion"`
 	Hosted              bool    `json:"hosted"`
 	PackageID           *int64  `json:"packageId"`
 	DisplayOrder        int     `json:"displayOrder"`
@@ -105,7 +105,7 @@ type ClientVersionCheckView struct {
 	DownloadURL     *string `json:"downloadUrl"`
 	SHA256          *string `json:"sha256"`
 	FileSize        int64   `json:"fileSize"`
-	ChangelogURL    *string `json:"changelogUrl,omitempty"`
+	ChangelogURL    *string `json:"changelogUrl"`
 }
 
 // SpecusView is the JSON representation of a specus mapping.
@@ -295,18 +295,20 @@ type credentialMutation struct {
 }
 
 type clientDownloadLinkMutation struct {
-	Implementation      string `json:"implementation"`
-	Platform            string `json:"platform"`
-	Arch                string `json:"arch"`
-	Version             string `json:"version"`
-	DisplayName         string `json:"displayName"`
-	DownloadURL         string `json:"downloadUrl"`
-	Description         string `json:"description"`
-	ChangelogURL        string `json:"changelogUrl"`
-	MinSupportedVersion string `json:"minSupportedVersion"`
-	DisplayOrder        *int   `json:"displayOrder"`
-	Enabled             *bool  `json:"enabled"`
-	IsLatest            *bool  `json:"isLatest"`
+	Implementation      string  `json:"implementation"`
+	Platform            string  `json:"platform"`
+	Arch                string  `json:"arch"`
+	Version             string  `json:"version"`
+	DisplayName         string  `json:"displayName"`
+	DownloadURL         string  `json:"downloadUrl"`
+	SHA256              *string `json:"sha256"`
+	FileSize            *int64  `json:"fileSize"`
+	Description         string  `json:"description"`
+	ChangelogURL        string  `json:"changelogUrl"`
+	MinSupportedVersion string  `json:"minSupportedVersion"`
+	DisplayOrder        *int    `json:"displayOrder"`
+	Enabled             *bool   `json:"enabled"`
+	IsLatest            *bool   `json:"isLatest"`
 }
 
 // specusMutation is the create/update specus request body.

@@ -4,6 +4,7 @@ import com.theshuai.specusserver.management.model.ClientDownloadLink;
 import com.theshuai.specusserver.management.model.ClientDownloadLinkView;
 import com.theshuai.specusserver.management.repository.ClientDownloadLinkRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -11,6 +12,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.InputStream;
 import java.net.URI;
@@ -64,12 +66,26 @@ public class ClientDownloadLinkService {
 
     @Transactional(readOnly = true)
     public List<ClientDownloadLinkView> listEnabled() {
-        return repository.findByEnabledTrueOrderByImplementationAscDisplayOrderAscIdAsc()
-                .stream().map(this::toView).toList();
+        List<ClientDownloadLink> catalogue = repository
+                .findAllByOrderByImplementationAscDisplayOrderAscIdAsc();
+        Set<String> versionedTargets = catalogue.stream()
+                .filter(row -> StringUtils.hasText(row.getVersion()))
+                .map(this::targetKey)
+                .collect(java.util.stream.Collectors.toSet());
+        return catalogue.stream()
+                .filter(ClientDownloadLink::isEnabled)
+                .filter(row -> versionedTargets.contains(targetKey(row))
+                        ? Boolean.TRUE.equals(row.getLatest())
+                        : !StringUtils.hasText(row.getVersion()))
+                .map(this::toView)
+                .toList();
     }
 
     @Transactional
     public ClientDownloadLinkView create(LinkMutation request) {
+        if (request == null) {
+            throw new IllegalArgumentException("request cannot be null");
+        }
         String now = Instant.now().toString();
         ClientDownloadLink row = new ClientDownloadLink();
         row.setId(ClientIdGenerator.newId());
@@ -81,6 +97,9 @@ public class ClientDownloadLinkService {
 
     @Transactional
     public ClientDownloadLinkView update(long id, LinkMutation request) {
+        if (request == null) {
+            throw new IllegalArgumentException("request cannot be null");
+        }
         ClientDownloadLink row = repository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("client download link not found: " + id));
         apply(row, request, false);
@@ -95,17 +114,22 @@ public class ClientDownloadLinkService {
         Path quarantine = Boolean.TRUE.equals(row.getHosted())
                 ? storage.quarantine(id).orElse(null)
                 : null;
+        if (quarantine != null) {
+            try {
+                afterCompletion(status -> {
+                    if (status == TransactionSynchronization.STATUS_COMMITTED) {
+                        storage.deleteQuietly(quarantine);
+                    } else {
+                        storage.restore(quarantine, id);
+                    }
+                });
+            } catch (RuntimeException exception) {
+                storage.restore(quarantine, id);
+                throw exception;
+            }
+        }
         repository.delete(row);
         repository.flush();
-        if (quarantine != null) {
-            afterCompletion(status -> {
-                if (status == TransactionSynchronization.STATUS_COMMITTED) {
-                    storage.deleteQuietly(quarantine);
-                } else {
-                    storage.restore(quarantine, id);
-                }
-            });
-        }
     }
 
     /** 把一条记录标记为其目标的最新版本；同目标其它记录的标记会被清除，因此该操作幂等。 */
@@ -116,7 +140,22 @@ public class ClientDownloadLinkService {
         if (!StringUtils.hasText(row.getVersion())) {
             throw new IllegalArgumentException("client download link has no version: " + id);
         }
+        String version = requireVersion(row.getVersion());
+        String minSupportedVersion = normalizeOptionalVersion(row.getMinSupportedVersion());
+        validateMinSupportedVersion(minSupportedVersion, version);
+        if (!row.isEnabled()) {
+            throw new IllegalArgumentException("a disabled client download cannot be latest");
+        }
+        if (!Boolean.TRUE.equals(row.getHosted()) && !hasAuthoritativeDistributionMetadata(row)) {
+            throw new IllegalArgumentException(
+                    "an external latest download requires HTTPS, sha256 and a positive fileSize");
+        }
         repository.clearLatest(row.getImplementation(), row.getPlatform(), row.getArch());
+        repository.flush();
+        row.setVersion(version);
+        row.setMinSupportedVersion(minSupportedVersion);
+        row.setCatalogKey(catalogKey(
+                row.getImplementation(), row.getPlatform(), row.getArch(), version, row.getId()));
         row.setLatest(true);
         row.setLatestSlot(latestSlot(row.getImplementation(), row.getPlatform(), row.getArch()));
         row.setUpdatedAt(Instant.now().toString());
@@ -133,19 +172,22 @@ public class ClientDownloadLinkService {
         String normalizedImplementation = requireImplementation(implementation);
         String normalizedPlatform = requirePlatform(platform);
         String normalizedArch = requireArch(arch);
+        validateTargetCoordinates(normalizedImplementation, normalizedPlatform, normalizedArch);
         SemanticVersion current = SemanticVersion.parse(currentVersion, "current");
 
         List<ClientDownloadLink> candidates = repository
-                .findByImplementationAndPlatformInAndArchInAndEnabledTrueAndHostedTrue(
+                .findByImplementationAndPlatformInAndArchInAndEnabledTrue(
                         normalizedImplementation,
                         fallbackValues(normalizedPlatform),
                         fallbackValues(normalizedArch)).stream()
-                .filter(this::hasAuthoritativePackageMetadata)
+                // A version is publishable only after an administrator explicitly marks it latest.
+                // Falling back to the highest unmarked upload would silently release staged builds
+                // after the published package is deleted or has its latest flag cleared.
+                .filter(row -> Boolean.TRUE.equals(row.getLatest()))
+                .filter(this::hasAuthoritativeDistributionMetadata)
                 .filter(row -> safeVersion(row).isPresent())
                 .toList();
-        boolean hasMarkedLatest = candidates.stream().anyMatch(row -> Boolean.TRUE.equals(row.getLatest()));
         ClientDownloadLink latest = candidates.stream()
-                .filter(row -> !hasMarkedLatest || Boolean.TRUE.equals(row.getLatest()))
                 .max(Comparator
                         .comparingInt((ClientDownloadLink row) -> specificity(
                                 row, normalizedPlatform, normalizedArch))
@@ -176,7 +218,7 @@ public class ClientDownloadLinkService {
         return new VersionCheckView(
                 updateAvailable,
                 mandatory,
-                latest.getVersion(),
+                SemanticVersion.normalize(latest.getVersion()),
                 latest.getDownloadUrl(),
                 latest.getSha256(),
                 latest.getFileSize() == null ? 0L : latest.getFileSize(),
@@ -204,27 +246,64 @@ public class ClientDownloadLinkService {
         }
     }
 
-    private boolean hasAuthoritativePackageMetadata(ClientDownloadLink row) {
-        return row.getFileSize() != null && row.getFileSize() > 0
-                && row.getSha256() != null && row.getSha256().matches("[0-9a-f]{64}");
+    private boolean hasAuthoritativeDistributionMetadata(ClientDownloadLink row) {
+        if (row.getFileSize() == null || row.getFileSize() <= 0
+                || row.getSha256() == null || !row.getSha256().matches("[0-9a-f]{64}")) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(row.getHosted())) {
+            return row.getId() != null && hostedDownloadUrl(row.getId()).equals(row.getDownloadUrl());
+        }
+        return isSafeExternalPackageUrl(row.getDownloadUrl());
+    }
+
+    private boolean isSafeExternalPackageUrl(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        try {
+            URI uri = new URI(value.trim());
+            return uri.isAbsolute()
+                    && "https".equalsIgnoreCase(uri.getScheme())
+                    && StringUtils.hasText(uri.getHost())
+                    && uri.getUserInfo() == null
+                    && uri.getRawQuery() == null
+                    && uri.getRawFragment() == null;
+        } catch (URISyntaxException exception) {
+            return false;
+        }
     }
 
     private void apply(ClientDownloadLink row, LinkMutation request, boolean creating) {
         String implementation = requireImplementation(request.implementation());
         String platform = requirePlatform(request.platform());
         String arch = requireArch(request.arch());
+        validateTargetCoordinates(implementation, platform, arch);
         row.setImplementation(implementation);
         row.setPlatform(platform);
         row.setArch(arch);
         row.setDisplayName(requireDisplayName(request.displayName()));
-        row.setDownloadUrl(requireDownloadUrl(request.downloadUrl()));
+        if (creating || !Boolean.TRUE.equals(row.getHosted())) {
+            row.setDownloadUrl(requireDownloadUrl(request.downloadUrl()));
+        }
         row.setDescription(normalizeDescription(request.description()));
-        row.setVersion(requireVersion(request.version()));
-        row.setSha256(normalizeSha256(request.sha256()));
-        row.setFileSize(normalizeFileSize(request.fileSize()));
-        row.setChangelogUrl(normalizeOptionalUrl(request.changelogUrl(), "changelogUrl"));
-        row.setMinSupportedVersion(normalizeOptionalVersion(request.minSupportedVersion()));
-        row.setCatalogKey(catalogKey(implementation, platform, arch, row.getVersion()));
+        if (creating || request.version() != null) {
+            row.setVersion(normalizeOptionalVersion(request.version()));
+        }
+        if (creating || (!Boolean.TRUE.equals(row.getHosted()) && request.sha256() != null)) {
+            row.setSha256(normalizeSha256(request.sha256()));
+        }
+        if (creating || (!Boolean.TRUE.equals(row.getHosted()) && request.fileSize() != null)) {
+            row.setFileSize(normalizeFileSize(request.fileSize()));
+        }
+        if (creating || request.changelogUrl() != null) {
+            row.setChangelogUrl(normalizeOptionalUrl(request.changelogUrl(), "changelogUrl"));
+        }
+        if (creating || request.minSupportedVersion() != null) {
+            row.setMinSupportedVersion(normalizeOptionalVersion(request.minSupportedVersion()));
+        }
+        validateMinSupportedVersion(row.getMinSupportedVersion(), row.getVersion());
+        row.setCatalogKey(catalogKey(implementation, platform, arch, row.getVersion(), row.getId()));
         if (creating || request.displayOrder() != null) {
             row.setDisplayOrder(request.displayOrder() == null ? 0 : request.displayOrder());
         }
@@ -237,17 +316,31 @@ public class ClientDownloadLinkService {
         boolean latest = request.isLatest() != null
                 ? request.isLatest()
                 : Boolean.TRUE.equals(row.getLatest());
+        if (latest && !StringUtils.hasText(row.getVersion())) {
+            throw new IllegalArgumentException("isLatest requires a versioned catalogue entry");
+        }
+        if (latest && !row.isEnabled()) {
+            throw new IllegalArgumentException("a disabled client download cannot be latest");
+        }
+        if (latest && !Boolean.TRUE.equals(row.getHosted())
+                && !hasAuthoritativeDistributionMetadata(row)) {
+            throw new IllegalArgumentException(
+                    "an external latest download requires HTTPS, sha256 and a positive fileSize");
+        }
         if (latest) {
             // Clear first so "at most one latest per target" still holds when the caller flips the
             // flag onto a different row of the same target.
             repository.clearLatest(implementation, platform, arch);
+            repository.flush();
         }
         row.setLatest(latest);
         row.setLatestSlot(latest ? latestSlot(implementation, platform, arch) : null);
     }
 
-    private static String catalogKey(String implementation, String platform, String arch, String version) {
-        return implementation + "|" + platform + "|" + arch + "|" + version;
+    private static String catalogKey(String implementation, String platform, String arch,
+                                     String version, long id) {
+        return implementation + "|" + platform + "|" + arch + "|"
+                + (StringUtils.hasText(version) ? version : "legacy:" + Long.toUnsignedString(id));
     }
 
     private static String latestSlot(String implementation, String platform, String arch) {
@@ -286,6 +379,9 @@ public class ClientDownloadLinkService {
         if (trimmed.length() > 120) {
             throw new IllegalArgumentException("displayName is too long (max 120)");
         }
+        if (trimmed.chars().anyMatch(Character::isISOControl)) {
+            throw new IllegalArgumentException("displayName cannot contain control characters");
+        }
         return trimmed;
     }
 
@@ -293,24 +389,49 @@ public class ClientDownloadLinkService {
         if (!StringUtils.hasText(value)) {
             throw new IllegalArgumentException("version cannot be blank");
         }
-        String trimmed = value.trim();
-        if (trimmed.length() > 32) {
+        String normalized = SemanticVersion.normalize(value);
+        if (normalized.length() > 32) {
             throw new IllegalArgumentException("version is too long (max 32)");
         }
-        SemanticVersion.parse(trimmed, "version");
-        return trimmed;
+        SemanticVersion.parse(normalized, "version");
+        return normalized;
+    }
+
+    private void validateTargetCoordinates(String implementation, String platform, String arch) {
+        if ("android".equals(implementation)
+                && (!"android".equals(platform) || !"any".equals(arch))) {
+            throw new IllegalArgumentException("android packages must use platform=android and arch=any");
+        }
+        if ("android".equals(platform)
+                && (!"android".equals(implementation) || !"any".equals(arch))) {
+            throw new IllegalArgumentException("platform=android is reserved for android/any packages");
+        }
     }
 
     private String normalizeOptionalVersion(String value) {
         if (!StringUtils.hasText(value)) {
             return null;
         }
-        String trimmed = value.trim();
-        if (trimmed.length() > 32) {
+        String normalized = SemanticVersion.normalize(value);
+        if (normalized.length() > 32) {
             throw new IllegalArgumentException("minSupportedVersion is too long (max 32)");
         }
-        SemanticVersion.parse(trimmed, "minSupportedVersion");
-        return trimmed;
+        SemanticVersion.parse(normalized, "minSupportedVersion");
+        return normalized;
+    }
+
+    private void validateMinSupportedVersion(String minimum, String releaseVersion) {
+        if (!StringUtils.hasText(minimum)) {
+            return;
+        }
+        if (!StringUtils.hasText(releaseVersion)) {
+            throw new IllegalArgumentException("minSupportedVersion requires version");
+        }
+        SemanticVersion min = SemanticVersion.parse(minimum, "minSupportedVersion");
+        SemanticVersion release = SemanticVersion.parse(releaseVersion, "version");
+        if (min.compareTo(release) > 0) {
+            throw new IllegalArgumentException("minSupportedVersion cannot be newer than version");
+        }
     }
 
     private String normalizeSha256(String value) {
@@ -350,15 +471,24 @@ public class ClientDownloadLinkService {
             throw new IllegalArgumentException(fieldName + " cannot be blank");
         }
         String trimmed = value.trim();
-        if (trimmed.length() > 1024) {
+        if (trimmed.length() > 1024 || trimmed.indexOf('\\') >= 0
+                || trimmed.chars().anyMatch(Character::isISOControl)) {
             throw new IllegalArgumentException(fieldName + " is too long (max 1024)");
-        }
-        // A hosted package points at this server's own download endpoint, i.e. a relative path.
-        if (allowRelative && trimmed.startsWith("/")) {
-            return trimmed;
         }
         try {
             URI uri = new URI(trimmed);
+            // A hosted package points at this server's own same-origin download endpoint.
+            if (allowRelative && !uri.isAbsolute()) {
+                String rawPath = uri.getRawPath();
+                String lowerPath = rawPath == null ? "" : rawPath.toLowerCase(Locale.ROOT);
+                if (!trimmed.startsWith("/") || trimmed.startsWith("//")
+                        || uri.getRawAuthority() != null || rawPath == null
+                        || List.of(rawPath.split("/")).contains("..")
+                        || lowerPath.contains("%2e")) {
+                    throw new IllegalArgumentException(fieldName + " must be a safe root-relative path");
+                }
+                return trimmed;
+            }
             String scheme = uri.getScheme();
             if (!uri.isAbsolute() || scheme == null
                     || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
@@ -366,6 +496,9 @@ public class ClientDownloadLinkService {
             }
             if (!StringUtils.hasText(uri.getHost())) {
                 throw new IllegalArgumentException(fieldName + " must contain a host");
+            }
+            if (uri.getUserInfo() != null) {
+                throw new IllegalArgumentException(fieldName + " cannot contain user information");
             }
         } catch (URISyntaxException e) {
             throw new IllegalArgumentException(fieldName + " is not a valid URI: " + e.getMessage());
@@ -428,6 +561,7 @@ public class ClientDownloadLinkService {
                 ClientDownloadLink row = new ClientDownloadLink();
                 row.setId(packageId);
                 row.setCreatedAt(now);
+                row.setHosted(true);
                 apply(row, new LinkMutation(
                         metadata.implementation(),
                         metadata.platform(),
@@ -443,15 +577,19 @@ public class ClientDownloadLinkService {
                         metadata.isLatest(),
                         metadata.changelogUrl(),
                         metadata.minSupportedVersion()), true);
-                row.setHosted(true);
                 row.setUpdatedAt(now);
                 repository.saveAndFlush(row);
                 Path published = storage.publish(staged, packageId);
-                afterCompletion(completion -> {
-                    if (completion != TransactionSynchronization.STATUS_COMMITTED) {
-                        storage.deleteQuietly(published);
-                    }
-                });
+                try {
+                    afterCompletion(completion -> {
+                        if (completion != TransactionSynchronization.STATUS_COMMITTED) {
+                            storage.deleteQuietly(published);
+                        }
+                    });
+                } catch (RuntimeException exception) {
+                    storage.deleteQuietly(published);
+                    throw exception;
+                }
                 result.set(toView(row));
             });
             return result.get();
@@ -460,9 +598,16 @@ public class ClientDownloadLinkService {
         }
     }
 
+    private String targetKey(ClientDownloadLink row) {
+        return latestSlot(row.getImplementation(), row.getPlatform(), row.getArch());
+    }
+
     private void validatePackageMetadata(PackageUpload metadata) {
         if (metadata == null) {
             throw new IllegalArgumentException("package metadata cannot be null");
+        }
+        if (Boolean.FALSE.equals(metadata.enabled()) && Boolean.TRUE.equals(metadata.isLatest())) {
+            throw new IllegalArgumentException("a disabled client download cannot be latest");
         }
         String releaseVersion = requireVersion(metadata.version());
         requireImplementation(metadata.implementation());
@@ -473,17 +618,61 @@ public class ClientDownloadLinkService {
         validateMinSupportedVersion(metadata.minSupportedVersion(), releaseVersion);
     }
 
+    private void afterCompletion(java.util.function.IntConsumer consumer) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("package mutation requires an active transaction");
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                consumer.accept(status);
+            }
+        });
+    }
+
     /** 解析一个可公开下载的托管包；未启用、非托管或文件缺失都视为不存在。 */
     @Transactional(readOnly = true)
     public DownloadablePackage downloadable(long id) {
         ClientDownloadLink row = repository.findByIdAndEnabledTrueAndHostedTrue(id)
-                .orElseThrow(() -> new IllegalArgumentException("client package not found: " + id));
-        Path path = storage.requireReadable(id);
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "client package not found"));
+        Path path;
+        try {
+            path = storage.requireReadable(id);
+        } catch (IllegalArgumentException exception) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "client package not found");
+        }
         return new DownloadablePackage(
                 path,
-                row.getDisplayName(),
+                downloadFileName(row),
                 row.getFileSize() == null ? 0L : row.getFileSize(),
                 row.getSha256());
+    }
+
+    private String downloadFileName(ClientDownloadLink row) {
+        String fallback = "specus-client-" + row.getId();
+        String source = StringUtils.hasText(row.getDisplayName()) ? row.getDisplayName().trim() : fallback;
+        StringBuilder safe = new StringBuilder(Math.min(160, source.length() + 4));
+        for (int index = 0; index < source.length() && safe.length() < 160; index++) {
+            char character = source.charAt(index);
+            if (Character.isISOControl(character)) {
+                continue;
+            }
+            safe.append("\\/:*?\"<>|".indexOf(character) >= 0 ? '_' : character);
+        }
+        String fileName = safe.toString().trim();
+        while (fileName.endsWith(".")) {
+            fileName = fileName.substring(0, fileName.length() - 1).trim();
+        }
+        if (!StringUtils.hasText(fileName)) {
+            fileName = fallback;
+        }
+        boolean universalAndroidApk = "android".equals(row.getImplementation())
+                && "android".equals(row.getPlatform())
+                && "any".equals(row.getArch());
+        if (universalAndroidApk && !fileName.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+            fileName += ".apk";
+        }
+        return fileName;
     }
 
     private static String hostedDownloadUrl(long packageId) {
@@ -507,7 +696,7 @@ public class ClientDownloadLinkService {
     }
 
     /** 下载所需的最小信息；路径已校验位于包目录内。 */
-    public record DownloadablePackage(Path path, String displayName, long fileSize, String sha256) {
+    public record DownloadablePackage(Path path, String fileName, long fileSize, String sha256) {
     }
 
     /**

@@ -11,13 +11,6 @@ namespace Specus.Server.Management;
 
 public sealed class ManagementMutationService
 {
-    private static readonly HashSet<string> AllowedDownloadImplementations =
-        new(StringComparer.OrdinalIgnoreCase) { "java", "go", "csharp", "android" };
-    private static readonly HashSet<string> AllowedDownloadPlatforms =
-        new(StringComparer.OrdinalIgnoreCase) { "windows", "linux", "macos", "android", "any" };
-    private static readonly HashSet<string> AllowedDownloadArchitectures =
-        new(StringComparer.OrdinalIgnoreCase) { "x64", "arm64", "any" };
-
     private readonly SpecusDbContext _db;
     private readonly SessionRegistry _sessions;
     private readonly NatControlService _natControl;
@@ -224,52 +217,6 @@ public sealed class ManagementMutationService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         return rows.Select(ClientPackageService.ToView).ToList();
-    }
-
-    public async Task<ClientDownloadLinkView> CreateClientDownloadAsync(
-        ManagementContext context,
-        ClientDownloadLinkMutation request,
-        CancellationToken cancellationToken)
-    {
-        ManagementUserService.RequireAdmin(context);
-        var now = DateTimeOffset.UtcNow;
-        var link = new ClientDownloadLink
-        {
-            Id = ClientIdGenerator.NewId(),
-            DisplayOrder = request.DisplayOrder ?? 0,
-            Enabled = request.Enabled ?? true,
-            CreatedAt = now,
-            UpdatedAt = now,
-        };
-        ApplyClientDownloadMutation(link, request);
-        link.CreatedAt = now;
-        _db.ClientDownloadLinks.Add(link);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return ClientPackageService.ToView(link);
-    }
-
-    public async Task<ClientDownloadLinkView> UpdateClientDownloadAsync(
-        ManagementContext context,
-        long id,
-        ClientDownloadLinkMutation request,
-        CancellationToken cancellationToken)
-    {
-        ManagementUserService.RequireAdmin(context);
-        var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
-        ApplyClientDownloadMutation(link, request);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return ClientPackageService.ToView(link);
-    }
-
-    public async Task DeleteClientDownloadAsync(ManagementContext context, long id,
-        CancellationToken cancellationToken)
-    {
-        ManagementUserService.RequireAdmin(context);
-        var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
-        _db.ClientDownloadLinks.Remove(link);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<SpecusMappingView>> ListSpecusMappingsAsync(ManagementContext context, long? clientId,
@@ -717,88 +664,6 @@ public sealed class ManagementMutationService
             throw new ArgumentException("apiKey length must be between 3 and 120");
         }
         return normalized;
-    }
-
-    private static void ApplyClientDownloadMutation(ClientDownloadLink link, ClientDownloadLinkMutation request)
-    {
-        link.Implementation = RequireDownloadEnum(request.Implementation, AllowedDownloadImplementations,
-            "implementation must be one of [java go csharp android]");
-        link.Platform = RequireDownloadEnum(request.Platform, AllowedDownloadPlatforms,
-            "platform must be one of [windows linux macos android any]");
-        link.Arch = RequireDownloadEnum(request.Arch, AllowedDownloadArchitectures,
-            "arch must be one of [x64 arm64 any]");
-        link.DisplayName = RequireDisplayName(request.DisplayName);
-        link.DownloadUrl = RequireDownloadUrl(request.DownloadUrl);
-        link.Description = NormalizeDownloadDescription(request.Description);
-        link.Version = string.IsNullOrWhiteSpace(request.Version) ? null : request.Version.Trim();
-        link.IsLatest = request.IsLatest ?? link.IsLatest;
-        link.ChangelogUrl = string.IsNullOrWhiteSpace(request.ChangelogUrl) ? null : request.ChangelogUrl.Trim();
-        link.MinSupportedVersion = string.IsNullOrWhiteSpace(request.MinSupportedVersion)
-            ? null
-            : request.MinSupportedVersion.Trim();
-        if (request.DisplayOrder is not null)
-        {
-            link.DisplayOrder = request.DisplayOrder.Value;
-        }
-        if (request.Enabled is not null)
-        {
-            link.Enabled = request.Enabled.Value;
-        }
-        link.UpdatedAt = DateTimeOffset.UtcNow;
-    }
-
-    private static string RequireDownloadEnum(string? value, IReadOnlySet<string> allowed, string message)
-    {
-        var normalized = value?.Trim().ToLowerInvariant() ?? string.Empty;
-        if (!allowed.Contains(normalized))
-        {
-            throw new ArgumentException(message);
-        }
-        return normalized;
-    }
-
-    private static string RequireDisplayName(string? displayName)
-    {
-        if (string.IsNullOrWhiteSpace(displayName))
-        {
-            throw new ArgumentException("displayName cannot be blank");
-        }
-        var normalized = displayName.Trim();
-        if (normalized.Length > 120)
-        {
-            throw new ArgumentException("displayName is too long (max 120)");
-        }
-        return normalized;
-    }
-
-    private static string RequireDownloadUrl(string? downloadUrl)
-    {
-        if (string.IsNullOrWhiteSpace(downloadUrl))
-        {
-            throw new ArgumentException("downloadUrl cannot be blank");
-        }
-        var normalized = downloadUrl.Trim();
-        if (normalized.Length > 1024)
-        {
-            throw new ArgumentException("downloadUrl is too long (max 1024)");
-        }
-        if (!Uri.TryCreate(normalized, UriKind.Absolute, out var uri)
-            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
-            || string.IsNullOrWhiteSpace(uri.Host))
-        {
-            throw new ArgumentException("downloadUrl must be an absolute http(s) URL");
-        }
-        return normalized;
-    }
-
-    private static string? NormalizeDownloadDescription(string? description)
-    {
-        if (string.IsNullOrWhiteSpace(description))
-        {
-            return null;
-        }
-        var normalized = description.Trim();
-        return normalized.Length > 512 ? normalized[..512] : normalized;
     }
 
     private static int RequirePort(int? port, string field)

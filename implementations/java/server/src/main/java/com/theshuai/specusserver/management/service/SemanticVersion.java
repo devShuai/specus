@@ -30,7 +30,7 @@ final class SemanticVersion implements Comparable<SemanticVersion> {
     }
 
     static SemanticVersion parse(String value, String fieldName) {
-        String normalized = value == null ? "" : value.trim();
+        String normalized = normalize(value);
         if (normalized.length() > 32) {
             throw new IllegalArgumentException(fieldName + " is too long (max 32)");
         }
@@ -52,6 +52,12 @@ final class SemanticVersion implements Comparable<SemanticVersion> {
                 new BigInteger(matcher.group(2)), new BigInteger(matcher.group(3)), identifiers);
     }
 
+    /** Canonical storage form: trim whitespace and remove at most one optional lowercase {@code v}. */
+    static String normalize(String value) {
+        String normalized = value == null ? "" : value.trim();
+        return normalized.startsWith("v") ? normalized.substring(1) : normalized;
+    }
+
     @Override
     public int compareTo(SemanticVersion other) {
         int result = major.compareTo(other.major);
@@ -63,6 +69,9 @@ final class SemanticVersion implements Comparable<SemanticVersion> {
         }
         if (result != 0) {
             return result;
+        }
+        if (preRelease.isEmpty() && other.preRelease.isEmpty()) {
+            return 0;
         }
         if (preRelease.isEmpty() || other.preRelease.isEmpty()) {
             return preRelease.isEmpty() ? 1 : -1;

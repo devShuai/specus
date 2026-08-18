@@ -33,13 +33,22 @@ public sealed class ManagementQueryService
         CancellationToken cancellationToken)
     {
         var rows = await _db.ClientDownloadLinks.AsNoTracking()
-            .Where(link => link.Enabled)
             .OrderBy(link => link.Implementation)
             .ThenBy(link => link.DisplayOrder)
             .ThenBy(link => link.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        return rows.Select(ClientPackageService.ToView).ToList();
+        return rows
+            .GroupBy(link => new { link.Implementation, link.Platform, link.Arch })
+            .SelectMany(group => group.Any(link => !string.IsNullOrWhiteSpace(link.Version))
+                ? group.Where(link => link.Enabled && link.IsLatest
+                    && !string.IsNullOrWhiteSpace(link.Version))
+                : group.Where(link => link.Enabled))
+            .OrderBy(link => link.Implementation)
+            .ThenBy(link => link.DisplayOrder)
+            .ThenBy(link => link.Id)
+            .Select(ClientPackageService.ToView)
+            .ToList();
     }
 
     public async Task<IReadOnlyList<ClientAccountView>> ListClientsAsync(ManagementContext context,

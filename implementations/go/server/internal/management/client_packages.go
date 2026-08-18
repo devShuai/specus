@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -104,6 +105,7 @@ func (a *API) handlePublicClientVersionCheck(w http.ResponseWriter, r *http.Requ
 	if !a.allowPublicDownloadRequest(w, r) {
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	implementation, err := requireDownloadEnum(r.URL.Query().Get("implementation"),
 		allowedDownloadImplementations, "implementation is unsupported")
 	if err != nil {
@@ -137,9 +139,13 @@ func (a *API) handlePublicClientVersionCheck(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusOK, ClientVersionCheckView{})
 		return
 	}
-	latestVersion, err := parseSemanticVersion(latest.Version)
+	if latest.Version == nil {
+		writeJSON(w, http.StatusOK, ClientVersionCheckView{})
+		return
+	}
+	latestVersion, err := parseSemanticVersion(*latest.Version)
 	if err != nil {
-		a.logger.Error("latest client package has invalid version", "id", latest.ID, "version", latest.Version)
+		a.logger.Error("latest client package has invalid version", "id", latest.ID, "version", *latest.Version)
 		writeJSON(w, http.StatusOK, ClientVersionCheckView{})
 		return
 	}
@@ -156,7 +162,7 @@ func (a *API) handlePublicClientVersionCheck(w http.ResponseWriter, r *http.Requ
 		FileSize:        latest.FileSize,
 		ChangelogURL:    latest.ChangelogURL,
 	}
-	view.LatestVersion = &latest.Version
+	view.LatestVersion = latest.Version
 	view.DownloadURL = &latest.DownloadURL
 	view.SHA256 = &latest.SHA256
 	if isHostedClientPackage(*latest) {
@@ -168,24 +174,12 @@ func (a *API) handlePublicClientVersionCheck(w http.ResponseWriter, r *http.Requ
 
 func selectLatestClientDownload(links []store.ClientDownloadLink,
 	implementation, platform, arch string) *store.ClientDownloadLink {
-	hasExplicitLatest := false
-	for index := range links {
-		candidate := &links[index]
-		if candidate.Enabled && candidate.IsLatest && isHostedClientPackage(*candidate) && candidate.Implementation == implementation &&
-			matchDownloadTarget(candidate.Platform, platform) >= 0 &&
-			matchDownloadTarget(candidate.Arch, arch) >= 0 {
-			if _, err := parseSemanticVersion(candidate.Version); err == nil {
-				hasExplicitLatest = true
-				break
-			}
-		}
-	}
 	bestRank := -1
 	var best *store.ClientDownloadLink
 	for index := range links {
 		candidate := &links[index]
-		if !candidate.Enabled || !isHostedClientPackage(*candidate) || candidate.Implementation != implementation ||
-			(hasExplicitLatest && !candidate.IsLatest) {
+		if !candidate.Enabled || !candidate.IsLatest || !isInstallableClientDistribution(*candidate) ||
+			candidate.Implementation != implementation {
 			continue
 		}
 		platformRank := matchDownloadTarget(candidate.Platform, platform)
@@ -193,7 +187,10 @@ func selectLatestClientDownload(links []store.ClientDownloadLink,
 		if platformRank < 0 || archRank < 0 {
 			continue
 		}
-		parsed, err := parseSemanticVersion(candidate.Version)
+		if candidate.Version == nil {
+			continue
+		}
+		parsed, err := parseSemanticVersion(*candidate.Version)
 		if err != nil {
 			continue
 		}
@@ -203,7 +200,7 @@ func selectLatestClientDownload(links []store.ClientDownloadLink,
 			continue
 		}
 		if rank == bestRank {
-			currentBest, err := parseSemanticVersion(best.Version)
+			currentBest, err := parseSemanticVersion(*best.Version)
 			if err != nil || compareSemanticVersions(parsed, currentBest) > 0 {
 				best = candidate
 			}
@@ -218,7 +215,7 @@ func selectLatestClientDownload(links []store.ClientDownloadLink,
 func publicClientDownloadLinks(links []store.ClientDownloadLink) []store.ClientDownloadLink {
 	versionedTargets := make(map[string]bool)
 	for _, link := range links {
-		if link.Enabled && !isLegacyClientDownload(link) {
+		if !isLegacyClientDownload(link) {
 			versionedTargets[clientDownloadTargetKey(link)] = true
 		}
 	}
@@ -233,8 +230,8 @@ func publicClientDownloadLinks(links []store.ClientDownloadLink) []store.ClientD
 			}
 			continue
 		}
-		// Old rows had neither version nor latest. Their deterministic migration marker lets us keep
-		// returning them until an administrator publishes the first versioned entry for the target.
+		// Old rows had neither version nor latest. Keep returning them until an administrator
+		// publishes the first versioned entry for the target.
 		if isLegacyClientDownload(link) {
 			result = append(result, link)
 		}
@@ -243,12 +240,13 @@ func publicClientDownloadLinks(links []store.ClientDownloadLink) []store.ClientD
 }
 
 func isLegacyClientDownload(link store.ClientDownloadLink) bool {
-	return strings.HasPrefix(link.Version, "0.0.0-legacy.") && link.SHA256 == "" &&
-		link.FileSize == 0 && !link.IsLatest
+	return link.Version == nil
 }
 
 func clientDownloadTargetKey(link store.ClientDownloadLink) string {
-	return link.Implementation + "\x00" + link.Platform + "\x00" + link.Arch
+	return strings.ToLower(strings.TrimSpace(link.Implementation)) + "\x00" +
+		strings.ToLower(strings.TrimSpace(link.Platform)) + "\x00" +
+		strings.ToLower(strings.TrimSpace(link.Arch))
 }
 
 func matchDownloadTarget(candidate, requested string) int {
@@ -283,6 +281,19 @@ func (a *API) handlePublicClientPackageDownload(w http.ResponseWriter, r *http.R
 		a.fail(w, err)
 		return
 	}
+	pathInfo, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		a.fail(w, store.ErrNotFound)
+		return
+	}
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if !pathInfo.Mode().IsRegular() {
+		a.fail(w, fmt.Errorf("hosted client package %d is not a regular file", id))
+		return
+	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		a.fail(w, store.ErrNotFound)
@@ -298,15 +309,41 @@ func (a *API) handlePublicClientPackageDownload(w http.ResponseWriter, r *http.R
 		a.fail(w, err)
 		return
 	}
-	if !info.Mode().IsRegular() || info.Size() != link.FileSize {
+	// SameFile closes the Lstat/Open race and prevents a local symlink swap from turning the
+	// public download route into a reader for another server-owned file.
+	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) || info.Size() != link.FileSize {
 		a.fail(w, fmt.Errorf("hosted client package %d metadata does not match file", id))
 		return
 	}
+	downloadName := clientPackageDownloadName(*link)
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": link.DisplayName}))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": downloadName}))
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("ETag", `"sha256-`+link.SHA256+`"`)
-	http.ServeContent(w, r, link.DisplayName, link.UpdatedAt, file)
+	http.ServeContent(w, r, downloadName, link.UpdatedAt, file)
+}
+
+func clientPackageDownloadName(link store.ClientDownloadLink) string {
+	name := strings.TrimSpace(link.DisplayName)
+	if separator := strings.LastIndexAny(name, `/\`); separator >= 0 {
+		name = name[separator+1:]
+	}
+	name = strings.Map(func(char rune) rune {
+		if char < 0x20 || char == 0x7f {
+			return '-'
+		}
+		return char
+	}, name)
+	name = strings.Trim(name, ". ")
+	if name == "" {
+		name = "specus-client-package-" + strconv.FormatInt(link.ID, 10)
+	}
+	if link.Implementation == "android" && link.Platform == "android" && link.Arch == "any" &&
+		!strings.HasSuffix(strings.ToLower(name), ".apk") {
+		name += ".apk"
+	}
+	return name
 }
 
 func (a *API) handleUploadClientPackage(w http.ResponseWriter, r *http.Request) {
@@ -374,9 +411,9 @@ func (a *API) handleUploadClientPackage(w http.ResponseWriter, r *http.Request) 
 		a.fail(w, err)
 		return
 	}
-	// Uploaded packages require a real release version; the synthetic legacy version is reserved
-	// exclusively for compatibility rows and old external-link CRUD clients.
-	if strings.TrimSpace(req.Version) == "" {
+	// Uploaded packages require a real release version; NULL is reserved for compatibility rows
+	// and old external-link CRUD clients.
+	if link.Version == nil {
 		a.fail(w, validation("version is required"))
 		return
 	}
@@ -475,12 +512,24 @@ func (a *API) handleSetLatestClientDownload(w http.ResponseWriter, r *http.Reque
 		a.fail(w, validation("disabled package cannot be latest"))
 		return
 	}
-	if _, err := parseSemanticVersion(link.Version); err != nil {
+	if link.Version == nil {
 		a.fail(w, validation("package version is not semantic"))
+		return
+	}
+	if _, err := parseSemanticVersion(*link.Version); err != nil {
+		a.fail(w, validation("package version is not semantic"))
+		return
+	}
+	if !isInstallableClientDistribution(*link) {
+		a.fail(w, validation("latest package requires a trusted HTTPS URL, SHA-256 and fileSize"))
 		return
 	}
 	updated, err := a.db.SetClientDownloadLinkLatest(r.Context(), id, time.Now())
 	if err != nil {
+		if errors.Is(err, store.ErrClientDownloadDisabled) {
+			a.fail(w, conflict("package was disabled or changed; refresh and retry"))
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -521,6 +570,10 @@ func optionalFormBool(value string) (*bool, error) {
 }
 
 func (a *API) ensureClientPackageDirectory() (string, error) {
+	return a.validatedClientPackageDirectory(true)
+}
+
+func (a *API) validatedClientPackageDirectory(create bool) (string, error) {
 	directory := strings.TrimSpace(a.packageDirectory)
 	if directory == "" {
 		return "", unavailable("client package directory is not configured")
@@ -529,8 +582,21 @@ func (a *API) ensureClientPackageDirectory() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(absolute, 0o750); err != nil {
-		return "", fmt.Errorf("create client package directory: %w", err)
+	info, err := os.Lstat(absolute)
+	if errors.Is(err, os.ErrNotExist) && create {
+		if err := os.MkdirAll(absolute, 0o750); err != nil {
+			return "", fmt.Errorf("create client package directory: %w", err)
+		}
+		info, err = os.Lstat(absolute)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "", unavailable("client package directory does not exist")
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect client package directory: %w", err)
+	}
+	if !info.IsDir() || clientPackageDirectoryIsReparsePoint(info) {
+		return "", unavailable("client package directory must be a physical directory")
 	}
 	return absolute, nil
 }
@@ -539,11 +605,7 @@ func (a *API) clientPackagePath(id int64) (string, error) {
 	if id <= 0 {
 		return "", validation("invalid client package id")
 	}
-	directory := strings.TrimSpace(a.packageDirectory)
-	if directory == "" {
-		return "", unavailable("client package directory is not configured")
-	}
-	absolute, err := filepath.Abs(directory)
+	absolute, err := a.validatedClientPackageDirectory(false)
 	if err != nil {
 		return "", err
 	}
@@ -555,8 +617,47 @@ func clientPackageDownloadURL(id int64) string {
 }
 
 func isHostedClientPackage(link store.ClientDownloadLink) bool {
-	return link.ID > 0 && link.DownloadURL == clientPackageDownloadURL(link.ID) &&
-		len(link.SHA256) == sha256.Size*2 && link.FileSize > 0
+	return isManagedClientPackageURL(link) && hasAuthoritativeClientPackageMetadata(link)
+}
+
+func isManagedClientPackageURL(link store.ClientDownloadLink) bool {
+	return link.ID > 0 && link.DownloadURL == clientPackageDownloadURL(link.ID)
+}
+
+func hasAuthoritativeClientPackageMetadata(link store.ClientDownloadLink) bool {
+	if len(link.SHA256) != sha256.Size*2 || link.FileSize <= 0 ||
+		link.FileSize > maxClientPackageUploadBytes {
+		return false
+	}
+	_, err := hex.DecodeString(link.SHA256)
+	return err == nil
+}
+
+func normalizeClientDownloadSHA256(value string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return "", nil
+	}
+	if len(normalized) != sha256.Size*2 {
+		return "", validation("sha256 must contain exactly 64 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(normalized); err != nil {
+		return "", validation("sha256 must contain exactly 64 hexadecimal characters")
+	}
+	return normalized, nil
+}
+
+func isExternalClientPackageURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && parsed.IsAbs() && strings.EqualFold(parsed.Scheme, "https") &&
+		parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+func isInstallableClientDistribution(link store.ClientDownloadLink) bool {
+	if !hasAuthoritativeClientPackageMetadata(link) {
+		return false
+	}
+	return isManagedClientPackageURL(link) || isExternalClientPackageURL(link.DownloadURL)
 }
 
 // stageClientPackageDeletion moves a hosted file out of its public numeric path before the DB row

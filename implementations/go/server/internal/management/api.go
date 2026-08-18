@@ -1168,7 +1168,9 @@ func (a *API) handlePublicClientDownloads(w http.ResponseWriter, r *http.Request
 	if !a.allowPublicDownloadRequest(w, r) {
 		return
 	}
-	links, err := a.db.ListClientDownloadLinks(r.Context(), true)
+	// Include disabled rows while deciding whether a target has entered the versioned catalog.
+	// Otherwise disabling its last published version would incorrectly resurrect a legacy link.
+	links, err := a.db.ListClientDownloadLinks(r.Context(), false)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1222,6 +1224,14 @@ func (a *API) handleCreateClientDownload(w http.ResponseWriter, r *http.Request)
 		a.fail(w, err)
 		return
 	}
+	if isManagedClientPackageURL(link) {
+		a.fail(w, validation("hosted package records must be created through /api/admin/client-packages"))
+		return
+	}
+	if link.IsLatest && !isInstallableClientDistribution(link) {
+		a.fail(w, validation("latest package requires a trusted HTTPS URL, SHA-256 and fileSize"))
+		return
+	}
 	if err := a.db.InsertClientDownloadLink(r.Context(), link); err != nil {
 		a.failClientDownloadMutation(w, err)
 		return
@@ -1259,8 +1269,16 @@ func (a *API) handleUpdateClientDownload(w http.ResponseWriter, r *http.Request)
 		a.fail(w, err)
 		return
 	}
+	if !wasHosted && isManagedClientPackageURL(*link) {
+		a.fail(w, validation("hosted package records must be created through /api/admin/client-packages"))
+		return
+	}
 	if wasHosted && !isHostedClientPackage(*link) {
 		a.fail(w, validation("hosted package downloadUrl, sha256 and fileSize are server managed"))
+		return
+	}
+	if link.IsLatest && !isInstallableClientDistribution(*link) {
+		a.fail(w, validation("latest package requires a trusted HTTPS URL, SHA-256 and fileSize"))
 		return
 	}
 	if err := a.db.UpdateClientDownloadLink(r.Context(), *link); err != nil {
@@ -2312,7 +2330,6 @@ func clientDownloadLinkView(link store.ClientDownloadLink) ClientDownloadLinkVie
 		DisplayName:         link.DisplayName,
 		DownloadURL:         link.DownloadURL,
 		Description:         link.Description,
-		SHA256:              link.SHA256,
 		FileSize:            link.FileSize,
 		IsLatest:            link.IsLatest,
 		ChangelogURL:        link.ChangelogURL,
@@ -2322,6 +2339,10 @@ func clientDownloadLinkView(link store.ClientDownloadLink) ClientDownloadLinkVie
 		Enabled:             link.Enabled,
 		CreatedAt:           link.CreatedAt.Format(time.RFC3339Nano),
 		UpdatedAt:           link.UpdatedAt.Format(time.RFC3339Nano),
+	}
+	if strings.TrimSpace(link.SHA256) != "" {
+		sha256 := link.SHA256
+		view.SHA256 = &sha256
 	}
 	if view.Hosted {
 		id := link.ID
@@ -2790,7 +2811,6 @@ func newClientDownloadLink(req clientDownloadLinkMutation) (store.ClientDownload
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	link.Version = "0.0.0-legacy." + strconv.FormatInt(link.ID, 36)
 	if err := applyClientDownloadLinkMutation(&link, req); err != nil {
 		return store.ClientDownloadLink{}, err
 	}
@@ -2817,6 +2837,11 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 	if err != nil {
 		return err
 	}
+	if implementation == "android" || platform == "android" {
+		if implementation != "android" || platform != "android" || arch != "any" {
+			return validation("Android packages require implementation=android, platform=android and arch=any")
+		}
+	}
 	displayName := strings.TrimSpace(req.DisplayName)
 	if displayName == "" {
 		return validation("displayName cannot be blank")
@@ -2828,6 +2853,27 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 	if err != nil {
 		return err
 	}
+	previousDownloadURL := link.DownloadURL
+	managedPackageURL := downloadURL == clientPackageDownloadURL(link.ID)
+	if !managedPackageURL && previousDownloadURL != "" && previousDownloadURL != downloadURL {
+		link.SHA256 = ""
+		link.FileSize = 0
+	}
+	if !managedPackageURL {
+		if req.SHA256 != nil {
+			sha256, err := normalizeClientDownloadSHA256(*req.SHA256)
+			if err != nil {
+				return err
+			}
+			link.SHA256 = sha256
+		}
+		if req.FileSize != nil {
+			if *req.FileSize < 0 || *req.FileSize > maxClientPackageUploadBytes {
+				return validation("fileSize must be between 0 and 1 GiB")
+			}
+			link.FileSize = *req.FileSize
+		}
+	}
 	description := normalizeDownloadDescription(req.Description)
 	version := strings.TrimSpace(req.Version)
 	if version != "" {
@@ -2835,11 +2881,19 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 			return validation("version must be a semantic version")
 		}
 		version = strings.TrimPrefix(version, "v")
+	}
+	var versionPtr *string
+	if version != "" {
+		versionPtr = &version
 	} else {
-		version = strings.TrimSpace(link.Version)
-		if version == "" {
-			return validation("version cannot be blank")
-		}
+		versionPtr = link.Version
+	}
+	if versionPtr != nil && !managedPackageURL &&
+		!isExternalClientPackageURL(downloadURL) {
+		return validation("versioned external packages require an absolute HTTPS downloadUrl without userinfo, query or fragment")
+	}
+	if versionPtr != nil && !managedPackageURL && !hasAuthoritativeClientPackageMetadata(*link) {
+		return validation("versioned external packages require sha256 and fileSize")
 	}
 	changelogURL, err := normalizeOptionalDownloadURL(req.ChangelogURL, "changelogUrl")
 	if err != nil {
@@ -2848,8 +2902,19 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 	minSupportedVersion := strings.TrimSpace(req.MinSupportedVersion)
 	var minSupportedVersionPtr *string
 	if minSupportedVersion != "" {
-		if _, err := parseSemanticVersion(minSupportedVersion); err != nil {
+		minimum, err := parseSemanticVersion(minSupportedVersion)
+		if err != nil {
 			return validation("minSupportedVersion must be a semantic version")
+		}
+		if versionPtr == nil {
+			return validation("minSupportedVersion requires version")
+		}
+		release, err := parseSemanticVersion(*versionPtr)
+		if err != nil {
+			return validation("version must be a semantic version")
+		}
+		if compareSemanticVersions(minimum, release) > 0 {
+			return validation("minSupportedVersion cannot be newer than version")
 		}
 		minSupportedVersion = strings.TrimPrefix(minSupportedVersion, "v")
 		minSupportedVersionPtr = &minSupportedVersion
@@ -2858,7 +2923,7 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 	link.Implementation = implementation
 	link.Platform = platform
 	link.Arch = arch
-	link.Version = version
+	link.Version = versionPtr
 	link.DisplayName = displayName
 	link.DownloadURL = downloadURL
 	link.Description = description
@@ -2878,6 +2943,14 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 	}
 	if link.IsLatest && !link.Enabled {
 		return validation("disabled package cannot be latest")
+	}
+	if link.IsLatest {
+		if link.Version == nil {
+			return validation("isLatest requires version")
+		}
+		if _, err := parseSemanticVersion(*link.Version); err != nil {
+			return validation("isLatest requires a semantic version")
+		}
 	}
 	link.UpdatedAt = time.Now()
 	return nil
@@ -2904,7 +2977,7 @@ func requireDownloadURL(value string) (string, error) {
 		return "", validation("downloadUrl is not a valid URI: " + err.Error())
 	}
 	if parsed.IsAbs() {
-		if parsed.Host == "" || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+		if parsed.User != nil || parsed.Host == "" || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
 			return "", validation("downloadUrl must be an absolute http(s) URL or a root-relative path")
 		}
 		return trimmed, nil
@@ -2924,9 +2997,9 @@ func normalizeOptionalDownloadURL(value, field string) (*string, error) {
 		return nil, validation(field + " is too long (max 1024)")
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || !parsed.IsAbs() || parsed.Host == "" ||
-		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
-		return nil, validation(field + " must be an absolute http(s) URL")
+	if err != nil || !parsed.IsAbs() || parsed.User != nil || parsed.Host == "" ||
+		!strings.EqualFold(parsed.Scheme, "https") {
+		return nil, validation(field + " must be an absolute HTTPS URL without userinfo")
 	}
 	return &trimmed, nil
 }

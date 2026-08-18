@@ -86,6 +86,8 @@ public sealed record ClientDownloadLinkMutation(
     string? DownloadUrl,
     string? Description,
     string? Version,
+    string? Sha256,
+    long? FileSize,
     bool? IsLatest,
     string? ChangelogUrl,
     string? MinSupportedVersion,

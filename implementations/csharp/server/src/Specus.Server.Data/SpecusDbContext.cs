@@ -284,6 +284,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.Sha256).HasColumnName("sha256").HasMaxLength(64);
             b.Property(x => x.FileSize).HasColumnName("file_size").IsRequired();
             b.Property(x => x.IsLatest).HasColumnName("is_latest").IsRequired();
+            b.Property(x => x.LatestSlot).HasColumnName("latest_slot").HasMaxLength(104);
             b.Property(x => x.ChangelogUrl).HasColumnName("changelog_url").HasMaxLength(1024);
             b.Property(x => x.MinSupportedVersion).HasColumnName("min_supported_version").HasMaxLength(32);
             b.Property(x => x.DisplayOrder).HasColumnName("display_order").IsRequired();
@@ -297,6 +298,9 @@ public sealed class SpecusDbContext : DbContext
             b.HasIndex(x => new { x.Implementation, x.Platform, x.Arch, x.Version })
                 .IsUnique()
                 .HasDatabaseName("uq_client_download_version");
+            b.HasIndex(x => x.LatestSlot)
+                .IsUnique()
+                .HasDatabaseName("uq_client_download_latest_slot");
             b.HasIndex(x => new { x.Implementation, x.Platform, x.Arch, x.IsLatest, x.Enabled })
                 .HasDatabaseName("idx_client_download_latest");
         });

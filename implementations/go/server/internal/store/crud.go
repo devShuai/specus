@@ -11,6 +11,11 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrClientDownloadDisabled is returned when a disabled catalog row is raced or selected for the
+// latest marker. Keeping this check in the transaction prevents a stale API read from publishing
+// a row that another administrator just disabled or retargeted.
+var ErrClientDownloadDisabled = errors.New("client download is disabled or changed")
+
 // ---- clients -------------------------------------------------------------------------
 
 // ListClients returns all client accounts ordered by id.
@@ -266,6 +271,9 @@ func (db *DB) GetClientDownloadLink(ctx context.Context, id int64) (*ClientDownl
 }
 
 func (db *DB) InsertClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	if link.IsLatest && !link.Enabled {
+		return ErrClientDownloadDisabled
+	}
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -286,7 +294,7 @@ func (db *DB) InsertClientDownloadLink(ctx context.Context, link ClientDownloadL
 		latestSlot = clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch)
 	}
 	if _, err := tx.ExecContext(ctx, query, link.ID, link.Implementation, link.Platform, link.Arch,
-		link.Version, link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
+		clientDownloadDatabaseVersion(link), link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
 		boolToInt(link.IsLatest), latestSlot, link.ChangelogURL, link.MinSupportedVersion, link.DisplayOrder,
 		boolToInt(link.Enabled), formatTime(link.CreatedAt), formatTime(link.UpdatedAt)); err != nil {
 		return err
@@ -295,6 +303,9 @@ func (db *DB) InsertClientDownloadLink(ctx context.Context, link ClientDownloadL
 }
 
 func (db *DB) UpdateClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	if link.IsLatest && !link.Enabled {
+		return ErrClientDownloadDisabled
+	}
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -314,7 +325,7 @@ func (db *DB) UpdateClientDownloadLink(ctx context.Context, link ClientDownloadL
 		latestSlot = clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch)
 	}
 	result, err := tx.ExecContext(ctx, query, link.Implementation, link.Platform, link.Arch,
-		link.Version, link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
+		clientDownloadDatabaseVersion(link), link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
 		boolToInt(link.IsLatest), latestSlot, link.ChangelogURL, link.MinSupportedVersion, link.DisplayOrder,
 		boolToInt(link.Enabled), formatTime(link.UpdatedAt), link.ID)
 	if err != nil {
@@ -345,13 +356,26 @@ func (db *DB) SetClientDownloadLinkLatest(ctx context.Context, id int64, updated
 	if err != nil {
 		return nil, err
 	}
+	if !link.Enabled {
+		return nil, ErrClientDownloadDisabled
+	}
 	if err := db.clearLatestClientDownloadTx(ctx, tx, link.Implementation, link.Platform, link.Arch); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE client_download_link
-		SET is_latest = ?, latest_slot = ?, updated_at = ? WHERE id = ?`), 1,
-		clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch), formatTime(updatedAt), id); err != nil {
+	result, err := tx.ExecContext(ctx, db.rebind(`UPDATE client_download_link
+		SET is_latest = ?, latest_slot = ?, updated_at = ?
+		WHERE id = ? AND enabled <> ? AND implementation = ? AND platform = ? AND arch = ?
+			AND version = ? AND download_url = ? AND sha256 = ? AND file_size = ?`), 1,
+		clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch), formatTime(updatedAt), id, 0,
+		link.Implementation, link.Platform, link.Arch, clientDownloadDatabaseVersion(link),
+		link.DownloadURL, link.SHA256, link.FileSize)
+	if err != nil {
 		return nil, err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return nil, rowsErr
+	} else if affected == 0 {
+		return nil, ErrClientDownloadDisabled
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -376,16 +400,19 @@ func (db *DB) DeleteClientDownloadLink(ctx context.Context, id int64) error {
 
 func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, error) {
 	var (
-		link                                    ClientDownloadLink
-		description, changelogURL, minSupported sql.NullString
-		enabled, isLatest                       databaseBoolean
-		createdAt, updated                      string
+		link                                             ClientDownloadLink
+		version, description, changelogURL, minSupported sql.NullString
+		enabled, isLatest                                databaseBoolean
+		createdAt, updated                               string
 	)
-	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch, &link.Version,
+	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch, &version,
 		&link.DisplayName, &link.DownloadURL, &description, &link.SHA256, &link.FileSize, &isLatest,
 		&changelogURL, &minSupported, &link.DisplayOrder, &enabled, &createdAt, &updated)
 	if err != nil {
 		return ClientDownloadLink{}, err
+	}
+	if version.Valid && strings.TrimSpace(version.String) != "" {
+		link.Version = &version.String
 	}
 	if description.Valid {
 		link.Description = &description.String
@@ -401,6 +428,13 @@ func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, erro
 	link.CreatedAt = parseTime(createdAt)
 	link.UpdatedAt = parseTime(updated)
 	return link, nil
+}
+
+func clientDownloadDatabaseVersion(link ClientDownloadLink) any {
+	if link.Version != nil {
+		return strings.TrimSpace(*link.Version)
+	}
+	return nil
 }
 
 // ---- specusMappings -------------------------------------------------------------------------

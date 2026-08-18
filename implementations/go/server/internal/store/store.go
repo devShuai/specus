@@ -321,25 +321,27 @@ func (db *DB) ensureCompatibleColumns() error {
 	return nil
 }
 
-// backfillClientDownloadVersions upgrades the original external-link-only catalog without making
-// startup fail when it contained more than one entry for the same target. Every legacy row gets a
-// stable SemVer-compatible prerelease derived from its id; an already populated version is kept
-// unless it duplicates an earlier row for the same implementation/platform/architecture tuple.
+// backfillClientDownloadVersions upgrades both the original external-link-only catalog and the
+// short-lived schema that stored invented 0.0.0-legacy.* versions. Only strict SemVer values are
+// retained. A single lower-case v prefix is removed, and canonical duplicates are deterministically
+// collapsed to one row so the unique target/version index can be recreated safely.
 func (db *DB) backfillClientDownloadVersions() error {
 	type row struct {
 		id                             int64
 		implementation, platform, arch string
 		version                        sql.NullString
+		latest, enabled                databaseBoolean
 	}
-	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, version
-		FROM client_download_link ORDER BY id`)
+	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, version, is_latest, enabled
+		FROM client_download_link ORDER BY id DESC`)
 	if err != nil {
 		return fmt.Errorf("list client download versions for compatibility migration: %w", err)
 	}
 	var catalog []row
 	for rows.Next() {
 		var item row
-		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.version); err != nil {
+		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.version,
+			&item.latest, &item.enabled); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("scan client download version for compatibility migration: %w", err)
 		}
@@ -353,27 +355,256 @@ func (db *DB) backfillClientDownloadVersions() error {
 		return fmt.Errorf("close client download compatibility rows: %w", err)
 	}
 
-	seen := make(map[string]struct{}, len(catalog))
+	type normalizedRow struct {
+		row
+		version string
+		valid   bool
+	}
+	normalized := make([]normalizedRow, 0, len(catalog))
+	winners := make(map[string]int, len(catalog))
 	for _, item := range catalog {
-		version := strings.TrimSpace(item.version.String)
+		version, valid := normalizeStoredClientDownloadVersion(item.version.String)
+		entry := normalizedRow{row: item, version: version, valid: item.version.Valid && valid}
+		normalized = append(normalized, entry)
+		if !entry.valid {
+			continue
+		}
 		keyPrefix := strings.ToLower(strings.TrimSpace(item.implementation)) + "\x00" +
 			strings.ToLower(strings.TrimSpace(item.platform)) + "\x00" +
 			strings.ToLower(strings.TrimSpace(item.arch)) + "\x00"
-		_, duplicate := seen[keyPrefix+version]
-		if version == "" || duplicate {
-			version = "0.0.0-legacy." + strconv.FormatInt(item.id, 36)
-			for suffix := int64(1); ; suffix++ {
-				if _, exists := seen[keyPrefix+version]; !exists {
-					break
-				}
-				version = "0.0.0-legacy." + strconv.FormatInt(item.id, 36) + "." + strconv.FormatInt(suffix, 36)
-			}
-			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET version = ? WHERE id = ?`),
-				version, item.id); err != nil {
-				return fmt.Errorf("backfill client download version for id %d: %w", item.id, err)
+		key := keyPrefix + strings.ToLower(version)
+		winnerIndex, exists := winners[key]
+		if !exists || preferClientDownloadVersionWinner(
+			bool(entry.enabled), bool(entry.latest), entry.id,
+			bool(normalized[winnerIndex].enabled), bool(normalized[winnerIndex].latest), normalized[winnerIndex].id) {
+			winners[key] = len(normalized) - 1
+		}
+	}
+
+	desired := make(map[int64]sql.NullString, len(normalized))
+	for _, entry := range normalized {
+		desired[entry.id] = sql.NullString{}
+	}
+	for _, winnerIndex := range winners {
+		winner := normalized[winnerIndex]
+		desired[winner.id] = sql.NullString{String: winner.version, Valid: true}
+	}
+	needsUpdate := false
+	for _, entry := range normalized {
+		want := desired[entry.id]
+		if entry.row.version.String != want.String || entry.row.version.Valid != want.Valid {
+			needsUpdate = true
+			break
+		}
+	}
+	nullable, err := db.clientDownloadVersionColumnNullable()
+	if err != nil {
+		return err
+	}
+	if needsUpdate || !nullable {
+		if err := db.dropIndexIfExists("uq_client_download_target_version", "client_download_link"); err != nil {
+			return err
+		}
+	}
+	if !nullable {
+		if err := db.makeClientDownloadVersionNullable(); err != nil {
+			return err
+		}
+	}
+	if !needsUpdate {
+		return nil
+	}
+	for _, entry := range normalized {
+		want := desired[entry.id]
+		if entry.row.version.String == want.String && entry.row.version.Valid == want.Valid {
+			continue
+		}
+		var value any
+		if want.Valid {
+			value = want.String
+		}
+		if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET version = ? WHERE id = ?`),
+			value, entry.id); err != nil {
+			return fmt.Errorf("normalize client download version for id %d: %w", entry.id, err)
+		}
+	}
+	return nil
+}
+
+func preferClientDownloadVersionWinner(candidateEnabled, candidateLatest bool, candidateID int64,
+	currentEnabled, currentLatest bool, currentID int64) bool {
+	candidatePublished := candidateEnabled && candidateLatest
+	currentPublished := currentEnabled && currentLatest
+	if candidatePublished != currentPublished {
+		return candidatePublished
+	}
+	if candidateEnabled != currentEnabled {
+		return candidateEnabled
+	}
+	return candidateID > currentID
+}
+
+func normalizeStoredClientDownloadVersion(value string) (string, bool) {
+	version := strings.TrimSpace(value)
+	version = strings.TrimPrefix(version, "v")
+	if version == "" || len(version) > 32 ||
+		strings.HasPrefix(strings.ToLower(version), "0.0.0-legacy.") {
+		return "", false
+	}
+	withoutBuild := version
+	if index := strings.IndexByte(withoutBuild, '+'); index >= 0 {
+		if index == len(withoutBuild)-1 ||
+			!validStoredSemanticIdentifiers(withoutBuild[index+1:], false) {
+			return "", false
+		}
+		withoutBuild = withoutBuild[:index]
+	}
+	core := withoutBuild
+	if index := strings.IndexByte(core, '-'); index >= 0 {
+		if index == len(core)-1 || !validStoredSemanticIdentifiers(core[index+1:], true) {
+			return "", false
+		}
+		core = core[:index]
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return "", false
+		}
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return "", false
 			}
 		}
-		seen[keyPrefix+version] = struct{}{}
+	}
+	return version, true
+}
+
+func validStoredSemanticIdentifiers(value string, rejectNumericLeadingZero bool) bool {
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for _, char := range identifier {
+			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') &&
+				(char < 'a' || char > 'z') && char != '-' {
+				return false
+			}
+			if char < '0' || char > '9' {
+				numeric = false
+			}
+		}
+		if rejectNumericLeadingZero && numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func (db *DB) clientDownloadVersionColumnNullable() (bool, error) {
+	switch db.dialect {
+	case DialectSQLite:
+		rows, err := db.sql.Query(`PRAGMA table_info(client_download_link)`)
+		if err != nil {
+			return false, fmt.Errorf("inspect client download version nullability: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				cid, notNull, primaryKey int
+				name, columnType         string
+				defaultValue             sql.NullString
+			)
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				return false, fmt.Errorf("scan client download version nullability: %w", err)
+			}
+			if strings.EqualFold(name, "version") {
+				return notNull == 0, nil
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+	case DialectPostgres:
+		var nullable string
+		err := db.sql.QueryRow(`SELECT is_nullable FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'client_download_link' AND column_name = 'version'`).Scan(&nullable)
+		if err != nil {
+			return false, fmt.Errorf("inspect client download version nullability: %w", err)
+		}
+		return strings.EqualFold(nullable, "YES"), nil
+	case DialectMySQL:
+		var nullable string
+		err := db.sql.QueryRow(`SELECT is_nullable FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = 'client_download_link' AND column_name = 'version'`).Scan(&nullable)
+		if err != nil {
+			return false, fmt.Errorf("inspect client download version nullability: %w", err)
+		}
+		return strings.EqualFold(nullable, "YES"), nil
+	}
+	return false, fmt.Errorf("client_download_link.version column is missing")
+}
+
+func (db *DB) makeClientDownloadVersionNullable() error {
+	switch db.dialect {
+	case DialectSQLite:
+		tx, err := db.sql.Begin()
+		if err != nil {
+			return fmt.Errorf("begin nullable client download version migration: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		for _, statement := range []string{
+			`ALTER TABLE client_download_link RENAME COLUMN version TO version_legacy_not_null`,
+			`ALTER TABLE client_download_link ADD COLUMN version VARCHAR(32)`,
+			`UPDATE client_download_link SET version = version_legacy_not_null`,
+			`ALTER TABLE client_download_link DROP COLUMN version_legacy_not_null`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("make SQLite client download version nullable: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit nullable client download version migration: %w", err)
+		}
+		return nil
+	case DialectPostgres:
+		_, err := db.sql.Exec(`ALTER TABLE client_download_link ALTER COLUMN version DROP NOT NULL`)
+		if err != nil {
+			return fmt.Errorf("make PostgreSQL client download version nullable: %w", err)
+		}
+		return nil
+	case DialectMySQL:
+		_, err := db.sql.Exec(`ALTER TABLE client_download_link MODIFY COLUMN version VARCHAR(32) NULL`)
+		if err != nil {
+			return fmt.Errorf("make MySQL client download version nullable: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported database dialect %q", db.dialect)
+	}
+}
+
+func (db *DB) dropIndexIfExists(indexName, table string) error {
+	if db.dialect == DialectMySQL {
+		var count int
+		if err := db.sql.QueryRow(`SELECT COUNT(*) FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`, table, indexName).Scan(&count); err != nil {
+			return fmt.Errorf("inspect index %s: %w", indexName, err)
+		}
+		if count == 0 {
+			return nil
+		}
+		if _, err := db.sql.Exec(fmt.Sprintf("DROP INDEX %s ON %s", indexName, table)); err != nil {
+			return fmt.Errorf("drop index %s: %w", indexName, err)
+		}
+		return nil
+	}
+	if _, err := db.sql.Exec(fmt.Sprintf("DROP INDEX IF EXISTS %s", indexName)); err != nil {
+		return fmt.Errorf("drop index %s: %w", indexName, err)
 	}
 	return nil
 }
@@ -386,9 +617,10 @@ func (db *DB) backfillClientDownloadLatestSlots() error {
 	type row struct {
 		id                             int64
 		implementation, platform, arch string
-		latest                         databaseBoolean
+		version                        sql.NullString
+		latest, enabled                databaseBoolean
 	}
-	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, is_latest
+	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, version, is_latest, enabled
 		FROM client_download_link ORDER BY id`)
 	if err != nil {
 		return fmt.Errorf("list client download latest slots: %w", err)
@@ -396,7 +628,8 @@ func (db *DB) backfillClientDownloadLatestSlots() error {
 	var catalog []row
 	for rows.Next() {
 		var item row
-		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.latest); err != nil {
+		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.version,
+			&item.latest, &item.enabled); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("scan client download latest slot: %w", err)
 		}
@@ -409,26 +642,42 @@ func (db *DB) backfillClientDownloadLatestSlots() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin client download latest slot migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Clear every persisted slot before rebuilding it from the in-memory snapshot. This prevents a
+	// stale slot on a later invalid row from colliding with the valid winner while the unique index
+	// from a partially upgraded schema is still present.
+	if _, err := tx.Exec(`UPDATE client_download_link SET latest_slot = NULL`); err != nil {
+		return fmt.Errorf("clear client download latest slots: %w", err)
+	}
 	seen := make(map[string]struct{})
 	for _, item := range catalog {
-		if !bool(item.latest) {
-			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET latest_slot = NULL WHERE id = ?`), item.id); err != nil {
+		_, validVersion := normalizeStoredClientDownloadVersion(item.version.String)
+		if !bool(item.latest) || !bool(item.enabled) || !item.version.Valid || !validVersion {
+			if _, err := tx.Exec(db.rebind(`UPDATE client_download_link
+				SET is_latest = ?, latest_slot = NULL WHERE id = ?`), 0, item.id); err != nil {
 				return fmt.Errorf("clear client download latest slot %d: %w", item.id, err)
 			}
 			continue
 		}
 		slot := clientDownloadLatestSlot(item.implementation, item.platform, item.arch)
 		if _, duplicate := seen[slot]; duplicate {
-			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link
+			if _, err := tx.Exec(db.rebind(`UPDATE client_download_link
 				SET is_latest = ?, latest_slot = NULL WHERE id = ?`), 0, item.id); err != nil {
 				return fmt.Errorf("demote duplicate latest client download %d: %w", item.id, err)
 			}
 			continue
 		}
 		seen[slot] = struct{}{}
-		if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET latest_slot = ? WHERE id = ?`), slot, item.id); err != nil {
+		if _, err := tx.Exec(db.rebind(`UPDATE client_download_link SET latest_slot = ? WHERE id = ?`), slot, item.id); err != nil {
 			return fmt.Errorf("backfill client download latest slot %d: %w", item.id, err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit client download latest slot migration: %w", err)
 	}
 	return nil
 }

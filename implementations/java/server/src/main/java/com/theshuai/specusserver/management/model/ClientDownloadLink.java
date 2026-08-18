@@ -15,8 +15,9 @@ import lombok.Setter;
  * {@code catalogKey} 和 {@code latestSlot} 是跨 SQLite/MySQL/PostgreSQL 的可移植唯一键：前者保证
  * (implementation, platform, arch, version) 唯一，后者保证每个目标最多一个 latest。
  *
- * <p>{@code implementation} 是客户端实现枚举值：{@code java} / {@code go} / {@code csharp}。
- * {@code platform} / {@code arch} 用于区分多平台变体（Windows/Linux/macOS × x64/arm64）。
+ * <p>{@code implementation} 是客户端实现枚举值：{@code java} / {@code go} / {@code csharp} /
+ * {@code android}。{@code platform} / {@code arch} 用于区分多平台变体，Android 通用 APK 使用
+ * {@code android}/{@code any}。
  */
 @Entity
 @Table(name = "client_download_link",
@@ -30,7 +31,7 @@ public class ClientDownloadLink {
     @Id
     private Long id;
 
-    /** 客户端实现：{@code java} / {@code go} / {@code csharp}。 */
+    /** 客户端实现：{@code java} / {@code go} / {@code csharp} / {@code android}。 */
     @Column(nullable = false, length = 32)
     private String implementation;
 
@@ -46,11 +47,11 @@ public class ClientDownloadLink {
     @Column(name = "display_name", nullable = false, length = 120)
     private String displayName;
 
-    /** 实际下载 URL，必须为 http/https 绝对地址。 */
+    /** 外链必须为 http/https 绝对地址；托管包固定为本站公开下载路由。 */
     @Column(name = "download_url", nullable = false, length = 1024)
     private String downloadUrl;
 
-    /** SemVer 2.0 版本；旧数据由启动迁移填入唯一的 legacy 版本。 */
+    /** SemVer 2.0 版本；旧外链数据保留 {@code null}，以便公开列表兼容返回。 */
     @Column(length = 32)
     private String version;
 

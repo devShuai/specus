@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Numerics;
 using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -17,11 +18,14 @@ public sealed class ClientPackageService
 
     private readonly SpecusDbContext _db;
     private readonly ClientPackageStore _store;
+    private readonly ILogger<ClientPackageService> _logger;
 
-    public ClientPackageService(SpecusDbContext db, ClientPackageStore store)
+    public ClientPackageService(SpecusDbContext db, ClientPackageStore store,
+        ILogger<ClientPackageService> logger)
     {
         _db = db;
         _store = store;
+        _logger = logger;
     }
 
     public async Task<ClientDownloadLinkView> UploadAsync(ManagementContext context, Stream content,
@@ -44,7 +48,7 @@ public sealed class ClientPackageService
             Version = metadata.Version,
             Sha256 = stored.Sha256,
             FileSize = stored.FileSize,
-            IsLatest = request.IsLatest ?? true,
+            IsLatest = request.IsLatest ?? false,
             ChangelogUrl = metadata.ChangelogUrl,
             MinSupportedVersion = metadata.MinSupportedVersion,
             DisplayOrder = request.DisplayOrder ?? 0,
@@ -52,6 +56,7 @@ public sealed class ClientPackageService
             CreatedAt = now,
             UpdatedAt = now,
         };
+        EnsureLatestCanBePublished(link);
 
         try
         {
@@ -63,6 +68,7 @@ public sealed class ClientPackageService
             {
                 await ClearLatestAsync(link, null, cancellationToken).ConfigureAwait(false);
             }
+            SynchronizeLatestSlot(link);
             _db.ClientDownloadLinks.Add(link);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -96,6 +102,8 @@ public sealed class ClientPackageService
             DownloadUrl = ClientPackageMetadata.RequireExternalUrl(request.DownloadUrl),
             Description = metadata.Description,
             Version = metadata.Version,
+            Sha256 = ClientPackageMetadata.NormalizeExternalSha256(request.Sha256, request.FileSize),
+            FileSize = ClientPackageMetadata.NormalizeExternalFileSize(request.Sha256, request.FileSize),
             IsLatest = request.IsLatest ?? false,
             ChangelogUrl = metadata.ChangelogUrl,
             MinSupportedVersion = metadata.MinSupportedVersion,
@@ -104,6 +112,7 @@ public sealed class ClientPackageService
             CreatedAt = now,
             UpdatedAt = now,
         };
+        EnsureLatestCanBePublished(link);
         await SaveCatalogueMutationAsync(link, null, cancellationToken).ConfigureAwait(false);
         return ToView(link);
     }
@@ -114,7 +123,8 @@ public sealed class ClientPackageService
         ManagementUserService.RequireAdmin(context);
         var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
-        var metadata = ClientPackageMetadata.NormalizeLink(request, requireVersion: IsHosted(link));
+        var hostedStorage = HasHostedStorage(link);
+        var metadata = ClientPackageMetadata.NormalizeLink(request, requireVersion: hostedStorage);
         link.Implementation = metadata.Implementation;
         link.Platform = metadata.Platform;
         link.Arch = metadata.Arch;
@@ -123,9 +133,11 @@ public sealed class ClientPackageService
         link.Version = metadata.Version;
         link.ChangelogUrl = metadata.ChangelogUrl;
         link.MinSupportedVersion = metadata.MinSupportedVersion;
-        if (!IsHosted(link))
+        if (!hostedStorage)
         {
             link.DownloadUrl = ClientPackageMetadata.RequireExternalUrl(request.DownloadUrl);
+            link.Sha256 = ClientPackageMetadata.NormalizeExternalSha256(request.Sha256, request.FileSize);
+            link.FileSize = ClientPackageMetadata.NormalizeExternalFileSize(request.Sha256, request.FileSize);
         }
         else if (!string.IsNullOrWhiteSpace(request.DownloadUrl)
                  && !string.Equals(request.DownloadUrl.Trim(), HostedDownloadUrl(id), StringComparison.Ordinal))
@@ -144,10 +156,7 @@ public sealed class ClientPackageService
         {
             link.IsLatest = request.IsLatest.Value;
         }
-        if (link.IsLatest && !link.Enabled)
-        {
-            throw new ArgumentException("a disabled package cannot be latest");
-        }
+        EnsureLatestCanBePublished(link);
         link.UpdatedAt = DateTimeOffset.UtcNow;
         await SaveCatalogueMutationAsync(link, id, cancellationToken).ConfigureAwait(false);
         return ToView(link);
@@ -159,9 +168,11 @@ public sealed class ClientPackageService
         ManagementUserService.RequireAdmin(context);
         var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
-        if (!link.Enabled || !SemanticVersion.TryParse(link.Version, out _))
+        if (!link.Enabled || !SemanticVersion.TryParse(link.Version, out _)
+            || !IsInstallableRelease(link))
         {
-            throw new ArgumentException("only an enabled entry with a semantic version can be latest");
+            throw new ArgumentException(
+                "only an enabled installable entry with a semantic version can be latest");
         }
         link.IsLatest = true;
         link.UpdatedAt = DateTimeOffset.UtcNow;
@@ -174,42 +185,32 @@ public sealed class ClientPackageService
         ManagementUserService.RequireAdmin(context);
         var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
-        var staged = IsHosted(link) ? _store.StageDelete(id) : null;
+        var staged = HasHostedStorage(link) ? _store.StageDelete(id) : null;
         try
         {
             await using var transaction = await _db.Database
                 .BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
             await LockCatalogueGroupAsync(link, cancellationToken).ConfigureAwait(false);
             _db.ClientDownloadLinks.Remove(link);
-            if (link.IsLatest)
-            {
-                var siblings = await _db.ClientDownloadLinks
-                    .Where(row => row.Id != id
-                        && row.Implementation == link.Implementation
-                        && row.Platform == link.Platform
-                        && row.Arch == link.Arch
-                        && row.Enabled && row.Version != null)
-                    .ToListAsync(cancellationToken).ConfigureAwait(false);
-                var replacement = siblings
-                    .Select(row => (Row: row, Parsed: SemanticVersion.ParseOrNull(row.Version)))
-                    .Where(item => item.Parsed is not null)
-                    .OrderByDescending(item => item.Parsed)
-                    .Select(item => item.Row)
-                    .FirstOrDefault();
-                if (replacement is not null)
-                {
-                    replacement.IsLatest = true;
-                    replacement.UpdatedAt = DateTimeOffset.UtcNow;
-                }
-            }
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            _store.CommitDelete(staged);
         }
         catch
         {
             _store.RollbackDelete(staged, id);
             throw;
+        }
+        try
+        {
+            _store.CommitDelete(staged);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // The catalogue transaction is already committed. A quarantined orphan is safer than
+            // reporting a false transaction failure or restoring bytes for a deleted package.
+            _logger.LogWarning(exception,
+                "client package {PackageId} was deleted from the catalogue but quarantine cleanup failed",
+                id);
         }
     }
 
@@ -229,18 +230,18 @@ public sealed class ClientPackageService
                 && row.Implementation == normalizedImplementation
                 && (row.Platform == normalizedPlatform || row.Platform == "any")
                 && (row.Arch == normalizedArch || row.Arch == "any")
-                && row.Version != null)
+                && row.Version != null
+                && row.Sha256 != null
+                && row.FileSize > 0)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
         var parsed = candidates
+            .Where(IsInstallableRelease)
             .Select(row => new Candidate(row, SemanticVersion.ParseOrNull(row.Version),
                 Specificity(row, normalizedPlatform, normalizedArch)))
-            .Where(candidate => candidate.Version is not null)
+            .Where(candidate => candidate.Version is not null && candidate.Row.IsLatest)
             .ToList();
-        var latestPool = parsed.Any(candidate => candidate.Row.IsLatest)
-            ? parsed.Where(candidate => candidate.Row.IsLatest)
-            : parsed;
-        var latest = latestPool
+        var latest = parsed
             .OrderByDescending(candidate => candidate.Specificity)
             .ThenByDescending(candidate => candidate.Version)
             .FirstOrDefault();
@@ -256,7 +257,7 @@ public sealed class ClientPackageService
             updateAvailable,
             mandatory,
             latest.Row.Version,
-            IsHosted(latest.Row) ? latest.Row.Id : null,
+            HasHostedStorage(latest.Row) ? latest.Row.Id : null,
             latest.Row.DownloadUrl,
             latest.Row.Sha256,
             latest.Row.FileSize,
@@ -273,13 +274,25 @@ public sealed class ClientPackageService
             throw new ResourceNotFoundException("package not found");
         }
         var stream = _store.OpenRead(id, link.FileSize);
-        return new ClientPackageDownload(stream, SafeDownloadName(link.DisplayName), link.FileSize,
+        return new ClientPackageDownload(stream, SafeDownloadName(link), link.FileSize,
             link.Sha256, link.UpdatedAt);
     }
 
     internal static bool IsHosted(ClientDownloadLink link) =>
-        !string.IsNullOrWhiteSpace(link.Sha256)
-        && string.Equals(link.DownloadUrl, HostedDownloadUrl(link.Id), StringComparison.Ordinal);
+        link.FileSize > 0
+        && IsAuthoritativeSha256(link.Sha256)
+        && HasHostedStorage(link);
+
+    internal static bool HasHostedStorage(ClientDownloadLink link) =>
+        string.Equals(link.DownloadUrl, HostedDownloadUrl(link.Id), StringComparison.Ordinal);
+
+    internal static bool IsInstallableRelease(ClientDownloadLink link) =>
+        link.FileSize > 0
+        && IsAuthoritativeSha256(link.Sha256)
+        && (HasHostedStorage(link) || ClientPackageMetadata.IsExternalUrl(link.DownloadUrl));
+
+    internal static bool IsAuthoritativeSha256(string? value) => value is { Length: 64 }
+        && value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     internal static string HostedDownloadUrl(long id) =>
         $"{DownloadPrefix}{id.ToString(CultureInfo.InvariantCulture)}/download";
@@ -318,6 +331,7 @@ public sealed class ClientPackageService
             {
                 await ClearLatestAsync(link, currentId, cancellationToken).ConfigureAwait(false);
             }
+            SynchronizeLatestSlot(link);
             if (currentId is null)
             {
                 _db.ClientDownloadLinks.Add(link);
@@ -334,8 +348,8 @@ public sealed class ClientPackageService
 
     private async Task LockCatalogueGroupAsync(ClientDownloadLink link, CancellationToken cancellationToken)
     {
-        // Under SERIALIZABLE this read protects both existing rows and the indexed key range. It
-        // makes the clear+set operation one atomic latest transition on SQLite, PostgreSQL and MySQL.
+        // The SERIALIZABLE read makes normal transitions deterministic. The nullable unique
+        // latest_slot is the final cross-provider invariant when two empty-range writes race.
         _ = await _db.ClientDownloadLinks.AsNoTracking()
             .Where(row => row.Implementation == link.Implementation
                 && row.Platform == link.Platform && row.Arch == link.Arch)
@@ -369,15 +383,51 @@ public sealed class ClientPackageService
             && row.IsLatest)
         .ExecuteUpdateAsync(update => update
             .SetProperty(row => row.IsLatest, false)
+            .SetProperty(row => row.LatestSlot, (string?)null)
             .SetProperty(row => row.UpdatedAt, DateTimeOffset.UtcNow), cancellationToken);
+
+    private static void EnsureLatestCanBePublished(ClientDownloadLink link)
+    {
+        if (!link.IsLatest)
+        {
+            return;
+        }
+        if (!link.Enabled)
+        {
+            throw new ArgumentException("a disabled package cannot be latest");
+        }
+        if (!SemanticVersion.TryParse(link.Version, out _))
+        {
+            throw new ArgumentException("a latest package must have a semantic version");
+        }
+        if (!IsInstallableRelease(link))
+        {
+            throw new ArgumentException(
+                "a latest package must have an HTTPS downloadUrl, SHA-256 and positive fileSize");
+        }
+    }
+
+    private static void SynchronizeLatestSlot(ClientDownloadLink link) =>
+        link.LatestSlot = link.IsLatest
+            ? $"{link.Implementation}/{link.Platform}/{link.Arch}"
+            : null;
 
     private static int Specificity(ClientDownloadLink row, string platform, string arch) =>
         (row.Platform == platform ? 2 : 0) + (row.Arch == arch ? 1 : 0);
 
-    private static string SafeDownloadName(string displayName)
+    private static string SafeDownloadName(ClientDownloadLink link)
     {
-        var fileName = Path.GetFileName(displayName.Trim());
-        return string.IsNullOrWhiteSpace(fileName) ? "specus-client-package" : fileName;
+        var fileName = Path.GetFileName(link.DisplayName.Trim());
+        if (string.IsNullOrWhiteSpace(fileName) || fileName.IndexOfAny(['\r', '\n', '\0']) >= 0)
+        {
+            fileName = "specus-client-package";
+        }
+        if (link.Implementation == "android" && link.Platform == "android" && link.Arch == "any"
+            && !fileName.EndsWith(".apk", StringComparison.OrdinalIgnoreCase))
+        {
+            fileName += ".apk";
+        }
+        return fileName;
     }
 
     private sealed record Candidate(ClientDownloadLink Row, SemanticVersion? Version, int Specificity);
@@ -402,6 +452,15 @@ public sealed class ClientPackageStore
         _packagesRoot = Path.GetFullPath(Path.Combine(dataRoot, "packages"));
         _maxPackageBytes = Math.Clamp(options.Value.MaxPackageBytes, 1, 16L * 1024 * 1024 * 1024);
         Directory.CreateDirectory(_packagesRoot);
+        EnsurePackagesRootIsOwnedDirectory();
+        if (!OperatingSystem.IsWindows())
+        {
+            // Package bytes are server-managed. Owner-only traversal/write permission prevents
+            // other local users from swapping a numeric package path between validation and open.
+            File.SetUnixFileMode(_packagesRoot,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        EnsurePackagesRootIsOwnedDirectory();
     }
 
     public async Task<StoredClientPackage> SaveAsync(long id, Stream source, long declaredLength,
@@ -457,12 +516,28 @@ public sealed class ClientPackageStore
     {
         var path = PathFor(id);
         var info = new FileInfo(path);
-        if (!info.Exists || info.Length != expectedLength)
+        if (!IsRegularUnlinkedFile(info) || info.Length != expectedLength)
         {
             throw new ResourceNotFoundException("package not found");
         }
-        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete,
-            128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        FileStream? stream = null;
+        try
+        {
+            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            info.Refresh();
+            if (!IsRegularUnlinkedFile(info) || info.Length != expectedLength
+                || stream.Length != expectedLength)
+            {
+                throw new ResourceNotFoundException("package not found");
+            }
+            return stream;
+        }
+        catch
+        {
+            stream?.Dispose();
+            throw;
+        }
     }
 
     public string? StageDelete(long id)
@@ -494,6 +569,7 @@ public sealed class ClientPackageStore
         {
             throw new ArgumentOutOfRangeException(nameof(id));
         }
+        EnsurePackagesRootIsOwnedDirectory();
         var path = Path.GetFullPath(Path.Combine(_packagesRoot, id.ToString(CultureInfo.InvariantCulture)));
         var prefix = _packagesRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                      + Path.DirectorySeparatorChar;
@@ -504,6 +580,27 @@ public sealed class ClientPackageStore
             throw new InvalidOperationException("package path escaped the configured data root");
         }
         return path;
+    }
+
+    private void EnsurePackagesRootIsOwnedDirectory()
+    {
+        var root = new DirectoryInfo(_packagesRoot);
+        root.Refresh();
+        if (!root.Exists || root.LinkTarget is not null
+            || root.Attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException("client package root must be a real directory, not a link");
+        }
+    }
+
+    private static bool IsRegularUnlinkedFile(FileInfo info)
+    {
+        info.Refresh();
+        return info.Exists
+            && info.LinkTarget is null
+            && !info.Attributes.HasFlag(FileAttributes.ReparsePoint)
+            && !info.Attributes.HasFlag(FileAttributes.Directory)
+            && !info.Attributes.HasFlag(FileAttributes.Device);
     }
 
     private static void TryDelete(string? path)
@@ -625,14 +722,40 @@ internal static class ClientPackageMetadata
     {
         var normalized = value?.Trim() ?? string.Empty;
         if (normalized.Length is 0 or > 1024
-            || !Uri.TryCreate(normalized, UriKind.Absolute, out var uri)
-            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
-            || string.IsNullOrWhiteSpace(uri.Host))
+            || !IsExternalUrl(normalized))
         {
-            throw new ArgumentException("downloadUrl must be an absolute http(s) URL");
+            throw new ArgumentException(
+                "downloadUrl must be an absolute HTTPS URL without credentials, query or fragment");
         }
         return normalized;
     }
+
+    public static bool IsExternalUrl(string? value) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps
+        && !string.IsNullOrWhiteSpace(uri.Host)
+        && string.IsNullOrEmpty(uri.UserInfo)
+        && string.IsNullOrEmpty(uri.Query)
+        && string.IsNullOrEmpty(uri.Fragment);
+
+    public static string? NormalizeExternalSha256(string? sha256, long? fileSize)
+    {
+        if (string.IsNullOrWhiteSpace(sha256) && fileSize is null or 0)
+        {
+            return null;
+        }
+        var normalized = sha256?.Trim();
+        if (!ClientPackageService.IsAuthoritativeSha256(normalized)
+            || fileSize is null or <= 0)
+        {
+            throw new ArgumentException(
+                "external release sha256 and positive fileSize must be supplied together");
+        }
+        return normalized;
+    }
+
+    public static long NormalizeExternalFileSize(string? sha256, long? fileSize) =>
+        NormalizeExternalSha256(sha256, fileSize) is null ? 0 : fileSize!.Value;
 
     private static NormalizedClientPackageMetadata Normalize(string? implementation, string? platform,
         string? arch, string? displayName, string? version, string? description, string? changelogUrl,
@@ -640,6 +763,19 @@ internal static class ClientPackageMetadata
     {
         var normalizedVersion = NormalizeVersion(version, "version", requireVersion);
         var normalizedMinimum = NormalizeVersion(minSupportedVersion, "minSupportedVersion", false);
+        if (normalizedMinimum is not null)
+        {
+            if (normalizedVersion is null)
+            {
+                throw new ArgumentException("minSupportedVersion requires version");
+            }
+            var parsedVersion = SemanticVersion.ParseOrNull(normalizedVersion)!.Value;
+            var parsedMinimum = SemanticVersion.ParseOrNull(normalizedMinimum)!.Value;
+            if (parsedMinimum.CompareTo(parsedVersion) > 0)
+            {
+                throw new ArgumentException("minSupportedVersion cannot be greater than version");
+            }
+        }
         return new NormalizedClientPackageMetadata(
             RequireImplementation(implementation),
             RequirePlatform(platform),
@@ -683,11 +819,12 @@ internal static class ClientPackageMetadata
             }
             return null;
         }
-        if (normalized.Length > 32 || !SemanticVersion.TryParse(normalized, out _))
+        var canonical = normalized.StartsWith('v') ? normalized[1..] : normalized;
+        if (canonical.Length > 32 || !SemanticVersion.TryParse(normalized, out _))
         {
             throw new ArgumentException($"{field} must be a semantic version no longer than 32 characters");
         }
-        return normalized.StartsWith('v') ? normalized[1..] : normalized;
+        return canonical;
     }
 
     private static string? NormalizeOptionalText(string? value, int maxLength)
@@ -712,16 +849,16 @@ internal static class ClientPackageMetadata
             return null;
         }
         if (normalized.Length > 1024 || !Uri.TryCreate(normalized, UriKind.Absolute, out var uri)
-            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
-            || string.IsNullOrWhiteSpace(uri.Host))
+            || uri.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(uri.Host)
+            || !string.IsNullOrEmpty(uri.UserInfo))
         {
-            throw new ArgumentException("changelogUrl must be an absolute http(s) URL");
+            throw new ArgumentException("changelogUrl must be an absolute HTTPS URL");
         }
         return normalized;
     }
 }
 
-internal readonly record struct SemanticVersion(int Major, int Minor, int Patch,
+internal readonly record struct SemanticVersion(BigInteger Major, BigInteger Minor, BigInteger Patch,
     IReadOnlyList<string> PreRelease) : IComparable<SemanticVersion>
 {
     public static bool TryParse(string? value, out SemanticVersion version)
@@ -736,23 +873,28 @@ internal readonly record struct SemanticVersion(int Major, int Minor, int Patch,
         {
             text = text[1..];
         }
+        if (text.Length is 0 or > 32)
+        {
+            return false;
+        }
+
         var buildAt = text.IndexOf('+');
+        string[] build = [];
         if (buildAt >= 0)
         {
+            build = text[(buildAt + 1)..].Split('.');
             text = text[..buildAt];
         }
         var dashAt = text.IndexOf('-');
         var core = dashAt < 0 ? text : text[..dashAt];
         string[] pre = dashAt < 0 ? [] : text[(dashAt + 1)..].Split('.');
         var parts = core.Split('.');
-        if (parts.Length == 4 && parts[3] == "0")
-        {
-            parts = parts[..3];
-        }
         if (parts.Length != 3 || !TryNumber(parts[0], out var major)
                               || !TryNumber(parts[1], out var minor)
                               || !TryNumber(parts[2], out var patch)
-                              || pre.Any(identifier => !ValidIdentifier(identifier)))
+                              || pre.Any(identifier => !ValidIdentifier(identifier)
+                                  || IsNumeric(identifier) && identifier.Length > 1 && identifier[0] == '0')
+                              || build.Any(identifier => !ValidIdentifier(identifier)))
         {
             return false;
         }
@@ -773,11 +915,14 @@ internal readonly record struct SemanticVersion(int Major, int Minor, int Patch,
         if (other.PreRelease.Count == 0) return -1;
         for (var i = 0; i < Math.Min(PreRelease.Count, other.PreRelease.Count); i++)
         {
-            var leftNumeric = int.TryParse(PreRelease[i], NumberStyles.None, CultureInfo.InvariantCulture, out var left);
-            var rightNumeric = int.TryParse(other.PreRelease[i], NumberStyles.None,
-                CultureInfo.InvariantCulture, out var right);
+            var leftNumeric = IsNumeric(PreRelease[i]);
+            var rightNumeric = IsNumeric(other.PreRelease[i]);
             int comparison;
-            if (leftNumeric && rightNumeric) comparison = left.CompareTo(right);
+            if (leftNumeric && rightNumeric)
+            {
+                comparison = BigInteger.Parse(PreRelease[i], CultureInfo.InvariantCulture)
+                    .CompareTo(BigInteger.Parse(other.PreRelease[i], CultureInfo.InvariantCulture));
+            }
             else if (leftNumeric) comparison = -1;
             else if (rightNumeric) comparison = 1;
             else comparison = string.CompareOrdinal(PreRelease[i], other.PreRelease[i]);
@@ -786,12 +931,15 @@ internal readonly record struct SemanticVersion(int Major, int Minor, int Patch,
         return PreRelease.Count.CompareTo(other.PreRelease.Count);
     }
 
-    private static bool TryNumber(string text, out int value)
+    private static bool TryNumber(string text, out BigInteger value)
     {
-        value = 0;
-        return text.Length > 0 && (text.Length == 1 || text[0] != '0')
-            && int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+        value = BigInteger.Zero;
+        return IsNumeric(text) && (text.Length == 1 || text[0] != '0')
+            && BigInteger.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out value);
     }
+
+    private static bool IsNumeric(string identifier) => identifier.Length > 0
+        && identifier.All(character => character is >= '0' and <= '9');
 
     private static bool ValidIdentifier(string identifier) => identifier.Length > 0
         && identifier.All(character => char.IsAsciiLetterOrDigit(character) || character == '-');

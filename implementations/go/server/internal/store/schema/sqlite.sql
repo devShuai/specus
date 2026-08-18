@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS client_download_link (
   implementation TEXT NOT NULL,
   platform TEXT NOT NULL,
   arch TEXT NOT NULL,
-  version TEXT NOT NULL,
+  version TEXT,
   display_name TEXT NOT NULL,
   download_url TEXT NOT NULL,
   description TEXT,

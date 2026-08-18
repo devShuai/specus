@@ -4,6 +4,8 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Specus.Server.Data;
 
 namespace Specus.IntegrationTests;
 
@@ -64,9 +66,17 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         Assert.True(Assert.Single(adminRows!, row => row.Id == second.Id).IsLatest);
 
         using var anonymous = _server!.CreateClient();
-        var check = await anonymous.GetFromJsonAsync<VersionCheckBody>(
-            "/api/public/client-version-check?implementation=csharp&platform=windows&arch=x64&current=1.0.0",
-            JsonOptions);
+        var publicRows = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        var publicCSharpRows = publicRows!.Where(row => row.Implementation == "csharp"
+            && row.Platform == "windows" && row.Arch == "x64").ToList();
+        Assert.Equal(second.Id, Assert.Single(publicCSharpRows).Id);
+
+        using var checkResponse = await anonymous.GetAsync(
+            "/api/public/client-version-check?implementation=csharp&platform=windows&arch=x64&current=1.0.0");
+        checkResponse.EnsureSuccessStatusCode();
+        Assert.True(checkResponse.Headers.CacheControl?.NoStore);
+        var check = await checkResponse.Content.ReadFromJsonAsync<VersionCheckBody>(JsonOptions);
         Assert.NotNull(check);
         Assert.True(check!.UpdateAvailable);
         Assert.True(check.Mandatory);
@@ -77,6 +87,7 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         using var download = await anonymous.GetAsync(check.DownloadUrl);
         download.EnsureSuccessStatusCode();
         Assert.Equal("nosniff", download.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.True(download.Headers.CacheControl?.NoStore);
         Assert.Equal(secondBytes, await download.Content.ReadAsByteArrayAsync());
 
         using var rangeRequest = new HttpRequestMessage(HttpMethod.Get, check.DownloadUrl);
@@ -93,8 +104,330 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
             "/api/public/client-version-check?implementation=csharp&platform=windows&arch=x64&current=1.0.0",
             JsonOptions);
         Assert.NotNull(afterDelete);
-        Assert.Equal("1.2.0", afterDelete!.LatestVersion);
+        Assert.False(afterDelete!.UpdateAvailable);
+        Assert.Null(afterDelete.LatestVersion);
+        Assert.Null(afterDelete.PackageId);
         Assert.False(afterDelete.Mandatory);
+        var publicAfterDelete = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.DoesNotContain(publicAfterDelete!, row => row.Implementation == "csharp"
+            && row.Platform == "windows" && row.Arch == "x64");
+    }
+
+    [Fact]
+    public async Task ExternalLatestWithAuthoritativeIntegrityBecomesUpdateCandidate()
+    {
+        using var admin = await AuthenticatedClientAsync(_server!);
+        _ = await UploadAsync(admin, Encoding.UTF8.GetBytes("trusted-hosted"), "1.0.0", true,
+            implementation: "csharp", platform: "any", arch: "any");
+        using var created = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "csharp",
+            platform = "any",
+            arch = "any",
+            displayName = "external-client.zip",
+            downloadUrl = "https://downloads.example/external-client.zip",
+            version = "99.0.0",
+            sha256 = new string('a', 64),
+            fileSize = 987654,
+            isLatest = true,
+            enabled = true,
+        });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var external = await created.Content.ReadFromJsonAsync<DownloadBody>(JsonOptions);
+        Assert.NotNull(external);
+        Assert.False(external!.Hosted);
+
+        using var anonymous = _server!.CreateClient();
+        var publicRows = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.Equal(external.Id, Assert.Single(publicRows!, row => row.Implementation == "csharp"
+            && row.Platform == "any" && row.Arch == "any").Id);
+
+        var check = await anonymous.GetFromJsonAsync<VersionCheckBody>(
+            "/api/public/client-version-check?implementation=csharp&platform=any&arch=any&current=0.9.0",
+            JsonOptions);
+        Assert.NotNull(check);
+        Assert.True(check!.UpdateAvailable);
+        Assert.Equal("99.0.0", check.LatestVersion);
+        Assert.Null(check.PackageId);
+        Assert.Equal(new string('a', 64), check.Sha256);
+        Assert.Equal(987654, check.FileSize);
+        Assert.Equal("https://downloads.example/external-client.zip", check.DownloadUrl);
+    }
+
+    [Fact]
+    public async Task UploadDefaultsToDraftAndRejectsIncompleteOrInvertedPublicationMetadata()
+    {
+        using var admin = await AuthenticatedClientAsync(_server!);
+        using var draftForm = PackageForm(Encoding.UTF8.GetBytes("draft"), "3.0.0",
+            "go", "linux", "arm64", isLatest: null);
+        using var draftResponse = await admin.PostAsync("/api/admin/client-packages", draftForm);
+        Assert.Equal(HttpStatusCode.Created, draftResponse.StatusCode);
+        var draft = await draftResponse.Content.ReadFromJsonAsync<DownloadBody>(JsonOptions);
+        Assert.NotNull(draft);
+        Assert.False(draft!.IsLatest);
+
+        using var anonymous = _server!.CreateClient();
+        var check = await anonymous.GetFromJsonAsync<VersionCheckBody>(
+            "/api/public/client-version-check?implementation=go&platform=linux&arch=arm64&current=1.0.0",
+            JsonOptions);
+        Assert.NotNull(check);
+        Assert.False(check!.UpdateAvailable);
+        var publicRows = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.DoesNotContain(publicRows!, row => row.Id == draft.Id);
+
+        using var latestWithoutVersion = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "java",
+            platform = "any",
+            arch = "any",
+            displayName = "unversioned-latest",
+            downloadUrl = "https://downloads.example/unversioned",
+            enabled = true,
+            isLatest = true,
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, latestWithoutVersion.StatusCode);
+
+        using var minimumWithoutVersion = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "java",
+            platform = "any",
+            arch = "any",
+            displayName = "unversioned-minimum",
+            downloadUrl = "https://downloads.example/unversioned-minimum",
+            enabled = true,
+            minSupportedVersion = "1.0.0",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, minimumWithoutVersion.StatusCode);
+
+        using var publishedExternalResponse = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "java",
+            platform = "windows",
+            arch = "x64",
+            displayName = "published-external",
+            downloadUrl = "https://downloads.example/published-external",
+            version = "1.0.0",
+            sha256 = new string('b', 64),
+            fileSize = 1234,
+            enabled = true,
+            isLatest = true,
+        });
+        Assert.Equal(HttpStatusCode.Created, publishedExternalResponse.StatusCode);
+        var publishedExternal = await publishedExternalResponse.Content
+            .ReadFromJsonAsync<DownloadBody>(JsonOptions);
+        Assert.NotNull(publishedExternal);
+        using var removePublishedVersion = await admin.PutAsJsonAsync(
+            $"/api/admin/client-downloads/{publishedExternal!.Id}", new
+            {
+                implementation = publishedExternal.Implementation,
+                platform = publishedExternal.Platform,
+                arch = publishedExternal.Arch,
+                displayName = publishedExternal.DisplayName,
+                downloadUrl = publishedExternal.DownloadUrl,
+                sha256 = publishedExternal.Sha256,
+                fileSize = publishedExternal.FileSize,
+                enabled = true,
+                isLatest = true,
+            });
+        Assert.Equal(HttpStatusCode.BadRequest, removePublishedVersion.StatusCode);
+
+        using var invertedForm = PackageForm(Encoding.UTF8.GetBytes("inverted"), "1.0.0",
+            "csharp", "linux", "x64", isLatest: false, minSupportedVersion: "2.0.0");
+        using var inverted = await admin.PostAsync("/api/admin/client-packages", invertedForm);
+        Assert.Equal(HttpStatusCode.BadRequest, inverted.StatusCode);
+
+        foreach (var invalidUrl in new[]
+                 {
+                     "http://downloads.example/client.zip",
+                     "https://user@downloads.example/client.zip",
+                     "https://downloads.example/client.zip?token=metadata",
+                     "https://downloads.example/client.zip#fragment",
+                 })
+        {
+            using var invalidExternal = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+            {
+                implementation = "java",
+                platform = "linux",
+                arch = "x64",
+                displayName = "invalid-external",
+                downloadUrl = invalidUrl,
+                version = "2.0.0",
+                sha256 = new string('c', 64),
+                fileSize = 10,
+                enabled = true,
+                isLatest = true,
+            });
+            Assert.Equal(HttpStatusCode.BadRequest, invalidExternal.StatusCode);
+        }
+
+        using var incompleteIntegrity = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "java",
+            platform = "linux",
+            arch = "x64",
+            displayName = "incomplete-integrity",
+            downloadUrl = "https://downloads.example/incomplete.zip",
+            version = "2.0.0",
+            sha256 = new string('d', 64),
+            enabled = true,
+            isLatest = true,
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, incompleteIntegrity.StatusCode);
+    }
+
+    [Fact]
+    public async Task NonCanonicalDigestCannotAuthorizeAHostedUpdateOrDownload()
+    {
+        using var admin = await AuthenticatedClientAsync(_server!);
+        var package = await UploadAsync(admin, Encoding.UTF8.GetBytes("canonical-digest"), "6.0.0", true,
+            implementation: "go", platform: "linux", arch: "arm64");
+        await using (var scope = _server!.HostServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var row = await db.ClientDownloadLinks.FindAsync(package.Id);
+            Assert.NotNull(row);
+            row!.Sha256 = new string('A', 64);
+            await db.SaveChangesAsync();
+        }
+
+        using var anonymous = _server.CreateClient();
+        var check = await anonymous.GetFromJsonAsync<VersionCheckBody>(
+            "/api/public/client-version-check?implementation=go&platform=linux&arch=arm64&current=1.0.0",
+            JsonOptions);
+        Assert.NotNull(check);
+        Assert.False(check!.UpdateAvailable);
+        using var download = await anonymous.GetAsync(package.DownloadUrl);
+        Assert.Equal(HttpStatusCode.NotFound, download.StatusCode);
+
+        var publicRows = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        var visible = Assert.Single(publicRows!, row => row.Id == package.Id);
+        Assert.False(visible.Hosted);
+        Assert.Null(visible.PackageId);
+    }
+
+    [Fact]
+    public async Task VersionedTargetSuppressesLegacyLinkUntilAnExplicitLatestIsPublished()
+    {
+        using var admin = await AuthenticatedClientAsync(_server!);
+        using var legacyResponse = await admin.PostAsJsonAsync("/api/admin/client-downloads", new
+        {
+            implementation = "java",
+            platform = "macos",
+            arch = "arm64",
+            displayName = "legacy-java-client",
+            downloadUrl = "https://downloads.example/legacy-java-client",
+            enabled = true,
+        });
+        legacyResponse.EnsureSuccessStatusCode();
+        var legacy = await legacyResponse.Content.ReadFromJsonAsync<DownloadBody>(JsonOptions);
+        Assert.NotNull(legacy);
+
+        using var anonymous = _server!.CreateClient();
+        var before = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.Equal(legacy!.Id, Assert.Single(before!, row => row.Implementation == "java"
+            && row.Platform == "macos" && row.Arch == "arm64").Id);
+
+        var published = await UploadAsync(admin, Encoding.UTF8.GetBytes("published-java"), "5.0.0", false,
+            implementation: "java", platform: "macos", arch: "arm64");
+        var unpublished = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.DoesNotContain(unpublished!, row => row.Implementation == "java"
+            && row.Platform == "macos" && row.Arch == "arm64");
+
+        using var markLatest = await admin.PostAsync(
+            $"/api/admin/client-downloads/{published.Id}/latest", content: null);
+        markLatest.EnsureSuccessStatusCode();
+        var after = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.Equal(published.Id, Assert.Single(after!, row => row.Implementation == "java"
+            && row.Platform == "macos" && row.Arch == "arm64").Id);
+        Assert.DoesNotContain(after!, row => row.Id == legacy.Id);
+
+        using var disable = await admin.PutAsJsonAsync($"/api/admin/client-downloads/{published.Id}", new
+        {
+            implementation = published.Implementation,
+            platform = published.Platform,
+            arch = published.Arch,
+            displayName = published.DisplayName,
+            version = published.Version,
+            enabled = false,
+            isLatest = false,
+        });
+        disable.EnsureSuccessStatusCode();
+        var afterDisable = await anonymous.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/public/client-downloads", JsonOptions);
+        Assert.DoesNotContain(afterDisable!, row => row.Implementation == "java"
+            && row.Platform == "macos" && row.Arch == "arm64");
+    }
+
+    [Fact]
+    public async Task PackageDownloadRejectsSymbolicLinkTargetsWhenPlatformSupportsLinks()
+    {
+        using var admin = await AuthenticatedClientAsync(_server!);
+        var bytes = Encoding.UTF8.GetBytes("outside-package-with-the-same-length");
+        var package = await UploadAsync(admin, bytes, "8.0.0", true,
+            implementation: "go", platform: "macos", arch: "arm64");
+        var storedPath = Path.Combine(_dataRoot, "packages", package.Id.ToString());
+        var outsidePath = Path.Combine(Path.GetTempPath(), $"specus-outside-{Guid.NewGuid():N}");
+        await File.WriteAllBytesAsync(outsidePath, bytes);
+        File.Delete(storedPath);
+        try
+        {
+            try
+            {
+                File.CreateSymbolicLink(storedPath, outsidePath);
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException
+                or IOException or NotSupportedException)
+            {
+                return;
+            }
+
+            using var anonymous = _server!.CreateClient();
+            using var response = await anonymous.GetAsync(package.DownloadUrl);
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        }
+        finally
+        {
+            try { File.Delete(storedPath); } catch { }
+            try { File.Delete(outsidePath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentLatestUploadsAcrossRequestDbContextsNeverCreateTwoLatestRows()
+    {
+        using var firstAdmin = await AuthenticatedClientAsync(_server!);
+        using var secondAdmin = await AuthenticatedClientAsync(_server!);
+        using var firstForm = PackageForm(Encoding.UTF8.GetBytes("parallel-a"), "7.0.0",
+            "go", "linux", "x64", true);
+        using var secondForm = PackageForm(Encoding.UTF8.GetBytes("parallel-b"), "7.1.0",
+            "go", "linux", "x64", true);
+
+        var responses = await Task.WhenAll(
+            firstAdmin.PostAsync("/api/admin/client-packages", firstForm),
+            secondAdmin.PostAsync("/api/admin/client-packages", secondForm));
+        try
+        {
+            Assert.Contains(responses, response => response.StatusCode == HttpStatusCode.Created);
+            Assert.DoesNotContain(responses, response =>
+                (int)response.StatusCode >= (int)HttpStatusCode.InternalServerError);
+        }
+        finally
+        {
+            foreach (var response in responses) response.Dispose();
+        }
+
+        var rows = await firstAdmin.GetFromJsonAsync<List<DownloadBody>>(
+            "/api/admin/client-downloads", JsonOptions);
+        var targetRows = rows!.Where(row => row.Implementation == "go"
+            && row.Platform == "linux" && row.Arch == "x64").ToList();
+        Assert.Single(targetRows, row => row.IsLatest);
     }
 
     [Fact]
@@ -107,6 +440,11 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         using var duplicate = PackageForm(bytes, "2.0.0", "csharp", "windows", "x64", false);
         using var duplicateResponse = await admin.PostAsync("/api/admin/client-packages", duplicate);
         Assert.Equal(HttpStatusCode.BadRequest, duplicateResponse.StatusCode);
+
+        using var forgedDigest = PackageForm(bytes, "2.1.0", "csharp", "windows", "x64", false);
+        forgedDigest.Add(new StringContent(new string('0', 64)), "sha256");
+        using var forgedDigestResponse = await admin.PostAsync("/api/admin/client-packages", forgedDigest);
+        Assert.Equal(HttpStatusCode.BadRequest, forgedDigestResponse.StatusCode);
 
         using var anonymous = _server!.CreateClient();
         using var unauthorizedForm = PackageForm(bytes, "3.0.0", "csharp", "windows", "x64", true);
@@ -130,11 +468,12 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
     public async Task AndroidGenericApkIsAcceptedAndInvalidAndroidTargetIsRejected()
     {
         using var admin = await AuthenticatedClientAsync(_server!);
-        var apk = await UploadAsync(admin, [0x50, 0x4b, 0x03, 0x04], "1.4.0", true,
+        var apk = await UploadAsync(admin, [0x50, 0x4b, 0x03, 0x04], "v1.4.0", true,
             implementation: "android", platform: "android", arch: "any");
         Assert.Equal("android", apk.Implementation);
         Assert.Equal("android", apk.Platform);
         Assert.Equal("any", apk.Arch);
+        Assert.Equal("1.4.0", apk.Version);
 
         using var invalidForm = PackageForm([1, 2, 3], "1.4.1", "android", "windows", "x64", true);
         using var invalid = await admin.PostAsync("/api/admin/client-packages", invalidForm);
@@ -147,6 +486,16 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         Assert.NotNull(check);
         Assert.True(check!.UpdateAvailable);
         Assert.Equal("1.4.0", check.LatestVersion);
+
+        using var head = new HttpRequestMessage(HttpMethod.Head, apk.DownloadUrl);
+        using var headResponse = await anonymous.SendAsync(head);
+        headResponse.EnsureSuccessStatusCode();
+        Assert.EndsWith(".apk", headResponse.Content.Headers.ContentDisposition?.FileNameStar
+            ?? headResponse.Content.Headers.ContentDisposition?.FileName, StringComparison.OrdinalIgnoreCase);
+        Assert.True(headResponse.Headers.CacheControl?.NoStore);
+        Assert.Equal("nosniff", headResponse.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.Equal(apk.FileSize, headResponse.Content.Headers.ContentLength);
+        Assert.Equal($"\"sha256-{apk.Sha256}\"", headResponse.Headers.ETag?.Tag);
     }
 
     [Fact]
@@ -172,6 +521,9 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, secondResponse.StatusCode);
         Assert.Equal(HttpStatusCode.TooManyRequests, thirdResponse.StatusCode);
         Assert.True(thirdResponse.Headers.Contains("Retry-After"));
+        Assert.Equal("application/json", thirdResponse.Content.Headers.ContentType?.MediaType);
+        using var error = JsonDocument.Parse(await thirdResponse.Content.ReadAsStringAsync());
+        Assert.Equal("rate_limited", error.RootElement.GetProperty("error").GetString());
         try { if (Directory.Exists(dataRoot)) Directory.Delete(dataRoot, true); } catch { }
     }
 
@@ -195,7 +547,7 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
     }
 
     private static MultipartFormDataContent PackageForm(byte[] bytes, string version,
-        string implementation, string platform, string arch, bool isLatest,
+        string implementation, string platform, string arch, bool? isLatest,
         string? minSupportedVersion = null)
     {
         var form = new MultipartFormDataContent();
@@ -205,9 +557,15 @@ public sealed class ClientPackageApiTests : IAsyncLifetime
         form.Add(new StringContent(implementation), "implementation");
         form.Add(new StringContent(platform), "platform");
         form.Add(new StringContent(arch), "arch");
-        form.Add(new StringContent($"specus-{implementation}-{version}.zip"), "displayName");
+        var displayName = implementation == "android"
+            ? $"specus-{implementation}-{version}"
+            : $"specus-{implementation}-{version}.zip";
+        form.Add(new StringContent(displayName), "displayName");
         form.Add(new StringContent(version), "version");
-        form.Add(new StringContent(isLatest.ToString()), "isLatest");
+        if (isLatest is not null)
+        {
+            form.Add(new StringContent(isLatest.Value.ToString()), "isLatest");
+        }
         form.Add(new StringContent("true"), "enabled");
         if (minSupportedVersion is not null)
         {
