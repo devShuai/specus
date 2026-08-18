@@ -42,6 +42,8 @@ public sealed class StunMessage
     public const ushort AttrXorRelayedAddress = 0x0016;
     public const ushort AttrRequestedTransport = 0x0019;
     public const ushort AttrXorMappedAddress = 0x0020;
+    /// <summary>RFC 5780 CHANGE-REQUEST: bit 2 changes IP, bit 1 changes port.</summary>
+    public const ushort AttrChangeRequest = 0x0003;
     public const ushort AttrSoftware = 0x8022;
     public const ushort AttrResponseOrigin = 0x802B;
     public const ushort AttrOtherAddress = 0x802C;
@@ -199,6 +201,25 @@ public sealed class StunMessage
     public StunAttribute? First(ushort type) => Attributes.FirstOrDefault(attr => attr.Type == type);
     public IEnumerable<StunAttribute> All(ushort type) => Attributes.Where(attr => attr.Type == type);
     public IPEndPoint? XorMappedAddress() => DecodeXorAddress(First(AttrXorMappedAddress)?.Value);
+
+    /// <summary>Decodes CHANGE-REQUEST; absent or malformed values request no change.</summary>
+    public (bool ChangeIp, bool ChangePort) ChangeRequest()
+    {
+        var value = First(AttrChangeRequest)?.Value;
+        if (value is null || value.Length < 4)
+        {
+            return (false, false);
+        }
+        return ((value[3] & 0x04) != 0, (value[3] & 0x02) != 0);
+    }
+
+    /// <summary>Builds a CHANGE-REQUEST attribute; used by tests and NAT probing clients.</summary>
+    public static StunAttribute ChangeRequest(bool changeIp, bool changePort)
+    {
+        var value = new byte[4];
+        value[3] = (byte)((changeIp ? 0x04 : 0) | (changePort ? 0x02 : 0));
+        return new StunAttribute(AttrChangeRequest, value);
+    }
     public IPEndPoint? XorRelayedAddress() => DecodeXorAddress(First(AttrXorRelayedAddress)?.Value);
     public IPEndPoint? XorPeerAddress() => DecodeXorAddress(First(AttrXorPeerAddress)?.Value);
     public IPEndPoint? OtherAddress() => DecodeXorAddress(First(AttrOtherAddress)?.Value);

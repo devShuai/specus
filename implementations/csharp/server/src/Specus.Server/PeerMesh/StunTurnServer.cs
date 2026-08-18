@@ -14,6 +14,13 @@ public sealed class StunTurnServer : BackgroundService
     private static readonly TimeSpan PermissionTtl = TimeSpan.FromSeconds(300);
 	private static readonly TimeSpan ChannelTtl = TimeSpan.FromSeconds(600);
 	private const int PeerProbeMaxBytes = 2048;
+	/// <summary>Largest datagram we will look at; anything bigger is dropped before parsing.</summary>
+	private const int MaxDatagramBytes = 8192;
+	/// <summary>Datagrams per source address per window, and the global ceiling across sources.</summary>
+	private const int MaxDatagramsPerSourcePerWindow = 400;
+	private const int MaxDatagramsPerWindow = 20_000;
+	private const int MaxTrackedSources = 50_000;
+	private static readonly TimeSpan RateWindow = TimeSpan.FromSeconds(1);
 	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly PeerMeshOptions _options;
@@ -26,6 +33,9 @@ public sealed class StunTurnServer : BackgroundService
     private UdpClient? _primary;
     private UdpClient? _alternate;
     private Channel<Func<CancellationToken, Task>>? _relayQueue;
+    private readonly ConcurrentDictionary<string, RateWindowState> _sourceRates = new(StringComparer.Ordinal);
+    private long _windowStartTicks;
+    private int _windowCount;
 
     public StunTurnServer(IOptions<PeerMeshOptions> options, IServiceScopeFactory scopeFactory,
         ILogger<StunTurnServer> logger, TurnCredentialService? turnCredentials = null)
@@ -57,7 +67,7 @@ public sealed class StunTurnServer : BackgroundService
         StartRelayWorkers(stoppingToken);
         var tasks = new List<Task>
         {
-            ReceiveLoopAsync(_primary, "primary", stoppingToken),
+            SuperviseReceiveLoopAsync(() => _primary, "primary", stoppingToken),
             CleanupLoopAsync(stoppingToken),
         };
 
@@ -67,7 +77,7 @@ public sealed class StunTurnServer : BackgroundService
             try
             {
                 _alternate = new UdpClient(new IPEndPoint(IPAddress.Any, alternatePort));
-                tasks.Add(ReceiveLoopAsync(_alternate, "alternate", stoppingToken));
+                tasks.Add(SuperviseReceiveLoopAsync(() => _alternate, "alternate", stoppingToken));
                 _logger.LogInformation("[peer-mesh] standard STUN alternate UDP port listening on {Port}",
                     alternatePort);
             }
@@ -145,6 +155,65 @@ public sealed class StunTurnServer : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Keeps a receive loop running. If it ever returns or throws while the service is still
+    /// supposed to be listening, restart it a bounded number of times and log loudly; a silent exit
+    /// would leave the advertised STUN/TURN port accepting nothing.
+    /// </summary>
+    private async Task SuperviseReceiveLoopAsync(Func<UdpClient?> socketAccessor, string probeRole,
+        CancellationToken cancellationToken)
+    {
+        const int maxRestarts = 16;
+        var restarts = 0;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var socket = socketAccessor();
+            if (socket is null)
+            {
+                return;
+            }
+            try
+            {
+                await ReceiveLoopAsync(socket, probeRole, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[peer-mesh] STUN/TURN receive loop faulted: role={Role}", probeRole);
+            }
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            if (++restarts > maxRestarts)
+            {
+                _logger.LogCritical(
+                    "[peer-mesh] STUN/TURN receive loop role={Role} exited {Restarts} times; giving up",
+                    probeRole, restarts);
+                return;
+            }
+            _logger.LogWarning("[peer-mesh] restarting STUN/TURN receive loop: role={Role}, attempt={Attempt}",
+                probeRole, restarts);
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Receives datagrams until cancellation. A malformed or hostile datagram must only be dropped:
+    /// the loop is the only thing keeping STUN/TURN alive, so it never exits on a packet-level
+    /// failure. Socket errors that describe one datagram (an ICMP unreachable surfaces as
+    /// ConnectionReset) are also non-fatal.
+    /// </summary>
     private async Task ReceiveLoopAsync(UdpClient socket, string probeRole, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -162,13 +231,23 @@ public sealed class StunTurnServer : BackgroundService
             {
                 return;
             }
+            catch (SocketException ex) when (IsTransientReceiveError(ex))
+            {
+                _logger.LogTrace(ex, "[peer-mesh] STUN/TURN transient receive error ignored");
+                continue;
+            }
             catch (SocketException ex)
             {
                 if (!cancellationToken.IsCancellationRequested)
                 {
-                    _logger.LogDebug(ex, "[peer-mesh] STUN/TURN receive failed");
+                    _logger.LogWarning(ex, "[peer-mesh] STUN/TURN receive failed on role={Role}", probeRole);
                 }
                 return;
+            }
+
+            if (result.Buffer.Length > MaxDatagramBytes || !AllowDatagram(result.RemoteEndPoint))
+            {
+                continue;
             }
 
             try
@@ -176,11 +255,59 @@ public sealed class StunTurnServer : BackgroundService
                 await HandleAsync(result.Buffer, result.RemoteEndPoint, socket, probeRole, cancellationToken)
                     .ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is SocketException or InvalidOperationException or ObjectDisposedException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogDebug(ex, "[peer-mesh] STUN/TURN packet handling failed");
+                return;
+            }
+            catch (Exception ex)
+            {
+                // Any parse or handling failure belongs to this datagram alone.
+                _logger.LogDebug(ex, "[peer-mesh] STUN/TURN packet handling failed: remote={Remote}",
+                    result.RemoteEndPoint);
             }
         }
+    }
+
+    private static bool IsTransientReceiveError(SocketException ex) =>
+        ex.SocketErrorCode is SocketError.ConnectionReset
+            or SocketError.MessageSize
+            or SocketError.NetworkReset
+            or SocketError.HostUnreachable
+            or SocketError.NetworkUnreachable
+            or SocketError.ConnectionRefused;
+
+    /// <summary>
+    /// Fixed-window admission control. A single source cannot spend the whole budget, and the global
+    /// ceiling keeps a distributed flood from saturating the handler.
+    /// </summary>
+    private bool AllowDatagram(IPEndPoint remote)
+    {
+        var now = DateTimeOffset.UtcNow.Ticks;
+        var windowStart = Interlocked.Read(ref _windowStartTicks);
+        if (now - windowStart >= RateWindow.Ticks)
+        {
+            if (Interlocked.CompareExchange(ref _windowStartTicks, now, windowStart) == windowStart)
+            {
+                Interlocked.Exchange(ref _windowCount, 0);
+                _sourceRates.Clear();
+            }
+        }
+        if (Interlocked.Increment(ref _windowCount) > MaxDatagramsPerWindow)
+        {
+            return false;
+        }
+        var key = remote.Address.ToString();
+        if (_sourceRates.Count >= MaxTrackedSources && !_sourceRates.ContainsKey(key))
+        {
+            return false;
+        }
+        var state = _sourceRates.GetOrAdd(key, _ => new RateWindowState());
+        return Interlocked.Increment(ref state.Count) <= MaxDatagramsPerSourcePerWindow;
+    }
+
+    private sealed class RateWindowState
+    {
+        public int Count;
     }
 
     private async Task HandleAsync(byte[] payload, IPEndPoint remote, UdpClient receiveSocket, string probeRole,
@@ -227,19 +354,48 @@ public sealed class StunTurnServer : BackgroundService
     private async Task BindingAsync(StunMessage request, IPEndPoint remote, UdpClient receiveSocket,
         string probeRole)
     {
+        // RFC 5780 CHANGE-REQUEST. We advertise OTHER-ADDRESS only when an alternate port exists, so
+        // change-port is answerable; we listen on a single address, so change-IP is not. Honour what
+        // we can and reject the rest explicitly instead of silently replying from the wrong socket,
+        // which would make the client's NAT classification wrong.
+        var change = request.ChangeRequest();
+        var responseSocket = receiveSocket;
+        if (change.ChangeIp)
+        {
+            await SendErrorAsync(receiveSocket, remote, request, StunMessage.BindingError, 420,
+                "change-ip-unsupported").ConfigureAwait(false);
+            return;
+        }
+        if (change.ChangePort)
+        {
+            var alternate = ReferenceEquals(receiveSocket, _primary) ? _alternate : _primary;
+            if (alternate is null)
+            {
+                await SendErrorAsync(receiveSocket, remote, request, StunMessage.BindingError, 420,
+                    "change-port-unsupported").ConfigureAwait(false);
+                return;
+            }
+            responseSocket = alternate;
+        }
+
         var attributes = new List<StunAttribute>
         {
             StunMessage.XorMappedAddress(remote, request.TransactionId),
             StunMessage.Software(SoftwareName),
-            StunMessage.ResponseOrigin(AdvertisedSocketAddress(receiveSocket), request.TransactionId),
+            StunMessage.ResponseOrigin(AdvertisedSocketAddress(responseSocket), request.TransactionId),
         };
         if (_alternate is not null)
         {
-            attributes.Add(StunMessage.OtherAddress(AdvertisedSocketAddress(_alternate), request.TransactionId));
+            var other = ReferenceEquals(responseSocket, _alternate) ? _primary : _alternate;
+            if (other is not null)
+            {
+                attributes.Add(StunMessage.OtherAddress(AdvertisedSocketAddress(other), request.TransactionId));
+            }
         }
-        await SendStunAsync(receiveSocket, remote,
+        await SendStunAsync(responseSocket, remote,
             new StunMessage(StunMessage.BindingSuccess, request.TransactionId, attributes)).ConfigureAwait(false);
-        _logger.LogTrace("[peer-mesh] STUN binding role={Role} remote={Remote}", probeRole, remote);
+        _logger.LogTrace("[peer-mesh] STUN binding role={Role} remote={Remote} changePort={ChangePort}",
+            probeRole, remote, change.ChangePort);
     }
 
     private async Task AllocateRequestAsync(StunMessage request, IPEndPoint remote, CancellationToken cancellationToken)

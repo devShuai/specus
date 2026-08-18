@@ -173,22 +173,29 @@ public sealed class ManagementQueryService
     {
         var clients = await ListClientsAsync(context, cancellationToken).ConfigureAwait(false);
         var visibleIds = clients.Select(c => c.Id).ToArray();
-        long successful = 0;
-        long failed = 0;
-        if (visibleIds.Length > 0)
-        {
-            successful = await _db.ConnectionRecords.AsNoTracking()
-                .LongCountAsync(r => (r.TenantId == context.TenantId || r.TenantId == null || r.TenantId == string.Empty)
-                                     && r.ClientId != null && visibleIds.Contains(r.ClientId.Value) && r.Success,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            failed = await _db.ConnectionRecords.AsNoTracking()
-                .LongCountAsync(r => (r.TenantId == context.TenantId || r.TenantId == null || r.TenantId == string.Empty)
-                                     && r.ClientId != null && visibleIds.Contains(r.ClientId.Value) && !r.Success,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
+        var visibleNames = clients.Select(c => c.ClientName).ToArray();
+        // Records always stay inside the acting tenant (legacy rows carry no tenant and belong to
+        // the default one). A failed login never reaches an authenticated client id, so restricting
+        // to client ids would drop exactly the rows an administrator needs for an audit; match those
+        // by the client name the attempt claimed instead.
+        var tenantRecords = _db.ConnectionRecords.AsNoTracking()
+            .Where(r => r.TenantId == context.TenantId || r.TenantId == null || r.TenantId == string.Empty);
+        var successful = await tenantRecords
+            .LongCountAsync(r => r.ClientId != null && visibleIds.Contains(r.ClientId.Value) && r.Success,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var failed = await tenantRecords
+            .LongCountAsync(r => !r.Success
+                                 && ((r.ClientId != null && visibleIds.Contains(r.ClientId.Value))
+                                     || (r.ClientId == null && context.IsAdmin
+                                         && visibleNames.Contains(r.ClientName))),
+                cancellationToken)
+            .ConfigureAwait(false);
 
+        // Active/rejected external connections are process-wide capacity counters with no tenant
+        // dimension. Only the built-in administrator sees the whole deployment, so exposing them to
+        // a tenant administrator would leak other tenants' activity.
+        var showProcessCounters = context.BuiltInAdmin;
         return new OverviewResponse(
             clients.Count,
             clients.Count(c => c.Online),
@@ -196,8 +203,8 @@ public sealed class ManagementQueryService
             failed,
             clients.Sum(c => c.UploadBytes),
             clients.Sum(c => c.DownloadBytes),
-            context.IsAdmin ? _remotePorts.ActiveExternalConnections : 0,
-            context.IsAdmin ? _remotePorts.RejectedExternalConnections : 0);
+            showProcessCounters ? _remotePorts.ActiveExternalConnections : 0,
+            showProcessCounters ? _remotePorts.RejectedExternalConnections : 0);
     }
 
     public async Task<ConnectionPageResponse> ListConnectionsAsync(ManagementContext context, long? clientId, bool? success,
