@@ -642,3 +642,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 ## 开发入口
 
 服务端下发 `NAT_CONTROL` 的管理接口见[下发端口映射](#3-下发端口映射)，客户端启动登录使用基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。协议字段和跨语言实现入口优先查看 [protocol/spec](protocol/spec/README.md)；Java 基准实现的服务端、客户端和公共协议分别位于 `implementations/java/server`、`implementations/java/client` 和 `implementations/java/common`。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
