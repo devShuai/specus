@@ -333,7 +333,8 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             var control = _sessions.Find(packet.ClientName!);
             if (control is null || control.ClientSessionId != packet.ClientSessionId)
             {
-                result = AuthenticationResult.Fail(result.Account, "数据连接未找到匹配的控制连接");
+                result = AuthenticationResult.Fail(result.Account, "数据连接未找到匹配的控制连接",
+                    result.AuditTenantId);
             }
         }
 
@@ -369,7 +370,7 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         {
             context.ConnectionRecordId = recordId;
             context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                packet.ClientSessionId, packet.ConnectionRole!);
+                packet.ClientSessionId, packet.ConnectionRole!, result.Account!.TenantId);
             if (dataConnection)
             {
                 displaced = _sessions.ReplaceData(packet.ClientName!, context);

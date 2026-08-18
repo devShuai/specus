@@ -326,6 +326,7 @@ public sealed class DatabaseInitializer
             .ConfigureAwait(false);
         await EnsureColumnAsync(db, "specus_connection_record", "tenant_id", "VARCHAR(80)", cancellationToken)
             .ConfigureAwait(false);
+        await BackfillConnectionRecordTenantAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_specus_connection_tenant", "specus_connection_record",
             "tenant_id", cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "specus_connection_stat", "tenant_id", "VARCHAR(80)", cancellationToken)
@@ -661,6 +662,34 @@ public sealed class DatabaseInitializer
         return db.Database.ExecuteSqlRawAsync(
             BuildConnectionStatTenantBackfillSql(db.Database.ProviderName),
             cancellationToken);
+    }
+
+    internal static async Task BackfillConnectionRecordTenantAsync(SpecusDbContext db,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await db.Database.ExecuteSqlRawAsync(
+                BuildConnectionRecordTenantBackfillSql(db.Database.ProviderName),
+                ["default"], cancellationToken)
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string BuildConnectionRecordTenantBackfillSql(string? providerName)
+    {
+        var idColumn = DatabaseDialect(providerName) switch
+        {
+            "postgresql" => "\"Id\"",
+            _ => "Id",
+        };
+        return
+            "UPDATE specus_connection_record " +
+            "SET tenant_id = COALESCE(" +
+                "(SELECT NULLIF(TRIM(c.tenant_id), '') FROM specus_client_account c " +
+                    "WHERE c." + idColumn + " = specus_connection_record.client_id LIMIT 1)," +
+                "{0}) " +
+            "WHERE tenant_id IS NULL OR TRIM(tenant_id) = ''";
     }
 
     private static string BuildConnectionStatTenantBackfillSql(string? providerName)

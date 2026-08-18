@@ -134,13 +134,15 @@ public sealed class ClientAccountService
         var session = _sessionStore.Find(packet.ClientSessionId, packet.AccessToken);
         if (session is null)
         {
-            return AuthenticationResult.Fail(null, "客户端访问令牌无效");
+            var auditTenantId = await ResolveAuditTenantAsync(packet.ClientSessionId, cancellationToken)
+                .ConfigureAwait(false);
+            return AuthenticationResult.Fail(null, "客户端访问令牌无效", auditTenantId);
         }
         if (session.ExpiresAt <= DateTimeOffset.UtcNow)
         {
             _sessionStore.MarkDisconnected(session.Id);
             await MarkSessionDisconnectedAsync(session.Id, cancellationToken).ConfigureAwait(false);
-            return AuthenticationResult.Fail(null, "客户端访问令牌已过期");
+            return AuthenticationResult.Fail(null, "客户端访问令牌已过期", session.TenantId);
         }
 
         var account = await _db.ClientAccounts
@@ -154,7 +156,7 @@ public sealed class ClientAccountService
 
         if (account is null || credential is null)
         {
-            return AuthenticationResult.Fail(null, "客户端不存在");
+            return AuthenticationResult.Fail(null, "客户端不存在", session.TenantId);
         }
         if (!account.Enabled || !credential.Enabled)
         {
@@ -190,6 +192,29 @@ public sealed class ClientAccountService
         }
         return AuthenticationResult.Pass(account);
     }
+
+    private async Task<string> ResolveAuditTenantAsync(long? sessionId,
+        CancellationToken cancellationToken)
+    {
+        if (sessionId is null or <= 0)
+        {
+            return DefaultTenantId;
+        }
+        var inMemory = _sessionStore.FindById(sessionId);
+        if (inMemory is not null)
+        {
+            return NormalizeTenant(inMemory.TenantId);
+        }
+        var persistedTenant = await _db.ClientSessions.AsNoTracking()
+            .Where(row => row.Id == sessionId.Value)
+            .Select(row => row.TenantId)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return NormalizeTenant(persistedTenant);
+    }
+
+    private static string NormalizeTenant(string? tenantId) =>
+        string.IsNullOrWhiteSpace(tenantId) ? DefaultTenantId : tenantId.Trim();
 
     private int PerMachineUserMaxInstances => _clientAuth.PerMachineUserMaxInstances <= 0
         ? 1

@@ -25,8 +25,19 @@ public static class ClientIdGenerator
 /// What <see cref="ClientAccountService.AuthenticateAsync"/> returns. Encodes both the success
 /// path (account present) and the rich set of failure modes the audit row needs to record.
 /// </summary>
-public sealed record AuthenticationResult(bool Success, ClientAccount? Account, string? Reason)
+public sealed record AuthenticationResult(
+    bool Success,
+    ClientAccount? Account,
+    string? Reason,
+    string AuditTenantId)
 {
-    public static AuthenticationResult Pass(ClientAccount account) => new(true, account, null);
-    public static AuthenticationResult Fail(ClientAccount? account, string reason) => new(false, account, reason);
+    public static AuthenticationResult Pass(ClientAccount account) =>
+        new(true, account, null, NormalizeTenant(account.TenantId));
+
+    public static AuthenticationResult Fail(ClientAccount? account, string reason,
+        string? auditTenantId = null) =>
+        new(false, account, reason, NormalizeTenant(account?.TenantId ?? auditTenantId));
+
+    private static string NormalizeTenant(string? tenantId) =>
+        string.IsNullOrWhiteSpace(tenantId) ? "default" : tenantId.Trim();
 }

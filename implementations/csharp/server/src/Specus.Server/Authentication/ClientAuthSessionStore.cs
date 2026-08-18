@@ -51,6 +51,20 @@ public sealed class ClientAuthSessionStore
         return _byTokenHash.TryGetValue(hash, out var session) ? session : null;
     }
 
+    /// <summary>
+    /// Resolves non-secret session metadata for audit attribution. Authentication must still use
+    /// <see cref="Find"/>; this lookup deliberately does not validate the supplied access token.
+    /// </summary>
+    public ClientAuthSession? FindById(long? sessionId)
+    {
+        if (sessionId is null or <= 0
+            || !_tokenHashBySessionId.TryGetValue(sessionId.Value, out var hash))
+        {
+            return null;
+        }
+        return _byTokenHash.TryGetValue(hash, out var session) ? session : null;
+    }
+
     public int CountOnlineByCredential(long credentialId) =>
         _byTokenHash.Values.Count(s => s.CredentialId == credentialId
             && s.Status == ClientAuthSessionStatus.NettyOnline);

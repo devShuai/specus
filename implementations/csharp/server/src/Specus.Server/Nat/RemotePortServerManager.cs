@@ -12,6 +12,8 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RemotePortServerManager> _logger;
     private readonly NettyServerOptions _options;
+    private readonly ConcurrentDictionary<string, TenantConnectionCounters> _tenantCounters =
+        new(StringComparer.Ordinal);
 
     private int _activeExternalConnections;
     private long _rejectedExternalConnections;
@@ -65,12 +67,16 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
         }
     }
 
-    public bool TryAcquireExternalConnection()
+    public bool TryAcquireExternalConnection() => TryAcquireExternalConnection("default");
+
+    public bool TryAcquireExternalConnection(string? tenantId)
     {
+        var tenant = NormalizeTenant(tenantId);
         var max = _options.MaxExternalConnections;
         if (max <= 0)
         {
             Interlocked.Increment(ref _activeExternalConnections);
+            TenantCounters(tenant).IncrementActive();
             return true;
         }
 
@@ -79,18 +85,22 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
             var current = Volatile.Read(ref _activeExternalConnections);
             if (current >= max)
             {
-                RecordRejectedExternalConnection();
+                RecordRejectedExternalConnection(tenant);
                 return false;
             }
             if (Interlocked.CompareExchange(ref _activeExternalConnections, current + 1, current) == current)
             {
+                TenantCounters(tenant).IncrementActive();
                 return true;
             }
         }
     }
 
-    public void ReleaseExternalConnection()
+    public void ReleaseExternalConnection() => ReleaseExternalConnection("default");
+
+    public void ReleaseExternalConnection(string? tenantId)
     {
+        var released = false;
         while (true)
         {
             var current = Volatile.Read(ref _activeExternalConnections);
@@ -100,17 +110,37 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
             }
             if (Interlocked.CompareExchange(ref _activeExternalConnections, current - 1, current) == current)
             {
-                return;
+                released = true;
+                break;
             }
+        }
+        if (released && _tenantCounters.TryGetValue(NormalizeTenant(tenantId), out var counters))
+        {
+            counters.DecrementActive();
         }
     }
 
-    public void RecordRejectedExternalConnection() =>
+    public void RecordRejectedExternalConnection() => RecordRejectedExternalConnection("default");
+
+    public void RecordRejectedExternalConnection(string? tenantId)
+    {
         Interlocked.Increment(ref _rejectedExternalConnections);
+        TenantCounters(NormalizeTenant(tenantId)).IncrementRejected();
+    }
 
     public int ActiveExternalConnections => Volatile.Read(ref _activeExternalConnections);
 
     public long RejectedExternalConnections => Volatile.Read(ref _rejectedExternalConnections);
+
+    public int ActiveExternalConnectionsForTenant(string? tenantId) =>
+        _tenantCounters.TryGetValue(NormalizeTenant(tenantId), out var counters)
+            ? counters.Active
+            : 0;
+
+    public long RejectedExternalConnectionsForTenant(string? tenantId) =>
+        _tenantCounters.TryGetValue(NormalizeTenant(tenantId), out var counters)
+            ? counters.Rejected
+            : 0;
 
     /// <summary>
     /// Test/visibility hook — true once <see cref="BindAsync"/> has successfully started a
@@ -126,6 +156,37 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
         foreach (var (_, server) in bindings)
         {
             await server.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private TenantConnectionCounters TenantCounters(string tenantId) =>
+        _tenantCounters.GetOrAdd(tenantId, static _ => new TenantConnectionCounters());
+
+    private static string NormalizeTenant(string? tenantId) =>
+        string.IsNullOrWhiteSpace(tenantId) ? "default" : tenantId.Trim();
+
+    private sealed class TenantConnectionCounters
+    {
+        private int _active;
+        private long _rejected;
+
+        public int Active => Volatile.Read(ref _active);
+        public long Rejected => Volatile.Read(ref _rejected);
+
+        public void IncrementActive() => Interlocked.Increment(ref _active);
+        public void IncrementRejected() => Interlocked.Increment(ref _rejected);
+
+        public void DecrementActive()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _active);
+                if (current <= 0
+                    || Interlocked.CompareExchange(ref _active, current - 1, current) == current)
+                {
+                    return;
+                }
+            }
         }
     }
 }

@@ -535,7 +535,8 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private bool TryAcquireExternalChannel(int port)
     {
-        if (!_remotePorts.TryAcquireExternalConnection())
+        var tenantId = _context.TenantId;
+        if (!_remotePorts.TryAcquireExternalConnection(tenantId))
         {
             return false;
         }
@@ -544,16 +545,16 @@ internal sealed class NatClientSession : IAsyncDisposable
         {
             if (ReachedLimit(_activeClientExternalChannels, _options.MaxExternalConnectionsPerClient))
             {
-                _remotePorts.ReleaseExternalConnection();
-                _remotePorts.RecordRejectedExternalConnection();
+                _remotePorts.ReleaseExternalConnection(tenantId);
+                _remotePorts.RecordRejectedExternalConnection(tenantId);
                 return false;
             }
 
             _portExternalCounts.TryGetValue(port, out var portCount);
             if (ReachedLimit(portCount, _options.MaxExternalConnectionsPerPort))
             {
-                _remotePorts.ReleaseExternalConnection();
-                _remotePorts.RecordRejectedExternalConnection();
+                _remotePorts.ReleaseExternalConnection(tenantId);
+                _remotePorts.RecordRejectedExternalConnection(tenantId);
                 return false;
             }
 
@@ -585,7 +586,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             }
         }
 
-        _remotePorts.ReleaseExternalConnection();
+        _remotePorts.ReleaseExternalConnection(_context.TenantId);
     }
 
     private static bool ReachedLimit(int current, int max) => max > 0 && current >= max;

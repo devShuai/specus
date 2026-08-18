@@ -30,7 +30,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private const string RelayProbeChangedPort = "changed-port";
     private const string PublicStunRolePrefix = "public-stun:";
 
-    private const string ProbeMagic = "specus-peer-mesh";
+    private const string ProbeMagic = PeerUdpProbeCodec.Magic;
     private const string ProbeTypeCheck = "check";
     private const string ProbeTypeCheckResponse = "check-response";
     private const string NatTypeNoNat = "NO_NAT";
@@ -121,9 +121,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly NatPortMappingService _portMappingService;
     private readonly TurnLongTermAuthenticator _turnAuthenticator = new();
     private readonly NatBehaviorDiscovery _natBehaviorDiscovery = new();
+    private readonly PeerUdpProbeRateLimiter _udpProbeRateLimiter = new();
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
+    private Task? _receiveTask;
+    private Task? _maintenanceTask;
+    private Task? _stopTask;
     private SpecusRuntimeState? _runtime;
     private FrameWriter? _writer;
     private string _runtimeConfigKey = "";
@@ -153,6 +157,28 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _logger = logger;
         _observer = observer;
         _portMappingService = new NatPortMappingService(logger);
+    }
+
+    internal Task? ReceiveTask
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _receiveTask;
+            }
+        }
+    }
+
+    internal Task? MaintenanceTask
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _maintenanceTask;
+            }
+        }
     }
 
     public async Task StartAsync(SpecusRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
@@ -283,9 +309,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         lock (_sync)
         {
             _device = device;
+            if (ReferenceEquals(_cts, cts) && ReferenceEquals(_udp, udp))
+            {
+                _receiveTask = SuperviseReceiveTaskAsync(
+                    ReceiveLoopAsync(udp, cts.Token),
+                    cts.Token,
+                    HandleUnexpectedReceiveExitAsync);
+                _maintenanceTask = MaintenanceLoopAsync(cts.Token);
+            }
         }
-        _ = Task.Run(() => ReceiveLoopAsync(udp, cts.Token), CancellationToken.None);
-        _ = Task.Run(() => MaintenanceLoopAsync(cts.Token), CancellationToken.None);
         await ReportDeviceAsync(runtime, writer, DeviceStatus(), FirstNonEmpty(deviceError, device.Error), "", "", cancellationToken).ConfigureAwait(false);
         await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
         PublishPeerMeshSnapshot();
@@ -530,6 +562,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _udp is not null
         && _cts is not null
         && !_cts.IsCancellationRequested
+        && _receiveTask is { IsCompleted: false }
+        && _maintenanceTask is { IsCompleted: false }
         && _runtime?.PeerMesh.Enabled == true;
 
     private bool ShouldRetryVirtualDeviceStartLocked() =>
@@ -564,8 +598,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             string.Join(',', publicStun));
     }
 
-    private async Task ReceiveLoopAsync(UdpClient udp, CancellationToken cancellationToken)
+    internal Task ReceiveLoopAsync(UdpClient udp, CancellationToken cancellationToken)
+        => ReceiveLoopAsync(udp, cancellationToken, HandleUdpAsync);
+
+    internal async Task ReceiveLoopAsync(
+        UdpClient udp,
+        CancellationToken cancellationToken,
+        Func<byte[], IPEndPoint, Task> handlePacketAsync)
     {
+        ArgumentNullException.ThrowIfNull(udp);
+        ArgumentNullException.ThrowIfNull(handlePacketAsync);
         while (!cancellationToken.IsCancellationRequested)
         {
             UdpReceiveResult result;
@@ -574,10 +616,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 result = await udp.ReceiveAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
             {
                 return;
             }
             catch (ObjectDisposedException)
+                when (cancellationToken.IsCancellationRequested)
             {
                 return;
             }
@@ -586,14 +630,71 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _logger.LogDebug(ex, "Peer Mesh UDP receive reset ignored");
                 continue;
             }
-            catch (SocketException ex)
+            catch (SocketException)
+                when (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogWarning(ex, "Peer Mesh UDP receive failed");
                 return;
             }
-            await HandleUdpAsync(result.Buffer, NormalizePeerEndpoint(result.RemoteEndPoint)).ConfigureAwait(false);
+            try
+            {
+                await handlePacketAsync(result.Buffer, NormalizePeerEndpoint(result.RemoteEndPoint)).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex) when (!IsFatalProcessException(ex))
+            {
+                // UDP is an untrusted datagram boundary. A malformed packet must not fault the
+                // long-lived receive task or disable later direct/TURN traffic.
+                _logger.LogDebug(ex, "Peer Mesh malformed UDP packet dropped: remote={Remote}", result.RemoteEndPoint);
+            }
         }
     }
+
+    internal static async Task SuperviseReceiveTaskAsync(
+        Task receiveTask,
+        CancellationToken cancellationToken,
+        Func<Exception?, Task> onUnexpectedExitAsync)
+    {
+        ArgumentNullException.ThrowIfNull(receiveTask);
+        ArgumentNullException.ThrowIfNull(onUnexpectedExitAsync);
+
+        Exception? failure = null;
+        try
+        {
+            await receiveTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (!IsFatalProcessException(ex))
+        {
+            failure = ex;
+        }
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        await onUnexpectedExitAsync(failure).ConfigureAwait(false);
+    }
+
+    internal async Task HandleUnexpectedReceiveExitAsync(Exception? failure)
+    {
+        if (failure is null)
+        {
+            _logger.LogWarning("Peer Mesh UDP receive loop exited unexpectedly; stopping the current Peer Mesh session");
+        }
+        else
+        {
+            _logger.LogWarning(failure, "Peer Mesh UDP receive loop failed; stopping the current Peer Mesh session");
+        }
+        await StopAsyncCore(receiveLoopInitiated: true).ConfigureAwait(false);
+    }
+
+    private static bool IsFatalProcessException(Exception exception)
+        => exception is OutOfMemoryException or StackOverflowException or AccessViolationException;
 
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
@@ -608,6 +709,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 {
                     lastMaintenance = now;
                     CleanupProbes();
+                    _udpProbeRateLimiter.Cleanup(now.ToUnixTimeMilliseconds());
                     CleanupPendingPackets();
                     await RenewPortMappingIfNeededAsync(cancellationToken).ConfigureAwait(false);
                     await RequestRelayCandidatesAsync().ConfigureAwait(false);
@@ -645,7 +747,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 			}
 			if (binding is not null && SameEndpoint(RelayEndpoint(), remote))
 			{
-				await HandleUdpPayloadAsync(channelData.Payload, remote, EndpointKey(binding.Peer)).ConfigureAwait(false);
+				await HandleUdpPayloadAsync(
+					channelData.Payload,
+					remote,
+					EndpointKey(binding.Peer),
+					binding.Peer.Address).ConfigureAwait(false);
 			}
 			return;
 		}
@@ -660,11 +766,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await HandlePeerDataFrameAsync(payload, remote, "").ConfigureAwait(false);
             return;
         }
-        var probe = JsonSerializer.Deserialize<PeerUdpProbe>(payload, JsonOptions);
-        if (probe?.Magic == ProbeMagic)
-        {
-            await HandleProbeAsync(probe, remote, "").ConfigureAwait(false);
-        }
+        await HandleProbePayloadAsync(payload, remote, "", remote.Address).ConfigureAwait(false);
     }
 
     private async Task HandleStunTurnMessageAsync(StunMessage message, IPEndPoint remote)
@@ -704,7 +806,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 var inner = message.Data();
                 if (peer is not null && inner is not null)
                 {
-                    await HandleUdpPayloadAsync(inner, remote, EndpointKey(peer)).ConfigureAwait(false);
+                    await HandleUdpPayloadAsync(inner, remote, EndpointKey(peer), peer.Address).ConfigureAwait(false);
                 }
                 break;
             case StunMessage.AllocateError:
@@ -1126,15 +1228,33 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
-    private async Task HandleUdpPayloadAsync(byte[] payload, IPEndPoint remote, string relayFrom)
+    private async Task HandleUdpPayloadAsync(
+        byte[] payload,
+        IPEndPoint remote,
+        string relayFrom,
+        IPAddress probeSourceAddress)
     {
         if (PeerDataFrameCodec.LooksLikeDataFrame(payload))
         {
             await HandlePeerDataFrameAsync(payload, remote, relayFrom).ConfigureAwait(false);
             return;
         }
-        var probe = JsonSerializer.Deserialize<PeerUdpProbe>(payload, JsonOptions);
-        if (probe?.Magic == ProbeMagic)
+        await HandleProbePayloadAsync(payload, remote, relayFrom, probeSourceAddress).ConfigureAwait(false);
+    }
+
+    private async Task HandleProbePayloadAsync(
+        byte[] payload,
+        IPEndPoint remote,
+        string relayFrom,
+        IPAddress sourceAddress)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (!_udpProbeRateLimiter.TryAcquire(sourceAddress, now))
+        {
+            return;
+        }
+        var probe = PeerUdpProbeCodec.Decode(payload);
+        if (probe is not null)
         {
             await HandleProbeAsync(probe, remote, relayFrom).ConfigureAwait(false);
         }
@@ -4237,24 +4357,35 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
-    private async Task StopAsync()
+    private Task StopAsync() => StopAsyncCore(receiveLoopInitiated: false);
+
+    private Task StopAsyncCore(bool receiveLoopInitiated)
     {
-        CancellationTokenSource? cts;
-        UdpClient? udp;
-        IPeerVirtualDevice? device;
-        NatPortMapping? portMapping;
-        List<PendingClientMessageAck> pendingMessageAcks;
-        List<PeerMeshSession> sessions;
+        StopState state;
+        TaskCompletionSource<bool> completion;
         lock (_sync)
         {
-            cts = _cts;
-            udp = _udp;
-            device = _device;
-            portMapping = _portMapping;
-            pendingMessageAcks = [.. _pendingMessageAcks.Values];
-            sessions = [.. _sessions.Values.Distinct()];
+            if (_stopTask is not null)
+            {
+                // An external stop owns cleanup and waits for this receive supervisor. Avoid
+                // forming a cycle by awaiting that stop from inside the supervisor itself.
+                return receiveLoopInitiated ? Task.CompletedTask : _stopTask;
+            }
+            completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _stopTask = completion.Task;
+            state = new StopState(
+                _cts,
+                _udp,
+                _receiveTask,
+                _maintenanceTask,
+                _device,
+                _portMapping,
+                [.. _pendingMessageAcks.Values],
+                [.. _sessions.Values.Distinct()]);
             _cts = null;
             _udp = null;
+            _receiveTask = null;
+            _maintenanceTask = null;
             _device = null;
             _runtime = null;
             _writer = null;
@@ -4294,35 +4425,136 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _lastEndpoint = "";
             _keyMaterial = null;
         }
-        foreach (var session in sessions)
+        return CompleteStopAsync(state, completion, receiveLoopInitiated);
+    }
+
+    private async Task CompleteStopAsync(
+        StopState state,
+        TaskCompletionSource<bool> completion,
+        bool receiveLoopInitiated)
+    {
+        try
         {
-            session.DisposeTrafficCodecs();
+            if (state.Cancellation is not null)
+            {
+                try
+                {
+                    await state.Cancellation.CancelAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!IsFatalProcessException(ex))
+                {
+                    _logger.LogDebug(ex, "Peer Mesh cancellation during shutdown failed");
+                }
+            }
+            try
+            {
+                state.Udp?.Dispose();
+            }
+            catch (Exception ex) when (!IsFatalProcessException(ex))
+            {
+                _logger.LogDebug(ex, "Peer Mesh UDP socket dispose failed");
+            }
+
+            if (!receiveLoopInitiated)
+            {
+                await ObserveBackgroundTaskAsync(state.ReceiveTask, "UDP receive").ConfigureAwait(false);
+            }
+            await ObserveBackgroundTaskAsync(state.MaintenanceTask, "maintenance").ConfigureAwait(false);
+
+            foreach (var session in state.Sessions)
+            {
+                try
+                {
+                    session.DisposeTrafficCodecs();
+                }
+                catch (Exception ex) when (!IsFatalProcessException(ex))
+                {
+                    _logger.LogDebug(ex, "Peer Mesh traffic codec dispose failed: session={SessionId}", session.Id);
+                }
+            }
+            foreach (var pending in state.PendingMessageAcks)
+            {
+                pending.Completion.TrySetResult(false);
+            }
+            if (state.Device is not null)
+            {
+                try
+                {
+                    await state.Device.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!IsFatalProcessException(ex))
+                {
+                    _logger.LogDebug(ex, "Peer Mesh virtual device dispose failed");
+                }
+            }
+            if (state.PortMapping is not null)
+            {
+                try
+                {
+                    await _portMappingService.ReleaseMappingAsync(state.PortMapping, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!IsFatalProcessException(ex))
+                {
+                    _logger.LogDebug(ex, "Peer Mesh port mapping release failed");
+                }
+            }
+            state.Cancellation?.Dispose();
+            try
+            {
+                _observer?.OnPeerMeshChanged(SpecusPeerMeshSnapshot.Disabled(_config.PeerMeshDevice, _config.PeerMeshTunName));
+            }
+            catch (Exception ex) when (!IsFatalProcessException(ex))
+            {
+                _logger.LogDebug(ex, "Peer Mesh observer failed during shutdown");
+            }
         }
-        foreach (var pending in pendingMessageAcks)
+        finally
         {
-            pending.Completion.TrySetResult(false);
+            completion.TrySetResult(true);
+            lock (_sync)
+            {
+                if (ReferenceEquals(_stopTask, completion.Task))
+                {
+                    _stopTask = null;
+                }
+            }
         }
-        if (cts is not null)
+    }
+
+    private async Task ObserveBackgroundTaskAsync(Task? task, string taskName)
+    {
+        if (task is null)
         {
-            await cts.CancelAsync().ConfigureAwait(false);
-            cts.Dispose();
+            return;
         }
-        udp?.Dispose();
-        if (device is not null)
+        try
         {
-            await device.DisposeAsync().ConfigureAwait(false);
+            await task.ConfigureAwait(false);
         }
-        if (portMapping is not null)
+        catch (OperationCanceledException)
         {
-            await _portMappingService.ReleaseMappingAsync(portMapping, CancellationToken.None).ConfigureAwait(false);
+            // Normal shutdown.
         }
-        _observer?.OnPeerMeshChanged(SpecusPeerMeshSnapshot.Disabled(_config.PeerMeshDevice, _config.PeerMeshTunName));
+        catch (Exception ex) when (!IsFatalProcessException(ex))
+        {
+            _logger.LogWarning(ex, "Peer Mesh {TaskName} task failed during shutdown", taskName);
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
     }
+
+    private sealed record StopState(
+        CancellationTokenSource? Cancellation,
+        UdpClient? Udp,
+        Task? ReceiveTask,
+        Task? MaintenanceTask,
+        IPeerVirtualDevice? Device,
+        NatPortMapping? PortMapping,
+        List<PendingClientMessageAck> PendingMessageAcks,
+        List<PeerMeshSession> Sessions);
 
     private void PublishPeerMeshSnapshot()
     {
@@ -4530,6 +4762,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     }
 
     private sealed record PendingProbe(long SessionId, long PeerId, DateTimeOffset SentAt, bool Relay, string? RelayId);
+
+    internal sealed record PeerUdpProbe(
+        [property: JsonPropertyName("magic")] string? Magic,
+        [property: JsonPropertyName("type")] string? Type,
+        [property: JsonPropertyName("sessionId")] long SessionId,
+        [property: JsonPropertyName("fromClientId")] long FromClientId,
+        [property: JsonPropertyName("toClientId")] long ToClientId,
+        [property: JsonPropertyName("nonce")] string Nonce,
+        [property: JsonPropertyName("token")] string? Token,
+        [property: JsonPropertyName("sentAtMillis")] long SentAtMillis);
 
     private sealed record PendingStunBinding(
         string Role,
@@ -4789,13 +5031,4 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             writer.WriteNumberValue(value);
     }
 
-    private sealed record PeerUdpProbe(
-        [property: JsonPropertyName("magic")] string? Magic,
-        [property: JsonPropertyName("type")] string? Type,
-        [property: JsonPropertyName("sessionId")] long SessionId,
-        [property: JsonPropertyName("fromClientId")] long FromClientId,
-        [property: JsonPropertyName("toClientId")] long ToClientId,
-        [property: JsonPropertyName("nonce")] string Nonce,
-        [property: JsonPropertyName("token")] string? Token,
-        [property: JsonPropertyName("sentAtMillis")] long SentAtMillis);
 }

@@ -56,6 +56,9 @@ public sealed class SpecusConnectionContext
 
     public string? ConnectionRole { get; private set; }
 
+    /// <summary>Tenant established by the authenticated account. Anonymous contexts stay default.</summary>
+    public string TenantId { get; private set; } = "default";
+
     /// <summary>Audit row id populated only on a successful login. Null → close path skips DB write.</summary>
     public long? ConnectionRecordId { get; set; }
 
@@ -73,12 +76,13 @@ public sealed class SpecusConnectionContext
     }
 
     public void OnLoginSuccess(string clientName, long loginTimeMs, long? clientSessionId = null,
-        string connectionRole = Specus.Protocol.ConnectionRole.Control)
+        string connectionRole = Specus.Protocol.ConnectionRole.Control, string? tenantId = null)
     {
         ClientName = clientName;
         LoginTimeMs = loginTimeMs;
         ClientSessionId = clientSessionId;
         ConnectionRole = connectionRole;
+        TenantId = string.IsNullOrWhiteSpace(tenantId) ? "default" : tenantId.Trim();
     }
 
     /// <summary>Returns true on the FIRST stamp; subsequent attempts are silently ignored so

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 	using System.Text.Json;
@@ -27,6 +28,7 @@ public sealed class StunTurnServer : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<StunTurnServer> _logger;
     private readonly TurnCredentialService _turnCredentials;
+    private readonly Func<IPEndPoint, UdpClient> _socketFactory;
     private readonly ConcurrentDictionary<string, Allocation> _allocations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _allocationByEndpoint = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _allocationByRelayEndpoint = new(StringComparer.Ordinal);
@@ -39,12 +41,25 @@ public sealed class StunTurnServer : BackgroundService
 
     public StunTurnServer(IOptions<PeerMeshOptions> options, IServiceScopeFactory scopeFactory,
         ILogger<StunTurnServer> logger, TurnCredentialService? turnCredentials = null)
+        : this(options, scopeFactory, logger,
+            static endpoint => new UdpClient(endpoint), turnCredentials)
+    {
+    }
+
+    internal StunTurnServer(IOptions<PeerMeshOptions> options, IServiceScopeFactory scopeFactory,
+        ILogger<StunTurnServer> logger, Func<IPEndPoint, UdpClient> socketFactory,
+        TurnCredentialService? turnCredentials = null)
     {
         _options = options.Value;
         _scopeFactory = scopeFactory;
         _logger = logger;
+        _socketFactory = socketFactory ?? throw new ArgumentNullException(nameof(socketFactory));
         _turnCredentials = turnCredentials ?? new TurnCredentialService(options);
     }
+
+    internal IPEndPoint? PrimaryLocalEndpoint => _primary?.Client.LocalEndPoint as IPEndPoint;
+
+    internal IPEndPoint? AlternateLocalEndpoint => _alternate?.Client.LocalEndPoint as IPEndPoint;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -55,7 +70,7 @@ public sealed class StunTurnServer : BackgroundService
 
         try
         {
-            _primary = new UdpClient(new IPEndPoint(IPAddress.Any, _options.StunTurnPort));
+            _primary = _socketFactory(new IPEndPoint(IPAddress.Any, _options.StunTurnPort));
         }
         catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
         {
@@ -76,7 +91,7 @@ public sealed class StunTurnServer : BackgroundService
         {
             try
             {
-                _alternate = new UdpClient(new IPEndPoint(IPAddress.Any, alternatePort));
+                _alternate = _socketFactory(new IPEndPoint(IPAddress.Any, alternatePort));
                 tasks.Add(SuperviseReceiveLoopAsync(() => _alternate, "alternate", stoppingToken));
                 _logger.LogInformation("[peer-mesh] standard STUN alternate UDP port listening on {Port}",
                     alternatePort);
@@ -358,6 +373,23 @@ public sealed class StunTurnServer : BackgroundService
         // change-port is answerable; we listen on a single address, so change-IP is not. Honour what
         // we can and reject the rest explicitly instead of silently replying from the wrong socket,
         // which would make the client's NAT classification wrong.
+        var changeAttribute = request.First(StunMessage.AttrChangeRequest);
+        if (changeAttribute is not null)
+        {
+            if (changeAttribute.Value.Length != 4)
+            {
+                await SendErrorAsync(receiveSocket, remote, request, StunMessage.BindingError, 400,
+                    "invalid-change-request").ConfigureAwait(false);
+                return;
+            }
+            var flags = BinaryPrimitives.ReadUInt32BigEndian(changeAttribute.Value);
+            if ((flags & ~0x06U) != 0)
+            {
+                await SendErrorAsync(receiveSocket, remote, request, StunMessage.BindingError, 400,
+                    "invalid-change-request-flags").ConfigureAwait(false);
+                return;
+            }
+        }
         var change = request.ChangeRequest();
         var responseSocket = receiveSocket;
         if (change.ChangeIp)

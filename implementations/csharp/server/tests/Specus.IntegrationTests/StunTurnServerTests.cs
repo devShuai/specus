@@ -15,6 +15,62 @@ namespace Specus.IntegrationTests;
 public sealed class StunTurnServerTests
 {
     [Fact]
+    public async Task EmbeddedServerHandlesBindingChangePortAndRejectsChangeIpOverRealUdp()
+    {
+        using var fixture = StunTurnFixture.Create(new PeerMeshOptions
+        {
+            Enabled = true,
+            PublicAddress = IPAddress.Loopback.ToString(),
+            StunTurnPort = 3478,
+            NatProbeAlternatePort = 3479,
+            AllocationTtlSeconds = 60,
+        }, static _ => ListenUdp());
+        await fixture.StartAsync();
+        try
+        {
+            using var source = ListenUdp();
+            var primary = fixture.PrimaryLocalEndpoint;
+            var alternate = fixture.AlternateLocalEndpoint;
+            Assert.NotEqual(primary.Port, alternate.Port);
+
+            var ordinary = await SendAndReceiveAsync(source, primary,
+                StunMessage.Of(StunMessage.BindingRequest, StunMessage.NewTransactionId()));
+            Assert.Equal(StunMessage.BindingSuccess, ordinary.Message.Type);
+            Assert.Equal(primary.Port, ordinary.Source.Port);
+            Assert.Equal(Remote(source), ordinary.Message.XorMappedAddress());
+
+            var changePort = await SendAndReceiveAsync(source, primary,
+                StunMessage.Of(StunMessage.BindingRequest, StunMessage.NewTransactionId(),
+                    StunMessage.ChangeRequest(changeIp: false, changePort: true)));
+            Assert.Equal(StunMessage.BindingSuccess, changePort.Message.Type);
+            Assert.Equal(alternate.Port, changePort.Source.Port);
+
+            var changeIp = await SendAndReceiveAsync(source, primary,
+                StunMessage.Of(StunMessage.BindingRequest, StunMessage.NewTransactionId(),
+                    StunMessage.ChangeRequest(changeIp: true, changePort: false)));
+            Assert.Equal(StunMessage.BindingError, changeIp.Message.Type);
+            Assert.Equal(primary.Port, changeIp.Source.Port);
+            Assert.Equal(420, ErrorCode(changeIp.Message));
+
+            var malformed = await SendAndReceiveAsync(source, primary,
+                StunMessage.Of(StunMessage.BindingRequest, StunMessage.NewTransactionId(),
+                    new StunAttribute(StunMessage.AttrChangeRequest, [0x02])));
+            Assert.Equal(StunMessage.BindingError, malformed.Message.Type);
+            Assert.Equal(400, ErrorCode(malformed.Message));
+
+            var unknownFlags = await SendAndReceiveAsync(source, primary,
+                StunMessage.Of(StunMessage.BindingRequest, StunMessage.NewTransactionId(),
+                    new StunAttribute(StunMessage.AttrChangeRequest, [0, 0, 0, 1])));
+            Assert.Equal(StunMessage.BindingError, unknownFlags.Message.Type);
+            Assert.Equal(400, ErrorCode(unknownFlags.Message));
+        }
+        finally
+        {
+            await fixture.StopAsync();
+        }
+    }
+
+    [Fact]
     public async Task AllocateRequiresAndAcceptsJavaCompatibleTurnCredentials()
     {
         using var fixture = StunTurnFixture.Create();
@@ -146,6 +202,24 @@ public sealed class StunTurnServerTests
             ?? throw new InvalidOperationException("STUN packet expected");
     }
 
+    private static async Task<(StunMessage Message, IPEndPoint Source)> SendAndReceiveAsync(
+        UdpClient socket, IPEndPoint target, StunMessage request)
+    {
+        var bytes = request.ToBytes();
+        await socket.SendAsync(bytes, target);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var response = await socket.ReceiveAsync(cts.Token);
+        return (StunMessage.Parse(response.Buffer)
+                ?? throw new InvalidOperationException("STUN packet expected"),
+            response.RemoteEndPoint);
+    }
+
+    private static int? ErrorCode(StunMessage message)
+    {
+        var value = message.First(StunMessage.AttrErrorCode)?.Value;
+        return value is { Length: >= 4 } ? value[2] * 100 + value[3] : null;
+    }
+
     private static async Task<byte[]> ReadBytesAsync(UdpClient socket) =>
         await TryReadBytesAsync(socket) ?? throw new InvalidOperationException("UDP payload expected");
 
@@ -178,10 +252,11 @@ public sealed class StunTurnServerTests
         private Type AllocationType => typeof(StunTurnServer).GetNestedType("Allocation", BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("Allocation type not found");
 
-        public static StunTurnFixture Create()
+        public static StunTurnFixture Create(PeerMeshOptions? configured = null,
+            Func<IPEndPoint, UdpClient>? socketFactory = null)
         {
             var services = new ServiceCollection();
-            var peerOptions = Options.Create(new PeerMeshOptions
+            var peerOptions = Options.Create(configured ?? new PeerMeshOptions
             {
                 Enabled = true,
                 StunTurnPort = 3478,
@@ -192,12 +267,39 @@ public sealed class StunTurnServerTests
             services.AddSingleton<ILogger<PeerMeshService>>(NullLogger<PeerMeshService>.Instance);
             services.AddScoped<PeerMeshService>();
             var provider = services.BuildServiceProvider();
-            var server = new StunTurnServer(
-                peerOptions,
-                provider.GetRequiredService<IServiceScopeFactory>(),
-                NullLogger<StunTurnServer>.Instance);
+            var server = socketFactory is null
+                ? new StunTurnServer(
+                    peerOptions,
+                    provider.GetRequiredService<IServiceScopeFactory>(),
+                    NullLogger<StunTurnServer>.Instance)
+                : new StunTurnServer(
+                    peerOptions,
+                    provider.GetRequiredService<IServiceScopeFactory>(),
+                    NullLogger<StunTurnServer>.Instance,
+                    socketFactory);
             return new StunTurnFixture(provider, server);
         }
+
+        public async Task StartAsync()
+        {
+            await Server.StartAsync(CancellationToken.None);
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+            while ((Server.PrimaryLocalEndpoint is null || Server.AlternateLocalEndpoint is null)
+                   && DateTimeOffset.UtcNow < deadline)
+            {
+                await Task.Delay(10);
+            }
+            _ = PrimaryLocalEndpoint;
+            _ = AlternateLocalEndpoint;
+        }
+
+        public Task StopAsync() => Server.StopAsync(CancellationToken.None);
+
+        public IPEndPoint PrimaryLocalEndpoint => Server.PrimaryLocalEndpoint
+            ?? throw new InvalidOperationException("primary STUN socket was not started");
+
+        public IPEndPoint AlternateLocalEndpoint => Server.AlternateLocalEndpoint
+            ?? throw new InvalidOperationException("alternate STUN socket was not started");
 
         public object Allocate(IPEndPoint remote) => Invoke("Allocate", remote, CancellationToken.None)
             ?? throw new InvalidOperationException("Allocate returned null");

@@ -33,7 +33,7 @@ public sealed class ConnectionRecordService
         var now = DateTimeOffset.UtcNow;
         var record = new ConnectionRecord
         {
-            TenantId = result.Account?.TenantId ?? "default",
+            TenantId = result.AuditTenantId,
             ClientId = result.Account?.Id,
             ClientName = clientName,
             ChannelId = channelId,

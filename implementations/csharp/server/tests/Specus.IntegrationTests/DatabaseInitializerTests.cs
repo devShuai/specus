@@ -29,6 +29,55 @@ public sealed class DatabaseInitializerTests
     }
 
     [Fact]
+    public void BackfillConnectionRecordTenantSqlQuotesPostgresPascalCaseId()
+    {
+        var sql = BuildConnectionRecordTenantBackfillSql("Npgsql.EntityFrameworkCore.PostgreSQL");
+
+        Assert.Contains("c.\"Id\" = specus_connection_record.client_id", sql);
+        Assert.DoesNotContain("c.Id = specus_connection_record.client_id", sql);
+    }
+
+    [Fact]
+    public async Task BackfillConnectionRecordTenantMapsKnownClientsAndDefaultsAnonymousFailures()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = CreateContext(connection);
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE specus_client_account (
+              Id INTEGER PRIMARY KEY,
+              tenant_id TEXT NOT NULL
+            );
+            CREATE TABLE specus_connection_record (
+              id INTEGER PRIMARY KEY,
+              client_id INTEGER,
+              tenant_id TEXT
+            );
+            INSERT INTO specus_client_account (Id, tenant_id) VALUES (10, 'tenant-a');
+            INSERT INTO specus_connection_record (id, client_id, tenant_id) VALUES
+              (1, 10, NULL),
+              (2, NULL, '   '),
+              (3, NULL, 'tenant-b');
+            """);
+
+        await DatabaseInitializer.BackfillConnectionRecordTenantAsync(db, CancellationToken.None);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT id, tenant_id FROM specus_connection_record ORDER BY id";
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1, reader.GetInt64(0));
+        Assert.Equal("tenant-a", reader.GetString(1));
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(2, reader.GetInt64(0));
+        Assert.Equal("default", reader.GetString(1));
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(3, reader.GetInt64(0));
+        Assert.Equal("tenant-b", reader.GetString(1));
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
     public async Task StartupCompatibilityAddsAndBackfillsPeerMeshAclDirection()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -174,6 +223,15 @@ public sealed class DatabaseInitializerTests
     {
         var method = typeof(DatabaseInitializer).GetMethod(
             "BuildConnectionStatTenantBackfillSql",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+        return Assert.IsType<string>(method.Invoke(null, [providerName]));
+    }
+
+    private static string BuildConnectionRecordTenantBackfillSql(string providerName)
+    {
+        var method = typeof(DatabaseInitializer).GetMethod(
+            "BuildConnectionRecordTenantBackfillSql",
             BindingFlags.NonPublic | BindingFlags.Static);
         Assert.NotNull(method);
         return Assert.IsType<string>(method.Invoke(null, [providerName]));

@@ -288,14 +288,16 @@ public sealed class PeerMeshService
     {
         var primaryHost = ResolveStunHost(requestHost);
         var primaryPort = StunPort();
-        var alternateHost = NormalizeHost(
-            string.IsNullOrWhiteSpace(_options.StandaloneStunAlternateAddress)
-                ? _options.StunAlternatePublicAddress
-                : _options.StandaloneStunAlternateAddress);
-        var alternatePort = _options.StandaloneStunAlternatePort > 0
-            ? _options.StandaloneStunAlternatePort
-            : _options.NatProbeAlternatePort;
-        var rfc5780 = !string.IsNullOrWhiteSpace(primaryHost)
+        // The embedded service binds one address on two ports. A configured advertised address
+        // cannot turn that into the four independently reachable sockets RFC 5780 requires.
+        // Only the explicit standalone deployment owns two addresses and two ports.
+        var standalone = HasStandaloneStun();
+        var alternateHost = standalone
+            ? NormalizeHost(_options.StandaloneStunAlternateAddress)
+            : string.Empty;
+        var alternatePort = standalone ? _options.StandaloneStunAlternatePort : 0;
+        var rfc5780 = standalone
+            && !string.IsNullOrWhiteSpace(primaryHost)
             && !string.IsNullOrWhiteSpace(alternateHost)
             && !string.Equals(primaryHost, alternateHost, StringComparison.OrdinalIgnoreCase)
             && primaryPort > 0 && alternatePort > 0 && primaryPort != alternatePort;

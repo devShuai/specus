@@ -117,6 +117,50 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public async Task EmbeddedNatProbeNeverAdvertisesRfc5780FromPublicAlternateAddress()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync(
+            publicAddress: "stun-primary.example.com",
+            stunTurnPort: 3478,
+            stunAlternatePublicAddress: "stun-alternate.example.com",
+            natProbeAlternatePort: 3479);
+
+        var config = fixture.Service.PublicNatProbeConfig("ignored.example.com");
+
+        Assert.True(config.Available);
+        Assert.Equal("BASIC_STUN", config.DiscoveryMethod);
+        Assert.Collection(config.Endpoints,
+            endpoint => Assert.Equal("A1P1", endpoint.Id));
+        Assert.True(config.Capabilities.Binding);
+        Assert.False(config.Capabilities.ChangeRequest);
+        Assert.False(config.Capabilities.ResponseOrigin);
+        Assert.False(config.Capabilities.OtherAddress);
+        Assert.False(config.Capabilities.ResponsePort);
+        Assert.False(config.Capabilities.Padding);
+    }
+
+    [Fact]
+    public async Task ExplicitStandaloneTwoAddressTopologyAdvertisesFourRfc5780Endpoints()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync(
+            standaloneStunAddress: "stun-primary.example.com",
+            standaloneStunPort: 3478,
+            standaloneStunAlternateAddress: "stun-alternate.example.com",
+            standaloneStunAlternatePort: 3479);
+
+        var config = fixture.Service.PublicNatProbeConfig("ignored.example.com");
+
+        Assert.Equal("RFC5780", config.DiscoveryMethod);
+        Assert.Equal(new[] { "A1P1", "A1P2", "A2P1", "A2P2" },
+            config.Endpoints.Select(endpoint => endpoint.Id));
+        Assert.True(config.Capabilities.ChangeRequest);
+        Assert.True(config.Capabilities.ResponseOrigin);
+        Assert.True(config.Capabilities.OtherAddress);
+        Assert.True(config.Capabilities.ResponsePort);
+        Assert.True(config.Capabilities.Padding);
+    }
+
+    [Fact]
     public async Task DeviceReportPersistsNatBehaviorFields()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();
@@ -735,7 +779,9 @@ public sealed class PeerMeshServiceTests
             string standaloneStunAlternateAddress = "",
             int standaloneStunAlternatePort = 0,
             bool enabled = true,
-            int stunTurnPort = 3478)
+            int stunTurnPort = 3478,
+            string stunAlternatePublicAddress = "",
+            int natProbeAlternatePort = 3479)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -755,6 +801,8 @@ public sealed class PeerMeshServiceTests
                 StandaloneStunPort = standaloneStunPort,
                 StandaloneStunAlternateAddress = standaloneStunAlternateAddress,
                 StandaloneStunAlternatePort = standaloneStunAlternatePort,
+                StunAlternatePublicAddress = stunAlternatePublicAddress,
+                NatProbeAlternatePort = natProbeAlternatePort,
                 PublicStunServers = publicStunServers?.ToList() ?? [],
                 SessionTtlSeconds = 3600,
             }), NullLogger<PeerMeshService>.Instance);
