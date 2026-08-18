@@ -167,9 +167,11 @@ jobs:
           npm --prefix apps/admin-web run deploy:java
 
       - name: Package Java modules
+        # -Drevision feeds the client pom's ${revision}; the jar manifest then reports the release
+        # version, which is what the login handshake sends.
         run: >-
           mvn -pl implementations/java/server,implementations/java/client,implementations/java/stun-server -am
-          -DskipTests -Dspecus.server.web.skip=true clean package
+          -DskipTests -Dspecus.server.web.skip=true -Drevision="${RELEASE_VERSION#v}" clean package
 
       - name: Rename and checksum
         run: |
@@ -177,7 +179,7 @@ jobs:
           dist="release-dist/java"
           mkdir -p "$dist"
           cp implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar "$dist/specus-server-java-$RELEASE_VERSION.jar"
-          cp implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-exec.jar "$dist/specus-client-java-$RELEASE_VERSION.jar"
+          cp "implementations/java/client/target/specus-client-${RELEASE_VERSION#v}-exec.jar" "$dist/specus-client-java-$RELEASE_VERSION.jar"
           cp implementations/java/stun-server/target/stun-server.jar "$dist/specus-stun-server-java-$RELEASE_VERSION.jar"
           (cd "$dist" && sha256sum -- *.jar > SHA256SUMS.txt)
 
@@ -245,7 +247,7 @@ jobs:
       - name: Publish .NET client
         run: >-
           dotnet publish implementations/csharp/client/src/Specus.Client
-          -c Release -o out/specus-client-csharp
+          -c Release -p:Version="${RELEASE_VERSION#v}" -o out/specus-client-csharp
 
       - name: Package archive
         run: |
@@ -277,7 +279,7 @@ jobs:
         shell: bash
         run: >-
           dotnet publish implementations/csharp/client/src/Specus.Client.Desktop/Specus.Client.Desktop.csproj
-          -r win-x64 -c Release
+          -r win-x64 -c Release -p:Version="${RELEASE_VERSION#v}"
           -p:SelfContained=true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true
           -o out/specus-desktop
 

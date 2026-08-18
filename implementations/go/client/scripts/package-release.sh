@@ -62,8 +62,10 @@ for target in "${TARGETS[@]}"; do
   [ "${goos}" = "windows" ] && bin="${BINARY}.exe"
 
   echo "==> build ${platform}/${arch} (${goos}/${goarch})"
+  # The release tag is the single source of truth for the version: inject it instead of
+  # committing it, so `--version` and the login handshake report the packaged build.
   CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-    go build -trimpath -ldflags "-s -w" \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION#v}" \
     -o "${stage}/${bin}" ./cmd/specus-client
 
   cp client.example.jsonc "${stage}/"

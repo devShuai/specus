@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +52,24 @@ type clientMessageCapabilities struct {
 }
 
 var authHTTPClient = &http.Client{Timeout: 20 * time.Second}
+
+// clientVersion is reported to the server during the login handshake. The binary sets it from the
+// version injected at package time; it stays empty for embedders that never call SetVersion, which
+// matches the previous wire behaviour.
+var clientVersion atomic.Pointer[string]
+
+// SetVersion records the version this build reports to the server.
+func SetVersion(value string) {
+	normalized := strings.TrimSpace(value)
+	clientVersion.Store(&normalized)
+}
+
+func currentClientVersion() string {
+	if value := clientVersion.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
 
 func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 	environment := collectEnvironment()
@@ -126,7 +145,7 @@ func collectEnvironment() clientEnvironmentInfo {
 		OSUser:             username,
 		OSName:             runtime.GOOS,
 		OSArch:             runtime.GOARCH,
-		ClientVersion:      "",
+		ClientVersion:      currentClientVersion(),
 		JavaVersion:        "",
 		PeerPublicKey:      peerPublicKeyBase64(),
 		ClientMessageCapabilities: clientMessageCapabilities{

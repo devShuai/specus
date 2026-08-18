@@ -825,7 +825,8 @@ public final class SpecusCore {
             info.osName = "Android";
             info.osVersion = Build.VERSION.RELEASE;
             info.osArch = System.getProperty("os.arch", "");
-            info.clientVersion = "android-0.1.0";
+            // Reported version follows the build, not a constant that drifts from releases.
+            info.clientVersion = "android-" + BuildConfig.VERSION_NAME;
             info.javaVersion = System.getProperty("java.version", "");
             info.peerPublicKey = PeerMeshEngine.KeyStore.publicKeyBase64(context);
             info.clientMessageCapabilities = ClientMessageCapabilities.androidDefault();

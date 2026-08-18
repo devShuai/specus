@@ -6,6 +6,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+    <!-- Release packaging overrides this with -p:Version=<tag without v>; the
+         checked-in default only shows up in local builds. -->
+    <Version>0.0.0-dev</Version>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <RootNamespace>Specus.Client</RootNamespace>
     <AssemblyName>specus-client</AssemblyName>

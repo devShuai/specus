@@ -14,6 +14,12 @@ android {
         versionName "0.1.0"
     }
 
+    buildFeatures {
+        // The handshake reports BuildConfig.VERSION_NAME, so the generated class must exist
+        // (AGP 8 no longer emits it by default).
+        buildConfig true
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
