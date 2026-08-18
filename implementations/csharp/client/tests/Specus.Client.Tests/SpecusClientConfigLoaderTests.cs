@@ -153,6 +153,26 @@ public sealed class SpecusClientConfigLoaderTests
     }
 
     [Fact]
+    public void CollectedEnvironmentUsesExplicitDesktopAttachmentOverride()
+    {
+        var environment = ClientEnvironmentInfo.Collect(
+            NullLogger.Instance,
+            ClientMessageCapabilities.DesktopFileTransfer());
+
+        Assert.True(environment.ClientMessageCapabilities.Attachments);
+        Assert.Equal(
+            ClientMessageCapabilities.DesktopMaxAttachmentBytes,
+            environment.ClientMessageCapabilities.MaxAttachmentBytes);
+
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(environment));
+        var capabilities = json.RootElement.GetProperty("clientMessageCapabilities");
+        Assert.True(capabilities.GetProperty("attachments").GetBoolean());
+        Assert.Equal(
+            ClientMessageCapabilities.DesktopMaxAttachmentBytes,
+            capabilities.GetProperty("maxAttachmentBytes").GetInt64());
+    }
+
+    [Fact]
     public void NatControlSnapshotDistinguishesMissingAndEmptyHttpRoutesLikeJava()
     {
         var missing = JsonSerializer.Deserialize<SpecusConfigSnapshot>(

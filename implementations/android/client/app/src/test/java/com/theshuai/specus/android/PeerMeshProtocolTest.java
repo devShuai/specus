@@ -1,5 +1,6 @@
 package com.theshuai.specus.android;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
@@ -9,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -19,6 +21,63 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class PeerMeshProtocolTest {
+    @Test
+    public void directSenderUsesAuthenticatedRosterIdentityOnly() {
+        assertEquals("Alice", PeerMeshEngine.trustedDirectSender(" Alice "));
+        assertNull(PeerMeshEngine.trustedDirectSender(" "));
+        assertEquals("Alice", PeerMeshEngine.trustedDirectSender(
+                "Alice", 42L, 42L, "Mallory"));
+        assertEquals("Alice", PeerMeshEngine.trustedDirectSender(
+                "Alice", 42L, 0L, "Mallory"));
+        assertNull(PeerMeshEngine.trustedDirectSender(
+                "Alice", 42L, 7L, "Alice"));
+    }
+
+    @Test
+    public void fileCapabilityGateRejectsLegacyDisabledAndOversizedTargets() {
+        PeerMeshEngine.TargetMessageCapabilities supported =
+                new PeerMeshEngine.TargetMessageCapabilities(true, true, true, 8L * 1024 * 1024);
+        assertNull(supported.rejectionReason(8L * 1024 * 1024));
+
+        PeerMeshEngine.TargetMessageCapabilities javaOrLegacy =
+                new PeerMeshEngine.TargetMessageCapabilities(true, true, false, 0L);
+        assertTrue(javaOrLegacy.rejectionReason(1L).contains("Java"));
+
+        PeerMeshEngine.TargetMessageCapabilities receiveDisabled =
+                new PeerMeshEngine.TargetMessageCapabilities(true, false, true, 8L * 1024 * 1024);
+        assertTrue(receiveDisabled.rejectionReason(1L).contains("消息接收"));
+
+        assertTrue(supported.rejectionReason(8L * 1024 * 1024 + 1L).contains("8.0 MB"));
+        assertTrue(new PeerMeshEngine.TargetMessageCapabilities(false, true, true, Long.MAX_VALUE)
+                .rejectionReason(1L).contains("不在线"));
+    }
+
+    @Test
+    public void caseDistinctRosterTargetsKeepExactCapabilitiesAndRouting() throws Exception {
+        JSONArray roster = new JSONArray()
+                .put(new JSONObject()
+                        .put("clientName", "alice")
+                        .put("online", true)
+                        .put("messageReceiveCapable", true)
+                        .put("messageAttachmentsCapable", false)
+                        .put("messageMaxAttachmentBytes", 0L))
+                .put(new JSONObject()
+                        .put("clientName", "ALICE")
+                        .put("online", true)
+                        .put("messageReceiveCapable", true)
+                        .put("messageAttachmentsCapable", true)
+                        .put("messageMaxAttachmentBytes", 1024L));
+
+        Map<String, PeerMeshEngine.TargetMessageCapabilities> capabilities =
+                PeerMeshEngine.parseAuthoritativeMessageCapabilities(roster);
+
+        assertEquals(2, capabilities.size());
+        assertNotNull(capabilities.get("alice").rejectionReason(1L));
+        assertNull(capabilities.get("ALICE").rejectionReason(1L));
+        assertTrue(PeerMeshEngine.clientNamesMatch(" alice ", "alice"));
+        assertFalse(PeerMeshEngine.clientNamesMatch("alice", "ALICE"));
+    }
+
     @Test
     public void spm2FrameRoundTripsAndAuthenticatesHeaderAndCiphertext() throws Exception {
         byte[] key = new byte[32];

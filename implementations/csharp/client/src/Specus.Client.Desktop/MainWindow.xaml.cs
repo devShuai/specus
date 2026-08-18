@@ -233,12 +233,17 @@ public partial class MainWindow : Window
 
         var filePath = dialog.FileName;
         var cancellationToken = _clientCts?.Token ?? CancellationToken.None;
-        AppendLog(LogLevel.Information, "desktop", $"文件发送开始: {Path.GetFileName(filePath)} -> {target}", null);
         try
         {
             await _transferManager.SendFileAsync(
                 target,
                 filePath,
+                (to, size) =>
+                {
+                    client.EnsureAttachmentTargetCanReceive(to, size);
+                    AppendLog(LogLevel.Information, "desktop",
+                        $"文件发送开始: {Path.GetFileName(filePath)} -> {to}", null);
+                },
                 (to, body, ct) => client.SendClientMessageAsync(to, body, ct, publishLocalEcho: false),
                 cancellationToken).ConfigureAwait(false);
         }
@@ -369,7 +374,8 @@ public partial class MainWindow : Window
         var auth = new ClientAuthService(
             config,
             _authHttpClient,
-            _loggerFactory.CreateLogger<ClientAuthService>());
+            _loggerFactory.CreateLogger<ClientAuthService>(),
+            ClientMessageCapabilities.DesktopFileTransfer());
         var forwarder = new DirectHttpForwarder(_routeHttpClient);
         _client = new SpecusControlClient(config, auth, forwarder, _loggerFactory, _observer);
         _running = true;
@@ -815,7 +821,8 @@ public partial class MainWindow : Window
         {
             return true;
         }
-        return MessagePeerRoutes.Any(peer => string.Equals(peer.ClientName, target, StringComparison.OrdinalIgnoreCase));
+        return MessagePeerRoutes.Any(peer =>
+            string.Equals(peer.ClientName?.Trim(), target, StringComparison.Ordinal));
     }
 
     private void UpdatePeerMeshStatusBrush()

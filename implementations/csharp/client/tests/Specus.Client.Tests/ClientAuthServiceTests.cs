@@ -15,4 +15,28 @@ public sealed class ClientAuthServiceTests
         Assert.Equal(TimeSpan.FromSeconds(20), client.Timeout);
         Assert.False(handler.AllowAutoRedirect);
     }
+
+    [Fact]
+    public void HeadlessClientDefaultsToTextOnlyCapability()
+    {
+        var capabilities = ClientMessageCapabilities.TextOnlyDefault();
+
+        Assert.True(capabilities.SendMessages);
+        Assert.True(capabilities.ReceiveMessages);
+        Assert.False(capabilities.Attachments);
+        Assert.False(capabilities.MediaPreview);
+        Assert.Equal(0, capabilities.MaxAttachmentBytes);
+    }
+
+    [Fact]
+    public void DesktopCanExplicitlyAdvertiseVerifiedStxferReceiveCapability()
+    {
+        var capabilities = ClientMessageCapabilities.DesktopFileTransfer();
+
+        Assert.True(capabilities.SendMessages);
+        Assert.True(capabilities.ReceiveMessages);
+        Assert.True(capabilities.Attachments);
+        Assert.False(capabilities.MediaPreview);
+        Assert.Equal(ClientMessageCapabilities.DesktopMaxAttachmentBytes, capabilities.MaxAttachmentBytes);
+    }
 }

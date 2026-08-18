@@ -156,6 +156,25 @@ public sealed class SpecusControlClient : IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Rejects attachment transfer before any STXFER1 frame is sent unless the authoritative
+    /// server roster says the online target can receive a file of this size. Text messages do not
+    /// use this gate and remain compatible with Java and older clients.
+    /// </summary>
+    public void EnsureAttachmentTargetCanReceive(string toClientName, long sizeBytes)
+    {
+        var target = toClientName.Trim();
+        if (target.Length == 0)
+        {
+            throw new ArgumentException("目标客户端不能为空。", nameof(toClientName));
+        }
+        var rejection = _peerMesh.GetAttachmentTransferRejectionReason(target, sizeBytes);
+        if (rejection is not null)
+        {
+            throw new InvalidOperationException(rejection);
+        }
+    }
+
     /// <summary>Runs the reconnect loop until cancellation; never returns success.</summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -575,16 +594,9 @@ public sealed class SpecusControlClient : IAsyncDisposable
     private void ApplyClientMessage(MessageResponsePacket message)
     {
         var runtime = _runtime;
-        var from = FirstNonEmpty(message.ClientName, "server");
-        var rawBody = message.Message ?? "";
-        var bytes = System.Text.Encoding.UTF8.GetBytes(rawBody);
-        if (PeerAppMessageCodec.LooksLike(bytes) && PeerAppMessageCodec.TryDecode(bytes, out var envelope))
-        {
-            from = FirstNonEmpty(envelope.FromClientName, from);
-            rawBody = envelope.Attachment is null
-                ? envelope.Message ?? ""
-                : PeerAppMessageCodec.DisplayText(envelope);
-        }
+        var decoded = DecodeAuthenticatedServerMessage(message);
+        var from = decoded.Sender;
+        var rawBody = decoded.RawBody;
         if (_observer?.OnRawClientMessage(from, rawBody) == true)
         {
             return;
@@ -601,6 +613,25 @@ public sealed class SpecusControlClient : IAsyncDisposable
             Status = "received",
             CreatedAt = DateTimeOffset.Now,
         });
+    }
+
+    /// <summary>
+    /// Decodes an optional STMSG2 payload without allowing its peer-controlled identity fields to
+    /// replace the source authenticated by the server control channel.
+    /// </summary>
+    internal static (string Sender, string RawBody) DecodeAuthenticatedServerMessage(
+        MessageResponsePacket message)
+    {
+        var sender = FirstNonEmpty(message.ClientName, "server");
+        var rawBody = message.Message ?? "";
+        var bytes = System.Text.Encoding.UTF8.GetBytes(rawBody);
+        if (PeerAppMessageCodec.LooksLike(bytes) && PeerAppMessageCodec.TryDecode(bytes, out var envelope))
+        {
+            rawBody = envelope.Attachment is null
+                ? envelope.Message ?? ""
+                : PeerAppMessageCodec.DisplayText(envelope);
+        }
+        return (sender, rawBody);
     }
 
     private async Task ApplyPeerControlAsync(string payload, FrameWriter writer, CancellationToken cancellationToken)

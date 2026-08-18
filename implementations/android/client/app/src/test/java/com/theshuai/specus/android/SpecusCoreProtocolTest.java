@@ -834,15 +834,34 @@ public class SpecusCoreProtocolTest {
     }
 
     @Test
-    public void androidAdvertisesOnlyCapabilitiesItFullyImplements() throws Exception {
+    public void androidAdvertisesVerifiedEightMiBFileTransfers() throws Exception {
         SpecusCore.ClientMessageCapabilities capabilities =
                 SpecusCore.ClientMessageCapabilities.androidDefault();
         JSONObject json = capabilities.toJson();
         assertTrue(json.getBoolean("sendMessages"));
         assertTrue(json.getBoolean("receiveMessages"));
-        assertFalse(json.getBoolean("attachments"));
+        assertTrue(json.getBoolean("attachments"));
         assertFalse(json.getBoolean("mediaPreview"));
-        assertEquals(0L, json.getLong("maxAttachmentBytes"));
+        assertEquals(8L * 1024 * 1024, json.getLong("maxAttachmentBytes"));
+    }
+
+    @Test
+    public void serverFallbackEnvelopeCannotSpoofAuthenticatedSender() throws Exception {
+        PeerAppMessageCodec.PeerAppMessage envelope = new PeerAppMessageCodec.PeerAppMessage();
+        envelope.type = PeerAppMessageCodec.TYPE_MESSAGE;
+        envelope.id = "spoof-1";
+        envelope.fromClientId = 999L;
+        envelope.fromClientName = "mallory";
+        envelope.toClientId = 2L;
+        envelope.toClientName = "android";
+        envelope.message = "hello";
+        envelope.createdAtMillis = 1234L;
+
+        SpecusCore.TrustedAppMessage delivered = SpecusCore.trustedServerAppMessage(
+                "Alice", new String(PeerAppMessageCodec.encode(envelope), java.nio.charset.StandardCharsets.UTF_8));
+
+        assertEquals("Alice", delivered.from);
+        assertEquals("hello", delivered.body);
     }
 
     private static void assertInvalidControlTls(String controlTls) {

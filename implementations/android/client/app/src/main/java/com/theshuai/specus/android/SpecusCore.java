@@ -153,6 +153,18 @@ public final class SpecusCore {
             current.sendClientMessage(toClientName, message);
         }
 
+        /** Fails before any STXFER frame is emitted when the authoritative roster disallows it. */
+        public void requireFileTransferTarget(String toClientName, long size) {
+            if (!running.get()) {
+                throw new IllegalStateException("specus runtime is not running");
+            }
+            ControlConnection current = connection;
+            if (current == null) {
+                throw new IllegalStateException("control channel is not connected");
+            }
+            current.requireFileTransferTarget(toClientName, size);
+        }
+
         @Override
         public void run() {
             int attempt = 0;
@@ -882,12 +894,10 @@ public final class SpecusCore {
             ClientMessageCapabilities capabilities = new ClientMessageCapabilities();
             capabilities.sendMessages = true;
             capabilities.receiveMessages = true;
-            // Android currently renders STMSG2 attachment metadata, but it does not
-            // download attachment objects or preview media. Do not advertise those
-            // capabilities until the complete receive path exists.
-            capabilities.attachments = false;
+            // STXFER1 is fully received, SHA-256 verified and bounded by the same advertised cap.
+            capabilities.attachments = true;
             capabilities.mediaPreview = false;
-            capabilities.maxAttachmentBytes = 0L;
+            capabilities.maxAttachmentBytes = FileTransferManager.MAX_FILE_BYTES;
             return capabilities;
         }
 
@@ -1449,17 +1459,8 @@ public final class SpecusCore {
         }
 
         private void dispatchClientMessage(MessageResponse packet) {
-            String from = firstText(packet.clientName, "server");
-            String body = packet.message == null ? "" : packet.message;
-            PeerAppMessageCodec.PeerAppMessage envelope =
-                    PeerAppMessageCodec.decode(body.getBytes(StandardCharsets.UTF_8));
-            if (envelope != null) {
-                from = firstText(envelope.fromClientName, from);
-                body = envelope.attachment == null
-                        ? envelope.message
-                        : PeerAppMessageCodec.displayText(envelope);
-            }
-            dispatchAppMessage(from, body);
+            TrustedAppMessage message = trustedServerAppMessage(packet.clientName, packet.message);
+            dispatchAppMessage(message.from, message.body);
         }
 
         private String clientMessageText(String body) {
@@ -1504,6 +1505,10 @@ public final class SpecusCore {
             }
             send(Packet.clientMessage(session.clientName, target, body));
             status.publish("Message sent", "server -> " + target, true);
+        }
+
+        private void requireFileTransferTarget(String toClientName, long size) {
+            peerMeshEngine.requireFileTransferTarget(toClientName, size);
         }
 
         private void updateVpn() throws Exception {
@@ -4210,6 +4215,33 @@ public final class SpecusCore {
             return "unknown";
         }
         return error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
+    }
+
+    /**
+     * Decodes only the peer-controlled payload from a server fallback packet. The displayed sender
+     * is always the authenticated {@code packet.clientName}; an STMSG envelope can never replace it.
+     */
+    static TrustedAppMessage trustedServerAppMessage(String packetClientName, String rawBody) {
+        String from = firstText(packetClientName, "server");
+        String body = rawBody == null ? "" : rawBody;
+        PeerAppMessageCodec.PeerAppMessage envelope =
+                PeerAppMessageCodec.decode(body.getBytes(StandardCharsets.UTF_8));
+        if (envelope != null) {
+            body = envelope.attachment == null
+                    ? envelope.message
+                    : PeerAppMessageCodec.displayText(envelope);
+        }
+        return new TrustedAppMessage(from, body == null ? "" : body);
+    }
+
+    static final class TrustedAppMessage {
+        final String from;
+        final String body;
+
+        TrustedAppMessage(String from, String body) {
+            this.from = from;
+            this.body = body;
+        }
     }
 
     private static String firstText(String value, String fallback) {

@@ -2,6 +2,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Specus.Client.Configuration;
 
 namespace Specus.Client.Desktop;
 
@@ -10,33 +11,40 @@ namespace Specus.Client.Desktop;
 /// (peer mesh first, server fallback). Wire-compatible with the Android client:
 /// every frame is a text message prefixed with "STXFER1\n" carrying a JSON body.
 ///
-/// <para>The receive path treats the peer as untrusted: sessions are keyed by the authenticated
-/// sender plus the transfer id, the remote id never reaches the filesystem, chunks are tracked in a
-/// bitmap so retries are idempotent, and completion requires every chunk plus a matching digest.
-/// Because the transport falls back to the server when a peer ACK is lost, duplicate deliveries are
-/// expected and must not corrupt or prematurely complete a file.</para>
+/// <para>The receive path treats the peer as untrusted. Sessions are keyed by the authenticated
+/// transport sender plus the transfer id, remote identifiers never reach the filesystem, and a
+/// file is published only after every exact-length chunk and the mandatory whole-file digest have
+/// been verified. Direct and server-fallback copies may be duplicated or reordered.</para>
 /// </summary>
-internal sealed class FileTransferManager
+internal sealed class FileTransferManager : IDisposable
 {
     internal const string Prefix = "STXFER1\n";
     internal const int ChunkBytes = 600;
-    internal const long MaxFileBytes = 8L * 1024 * 1024;
-    /// <summary>Concurrent inbound sessions across all peers.</summary>
+    internal const long MaxFileBytes = ClientMessageCapabilities.DesktopMaxAttachmentBytes;
     internal const int MaxConcurrentSessions = 16;
-    /// <summary>Total bytes reserved on disk by in-flight inbound sessions.</summary>
     internal const long MaxPendingBytes = 64L * 1024 * 1024;
+    /// <summary>Maximum JSON payload length in UTF-16 characters before deserialization.</summary>
+    internal const int MaxFrameCharacters = 8 * 1024;
+
+    private const int MaxTransferIdLength = 128;
+    private const int MaxCompletedTombstones = 512;
+    private const int MaxTerminalEntriesPerSender = 64;
+    private const int ProgressEveryChunks = 32;
     private static readonly TimeSpan SessionTtl = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(15);
-    private const int ProgressEveryChunks = 32;
-
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly object _gate = new();
-    private readonly Dictionary<string, IncomingSession> _incoming = new(StringComparer.Ordinal);
-    /// <summary>Sessions finished recently, so a replayed "done" is ignored instead of re-delivered.</summary>
-    private readonly Dictionary<string, DateTime> _completed = new(StringComparer.Ordinal);
+    private readonly Dictionary<TransferKey, IncomingSession> _incoming = [];
+    /// <summary>Terminal (completed or aborted) transfers whose delayed fallback frames are ignored.</summary>
+    private readonly Dictionary<TransferKey, DateTime> _completed = [];
+    /// <summary>Done frames that raced ahead of their offer on the other transport path.</summary>
+    private readonly Dictionary<TransferKey, DateTime> _earlyDone = [];
+    private readonly IFileTransferStorage _storage;
+    private readonly FileTransferTestHooks _testHooks;
     private readonly Timer _sweepTimer;
     private long _pendingBytes;
+    private int _disposed;
 
     public static FileTransferManager Instance { get; } = new();
 
@@ -45,19 +53,46 @@ internal sealed class FileTransferManager
 
     private FileTransferManager()
     {
-        // Expiry must not depend on the next inbound message: a stalled sender would otherwise pin
-        // the temp file and its reserved bytes indefinitely.
+        _storage = PhysicalFileTransferStorage.Instance;
+        _testHooks = new FileTransferTestHooks();
         _sweepTimer = new Timer(_ => SweepExpired(), null, SweepInterval, SweepInterval);
     }
 
-    /// <summary>Test seam: builds an instance whose downloads land under <paramref name="rootDirectory"/>.</summary>
-    internal FileTransferManager(string rootDirectory)
+    /// <summary>Test seam: downloads land under <paramref name="rootDirectory"/>.</summary>
+    internal FileTransferManager(
+        string rootDirectory,
+        IFileTransferStorage? storage = null,
+        FileTransferTestHooks? testHooks = null)
     {
         RootDirectoryOverride = rootDirectory;
+        _storage = storage ?? PhysicalFileTransferStorage.Instance;
+        _testHooks = testHooks ?? new FileTransferTestHooks();
         _sweepTimer = new Timer(_ => SweepExpired(), null, SweepInterval, SweepInterval);
     }
 
     internal string? RootDirectoryOverride { get; }
+
+    internal int IncomingSessionCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _incoming.Count;
+            }
+        }
+    }
+
+    internal long PendingBytes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pendingBytes;
+            }
+        }
+    }
 
     public static bool IsTransferMessage(string? body)
         => body is not null && body.StartsWith(Prefix, StringComparison.Ordinal);
@@ -68,6 +103,14 @@ internal sealed class FileTransferManager
         {
             return false;
         }
+        if (body.Length - Prefix.Length > MaxFrameCharacters)
+        {
+            // Legal STXFER1 frames are roughly 1 KiB. Bound the untrusted JSON before the parser
+            // materializes its strings; the outer transport's much larger message limit is not a
+            // suitable per-chunk allocation limit.
+            return true;
+        }
+
         TransferFrame? frame;
         try
         {
@@ -77,43 +120,71 @@ internal sealed class FileTransferManager
         {
             return true;
         }
-        if (frame is null || string.IsNullOrWhiteSpace(frame.Id))
+
+        var authenticatedSender = from?.Trim() ?? "";
+        var transferId = frame?.Id?.Trim() ?? "";
+        if (frame is null
+            || authenticatedSender.Length == 0
+            || transferId.Length == 0
+            || transferId.Length > MaxTransferIdLength)
         {
             return true;
         }
-        // The envelope's own sender field is peer-controlled and must never override the
-        // authenticated sender the transport gives us.
-        var sessionKey = SessionKey(from, frame.Id!);
 
+        var sessionKey = TransferKey.Create(authenticatedSender, transferId);
+        TransferNotice? notice = null;
         try
         {
-            switch (frame.Type)
+            lock (_gate)
             {
-                case "offer":
-                    HandleOffer(sessionKey, from, frame);
-                    break;
-                case "chunk":
-                    HandleChunk(sessionKey, from, frame);
-                    break;
-                case "done":
-                    HandleDone(sessionKey, from, frame);
-                    break;
-                case "abort":
-                    HandleAbort(sessionKey, from, frame);
-                    break;
+                if (_disposed != 0 || _completed.ContainsKey(sessionKey))
+                {
+                    // A successful transfer leaves a tombstone that consumes every delayed frame,
+                    // including an old offer arriving after the server fallback.
+                    return true;
+                }
+
+                notice = frame.Type switch
+                {
+                    "offer" => HandleOfferLocked(sessionKey, authenticatedSender, frame),
+                    "chunk" => HandleChunkLocked(sessionKey, frame),
+                    "done" => HandleDoneLocked(sessionKey),
+                    "abort" => HandleAbortLocked(sessionKey),
+                    _ => null,
+                };
             }
+        }
+        catch (TransferProtocolException ex)
+        {
+            lock (_gate)
+            {
+                if (ex.DropSession)
+                {
+                    DropSessionLocked(sessionKey);
+                }
+            }
+            notice = new TransferNotice(
+                "IN",
+                authenticatedSender,
+                ex.UserFacingText ?? $"文件接收失败 · {ex.Message}");
         }
         catch (Exception ex)
         {
-            DropSession(sessionKey);
-            Emit("IN", from, $"文件接收失败 · {ex.Message}");
+            lock (_gate)
+            {
+                DropSessionLocked(sessionKey);
+            }
+            notice = new TransferNotice("IN", authenticatedSender, $"文件接收失败 · {ex.Message}");
         }
+
+        notice?.Publish(this);
         return true;
     }
 
     public async Task SendFileAsync(
         string target,
         string filePath,
+        Action<string, long> ensureTargetCanReceive,
         Func<string, string, CancellationToken, Task> sendAsync,
         CancellationToken cancellationToken)
     {
@@ -128,17 +199,34 @@ internal sealed class FileTransferManager
             Emit("OUT", target, $"文件过大 · 上限 {FormatBytes(MaxFileBytes)}");
             return;
         }
+        // Validate the same size snapshot used to construct the offer immediately before any
+        // digest work or STXFER1 frame is emitted.
+        ensureTargetCanReceive(target, fileInfo.Length);
 
         var id = Guid.NewGuid().ToString("N");
         var name = fileInfo.Name;
         var total = fileInfo.Length;
-        // A zero-byte file carries no chunks at all; the digest still proves the transfer.
         var chunks = (int)((total + ChunkBytes - 1) / ChunkBytes);
+        string digest;
         try
         {
-            var digest = await ComputeFileDigestAsync(filePath, cancellationToken).ConfigureAwait(false);
+            digest = await ComputeFileDigestAsync(filePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Emit("OUT", target, $"文件发送失败 · {ex.Message}");
+            return;
+        }
+
+        // Capability and online state may change while hashing. Re-read the authoritative roster
+        // immediately before the first frame, with no await between the gate and send.
+        ensureTargetCanReceive(target, total);
+        var offerSent = false;
+        try
+        {
             await sendAsync(target, BuildOffer(id, name, total, chunks, digest), cancellationToken)
                 .ConfigureAwait(false);
+            offerSent = true;
             Emit("OUT", target, $"发送中 {name} · {FormatBytes(total)}");
 
             var buffer = new byte[ChunkBytes];
@@ -164,19 +252,22 @@ internal sealed class FileTransferManager
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            try
+            if (offerSent)
             {
-                await sendAsync(target, BuildAbort(id, ex.Message), CancellationToken.None).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Best effort abort notice.
+                try
+                {
+                    await sendAsync(target, BuildAbort(id, ex.Message), CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best effort abort notice after the target accepted the offer.
+                }
             }
             Emit("OUT", target, $"文件发送失败 · {ex.Message}");
         }
     }
 
-    internal static string BuildOffer(string id, string name, long size, int chunks, string? sha256 = null)
+    internal static string BuildOffer(string id, string name, long size, int chunks, string? sha256)
         => Prefix + JsonSerializer.Serialize(new TransferFrame
         {
             Type = "offer",
@@ -203,194 +294,332 @@ internal sealed class FileTransferManager
     internal static string BuildAbort(string id, string reason)
         => Prefix + JsonSerializer.Serialize(new TransferFrame { Type = "abort", Id = id, Reason = reason }, JsonOptions);
 
-    private void HandleOffer(string sessionKey, string from, TransferFrame frame)
+    private TransferNotice? HandleOfferLocked(TransferKey sessionKey, string from, TransferFrame frame)
     {
-        var expectedChunks = (int)((frame.Size + ChunkBytes - 1) / ChunkBytes);
-        if (frame.Size < 0 || frame.Size > MaxFileBytes || frame.Chunks < 0 || frame.Chunks != expectedChunks)
+        _incoming.TryGetValue(sessionKey, out var existing);
+        ValidateOffer(frame, dropSession: existing is null);
+
+        var name = SanitizeName(frame.Name);
+        var digest = frame.Sha256!.ToLowerInvariant();
+        if (existing is not null)
         {
-            throw new ArgumentException("invalid offer");
+            if (!existing.MatchesOffer(name, frame.Size, frame.Chunks, digest))
+            {
+                // A conflicting replay must not erase bytes already received for the authenticated
+                // sender's original transfer.
+                throw new TransferProtocolException("conflicting offer", dropSession: false);
+            }
+            existing.LastTouchedAt = DateTime.UtcNow;
+            return null;
         }
-        if (frame.Sha256 is not null && !IsHexDigest(frame.Sha256))
+
+        if (_incoming.Count >= MaxConcurrentSessions)
         {
-            throw new ArgumentException("invalid digest");
+            throw new TransferProtocolException("接收会话过多", dropSession: false);
         }
-        // A repeated offer for the same sender+id restarts the transfer; it must not leak the
-        // previous temp file or its reserved bytes.
-        DropSession(sessionKey);
+        if (!HasTerminalCapacityForLocked(sessionKey))
+        {
+            // Every admitted session reserves one terminal slot. Never evict another authenticated
+            // sender's tombstone: that would let delayed fallback frames publish a second file.
+            throw new TransferProtocolException("接收终止记录已满", dropSession: false);
+        }
+        if (_pendingBytes > MaxPendingBytes - frame.Size)
+        {
+            throw new TransferProtocolException("接收缓冲已满", dropSession: false);
+        }
 
         var directory = TempDirectory();
-        Directory.CreateDirectory(directory);
-        // The remote id never reaches the filesystem: the temp name is locally generated and the
-        // resolved path is verified to stay inside our own directory.
+        _storage.CreateDirectory(directory);
         var temp = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".part");
         EnsureContained(directory, temp);
 
-        lock (_gate)
+        Stream? stream = null;
+        var registered = false;
+        try
         {
-            if (_incoming.Count >= MaxConcurrentSessions)
+            stream = _storage.CreateTemporaryFile(temp);
+            _storage.SetLength(stream, frame.Size);
+            _testHooks.BeforeSessionRegistration?.Invoke();
+
+            var doneSeen = _earlyDone.ContainsKey(sessionKey);
+            var session = new IncomingSession
             {
-                throw new InvalidOperationException("接收会话过多");
-            }
-            if (_pendingBytes + frame.Size > MaxPendingBytes)
-            {
-                throw new InvalidOperationException("接收缓冲已满");
-            }
-            var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                64 * 1024, useAsync: false);
-            stream.SetLength(frame.Size);
-            _incoming[sessionKey] = new IncomingSession
-            {
-                Name = SanitizeName(frame.Name),
+                Name = name,
                 From = from,
                 Size = frame.Size,
                 Chunks = frame.Chunks,
-                Sha256 = frame.Sha256,
+                Sha256 = digest,
                 TempPath = temp,
                 Stream = stream,
                 ReceivedChunks = new bool[frame.Chunks],
+                DoneSeen = doneSeen,
                 LastTouchedAt = DateTime.UtcNow,
             };
+            _incoming.Add(sessionKey, session);
             _pendingBytes += frame.Size;
+            registered = true;
+            stream = null;
+            if (doneSeen)
+            {
+                _earlyDone.Remove(sessionKey);
+            }
+            _testHooks.AfterSessionRegistration?.Invoke();
+
+            if (session.DoneSeen && session.IsComplete)
+            {
+                return FinalizeLocked(sessionKey, session);
+            }
         }
-        Emit("IN", from, $"接收中 {SanitizeName(frame.Name)} · {FormatBytes(frame.Size)}");
+        finally
+        {
+            if (!registered)
+            {
+                TryDispose(stream);
+                TryDelete(temp);
+            }
+        }
+
+        return new TransferNotice("IN", from, $"接收中 {name} · {FormatBytes(frame.Size)}");
     }
 
-    private void HandleChunk(string sessionKey, string from, TransferFrame frame)
+    private TransferNotice? HandleChunkLocked(TransferKey sessionKey, TransferFrame frame)
     {
-        var session = GetSession(sessionKey);
-        if (session is null)
+        if (!_incoming.TryGetValue(sessionKey, out var session))
         {
-            return;
+            return null;
         }
         if (frame.Seq < 0 || frame.Seq >= session.Chunks)
         {
-            throw new ArgumentException("invalid chunk seq");
+            throw new TransferProtocolException("invalid chunk seq", dropSession: true);
         }
-        var data = Convert.FromBase64String(frame.Data ?? "");
+        if (frame.Data is null || frame.Data.Length > 4 * ((ChunkBytes + 2) / 3))
+        {
+            throw new TransferProtocolException("invalid chunk data", dropSession: true);
+        }
+
+        byte[] data;
+        try
+        {
+            data = Convert.FromBase64String(frame.Data);
+        }
+        catch (FormatException ex)
+        {
+            throw new TransferProtocolException("invalid chunk data", dropSession: true, innerException: ex);
+        }
+
         var offset = (long)frame.Seq * ChunkBytes;
-        // Every chunk but the last must be exactly ChunkBytes, so a short chunk cannot silently
-        // leave a hole that the bitmap would still count as received.
         var expected = (int)Math.Min(ChunkBytes, session.Size - offset);
         if (data.Length != expected)
         {
-            throw new ArgumentException("chunk length mismatch");
+            throw new TransferProtocolException("chunk length mismatch", dropSession: true);
         }
 
-        var progress = 0;
-        lock (session)
+        session.LastTouchedAt = DateTime.UtcNow;
+        if (session.ReceivedChunks[frame.Seq])
         {
-            session.LastTouchedAt = DateTime.UtcNow;
-            if (session.ReceivedChunks[frame.Seq])
-            {
-                // Duplicate delivery (peer retry or server fallback): writing again is harmless but
-                // the completion count must stay unchanged.
-                return;
-            }
-            session.Stream.Position = offset;
-            session.Stream.Write(data, 0, data.Length);
-            session.ReceivedChunks[frame.Seq] = true;
-            session.ReceivedCount++;
-            session.ReceivedBytes += data.Length;
-            progress = session.ReceivedCount;
+            return null;
         }
-        if (progress > 0 && progress % ProgressEveryChunks == 0)
+
+        var stream = session.Stream
+            ?? throw new TransferProtocolException("receive stream unavailable", dropSession: true);
+        stream.Position = offset;
+        stream.Write(data, 0, data.Length);
+        session.ReceivedChunks[frame.Seq] = true;
+        session.ReceivedCount++;
+        session.ReceivedBytes += data.Length;
+
+        if (session.DoneSeen && session.IsComplete)
         {
-            var percent = (int)(progress * 100L / Math.Max(1, session.Chunks));
-            Emit("IN", from, $"接收中 {session.Name} · {percent}%");
+            return FinalizeLocked(sessionKey, session);
         }
+        if (session.ReceivedCount > 0 && session.ReceivedCount % ProgressEveryChunks == 0)
+        {
+            var percent = (int)(session.ReceivedCount * 100L / Math.Max(1, session.Chunks));
+            return new TransferNotice("IN", session.From, $"接收中 {session.Name} · {percent}%");
+        }
+        return null;
     }
 
-    private void HandleDone(string sessionKey, string from, TransferFrame frame)
+    private TransferNotice? HandleDoneLocked(TransferKey sessionKey)
     {
-        IncomingSession? session;
-        lock (_gate)
+        if (!_incoming.TryGetValue(sessionKey, out var session))
         {
-            if (_completed.ContainsKey(sessionKey))
-            {
-                // The sender retried "done" after its ACK was lost; the file is already delivered.
-                return;
-            }
-            if (_incoming.Remove(sessionKey, out session) && session is not null)
-            {
-                _pendingBytes = Math.Max(0, _pendingBytes - session.Size);
-            }
+            AddEarlyDoneLocked(sessionKey);
+            return null;
         }
-        if (session is null)
+        session.DoneSeen = true;
+        session.LastTouchedAt = DateTime.UtcNow;
+        // A direct-path done may race ahead of server-fallback chunks. Keep the session alive and
+        // let the last missing chunk trigger finalization.
+        return session.IsComplete ? FinalizeLocked(sessionKey, session) : null;
+    }
+
+    private TransferNotice? HandleAbortLocked(TransferKey sessionKey)
+    {
+        var session = DropSessionLocked(sessionKey);
+        _earlyDone.Remove(sessionKey);
+        if (session is not null || HasTerminalCapacityForLocked(sessionKey))
         {
-            return;
+            AddCompletedTombstoneLocked(sessionKey);
         }
-        session.Stream.Dispose();
-        if (session.ReceivedCount != session.Chunks || session.ReceivedBytes != session.Size)
+        return session is null
+            ? null
+            : new TransferNotice("IN", session.From, $"对方取消发送 · {session.Name}");
+    }
+
+    private TransferNotice FinalizeLocked(TransferKey sessionKey, IncomingSession session)
+    {
+        string? ownedTarget = null;
+        try
         {
-            TryDelete(session.TempPath);
-            Emit("IN", from, $"文件不完整 · {session.Name} ({session.ReceivedCount}/{session.Chunks})");
-            return;
-        }
-        if (session.Sha256 is not null)
-        {
-            var actual = ComputeFileDigest(session.TempPath);
+            var stream = session.Stream
+                ?? throw new TransferProtocolException("receive stream unavailable", dropSession: true);
+            stream.Flush();
+            stream.Dispose();
+            // Keep the session reference until Dispose succeeds. If it throws, DropSessionLocked
+            // retries disposal before deleting the temporary file and releasing accounting.
+            session.Stream = null;
+
+            var actual = _storage.ComputeSha256(session.TempPath);
             if (!string.Equals(actual, session.Sha256, StringComparison.OrdinalIgnoreCase))
             {
-                TryDelete(session.TempPath);
-                Emit("IN", from, $"文件校验失败 · {session.Name}");
-                return;
+                throw new TransferProtocolException(
+                    "digest mismatch",
+                    dropSession: true,
+                    userFacingText: $"文件校验失败 · {session.Name}");
+            }
+
+            var target = PublishTempFile(session.TempPath, session.Name);
+            ownedTarget = target;
+            RemoveRegisteredSessionLocked(sessionKey, session);
+            AddCompletedTombstoneLocked(sessionKey);
+            return new TransferNotice(
+                "IN",
+                session.From,
+                $"已接收 {session.Name} · {FormatBytes(session.Size)}\n保存到 {target}");
+        }
+        catch
+        {
+            if (ownedTarget is not null)
+            {
+                TryDelete(ownedTarget);
+            }
+            DropSessionLocked(sessionKey);
+            throw;
+        }
+    }
+
+    private static void ValidateOffer(TransferFrame frame, bool dropSession)
+    {
+        if (frame.Size < 0 || frame.Size > MaxFileBytes)
+        {
+            throw new TransferProtocolException("invalid offer", dropSession);
+        }
+        var expectedChunks = (int)((frame.Size + ChunkBytes - 1) / ChunkBytes);
+        if (frame.Chunks < 0 || frame.Chunks != expectedChunks)
+        {
+            throw new TransferProtocolException("invalid offer", dropSession);
+        }
+        if (string.IsNullOrWhiteSpace(frame.Sha256) || !IsHexDigest(frame.Sha256))
+        {
+            throw new TransferProtocolException("invalid digest", dropSession);
+        }
+    }
+
+    private IncomingSession? DropSessionLocked(TransferKey sessionKey)
+    {
+        if (!_incoming.Remove(sessionKey, out var session) || session is null)
+        {
+            return null;
+        }
+        _pendingBytes = Math.Max(0, _pendingBytes - session.Size);
+        TryDispose(session.Stream);
+        session.Stream = null;
+        TryDelete(session.TempPath);
+        return session;
+    }
+
+    private void RemoveRegisteredSessionLocked(TransferKey sessionKey, IncomingSession expected)
+    {
+        if (_incoming.Remove(sessionKey, out var removed) && removed is not null)
+        {
+            _pendingBytes = Math.Max(0, _pendingBytes - removed.Size);
+            if (!ReferenceEquals(removed, expected))
+            {
+                TryDispose(removed.Stream);
+                TryDelete(removed.TempPath);
             }
         }
+    }
 
-        var target = UniqueTargetPath(session.Name);
-        File.Move(session.TempPath, target);
-        lock (_gate)
+    private void AddCompletedTombstoneLocked(TransferKey sessionKey)
+    {
+        if (_completed.ContainsKey(sessionKey))
         {
             _completed[sessionKey] = DateTime.UtcNow;
+            return;
         }
-        Emit("IN", from, $"已接收 {session.Name} · {FormatBytes(session.Size)}\n保存到 {target}");
+        if (!HasTerminalCapacityForLocked(sessionKey))
+        {
+            // Capacity is fail-closed. New offers are rejected until TTL cleanup makes room, while
+            // existing senders retain replay protection for the full window.
+            return;
+        }
+        _completed[sessionKey] = DateTime.UtcNow;
     }
 
-    private void HandleAbort(string sessionKey, string from, TransferFrame frame)
+    private bool HasTerminalCapacityForLocked(TransferKey sessionKey)
     {
-        var session = DropSession(sessionKey);
-        if (session is not null)
+        if (_completed.Count + _incoming.Count >= MaxCompletedTombstones)
         {
-            Emit("IN", from, $"对方取消发送 · {session.Name}");
+            return false;
         }
+        var senderEntries = _completed.Keys.Count(key => key.Sender == sessionKey.Sender)
+            + _incoming.Keys.Count(key => key.Sender == sessionKey.Sender);
+        return senderEntries < MaxTerminalEntriesPerSender;
     }
 
-    private IncomingSession? GetSession(string sessionKey)
+    private void AddEarlyDoneLocked(TransferKey sessionKey)
     {
-        lock (_gate)
+        if (_earlyDone.ContainsKey(sessionKey))
         {
-            return _incoming.TryGetValue(sessionKey, out var session) ? session : null;
+            _earlyDone[sessionKey] = DateTime.UtcNow;
+            return;
         }
-    }
-
-    private IncomingSession? DropSession(string sessionKey)
-    {
-        IncomingSession? session;
-        lock (_gate)
+        if (_earlyDone.Count >= MaxCompletedTombstones
+            || _earlyDone.Keys.Count(key => key.Sender == sessionKey.Sender) >= MaxTerminalEntriesPerSender)
         {
-            if (_incoming.Remove(sessionKey, out session) && session is not null)
-            {
-                _pendingBytes = Math.Max(0, _pendingBytes - session.Size);
-            }
+            return;
         }
-        if (session is not null)
-        {
-            session.Stream.Dispose();
-            TryDelete(session.TempPath);
-        }
-        return session;
+        _earlyDone[sessionKey] = DateTime.UtcNow;
     }
 
     internal void SweepExpired()
     {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
         var now = DateTime.UtcNow;
-        List<string> expired;
+        List<TransferNotice> notices = [];
         lock (_gate)
         {
-            expired = _incoming
-                .Where(pair => now - pair.Value.LastTouchedAt > SessionTtl)
-                .Select(pair => pair.Key)
-                .ToList();
+            if (_disposed != 0)
+            {
+                return;
+            }
+            foreach (var key in _incoming
+                         .Where(pair => now - pair.Value.LastTouchedAt > SessionTtl)
+                         .Select(pair => pair.Key)
+                         .ToList())
+            {
+                var session = DropSessionLocked(key);
+                if (session is not null)
+                {
+                    notices.Add(new TransferNotice("IN", session.From, $"接收超时 · {session.Name}"));
+                }
+            }
             foreach (var key in _completed
                          .Where(pair => now - pair.Value > SessionTtl)
                          .Select(pair => pair.Key)
@@ -398,24 +627,23 @@ internal sealed class FileTransferManager
             {
                 _completed.Remove(key);
             }
-        }
-        foreach (var key in expired)
-        {
-            var session = DropSession(key);
-            if (session is not null)
+            foreach (var key in _earlyDone
+                         .Where(pair => now - pair.Value > SessionTtl)
+                         .Select(pair => pair.Key)
+                         .ToList())
             {
-                Emit("IN", session.From, $"接收超时 · {session.Name}");
+                _earlyDone.Remove(key);
             }
         }
+        foreach (var notice in notices)
+        {
+            notice.Publish(this);
+        }
     }
-
-    /// <summary>Sessions are per authenticated sender, so peers cannot collide on transfer ids.</summary>
-    private static string SessionKey(string from, string id) => from + " " + id;
 
     private string TempDirectory()
         => Path.Combine(RootDirectoryOverride ?? Path.GetTempPath(), "specus-transfers");
 
-    /// <summary>Rejects any candidate that resolves outside the directory we own.</summary>
     private static void EnsureContained(string directory, string candidate)
     {
         var root = Path.GetFullPath(directory);
@@ -430,7 +658,10 @@ internal sealed class FileTransferManager
         }
     }
 
-    private static async Task<int> ReadChunkAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    private static async Task<int> ReadChunkAsync(
+        Stream stream,
+        byte[] buffer,
+        CancellationToken cancellationToken)
     {
         var read = 0;
         while (read < buffer.Length)
@@ -454,16 +685,10 @@ internal sealed class FileTransferManager
         return Convert.ToHexString(digest).ToLowerInvariant();
     }
 
-    private static string ComputeFileDigest(string path)
-    {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-    }
+    private static bool IsHexDigest(string value)
+        => value.Length == 64 && value.All(Uri.IsHexDigit);
 
-    private static bool IsHexDigest(string value) =>
-        value.Length == 64 && value.All(Uri.IsHexDigit);
-
-    private string UniqueTargetPath(string name)
+    private string PublishTempFile(string source, string name)
     {
         var downloads = RootDirectoryOverride is null
             ? Path.Combine(
@@ -471,36 +696,54 @@ internal sealed class FileTransferManager
                 "Downloads",
                 "specus")
             : Path.Combine(RootDirectoryOverride, "downloads");
-        Directory.CreateDirectory(downloads);
+        _storage.CreateDirectory(downloads);
 
-        var candidate = Path.Combine(downloads, name);
-        EnsureContained(downloads, candidate);
-        if (!File.Exists(candidate))
+        for (var attempt = 0; attempt < 1016; attempt++)
         {
-            return candidate;
-        }
-        var baseName = Path.GetFileNameWithoutExtension(name);
-        var extension = Path.GetExtension(name);
-        for (var i = 1; i < 1000; i++)
-        {
-            candidate = Path.Combine(downloads, $"{baseName} ({i}){extension}");
-            if (!File.Exists(candidate))
+            var candidateName = PublishCandidateName(name, attempt);
+            var candidate = Path.Combine(downloads, candidateName);
+            EnsureContained(downloads, candidate);
+            var result = _storage.PublishFile(source, candidate);
+            if (result.OwnedPartialPath is not null)
+            {
+                EnsureContained(downloads, result.OwnedPartialPath);
+                TryDelete(result.OwnedPartialPath);
+            }
+            if (result.Status == FileTransferPublishStatus.Published)
             {
                 return candidate;
             }
+            if (result.Status == FileTransferPublishStatus.Conflict)
+            {
+                continue;
+            }
+            // Delete only a destination the storage implementation explicitly says this transfer
+            // created. A generic publish failure may instead belong to a racing external writer.
+            if (result.TargetOwned)
+            {
+                TryDelete(candidate);
+            }
+            throw result.Error ?? new IOException("文件发布失败");
         }
-        return Path.Combine(downloads, $"{DateTimeOffset.Now.ToUnixTimeMilliseconds()}-{name}");
+        throw new IOException("无法分配下载文件名");
     }
 
-    /// <summary>
-    /// Reduces a peer-supplied name to a bare file name. Separators, traversal segments, reserved
-    /// device names and invalid characters are all removed before the name reaches the filesystem.
-    /// </summary>
+    private static string PublishCandidateName(string name, int attempt)
+    {
+        if (attempt == 0)
+        {
+            return name;
+        }
+        var baseName = Path.GetFileNameWithoutExtension(name);
+        var extension = Path.GetExtension(name);
+        return attempt < 1000
+            ? $"{baseName} ({attempt}){extension}"
+            : $"{Guid.NewGuid():N}-{name}";
+    }
+
     internal static string SanitizeName(string? name)
     {
         var value = string.IsNullOrWhiteSpace(name) ? "" : name.Trim();
-        // Strip any directory component the peer tried to smuggle in, using both separators so a
-        // POSIX-style path is handled on Windows too.
         var lastSeparator = value.LastIndexOfAny(['/', '\\']);
         if (lastSeparator >= 0)
         {
@@ -542,14 +785,23 @@ internal sealed class FileTransferManager
         return unit == 0 ? $"{value:0} {units[unit]}" : $"{value:0.0} {units[unit]}";
     }
 
-    private static void TryDelete(string path)
+    private static void TryDispose(Stream? stream)
     {
         try
         {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
+            stream?.Dispose();
+        }
+        catch
+        {
+            // Cleanup must continue to the temporary file and accounting release.
+        }
+    }
+
+    private void TryDelete(string path)
+    {
+        try
+        {
+            _storage.DeleteFile(path);
         }
         catch
         {
@@ -558,8 +810,30 @@ internal sealed class FileTransferManager
     }
 
     private void Emit(string direction, string peer, string text)
+        => TransferEvent?.Invoke(direction, peer, text);
+
+    public void Dispose()
     {
-        TransferEvent?.Invoke(direction, peer, text);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+        _sweepTimer.Dispose();
+        lock (_gate)
+        {
+            foreach (var key in _incoming.Keys.ToList())
+            {
+                DropSessionLocked(key);
+            }
+            _completed.Clear();
+            _earlyDone.Clear();
+        }
+    }
+
+    private readonly record struct TransferKey(string Sender, string TransferId)
+    {
+        public static TransferKey Create(string sender, string transferId)
+            => new(sender.Trim(), transferId);
     }
 
     private sealed class IncomingSession
@@ -568,13 +842,45 @@ internal sealed class FileTransferManager
         public string From { get; init; } = "";
         public long Size { get; init; }
         public int Chunks { get; init; }
-        public string? Sha256 { get; init; }
+        public string Sha256 { get; init; } = "";
         public bool[] ReceivedChunks { get; init; } = [];
         public int ReceivedCount { get; set; }
         public long ReceivedBytes { get; set; }
         public string TempPath { get; init; } = "";
-        public FileStream Stream { get; init; } = null!;
+        public Stream? Stream { get; set; }
+        public bool DoneSeen { get; set; }
         public DateTime LastTouchedAt { get; set; }
+
+        public bool IsComplete => ReceivedCount == Chunks && ReceivedBytes == Size;
+
+        public bool MatchesOffer(string name, long size, int chunks, string sha256)
+            => string.Equals(Name, name, StringComparison.Ordinal)
+               && Size == size
+               && Chunks == chunks
+               && string.Equals(Sha256, sha256, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class TransferProtocolException : Exception
+    {
+        public TransferProtocolException(
+            string message,
+            bool dropSession,
+            string? userFacingText = null,
+            Exception? innerException = null)
+            : base(message, innerException)
+        {
+            DropSession = dropSession;
+            UserFacingText = userFacingText;
+        }
+
+        public bool DropSession { get; }
+
+        public string? UserFacingText { get; }
+    }
+
+    private sealed record TransferNotice(string Direction, string Peer, string Text)
+    {
+        public void Publish(FileTransferManager manager) => manager.Emit(Direction, Peer, Text);
     }
 
     internal sealed class TransferFrame
@@ -606,8 +912,134 @@ internal sealed class FileTransferManager
         [JsonPropertyName("reason")]
         public string? Reason { get; set; }
 
-        /// <summary>Whole-file digest; absent for peers that predate the check.</summary>
+        /// <summary>Mandatory SHA-256 digest for the complete file.</summary>
         [JsonPropertyName("sha256")]
         public string? Sha256 { get; set; }
     }
+}
+
+internal sealed class FileTransferTestHooks
+{
+    public Action? BeforeSessionRegistration { get; init; }
+
+    public Action? AfterSessionRegistration { get; init; }
+}
+
+internal interface IFileTransferStorage
+{
+    void CreateDirectory(string path);
+
+    Stream CreateTemporaryFile(string path);
+
+    void SetLength(Stream stream, long length);
+
+    string ComputeSha256(string path);
+
+    FileTransferPublishResult PublishFile(string source, string target);
+
+    void DeleteFile(string path);
+}
+
+internal sealed class PhysicalFileTransferStorage : IFileTransferStorage
+{
+    public static PhysicalFileTransferStorage Instance { get; } = new();
+
+    private PhysicalFileTransferStorage()
+    {
+    }
+
+    public void CreateDirectory(string path) => Directory.CreateDirectory(path);
+
+    public Stream CreateTemporaryFile(string path)
+        => new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            64 * 1024, useAsync: false);
+
+    public void SetLength(Stream stream, long length) => stream.SetLength(length);
+
+    public string ComputeSha256(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    public FileTransferPublishResult PublishFile(string source, string target)
+    {
+        var directory = Path.GetDirectoryName(target)
+            ?? throw new InvalidOperationException("publish target has no directory");
+        var partial = Path.Combine(directory, $".specus-{Guid.NewGuid():N}.partial");
+        var targetOwned = false;
+        FileTransferPublishResult result;
+        try
+        {
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var output = new FileStream(
+                       partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024))
+            {
+                input.CopyTo(output);
+                output.Flush(flushToDisk: true);
+            }
+
+            // File.Move without overwrite is the atomic no-replace publication point. A racing
+            // target never becomes ours and is handled as a naming conflict below.
+            File.Move(partial, target);
+            targetOwned = true;
+            File.Delete(source);
+            result = FileTransferPublishResult.Published();
+        }
+        catch (IOException) when (!targetOwned && File.Exists(source) && File.Exists(target))
+        {
+            result = FileTransferPublishResult.Conflict();
+        }
+        catch (Exception ex)
+        {
+            result = FileTransferPublishResult.Failed(ex, targetOwned);
+        }
+
+        if (File.Exists(partial))
+        {
+            try
+            {
+                File.Delete(partial);
+            }
+            catch
+            {
+                result = result with { OwnedPartialPath = partial };
+            }
+        }
+        return result;
+    }
+
+    public void DeleteFile(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+    }
+}
+
+internal enum FileTransferPublishStatus
+{
+    Published,
+    Conflict,
+    Failed,
+}
+
+internal readonly record struct FileTransferPublishResult(
+    FileTransferPublishStatus Status,
+    bool TargetOwned,
+    Exception? Error,
+    string? OwnedPartialPath)
+{
+    public static FileTransferPublishResult Published()
+        => new(FileTransferPublishStatus.Published, TargetOwned: true, Error: null, OwnedPartialPath: null);
+
+    public static FileTransferPublishResult Conflict()
+        => new(FileTransferPublishStatus.Conflict, TargetOwned: false, Error: null, OwnedPartialPath: null);
+
+    public static FileTransferPublishResult Failed(
+        Exception error,
+        bool targetOwned,
+        string? ownedPartialPath = null)
+        => new(FileTransferPublishStatus.Failed, targetOwned, error, ownedPartialPath);
 }

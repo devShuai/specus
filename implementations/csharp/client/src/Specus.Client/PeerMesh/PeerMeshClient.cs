@@ -334,7 +334,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             peer = _peers.Values.FirstOrDefault(item =>
                 item.Online
                 && item.MessageReceiveCapable
-                && string.Equals(item.ClientName, target, StringComparison.OrdinalIgnoreCase));
+                && ExactAuthenticatedClientName(item.ClientName, target));
             session = peer is null ? null : ReusableSessionLocked(peer.ClientId, now);
         }
         if (peer is null)
@@ -410,6 +410,58 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
         }
     }
+
+    internal string? GetAttachmentTransferRejectionReason(string toClientName, long sizeBytes)
+    {
+        var target = toClientName.Trim();
+        PeerMeshPeer? peer;
+        lock (_sync)
+        {
+            peer = _peers.Values.FirstOrDefault(item =>
+                ExactAuthenticatedClientName(item.ClientName, target));
+        }
+        return AttachmentTransferRejectionReason(
+            peer is not null,
+            peer?.Online == true,
+            peer?.MessageReceiveCapable == true,
+            peer?.MessageAttachmentsCapable == true,
+            peer?.MessageMaxAttachmentBytes ?? 0,
+            sizeBytes);
+    }
+
+    internal static string? AttachmentTransferRejectionReason(
+        bool targetKnown,
+        bool online,
+        bool receiveMessages,
+        bool attachments,
+        long maxAttachmentBytes,
+        long sizeBytes)
+    {
+        if (sizeBytes < 0)
+        {
+            return "文件大小无效。";
+        }
+        if (!targetKnown || !online)
+        {
+            return "目标客户端不在线或能力信息不可用。";
+        }
+        if (!receiveMessages)
+        {
+            return "目标客户端不支持接收消息。";
+        }
+        if (!attachments || maxAttachmentBytes <= 0)
+        {
+            return "目标客户端不支持文件互传（可能是 Java 或旧版本客户端）。";
+        }
+        if (sizeBytes > maxAttachmentBytes)
+        {
+            return $"目标客户端文件接收上限为 {FormatBytes(maxAttachmentBytes)}。";
+        }
+        return null;
+    }
+
+    internal static bool ExactAuthenticatedClientName(string? authenticatedName, string target)
+        => string.Equals(authenticatedName?.Trim(), target, StringComparison.Ordinal);
 
     public async Task HandleControlAsync(string payload, SpecusRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
     {
@@ -1886,7 +1938,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 session.PeerId);
             return true;
         }
-        if (message.FromClientId != 0 && message.FromClientId != session.PeerId)
+        string? rosterPeerName;
+        lock (_sync)
+        {
+            rosterPeerName = _peers.TryGetValue(session.PeerId, out var rosterPeer)
+                ? rosterPeer.ClientName
+                : null;
+        }
+        var from = ResolveAuthenticatedPeerSender(
+            message,
+            rosterPeerName,
+            session.PeerName,
+            session.PeerId);
+        if (from is null)
         {
             return true;
         }
@@ -1905,13 +1969,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return true;
         }
 
-        var from = FirstNonEmpty(message.FromClientName, session.PeerName, session.PeerId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var rawBody = message.Attachment is null
             ? message.Message ?? ""
             : PeerAppMessageCodec.DisplayText(message);
         if (_observer?.OnRawClientMessage(from, rawBody) == true)
         {
-            await SendPeerClientMessageAckAsync(message, session, runtime).ConfigureAwait(false);
+            await SendPeerClientMessageAckAsync(message, session, runtime, from).ConfigureAwait(false);
             return true;
         }
 
@@ -1926,8 +1989,29 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             Status = "received",
             CreatedAt = DateTimeOffset.Now,
         });
-        await SendPeerClientMessageAckAsync(message, session, runtime).ConfigureAwait(false);
+        await SendPeerClientMessageAckAsync(message, session, runtime, from).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// Resolves the peer identity exclusively from the authenticated encrypted session and the
+    /// server roster. STMSG2 identity fields are consistency hints only and cannot select a sender.
+    /// </summary>
+    internal static string? ResolveAuthenticatedPeerSender(
+        PeerAppMessage message,
+        string? rosterPeerName,
+        string? sessionPeerName,
+        long authenticatedPeerId)
+    {
+        if (authenticatedPeerId <= 0
+            || (message.FromClientId != 0 && message.FromClientId != authenticatedPeerId))
+        {
+            return null;
+        }
+        return FirstNonEmpty(
+            rosterPeerName,
+            sessionPeerName,
+            authenticatedPeerId.ToString(System.Globalization.CultureInfo.InvariantCulture));
     }
 
     private static string PeerAppMessageText(PeerAppMessage message)
@@ -1968,7 +2052,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private async Task SendPeerClientMessageAckAsync(
         PeerAppMessage message,
         PeerMeshSession session,
-        SpecusRuntimeState runtime)
+        SpecusRuntimeState runtime,
+        string authenticatedPeerName)
     {
         if (string.IsNullOrWhiteSpace(message.Id))
         {
@@ -1981,7 +2066,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             FromClientId = runtime.PeerMesh.ClientId,
             FromClientName = runtime.PeerMesh.ClientName,
             ToClientId = session.PeerId,
-            ToClientName = FirstNonEmpty(message.FromClientName, session.PeerName),
+            ToClientName = authenticatedPeerName,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
         try

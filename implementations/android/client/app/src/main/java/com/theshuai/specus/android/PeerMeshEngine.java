@@ -126,6 +126,8 @@ final class PeerMeshEngine implements Closeable {
     private final AtomicBoolean enabled = new AtomicBoolean(false);
     private final Map<Long, PeerInfo> peers = new ConcurrentHashMap<>();
     private final Map<String, PeerInfo> peersByVirtualIp = new ConcurrentHashMap<>();
+    /** Capability snapshot comes only from the latest server-authenticated roster. */
+    private volatile Map<String, TargetMessageCapabilities> authoritativeMessageCapabilities = Map.of();
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessionsById = new ConcurrentHashMap<>();
     private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
@@ -245,11 +247,15 @@ final class PeerMeshEngine implements Closeable {
             startOrUpdate(next);
             return;
         }
-        if (!enabled.get()) {
+        if (TYPE_ROSTER.equals(type)) {
+            JSONArray roster = json.optJSONArray("peers");
+            updateAuthoritativeMessageCapabilities(roster);
+            if (enabled.get()) {
+                updateRoster(roster);
+            }
             return;
         }
-        if (TYPE_ROSTER.equals(type)) {
-            updateRoster(json.optJSONArray("peers"));
+        if (!enabled.get()) {
             return;
         }
         if (TYPE_SESSION_GRANT.equals(type)) {
@@ -336,6 +342,21 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
+    void requireFileTransferTarget(String toClientName, long size) {
+        String target = normalizeClientName(toClientName);
+        if (target.isEmpty()) {
+            throw new IllegalArgumentException("目标客户端为空");
+        }
+        TargetMessageCapabilities capabilities = authoritativeMessageCapabilities.get(target);
+        if (capabilities == null) {
+            throw new IllegalStateException("对方未上报文件接收能力，可能是 Java 或旧版本客户端");
+        }
+        String rejection = capabilities.rejectionReason(size);
+        if (rejection != null) {
+            throw new IllegalStateException(rejection);
+        }
+    }
+
     private void updateRoster(JSONArray array) throws Exception {
         Map<Long, PeerInfo> previous = new HashMap<>(peers);
         peers.clear();
@@ -367,6 +388,31 @@ final class PeerMeshEngine implements Closeable {
         announceCandidatesToOnlinePeers();
         refreshSessionKeys();
         publish("Peer roster", peers.size() + " peer(s)");
+    }
+
+    private void updateAuthoritativeMessageCapabilities(JSONArray array) {
+        authoritativeMessageCapabilities = parseAuthoritativeMessageCapabilities(array);
+    }
+
+    static Map<String, TargetMessageCapabilities> parseAuthoritativeMessageCapabilities(JSONArray array) {
+        Map<String, TargetMessageCapabilities> next = new HashMap<>();
+        if (array != null) {
+            for (int index = 0; index < array.length(); index++) {
+                JSONObject item = array.optJSONObject(index);
+                if (item == null) {
+                    continue;
+                }
+                String normalizedName = normalizeClientName(item.optString("clientName", ""));
+                if (!normalizedName.isEmpty()) {
+                    next.put(normalizedName, new TargetMessageCapabilities(
+                            item.optBoolean("online", false),
+                            item.optBoolean("messageReceiveCapable", false),
+                            item.optBoolean("messageAttachmentsCapable", false),
+                            item.optLong("messageMaxAttachmentBytes", 0L)));
+                }
+            }
+        }
+        return Map.copyOf(next);
     }
 
     private List<String> onlinePeerVirtualIps() {
@@ -1197,13 +1243,19 @@ final class PeerMeshEngine implements Closeable {
         }
         SpecusCore.PeerMeshConfig current = config;
         if (current == null
-                || (message.fromClientId != 0L && message.fromClientId != session.peerId)
                 || (message.toClientId != 0L && message.toClientId != current.clientId)) {
             return true;
         }
         PeerInfo peer = peers.get(session.peerId);
-        String from = firstText(message.fromClientName,
-                peer == null ? String.valueOf(session.peerId) : peer.clientName);
+        String from = trustedDirectSender(
+                peer == null ? "" : peer.clientName,
+                session.peerId,
+                message.fromClientId,
+                message.fromClientName);
+        if (from == null) {
+            publish("Peer message dropped", "authenticated peer has no roster name: " + session.peerId);
+            return true;
+        }
         publish("Message received", from + ": " + peerAppMessageText(message));
         if (appMessageSink != null) {
             appMessageSink.onAppMessage(from, message.attachment == null
@@ -1245,7 +1297,10 @@ final class PeerMeshEngine implements Closeable {
         ack.fromClientId = current.clientId;
         ack.fromClientName = current.clientName;
         ack.toClientId = session.peerId;
-        ack.toClientName = firstText(message.fromClientName, peer.clientName);
+        ack.toClientName = trustedDirectSender(peer.clientName);
+        if (ack.toClientName == null) {
+            return;
+        }
         ack.createdAtMillis = System.currentTimeMillis();
         sendEncryptedPayload(peer, session, PeerAppMessageCodec.encode(ack));
     }
@@ -1537,11 +1592,37 @@ final class PeerMeshEngine implements Closeable {
             return null;
         }
         for (PeerInfo peer : peers.values()) {
-            if (peer != null && peer.online && peer.messageReceiveCapable && clientName.equalsIgnoreCase(peer.clientName)) {
+            if (peer != null && peer.online && peer.messageReceiveCapable
+                    && clientNamesMatch(clientName, peer.clientName)) {
                 return peer;
             }
         }
         return null;
+    }
+
+    /** The encrypted envelope name is display-only input and never participates in identity. */
+    static String trustedDirectSender(String rosterClientName) {
+        return isBlank(rosterClientName) ? null : rosterClientName.trim();
+    }
+
+    static String trustedDirectSender(String rosterClientName,
+                                      long authenticatedPeerId,
+                                      long envelopeFromClientId,
+                                      String envelopeFromClientName) {
+        if (authenticatedPeerId <= 0L
+                || (envelopeFromClientId != 0L && envelopeFromClientId != authenticatedPeerId)) {
+            return null;
+        }
+        // envelopeFromClientName is intentionally ignored: only the authenticated roster names it.
+        return trustedDirectSender(rosterClientName);
+    }
+
+    private static String normalizeClientName(String clientName) {
+        return clientName == null ? "" : clientName.trim();
+    }
+
+    static boolean clientNamesMatch(String requested, String rosterName) {
+        return normalizeClientName(requested).equals(normalizeClientName(rosterName));
     }
 
     private PeerSession waitForReadySession(long peerId, long deadlineMillis) {
@@ -3015,6 +3096,7 @@ final class PeerMeshEngine implements Closeable {
     private void stop() {
         reportDevice("STOPPED", "");
         enabled.set(false);
+        authoritativeMessageCapabilities = Map.of();
         Thread maintenance = maintenanceThread;
         maintenanceThread = null;
         if (maintenance != null) {
@@ -3218,6 +3300,45 @@ final class PeerMeshEngine implements Closeable {
 
     interface StatusPublisher {
         void publish(String status, String detail, boolean running);
+    }
+
+    static final class TargetMessageCapabilities {
+        final boolean online;
+        final boolean receiveMessages;
+        final boolean attachments;
+        final long maxAttachmentBytes;
+
+        TargetMessageCapabilities(boolean online,
+                                  boolean receiveMessages,
+                                  boolean attachments,
+                                  long maxAttachmentBytes) {
+            this.online = online;
+            this.receiveMessages = receiveMessages;
+            this.attachments = attachments;
+            this.maxAttachmentBytes = maxAttachmentBytes;
+        }
+
+        String rejectionReason(long size) {
+            if (!online) {
+                return "对方当前不在线";
+            }
+            if (!receiveMessages) {
+                return "对方未启用消息接收";
+            }
+            if (!attachments) {
+                return "对方不支持文件互传，可能是 Java 或旧版本客户端";
+            }
+            if (maxAttachmentBytes <= 0L) {
+                return "对方未声明文件接收上限，无法安全发送";
+            }
+            if (size < 0L) {
+                return "无法确定待发送文件大小";
+            }
+            if (size > maxAttachmentBytes) {
+                return "文件超过对方接收上限 " + FileTransferManager.formatBytes(maxAttachmentBytes);
+            }
+            return null;
+        }
     }
 
     private static final class PeerInfo {

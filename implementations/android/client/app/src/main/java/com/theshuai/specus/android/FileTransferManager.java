@@ -9,16 +9,10 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.RandomAccessFile;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.Iterator;
 import java.util.Locale;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -26,11 +20,12 @@ import java.util.concurrent.TimeUnit;
 
 final class FileTransferManager {
     private static final String PREFIX = "STXFER1\n";
-    private static final int CHUNK_BYTES = 600;
-    private static final long MAX_FILE_BYTES = 8L * 1024 * 1024;
-    private static final long SESSION_TTL_MILLIS = 120_000L;
+    static final int MAX_TRANSFER_FRAME_BYTES = 8 * 1024;
+    static final int CHUNK_BYTES = 600;
+    static final long MAX_FILE_BYTES = 8L * 1024 * 1024;
+    static final long SESSION_TTL_MILLIS = 120_000L;
     private static final long SWEEP_INTERVAL_MILLIS = 15_000L;
-    private static final int PROGRESS_EVERY_CHUNKS = 32;
+    static final int PROGRESS_EVERY_CHUNKS = 32;
     /** Concurrent inbound sessions across all peers. */
     static final int MAX_CONCURRENT_SESSIONS = 16;
     /** Total bytes reserved on disk by in-flight inbound sessions. */
@@ -39,11 +34,8 @@ final class FileTransferManager {
 
     private static FileTransferManager instance;
 
-    private final Map<String, IncomingSession> incoming = new HashMap<>();
-    /** Sessions finished recently, so a replayed "done" is ignored instead of re-delivered. */
-    private final Map<String, Long> completed = new HashMap<>();
+    private final IncomingFileTransfer receiver = new IncomingFileTransfer();
     private ScheduledExecutorService sweeper;
-    private long pendingBytes;
 
     private FileTransferManager() {
     }
@@ -79,12 +71,11 @@ final class FileTransferManager {
         return body != null && body.startsWith(PREFIX);
     }
 
-    static String buildOffer(String id, String name, long size, String mime, int chunks) throws Exception {
-        return buildOffer(id, name, size, mime, chunks, null);
-    }
-
     static String buildOffer(String id, String name, long size, String mime, int chunks, String sha256)
             throws Exception {
+        if (!isHexDigest(sha256 == null ? "" : sha256)) {
+            throw new IllegalArgumentException("sha256 must be 64 hexadecimal characters");
+        }
         JSONObject json = new JSONObject();
         json.put("t", "offer");
         json.put("id", id);
@@ -92,9 +83,7 @@ final class FileTransferManager {
         json.put("size", size);
         json.put("mime", mime);
         json.put("chunks", chunks);
-        if (sha256 != null && !sha256.isEmpty()) {
-            json.put("sha256", sha256);
-        }
+        json.put("sha256", sha256.toLowerCase(Locale.ROOT));
         return PREFIX + json.toString();
     }
 
@@ -124,7 +113,7 @@ final class FileTransferManager {
     }
 
     static JSONObject parseTransfer(String body) {
-        if (!isTransferMessage(body)) {
+        if (!isTransferMessage(body) || utf8LengthExceeds(body, MAX_TRANSFER_FRAME_BYTES)) {
             return null;
         }
         try {
@@ -134,42 +123,49 @@ final class FileTransferManager {
         }
     }
 
-    synchronized boolean onIncomingMessage(Context context, String from, String body) {
-        ensureSweeper(context);
-        JSONObject json = parseTransfer(body);
-        if (json == null) {
+    /** Counts UTF-8 bytes without allocating a second attacker-sized byte array. */
+    static boolean utf8LengthExceeds(String value, int limit) {
+        if (value == null) {
             return false;
         }
-        String type = json.optString("t", "");
-        String id = json.optString("id", "");
-        if (id.trim().isEmpty()) {
+        int bytes = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char current = value.charAt(index);
+            if (current <= 0x7F) {
+                bytes++;
+            } else if (current <= 0x7FF) {
+                bytes += 2;
+            } else if (Character.isHighSurrogate(current)
+                    && index + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(index + 1))) {
+                bytes += 4;
+                index++;
+            } else {
+                // Conservatively count an unpaired surrogate as a three-byte code unit.
+                bytes += 3;
+            }
+            if (bytes > limit) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    boolean onIncomingMessage(Context context, String from, String body) {
+        ensureSweeper(context);
+        if (!isTransferMessage(body)) {
+            return false;
+        }
+        JSONObject json = parseTransfer(body);
+        if (json == null) {
+            // A malformed reserved frame is consumed rather than rendered as chat text.
             return true;
         }
-        // The envelope's own sender field is peer-controlled and must never override the
-        // authenticated sender the transport gives us.
-        String sessionKey = sessionKey(from, id);
-        try {
-            switch (type) {
-                case "offer":
-                    handleOffer(context, sessionKey, from, json);
-                    break;
-                case "chunk":
-                    handleChunk(context, sessionKey, from, json);
-                    break;
-                case "done":
-                    handleDone(context, sessionKey, from, json);
-                    break;
-                case "abort":
-                    handleAbort(context, sessionKey, from, json);
-                    break;
-                default:
-                    break;
-            }
-        } catch (Exception error) {
-            dropSession(sessionKey);
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                    "文件接收失败 · " + error.getMessage());
-        }
+        receiver.onFrame(transferDirectory(context), downloadDirectory(context),
+                IncomingFileTransfer.SYSTEM_FILE_OPS,
+                (peer, text) -> ChatEvents.send(context, ChatEvents.DIRECTION_IN,
+                        ChatEvents.KIND_FILE, peer, text),
+                from, json);
         return true;
     }
 
@@ -178,6 +174,7 @@ final class FileTransferManager {
         long size = -1L;
         String mime = "application/octet-stream";
         String id = UUID.randomUUID().toString().replace("-", "");
+        boolean offerSent = false;
         try {
             Cursor cursor = context.getContentResolver().query(uri, null, null, null, null);
             if (cursor != null) {
@@ -205,6 +202,9 @@ final class FileTransferManager {
                         "文件过大 · 上限 " + formatBytes(MAX_FILE_BYTES));
                 return;
             }
+            if (size >= 0L) {
+                runtime.requireFileTransferTarget(target, size);
+            }
             InputStream in = context.getContentResolver().openInputStream(uri);
             if (in == null) {
                 ChatEvents.send(context, ChatEvents.DIRECTION_OUT, ChatEvents.KIND_FILE, target,
@@ -231,8 +231,12 @@ final class FileTransferManager {
                         return;
                     }
                 }
+                // Re-check with the authoritative measured size immediately before the first
+                // STXFER frame. A rejected/legacy target receives no transfer protocol traffic.
+                runtime.requireFileTransferTarget(target, total);
                 runtime.sendClientMessage(target, buildOffer(id, name, total, mime, chunks,
                         digestOf(buffered, lengths)));
+                offerSent = true;
                 ChatEvents.send(context, ChatEvents.DIRECTION_OUT, ChatEvents.KIND_FILE, target,
                         "发送中 " + name + " · " + formatBytes(total));
                 for (int seq = 0; seq < chunks; seq++) {
@@ -248,215 +252,29 @@ final class FileTransferManager {
                         "已发送 " + name + " · " + formatBytes(total));
             }
         } catch (Exception error) {
-            try {
-                runtime.sendClientMessage(target, buildAbort(id, error.getMessage()));
-            } catch (Exception ignored) {
+            if (offerSent) {
+                try {
+                    runtime.sendClientMessage(target, buildAbort(id, error.getMessage()));
+                } catch (Exception ignored) {
+                }
             }
             ChatEvents.send(context, ChatEvents.DIRECTION_OUT, ChatEvents.KIND_FILE, target,
                     "文件发送失败 · " + (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
         }
     }
 
-    private void handleOffer(Context context, String sessionKey, String from, JSONObject json)
-            throws Exception {
-        long size = json.optLong("size", -1L);
-        int chunks = json.optInt("chunks", -1);
-        int expectedChunks = (int) ((size + CHUNK_BYTES - 1) / CHUNK_BYTES);
-        if (size < 0 || size > MAX_FILE_BYTES || chunks < 0 || chunks != expectedChunks) {
-            throw new IllegalArgumentException("invalid offer");
-        }
-        String sha256 = json.optString("sha256", "");
-        if (!sha256.isEmpty() && !isHexDigest(sha256)) {
-            throw new IllegalArgumentException("invalid digest");
-        }
-        // A repeated offer for the same sender+id restarts the transfer; it must not leak the
-        // previous temp file or its reserved bytes.
-        dropSession(sessionKey);
-        if (incoming.size() >= MAX_CONCURRENT_SESSIONS) {
-            throw new IllegalStateException("session limit reached");
-        }
-        if (pendingBytes + size > MAX_PENDING_BYTES) {
-            throw new IllegalStateException("pending buffer full");
-        }
-        File dir = new File(context.getFilesDir(), "transfers");
-        if (!dir.exists() && !dir.mkdirs()) {
-            throw new IllegalStateException("transfer dir unavailable");
-        }
-        // The remote id never reaches the filesystem: the temp name is locally generated and the
-        // resolved path is verified to stay inside our own directory.
-        File temp = new File(dir, UUID.randomUUID().toString().replace("-", "") + ".part");
-        requireContained(dir, temp);
-        IncomingSession session = new IncomingSession();
-        session.name = sanitizeName(json.optString("name", "file"));
-        session.size = size;
-        session.chunks = chunks;
-        session.sha256 = sha256.isEmpty() ? null : sha256;
-        session.from = from == null ? "" : from;
-        session.file = temp;
-        session.randomAccess = new RandomAccessFile(temp, "rw");
-        session.randomAccess.setLength(size);
-        session.receivedChunks = new boolean[chunks];
-        session.lastTouchedAtMillis = System.currentTimeMillis();
-        incoming.put(sessionKey, session);
-        pendingBytes += size;
-        ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                "接收中 " + session.name + " · " + formatBytes(size));
+    private void sweepExpired(Context context) {
+        receiver.sweepExpired((peer, text) -> ChatEvents.send(context, ChatEvents.DIRECTION_IN,
+                ChatEvents.KIND_FILE, peer, text));
     }
 
-    private void handleChunk(Context context, String sessionKey, String from, JSONObject json)
-            throws Exception {
-        IncomingSession session = incoming.get(sessionKey);
-        if (session == null) {
-            return;
-        }
-        int seq = json.optInt("seq", -1);
-        byte[] data = Base64.getDecoder().decode(json.optString("data", ""));
-        if (seq < 0 || seq >= session.chunks) {
-            throw new IllegalArgumentException("invalid chunk seq");
-        }
-        long offset = (long) seq * CHUNK_BYTES;
-        // Every chunk but the last must be exactly CHUNK_BYTES, so a short chunk cannot silently
-        // leave a hole that the bitmap would still count as received.
-        int expected = (int) Math.min(CHUNK_BYTES, session.size - offset);
-        if (data.length != expected) {
-            throw new IllegalArgumentException("chunk length mismatch");
-        }
-        session.lastTouchedAtMillis = System.currentTimeMillis();
-        if (session.receivedChunks[seq]) {
-            // Duplicate delivery (peer retry or server fallback): the completion count must not move.
-            return;
-        }
-        session.randomAccess.seek(offset);
-        session.randomAccess.write(data);
-        session.receivedChunks[seq] = true;
-        session.received++;
-        session.receivedBytes += data.length;
-        if (session.received % PROGRESS_EVERY_CHUNKS == 0) {
-            int percent = (int) ((session.received * 100L) / Math.max(1, session.chunks));
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                    "接收中 " + session.name + " · " + percent + "%");
-        }
+    private static File transferDirectory(Context context) {
+        return new File(context.getFilesDir(), "transfers");
     }
 
-    private void handleDone(Context context, String sessionKey, String from, JSONObject json)
-            throws Exception {
-        if (completed.containsKey(sessionKey)) {
-            // The sender retried "done" after its ACK was lost; the file is already delivered.
-            return;
-        }
-        IncomingSession session = incoming.remove(sessionKey);
-        if (session == null) {
-            return;
-        }
-        pendingBytes = Math.max(0L, pendingBytes - session.size);
-        session.randomAccess.close();
-        if (session.received != session.chunks || session.receivedBytes != session.size) {
-            //noinspection ResultOfMethodCallIgnored
-            session.file.delete();
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                    "文件不完整 · " + session.name + " (" + session.received + "/" + session.chunks + ")");
-            return;
-        }
-        if (session.sha256 != null && !session.sha256.equalsIgnoreCase(fileDigest(session.file))) {
-            //noinspection ResultOfMethodCallIgnored
-            session.file.delete();
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                    "文件校验失败 · " + session.name);
-            return;
-        }
-        completed.put(sessionKey, System.currentTimeMillis());
-        File target = uniqueTarget(context, session.name);
-        if (!session.file.renameTo(target)) {
-            copyFile(session.file, target);
-            //noinspection ResultOfMethodCallIgnored
-            session.file.delete();
-        }
-        ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                "已接收 " + session.name + " · " + formatBytes(session.size) + "\n保存到 " + target.getAbsolutePath());
-    }
-
-    private void handleAbort(Context context, String sessionKey, String from, JSONObject json) {
-        IncomingSession session = dropSession(sessionKey);
-        if (session != null) {
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, from,
-                    "对方取消发送 · " + session.name);
-        }
-    }
-
-    synchronized void sweepExpired(Context context) {
-        long now = System.currentTimeMillis();
-        Iterator<Map.Entry<String, Long>> completedIterator = completed.entrySet().iterator();
-        while (completedIterator.hasNext()) {
-            if (now - completedIterator.next().getValue() > SESSION_TTL_MILLIS) {
-                completedIterator.remove();
-            }
-        }
-        Iterator<Map.Entry<String, IncomingSession>> iterator = incoming.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<String, IncomingSession> entry = iterator.next();
-            IncomingSession session = entry.getValue();
-            if (now - session.lastTouchedAtMillis <= SESSION_TTL_MILLIS) {
-                continue;
-            }
-            iterator.remove();
-            pendingBytes = Math.max(0L, pendingBytes - session.size);
-            closeQuietly(session.randomAccess);
-            //noinspection ResultOfMethodCallIgnored
-            session.file.delete();
-            ChatEvents.send(context, ChatEvents.DIRECTION_IN, ChatEvents.KIND_FILE, session.from,
-                    "接收超时 · " + session.name);
-        }
-    }
-
-    private IncomingSession dropSession(String sessionKey) {
-        IncomingSession session = incoming.remove(sessionKey);
-        if (session != null) {
-            pendingBytes = Math.max(0L, pendingBytes - session.size);
-            closeQuietly(session.randomAccess);
-            //noinspection ResultOfMethodCallIgnored
-            session.file.delete();
-        }
-        return session;
-    }
-
-    private static File uniqueTarget(Context context, String name) {
-        File dir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS);
-        if (dir == null) {
-            dir = new File(context.getFilesDir(), "downloads");
-        }
-        if (!dir.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            dir.mkdirs();
-        }
-        File target = new File(dir, name);
-        if (!target.exists()) {
-            return target;
-        }
-        String base = name;
-        String extension = "";
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            base = name.substring(0, dot);
-            extension = name.substring(dot);
-        }
-        for (int i = 1; i < 1000; i++) {
-            File candidate = new File(dir, base + " (" + i + ")" + extension);
-            if (!candidate.exists()) {
-                return candidate;
-            }
-        }
-        return new File(dir, System.currentTimeMillis() + "-" + name);
-    }
-
-    private static void copyFile(File source, File target) throws Exception {
-        try (FileInputStream in = new FileInputStream(source);
-             FileOutputStream out = new FileOutputStream(target)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) > 0) {
-                out.write(buffer, 0, read);
-            }
-        }
+    private static File downloadDirectory(Context context) {
+        File directory = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS);
+        return directory == null ? new File(context.getFilesDir(), "downloads") : directory;
     }
 
     private static int readFully(InputStream in, byte[] buffer) throws Exception {
@@ -469,11 +287,6 @@ final class FileTransferManager {
             offset += read;
         }
         return offset;
-    }
-
-    /** Sessions are per authenticated sender, so peers cannot collide on transfer ids. */
-    private static String sessionKey(String from, String id) {
-        return (from == null ? "" : from) + " " + id;
     }
 
     /**
@@ -501,17 +314,6 @@ final class FileTransferManager {
             return "file";
         }
         return value.length() > MAX_NAME_LENGTH ? value.substring(value.length() - MAX_NAME_LENGTH) : value;
-    }
-
-    /** Rejects any candidate that resolves outside the directory we own. */
-    private static void requireContained(File directory, File candidate) throws Exception {
-        String root = directory.getCanonicalPath();
-        if (!root.endsWith(File.separator)) {
-            root = root + File.separator;
-        }
-        if (!candidate.getCanonicalPath().startsWith(root)) {
-            throw new IllegalArgumentException("resolved path escapes the transfer directory");
-        }
     }
 
     private static boolean isHexDigest(String value) {
@@ -572,26 +374,4 @@ final class FileTransferManager {
         return String.format(Locale.ROOT, value >= 10 || unit == 0 ? "%.0f %s" : "%.1f %s", value, units[unit]);
     }
 
-    private static void closeQuietly(java.io.Closeable closeable) {
-        try {
-            if (closeable != null) {
-                closeable.close();
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private static final class IncomingSession {
-        String name;
-        String from;
-        long size;
-        int chunks;
-        int received;
-        long receivedBytes;
-        boolean[] receivedChunks;
-        String sha256;
-        File file;
-        RandomAccessFile randomAccess;
-        long lastTouchedAtMillis;
-    }
 }

@@ -26,12 +26,20 @@ public sealed class ClientAuthService
     private readonly SpecusClientConfig _config;
     private readonly HttpClient _http;
     private readonly ILogger<ClientAuthService> _logger;
+    private readonly ClientMessageCapabilities _messageCapabilities;
 
-    public ClientAuthService(SpecusClientConfig config, HttpClient http, ILogger<ClientAuthService> logger)
+    public ClientAuthService(
+        SpecusClientConfig config,
+        HttpClient http,
+        ILogger<ClientAuthService> logger,
+        ClientMessageCapabilities? messageCapabilities = null)
     {
         _config = config;
         _http = http;
         _logger = logger;
+        // The headless CLI has no STXFER receive handler. Callers must opt in only when their
+        // concrete frontend owns a complete attachment receive path.
+        _messageCapabilities = messageCapabilities ?? ClientMessageCapabilities.TextOnlyDefault();
     }
 
     /// <summary>
@@ -57,7 +65,7 @@ public sealed class ClientAuthService
 
     public async Task<SpecusRuntimeState> LoginAsync(CancellationToken cancellationToken)
     {
-        var environment = ClientEnvironmentInfo.Collect(_logger);
+        var environment = ClientEnvironmentInfo.Collect(_logger, _messageCapabilities);
         var request = new ClientAuthLoginRequest
         {
             Environment = environment,
@@ -196,7 +204,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("startedAt")]
     public string? StartedAt { get; set; }
 
-    public static ClientEnvironmentInfo Collect(ILogger logger)
+    public static ClientEnvironmentInfo Collect(
+        ILogger logger,
+        ClientMessageCapabilities? messageCapabilities = null)
     {
         var info = new ClientEnvironmentInfo
         {
@@ -209,7 +219,7 @@ public sealed class ClientEnvironmentInfo
             ClientVersion = typeof(ClientEnvironmentInfo).Assembly.GetName().Version?.ToString(),
             JavaVersion = "",
             PeerPublicKey = PeerKeyStore.PublicKeyBase64(logger),
-            ClientMessageCapabilities = ClientMessageCapabilities.DesktopDefault(),
+            ClientMessageCapabilities = (messageCapabilities ?? ClientMessageCapabilities.TextOnlyDefault()).Copy(),
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -290,6 +300,8 @@ public sealed class ClientEnvironmentInfo
 
 public sealed class ClientMessageCapabilities
 {
+    public const long DesktopMaxAttachmentBytes = 8L * 1024 * 1024;
+
     [JsonPropertyName("sendMessages")]
     public bool SendMessages { get; set; }
 
@@ -305,12 +317,30 @@ public sealed class ClientMessageCapabilities
     [JsonPropertyName("maxAttachmentBytes")]
     public long MaxAttachmentBytes { get; set; }
 
-    public static ClientMessageCapabilities DesktopDefault() => new()
+    public static ClientMessageCapabilities TextOnlyDefault() => new()
     {
         SendMessages = true,
         ReceiveMessages = true,
         Attachments = false,
         MediaPreview = false,
         MaxAttachmentBytes = 0L,
+    };
+
+    public static ClientMessageCapabilities DesktopFileTransfer() => new()
+    {
+        SendMessages = true,
+        ReceiveMessages = true,
+        Attachments = true,
+        MediaPreview = false,
+        MaxAttachmentBytes = DesktopMaxAttachmentBytes,
+    };
+
+    internal ClientMessageCapabilities Copy() => new()
+    {
+        SendMessages = SendMessages,
+        ReceiveMessages = ReceiveMessages,
+        Attachments = Attachments,
+        MediaPreview = MediaPreview,
+        MaxAttachmentBytes = MaxAttachmentBytes,
     };
 }

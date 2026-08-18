@@ -12,11 +12,18 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThrows;
 
 public class FileTransferManagerTest {
+    private static final String ZERO_DIGEST =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+    private static final String EMPTY_DIGEST =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     @Test
     public void offerRoundTripsWithAllMetadata() throws Exception {
-        String body = FileTransferManager.buildOffer("abc123", "报告 最终版.pdf", 123456L, "application/pdf", 206);
+        String body = FileTransferManager.buildOffer(
+                "abc123", "报告 最终版.pdf", 123456L, "application/pdf", 206, ZERO_DIGEST);
 
         assertTrue(FileTransferManager.isTransferMessage(body));
         JSONObject parsed = FileTransferManager.parseTransfer(body);
@@ -86,6 +93,17 @@ public class FileTransferManagerTest {
     }
 
     @Test
+    public void oversizedRawTransferFrameIsRejectedBeforeJsonParsing() {
+        String oversized = "STXFER1\n{\"t\":\"chunk\",\"id\":\"x\",\"data\":\""
+                + "A".repeat(FileTransferManager.MAX_TRANSFER_FRAME_BYTES) + "\"}";
+
+        assertTrue(FileTransferManager.isTransferMessage(oversized));
+        assertTrue(FileTransferManager.utf8LengthExceeds(
+                oversized, FileTransferManager.MAX_TRANSFER_FRAME_BYTES));
+        assertNull(FileTransferManager.parseTransfer(oversized));
+    }
+
+    @Test
     public void formatBytesMatchesUiStyle() {
         assertEquals("0 B", FileTransferManager.formatBytes(0));
         assertEquals("512 B", FileTransferManager.formatBytes(512));
@@ -103,11 +121,9 @@ public class FileTransferManagerTest {
         assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 parsed.getString("sha256"));
 
-        // Peers that predate the digest simply omit the field.
-        JSONObject legacy = FileTransferManager.parseTransfer(
-                FileTransferManager.buildOffer("id-l", "a.bin", 3L, "application/octet-stream", 1));
-        assertNotNull(legacy);
-        assertFalse(legacy.has("sha256"));
+        assertThrows(IllegalArgumentException.class,
+                () -> FileTransferManager.buildOffer(
+                        "id-l", "a.bin", 3L, "application/octet-stream", 1, null));
     }
 
     @Test
@@ -138,7 +154,8 @@ public class FileTransferManagerTest {
     @Test
     public void zeroByteOfferCarriesNoChunks() throws Exception {
         JSONObject parsed = FileTransferManager.parseTransfer(
-                FileTransferManager.buildOffer("id-0", "empty.txt", 0L, "text/plain", 0));
+                FileTransferManager.buildOffer(
+                        "id-0", "empty.txt", 0L, "text/plain", 0, EMPTY_DIGEST));
 
         assertNotNull(parsed);
         assertEquals(0L, parsed.getLong("size"));
