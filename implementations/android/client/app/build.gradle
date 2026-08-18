@@ -27,6 +27,7 @@ android {
         targetSdk 35
         versionCode releaseVersionCode
         versionName releaseVersion
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -78,4 +79,8 @@ dependencies {
     // Android's org.json classes are stubs in local JVM tests. Use the matching
     // standalone implementation so protocol JSON is exercised for real.
     testImplementation "org.json:json:20250517"
+    // On-device coverage for behaviour the JVM cannot reach: real Android service lifecycle.
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test:rules:1.6.1"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
 }

@@ -63,7 +63,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -71,6 +75,23 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class SpecusCore {
     static final int CONTROL_READ_IDLE_TIMEOUT_MILLIS = 60_000;
     static final int CONTROL_CONNECT_TIMEOUT_MILLIS = 5_000;
+    /**
+     * Ceiling on concurrently open streams of all kinds.
+     *
+     * Every stream holds a local socket, queued bytes and pool slots. Without a ceiling a peer can
+     * open them until the phone runs out of descriptors or memory, so past this point new OPENs are
+     * refused with a reset rather than accepted and then starved.
+     */
+    static final int MAX_ACTIVE_STREAMS = 512;
+
+    /**
+     * Whether a new stream would exceed the ceiling. Split out from the OPEN path so the admission
+     * rule can be asserted directly, since standing up a live control connection to open 512
+     * streams would test the harness more than the rule.
+     */
+    static boolean streamLimitReached(int active, int limit) {
+        return active >= limit;
+    }
     static final int CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS = 10_000;
     static final int WEBSOCKET_PREOPEN_FIN_TIMEOUT_MILLIS = 5_000;
     static final String CONNECTION_ROLE_CONTROL = "control";
@@ -104,18 +125,44 @@ public final class SpecusCore {
     }
 
     public static final class Runtime implements Runnable {
+        /** Hard ceiling on IO threads; the pool grows toward it only under real concurrency. */
+        static final int MAX_IO_THREADS = 64;
+        static final int MAX_IO_THREADS_FLOOR = 16;
+        static final int IO_QUEUE_CAPACITY = 512;
+
         private final Context context;
         private final String configText;
         private final StatusListener listener;
         private final VpnPlatform vpnPlatform;
         private final AtomicBoolean running = new AtomicBoolean(true);
-        private final ExecutorService ioPool = Executors.newCachedThreadPool(r -> {
-            Thread thread = new Thread(r, "specus-io");
-            thread.setDaemon(true);
-            return thread;
-        });
+        private final ExecutorService ioPool = newIoPool();
         private volatile ControlConnection connection;
         private volatile AppMessageListener appMessageListener;
+
+        /**
+         * Bounded IO pool.
+         *
+         * A cached pool starts a thread per concurrent task with no ceiling, so a peer opening
+         * streams faster than they complete could grow the thread count until the process died.
+         * The queue absorbs bursts; once both the pool and the queue are full the caller runs the
+         * task itself, which throttles the accepting path instead of dropping work.
+         */
+        static ExecutorService newIoPool() {
+            int cores = Math.max(2, java.lang.Runtime.getRuntime().availableProcessors());
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                    Math.min(4, cores),
+                    Math.max(MAX_IO_THREADS_FLOOR, Math.min(MAX_IO_THREADS, cores * 8)),
+                    30L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(IO_QUEUE_CAPACITY),
+                    r -> {
+                        Thread thread = new Thread(r, "specus-io");
+                        thread.setDaemon(true);
+                        return thread;
+                    },
+                    new ThreadPoolExecutor.CallerRunsPolicy());
+            pool.allowCoreThreadTimeOut(true);
+            return pool;
+        }
 
         Runtime(Context context, String configText, StatusListener listener, VpnPlatform vpnPlatform) {
             this.context = context.getApplicationContext();
@@ -1099,10 +1146,19 @@ public final class SpecusCore {
         }
     }
 
-    private static final class SpecusEndpoint {
+    static final class SpecusEndpoint {
         int port;
         String specusAddress;
         int specusPort;
+
+        SpecusEndpoint() {
+        }
+
+        SpecusEndpoint(String specusAddress, int specusPort) {
+            this.specusAddress = specusAddress;
+            this.specusPort = specusPort;
+            this.port = specusPort;
+        }
     }
 
     private static final class HttpRouteEndpoint {
@@ -1217,7 +1273,7 @@ public final class SpecusCore {
         }
     }
 
-    private static final class ControlConnection implements Closeable {
+    private static final class ControlConnection implements Closeable, LocalStreamChannel {
         private static final int PENDING_STREAM_LIMIT = 1024;
         private static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
 
@@ -1548,6 +1604,15 @@ public final class SpecusCore {
                     sendReset(packet.streamId, 7, "duplicate or excessive pending stream");
                     return;
                 }
+                if (streamLimitReached(activeStreamCount(), MAX_ACTIVE_STREAMS)) {
+                    // Refusing here is honest backpressure. Accepting the stream and then starving
+                    // it would look like a hang to the peer and still cost us the resources.
+                    streamLifecycle.markClosed(packet.streamId);
+                    status.publish("Stream rejected",
+                            "active stream limit " + MAX_ACTIVE_STREAMS + " reached", true);
+                    sendReset(packet.streamId, 7, "active stream limit reached");
+                    return;
+                }
                 if (!streamFlow.open(packet.streamId)) {
                     streamLifecycle.markClosed(packet.streamId);
                     sendReset(packet.streamId, 7, "duplicate OPEN");
@@ -1687,6 +1752,11 @@ public final class SpecusCore {
             streamFlow.closeStream(streamId);
         }
 
+        /** Open streams of every kind; the ceiling applies to their sum, not to each registry. */
+        int activeStreamCount() {
+            return localSpecusMappings.size() + localWebSockets.size() + httpStreams.size();
+        }
+
         private void openHttpStream(int streamId, Map<String, Object> metadata) throws Exception {
             if (!"request".equals(asString(metadata.get("phase")))) {
                 sendReset(streamId, 10, "invalid HTTP stream phase");
@@ -1792,12 +1862,26 @@ public final class SpecusCore {
             }
         }
 
-        void sendNatData(int streamId, byte[] data) throws Exception {
+        @Override
+        public void sendNatData(int streamId, byte[] data) throws Exception {
             sendStreamData(streamId, data);
         }
 
-        void sendWsData(int streamId, byte[] data) throws Exception {
-            sendStreamData(streamId, data);
+        /**
+         * Queues a WebSocket chunk without waiting for SWS2 credit.
+         *
+         * Callers on a Netty event loop must never block here: the loop is shared by every
+         * WebSocket stream, so waiting for one peer's WINDOW_UPDATE would freeze all of them. There
+         * is deliberately no blocking counterpart, so no future caller can reintroduce the stall.
+         */
+        StreamFlowScheduler.Submission submitWsData(int streamId, byte[] data) throws IOException {
+            byte[] payload = data == null ? new byte[0] : data;
+            NatMessage packet = Packet.stream(NatMessageType.DATA, streamId, 0, payload);
+            return streamFlow.submit(streamId, payload.length, () -> sendData(packet));
+        }
+
+        boolean streamSendSaturated(int streamId) {
+            return streamFlow.saturated(streamId);
         }
 
         void sendHttpHead(int streamId, int statusCode, List<String> headers,
@@ -1813,16 +1897,21 @@ public final class SpecusCore {
             send(head);
         }
 
-        void sendHttpData(int streamId, byte[] data) throws Exception {
-            sendStreamData(streamId, data);
+        /** Queues an HTTP response chunk; the caller is on a Netty event loop and must not wait. */
+        StreamFlowScheduler.Submission submitHttpData(int streamId, byte[] data) throws IOException {
+            byte[] payload = data == null ? new byte[0] : data;
+            NatMessage packet = Packet.stream(NatMessageType.DATA, streamId, 0, payload);
+            return streamFlow.submit(streamId, payload.length, () -> sendData(packet));
         }
 
-        void sendHttpFin(int streamId, List<String> trailers) throws Exception {
+        /** Queues the HTTP response FIN; the caller is on a Netty event loop and must not wait. */
+        CompletableFuture<Void> submitHttpFin(int streamId, List<String> trailers)
+                throws IOException {
             NatMessage fin = Packet.stream(NatMessageType.FIN, streamId, 0, null);
             if (trailers != null && !trailers.isEmpty()) {
                 fin.meta = Map.of("trailers", trailers);
             }
-            streamFlow.finish(streamId, () -> sendData(fin));
+            return streamFlow.submitFinish(streamId, () -> sendData(fin));
         }
 
         void returnHttpRequestCredit(int streamId, int credit) throws Exception {
@@ -1835,7 +1924,8 @@ public final class SpecusCore {
             streamLifecycle.markClosed(streamId);
         }
 
-        void completeTcpStream(int streamId, LocalSpecus expected) {
+        @Override
+        public void completeTcpStream(int streamId, LocalSpecus expected) {
             localSpecusMappings.remove(streamId, expected);
             closeSendWindow(streamId);
             streamLifecycle.markClosed(streamId);
@@ -1847,7 +1937,8 @@ public final class SpecusCore {
             streamLifecycle.markClosed(streamId);
         }
 
-        void resetTcpStream(int streamId, LocalSpecus expected,
+        @Override
+        public void resetTcpStream(int streamId, LocalSpecus expected,
                             long errorCode, String reason) {
             if (!localSpecusMappings.remove(streamId, expected)) {
                 return;
@@ -1889,8 +1980,22 @@ public final class SpecusCore {
             }
         }
 
-        void markStreamOpened(int streamId) {
+        @Override
+        public void markStreamOpened(int streamId) {
             streamLifecycle.markOpened(streamId);
+        }
+
+        /**
+         * Schedules a watchdog on the heartbeat scheduler. Returns null when the scheduler is gone,
+         * which callers treat as "no watchdog" rather than as a failure.
+         */
+        @Override
+        public ScheduledFuture<?> scheduleWatchdog(Runnable task, long delayMillis) {
+            try {
+                return heartbeat.schedule(task, delayMillis, TimeUnit.MILLISECONDS);
+            } catch (RuntimeException ignored) {
+                return null;
+            }
         }
 
         private void sendStreamData(int streamId, byte[] data) throws Exception {
@@ -1899,13 +2004,15 @@ public final class SpecusCore {
             streamFlow.send(streamId, payload.length, () -> sendData(packet));
         }
 
-        void protect(Socket socket) throws IOException {
+        @Override
+        public void protect(Socket socket) throws IOException {
             if (session.usesVpnDevice()) {
                 protectSocket(vpnPlatform, socket);
             }
         }
 
-        void sendFin(int streamId) throws Exception {
+        @Override
+        public void sendFin(int streamId) throws Exception {
             NatMessage fin = Packet.stream(NatMessageType.FIN, streamId, 0, null);
             streamFlow.finish(streamId, () -> sendData(fin));
         }
@@ -1920,7 +2027,8 @@ public final class SpecusCore {
             }
         }
 
-        private void sendWindowUpdate(int streamId, int credit) throws Exception {
+        @Override
+        public void sendWindowUpdate(int streamId, int credit) throws Exception {
             if (credit > 0) {
                 send(Packet.stream(NatMessageType.WINDOW_UPDATE, streamId,
                         Integer.toUnsignedLong(credit), null));
@@ -2112,24 +2220,71 @@ public final class SpecusCore {
         }
     }
 
-    private static final class LocalSpecus implements Closeable {
+    /**
+     * What a local TCP stream needs from the control connection.
+     *
+     * Naming the dependency lets the stream be tested against real sockets and a slow consumer
+     * without building a live session, which is the only way to prove the reader does not block.
+     */
+    interface LocalStreamChannel {
+        void protect(Socket socket) throws IOException;
+
+        void markStreamOpened(int streamId);
+
+        void sendNatData(int streamId, byte[] data) throws Exception;
+
+        void sendWindowUpdate(int streamId, int credit) throws Exception;
+
+        void sendFin(int streamId) throws Exception;
+
+        void completeTcpStream(int streamId, LocalSpecus specus);
+
+        void resetTcpStream(int streamId, LocalSpecus specus, long errorCode, String reason);
+
+        ScheduledFuture<?> scheduleWatchdog(Runnable task, long delayMillis);
+    }
+
+    static final class LocalSpecus implements Closeable {
         private static final int MAX_PENDING_REMOTE_BYTES = 1024 * 1024;
+        /**
+         * How long one local write may take before the socket is closed underneath it. Generous
+         * enough for a paused consumer to resume, short enough that a dead one is reclaimed.
+         */
+        private static final long LOCAL_WRITE_TIMEOUT_MILLIS = 30_000L;
 
         private final int streamId;
         private final SpecusEndpoint endpoint;
-        private final ControlConnection control;
+        private final LocalStreamChannel control;
         private final ExecutorService ioPool;
+        private final long writeTimeoutMillis;
         private final TcpHalfCloseState closeState = new TcpHalfCloseState();
         private final Object outputLock = new Object();
-        private final List<byte[]> pendingRemoteData = new ArrayList<>();
-        private int pendingRemoteBytes;
+        /**
+         * Remote bytes and the FIN marker, in arrival order, waiting to be written locally.
+         *
+         * The multiplexed data channel has one reader thread serving every stream. Writing straight
+         * to the local socket from it meant a single slow or half-open local service stalled every
+         * other stream on the connection, control frames included. The reader now only enqueues.
+         */
+        private final ArrayDeque<byte[]> inbound = new ArrayDeque<>();
+        private int inboundBytes;
+        private boolean inboundFin;
+        private boolean draining;
         private volatile Socket socket;
 
-        LocalSpecus(int streamId, SpecusEndpoint endpoint, ControlConnection control, ExecutorService ioPool) {
+        LocalSpecus(int streamId, SpecusEndpoint endpoint, LocalStreamChannel control,
+                    ExecutorService ioPool) {
+            this(streamId, endpoint, control, ioPool, LOCAL_WRITE_TIMEOUT_MILLIS);
+        }
+
+        /** Same, with an explicit write deadline so tests need not wait out the production one. */
+        LocalSpecus(int streamId, SpecusEndpoint endpoint, LocalStreamChannel control,
+                    ExecutorService ioPool, long writeTimeoutMillis) {
             this.streamId = streamId;
             this.endpoint = endpoint;
             this.control = control;
             this.ioPool = ioPool;
+            this.writeTimeoutMillis = writeTimeoutMillis;
         }
 
         void start() {
@@ -2174,25 +2329,28 @@ public final class SpecusCore {
             }
         }
 
+        /**
+         * Called on the shared data-channel reader thread. Protocol violations are still detected
+         * here, synchronously, so the caller can reset the stream; the socket write itself is left
+         * to the drain task belonging to this stream.
+         */
         void write(byte[] data) throws IOException {
             byte[] value = data == null ? new byte[0] : data;
             synchronized (outputLock) {
                 if (!closeState.canReceiveRemoteData()) {
                     throw new IOException("remote TCP DATA after FIN");
                 }
-                Socket local = socket;
-                if (local == null) {
-                    if ((long) pendingRemoteBytes + value.length > MAX_PENDING_REMOTE_BYTES) {
-                        throw new IOException("remote TCP DATA exceeded pre-connect buffer");
-                    }
-                    if (value.length > 0) {
-                        pendingRemoteData.add(value.clone());
-                        pendingRemoteBytes += value.length;
-                    }
-                    return;
+                if ((long) inboundBytes + value.length > MAX_PENDING_REMOTE_BYTES) {
+                    // The peer sent more than the window we advertised: WINDOW_UPDATE only goes out
+                    // after a chunk has actually reached the local socket.
+                    throw new IOException("remote TCP DATA exceeded the receive window");
                 }
-                writeToLocal(local, value);
+                if (value.length > 0) {
+                    inbound.addLast(value.clone());
+                    inboundBytes += value.length;
+                }
             }
+            kickDrain();
         }
 
         void receiveRemoteFin() throws IOException {
@@ -2204,12 +2362,81 @@ public final class SpecusCore {
                 if (transition == TcpHalfCloseState.Transition.RESET) {
                     return;
                 }
-                Socket local = socket;
-                if (local != null && !shutdownLocalOutput(local)) {
+                // Ordered behind whatever is still queued: the half-close must follow the bytes.
+                inboundFin = true;
+            }
+            kickDrain();
+        }
+
+        /**
+         * Ensures exactly one drain task is pending. A dedicated thread per stream would cost one
+         * thread per idle connection; this holds a pool slot only while there is work.
+         */
+        private void kickDrain() {
+            synchronized (outputLock) {
+                if (draining || socket == null || (inbound.isEmpty() && !inboundFin)) {
                     return;
                 }
+                draining = true;
             }
-            closeIfComplete();
+            try {
+                ioPool.execute(this::drainInbound);
+            } catch (RejectedExecutionException error) {
+                synchronized (outputLock) {
+                    draining = false;
+                }
+                failLocalIo("local TCP writer unavailable: " + message(error));
+            }
+        }
+
+        private void drainInbound() {
+            while (true) {
+                Socket local;
+                byte[] chunk;
+                boolean finish;
+                synchronized (outputLock) {
+                    local = socket;
+                    chunk = inbound.pollFirst();
+                    if (chunk != null) {
+                        inboundBytes -= chunk.length;
+                    }
+                    finish = chunk == null && inboundFin;
+                    if (local == null || (chunk == null && !finish)) {
+                        draining = false;
+                        return;
+                    }
+                    if (finish) {
+                        inboundFin = false;
+                    }
+                }
+                if (closeState.isReset()) {
+                    discardInbound();
+                    return;
+                }
+                if (chunk != null) {
+                    if (!writeToLocal(local, chunk)) {
+                        discardInbound();
+                        return;
+                    }
+                    continue;
+                }
+                boolean shutdown = shutdownLocalOutput(local);
+                synchronized (outputLock) {
+                    draining = false;
+                }
+                if (shutdown) {
+                    closeIfComplete();
+                }
+                return;
+            }
+        }
+
+        private void discardInbound() {
+            synchronized (outputLock) {
+                inbound.clear();
+                inboundBytes = 0;
+                draining = false;
+            }
         }
 
         void receiveRemoteReset() {
@@ -2219,6 +2446,11 @@ public final class SpecusCore {
             closeQuietly(socket);
         }
 
+        /**
+         * Publishes the connected socket and lets the drain task flush whatever arrived while the
+         * connect was still in flight. Keeping a single writer keeps the ordering rules in one
+         * place rather than splitting them across the connect thread and the drain.
+         */
         private void attachAndFlush(Socket local) throws Exception {
             synchronized (outputLock) {
                 if (closeState.isReset()) {
@@ -2226,32 +2458,41 @@ public final class SpecusCore {
                     return;
                 }
                 socket = local;
-                for (byte[] data : pendingRemoteData) {
-                    writeToLocal(local, data);
-                    if (closeState.isReset()) {
-                        return;
-                    }
-                }
-                pendingRemoteData.clear();
-                pendingRemoteBytes = 0;
-                if (closeState.remoteFinReceived() && !shutdownLocalOutput(local)) {
-                    return;
+                if (closeState.remoteFinReceived()) {
+                    inboundFin = true;
                 }
             }
-            closeIfComplete();
+            kickDrain();
         }
 
-        private void writeToLocal(Socket local, byte[] data) {
+        /**
+         * Returns false when the write failed and the stream has been torn down.
+         *
+         * A blocking socket write has no timeout of its own: if the local service stops reading and
+         * never closes, {@code write} parks forever and the stream leaks its socket and its drain
+         * slot. The watchdog closes the socket, which is what actually unblocks the write.
+         */
+        private boolean writeToLocal(Socket local, byte[] data) {
             if (data.length == 0 || closeState.isReset()) {
-                return;
+                return true;
             }
+            ScheduledFuture<?> watchdog = control.scheduleWatchdog(
+                    () -> failLocalIo("local TCP write timed out"), writeTimeoutMillis);
             try {
                 OutputStream out = local.getOutputStream();
                 out.write(data);
                 out.flush();
+                // The window only reopens once the bytes are actually with the local service, so a
+                // slow consumer throttles its own peer instead of buffering without limit here.
                 control.sendWindowUpdate(streamId, data.length);
+                return true;
             } catch (Exception error) {
                 failLocalIo("write to local TCP failed: " + message(error));
+                return false;
+            } finally {
+                if (watchdog != null) {
+                    watchdog.cancel(false);
+                }
             }
         }
 
@@ -2812,20 +3053,61 @@ public final class SpecusCore {
             }
         }
 
+        /**
+         * Runs on the Netty event loop. Chunks are queued rather than written through, and the local
+         * socket stops being read while the SWS2 queue is deep, so a peer that withholds
+         * WINDOW_UPDATE slows only its own stream instead of the shared loop.
+         */
         private void forwardToControl(int opcode, boolean fin, int rsv,
                                       int closeCode, byte[] payload) {
             try {
+                boolean saturated = false;
+                StreamFlowScheduler.Submission last = null;
                 for (byte[] chunk : WebSocketSupport.encodeFrameChunks(
                         opcode, fin, rsv, closeCode, payload)) {
-                    control.sendWsData(streamId, chunk);
+                    last = control.submitWsData(streamId, chunk);
+                    saturated |= last.saturated();
+                    last.completion().whenComplete((ignored, error) -> {
+                        if (error != null) {
+                            failFromUpstreamWrite(error);
+                        }
+                    });
+                }
+                if (saturated && last != null) {
+                    pauseUpstreamUntilDrained(last);
                 }
             } catch (Exception error) {
-                NettyWebSocketTransport socket = webSocket;
-                if (socket != null) {
-                    socket.close();
-                }
-                finish(false, message(error));
+                failFromUpstreamWrite(error);
             }
+        }
+
+        private void failFromUpstreamWrite(Throwable error) {
+            NettyWebSocketTransport socket = webSocket;
+            if (socket != null) {
+                socket.close();
+            }
+            finish(false, message(error));
+        }
+
+        /**
+         * Stops reading the local WebSocket until the queued chunk clears and the stream is back
+         * under the mark. Resuming is driven by the send completion, never by a sleeping thread.
+         */
+        private void pauseUpstreamUntilDrained(StreamFlowScheduler.Submission submission) {
+            NettyWebSocketTransport socket = webSocket;
+            if (socket == null) {
+                return;
+            }
+            socket.setReceiving(false);
+            submission.completion().whenComplete((ignored, error) -> {
+                NettyWebSocketTransport current = webSocket;
+                if (current == null) {
+                    return;
+                }
+                if (error != null || !control.streamSendSaturated(streamId)) {
+                    current.setReceiving(true);
+                }
+            });
         }
 
         private void finish(boolean notifyControl, String detail) {
@@ -2882,6 +3164,38 @@ public final class SpecusCore {
         private boolean requestEnded;
         private volatile NettyHttpTransport connection;
         private volatile boolean responseCompleted;
+
+        /**
+         * A queued response chunk failed to reach the control channel. The upstream connection is
+         * the only thing still producing, so cutting it is what stops the stream.
+         */
+        private void failResponseWrite(Throwable error) {
+            NettyHttpTransport upstream = connection;
+            if (upstream != null) {
+                upstream.close();
+            }
+        }
+
+        /**
+         * Stops reading the upstream response until the queued chunk clears and the stream drops
+         * back under the mark. Driven by the send completion, never by a sleeping thread.
+         */
+        private void pauseUpstreamUntilDrained(StreamFlowScheduler.Submission submission) {
+            NettyHttpTransport upstream = connection;
+            if (upstream == null) {
+                return;
+            }
+            upstream.setReceiving(false);
+            submission.completion().whenComplete((ignored, error) -> {
+                NettyHttpTransport current = connection;
+                if (current == null) {
+                    return;
+                }
+                if (error != null || !control.streamSendSaturated(streamId)) {
+                    current.setReceiving(true);
+                }
+            });
+        }
 
         HttpStreamForwarder(int streamId, Map<String, Object> metadata,
                             Map<String, String> routes, ControlConnection control,
@@ -2986,14 +3300,29 @@ public final class SpecusCore {
                                 control.sendHttpHead(streamId, statusCode, headers, responseTrailerNames);
                             }
 
+                            // Runs on the Netty event loop: queue, never wait for SWS2 credit.
                             @Override
                             public void onResponseData(byte[] data) throws Exception {
-                                control.sendHttpData(streamId, data);
+                                StreamFlowScheduler.Submission submission =
+                                        control.submitHttpData(streamId, data);
+                                submission.completion().whenComplete((ignored, error) -> {
+                                    if (error != null) {
+                                        failResponseWrite(error);
+                                    }
+                                });
+                                if (submission.saturated()) {
+                                    pauseUpstreamUntilDrained(submission);
+                                }
                             }
 
                             @Override
                             public void onResponseEnd(List<String> trailers) throws Exception {
-                                control.sendHttpFin(streamId, trailers);
+                                control.submitHttpFin(streamId, trailers)
+                                        .whenComplete((ignored, error) -> {
+                                            if (error != null) {
+                                                failResponseWrite(error);
+                                            }
+                                        });
                                 responseCompleted = true;
                                 requestQueue.clear();
                                 requestQueue.offer(RequestChunk.CANCELLED);

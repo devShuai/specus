@@ -89,6 +89,26 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
         return START_STICKY;
     }
 
+    /**
+     * Android 15 caps how long a {@code dataSync} foreground service may run and calls this when
+     * the budget is spent. The service must stop itself promptly: staying up past the callback is
+     * an ANR on Android 15 and a hard crash on later releases. Tearing the runtime down here also
+     * releases the tunnel sockets rather than leaving them for the platform to reap.
+     */
+    @Override
+    public void onTimeout(int startId) {
+        onTimeout(startId, 0);
+    }
+
+    /** Android 16 hands the service type along; the response is the same. */
+    @Override
+    public void onTimeout(int startId, int foregroundServiceType) {
+        stopRuntime("Foreground service time limit reached");
+        stopVpn();
+        stopForeground(true);
+        stopSelf(startId);
+    }
+
     @Override
     public void onDestroy() {
         stopRuntime("Service destroyed");

@@ -16,6 +16,16 @@ final class StreamFlowScheduler implements Closeable {
     static final long MAXIMUM_BYTES = 16L * 1024L * 1024L;
     static final int MAX_PENDING_BYTES = 4 * 1024 * 1024;
     static final int MAX_CHUNK_BYTES = 64 * 1024;
+    /**
+     * Ceiling on queued bytes across every stream. Per-stream limits alone let N streams hold
+     * N * MAX_PENDING_BYTES, which on a phone is an OOM rather than backpressure.
+     */
+    static final int MAX_TOTAL_PENDING_BYTES = 16 * 1024 * 1024;
+    /**
+     * Queue depth at which a non-blocking submitter is told to stop reading its source. Sitting
+     * below the hard limit leaves room for the in-flight chunk that crosses the mark.
+     */
+    static final int SATURATION_BYTES = MAX_PENDING_BYTES / 2;
 
     @FunctionalInterface
     interface SendAction {
@@ -26,6 +36,7 @@ final class StreamFlowScheduler implements Closeable {
     private final Map<Integer, StreamState> streams = new HashMap<>();
     private final ArrayDeque<Integer> readyStreams = new ArrayDeque<>();
     private final Thread worker;
+    private int totalPendingBytes;
     private boolean closed;
 
     StreamFlowScheduler() {
@@ -50,6 +61,70 @@ final class StreamFlowScheduler implements Closeable {
         }
     }
 
+    /**
+     * Outcome of a non-blocking submission.
+     *
+     * @param completion completes once the chunk has actually been written to the control channel
+     * @param saturated  true when the caller should stop producing until the queue drains
+     */
+    record Submission(CompletableFuture<Void> completion, boolean saturated) {
+    }
+
+    /**
+     * Queues a chunk without waiting for credit or for queue space.
+     *
+     * The blocking {@link #send} is correct on a thread dedicated to one stream, but fatal on a
+     * shared Netty event loop: waiting there for a peer's WINDOW_UPDATE stalls every other stream
+     * and the control messages on the same loop. Callers on shared threads submit instead and apply
+     * backpressure to their own source when {@code saturated} comes back true.
+     */
+    Submission submit(int streamId, int bytes, SendAction action) throws IOException {
+        if (bytes <= 0 || bytes > MAX_CHUNK_BYTES || action == null) {
+            throw new IOException("invalid stream DATA chunk");
+        }
+        Pending pending = new Pending(bytes, action);
+        synchronized (lock) {
+            StreamState state = streams.get(streamId);
+            if (closed || state == null || state.closed) {
+                throw new IOException("stream send window closed");
+            }
+            // The submitter stops reading the moment it is told it is saturated, so the queue can
+            // overshoot by at most the chunk that crossed the mark.
+            if (state.pendingBytes > MAX_PENDING_BYTES - bytes) {
+                throw new IOException("stream send queue is full");
+            }
+            if (totalPendingBytes > MAX_TOTAL_PENDING_BYTES - bytes) {
+                throw new IOException("total stream send queue is full");
+            }
+            state.pending.addLast(pending);
+            state.pendingBytes += bytes;
+            totalPendingBytes += bytes;
+            schedule(streamId, state);
+            lock.notifyAll();
+            return new Submission(pending.completion, saturatedLocked(state));
+        }
+    }
+
+    /** Whether the stream is still above the mark at which producers should hold off. */
+    boolean saturated(int streamId) {
+        synchronized (lock) {
+            StreamState state = streams.get(streamId);
+            return state != null && saturatedLocked(state);
+        }
+    }
+
+    private boolean saturatedLocked(StreamState state) {
+        return state.pendingBytes >= SATURATION_BYTES
+                || totalPendingBytes >= MAX_TOTAL_PENDING_BYTES / 2;
+    }
+
+    /** Queued bytes across every stream; exposed for tests and diagnostics. */
+    int totalPendingBytes() {
+        synchronized (lock) {
+            return totalPendingBytes;
+        }
+    }
+
     void send(int streamId, int bytes, SendAction action) throws Exception {
         if (bytes <= 0 || bytes > MAX_CHUNK_BYTES || action == null) {
             throw new IOException("invalid stream DATA chunk");
@@ -61,7 +136,8 @@ final class StreamFlowScheduler implements Closeable {
                 throw new IOException("stream send window closed");
             }
             while (!closed && !state.closed
-                    && state.pendingBytes > MAX_PENDING_BYTES - bytes) {
+                    && (state.pendingBytes > MAX_PENDING_BYTES - bytes
+                        || totalPendingBytes > MAX_TOTAL_PENDING_BYTES - bytes)) {
                 try {
                     lock.wait();
                 } catch (InterruptedException error) {
@@ -74,6 +150,7 @@ final class StreamFlowScheduler implements Closeable {
             }
             state.pending.addLast(pending);
             state.pendingBytes += bytes;
+            totalPendingBytes += bytes;
             schedule(streamId, state);
             lock.notifyAll();
         }
@@ -124,6 +201,7 @@ final class StreamFlowScheduler implements Closeable {
             }
             streams.clear();
             readyStreams.clear();
+            totalPendingBytes = 0;
             lock.notifyAll();
         }
         worker.interrupt();
@@ -156,6 +234,7 @@ final class StreamFlowScheduler implements Closeable {
                 state.pending.removeFirst();
                 if (!pending.terminal) {
                     state.pendingBytes -= pending.bytes;
+                    totalPendingBytes -= pending.bytes;
                     state.credit -= pending.bytes;
                     state.outstanding += pending.bytes;
                 }
@@ -184,7 +263,49 @@ final class StreamFlowScheduler implements Closeable {
         }
     }
 
+    /**
+     * Queues the graceful terminal without waiting for it to be written.
+     *
+     * Same reason as {@link #submit}: a Netty event loop must not park until the queue ahead of the
+     * FIN has drained. The returned future completes when the FIN actually goes out.
+     */
+    CompletableFuture<Void> submitFinish(int streamId, SendAction action) throws IOException {
+        Pending terminal = queueTerminal(streamId, action, false);
+        if (terminal == null) {
+            // Nothing was queued because the stream was already gone; run the action inline. The
+            // caller is on an event loop, but this is a single small control frame, not a wait.
+            CompletableFuture<Void> direct = new CompletableFuture<>();
+            try {
+                action.send();
+                direct.complete(null);
+            } catch (Exception error) {
+                direct.completeExceptionally(error);
+            }
+            return direct;
+        }
+        return terminal.completion.whenComplete(
+                (ignored, error) -> releaseTerminatedStream(streamId, terminal));
+    }
+
     private void terminate(int streamId, SendAction action, boolean abortPending) throws Exception {
+        Pending terminal = queueTerminal(streamId, action, abortPending);
+        if (terminal == null) {
+            action.send();
+            return;
+        }
+        try {
+            await(terminal.completion);
+        } finally {
+            releaseTerminatedStream(streamId, terminal);
+        }
+    }
+
+    /**
+     * Queues the terminal action, or returns null when the stream is already gone and the caller
+     * should just run the action directly.
+     */
+    private Pending queueTerminal(int streamId, SendAction action, boolean abortPending)
+            throws IOException {
         if (action == null) {
             throw new IOException("stream terminal action is required");
         }
@@ -234,22 +355,19 @@ final class StreamFlowScheduler implements Closeable {
                 lock.notifyAll();
             }
         }
-        if (runDirect) {
-            action.send();
-            return;
-        }
-        try {
-            await(terminal.completion);
-        } finally {
-            synchronized (lock) {
-                StreamState state = streams.get(streamId);
-                if (state != null && state.closed && state.terminal == terminal
-                        && terminal.completion.isDone() && state.pending.isEmpty()) {
-                    streams.remove(streamId, state);
-                    state.scheduled = false;
-                }
-                lock.notifyAll();
+        return runDirect ? null : terminal;
+    }
+
+    /** Drops the stream identity once its terminal has been written and nothing is left queued. */
+    private void releaseTerminatedStream(int streamId, Pending terminal) {
+        synchronized (lock) {
+            StreamState state = streams.get(streamId);
+            if (state != null && state.closed && state.terminal == terminal
+                    && terminal.completion.isDone() && state.pending.isEmpty()) {
+                streams.remove(streamId, state);
+                state.scheduled = false;
             }
+            lock.notifyAll();
         }
     }
 
@@ -277,10 +395,14 @@ final class StreamFlowScheduler implements Closeable {
         }
     }
 
-    private static void failPending(StreamState state, Throwable error) {
+    private void failPending(StreamState state, Throwable error) {
         Pending pending;
         while ((pending = state.pending.pollFirst()) != null) {
             pending.completion.completeExceptionally(error);
+        }
+        totalPendingBytes -= state.pendingBytes;
+        if (totalPendingBytes < 0) {
+            totalPendingBytes = 0;
         }
         state.pendingBytes = 0;
     }

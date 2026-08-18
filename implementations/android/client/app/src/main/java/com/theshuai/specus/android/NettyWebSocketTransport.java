@@ -215,6 +215,27 @@ final class NettyWebSocketTransport {
         return completion;
     }
 
+    /**
+     * Pauses or resumes reading from the local WebSocket.
+     *
+     * Frames are forwarded to the control channel without blocking the event loop, so the only way
+     * to stop a fast local server from outrunning a saturated SWS2 send queue is to stop reading it.
+     */
+    void setReceiving(boolean receiving) {
+        Channel active = channel;
+        if (active == null) {
+            return;
+        }
+        try {
+            active.config().setAutoRead(receiving);
+            if (receiving) {
+                active.read();
+            }
+        } catch (RuntimeException ignored) {
+            // A channel closing underneath us needs no flow control.
+        }
+    }
+
     void close() {
         Channel active;
         synchronized (lifecycleLock) {

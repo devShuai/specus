@@ -198,6 +198,27 @@ final class NettyHttpTransport {
         return completed.isDone() && !completed.isCompletedExceptionally();
     }
 
+    /**
+     * Pauses or resumes reading the upstream response.
+     *
+     * Response chunks are handed to the SWS2 scheduler without blocking the event loop, so when
+     * that queue fills the only remaining backpressure is to stop reading the upstream server.
+     */
+    void setReceiving(boolean receiving) {
+        Channel active = channel;
+        if (active == null) {
+            return;
+        }
+        try {
+            active.config().setAutoRead(receiving);
+            if (receiving) {
+                active.read();
+            }
+        } catch (RuntimeException ignored) {
+            // A channel closing underneath us needs no flow control.
+        }
+    }
+
     void close() {
         Channel active;
         synchronized (lifecycleLock) {
