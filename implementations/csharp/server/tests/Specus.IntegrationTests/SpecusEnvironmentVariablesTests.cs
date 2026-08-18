@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Specus.Server.Configuration;
 
 namespace Specus.IntegrationTests;
@@ -84,6 +85,7 @@ public sealed class SpecusEnvironmentVariablesTests
             ["SPECUS_TLS_KEYSTORE_PASSWORD"] = "changeit",
             ["SPECUS_TLS_REQUIRE_ENCRYPTION"] = "true",
             ["SPECUS_TLS_TERMINATED_UPSTREAM"] = "true",
+            ["SPECUS_TRUSTED_PROXIES"] = "127.0.0.1/32,10.0.0.0/8",
         };
 
         var mapped = SpecusEnvironmentVariables.BuildConfigurationMap(variables);
@@ -164,6 +166,15 @@ public sealed class SpecusEnvironmentVariablesTests
         Assert.Equal("changeit", mapped["Specus:Tls:KeystorePassword"]);
         Assert.Equal("true", mapped["Specus:Tls:RequireEncryption"]);
         Assert.Equal("true", mapped["Specus:Tls:TerminatedUpstream"]);
+        Assert.Equal("127.0.0.1/32,10.0.0.0/8", mapped["Specus:TrustedProxies"]);
+        Assert.False(mapped.ContainsKey("Specus:Trusted:Proxies"));
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(mapped)
+            .Build();
+        var options = configuration.GetSection(SpecusOptions.SectionName).Get<SpecusOptions>();
+        Assert.NotNull(options);
+        Assert.Equal("127.0.0.1/32,10.0.0.0/8", options!.TrustedProxies);
     }
 
     [Fact]

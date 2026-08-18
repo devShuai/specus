@@ -234,8 +234,9 @@ func (a *API) ValidateConnectionWebSocketToken(token string) (wsevents.Access, b
 
 // ---- auth ----------------------------------------------------------------------------
 
-// loginClientIP returns the connection peer address. Forwarded headers are not consulted: without a
-// trusted-proxy boundary they are attacker-controlled and would let a client reset its own quota.
+// handleLogin applies the shared trusted-proxy resolver before charging the IP quota. Direct
+// clients cannot spoof forwarded headers; configured proxies resolve the same chain as every other
+// security-sensitive HTTP and WebSocket entry point.
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -243,7 +244,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Throttle before the captcha and credential check so deployments without Turnstile are still
-	// bounded. Connection peer only: forwarded headers are not trusted for quota decisions.
+	// bounded. Forwarded addresses participate only through the configured trusted-proxy boundary.
 	if allowed, retryAfter := a.loginLimiter.Allow(a.addressResolver.Resolve(r), req.Username); !allowed {
 		w.Header().Set("Retry-After", strconv.FormatInt(int64(retryAfter.Seconds()), 10))
 		writeError(w, http.StatusTooManyRequests, security.LoginRateLimitedMessage)

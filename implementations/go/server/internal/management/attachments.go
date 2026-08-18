@@ -61,7 +61,7 @@ func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if err := a.attachments.CheckPresignIPContext(r.Context(), a.attachmentClientIP(r)); err != nil {
+	if err := a.attachments.CheckPresignIPContext(r.Context(), a.clientAddress(r)); err != nil {
 		a.failAttachment(w, err)
 		return
 	}
@@ -246,7 +246,7 @@ func attachmentLookupError(id int64, err error) error {
 	return errors.New("attachment not found: " + strconv.FormatInt(id, 10))
 }
 
-// attachmentClientIP resolves the rate-limit identity through the shared trusted-proxy boundary.
-func (a *API) attachmentClientIP(r *http.Request) string {
+// clientAddress resolves the request identity through the shared trusted-proxy boundary.
+func (a *API) clientAddress(r *http.Request) string {
 	return a.addressResolver.Resolve(r)
 }

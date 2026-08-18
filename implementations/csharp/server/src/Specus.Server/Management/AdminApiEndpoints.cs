@@ -91,7 +91,8 @@ public static class AdminApiEndpoints
     {
         app.MapPost("/auth/login", async (AdminLoginRequest? request, HttpContext httpContext,
             LocalTokenService tokens, ManagementUserService users, ITurnstileVerifier turnstile,
-            LoginRateLimiter loginRateLimiter, CancellationToken cancellationToken) =>
+            LoginRateLimiter loginRateLimiter, ClientAddressResolver addressResolver,
+            CancellationToken cancellationToken) =>
         {
             if (request is null)
             {
@@ -99,9 +100,9 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
             // Throttle before the captcha and credential check so deployments without Turnstile are
-            // still bounded. Connection peer only: forwarded headers are not trusted for quotas.
+            // still bounded. Forwarded addresses are accepted only from configured trusted proxies.
             if (!loginRateLimiter.TryAcquire(
-                    httpContext.Connection.RemoteIpAddress?.ToString(),
+                    addressResolver.Resolve(httpContext),
                     request.Username,
                     out var retryAfterSeconds))
             {

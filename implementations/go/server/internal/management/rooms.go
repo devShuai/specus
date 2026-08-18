@@ -75,7 +75,7 @@ func (a *API) handleRoomRedeemPairingCode(w http.ResponseWriter, r *http.Request
 	if !decodeRoomRequest(w, r, &request) {
 		return
 	}
-	if err := a.rooms.CheckPairingCodeRedeem(r.Context(), a.attachmentClientIP(r)); err != nil {
+	if err := a.rooms.CheckPairingCodeRedeem(r.Context(), a.clientAddress(r)); err != nil {
 		a.failRoom(w, err)
 		return
 	}

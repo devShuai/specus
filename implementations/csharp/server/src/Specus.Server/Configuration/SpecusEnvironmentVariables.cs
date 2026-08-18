@@ -74,6 +74,14 @@ public static class SpecusEnvironmentVariables
             return null;
         }
 
+        // This setting belongs directly to the Specus root. The generic underscore mapper would
+        // incorrectly turn SPECUS_TRUSTED_PROXIES into Specus:Trusted:Proxies, which the
+        // SpecusOptions binder never reads.
+        if (key.Equals("TRUSTED_PROXIES", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Specus:TrustedProxies";
+        }
+
         if (key.Contains("__", StringComparison.Ordinal))
         {
             var normalized = key.Replace("__", ":", StringComparison.Ordinal);
