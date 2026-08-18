@@ -273,7 +273,7 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		TenantID:                     firstText(credential.TenantID, "default"),
 		OwnerUsername:                credential.OwnerUsername,
 		ClientName:                   clientName,
-		PasswordHash:                 auth.HashPassword(time.Now().Format(time.RFC3339Nano)),
+		PasswordHash:                 auth.HashToken(time.Now().Format(time.RFC3339Nano)),
 		Enabled:                      true,
 		ConnectionRateLimitPerMinute: 30,
 		CreatedAt:                    now,

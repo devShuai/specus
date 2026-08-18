@@ -7,7 +7,7 @@ namespace Specus.IntegrationTests;
 public sealed class HttpRouteBasicAuthenticatorTests
 {
     private const string Username = "访客";
-    private static readonly string PasswordHash = PasswordHasher.Hash("route secret");
+    private static readonly string PasswordHash = PasswordHasher.HashToken("route secret");
 
     [Theory]
     [InlineData(null)]

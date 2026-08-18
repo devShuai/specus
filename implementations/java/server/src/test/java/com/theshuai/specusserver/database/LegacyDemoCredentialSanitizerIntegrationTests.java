@@ -140,7 +140,7 @@ class LegacyDemoCredentialSanitizerIntegrationTests {
         account.setTenantId("default");
         account.setOwnerUsername("admin");
         account.setClientName(name);
-        account.setPasswordHash(PasswordService.hash(secret));
+        account.setPasswordHash(PasswordService.hashToken(secret));
         account.setEnabled(true);
         account.setConnectionRateLimitPerMinute(30);
         account.setCreatedAt(now);
@@ -155,7 +155,7 @@ class LegacyDemoCredentialSanitizerIntegrationTests {
         credential.setTenantId("default");
         credential.setOwnerUsername("admin");
         credential.setApiKey(apiKey);
-        credential.setSecretHash(PasswordService.hash(secret));
+        credential.setSecretHash(PasswordService.hashToken(secret));
         credential.setEnabled(true);
         credential.setMaxOnlineInstances(2);
         credential.setCreatedAt(now);

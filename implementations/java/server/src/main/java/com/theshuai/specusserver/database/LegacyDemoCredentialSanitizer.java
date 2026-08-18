@@ -64,7 +64,7 @@ public class LegacyDemoCredentialSanitizer {
         if (account == null
                 || !DEMO_CLIENT_NAME.equals(account.getClientName())
                 || !account.isEnabled()
-                || !PasswordService.matches(DEMO_SECRET, account.getPasswordHash())) {
+                || !PasswordService.tokenMatches(DEMO_SECRET, account.getPasswordHash())) {
             return 0;
         }
         account.setEnabled(false);
@@ -80,7 +80,7 @@ public class LegacyDemoCredentialSanitizer {
         if (credential == null
                 || !DEMO_API_KEY.equals(credential.getApiKey())
                 || !credential.isEnabled()
-                || !PasswordService.matches(DEMO_SECRET, credential.getSecretHash())) {
+                || !PasswordService.tokenMatches(DEMO_SECRET, credential.getSecretHash())) {
             return 0;
         }
         credential.setEnabled(false);

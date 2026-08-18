@@ -38,7 +38,7 @@ internal static class HttpRouteBasicAuthenticator
         var username = decoded[..separator];
         var password = decoded[(separator + 1)..];
         return ConstantTimeEquals(expectedUsername!, username)
-               & PasswordHasher.Matches(password, expectedPasswordHash!);
+               & PasswordHasher.TokenMatches(password, expectedPasswordHash!);
     }
 
     public static bool IsConfigured(string? expectedUsername, string? expectedPasswordHash) =>

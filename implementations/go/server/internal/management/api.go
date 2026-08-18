@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -366,8 +365,22 @@ func (a *API) authenticatePassword(ctx context.Context, username, password strin
 	if err != nil {
 		return managementPrincipal{}, false, err
 	}
-	if user == nil || !user.Enabled || !passwordMatches(password, user.PasswordHash) {
+	if user == nil || !user.Enabled {
 		return managementPrincipal{}, false, nil
+	}
+	verification := auth.VerifyPassword(password, user.PasswordHash)
+	if !verification.Matches {
+		return managementPrincipal{}, false, nil
+	}
+	// A successful login is the only moment the plaintext exists, so it is the only chance to
+	// replace a legacy or under-cost hash. A failure here must not fail the login: the user is
+	// authenticated either way, and the old hash still works next time.
+	if verification.NeedsUpgrade {
+		upgraded := *user
+		upgraded.PasswordHash = verification.UpgradedHash
+		if err := a.db.UpdateManagementUser(ctx, upgraded); err != nil {
+			a.logger.Warn("password hash upgrade failed", "user", user.Username, "err", err)
+		}
 	}
 	role := normalizeRole(user.Role)
 	return managementPrincipal{
@@ -447,7 +460,7 @@ func (a *API) handleOidcToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
 		return
 	}
-	identityKey := auth.HashPassword(identity.Issuer + "\x00" + identity.Subject)
+	identityKey := auth.DigestKey(identity.Issuer + "\x00" + identity.Subject)
 	user, resolveErr := a.db.ResolveOrProvisionOIDCUser(r.Context(), identity.Issuer, identity.Subject,
 		identityKey, username, a.defaultTenant(), auth.HashPassword(auth.GeneratePassword()), time.Now())
 	if resolveErr != nil {
@@ -891,7 +904,7 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		TenantID:                     principal.TenantID,
 		OwnerUsername:                principal.Username,
 		ClientName:                   name,
-		PasswordHash:                 auth.HashPassword(strconv.FormatInt(auth.NewClientID(), 10)),
+		PasswordHash:                 auth.HashToken(strconv.FormatInt(auth.NewClientID(), 10)),
 		Enabled:                      boolOr(req.Enabled, true),
 		ConnectionRateLimitPerMinute: rateLimit,
 		CreatedAt:                    now,
@@ -1065,7 +1078,7 @@ func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 		TenantID:           principal.TenantID,
 		OwnerUsername:      principal.Username,
 		APIKey:             apiKey,
-		SecretHash:         auth.HashPassword(secret),
+		SecretHash:         auth.HashToken(secret),
 		Enabled:            boolOr(req.Enabled, true),
 		MaxOnlineInstances: maxOnlineInstances,
 		CreatedAt:          now,
@@ -1116,7 +1129,7 @@ func (a *API) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
 	var revealed string
 	if secret := strings.TrimSpace(req.Secret); secret != "" {
 		revealed = secret
-		credential.SecretHash = auth.HashPassword(secret)
+		credential.SecretHash = auth.HashToken(secret)
 	}
 	if req.Enabled != nil {
 		credential.Enabled = *req.Enabled
@@ -2453,7 +2466,7 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 	}
 	if a.oidcAuth != nil {
 		if identity, ok := a.oidcAuth.ValidateIdentity(ctx, token); ok {
-			identityKey := auth.HashPassword(identity.Issuer + "\x00" + identity.Subject)
+			identityKey := auth.DigestKey(identity.Issuer + "\x00" + identity.Subject)
 			user, err := a.db.FindManagementUserByOIDCIdentity(ctx, identity.Issuer, identity.Subject,
 				identityKey)
 			if err != nil {
@@ -2631,10 +2644,10 @@ func requirePassword(password string) (string, error) {
 	return normalized, nil
 }
 
+// passwordMatches verifies without upgrading. Callers that can persist should use
+// auth.VerifyPassword directly so a legacy hash is retired instead of surviving another login.
 func passwordMatches(password, expectedHash string) bool {
-	expected := strings.ToLower(strings.TrimSpace(expectedHash))
-	actual := auth.HashPassword(password)
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+	return auth.VerifyPassword(password, expectedHash).Matches
 }
 
 func normalizeTenant(value string) string {
@@ -2784,7 +2797,10 @@ func applyHTTPRouteAuthMutation(mapping *store.HTTPRouteMapping, req httpRouteMu
 		if utf8.RuneCountInString(*req.AuthPassword) > 256 {
 			return validation("认证密码不能超过 256 个字符")
 		}
-		mapping.AuthPasswordHash = auth.HashPassword(*req.AuthPassword)
+		// A per-route shared secret, checked on every proxied request. The slow KDF used for login
+		// passwords would turn each request into a deliberate 210k-iteration derivation, so this
+		// stays a digest; the route protection is a gate, not an account.
+		mapping.AuthPasswordHash = auth.HashToken(*req.AuthPassword)
 	}
 	if mapping.AuthEnabled {
 		if strings.TrimSpace(mapping.AuthUsername) == "" {

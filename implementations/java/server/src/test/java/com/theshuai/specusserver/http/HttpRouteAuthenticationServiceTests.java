@@ -40,7 +40,7 @@ class HttpRouteAuthenticationServiceTests {
         route.setEnabled(true);
         route.setAuthEnabled(true);
         route.setAuthUsername("viewer");
-        route.setAuthPasswordHash(PasswordService.hash("secret:tail"));
+        route.setAuthPasswordHash(PasswordService.hashToken("secret:tail"));
 
         when(clientAccountService.findClientByName("client-a")).thenReturn(Optional.of(account));
         when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 42L, "private"))

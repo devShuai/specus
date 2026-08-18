@@ -56,7 +56,7 @@ public class ClientCredentialService {
         credential.setId(ClientIdGenerator.newId());
         credential.setTenantId(tenant.tenantId());
         credential.setApiKey(apiKey);
-        credential.setSecretHash(PasswordService.hash(secret));
+        credential.setSecretHash(PasswordService.hashToken(secret));
         credential.setEnabled(request.enabled() == null || request.enabled());
         credential.setMaxOnlineInstances(normalizeMaxOnline(request.maxOnlineInstances()));
         credential.setCreatedAt(now);
@@ -81,7 +81,7 @@ public class ClientCredentialService {
         credential.setTenantId(context.tenant().tenantId());
         credential.setOwnerUsername(context.username());
         credential.setApiKey(apiKey);
-        credential.setSecretHash(PasswordService.hash(secret));
+        credential.setSecretHash(PasswordService.hashToken(secret));
         credential.setEnabled(request.enabled() == null || request.enabled());
         credential.setMaxOnlineInstances(normalizeMaxOnline(request.maxOnlineInstances()));
         credential.setCreatedAt(now);
@@ -115,7 +115,7 @@ public class ClientCredentialService {
         String revealedSecret = null;
         if (StringUtils.hasText(request.secret())) {
             revealedSecret = request.secret().trim();
-            credential.setSecretHash(PasswordService.hash(revealedSecret));
+            credential.setSecretHash(PasswordService.hashToken(revealedSecret));
         }
         if (request.enabled() != null) {
             credential.setEnabled(request.enabled());

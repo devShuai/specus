@@ -375,7 +375,7 @@ public sealed class ClientAccountService
             OwnerUsername = credential.OwnerUsername,
             ClientName = await GenerateClientNameAsync(credential, environment, cancellationToken)
                 .ConfigureAwait(false),
-            PasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N")),
+            PasswordHash = PasswordHasher.HashToken(Guid.NewGuid().ToString("N")),
             Enabled = true,
             ConnectionRateLimitPerMinute = 30,
             CreatedAt = now,

@@ -200,7 +200,7 @@ func insertCredentialForTest(t *testing.T, app *App, tenantID, owner, apiKey, se
 		TenantID:           tenantID,
 		OwnerUsername:      owner,
 		APIKey:             apiKey,
-		SecretHash:         auth.HashPassword(secret),
+		SecretHash:         auth.HashToken(secret),
 		Enabled:            true,
 		MaxOnlineInstances: maxOnline,
 		CreatedAt:          now,

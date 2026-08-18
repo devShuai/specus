@@ -104,7 +104,7 @@ public class ClientAccountService {
         account.setId(ClientIdGenerator.newId());
         account.setTenantId(tenant.tenantId());
         account.setClientName(clientName);
-        account.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
+        account.setPasswordHash(PasswordService.hashToken(PasswordService.generatePassword()));
         account.setEnabled(request.enabled() == null || request.enabled());
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);
@@ -126,7 +126,7 @@ public class ClientAccountService {
         account.setTenantId(context.tenant().tenantId());
         account.setOwnerUsername(context.username());
         account.setClientName(clientName);
-        account.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
+        account.setPasswordHash(PasswordService.hashToken(PasswordService.generatePassword()));
         account.setEnabled(request.enabled() == null || request.enabled());
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);

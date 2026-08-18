@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
@@ -12,11 +13,14 @@ public sealed class ManagementUserService
 {
     private readonly SpecusDbContext _db;
     private readonly AuthOptions _auth;
+    private readonly ILogger<ManagementUserService>? _logger;
 
-    public ManagementUserService(SpecusDbContext db, IOptions<AuthOptions> auth)
+    public ManagementUserService(SpecusDbContext db, IOptions<AuthOptions> auth,
+        ILogger<ManagementUserService>? logger = null)
     {
         _db = db;
         _auth = auth.Value;
+        _logger = logger;
     }
 
     public async Task<LoginUser?> AuthenticateAsync(string? username, string? password,
@@ -39,12 +43,50 @@ public sealed class ManagementUserService
         var user = await _db.ManagementUsers.AsNoTracking()
             .FirstOrDefaultAsync(u => u.Username.ToLower() == normalized.ToLower(), cancellationToken)
             .ConfigureAwait(false);
-        if (user is null || !user.Enabled || !PasswordHasher.Matches(password, user.PasswordHash))
+        if (user is null || !user.Enabled)
         {
             return null;
         }
+        var verification = PasswordHasher.Verify(password, user.PasswordHash);
+        if (!verification.Matches)
+        {
+            return null;
+        }
+        // A successful login is the only moment the plaintext exists, so it is the only chance to
+        // retire a legacy or under-cost hash. Failing to persist must not fail the login: the user
+        // is authenticated either way and the old hash still works next time.
+        if (verification is { NeedsUpgrade: true, UpgradedHash: not null })
+        {
+            await UpgradeStoredPasswordAsync(user.Username, verification.UpgradedHash, cancellationToken)
+                .ConfigureAwait(false);
+        }
         return new LoginUser(user.Username, ManagementContext.NormalizeTenant(user.TenantId),
             user.Role, BuiltInAdmin: false);
+    }
+
+    /// <summary>
+    /// Rewrites a stored password hash that verified but is legacy or below the current cost.
+    /// Best effort: the caller is already authenticated, and the old hash keeps working.
+    /// </summary>
+    private async Task UpgradeStoredPasswordAsync(string username, string upgradedHash,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var tracked = await _db.ManagementUsers
+                .FirstOrDefaultAsync(u => u.Username == username, cancellationToken)
+                .ConfigureAwait(false);
+            if (tracked is null)
+            {
+                return;
+            }
+            tracked.PasswordHash = upgradedHash;
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            _logger?.LogWarning(error, "password hash upgrade failed for {Username}", username);
+        }
     }
 
     /// <summary>

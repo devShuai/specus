@@ -78,7 +78,7 @@ func (s *SessionStore) CreateForClient(account store.ClientAccount, credentialID
 		MachineFingerprint: machineFingerprint,
 		OSUser:             osUser,
 		AccessToken:        token,
-		TokenHash:          HashPassword(token),
+		TokenHash:          HashToken(token),
 		ExpiresAt:          time.Now().Add(ttl),
 		Status:             StatusHTTPAuthenticated,
 	}
@@ -107,7 +107,7 @@ func (s *SessionStore) Find(sessionID int64, accessToken string) (Session, bool)
 	if sessionID <= 0 || accessToken == "" {
 		return Session{}, false
 	}
-	hash := HashPassword(accessToken)
+	hash := HashToken(accessToken)
 	s.mu.RLock()
 	storedHash, ok := s.tokenHashBySessionID[sessionID]
 	if !ok || !hmac.Equal([]byte(storedHash), []byte(hash)) {
@@ -193,10 +193,21 @@ func (s *SessionStore) updateStatus(sessionID int64, status string) {
 	s.byTokenHash[tokenHash] = session
 }
 
-// HashPassword returns the lowercase hex SHA-256 of the plaintext password (no salt),
-// matching the stored password_hash format.
-func HashPassword(plaintext string) string {
+// HashToken returns the lowercase hex SHA-256 of a high-entropy secret.
+//
+// This is the right primitive for access tokens, session tokens and machine secrets: they are
+// generated with full entropy, so there is nothing to guess and an iterated KDF would only add
+// latency to every request. Human passwords are the opposite case and go through HashPassword,
+// which is salted and deliberately slow.
+func HashToken(plaintext string) string {
 	sum := sha256.Sum256([]byte(plaintext))
+	return hex.EncodeToString(sum[:])
+}
+
+// DigestKey derives a deterministic lookup key from non-secret identifiers, such as an OIDC
+// issuer and subject pair. It is an index, not a credential.
+func DigestKey(value string) string {
+	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }
 

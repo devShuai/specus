@@ -106,7 +106,7 @@ public sealed class DatabaseInitializer
                 TenantId = tenantId,
                 OwnerUsername = ownerUsername,
                 ClientName = DemoClientName,
-                PasswordHash = PasswordHasher.Hash(DemoCredentialSecret),
+                PasswordHash = PasswordHasher.HashToken(DemoCredentialSecret),
                 Enabled = true,
                 ConnectionRateLimitPerMinute = 30,
                 CreatedAt = now,
@@ -123,7 +123,7 @@ public sealed class DatabaseInitializer
                 TenantId = tenantId,
                 OwnerUsername = ownerUsername,
                 ApiKey = DemoCredentialApiKey,
-                SecretHash = PasswordHasher.Hash(DemoCredentialSecret),
+                SecretHash = PasswordHasher.HashToken(DemoCredentialSecret),
                 Enabled = true,
                 MaxOnlineInstances = NormalizeDefaultMaxOnlineInstances(
                     _clientAuth.Value.DefaultMaxOnlineInstances),
@@ -156,7 +156,7 @@ public sealed class DatabaseInitializer
             return LegacyDemoCredentialCleanupResult.None;
         }
 
-        var legacyHash = PasswordHasher.Hash(DemoCredentialSecret);
+        var legacyHash = PasswordHasher.HashToken(DemoCredentialSecret);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
 

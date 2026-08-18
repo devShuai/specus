@@ -67,7 +67,7 @@ public class HttpRouteAuthenticationService {
                 return Decision.unauthorized();
             }
             boolean usernameMatches = constantTimeEquals(managedRoute.getAuthUsername(), credentials.username());
-            boolean passwordMatches = PasswordService.matches(
+            boolean passwordMatches = PasswordService.tokenMatches(
                     credentials.password(), managedRoute.getAuthPasswordHash());
             return usernameMatches & passwordMatches
                     ? Decision.authenticated()

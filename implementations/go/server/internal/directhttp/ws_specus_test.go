@@ -120,7 +120,7 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 					return nil
 				}, nil), nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashPassword("ws-password"),
+			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
 		}}, nil, store.TrafficDetailOptions{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -207,7 +207,7 @@ func TestServeWebSocketRejectsMissingBasicAuthBeforeUpgrade(t *testing.T) {
 			opened = true
 			return nil, nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashPassword("ws-password"),
+			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
 		}}, nil, store.TrafficDetailOptions{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.SetPathValue("clientName", "Demo client")

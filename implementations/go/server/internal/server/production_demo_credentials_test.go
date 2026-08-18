@@ -35,7 +35,7 @@ func insertHistoricalDemoCredentials(t *testing.T, databasePath string) {
 	now := time.Now().UTC()
 	if err := db.InsertClient(context.Background(), store.ClientAccount{
 		ID: 1, TenantID: "default", OwnerUsername: "admin",
-		ClientName: DemoClientName, PasswordHash: auth.HashPassword(DemoCredentialPlainSecret), Enabled: true,
+		ClientName: DemoClientName, PasswordHash: auth.HashToken(DemoCredentialPlainSecret), Enabled: true,
 		ConnectionRateLimitPerMinute: 30, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		_ = db.Close()
@@ -43,7 +43,7 @@ func insertHistoricalDemoCredentials(t *testing.T, databasePath string) {
 	}
 	if err := db.InsertCredential(context.Background(), store.ClientCredential{
 		ID: 2, TenantID: "default", OwnerUsername: "admin",
-		APIKey: DemoCredentialAPIKey, SecretHash: auth.HashPassword(DemoCredentialPlainSecret), Enabled: true,
+		APIKey: DemoCredentialAPIKey, SecretHash: auth.HashToken(DemoCredentialPlainSecret), Enabled: true,
 		MaxOnlineInstances: 2, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		_ = db.Close()

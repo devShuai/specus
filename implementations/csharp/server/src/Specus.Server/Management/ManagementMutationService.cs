@@ -36,7 +36,7 @@ public sealed class ManagementMutationService
             TenantId = context.TenantId,
             OwnerUsername = context.Username,
             ClientName = clientName,
-            PasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N")),
+            PasswordHash = PasswordHasher.HashToken(Guid.NewGuid().ToString("N")),
             Enabled = request.Enabled ?? true,
             ConnectionRateLimitPerMinute = NormalizeRateLimit(request.ConnectionRateLimitPerMinute, 30),
             CreatedAt = now,
@@ -143,7 +143,7 @@ public sealed class ManagementMutationService
             TenantId = context.TenantId,
             OwnerUsername = context.Username,
             ApiKey = apiKey,
-            SecretHash = PasswordHasher.Hash(secret),
+            SecretHash = PasswordHasher.HashToken(secret),
             Enabled = request.Enabled ?? true,
             MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances,
                 _clientAuth.DefaultMaxOnlineInstances),
@@ -181,7 +181,7 @@ public sealed class ManagementMutationService
         if (!string.IsNullOrWhiteSpace(request.Secret))
         {
             revealedSecret = request.Secret.Trim();
-            credential.SecretHash = PasswordHasher.Hash(revealedSecret);
+            credential.SecretHash = PasswordHasher.HashToken(revealedSecret);
         }
         if (request.Enabled is not null)
         {
@@ -563,7 +563,9 @@ public sealed class ManagementMutationService
         {
             throw new ArgumentException("authPassword is too long (max 256)");
         }
-        return PasswordHasher.Hash(password);
+        // A per-route gate secret, checked on every proxied request. The login KDF would turn each
+        // request into a deliberate 210k-iteration derivation, so this stays a digest.
+        return PasswordHasher.HashToken(password);
     }
 
     private static void ValidateAuthConfiguration(bool enabled, string? username, string? passwordHash)

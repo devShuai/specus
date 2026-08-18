@@ -255,7 +255,7 @@ func TestOIDCDirectBearerRequiresBoundEnabledUserAndUsesCurrentAuthorization(t *
 	}
 
 	now := time.Now()
-	identityKey := auth.HashPassword(idp.URL + "\x00" + "subject-admin")
+	identityKey := auth.DigestKey(idp.URL + "\x00" + "subject-admin")
 	if err := db.InsertManagementUser(context.Background(), store.ManagementUser{
 		Username: "local-user", TenantID: "tenant-db", PasswordHash: auth.HashPassword(auth.GeneratePassword()),
 		OIDCIssuer: idp.URL, OIDCSubject: "subject-admin", OIDCIdentityKey: identityKey,

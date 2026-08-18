@@ -319,7 +319,7 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 
 func TestServeHTTPEnforcesManagedRouteBasicAuthentication(t *testing.T) {
 	policy := &store.HTTPRouteAccessPolicy{
-		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashPassword("route-password"),
+		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
 	}
 	routes := &staticRouteSettings{policy: policy}
 	opened := false
@@ -371,7 +371,7 @@ func TestServeHTTPStripsProtectedRouteAuthorizationFromTunnelAndDetail(t *testin
 		opened = metadata
 		return stream, nil
 	}, nil, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashPassword("route-password"),
+		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
 	}}, recorder, store.TrafficDetailOptions{Enabled: true})
 	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/private", "")
 	request.SetBasicAuth("route-user", "route-password")
@@ -427,7 +427,7 @@ func TestServeHTTPFiltersAuthorizationRequestTrailersByRoutePolicy(t *testing.T)
 	}{
 		{name: "protected", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
 			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
-			AuthPasswordHash: auth.HashPassword("route-password"),
+			AuthPasswordHash: auth.HashToken("route-password"),
 		}}, protected: true},
 		{name: "managed public", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
 			Enabled: true,
@@ -510,10 +510,10 @@ func TestServeHTTPRejectsDisabledAndIncompleteManagedPolicies(t *testing.T) {
 		{name: "disabled", policy: &store.HTTPRouteAccessPolicy{Enabled: false},
 			username: "route-user", password: "password", wantStatus: http.StatusNotFound},
 		{name: "missing username", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthPasswordHash: auth.HashPassword("password"),
+			Enabled: true, AuthEnabled: true, AuthPasswordHash: auth.HashToken("password"),
 		}, username: "", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "whitespace username", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "   ", AuthPasswordHash: auth.HashPassword("password"),
+			Enabled: true, AuthEnabled: true, AuthUsername: "   ", AuthPasswordHash: auth.HashToken("password"),
 		}, username: "   ", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "missing password hash", policy: &store.HTTPRouteAccessPolicy{
 			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",

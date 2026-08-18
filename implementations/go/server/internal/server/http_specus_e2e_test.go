@@ -27,7 +27,7 @@ func TestHTTPDataChannelStreamsFragmentedResponse(t *testing.T) {
 	if err := app.db.InsertHTTPRoute(context.Background(), store.HTTPRouteMapping{
 		ID: auth.NewClientID(), TenantID: account.TenantID, ClientID: account.ID, ClientName: account.ClientName,
 		Route: "web", TargetBaseURL: "http://127.0.0.1:8080", Enabled: true,
-		AuthEnabled: true, AuthUsername: "e2e-user", AuthPasswordHash: auth.HashPassword("e2e-password"),
+		AuthEnabled: true, AuthUsername: "e2e-user", AuthPasswordHash: auth.HashToken("e2e-password"),
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("insert protected HTTP route: %v", err)

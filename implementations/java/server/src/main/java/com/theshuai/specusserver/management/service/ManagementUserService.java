@@ -85,8 +85,33 @@ public class ManagementUserService {
         }
         return candidate
                 .filter(ManagementUser::isEnabled)
-                .filter(user -> PasswordService.matches(password, user.getPasswordHash()))
+                .filter(user -> verifyAndUpgrade(user, password))
                 .map(this::toLoginUser);
+    }
+
+    /**
+     * Verifies the password and, on success, retires a legacy or under-cost hash.
+     *
+     * <p>A successful login is the only moment the plaintext exists, so it is the only chance to
+     * rewrite the stored hash. A failure to persist must not fail the login: the user is
+     * authenticated either way and the old hash still works next time.
+     */
+    private boolean verifyAndUpgrade(ManagementUser user, String password) {
+        PasswordService.Verification verification =
+                PasswordService.verify(password, user.getPasswordHash());
+        if (!verification.matches()) {
+            return false;
+        }
+        if (verification.needsUpgrade() && verification.upgradedHash() != null) {
+            try {
+                user.setPasswordHash(verification.upgradedHash());
+                repository.save(user);
+            } catch (RuntimeException error) {
+                log.warn("管理用户口令哈希升级失败: user={}, reason={}",
+                        user.getUsername(), error.getMessage());
+            }
+        }
+        return true;
     }
 
     /**

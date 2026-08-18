@@ -314,7 +314,7 @@ public class ClientAuthService {
         account.setTenantId(credential.getTenantId());
         account.setOwnerUsername(credential.getOwnerUsername());
         account.setClientName(generateClientName(credential, environment));
-        account.setPasswordHash(PasswordService.hash(UUID.randomUUID().toString()));
+        account.setPasswordHash(PasswordService.hashToken(UUID.randomUUID().toString()));
         account.setEnabled(true);
         account.setConnectionRateLimitPerMinute(30);
         account.setCreatedAt(now);

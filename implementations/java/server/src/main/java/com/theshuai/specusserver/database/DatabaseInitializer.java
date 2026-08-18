@@ -90,7 +90,7 @@ public class DatabaseInitializer {
             client.setTenantId(tenant.tenantId());
             client.setOwnerUsername(adminUsername);
             client.setClientName("Demo client");
-            client.setPasswordHash(PasswordService.hash("test1234"));
+            client.setPasswordHash(PasswordService.hashToken("test1234"));
             client.setEnabled(true);
             client.setConnectionRateLimitPerMinute(30);
             client.setCreatedAt(now);
@@ -104,7 +104,7 @@ public class DatabaseInitializer {
             credential.setTenantId(tenant.tenantId());
             credential.setOwnerUsername(adminUsername);
             credential.setApiKey("demo-client");
-            credential.setSecretHash(PasswordService.hash("test1234"));
+            credential.setSecretHash(PasswordService.hashToken("test1234"));
             credential.setEnabled(true);
             credential.setMaxOnlineInstances(clientAuthProperties.getDefaultMaxOnlineInstances());
             credential.setCreatedAt(now);

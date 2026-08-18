@@ -68,7 +68,9 @@ class ManagementUserServiceTests {
         assertThat(saved.getLoginNameNormalized()).isEqualTo("new-user");
         assertThat(saved.getOidcSubject()).isEqualTo("subject-new");
         assertThat(saved.getOidcIdentityKey()).matches("[0-9a-f]{64}");
-        assertThat(saved.getPasswordHash()).matches("[0-9a-f]{64}");
+        // An OIDC-provisioned account gets a hash of a random password nobody holds, so
+        // password login can never succeed for it. It is a real hash, not a placeholder digest.
+        assertThat(saved.getPasswordHash()).startsWith("$pbkdf2-sha256$v=1$i=");
         assertThat(saved.isEnabled()).isTrue();
         assertThat(saved.getCreatedAt()).isNotBlank();
         assertThat(saved.getUpdatedAt()).isEqualTo(saved.getCreatedAt());

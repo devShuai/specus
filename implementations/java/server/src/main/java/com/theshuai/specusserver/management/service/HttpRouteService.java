@@ -302,7 +302,9 @@ public class HttpRouteService {
         String passwordHash = row.getAuthPasswordHash();
         if (StringUtils.hasText(request.authPassword())) {
             String password = requireAuthPassword(request.authPassword());
-            passwordHash = PasswordService.hash(password);
+            // A per-route gate secret, checked on every proxied request; the login KDF
+            // would turn each request into a deliberate 210k-iteration derivation.
+            passwordHash = PasswordService.hashToken(password);
         }
 
         if (enabled) {

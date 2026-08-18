@@ -181,7 +181,7 @@ public sealed class DatabaseInitializerTests
     {
         await using var connection = await OpenDatabaseAsync();
         await using var db = CreateContext(connection);
-        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var legacyHash = PasswordHasher.HashToken(DatabaseInitializer.DemoCredentialSecret);
         var now = DateTimeOffset.UtcNow;
         db.AddRange(
             ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),
@@ -213,8 +213,8 @@ public sealed class DatabaseInitializerTests
     {
         await using var connection = await OpenDatabaseAsync();
         await using var db = CreateContext(connection);
-        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
-        var rotatedHash = PasswordHasher.Hash("operator-rotated-secret");
+        var legacyHash = PasswordHasher.HashToken(DatabaseInitializer.DemoCredentialSecret);
+        var rotatedHash = PasswordHasher.HashToken("operator-rotated-secret");
         var now = DateTimeOffset.UtcNow;
         db.AddRange(
             ClientAccount(1, DatabaseInitializer.DemoClientName, rotatedHash, now),
@@ -239,7 +239,7 @@ public sealed class DatabaseInitializerTests
     {
         await using var connection = await OpenDatabaseAsync();
         await using var db = CreateContext(connection);
-        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var legacyHash = PasswordHasher.HashToken(DatabaseInitializer.DemoCredentialSecret);
         var now = DateTimeOffset.UtcNow;
         db.AddRange(
             ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),
@@ -260,7 +260,7 @@ public sealed class DatabaseInitializerTests
     {
         await using var connection = await OpenDatabaseAsync();
         await using var db = CreateContext(connection);
-        var legacyHash = PasswordHasher.Hash(DatabaseInitializer.DemoCredentialSecret);
+        var legacyHash = PasswordHasher.HashToken(DatabaseInitializer.DemoCredentialSecret);
         var now = DateTimeOffset.UtcNow;
         db.AddRange(
             ClientAccount(1, DatabaseInitializer.DemoClientName, legacyHash, now),

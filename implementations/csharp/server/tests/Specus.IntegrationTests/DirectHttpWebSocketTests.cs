@@ -472,7 +472,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
             Enabled = true,
             AuthEnabled = true,
             AuthUsername = Username,
-            AuthPasswordHash = PasswordHasher.Hash(Password),
+            AuthPasswordHash = PasswordHasher.HashToken(Password),
             CreatedAt = now,
             UpdatedAt = now,
         });
