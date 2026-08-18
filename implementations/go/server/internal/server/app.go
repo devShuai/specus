@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -67,6 +68,12 @@ type App struct {
 	mediaCapture            *media.Service
 	webSocketTickets        *security.WebSocketTicketService
 	addressResolver         *security.ClientAddressResolver
+
+	// backgroundWritersMu guards backgroundWriters, which is set when Run launches the goroutines
+	// that write to the database on their own schedule and closed once they have all returned.
+	backgroundWritersMu sync.Mutex
+	backgroundWriters   chan struct{}
+	runCtx              context.Context
 }
 
 // New opens the database, applies the schema, sanitizes production defaults, seeds allowed demo
@@ -414,6 +421,7 @@ func (a *App) Close() error {
 func (a *App) flushPendingWrites() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
 	defer cancel()
+	a.awaitBackgroundWriters(ctx)
 	if a.traffic != nil {
 		a.traffic.Flush(ctx)
 	}
@@ -427,19 +435,64 @@ func (a *App) flushPendingWrites() error {
 	return nil
 }
 
+// awaitBackgroundWriters waits for the workers that flush on context cancellation to finish their
+// final write. Run returning only means the listeners stopped; these goroutines outlive it briefly,
+// and closing the database underneath them silently drops whatever they were writing.
+func (a *App) awaitBackgroundWriters(ctx context.Context) {
+	a.backgroundWritersMu.Lock()
+	finished := a.backgroundWriters
+	runCtx := a.runCtx
+	a.backgroundWritersMu.Unlock()
+	if finished == nil {
+		return
+	}
+	// Only a cancelled run context makes these goroutines wind down. Closing an app that is still
+	// running is a different situation — waiting there would just burn the whole timeout.
+	if runCtx != nil && runCtx.Err() == nil {
+		return
+	}
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		a.logger.Warn("background writers did not finish before the shutdown flush timeout")
+	}
+}
+
 // Run starts the background workers, binds and serves the control channel, and serves the
 // management HTTP surface until ctx is cancelled.
 func (a *App) Run(ctx context.Context) error {
 	a.executor.Start(ctx)
-	go a.traffic.Run(ctx)
+
+	// These two goroutines each perform a final write when the context is cancelled. Close has to
+	// wait for both before closing the database, or the last flush races the close and its bytes are
+	// re-credited to a counter map nobody will ever drain again.
+	var writers sync.WaitGroup
+	writers.Add(2)
+	go func() {
+		defer writers.Done()
+		a.traffic.Run(ctx)
+	}()
+	go func() {
+		defer writers.Done()
+		a.db.RunTrafficDetailFlush(ctx,
+			time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
+			func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
+	}()
+	finished := make(chan struct{})
+	go func() {
+		writers.Wait()
+		close(finished)
+	}()
+	a.backgroundWritersMu.Lock()
+	a.backgroundWriters = finished
+	a.runCtx = ctx
+	a.backgroundWritersMu.Unlock()
+
 	go a.peerMesh.Run(ctx)
 	go a.peerMesh.RunStunTurn(ctx)
 	go a.attachments.RunExpiration(ctx)
 	go a.mediaCapture.Run(ctx)
 	go a.api.RunRegistrationCleanup(ctx)
-	go a.db.RunTrafficDetailFlush(ctx,
-		time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
-		func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
 	go runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord)
 
 	controlAddr := net.JoinHostPort(strings.TrimSpace(a.cfg.Netty.BindAddress),

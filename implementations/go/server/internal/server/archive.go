@@ -12,8 +12,10 @@ import (
 // runArchive periodically aggregates old connection records into monthly stats and deletes the
 // archived detail rows. Mirrors Java's ConnectionArchiveService fixed-delay behavior.
 func runArchive(ctx context.Context, db *store.DB, logger *slog.Logger, options config.ConnectionRecordConfig) {
-	if options.DetailRetentionDays <= 0 {
-		logger.Info("connection archive disabled", "detailRetentionDays", options.DetailRetentionDays)
+	if options.DetailRetentionDays <= 0 && options.SessionRetentionDays <= 0 {
+		logger.Info("connection archive disabled",
+			"detailRetentionDays", options.DetailRetentionDays,
+			"sessionRetentionDays", options.SessionRetentionDays)
 		return
 	}
 	interval := time.Duration(options.ArchiveIntervalMs) * time.Millisecond
@@ -29,20 +31,25 @@ func runArchive(ctx context.Context, db *store.DB, logger *slog.Logger, options 
 		case <-ticker.C:
 		}
 		archiveCtx, cancel := context.WithTimeout(ctx, time.Minute)
-		cutoff, ok := connectionArchiveCutoff(time.Now(), options.DetailRetentionDays)
-		if !ok {
-			cancel()
-			continue
+		now := time.Now()
+		if cutoff, ok := connectionArchiveCutoff(now, options.DetailRetentionDays); ok {
+			archived, err := db.ArchiveOldConnections(archiveCtx, cutoff)
+			if err != nil {
+				logger.Error("connection archive failed", "err", err)
+			} else if archived > 0 {
+				logger.Info("archived old connections", "count", archived)
+			}
 		}
-		archived, err := db.ArchiveOldConnections(archiveCtx, cutoff)
+		if cutoff, ok := connectionArchiveCutoff(now, options.SessionRetentionDays); ok {
+			purged, err := db.PurgeDisconnectedClientSessions(archiveCtx, cutoff, now)
+			if err != nil {
+				logger.Error("client session retention purge failed", "err", err)
+			} else if purged > 0 {
+				logger.Info("purged expired client sessions", "count", purged,
+					"retentionDays", options.SessionRetentionDays)
+			}
+		}
 		cancel()
-		if err != nil {
-			logger.Error("connection archive failed", "err", err)
-			continue
-		}
-		if archived > 0 {
-			logger.Info("archived old connections", "count", archived)
-		}
 	}
 }
 

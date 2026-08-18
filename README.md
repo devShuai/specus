@@ -606,9 +606,12 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | --- | --- | --- | --- |
 | `specus.connection-record.detail-retention-days` | `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` | `60` | 保留最近多少天的连接明细（滚动窗口）；更早的明细按自然月汇总后删除。`0` 关闭归档 |
 | `specus.connection-record.archive-interval-ms` | `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | 归档任务执行间隔（毫秒） |
+| `specus.connection-record.session-retention-days` | `SPECUS_CLIENT_SESSION_RETENTION_DAYS` | `30` | 保留多少天的客户端会话历史（Go server）。每次重连都会退役上一条会话记录，超过该窗口且已过期的记录会在归档任务中删除；仍在线或未过期的会话永不删除。`0` 关闭清理并保留全部历史 |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` | `SPECUS_DB_BATCH_SIZE` | `50` | Hibernate JDBC 批量大小 |
 
 Go server 与 .NET server 也兼容 `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` 和 `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS`，用于对齐 Java 的连接明细归档策略。
+
+Go server 额外提供 `SPECUS_CLIENT_SESSION_RETENTION_DAYS`：客户端断线重连会不断退役旧会话行，而该表位于登录路径上，因此需要一个明确的保留窗口，避免无界增长拖慢认证。
 
 > 月度归档总量（`specus_connection_stat`）与每日流量（`specus_traffic_usage`）都长期保留，只有连接明细会被汇总后清理。对于超大规模部署，建议进一步在数据库层对明细表按 `connected_at` 做时间分区（如 PostgreSQL 声明式分区）；JPA 的 `ddl-auto` 不会自动建立分区，需要在数据库侧维护。首次归档历史积压较大时，单次事务会汇总并删除全部过期明细，必要时可分批执行。
 

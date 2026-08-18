@@ -279,9 +279,6 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
 	}
-	if err := a.db.InsertClient(ctx, account); err != nil {
-		return nil, nil, err
-	}
 	identity = &store.ClientIdentity{
 		ID:                 auth.NewClientID(),
 		TenantID:           account.TenantID,
@@ -294,7 +291,9 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		FirstSeenAt:        now,
 		LastSeenAt:         now,
 	}
-	if err := a.db.InsertIdentity(ctx, *identity); err != nil {
+	// One transaction: an account without its identity row could never be matched on the next
+	// login, yet would keep its name reserved and appear in the management UI.
+	if err := a.db.InsertClientWithIdentity(ctx, account, *identity); err != nil {
 		return nil, nil, err
 	}
 	return &account, identity, nil

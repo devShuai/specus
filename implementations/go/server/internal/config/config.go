@@ -138,6 +138,10 @@ type ClientAuthConfig struct {
 type ConnectionRecordConfig struct {
 	DetailRetentionDays int   `json:"detailRetentionDays"`
 	ArchiveIntervalMs   int64 `json:"archiveIntervalMs"`
+	// SessionRetentionDays bounds how long expired client-session rows are kept after the client
+	// disconnected. Every reconnect retires a row, so without a cutoff the table on the login path
+	// grows forever. Zero disables the purge and keeps the full history.
+	SessionRetentionDays int `json:"sessionRetentionDays"`
 }
 
 // TrafficConfig mirrors Specus:Traffic.
@@ -447,8 +451,9 @@ func Default() Config {
 			TokenTTLSeconds:            28800,
 		},
 		ConnectionRecord: ConnectionRecordConfig{
-			DetailRetentionDays: 60,
-			ArchiveIntervalMs:   3600000,
+			DetailRetentionDays:  60,
+			ArchiveIntervalMs:    3600000,
+			SessionRetentionDays: 30,
 		},
 		Traffic: TrafficConfig{
 			FlushIntervalMs:        5000,
@@ -718,6 +723,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt64("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS", &cfg.ClientAuth.TokenTTLSeconds)
 
 	setInt("SPECUS_CONNECTION_DETAIL_RETENTION_DAYS", &cfg.ConnectionRecord.DetailRetentionDays)
+	setInt("SPECUS_CLIENT_SESSION_RETENTION_DAYS", &cfg.ConnectionRecord.SessionRetentionDays)
 	setInt64("SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS", &cfg.ConnectionRecord.ArchiveIntervalMs)
 
 	setInt("SPECUS_TRAFFIC_FLUSH_INTERVAL_MS", &cfg.Traffic.FlushIntervalMs)

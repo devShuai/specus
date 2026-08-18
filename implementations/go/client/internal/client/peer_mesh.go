@@ -88,60 +88,62 @@ type peerMeshClient struct {
 	config Config
 	logger *log.Logger
 
-	mu                    sync.Mutex
-	runtime               RuntimeConfig
-	conn                  net.Conn
-	sender                peerControlSender
-	udp                   *net.UDPConn
-	stopCh                chan struct{}
-	peers                 map[int64]*peerMeshPeer
-	sessions              map[int64]*peerMeshSession
-	sessionsByID          map[int64]*peerMeshSession
-	pending               map[string]pendingPeerProbe
-	pendingStun           map[string]pendingStunBinding
-	pendingTurn           map[string]pendingTurnRequest
-	packets               map[int64][]pendingPeerPacket
-	prepared              map[int64]time.Time
+	mu           sync.Mutex
+	runtime      RuntimeConfig
+	conn         net.Conn
+	sender       peerControlSender
+	udp          *net.UDPConn
+	stopCh       chan struct{}
+	peers        map[int64]*peerMeshPeer
+	sessions     map[int64]*peerMeshSession
+	sessionsByID map[int64]*peerMeshSession
+	pending      map[string]pendingPeerProbe
+	pendingStun  map[string]pendingStunBinding
+	pendingTurn  map[string]pendingTurnRequest
+	packets      map[int64][]pendingPeerPacket
+	prepared     map[int64]time.Time
 	// H-2：记录已排程密集退避重试的 session，防止重复排程；本轮结束后释放以便路径失效后重新进入。
 	holePunchRetryScheduled map[int64]bool
 	// H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
 	candidateReciprocateAt map[int64]time.Time
-	srflx                 *peerCandidate
-	srflxCandidates       map[string]peerCandidate
-	relay                 *peerCandidate
-	relayID               string
-	relayTTL              time.Time
-	portMap               *peerCandidate
-	portMapping           *natPortMapping
-	portMappingService    *natPortMappingService
-	lastPortMapAttempt    time.Time
-	lastStunRequest       time.Time
-	lastRelayRequest      time.Time
-	lastAlternateRequest  time.Time
-	lastBehaviorDiscovery time.Time
-	natByRole             map[string]string
-	natBehavior           *natBehaviorDiscovery
-	natType               string
-	natMappingBehavior    string
-	natFilteringBehavior  string
-	natBehaviorDiscovery  string
-	lastEndpoint          string
-	turnPermissions       map[string]time.Time
-	turnChannelsByPeer    map[string]*turnChannelBinding
-	turnChannelsByNumber  map[uint16]*turnChannelBinding
-	nextTurnChannel       uint16
-	localKey              *ecdh.PrivateKey
+	srflx                  *peerCandidate
+	srflxCandidates        map[string]peerCandidate
+	relay                  *peerCandidate
+	relayID                string
+	relayTTL               time.Time
+	portMap                *peerCandidate
+	portMapping            *natPortMapping
+	portMappingService     *natPortMappingService
+	lastPortMapAttempt     time.Time
+	lastStunRequest        time.Time
+	lastRelayRequest       time.Time
+	lastAlternateRequest   time.Time
+	lastBehaviorDiscovery  time.Time
+	natByRole              map[string]string
+	natBehavior            *natBehaviorDiscovery
+	natType                string
+	natMappingBehavior     string
+	natFilteringBehavior   string
+	natBehaviorDiscovery   string
+	lastEndpoint           string
+	turnPermissions        map[string]time.Time
+	turnChannelsByPeer     map[string]*turnChannelBinding
+	turnChannelsByNumber   map[uint16]*turnChannelBinding
+	nextTurnChannel        uint16
+	localKey               *ecdh.PrivateKey
 	// localKeyEpoch is this process instance's random SPM2 key epoch. It is the anchor for
 	// AES-GCM nonce uniqueness: sessionId/token are reused within the server session TTL and
 	// X25519 keys are persisted on disk, so only a fresh epoch keeps a restarted client from
 	// falling back into the same nonce space once its sequence restarts at 1.
-	localKeyEpoch         string
-	device                peerVirtualDevice
-	runtimeConfigKey      string
-	ignoredPacketLogAt    map[string]time.Time
-	pathMTUCache          map[string]cachedPeerPathMTU
-	messageHandler        func(ClientMessage)
-	turnAuth              turnAuthCredentials
+	localKeyEpoch      string
+	device             peerVirtualDevice
+	dataPlane          *peerDataPlane
+	probeLimiter       *peerUDPProbeRateLimiter
+	runtimeConfigKey   string
+	ignoredPacketLogAt map[string]time.Time
+	pathMTUCache       map[string]cachedPeerPathMTU
+	messageHandler     func(ClientMessage)
+	turnAuth           turnAuthCredentials
 }
 
 type peerMeshPeer struct {
@@ -476,6 +478,13 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 		return
 	}
 	mesh.udp = udp
+	if mesh.dataPlane == nil {
+		mesh.dataPlane = newPeerDataPlane(defaultPeerDataPlaneWorkers(), peerDataPlaneQueueCapacity,
+			mesh.handlePeerDataFrame)
+	}
+	if mesh.probeLimiter == nil {
+		mesh.probeLimiter = newPeerUDPProbeRateLimiter()
+	}
 	stopCh := mesh.stopCh
 	mesh.mu.Unlock()
 
@@ -519,6 +528,9 @@ func (mesh *peerMeshClient) stopLocked() {
 		_ = mesh.device.Close()
 		mesh.device = nil
 	}
+	// close() only signals; waiting here would deadlock against a worker blocked on mesh.mu.
+	mesh.dataPlane.close()
+	mesh.dataPlane = nil
 	mesh.conn = nil
 	mesh.sender = nil
 	mesh.peers = nil
@@ -666,6 +678,7 @@ func (mesh *peerMeshClient) maintenanceLoop(stopCh <-chan struct{}) {
 			return
 		case <-maintenanceTicker.C:
 			mesh.cleanupProbes()
+			mesh.cleanupProbeRateLimiter()
 			mesh.cleanupPendingPackets()
 			mesh.renewPortMappingIfNeeded()
 			mesh.requestRelayCandidates()
@@ -683,11 +696,11 @@ func (mesh *peerMeshClient) handleUDP(payload []byte, remote *net.UDPAddr) {
 	if len(payload) == 0 {
 		return
 	}
-	if looksLikeTurnChannelData(payload) {
-		frame, err := parseTurnChannelData(payload)
-		if err != nil {
-			return
-		}
+	// Classify on a successful parse, never on the channel range alone. The SPM2 data-frame magic
+	// 0x53504d32 opens with 0x5350, which sits inside the TURN ChannelData range 0x4000-0x7fff, so a
+	// range-only test claimed every direct data frame and then dropped it when the ChannelData length
+	// failed to add up. Java parses first for exactly this reason.
+	if frame, err := parseTurnChannelData(payload); err == nil {
 		mesh.mu.Lock()
 		binding := mesh.turnChannelsByNumber[frame.Channel]
 		valid := binding != nil && binding.Active && binding.ExpiresAt.After(time.Now())
@@ -698,8 +711,10 @@ func (mesh *peerMeshClient) handleUDP(payload []byte, remote *net.UDPAddr) {
 		mesh.mu.Unlock()
 		if valid && sameUDPEndpoint(mesh.relayEndpoint(), remote) {
 			mesh.handleRelayedPayload(frame.Payload, remote, peer)
+			return
 		}
-		return
+		// An unbound channel or a foreign source is not ChannelData we own; fall through so a data
+		// frame that happens to parse as ChannelData still reaches its own handler.
 	}
 	if looksLikeStun(payload) {
 		message, err := parseStunMessage(payload)
@@ -709,7 +724,12 @@ func (mesh *peerMeshClient) handleUDP(payload []byte, remote *net.UDPAddr) {
 		return
 	}
 	if looksLikePeerDataFrame(payload) {
-		mesh.handlePeerDataFrame(payload, remote, "")
+		mesh.dispatchPeerDataFrame(payload, remote, "")
+		return
+	}
+	// Probes are unauthenticated and each one costs a decode plus a reply, so they are rate limited
+	// before being parsed, per source and globally.
+	if !mesh.allowProbeFrom(remote) {
 		return
 	}
 	var probe peerUDPProbe
@@ -717,6 +737,22 @@ func (mesh *peerMeshClient) handleUDP(payload []byte, remote *net.UDPAddr) {
 		return
 	}
 	mesh.handleProbe(probe, remote, "")
+}
+
+// allowProbeFrom applies the shared probe budget. The source is the observed datagram origin, which
+// for relayed traffic is the peer address the relay reported.
+func (mesh *peerMeshClient) allowProbeFrom(remote *net.UDPAddr) bool {
+	mesh.mu.Lock()
+	limiter := mesh.probeLimiter
+	mesh.mu.Unlock()
+	if limiter == nil {
+		return true
+	}
+	var source net.IP
+	if remote != nil {
+		source = remote.IP
+	}
+	return limiter.tryAcquire(source, time.Now())
 }
 
 func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *net.UDPAddr) {
@@ -757,7 +793,10 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 func (mesh *peerMeshClient) handleRelayedPayload(inner []byte, remote, peer *net.UDPAddr) {
 	relayFrom := endpointKeyUDP(peer)
 	if looksLikePeerDataFrame(inner) {
-		mesh.handlePeerDataFrame(inner, remote, relayFrom)
+		mesh.dispatchPeerDataFrame(inner, remote, relayFrom)
+		return
+	}
+	if !mesh.allowProbeFrom(peer) {
 		return
 	}
 	var probe peerUDPProbe
@@ -1216,6 +1255,26 @@ func (mesh *peerMeshClient) replyProbe(probe peerUDPProbe, remote *net.UDPAddr, 
 	_, _ = udp.WriteToUDP(body, remote)
 }
 
+// dispatchPeerDataFrame hands the frame to the bounded data-plane workers so decryption and the
+// virtual-device write stay off the receive loop. Falling back to inline handling keeps behaviour
+// intact for callers that run before the workers exist (tests, and the window before startOrUpdate).
+func (mesh *peerMeshClient) dispatchPeerDataFrame(payload []byte, remote *net.UDPAddr, relayFrom string) {
+	mesh.mu.Lock()
+	plane := mesh.dataPlane
+	mesh.mu.Unlock()
+	if plane == nil {
+		mesh.handlePeerDataFrame(payload, remote, relayFrom)
+		return
+	}
+	sessionID, ok := peerDataFrameSessionID(payload)
+	if !ok {
+		return
+	}
+	if !plane.submit(sessionID, peerDataFrameTask{payload: payload, remote: remote, relayFrom: relayFrom}) {
+		mesh.logDroppedPeerDataFrame(sessionID, plane)
+	}
+}
+
 func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPAddr, relayFrom string) {
 	if relayFrom == "" && (mesh.shouldAvoidDirectPath() || mesh.isMeshEndpoint(remote)) {
 		return
@@ -1510,6 +1569,34 @@ func (mesh *peerMeshClient) logIgnoredVirtualPacket(targetVirtualIP, reason stri
 	mesh.mu.Unlock()
 	mesh.logger.Printf("Peer Mesh ignored non-peer virtual packet: target=%s reason=%s peers=%d sessions=%d",
 		targetVirtualIP, reason, peerCount, sessionCount)
+}
+
+// logDroppedPeerDataFrame reports data-plane saturation at most once every 30s per session: a
+// saturated shard means a burst of drops, and one line per dropped datagram would itself become the
+// bottleneck.
+func (mesh *peerMeshClient) logDroppedPeerDataFrame(sessionID int64, plane *peerDataPlane) {
+	now := time.Now()
+	key := fmt.Sprintf("dropped-data-frame|%d", sessionID)
+	mesh.mu.Lock()
+	if mesh.ignoredPacketLogAt == nil {
+		mesh.ignoredPacketLogAt = make(map[string]time.Time)
+	}
+	if previous, ok := mesh.ignoredPacketLogAt[key]; ok && now.Sub(previous) < 30*time.Second {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.ignoredPacketLogAt[key] = now
+	mesh.mu.Unlock()
+	stats := plane.stats()
+	mesh.logger.Printf("Peer Mesh dropped peer data frame, data plane saturated: session=%d workers=%d depth=%d highWater=%d rejected=%d",
+		sessionID, stats.Workers, stats.Depth, stats.HighWater, stats.Rejected)
+}
+
+func (mesh *peerMeshClient) cleanupProbeRateLimiter() {
+	mesh.mu.Lock()
+	limiter := mesh.probeLimiter
+	mesh.mu.Unlock()
+	limiter.cleanup(time.Now())
 }
 
 func (mesh *peerMeshClient) syncVirtualDeviceRoutes() {

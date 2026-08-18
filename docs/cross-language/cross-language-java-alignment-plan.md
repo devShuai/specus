@@ -40,6 +40,7 @@
   - Netty 运行时登录已按 Java 语义检查同一机器/用户单实例与凭证 `maxOnlineInstances`，并在连接断开时回收内存会话在线状态。
   - `specus.client-auth.*` 已独立于管理端 `specus.auth.*`：HTTP 启动登录 token TTL 使用 `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS`，同机用户在线实例数使用 `SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES`，凭证默认最大在线数使用 `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES`；同时补齐 Java 当前 `SPECUS_LOGIN_EXECUTOR_MAX` / `SPECUS_LOGIN_EXECUTOR_QUEUE` 环境变量别名。
   - 连接记录后台归档已改为读取 Java 同名配置：`SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` 控制明细保留天数，`SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` 控制归档间隔；保留天数小于等于 0 时关闭归档，归档 cutoff 使用 UTC 自然日边界。
+  - 客户端会话历史保留窗口为 Go server 独有扩展（Java 未定义）：`SPECUS_CLIENT_SESSION_RETENTION_DAYS`（默认 30）在同一归档任务里删除已过期且断线时间早于 cutoff 的 `specus_client_session` 行；在线或未过期的会话永不删除，`0` 关闭清理。重连会不断退役旧会话行，而该表位于登录热路径上，因此需要明确的保留口径。
   - 新增 `specus_client_session` schema 与 store 操作；HTTP 启动登录写入 `HTTP_AUTHENTICATED`，Netty 登录成功改为 `NETTY_ONLINE`，断开和过期改为 `DISCONNECTED`，启动时会清理上一进程遗留的在线会话。
   - admin 可管理用户和查看当前租户内全部资源。
   - 普通用户只能看到自己创建的客户端、启动凭证、TCP 映射、HTTP route、连接记录、流量和归档统计。
@@ -152,6 +153,9 @@
   - 路径选择细节已对齐 Java：已绑定 `relayTargetAllocationId` 时数据面优先走 relay；direct 路径 45 秒内仍健康时不会被本端 relay check-response 抢占；收到 direct 数据帧会清理旧 relay allocation，避免路径状态残留。
   - `path-report` 与 active path 日志节流已对齐 Java：路径变化立即上报；路径不变时 60 秒内不重复刷控制面。
   - TUN 出站虚拟包在 session/path 未就绪时会按 Java 策略短暂排队：每个 peer 最多 32 个、30 秒 TTL；路径准备会主动重新上报 candidates / 触发 connectivity check，主动探测或收到对端数据导致路径就绪后都会 flush，避免 TCP SYN 等第一批包被直接丢弃。
+  - UDP 数据报分类已对齐 Java/.NET 的“解析成功才归类”口径：`SPM2` magic `0x53504d32` 的高 16 位 `0x5350` 落在 TURN ChannelData 通道号区间 `0x4000-0x7fff`，此前 Go 只按通道号区间判断，导致所有 direct 数据帧被误判为 ChannelData 并在长度校验失败后丢弃；现改为先尝试 `parseTurnChannelData`，失败再依次判断 STUN、`SPM2` 数据帧、probe。与 Java/.NET 的唯一有意差异：ChannelData 解析成功但通道未绑定或来源不是 relay 时，Go 会继续向下分类而不是直接返回，以覆盖上述 magic 碰撞。
+  - 已对齐 Java `DataPlaneWorker` 有界数据面：`SPM2` 数据帧按 session id 分片提交给 2-8 个 worker（随 CPU 数收敛）、每片队列 2048，队列满即丢帧并按 session 30 秒节流记日志；解密与虚拟网卡写入不再占用 UDP 接收循环，慢 TUN 写或数据帧洪泛不会阻塞 STUN、TURN、保活与路径切换。
+  - 已对齐 Java/.NET probe 限速（`PeerUdpProbeRateLimiter`）：1 秒固定窗口，全局 2000 包、单源 100 包，最多跟踪 4096 个源，60 秒未见即回收；direct 与 relay 两条 probe 路径共用同一预算，未知来源直接拒绝。
   - 当虚拟设备为 `noop` 时，收到目标为本机虚拟 IP 的 ICMP echo request 会和 Java 一样在应用层构造 echo reply 并加密发回；真实 TUN / Wintun / utun 路径仍交给系统协议栈处理。
 - .NET client：
   - 已读取 Java 启动配置里的 `peerMeshDevice`、`peerMeshTunName`、`peerMeshMtu`。
