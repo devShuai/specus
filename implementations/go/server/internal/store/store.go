@@ -203,6 +203,13 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_client_session", "message_attachments_capable", clientCapabilityBoolType},
 		{"specus_client_session", "message_media_preview_capable", clientCapabilityBoolType},
 		{"specus_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
+		{"client_download_link", "version", "VARCHAR(32)"},
+		{"client_download_link", "sha256", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"client_download_link", "file_size", "BIGINT NOT NULL DEFAULT 0"},
+		{"client_download_link", "is_latest", boolType},
+		{"client_download_link", "latest_slot", "VARCHAR(160)"},
+		{"client_download_link", "changelog_url", "VARCHAR(1024)"},
+		{"client_download_link", "min_supported_version", "VARCHAR(32)"},
 		{"transfer_attachment", "public_transfer_room_id", "BIGINT"},
 		{"peer_mesh_device", "nat_mapping_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_filtering_behavior", "VARCHAR(80)"},
@@ -223,6 +230,19 @@ func (db *DB) ensureCompatibleColumns() error {
 		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := db.backfillClientDownloadVersions(); err != nil {
+		return err
+	}
+	if err := db.backfillClientDownloadLatestSlots(); err != nil {
+		return err
+	}
+	if err := db.ensureUniqueIndex("uq_client_download_target_version", "client_download_link",
+		"implementation, platform, arch, version"); err != nil {
+		return err
+	}
+	if err := db.ensureUniqueIndex("uq_client_download_latest_slot", "client_download_link", "latest_slot"); err != nil {
+		return err
 	}
 	// This index must be created after ensureColumn. Embedded schema statements run before the
 	// compatibility pass, so putting the index there would make an old table without the nullable
@@ -299,6 +319,124 @@ func (db *DB) ensureCompatibleColumns() error {
 		}
 	}
 	return nil
+}
+
+// backfillClientDownloadVersions upgrades the original external-link-only catalog without making
+// startup fail when it contained more than one entry for the same target. Every legacy row gets a
+// stable SemVer-compatible prerelease derived from its id; an already populated version is kept
+// unless it duplicates an earlier row for the same implementation/platform/architecture tuple.
+func (db *DB) backfillClientDownloadVersions() error {
+	type row struct {
+		id                             int64
+		implementation, platform, arch string
+		version                        sql.NullString
+	}
+	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, version
+		FROM client_download_link ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list client download versions for compatibility migration: %w", err)
+	}
+	var catalog []row
+	for rows.Next() {
+		var item row
+		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.version); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan client download version for compatibility migration: %w", err)
+		}
+		catalog = append(catalog, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate client download versions for compatibility migration: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close client download compatibility rows: %w", err)
+	}
+
+	seen := make(map[string]struct{}, len(catalog))
+	for _, item := range catalog {
+		version := strings.TrimSpace(item.version.String)
+		keyPrefix := strings.ToLower(strings.TrimSpace(item.implementation)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(item.platform)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(item.arch)) + "\x00"
+		_, duplicate := seen[keyPrefix+version]
+		if version == "" || duplicate {
+			version = "0.0.0-legacy." + strconv.FormatInt(item.id, 36)
+			for suffix := int64(1); ; suffix++ {
+				if _, exists := seen[keyPrefix+version]; !exists {
+					break
+				}
+				version = "0.0.0-legacy." + strconv.FormatInt(item.id, 36) + "." + strconv.FormatInt(suffix, 36)
+			}
+			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET version = ? WHERE id = ?`),
+				version, item.id); err != nil {
+				return fmt.Errorf("backfill client download version for id %d: %w", item.id, err)
+			}
+		}
+		seen[keyPrefix+version] = struct{}{}
+	}
+	return nil
+}
+
+// backfillClientDownloadLatestSlots converts the boolean marker into a nullable unique slot. The
+// slot closes the race where two concurrent transactions could both clear and then mark different
+// rows latest. If a pre-constraint database already contains duplicates, the oldest row keeps the
+// marker and the remaining rows are safely demoted before the unique index is created.
+func (db *DB) backfillClientDownloadLatestSlots() error {
+	type row struct {
+		id                             int64
+		implementation, platform, arch string
+		latest                         databaseBoolean
+	}
+	rows, err := db.sql.Query(`SELECT id, implementation, platform, arch, is_latest
+		FROM client_download_link ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list client download latest slots: %w", err)
+	}
+	var catalog []row
+	for rows.Next() {
+		var item row
+		if err := rows.Scan(&item.id, &item.implementation, &item.platform, &item.arch, &item.latest); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan client download latest slot: %w", err)
+		}
+		catalog = append(catalog, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{})
+	for _, item := range catalog {
+		if !bool(item.latest) {
+			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET latest_slot = NULL WHERE id = ?`), item.id); err != nil {
+				return fmt.Errorf("clear client download latest slot %d: %w", item.id, err)
+			}
+			continue
+		}
+		slot := clientDownloadLatestSlot(item.implementation, item.platform, item.arch)
+		if _, duplicate := seen[slot]; duplicate {
+			if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link
+				SET is_latest = ?, latest_slot = NULL WHERE id = ?`), 0, item.id); err != nil {
+				return fmt.Errorf("demote duplicate latest client download %d: %w", item.id, err)
+			}
+			continue
+		}
+		seen[slot] = struct{}{}
+		if _, err := db.sql.Exec(db.rebind(`UPDATE client_download_link SET latest_slot = ? WHERE id = ?`), slot, item.id); err != nil {
+			return fmt.Errorf("backfill client download latest slot %d: %w", item.id, err)
+		}
+	}
+	return nil
+}
+
+func clientDownloadLatestSlot(implementation, platform, arch string) string {
+	return strings.ToLower(strings.TrimSpace(implementation)) + "|" +
+		strings.ToLower(strings.TrimSpace(platform)) + "|" +
+		strings.ToLower(strings.TrimSpace(arch))
 }
 
 var clientMessageCapabilityColumns = []string{

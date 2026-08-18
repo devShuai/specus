@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type DragEvent } from "react";
 import {
   Button,
   Card,
@@ -28,13 +28,14 @@ import type {
   ClientArch,
   ClientDownloadLink,
   ClientDownloadLinkMutation,
+  ClientPackageUpload,
   ClientImplementation,
   ClientPlatform,
   ManagementRole,
   ManagementUser,
   ManagementUserMutation,
 } from "../../api/types";
-import { formatDateTime } from "../../lib/format";
+import { formatBytes, formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ConfirmModal } from "../../components/ConfirmModal";
@@ -151,11 +152,12 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     });
   };
 
-  // ---- GitHub Releases 不可用时的备用下载链接管理 ----
+  // ---- 客户端版本编目与服务端托管发布包 ----
   const [downloadLinks, setDownloadLinks] = useState<ClientDownloadLink[]>([]);
   const [loadingDownloads, setLoadingDownloads] = useState(false);
   const [editingLink, setEditingLink] = useState<ClientDownloadLink | null>(null);
   const linkModal = useDisclosure();
+  const packageModal = useDisclosure();
 
   const loadDownloadLinks = async () => {
     setLoadingDownloads(true);
@@ -201,6 +203,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         description: link.description ?? null,
         displayOrder: link.displayOrder,
         enabled: !link.enabled,
+        version: link.version,
+        isLatest: link.isLatest,
+        changelogUrl: link.changelogUrl,
+        minSupportedVersion: link.minSupportedVersion,
       });
     } catch (error) {
       setDownloadLinks((prev) => prev.map((item) => (item.id === link.id ? link : item)));
@@ -211,6 +217,17 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         next.delete(link.id);
         return next;
       });
+    }
+  };
+
+  const markLinkLatest = async (link: ClientDownloadLink) => {
+    if (link.isLatest) return;
+    try {
+      await adminApi.setClientDownloadLatest(link.id);
+      notify(`v${link.version || "-"} 已设为最新版本`);
+      await loadDownloadLinks();
+    } catch (error) {
+      notifyError(error, "设置最新版本失败");
     }
   };
 
@@ -449,17 +466,20 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
       <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">备用下载链接</h2>
+          <h2 className="text-lg font-semibold text-foreground">客户端发布</h2>
           <p className="mt-1 text-small text-default-500">
-            站点默认读取 GitHub Releases；仅在 GitHub 不可用时使用这里的链接。
+            上传受校验的发布包，按实现、平台与架构维护版本轨道。
           </p>
         </div>
         <div className="flex gap-2">
           <Button radius="sm" variant="flat" isLoading={loadingDownloads} onPress={() => void loadDownloadLinks()}>
             刷新
           </Button>
-          <Button radius="sm" color="primary" onPress={openCreateLink}>
-            新增链接
+          <Button radius="sm" variant="bordered" onPress={openCreateLink}>
+            新增外链
+          </Button>
+          <Button radius="sm" color="primary" onPress={packageModal.onOpen}>
+            上传发布包
           </Button>
         </div>
       </CardHeader>
@@ -469,7 +489,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           <MobileListCardList
             items={downloadLinks}
             isLoading={loadingDownloads}
-            emptyContent={<EmptyState icon="generic" title="暂无备用链接" description="GitHub Releases 不可用时将显示空状态" />}
+            emptyContent={<EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />}
             renderCard={(raw) => {
               const link = raw as ClientDownloadLink;
               const pending = pendingLinkIds.has(link.id);
@@ -485,6 +505,8 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                       </Chip>
                       <Chip size="sm" variant="flat">{platformLabel(link.platform)}</Chip>
                       <Chip size="sm" variant="flat">{archLabel(link.arch)}</Chip>
+                      {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">v{link.version}</Chip> : null}
+                      {link.hosted ? <Chip size="sm" color="secondary" variant="flat">托管</Chip> : null}
                       <Switch
                         size="sm"
                         isSelected={link.enabled}
@@ -510,12 +532,19 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                       ),
                     },
                     { label: "排序", value: link.displayOrder },
+                    { label: "文件", value: link.fileSize ? formatBytes(link.fileSize) : "外部链接" },
+                    { label: "SHA-256", value: link.sha256 ? <span className="break-all font-mono text-tiny">{link.sha256}</span> : "-" },
                   ]}
                   actions={
                     <>
                       <Button size="sm" radius="sm" variant="flat" onPress={() => openEditLink(link)}>
                         编辑
                       </Button>
+                      {!link.isLatest && link.version ? (
+                        <Button size="sm" radius="sm" color="success" variant="flat" onPress={() => void markLinkLatest(link)}>
+                          设为最新
+                        </Button>
+                      ) : null}
                       <Button
                         size="sm"
                         radius="sm"
@@ -536,7 +565,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         {/* desktop: 表格 */}
         <div className="hidden overflow-x-auto lg:block">
           <Table
-            aria-label="客户端下载链接"
+            aria-label="客户端发布版本"
             isHeaderSticky
             removeWrapper
             classNames={{ th: "bg-default-100", td: "align-middle" }}
@@ -545,12 +574,13 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
               <TableColumn>实现</TableColumn>
               <TableColumn>平台 / 架构</TableColumn>
               <TableColumn>名称</TableColumn>
+              <TableColumn>版本</TableColumn>
               <TableColumn>URL</TableColumn>
-              <TableColumn>排序</TableColumn>
+              <TableColumn>校验</TableColumn>
               <TableColumn>启用</TableColumn>
               <TableColumn className="text-right">操作</TableColumn>
             </TableHeader>
-            <TableBody emptyContent={<EmptyState icon="generic" title="暂无备用链接" description="GitHub Releases 不可用时将显示空状态" />} isLoading={loadingDownloads} items={downloadLinks}>
+            <TableBody emptyContent={<EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />} isLoading={loadingDownloads} items={downloadLinks}>
               {(link) => {
                 const pending = pendingLinkIds.has(link.id);
                 return (
@@ -573,6 +603,14 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                     ) : null}
                   </TableCell>
                   <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">
+                        {link.version ? `v${link.version}` : "未标版本"}
+                      </Chip>
+                      {link.hosted ? <Chip size="sm" color="secondary" variant="flat">托管</Chip> : null}
+                    </div>
+                  </TableCell>
+                  <TableCell>
                     <a
                       className="block max-w-64 truncate font-mono text-tiny text-primary hover:underline"
                       href={link.downloadUrl}
@@ -583,7 +621,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                       {link.downloadUrl}
                     </a>
                   </TableCell>
-                  <TableCell>{link.displayOrder}</TableCell>
+                  <TableCell>
+                    <div className="text-tiny text-default-500">{link.fileSize ? formatBytes(link.fileSize) : "外部文件"}</div>
+                    {link.sha256 ? <div className="max-w-32 truncate font-mono text-tiny" title={link.sha256}>{link.sha256}</div> : null}
+                  </TableCell>
                   <TableCell>
                     <Switch
                       aria-label="启用"
@@ -598,6 +639,11 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                       <Button size="sm" radius="sm" variant="flat" onPress={() => openEditLink(link)}>
                         编辑
                       </Button>
+                      {!link.isLatest && link.version ? (
+                        <Button size="sm" radius="sm" color="success" variant="flat" onPress={() => void markLinkLatest(link)}>
+                          设为最新
+                        </Button>
+                      ) : null}
                       <Button
                         size="sm"
                         radius="sm"
@@ -621,6 +667,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     <EditClientDownloadModal
       disclosure={linkModal}
       link={editingLink}
+      onSaved={() => void loadDownloadLinks()}
+    />
+    <UploadClientPackageModal
+      disclosure={packageModal}
       onSaved={() => void loadDownloadLinks()}
     />
     <ResetPasswordModal
@@ -730,9 +780,172 @@ function implementationLabel(impl: string): string {
       return "Go";
     case "csharp":
       return ".NET";
+    case "android":
+      return "Android";
     default:
       return impl;
   }
+}
+
+interface UploadClientPackageModalProps {
+  disclosure: ReturnType<typeof useDisclosure>;
+  onSaved: () => void;
+}
+
+function UploadClientPackageModal({ disclosure, onSaved }: UploadClientPackageModalProps) {
+  const [file, setFile] = useState<File | null>(null);
+  const [implementation, setImplementation] = useState<ClientImplementation>("go");
+  const [platform, setPlatform] = useState<ClientPlatform>("linux");
+  const [arch, setArch] = useState<ClientArch>("x64");
+  const [version, setVersion] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [description, setDescription] = useState("");
+  const [changelogUrl, setChangelogUrl] = useState("");
+  const [minSupportedVersion, setMinSupportedVersion] = useState("");
+  const [isLatest, setIsLatest] = useState(true);
+  const [enabled, setEnabled] = useState(true);
+  const [dragging, setDragging] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!disclosure.isOpen) return;
+    setFile(null);
+    setVersion("");
+    setDisplayName("");
+    setDescription("");
+    setChangelogUrl("");
+    setMinSupportedVersion("");
+    setIsLatest(true);
+    setEnabled(true);
+  }, [disclosure.isOpen]);
+
+  const chooseImplementation = (value: ClientImplementation) => {
+    setImplementation(value);
+    if (value === "android") {
+      setPlatform("android");
+      setArch("any");
+    } else if (platform === "android") {
+      setPlatform("any");
+    }
+  };
+
+  const acceptDroppedFile = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    setDragging(false);
+    const dropped = event.dataTransfer.files.item(0);
+    if (dropped) setFile(dropped);
+  };
+
+  const upload = async () => {
+    if (!file || !version.trim() || !displayName.trim()) {
+      notify("请选择文件并填写版本号与显示名称", "error");
+      return;
+    }
+    const body: ClientPackageUpload = {
+      file,
+      implementation,
+      platform,
+      arch,
+      version: version.trim().replace(/^v/i, ""),
+      displayName: displayName.trim(),
+      description: description.trim() || null,
+      changelogUrl: changelogUrl.trim() || null,
+      minSupportedVersion: minSupportedVersion.trim().replace(/^v/i, "") || null,
+      enabled,
+      isLatest,
+    };
+    setSaving(true);
+    try {
+      await adminApi.uploadClientPackage(body);
+      notify(`v${body.version} 发布包已上传`);
+      disclosure.onClose();
+      onSaved();
+    } catch (error) {
+      notifyError(error, "发布包上传失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange} size="2xl" scrollBehavior="inside">
+      <ModalContent>
+        {(onClose) => (
+          <>
+            <ModalHeader className="flex flex-col items-start gap-1">
+              <span>上传客户端发布包</span>
+              <span className="text-tiny font-normal text-default-500">服务端计算大小与 SHA-256；设为最新后客户端才会收到升级提示。</span>
+            </ModalHeader>
+            <ModalBody className="gap-4">
+              <label
+                htmlFor="client-package-file"
+                className={`flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed px-5 py-6 text-center transition ${dragging ? "border-primary bg-primary-50 dark:bg-primary-500/10" : "border-default-300 bg-default-50 hover:border-primary"}`}
+                onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+                onDragOver={(event) => event.preventDefault()}
+                onDragLeave={() => setDragging(false)}
+                onDrop={acceptDroppedFile}
+              >
+                <input
+                  id="client-package-file"
+                  className="sr-only"
+                  type="file"
+                  onChange={(event) => setFile(event.target.files?.item(0) ?? null)}
+                />
+                <span className="font-medium text-foreground">{file ? file.name : "拖入发布包，或点击选择文件"}</span>
+                <span className="mt-1 text-tiny text-default-500">{file ? formatBytes(file.size) : "APK、JAR、ZIP、tar.gz 均按二进制原样托管"}</span>
+              </label>
+
+              <div className="grid gap-3 sm:grid-cols-3">
+                <Select label="实现" selectedKeys={[implementation]} onSelectionChange={(keys) => {
+                  const value = Array.from(keys)[0]?.toString() as ClientImplementation | undefined;
+                  if (value) chooseImplementation(value);
+                }}>
+                  <SelectItem key="go">Go</SelectItem>
+                  <SelectItem key="csharp">.NET</SelectItem>
+                  <SelectItem key="java">Java</SelectItem>
+                  <SelectItem key="android">Android</SelectItem>
+                </Select>
+                <Select isDisabled={implementation === "android"} label="操作系统" selectedKeys={[platform]} onSelectionChange={(keys) => {
+                  const value = Array.from(keys)[0]?.toString() as ClientPlatform | undefined;
+                  if (value) setPlatform(value);
+                }}>
+                  <SelectItem key="any">跨平台</SelectItem>
+                  <SelectItem key="windows">Windows</SelectItem>
+                  <SelectItem key="linux">Linux</SelectItem>
+                  <SelectItem key="macos">macOS</SelectItem>
+                  <SelectItem key="android">Android</SelectItem>
+                </Select>
+                <Select isDisabled={implementation === "android"} label="架构" selectedKeys={[arch]} onSelectionChange={(keys) => {
+                  const value = Array.from(keys)[0]?.toString() as ClientArch | undefined;
+                  if (value) setArch(value);
+                }}>
+                  <SelectItem key="any">跨架构</SelectItem>
+                  <SelectItem key="x64">x86_64</SelectItem>
+                  <SelectItem key="arm64">ARM64</SelectItem>
+                </Select>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Input isRequired label="版本号" placeholder="1.4.0" value={version} onValueChange={setVersion} />
+                <Input isRequired label="显示名称" placeholder="Android 客户端 1.4.0" value={displayName} onValueChange={setDisplayName} />
+                <Input label="最低支持版本（可选）" placeholder="1.2.0" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
+                <Input label="更新说明 URL（可选）" placeholder="https://…" value={changelogUrl} onValueChange={setChangelogUrl} />
+              </div>
+              <Textarea label="版本说明（可选）" maxRows={3} value={description} onValueChange={setDescription} />
+              <div className="flex flex-wrap gap-5 rounded-md border border-default-200 bg-default-50 p-3">
+                <Switch isSelected={isLatest} onValueChange={setIsLatest}>设为此目标的最新版本</Switch>
+                <Switch isSelected={enabled} onValueChange={setEnabled}>公开下载</Switch>
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button variant="flat" onPress={onClose} isDisabled={saving}>取消</Button>
+              <Button color="primary" isLoading={saving} onPress={() => void upload()}>校验并上传</Button>
+            </ModalFooter>
+          </>
+        )}
+      </ModalContent>
+    </Modal>
+  );
 }
 
 interface EditClientDownloadModalProps {
@@ -750,6 +963,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
   const [description, setDescription] = useState("");
   const [displayOrder, setDisplayOrder] = useState("0");
   const [enabled, setEnabled] = useState(true);
+  const [version, setVersion] = useState("");
+  const [isLatest, setIsLatest] = useState(false);
+  const [changelogUrl, setChangelogUrl] = useState("");
+  const [minSupportedVersion, setMinSupportedVersion] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -765,6 +982,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       setDescription(link.description ?? "");
       setDisplayOrder(String(link.displayOrder));
       setEnabled(link.enabled);
+      setVersion(link.version ?? "");
+      setIsLatest(link.isLatest === true);
+      setChangelogUrl(link.changelogUrl ?? "");
+      setMinSupportedVersion(link.minSupportedVersion ?? "");
     } else {
       setImplementation("java");
       setPlatform("any");
@@ -774,12 +995,16 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       setDescription("");
       setDisplayOrder("0");
       setEnabled(true);
+      setVersion("");
+      setIsLatest(false);
+      setChangelogUrl("");
+      setMinSupportedVersion("");
     }
   }, [disclosure.isOpen, link]);
 
   const save = async () => {
-    if (!displayName.trim() || !downloadUrl.trim()) {
-      notify("请填写名称和下载 URL", "error");
+    if (!displayName.trim() || !downloadUrl.trim() || !version.trim()) {
+      notify("请填写版本号、名称和下载 URL", "error");
       return;
     }
     setSaving(true);
@@ -792,6 +1017,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
       description: description.trim() || null,
       displayOrder: Number(displayOrder) || 0,
       enabled,
+      version: version.trim().replace(/^v/i, ""),
+      isLatest,
+      changelogUrl: changelogUrl.trim() || null,
+      minSupportedVersion: minSupportedVersion.trim().replace(/^v/i, "") || null,
     };
     try {
       if (link) {
@@ -829,6 +1058,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   <SelectItem key="java">Java</SelectItem>
                   <SelectItem key="go">Go</SelectItem>
                   <SelectItem key="csharp">.NET</SelectItem>
+                  <SelectItem key="android">Android</SelectItem>
                 </Select>
                 <Select
                   label="操作系统"
@@ -842,6 +1072,7 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   <SelectItem key="windows">Windows</SelectItem>
                   <SelectItem key="linux">Linux</SelectItem>
                   <SelectItem key="macos">macOS</SelectItem>
+                  <SelectItem key="android">Android</SelectItem>
                 </Select>
                 <Select
                   label="架构"
@@ -856,6 +1087,14 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   <SelectItem key="arm64">ARM64</SelectItem>
                 </Select>
               </div>
+              <Input
+                label="版本号"
+                value={version}
+                onValueChange={setVersion}
+                maxLength={64}
+                isRequired
+                placeholder="1.4.0"
+              />
               <Input
                 label="名称"
                 value={displayName}
@@ -879,6 +1118,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                 maxRows={3}
                 placeholder="哈希值、签名说明等"
               />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Input label="最低支持版本（可选）" value={minSupportedVersion} onValueChange={setMinSupportedVersion} />
+                <Input label="更新说明 URL（可选）" value={changelogUrl} onValueChange={setChangelogUrl} />
+              </div>
               <div className="grid gap-3 sm:grid-cols-[120px_1fr] sm:items-center">
                 <Input
                   label="排序"
@@ -886,9 +1129,10 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
                   value={displayOrder}
                   onValueChange={setDisplayOrder}
                 />
-                <Switch isSelected={enabled} onValueChange={setEnabled}>
-                  启用
-                </Switch>
+                <div className="flex flex-wrap gap-4">
+                  <Switch isSelected={enabled} onValueChange={setEnabled}>启用</Switch>
+                  <Switch isSelected={isLatest} onValueChange={setIsLatest}>最新版本</Switch>
+                </div>
               </div>
             </ModalBody>
             <ModalFooter>

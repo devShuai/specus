@@ -6,6 +6,7 @@ import type {
   ClientDetail,
   ClientDownloadLink,
   ClientDownloadLinkMutation,
+  ClientPackageUpload,
   ClientMutation,
   ClientNameAvailability,
   ConnectionPage,
@@ -68,7 +69,6 @@ import type {
 import {
   fetchLatestGithubClientDownloads,
   hasCompleteGithubClientDownloadSet,
-  mergeGithubAndConfiguredDownloads,
   mergePreferredClientDownloads,
 } from "../lib/githubReleaseDownloads";
 
@@ -127,7 +127,9 @@ class ApiError extends Error {}
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set("Content-Type", "application/json");
+  if (!(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
   const token = tokenStore.get();
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
@@ -472,6 +474,24 @@ export const adminApi = {
   updateClientDownload: (id: number, body: ClientDownloadLinkMutation) =>
     request<ClientDownloadLink>(`/client-downloads/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClientDownload: (id: number) => request<null>(`/client-downloads/${id}`, { method: "DELETE" }),
+  setClientDownloadLatest: (id: number) =>
+    request<ClientDownloadLink>(`/client-downloads/${id}/latest`, { method: "POST" }),
+  uploadClientPackage: (body: ClientPackageUpload) => {
+    const form = new FormData();
+    form.set("file", body.file);
+    form.set("implementation", body.implementation);
+    form.set("platform", body.platform);
+    form.set("arch", body.arch);
+    form.set("version", body.version);
+    form.set("displayName", body.displayName);
+    form.set("description", body.description ?? "");
+    form.set("changelogUrl", body.changelogUrl ?? "");
+    form.set("minSupportedVersion", body.minSupportedVersion ?? "");
+    form.set("displayOrder", String(body.displayOrder ?? 0));
+    form.set("enabled", String(body.enabled ?? true));
+    form.set("isLatest", String(body.isLatest ?? true));
+    return request<ClientDownloadLink>("/client-packages", { method: "POST", body: form });
+  },
 
   presignClientMessageAttachmentUpload: (body: AttachmentPresignUploadRequest) =>
     request<AttachmentPresignUploadResponse>("/client-messages/attachments/presign-upload", {
@@ -514,10 +534,14 @@ async function fetchConfiguredClientDownloads(): Promise<ClientDownloadLink[]> {
     if (!Array.isArray(body)) {
       throw new Error("备用客户端下载接口返回了无效数据");
     }
-    return body.flatMap((value) => {
+    const links = body.flatMap((value) => {
       const link = parseConfiguredClientDownload(value);
       return link ? [link] : [];
     });
+    const targetsWithLatest = new Set(links.filter((link) => link.isLatest)
+      .map((link) => `${link.implementation}:${link.platform}:${link.arch}`));
+    return links.filter((link) => link.isLatest
+      || !targetsWithLatest.has(`${link.implementation}:${link.platform}:${link.arch}`));
   } finally {
     globalThis.clearTimeout(timeout);
   }
@@ -534,8 +558,8 @@ function parseConfiguredClientDownload(value: unknown): ClientDownloadLink | nul
   const description = link.description;
   if (!Number.isSafeInteger(link.id)
     || !Number.isSafeInteger(link.displayOrder)
-    || (implementation !== "java" && implementation !== "go" && implementation !== "csharp")
-    || (platform !== "windows" && platform !== "linux" && platform !== "macos" && platform !== "any")
+    || (implementation !== "java" && implementation !== "go" && implementation !== "csharp" && implementation !== "android")
+    || (platform !== "windows" && platform !== "linux" && platform !== "macos" && platform !== "android" && platform !== "any")
     || (arch !== "x64" && arch !== "arm64" && arch !== "any")
     || typeof displayName !== "string" || !displayName.trim()
     || typeof downloadUrl !== "string" || !isSafeConfiguredDownloadUrl(downloadUrl)
@@ -555,6 +579,14 @@ function parseConfiguredClientDownload(value: unknown): ClientDownloadLink | nul
     description: description as string | null | undefined,
     displayOrder: link.displayOrder as number,
     enabled: link.enabled,
+    ...(typeof link.version === "string" ? { version: link.version } : {}),
+    ...(typeof link.sha256 === "string" ? { sha256: link.sha256 } : {}),
+    ...(typeof link.fileSize === "number" && Number.isSafeInteger(link.fileSize) ? { fileSize: link.fileSize } : {}),
+    ...(typeof link.isLatest === "boolean" ? { isLatest: link.isLatest } : {}),
+    ...(typeof link.changelogUrl === "string" ? { changelogUrl: link.changelogUrl } : {}),
+    ...(typeof link.minSupportedVersion === "string" ? { minSupportedVersion: link.minSupportedVersion } : {}),
+    ...(typeof link.hosted === "boolean" ? { hosted: link.hosted } : {}),
+    ...(typeof link.packageId === "number" && Number.isSafeInteger(link.packageId) ? { packageId: link.packageId } : {}),
     createdAt: link.createdAt,
     updatedAt: link.updatedAt,
   };
@@ -562,6 +594,7 @@ function parseConfiguredClientDownload(value: unknown): ClientDownloadLink | nul
 
 function isSafeConfiguredDownloadUrl(rawUrl: string): boolean {
   if (rawUrl !== rawUrl.trim()) return false;
+  if (/^\/api\/public\/client-packages\/\d+\/download$/.test(rawUrl)) return true;
   try {
     const url = new URL(rawUrl);
     if (url.protocol === "https:") return true;
@@ -573,8 +606,8 @@ function isSafeConfiguredDownloadUrl(rawUrl: string): boolean {
 }
 
 /**
- * Reads the latest release assets directly from GitHub. The configured public endpoint remains
- * a quiet fallback for rate limits or temporary GitHub outages.
+ * Reads the server-hosted version catalog first. GitHub Releases fills targets that have not been
+ * uploaded yet and remains a bounded fallback during a catalog outage.
  */
 export async function fetchPublicClientDownloads(options: { refresh?: boolean } = {}): Promise<ClientDownloadLink[]> {
   if (!options.refresh && cachedGithubClientDownloads && cachedGithubClientDownloads.expiresAt > Date.now()) {
@@ -590,15 +623,18 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
     : [];
   const request = (async () => {
     try {
-      const githubLinks = await fetchLatestGithubClientDownloads();
-      let links = githubLinks;
-      if (!hasCompleteGithubClientDownloadSet(githubLinks)) {
+      const configuredLinks = await fetchConfiguredClientDownloads();
+      let links = configuredLinks;
+      if (!hasCompleteGithubClientDownloadSet(configuredLinks)) {
         try {
-          links = mergeGithubAndConfiguredDownloads(githubLinks, await fetchConfiguredClientDownloads());
+          const githubLinks = await fetchLatestGithubClientDownloads();
+          links = mergePreferredClientDownloads(configuredLinks, githubLinks);
         } catch {
-          // A partial GitHub Release is still more useful than hiding every available asset
-          // because the optional configured fallback is temporarily unavailable.
+          // A partial server catalog is still useful while GitHub is unavailable.
         }
+      }
+      if (links.length === 0) {
+        throw new Error("服务端客户端版本编目为空");
       }
       const cachedAt = Date.now();
       cachedGithubClientDownloads = {
@@ -607,16 +643,16 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
         staleUntil: cachedAt + GITHUB_DOWNLOAD_MAX_STALE_MS,
       };
       return links;
-    } catch (githubError) {
-      let configured: ClientDownloadLink[] = [];
+    } catch (catalogError) {
+      let github: ClientDownloadLink[] = [];
       try {
-        configured = await fetchConfiguredClientDownloads();
+        github = await fetchLatestGithubClientDownloads();
       } catch {
         // A recent successful response can still keep the download page usable.
       }
       const links = previousDownloads.length > 0
-        ? mergePreferredClientDownloads(configured, previousDownloads)
-        : configured;
+        ? mergePreferredClientDownloads(github, previousDownloads)
+        : github;
       if (links.length > 0) {
         const cachedAt = Date.now();
         cachedGithubClientDownloads = {
@@ -629,8 +665,8 @@ export async function fetchPublicClientDownloads(options: { refresh?: boolean } 
         };
         return links;
       }
-      throw new Error("无法从 GitHub Releases 或备用接口获取客户端下载链接", {
-        cause: githubError,
+      throw new Error("无法从服务端版本编目或 GitHub Releases 获取客户端下载链接", {
+        cause: catalogError,
       });
     }
   })();

@@ -278,6 +278,23 @@ public sealed class PublicTransferOptions
     public long PairingCodeRedeemRateLimitWindowSeconds { get; set; } = 300;
 }
 
+/// <summary>Locally hosted client release packages and their public read limits.</summary>
+public sealed class ClientPackageOptions
+{
+    public const string SectionName = "Specus:ClientPackages";
+
+    /// <summary>
+    /// Root data directory. Relative paths are resolved below the server content root; package
+    /// bytes are always stored in its <c>packages</c> child directory using the catalogue id.
+    /// </summary>
+    public string DataDirectory { get; set; } = "data";
+
+    public long MaxPackageBytes { get; set; } = 2L * 1024 * 1024 * 1024;
+    public int PublicRequestsPerIp { get; set; } = 120;
+    public long PublicRateLimitWindowSeconds { get; set; } = 60;
+    public int MaxTrackedSources { get; set; } = 4096;
+}
+
 public sealed class ObjectStorageOptions
 {
     public const string SectionName = "Specus:ObjectStorage";

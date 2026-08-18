@@ -12,9 +12,9 @@ namespace Specus.Server.Management;
 public sealed class ManagementMutationService
 {
     private static readonly HashSet<string> AllowedDownloadImplementations =
-        new(StringComparer.OrdinalIgnoreCase) { "java", "go", "csharp" };
+        new(StringComparer.OrdinalIgnoreCase) { "java", "go", "csharp", "android" };
     private static readonly HashSet<string> AllowedDownloadPlatforms =
-        new(StringComparer.OrdinalIgnoreCase) { "windows", "linux", "macos", "any" };
+        new(StringComparer.OrdinalIgnoreCase) { "windows", "linux", "macos", "android", "any" };
     private static readonly HashSet<string> AllowedDownloadArchitectures =
         new(StringComparer.OrdinalIgnoreCase) { "x64", "arm64", "any" };
 
@@ -223,7 +223,7 @@ public sealed class ManagementMutationService
             .ThenBy(link => link.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        return rows.Select(ToClientDownloadLinkView).ToList();
+        return rows.Select(ClientPackageService.ToView).ToList();
     }
 
     public async Task<ClientDownloadLinkView> CreateClientDownloadAsync(
@@ -245,7 +245,7 @@ public sealed class ManagementMutationService
         link.CreatedAt = now;
         _db.ClientDownloadLinks.Add(link);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return ToClientDownloadLinkView(link);
+        return ClientPackageService.ToView(link);
     }
 
     public async Task<ClientDownloadLinkView> UpdateClientDownloadAsync(
@@ -259,7 +259,7 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
         ApplyClientDownloadMutation(link, request);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return ToClientDownloadLinkView(link);
+        return ClientPackageService.ToView(link);
     }
 
     public async Task DeleteClientDownloadAsync(ManagementContext context, long id,
@@ -540,6 +540,7 @@ public sealed class ManagementMutationService
         account.ConnectionRateLimitPerMinute,
         Online: false,
         ConnectedSinceMs: null,
+        ClientVersion: null,
         MessageSendCapable: false,
         MessageReceiveCapable: false,
         MessageAttachmentsCapable: false,
@@ -558,19 +559,6 @@ public sealed class ManagementMutationService
         credential.MaxOnlineInstances,
         credential.CreatedAt.ToString("O"),
         credential.UpdatedAt.ToString("O"));
-
-    private static ClientDownloadLinkView ToClientDownloadLinkView(ClientDownloadLink link) => new(
-        link.Id,
-        link.Implementation,
-        link.Platform,
-        link.Arch,
-        link.DisplayName,
-        link.DownloadUrl,
-        link.Description,
-        link.DisplayOrder,
-        link.Enabled,
-        link.CreatedAt.ToString("O"),
-        link.UpdatedAt.ToString("O"));
 
     private static SpecusMappingView ToSpecusView(SpecusMapping mapping) => new(
         mapping.Id,
@@ -734,14 +722,20 @@ public sealed class ManagementMutationService
     private static void ApplyClientDownloadMutation(ClientDownloadLink link, ClientDownloadLinkMutation request)
     {
         link.Implementation = RequireDownloadEnum(request.Implementation, AllowedDownloadImplementations,
-            "implementation must be one of [java go csharp]");
+            "implementation must be one of [java go csharp android]");
         link.Platform = RequireDownloadEnum(request.Platform, AllowedDownloadPlatforms,
-            "platform must be one of [windows linux macos any]");
+            "platform must be one of [windows linux macos android any]");
         link.Arch = RequireDownloadEnum(request.Arch, AllowedDownloadArchitectures,
             "arch must be one of [x64 arm64 any]");
         link.DisplayName = RequireDisplayName(request.DisplayName);
         link.DownloadUrl = RequireDownloadUrl(request.DownloadUrl);
         link.Description = NormalizeDownloadDescription(request.Description);
+        link.Version = string.IsNullOrWhiteSpace(request.Version) ? null : request.Version.Trim();
+        link.IsLatest = request.IsLatest ?? link.IsLatest;
+        link.ChangelogUrl = string.IsNullOrWhiteSpace(request.ChangelogUrl) ? null : request.ChangelogUrl.Trim();
+        link.MinSupportedVersion = string.IsNullOrWhiteSpace(request.MinSupportedVersion)
+            ? null
+            : request.MinSupportedVersion.Trim();
         if (request.DisplayOrder is not null)
         {
             link.DisplayOrder = request.DisplayOrder.Value;

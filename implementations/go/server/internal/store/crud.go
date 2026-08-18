@@ -227,7 +227,8 @@ func scanCredential(scanner credentialScanner) (ClientCredential, error) {
 // ---- client download links ----------------------------------------------------------
 
 func (db *DB) ListClientDownloadLinks(ctx context.Context, enabledOnly bool) ([]ClientDownloadLink, error) {
-	query := `SELECT id, implementation, platform, arch, display_name, download_url, description,
+	query := `SELECT id, implementation, platform, arch, version, display_name, download_url, description,
+		sha256, file_size, is_latest, changelog_url, min_supported_version,
 		display_order, enabled, created_at, updated_at FROM client_download_link`
 	if enabledOnly {
 		query += ` WHERE enabled <> 0 ORDER BY implementation, display_order, id`
@@ -251,7 +252,8 @@ func (db *DB) ListClientDownloadLinks(ctx context.Context, enabledOnly bool) ([]
 }
 
 func (db *DB) GetClientDownloadLink(ctx context.Context, id int64) (*ClientDownloadLink, error) {
-	query := db.rebind(`SELECT id, implementation, platform, arch, display_name, download_url, description,
+	query := db.rebind(`SELECT id, implementation, platform, arch, version, display_name, download_url, description,
+		sha256, file_size, is_latest, changelog_url, min_supported_version,
 		display_order, enabled, created_at, updated_at FROM client_download_link WHERE id = ?`)
 	link, err := scanClientDownloadLink(db.sql.QueryRowContext(ctx, query, id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -264,23 +266,106 @@ func (db *DB) GetClientDownloadLink(ctx context.Context, id int64) (*ClientDownl
 }
 
 func (db *DB) InsertClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if link.IsLatest {
+		if err := db.clearLatestClientDownloadTx(ctx, tx, link.Implementation, link.Platform, link.Arch); err != nil {
+			return err
+		}
+	}
 	query := db.rebind(`INSERT INTO client_download_link
-		(id, implementation, platform, arch, display_name, download_url, description,
+		(id, implementation, platform, arch, version, display_name, download_url, description,
+		 sha256, file_size, is_latest, latest_slot, changelog_url, min_supported_version,
 		 display_order, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, link.ID, link.Implementation, link.Platform, link.Arch,
-		link.DisplayName, link.DownloadURL, link.Description, link.DisplayOrder, boolToInt(link.Enabled),
-		formatTime(link.CreatedAt), formatTime(link.UpdatedAt))
-	return err
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	latestSlot := any(nil)
+	if link.IsLatest {
+		latestSlot = clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch)
+	}
+	if _, err := tx.ExecContext(ctx, query, link.ID, link.Implementation, link.Platform, link.Arch,
+		link.Version, link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
+		boolToInt(link.IsLatest), latestSlot, link.ChangelogURL, link.MinSupportedVersion, link.DisplayOrder,
+		boolToInt(link.Enabled), formatTime(link.CreatedAt), formatTime(link.UpdatedAt)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) UpdateClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if link.IsLatest {
+		if err := db.clearLatestClientDownloadTx(ctx, tx, link.Implementation, link.Platform, link.Arch); err != nil {
+			return err
+		}
+	}
 	query := db.rebind(`UPDATE client_download_link SET implementation = ?, platform = ?, arch = ?,
-		display_name = ?, download_url = ?, description = ?, display_order = ?, enabled = ?,
+		version = ?, display_name = ?, download_url = ?, description = ?, sha256 = ?, file_size = ?,
+		is_latest = ?, latest_slot = ?, changelog_url = ?, min_supported_version = ?, display_order = ?, enabled = ?,
 		updated_at = ? WHERE id = ?`)
-	_, err := db.sql.ExecContext(ctx, query, link.Implementation, link.Platform, link.Arch,
-		link.DisplayName, link.DownloadURL, link.Description, link.DisplayOrder, boolToInt(link.Enabled),
-		formatTime(link.UpdatedAt), link.ID)
+	latestSlot := any(nil)
+	if link.IsLatest {
+		latestSlot = clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch)
+	}
+	result, err := tx.ExecContext(ctx, query, link.Implementation, link.Platform, link.Arch,
+		link.Version, link.DisplayName, link.DownloadURL, link.Description, link.SHA256, link.FileSize,
+		boolToInt(link.IsLatest), latestSlot, link.ChangelogURL, link.MinSupportedVersion, link.DisplayOrder,
+		boolToInt(link.Enabled), formatTime(link.UpdatedAt), link.ID)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+// SetClientDownloadLinkLatest atomically clears the previous latest entry for one target and marks
+// the requested enabled entry as latest. It is safe under concurrent admin requests on every
+// supported database because the updates share one transaction.
+func (db *DB) SetClientDownloadLinkLatest(ctx context.Context, id int64, updatedAt time.Time) (*ClientDownloadLink, error) {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := db.rebind(`SELECT id, implementation, platform, arch, version, display_name, download_url, description,
+		sha256, file_size, is_latest, changelog_url, min_supported_version,
+		display_order, enabled, created_at, updated_at FROM client_download_link WHERE id = ?`)
+	link, err := scanClientDownloadLink(tx.QueryRowContext(ctx, query, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := db.clearLatestClientDownloadTx(ctx, tx, link.Implementation, link.Platform, link.Arch); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE client_download_link
+		SET is_latest = ?, latest_slot = ?, updated_at = ? WHERE id = ?`), 1,
+		clientDownloadLatestSlot(link.Implementation, link.Platform, link.Arch), formatTime(updatedAt), id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	link.IsLatest = true
+	link.UpdatedAt = updatedAt
+	return &link, nil
+}
+
+func (db *DB) clearLatestClientDownloadTx(ctx context.Context, tx *sql.Tx,
+	implementation, platform, arch string) error {
+	_, err := tx.ExecContext(ctx, db.rebind(`UPDATE client_download_link SET is_latest = ?, latest_slot = NULL
+		WHERE implementation = ? AND platform = ? AND arch = ? AND is_latest <> ?`),
+		0, implementation, platform, arch, 0)
 	return err
 }
 
@@ -291,21 +376,28 @@ func (db *DB) DeleteClientDownloadLink(ctx context.Context, id int64) error {
 
 func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, error) {
 	var (
-		link               ClientDownloadLink
-		description        sql.NullString
-		enabled            databaseBoolean
-		createdAt, updated string
+		link                                    ClientDownloadLink
+		description, changelogURL, minSupported sql.NullString
+		enabled, isLatest                       databaseBoolean
+		createdAt, updated                      string
 	)
-	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch,
-		&link.DisplayName, &link.DownloadURL, &description, &link.DisplayOrder, &enabled,
-		&createdAt, &updated)
+	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch, &link.Version,
+		&link.DisplayName, &link.DownloadURL, &description, &link.SHA256, &link.FileSize, &isLatest,
+		&changelogURL, &minSupported, &link.DisplayOrder, &enabled, &createdAt, &updated)
 	if err != nil {
 		return ClientDownloadLink{}, err
 	}
 	if description.Valid {
 		link.Description = &description.String
 	}
+	if changelogURL.Valid {
+		link.ChangelogURL = &changelogURL.String
+	}
+	if minSupported.Valid {
+		link.MinSupportedVersion = &minSupported.String
+	}
 	link.Enabled = bool(enabled)
+	link.IsLatest = bool(isLatest)
 	link.CreatedAt = parseTime(createdAt)
 	link.UpdatedAt = parseTime(updated)
 	return link, nil

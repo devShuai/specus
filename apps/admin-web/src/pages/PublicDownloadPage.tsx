@@ -32,6 +32,7 @@ const MANUAL_DEVICES: Array<{ label: string; detail: string; device: VisitorDevi
   { label: "Windows", detail: "ARM64", device: { platform: "windows", arch: "arm64" } },
   { label: "Linux", detail: "x86_64", device: { platform: "linux", arch: "x64" } },
   { label: "Linux", detail: "ARM64", device: { platform: "linux", arch: "arm64" } },
+  { label: "Android", detail: "Android 8.0+", device: { platform: "android", arch: "unknown" } },
 ];
 
 const DOWNLOAD_GROUPS: Array<{
@@ -42,6 +43,7 @@ const DOWNLOAD_GROUPS: Array<{
   { key: "macos", title: "macOS", description: "Homebrew Cask 或对应架构的 Go 单文件客户端" },
   { key: "windows", title: "Windows", description: "图形桌面版或轻量 Go 命令行客户端" },
   { key: "linux", title: "Linux", description: "x86_64 与 ARM64 静态单文件客户端" },
+  { key: "android", title: "Android", description: "通用 APK，安装时由 Android 确认应用来源与权限" },
   { key: "any", title: "跨平台 · 需要运行时", description: "适合已有 Java 或 .NET 运行环境的设备" },
 ];
 
@@ -59,9 +61,9 @@ export function PublicDownloadPage() {
   const allDownloadsRef = useRef<HTMLDivElement>(null);
 
   usePageSeo({
-    title: "Specus Client 下载 · Windows / macOS / Linux · specus",
+    title: "Specus Client 下载 · Windows / macOS / Linux / Android · specus",
     description:
-      "下载 Specus Client。页面会自动识别 macOS、Windows、Linux 与 CPU 架构，优先推荐 Homebrew、Windows 桌面版或对应架构的 Go 客户端。",
+      "下载 Specus Client。页面会自动识别 macOS、Windows、Linux、Android 与 CPU 架构，优先推荐最合适的安装包。",
     canonical: "https://specus.devshuai.com/download",
     keywords: "Specus Client 下载,macOS Homebrew,Windows 客户端,Linux ARM64,内网穿透客户端",
     jsonLd: {
@@ -71,7 +73,7 @@ export function PublicDownloadPage() {
       url: "https://specus.devshuai.com/download",
       downloadUrl: GITHUB_RELEASES_URL,
       applicationCategory: "DeveloperApplication",
-      operatingSystem: "Windows, macOS, Linux",
+      operatingSystem: "Windows, macOS, Linux, Android",
       description: "Specus 自托管内网穿透与对端互联客户端。",
       offers: { "@type": "Offer", price: "0", priceCurrency: "CNY" },
     },
@@ -336,6 +338,35 @@ function RecommendedInstall({
     return <MacosInstallGuide landing />;
   }
 
+  if (device.platform === "android") {
+    if (loading && recommendation.kind === "none") {
+      return <DownloadLoading />;
+    }
+    if (recommendation.kind === "download") {
+      return (
+        <div className="grid gap-6 md:grid-cols-[1fr_auto] md:items-end">
+          <div>
+            <span className="download-match-badge">Android 最佳匹配</span>
+            <h3 className="mt-3 text-2xl font-semibold">{recommendation.link.displayName}</h3>
+            <p className="mt-2 max-w-2xl text-small leading-6 text-zinc-600 dark:text-zinc-400">
+              下载通用 APK 后，Android 会再次确认安装。后续版本可由客户端主动提示。
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2 text-tiny text-zinc-600 dark:text-zinc-400">
+              <span className="download-meta-chip">Android 8.0+</span>
+              {recommendation.link.version ? <span className="download-meta-chip">v{recommendation.link.version}</span> : null}
+              <span className="download-meta-chip">APK</span>
+            </div>
+          </div>
+          <a className="landing-primary-button px-6" href={recommendation.link.downloadUrl} rel="noopener noreferrer">
+            下载 Android 版
+            <DownloadArrowIcon />
+          </a>
+        </div>
+      );
+    }
+    return <DownloadUnavailable networkError={loadError} onRetry={onRetry} onShowAll={onShowAll} />;
+  }
+
   if (device.platform === "windows" || device.platform === "linux") {
     if (device.arch === "unknown") {
       if (detectingDevice) {
@@ -415,7 +446,7 @@ function RecommendedInstall({
         <span className="download-match-badge download-match-badge-neutral">桌面客户端</span>
         <h3 className="mt-3 text-xl font-semibold">请在电脑上打开下载页</h3>
         <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-          当前暂未提供 iOS、iPadOS、Android 或 ChromeOS 安装包。请使用 macOS、Windows 或 Linux 设备下载客户端。
+          当前暂未提供 iOS、iPadOS 或 ChromeOS 安装包。请使用 Android、macOS、Windows 或 Linux 设备下载客户端。
         </p>
         <button className="mt-5 font-medium text-primary hover:underline" type="button" onClick={onShowAll}>
           仍然查看全部桌面平台 →
@@ -588,7 +619,7 @@ function ReleaseDownloadRow({ link }: { link: ClientDownloadLink }) {
 }
 
 function orderedDownloadGroups(device: VisitorDevice) {
-  const preferred = device.platform === "macos" || device.platform === "windows" || device.platform === "linux"
+  const preferred = device.platform === "macos" || device.platform === "windows" || device.platform === "linux" || device.platform === "android"
     ? device.platform
     : null;
   return [...DOWNLOAD_GROUPS].sort((left, right) => {
@@ -638,6 +669,7 @@ function stringValue(value: unknown): string | undefined {
 function implementationLabel(link: Pick<ClientDownloadLink, "implementation">): string {
   if (link.implementation === "go") return "Go 单文件客户端";
   if (link.implementation === "csharp") return ".NET 客户端";
+  if (link.implementation === "android") return "Android 客户端";
   return "Java 客户端";
 }
 
@@ -648,7 +680,7 @@ function archLabel(arch: ClientArch): string {
 }
 
 function DeviceIcon({ device }: { device: VisitorDevice }) {
-  if (device.platform === "unsupported") {
+  if (device.platform === "unsupported" || device.platform === "android") {
     return <svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5" /><path d="M10.5 18.5h3" /></svg>;
   }
   return <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>;

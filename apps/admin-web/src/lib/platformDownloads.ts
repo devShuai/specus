@@ -1,8 +1,8 @@
 import type { ClientDownloadLink } from "../api/types";
 
-export type VisitorPlatform = "windows" | "linux" | "macos" | "unsupported" | "unknown";
+export type VisitorPlatform = "windows" | "linux" | "macos" | "android" | "unsupported" | "unknown";
 export type VisitorArch = "x64" | "arm64" | "unknown";
-export type UnsupportedVisitorPlatform = "ios" | "ipados" | "android" | "chromeos" | "mobile";
+export type UnsupportedVisitorPlatform = "ios" | "ipados" | "chromeos" | "mobile";
 
 /**
  * Browser-provided User-Agent Client Hints after any high-entropy values have
@@ -37,7 +37,7 @@ export type ClientDownloadRecommendation =
   }
   | {
     kind: "download";
-    reason: "windows-desktop" | "native-go";
+    reason: "windows-desktop" | "native-go" | "android-app";
     link: ClientDownloadLink;
   }
   | {
@@ -61,9 +61,6 @@ function unsupportedFromPlatformName(value: string): UnsupportedVisitorPlatform 
   if (platform === "ios" || platform === "iphone" || platform === "ipod") {
     return "ios";
   }
-  if (platform === "android") {
-    return "android";
-  }
   if (platform === "chromeos" || platform === "cros") {
     return "chromeos";
   }
@@ -83,13 +80,10 @@ function unsupportedFromLegacySignals(
   if (/\b(?:iphone|ipod)\b/.test(userAgent)) {
     return "ios";
   }
-  if (/\bandroid\b/.test(userAgent)) {
-    return "android";
-  }
   if (/\bcros\b/.test(userAgent) || /\bchrome\s*os\b/.test(userAgent)) {
     return "chromeos";
   }
-  if (/\bmobile\b/.test(userAgent)) {
+  if (/\bmobile\b/.test(userAgent) && !/\bandroid\b/.test(userAgent)) {
     return "mobile";
   }
   return null;
@@ -106,11 +100,17 @@ function platformFromUserAgentHints(value: string): Exclude<VisitorPlatform, "un
   if (platform === "linux") {
     return "linux";
   }
+  if (platform === "android") {
+    return "android";
+  }
   return null;
 }
 
 function platformFromLegacySignals(userAgent: string, navigatorPlatform: string): VisitorPlatform {
   const combined = `${userAgent} ${navigatorPlatform}`;
+  if (/\bandroid\b/.test(combined)) {
+    return "android";
+  }
   if (/\b(?:windows|win32|win64)\b/.test(combined)) {
     return "windows";
   }
@@ -160,7 +160,7 @@ export function detectVisitorDevice(input: VisitorDeviceInput): VisitorDevice {
 
   const unsupported = unsupportedFromPlatformName(hints?.platform ?? "")
     ?? unsupportedFromLegacySignals(userAgent, navigatorPlatform, input.maxTouchPoints ?? 0)
-    ?? (hints?.mobile === true ? "mobile" : null);
+    ?? (hints?.mobile === true && normalized(hints?.platform) !== "android" ? "mobile" : null);
   if (unsupported) {
     return { platform: "unsupported", arch: "unknown", unsupportedPlatform: unsupported };
   }
@@ -204,6 +204,13 @@ export function recommendClientDownload(
   if (device.platform === "macos") {
     return { kind: "homebrew", reason: "macos-homebrew" };
   }
+  if (device.platform === "android") {
+    const android = firstAvailable(links, (link) => link.implementation === "android"
+      && link.platform === "android" && link.arch === "any");
+    return android
+      ? { kind: "download", reason: "android-app", link: android }
+      : { kind: "none", reason: "download-unavailable" };
+  }
   if (device.arch === "unknown") {
     return { kind: "none", reason: "unknown-architecture" };
   }
@@ -227,10 +234,10 @@ export function visitorPlatformDisplayName(device: VisitorDevice): string {
   if (device.platform === "windows") return "Windows";
   if (device.platform === "macos") return "macOS";
   if (device.platform === "linux") return "Linux";
+  if (device.platform === "android") return "Android";
   if (device.platform === "unknown") return "未识别设备";
   if (device.unsupportedPlatform === "ios") return "iPhone / iOS";
   if (device.unsupportedPlatform === "ipados") return "iPad / iPadOS";
-  if (device.unsupportedPlatform === "android") return "Android";
   if (device.unsupportedPlatform === "chromeos") return "ChromeOS";
   return "移动设备";
 }

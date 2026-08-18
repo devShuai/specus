@@ -145,17 +145,23 @@ type ManagementRegistrationChallenge struct {
 
 // ClientDownloadLink mirrors client_download_link.
 type ClientDownloadLink struct {
-	ID             int64
-	Implementation string
-	Platform       string
-	Arch           string
-	DisplayName    string
-	DownloadURL    string
-	Description    *string
-	DisplayOrder   int
-	Enabled        bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                  int64
+	Implementation      string
+	Platform            string
+	Arch                string
+	Version             string
+	DisplayName         string
+	DownloadURL         string
+	Description         *string
+	SHA256              string
+	FileSize            int64
+	IsLatest            bool
+	ChangelogURL        *string
+	MinSupportedVersion *string
+	DisplayOrder        int
+	Enabled             bool
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // TransferAttachment mirrors transfer_attachment used by public transfers and admin messages.

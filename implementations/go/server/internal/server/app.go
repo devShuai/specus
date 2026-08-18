@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -258,6 +259,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
+	dataDirectory := strings.TrimSpace(cfg.DataDirectory)
+	if dataDirectory == "" {
+		dataDirectory = "./data"
+	}
+	api.SetClientPackageDirectory(filepath.Join(dataDirectory, "packages"))
 	wsHub := wsevents.NewHub(webSocketTickets, addressResolver, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true

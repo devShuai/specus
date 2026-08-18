@@ -62,6 +62,24 @@ func TestLoadConfigDefaultsPeerMeshOptions(t *testing.T) {
 	if config.PeerMeshMTU != DefaultPeerMeshMTU {
 		t.Fatalf("peerMeshMtu default mismatch: %d", config.PeerMeshMTU)
 	}
+	if !config.UpdatesEnabled() {
+		t.Fatal("update checks should default to enabled")
+	}
+}
+
+func TestLoadConfigCanDisableUpdateChecksAndEnableAutomaticUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.jsonc")
+	content := `{"serverBaseUrl":"https://specus.example.com","apiKey":"demo","secret":"test1234","updateCheckEnabled":false,"autoUpdate":true}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.UpdatesEnabled() || !config.AutoUpdate {
+		t.Fatalf("update options not loaded: enabled=%t auto=%t", config.UpdatesEnabled(), config.AutoUpdate)
+	}
 }
 
 func TestLoadConfigRejectsNonHTTPServerBaseURL(t *testing.T) {

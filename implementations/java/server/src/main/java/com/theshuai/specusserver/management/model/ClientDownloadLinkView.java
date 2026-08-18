@@ -1,5 +1,7 @@
 package com.theshuai.specusserver.management.model;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 /**
  * 客户端下载链接的展示视图。管理端与公开接口共用同一个 record——公开接口不返回敏感字段，
  * 当前所有字段都是公开可见的，所以无需薄/厚两个版本。
@@ -14,6 +16,14 @@ public record ClientDownloadLinkView(
         String description,
         int displayOrder,
         boolean enabled,
+        String version,
+        String sha256,
+        long fileSize,
+        @JsonProperty("isLatest") boolean isLatest,
+        String changelogUrl,
+        String minSupportedVersion,
+        boolean hosted,
+        Long packageId,
         String createdAt,
         String updatedAt
 ) {

@@ -3,25 +3,27 @@ import { Button, Card, CardBody, CardHeader, Chip, Spinner } from "@heroui/react
 import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
 import { MacosInstallGuide } from "../../components/MacosInstallGuide";
-import { formatDateTime } from "../../lib/format";
+import { formatBytes, formatDateTime } from "../../lib/format";
 
 const IMPLEMENTATION_LABELS: Record<ClientImplementation, string> = {
   java: "Java 客户端",
   go: "Go 客户端",
   csharp: ".NET 客户端",
+  android: "Android 客户端",
 };
 
 const IMPLEMENTATION_DESCRIPTIONS: Record<ClientImplementation, string> = {
   java: "Spring Boot 实现，跨平台 jar。需要 JDK 21+。",
   go: "Go 实现，单二进制无依赖，启动最快。各操作系统/架构都有独立产物。",
   csharp: ".NET 实现，发布为自包含程序集或 dotnet 运行包。",
+  android: "Android 8.0+ 通用 APK，客户端会主动检查新版本。",
 };
 
-const IMPLEMENTATION_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
+const IMPLEMENTATION_ORDER: ClientImplementation[] = ["go", "csharp", "android", "java"];
 
 /**
- * 客户端下载面板（只读）。优先读取最新 GitHub Release，按 implementation 分组展示；
- * 管理员维护的公开接口仅在 GitHub 不可用时作为回退。
+ * 客户端下载面板（只读）。优先读取服务端版本编目，按 implementation 分组展示；
+ * GitHub Releases 只补齐尚未托管的目标并在服务端不可用时回退。
  */
 export function ClientDownloadsPanel() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
@@ -81,7 +83,7 @@ export function ClientDownloadsPanel() {
       ) : loading && links.length === 0 ? (
         <Spinner className="my-8" label="加载中…" />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-3">
+        <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
           {grouped.map(({ implementation, links: implLinks }) => (
             <Card key={implementation} shadow="none" className="rounded-md border border-default-200">
               <CardHeader className="flex flex-col items-start gap-1 px-5 pb-2 pt-4">
@@ -129,6 +131,8 @@ function DownloadCard({ link }: { link: ClientDownloadLink }) {
         <Chip size="sm" variant="flat">
           {archLabel(link.arch)}
         </Chip>
+        {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">v{link.version}</Chip> : null}
+        {link.fileSize ? <span className="text-tiny text-default-400">{formatBytes(link.fileSize)}</span> : null}
         <span className="ml-auto text-tiny text-default-400">更新 {formatDateTime(link.updatedAt)}</span>
       </div>
     </a>
@@ -143,6 +147,8 @@ export function platformLabel(platform: string): string {
       return "Linux";
     case "macos":
       return "macOS";
+    case "android":
+      return "Android";
     case "any":
       return "跨平台";
     default:

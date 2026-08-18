@@ -72,6 +72,15 @@ function assetDescriptors(tagName: string): AssetDescriptor[] {
       description: "跨平台程序集，需要 .NET 10 Runtime。",
       displayOrder: 310,
     },
+    {
+      assetName: `specus-client-android-${tagName}.apk`,
+      implementation: "android",
+      platform: "android",
+      arch: "any",
+      displayName: "Android 应用",
+      description: "适用于 Android 8.0 或更高版本。",
+      displayOrder: 400,
+    },
   ];
 }
 
@@ -178,6 +187,14 @@ export function mapGithubReleaseToClientDownloads(payload: unknown): ClientDownl
       description: descriptor.description,
       displayOrder: descriptor.displayOrder,
       enabled: true,
+      version: tagName.replace(/^v/i, ""),
+      sha256: stringField(asset, "digest").replace(/^sha256:/i, "") || null,
+      fileSize: typeof asset.size === "number" && Number.isSafeInteger(asset.size) ? asset.size : null,
+      isLatest: true,
+      changelogUrl: null,
+      minSupportedVersion: null,
+      hosted: false,
+      packageId: null,
       createdAt: stringField(asset, "created_at") || releaseTimestamp,
       updatedAt: stringField(asset, "updated_at") || releaseTimestamp,
     });

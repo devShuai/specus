@@ -82,6 +82,13 @@ public static class SpecusEnvironmentVariables
             return "Specus:TrustedProxies";
         }
 
+        if (key.StartsWith("CLIENT_PACKAGES_", StringComparison.OrdinalIgnoreCase))
+        {
+            var suffix = key["CLIENT_PACKAGES_".Length..]
+                .Split('_', StringSplitOptions.RemoveEmptyEntries);
+            return suffix.Length == 0 ? "Specus:ClientPackages" : $"Specus:ClientPackages:{ToPascal(suffix)}";
+        }
+
         if (key.Contains("__", StringComparison.Ordinal))
         {
             var normalized = key.Replace("__", ":", StringComparison.Ordinal);

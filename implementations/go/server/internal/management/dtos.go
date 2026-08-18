@@ -27,22 +27,23 @@ type ManagementUserView struct {
 
 // ClientView is the JSON representation of a client account for the SPA.
 type ClientView struct {
-	ID                           int64  `json:"id"`
-	ClientName                   string `json:"clientName"`
-	OwnerUsername                string `json:"ownerUsername,omitempty"`
-	Enabled                      bool   `json:"enabled"`
-	ConnectionRateLimitPerMinute int    `json:"connectionRateLimitPerMinute"`
-	Online                       bool   `json:"online"`
-	ConnectedSinceMs             *int64 `json:"connectedSinceMs"`
-	MessageSendCapable           bool   `json:"messageSendCapable"`
-	MessageReceiveCapable        bool   `json:"messageReceiveCapable"`
-	MessageAttachmentsCapable    bool   `json:"messageAttachmentsCapable"`
-	MessageMediaPreviewCapable   bool   `json:"messageMediaPreviewCapable"`
-	MessageMaxAttachmentBytes    int64  `json:"messageMaxAttachmentBytes"`
-	UploadBytes                  int64  `json:"uploadBytes"`
-	DownloadBytes                int64  `json:"downloadBytes"`
-	CreatedAt                    string `json:"createdAt"`
-	UpdatedAt                    string `json:"updatedAt"`
+	ID                           int64   `json:"id"`
+	ClientName                   string  `json:"clientName"`
+	OwnerUsername                string  `json:"ownerUsername,omitempty"`
+	Enabled                      bool    `json:"enabled"`
+	ConnectionRateLimitPerMinute int     `json:"connectionRateLimitPerMinute"`
+	Online                       bool    `json:"online"`
+	ConnectedSinceMs             *int64  `json:"connectedSinceMs"`
+	MessageSendCapable           bool    `json:"messageSendCapable"`
+	MessageReceiveCapable        bool    `json:"messageReceiveCapable"`
+	MessageAttachmentsCapable    bool    `json:"messageAttachmentsCapable"`
+	MessageMediaPreviewCapable   bool    `json:"messageMediaPreviewCapable"`
+	MessageMaxAttachmentBytes    int64   `json:"messageMaxAttachmentBytes"`
+	ClientVersion                *string `json:"clientVersion,omitempty"`
+	UploadBytes                  int64   `json:"uploadBytes"`
+	DownloadBytes                int64   `json:"downloadBytes"`
+	CreatedAt                    string  `json:"createdAt"`
+	UpdatedAt                    string  `json:"updatedAt"`
 }
 
 // ClientResult wraps a client mutation result.
@@ -75,17 +76,36 @@ type CredentialResult struct {
 
 // ClientDownloadLinkView is the JSON representation of a managed/public client download link.
 type ClientDownloadLinkView struct {
-	ID             int64   `json:"id"`
-	Implementation string  `json:"implementation"`
-	Platform       string  `json:"platform"`
-	Arch           string  `json:"arch"`
-	DisplayName    string  `json:"displayName"`
-	DownloadURL    string  `json:"downloadUrl"`
-	Description    *string `json:"description,omitempty"`
-	DisplayOrder   int     `json:"displayOrder"`
-	Enabled        bool    `json:"enabled"`
-	CreatedAt      string  `json:"createdAt"`
-	UpdatedAt      string  `json:"updatedAt"`
+	ID                  int64   `json:"id"`
+	Implementation      string  `json:"implementation"`
+	Platform            string  `json:"platform"`
+	Arch                string  `json:"arch"`
+	Version             string  `json:"version"`
+	DisplayName         string  `json:"displayName"`
+	DownloadURL         string  `json:"downloadUrl"`
+	Description         *string `json:"description,omitempty"`
+	SHA256              string  `json:"sha256"`
+	FileSize            int64   `json:"fileSize"`
+	IsLatest            bool    `json:"isLatest"`
+	ChangelogURL        *string `json:"changelogUrl,omitempty"`
+	MinSupportedVersion *string `json:"minSupportedVersion,omitempty"`
+	Hosted              bool    `json:"hosted"`
+	PackageID           *int64  `json:"packageId"`
+	DisplayOrder        int     `json:"displayOrder"`
+	Enabled             bool    `json:"enabled"`
+	CreatedAt           string  `json:"createdAt"`
+	UpdatedAt           string  `json:"updatedAt"`
+}
+
+type ClientVersionCheckView struct {
+	UpdateAvailable bool    `json:"updateAvailable"`
+	Mandatory       bool    `json:"mandatory"`
+	LatestVersion   *string `json:"latestVersion"`
+	PackageID       *int64  `json:"packageId"`
+	DownloadURL     *string `json:"downloadUrl"`
+	SHA256          *string `json:"sha256"`
+	FileSize        int64   `json:"fileSize"`
+	ChangelogURL    *string `json:"changelogUrl,omitempty"`
 }
 
 // SpecusView is the JSON representation of a specus mapping.
@@ -275,14 +295,18 @@ type credentialMutation struct {
 }
 
 type clientDownloadLinkMutation struct {
-	Implementation string `json:"implementation"`
-	Platform       string `json:"platform"`
-	Arch           string `json:"arch"`
-	DisplayName    string `json:"displayName"`
-	DownloadURL    string `json:"downloadUrl"`
-	Description    string `json:"description"`
-	DisplayOrder   *int   `json:"displayOrder"`
-	Enabled        *bool  `json:"enabled"`
+	Implementation      string `json:"implementation"`
+	Platform            string `json:"platform"`
+	Arch                string `json:"arch"`
+	Version             string `json:"version"`
+	DisplayName         string `json:"displayName"`
+	DownloadURL         string `json:"downloadUrl"`
+	Description         string `json:"description"`
+	ChangelogURL        string `json:"changelogUrl"`
+	MinSupportedVersion string `json:"minSupportedVersion"`
+	DisplayOrder        *int   `json:"displayOrder"`
+	Enabled             *bool  `json:"enabled"`
+	IsLatest            *bool  `json:"isLatest"`
 }
 
 // specusMutation is the create/update specus request body.

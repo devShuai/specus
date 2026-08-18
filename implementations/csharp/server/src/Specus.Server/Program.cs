@@ -43,6 +43,8 @@ builder.Services.Configure<DirectHttpOptions>(
     builder.Configuration.GetSection(DirectHttpOptions.SectionName));
 builder.Services.Configure<PublicTransferOptions>(
     builder.Configuration.GetSection(PublicTransferOptions.SectionName));
+builder.Services.Configure<ClientPackageOptions>(
+    builder.Configuration.GetSection(ClientPackageOptions.SectionName));
 builder.Services.Configure<ObjectStorageOptions>(
     builder.Configuration.GetSection(ObjectStorageOptions.SectionName));
 builder.Services.Configure<MediaCaptureOptions>(
@@ -106,6 +108,7 @@ builder.Services.AddScoped<ConnectionRecordService>();
 builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
+builder.Services.AddScoped<ClientPackageService>();
 builder.Services.AddScoped<ManagementUserService>();
 builder.Services.AddScoped<UserDiagramDocumentService>();
 builder.Services.AddScoped<PublicTransferRoomService>();
@@ -114,6 +117,8 @@ builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSen
 builder.Services.AddSingleton<ITurnstileVerifier, TurnstileVerifier>();
 builder.Services.AddSingleton<LoginRateLimiter>();
 builder.Services.AddSingleton<ClientAddressResolver>();
+builder.Services.AddSingleton<ClientPackageStore>();
+builder.Services.AddSingleton<ClientPackagePublicRateLimiter>();
 builder.Services.AddHostedService<RegistrationChallengeCleanupService>();
 builder.Services.AddSingleton<TurnCredentialService>();
 builder.Services.AddScoped<PeerMeshService>();

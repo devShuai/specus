@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Button, Card, CardBody, CardHeader, Spinner } from "@heroui/react";
 import { adminApi } from "../../api/client";
-import type { Overview, TrafficUsage } from "../../api/types";
+import type { Client, Overview, TrafficUsage } from "../../api/types";
 import { formatBytes } from "../../lib/format";
 import { notifyError } from "../../components/toast";
 import { EmptyState } from "../../components/EmptyState";
@@ -35,17 +35,20 @@ interface ClientTraffic {
 export function OverviewPanel() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [traffic, setTraffic] = useState<TrafficUsage[]>([]);
+  const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [overviewData, trafficData] = await Promise.all([
+      const [overviewData, trafficData, clientData] = await Promise.all([
         adminApi.overview(),
         adminApi.listTraffic(120),
+        adminApi.listClients(),
       ]);
       setOverview(overviewData);
       setTraffic(trafficData);
+      setClients(clientData);
     } catch (error) {
       notifyError(error, "加载概览失败");
     } finally {
@@ -161,6 +164,10 @@ export function OverviewPanel() {
 
       <ChartPanel title="客户端流量排行" subtitle="最近记录按客户端汇总">
         <ClientTrafficBars items={clientTraffic} />
+      </ChartPanel>
+
+      <ChartPanel title="客户端版本分布" subtitle={`${clients.length} 个已注册实例 · 版本来自最近一次登录`}>
+        <ClientVersionDistribution clients={clients} />
       </ChartPanel>
     </div>
   );
@@ -398,6 +405,40 @@ function ClientTrafficBars({ items }: { items: ClientTraffic[] }) {
 
 function EmptyChart({ message }: { message: string }) {
   return <EmptyState className="min-h-40 py-8" icon="traffic" title={message} />;
+}
+
+function ClientVersionDistribution({ clients }: { clients: Client[] }) {
+  const counts = new Map<string, { version: string; total: number; online: number }>();
+  clients.forEach((client) => {
+    const version = client.clientVersion?.trim() || "未上报";
+    const item = counts.get(version) ?? { version, total: 0, online: 0 };
+    item.total += 1;
+    if (client.online) item.online += 1;
+    counts.set(version, item);
+  });
+  const rows = Array.from(counts.values()).sort((left, right) =>
+    right.total - left.total || right.version.localeCompare(left.version, undefined, { numeric: true }));
+  if (rows.length === 0) return <EmptyChart message="暂无客户端版本数据" />;
+  const maximum = Math.max(...rows.map((row) => row.total), 1);
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      {rows.map((row, index) => (
+        <div key={row.version} className="relative overflow-hidden rounded-md border border-default-200 bg-default-50 p-3">
+          <div className="absolute inset-y-0 left-0 w-1 bg-primary" style={{ opacity: Math.max(0.25, 1 - index * 0.12) }} />
+          <div className="flex items-start justify-between gap-3 pl-1">
+            <div className="min-w-0">
+              <p className="truncate font-mono text-small font-semibold" title={row.version}>{row.version}</p>
+              <p className="mt-1 text-tiny text-default-500">{row.online} 个在线</p>
+            </div>
+            <span className="text-xl font-semibold tabular-nums">{row.total}</span>
+          </div>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-default-200">
+            <div className="h-full rounded-full bg-primary" style={{ width: `${Math.max(8, row.total / maximum * 100)}%` }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function Legend({ color, label }: { color: string; label: string }) {

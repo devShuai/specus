@@ -10,6 +10,8 @@ import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.bean.SpecusConfig;
 import com.theshuai.specusclient.peer.PeerKeyStore;
+import com.theshuai.specusclient.update.ClientUpdateChecker;
+import com.theshuai.specusclient.update.DesktopUpdateNotifier;
 import org.apache.commons.io.IOUtils;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
@@ -70,6 +72,16 @@ public class SpecusClientApplication {
     @Bean
     public SpecusBean specusBean(ClientStartupConfig startupConfig) {
         return loginAndBuildSpecus(startupConfig);
+    }
+
+    @Bean(destroyMethod = "close")
+    public ClientUpdateChecker clientUpdateChecker(ClientStartupConfig startupConfig) {
+        ClientUpdateChecker checker = new ClientUpdateChecker(
+                startupConfig,
+                currentVersion(),
+                new DesktopUpdateNotifier(startupConfig));
+        checker.start();
+        return checker;
     }
 
     private static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig) {
@@ -167,7 +179,7 @@ public class SpecusClientApplication {
         info.setOsVersion(System.getProperty("os.version", ""));
         info.setOsArch(System.getProperty("os.arch", ""));
         info.setJavaVersion(System.getProperty("java.version", ""));
-        info.setClientVersion(SpecusClientApplication.class.getPackage().getImplementationVersion());
+        info.setClientVersion(currentVersion());
         info.setLocalAddresses(localAddresses());
         info.setPeerPublicKey(PeerKeyStore.publicKeyBase64());
         info.setStartedAt(Instant.now().toString());
@@ -281,5 +293,11 @@ public class SpecusClientApplication {
             normalized = normalized.substring(0, normalized.length() - 1);
         }
         return normalized;
+    }
+
+    /** Manifest version injected by release packaging; deterministic development fallback otherwise. */
+    static String currentVersion() {
+        String version = SpecusClientApplication.class.getPackage().getImplementationVersion();
+        return StringUtils.hasText(version) ? version.trim() : "0.0.0-dev";
     }
 }

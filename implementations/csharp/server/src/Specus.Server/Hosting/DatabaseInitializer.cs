@@ -301,6 +301,28 @@ public sealed class DatabaseInitializer
             "implementation", cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_client_download_order", "client_download_link",
             "display_order", cancellationToken).ConfigureAwait(false);
+        var latestType = DatabaseDialect(db.Database.ProviderName) switch
+        {
+            "postgresql" => "BOOLEAN NOT NULL DEFAULT FALSE",
+            "mysql" => "TINYINT(1) NOT NULL DEFAULT 0",
+            _ => "INTEGER NOT NULL DEFAULT 0",
+        };
+        await EnsureColumnAsync(db, "client_download_link", "version", "VARCHAR(32)", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "sha256", "VARCHAR(64)", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "file_size", "BIGINT NOT NULL DEFAULT 0",
+            cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "is_latest", latestType, cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "changelog_url", "VARCHAR(1024)",
+            cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "client_download_link", "min_supported_version", "VARCHAR(32)",
+            cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uq_client_download_version", "client_download_link",
+            "implementation, platform, arch, version", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_client_download_latest", "client_download_link",
+            "implementation, platform, arch, is_latest, enabled", cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task EnsureMappingCompatibilityColumnsAsync(SpecusDbContext db,

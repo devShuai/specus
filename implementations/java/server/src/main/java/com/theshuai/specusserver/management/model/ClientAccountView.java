@@ -8,6 +8,7 @@ public record ClientAccountView(
         int connectionRateLimitPerMinute,
         boolean online,
         Long connectedSinceMs,
+        String clientVersion,
         boolean messageSendCapable,
         boolean messageReceiveCapable,
         boolean messageAttachmentsCapable,

@@ -38,6 +38,13 @@ public static class AdminApiEndpoints
                 context.Response.StatusCode = StatusCodes.Status404NotFound;
                 await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
             }
+            catch (InvalidDataException) when (context.Request.Path.Equals("/api/admin/client-packages",
+                       StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await context.Response.WriteAsJsonAsync(new { error = "package multipart body is invalid or too large" })
+                    .ConfigureAwait(false);
+            }
             catch (ArgumentException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -213,8 +220,47 @@ public static class AdminApiEndpoints
                 exchange.ExchangeAsync(request, cancellationToken));
 
         app.MapGet("/api/public/client-downloads",
-            (ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.ListPublicClientDownloadsAsync(cancellationToken));
+            async (HttpContext context, ManagementQueryService service,
+                ClientPackagePublicRateLimiter limiter, ClientAddressResolver addresses,
+                CancellationToken cancellationToken) =>
+            {
+                if (!AcquireClientPackageRead(context, limiter, addresses))
+                {
+                    return Results.Empty;
+                }
+                return Results.Ok(await service.ListPublicClientDownloadsAsync(cancellationToken)
+                    .ConfigureAwait(false));
+            });
+
+        app.MapGet("/api/public/client-version-check",
+            async (HttpContext context, string? implementation, string? platform, string? arch,
+                string? current, ClientPackageService service, ClientPackagePublicRateLimiter limiter,
+                ClientAddressResolver addresses, CancellationToken cancellationToken) =>
+            {
+                if (!AcquireClientPackageRead(context, limiter, addresses))
+                {
+                    return Results.Empty;
+                }
+                return Results.Ok(await service.CheckVersionAsync(implementation, platform, arch, current,
+                    cancellationToken).ConfigureAwait(false));
+            });
+
+        app.MapGet("/api/public/client-packages/{id:long}/download",
+            async (HttpContext context, long id, ClientPackageService service,
+                ClientPackagePublicRateLimiter limiter, ClientAddressResolver addresses,
+                CancellationToken cancellationToken) =>
+            {
+                if (!AcquireClientPackageRead(context, limiter, addresses))
+                {
+                    return Results.Empty;
+                }
+                var package = await service.OpenDownloadAsync(id, cancellationToken).ConfigureAwait(false);
+                context.Response.Headers.ETag = $"\"sha256-{package.Sha256}\"";
+                context.Response.Headers.XContentTypeOptions = "nosniff";
+                context.Response.Headers.CacheControl = "public, max-age=3600, immutable";
+                return Results.File(package.Stream, "application/octet-stream", package.FileName,
+                    package.LastModified, entityTag: null, enableRangeProcessing: true);
+            });
 
         app.MapGet("/api/public/peer-mesh/stun-config",
             (HttpContext context, PeerMeshService service) =>
@@ -469,9 +515,9 @@ public static class AdminApiEndpoints
 
         app.MapPost("/api/admin/client-downloads",
             async (HttpContext context, ClientDownloadLinkMutation request, IOptions<AuthOptions> authOptions,
-                ManagementMutationService service, CancellationToken cancellationToken) =>
+                ClientPackageService service, CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateClientDownloadAsync(
+                var created = await service.CreateExternalLinkAsync(
                         ManagementContext.From(context, authOptions.Value), request, cancellationToken)
                     .ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
@@ -479,16 +525,60 @@ public static class AdminApiEndpoints
 
         app.MapPut("/api/admin/client-downloads/{id:long}",
             (HttpContext context, long id, ClientDownloadLinkMutation request,
-                IOptions<AuthOptions> authOptions, ManagementMutationService service,
+                IOptions<AuthOptions> authOptions, ClientPackageService service,
                 CancellationToken cancellationToken) =>
-                service.UpdateClientDownloadAsync(ManagementContext.From(context, authOptions.Value),
+                service.UpdateAsync(ManagementContext.From(context, authOptions.Value),
                     id, request, cancellationToken));
+
+        app.MapPost("/api/admin/client-downloads/{id:long}/latest",
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ClientPackageService service, CancellationToken cancellationToken) =>
+                service.SetLatestAsync(ManagementContext.From(context, authOptions.Value), id,
+                    cancellationToken));
+
+        app.MapPost("/api/admin/client-packages",
+            async (HttpContext context, IOptions<AuthOptions> authOptions,
+                IOptions<ClientPackageOptions> packageOptions, ClientPackageService service,
+                CancellationToken cancellationToken) =>
+            {
+                if (!context.Request.HasFormContentType)
+                {
+                    throw new ArgumentException("multipart/form-data is required");
+                }
+                var maxBytes = Math.Clamp(packageOptions.Value.MaxPackageBytes, 1,
+                    16L * 1024 * 1024 * 1024);
+                if (context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } bodySize)
+                {
+                    bodySize.MaxRequestBodySize = checked(maxBytes + 1024 * 1024);
+                }
+                context.Features.Set<IFormFeature>(new FormFeature(context.Request, new FormOptions
+                {
+                    // Multipart headers and scalar metadata add bounded overhead; the package
+                    // stream itself is independently capped and counted by ClientPackageStore.
+                    MultipartBodyLengthLimit = checked(maxBytes + 1024 * 1024),
+                    MultipartHeadersLengthLimit = 16 * 1024,
+                    ValueLengthLimit = 4096,
+                    KeyLengthLimit = 128,
+                    ValueCountLimit = 32,
+                }));
+                var form = await context.Request.ReadFormAsync(cancellationToken).ConfigureAwait(false);
+                if (form.Files.Count != 1 || form.Files.GetFile("file") is not { } file)
+                {
+                    throw new ArgumentException("exactly one multipart file field named 'file' is required");
+                }
+                var request = ParseClientPackageUpload(form);
+                await using var stream = file.OpenReadStream();
+                var created = await service.UploadAsync(
+                    ManagementContext.From(context, authOptions.Value), stream, file.Length, request,
+                    cancellationToken).ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            }).DisableAntiforgery();
 
         app.MapDelete("/api/admin/client-downloads/{id:long}",
             async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
-                ManagementMutationService service, CancellationToken cancellationToken) =>
+                ClientPackageService service, CancellationToken cancellationToken) =>
             {
-                await service.DeleteClientDownloadAsync(ManagementContext.From(context, authOptions.Value),
+                await service.DeleteAsync(ManagementContext.From(context, authOptions.Value),
                         id, cancellationToken)
                     .ConfigureAwait(false);
                 return Results.NoContent();
@@ -738,6 +828,67 @@ public static class AdminApiEndpoints
     private static string ClientIp(HttpContext context) =>
         context.RequestServices.GetRequiredService<ClientAddressResolver>().Resolve(context);
 
+    private static bool AcquireClientPackageRead(HttpContext context,
+        ClientPackagePublicRateLimiter limiter, ClientAddressResolver addresses)
+    {
+        if (limiter.TryAcquire(addresses.Resolve(context), out var retryAfterSeconds))
+        {
+            return true;
+        }
+        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        context.Response.Headers.RetryAfter = retryAfterSeconds.ToString(
+            System.Globalization.CultureInfo.InvariantCulture);
+        return false;
+    }
+
+    private static ClientPackageUploadMutation ParseClientPackageUpload(IFormCollection form) => new(
+        Text(form, "implementation"),
+        Text(form, "platform"),
+        Text(form, "arch"),
+        Text(form, "displayName"),
+        Text(form, "version"),
+        Text(form, "description"),
+        ParseInt(form, "displayOrder"),
+        ParseBool(form, "enabled"),
+        ParseBool(form, "isLatest"),
+        Text(form, "changelogUrl"),
+        Text(form, "minSupportedVersion"));
+
+    private static string? Text(IFormCollection form, string key)
+    {
+        var values = form[key];
+        if (values.Count > 1)
+        {
+            throw new ArgumentException($"multipart field '{key}' must appear at most once");
+        }
+        return values.Count == 0 ? null : values[0];
+    }
+
+    private static int? ParseInt(IFormCollection form, string key)
+    {
+        var value = Text(form, key);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        return int.TryParse(value, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : throw new ArgumentException($"multipart field '{key}' must be an integer");
+    }
+
+    private static bool? ParseBool(IFormCollection form, string key)
+    {
+        var value = Text(form, key);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        return bool.TryParse(value, out var parsed)
+            ? parsed
+            : throw new ArgumentException($"multipart field '{key}' must be true or false");
+    }
+
     private static bool RequiresBearerAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)
         || path.StartsWithSegments("/api/public/transfer/attachments",
@@ -750,6 +901,8 @@ public static class AdminApiEndpoints
             StringComparison.OrdinalIgnoreCase)
         || path.StartsWithSegments("/api/public/transfer/rooms",
             StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/api/public/client-packages", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/api/public/client-version-check", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/ws-tickets", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/oss-callback", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase)

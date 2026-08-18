@@ -2,6 +2,10 @@ server:
   port: 8088
 
 spring:
+  servlet:
+    multipart:
+      max-file-size: ${SPECUS_CLIENT_PACKAGE_MULTIPART_MAX_FILE_SIZE:512MB}
+      max-request-size: ${SPECUS_CLIENT_PACKAGE_MULTIPART_MAX_REQUEST_SIZE:513MB}
   datasource:
     url: ${SPECUS_DB_URL:jdbc:sqlite:./specus.db}
     driver-class-name: ${SPECUS_DB_DRIVER:org.sqlite.JDBC}
@@ -76,6 +80,13 @@ specus:
   database:
     # Demo client/credential seeding. Honoured only in dev/test; prod ignores it.
     seed-demo-client: ${SPECUS_DB_SEED_DEMO_CLIENT:true}
+  client-packages:
+    # Uploaded release artifacts are streamed into <data-directory>/packages/{id}; the service
+    # independently enforces max-package-bytes even if a reverse proxy/servlet limit is relaxed.
+    data-directory: ${SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY:./data}
+    max-package-bytes: ${SPECUS_CLIENT_PACKAGE_MAX_BYTES:536870912}
+    public-rate-limit-per-ip: ${SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_PER_IP:120}
+    public-rate-limit-window-seconds: ${SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_WINDOW_SECONDS:60}
   netty:
     port: ${SPECUS_NETTY_PORT:7010}
     bind-address: ${SPECUS_NETTY_BIND_ADDRESS:0.0.0.0}

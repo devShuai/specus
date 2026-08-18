@@ -214,7 +214,9 @@ brew upgrade --cask specus-client
 ```
 
 Homebrew Cask 源码位于 [`devShuai/homebrew-specus`](https://github.com/devShuai/homebrew-specus)。网站的 macOS Release 压缩包仍可用于手动安装。
-公开的 [Specus Client 下载页](https://specus.devshuai.com/download) 会按访问设备优先推荐 macOS Homebrew、Windows 桌面版或对应架构的 Go 客户端，并可展开查看全部平台与实现。
+公开的 [Specus Client 下载页](https://specus.devshuai.com/download) 会优先读取服务端版本编目，按访问设备推荐 macOS Homebrew、Windows 桌面版、Android APK 或对应架构的 Go 客户端；未托管的目标由 GitHub Releases 补齐，并可展开查看全部平台与实现。
+
+管理后台「系统 → 客户端发布」可上传发布包。服务端流式计算 SHA-256 和文件大小，按 `实现 / 平台 / 架构 / 版本` 编目，并原子切换同一目标的最新版本。Go 与 .NET 客户端支持提示后确认自更新及校验失败回滚；Java 与 Android 只提示并打开受校验的下载地址，不静默替换程序。客户端在启动时检查，长时间运行或 Android 再次进入前台时最多每 24 小时复查；管理端概览可查看最近登录上报的客户端版本分布。
 
 从源码启动 Java 客户端：
 

@@ -280,6 +280,12 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.DisplayName).HasColumnName("display_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.DownloadUrl).HasColumnName("download_url").HasMaxLength(1024).IsRequired();
             b.Property(x => x.Description).HasColumnName("description").HasMaxLength(512);
+            b.Property(x => x.Version).HasColumnName("version").HasMaxLength(32);
+            b.Property(x => x.Sha256).HasColumnName("sha256").HasMaxLength(64);
+            b.Property(x => x.FileSize).HasColumnName("file_size").IsRequired();
+            b.Property(x => x.IsLatest).HasColumnName("is_latest").IsRequired();
+            b.Property(x => x.ChangelogUrl).HasColumnName("changelog_url").HasMaxLength(1024);
+            b.Property(x => x.MinSupportedVersion).HasColumnName("min_supported_version").HasMaxLength(32);
             b.Property(x => x.DisplayOrder).HasColumnName("display_order").IsRequired();
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
@@ -288,6 +294,11 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.Implementation).HasDatabaseName("idx_client_download_impl");
             b.HasIndex(x => x.DisplayOrder).HasDatabaseName("idx_client_download_order");
+            b.HasIndex(x => new { x.Implementation, x.Platform, x.Arch, x.Version })
+                .IsUnique()
+                .HasDatabaseName("uq_client_download_version");
+            b.HasIndex(x => new { x.Implementation, x.Platform, x.Arch, x.IsLatest, x.Enabled })
+                .HasDatabaseName("idx_client_download_latest");
         });
 
         modelBuilder.Entity<ConnectionRecord>(b =>

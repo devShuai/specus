@@ -65,6 +65,14 @@ public sealed record ClientDownloadLinkView(
     string DisplayName,
     string DownloadUrl,
     string? Description,
+    string? Version,
+    string? Sha256,
+    long FileSize,
+    bool IsLatest,
+    string? ChangelogUrl,
+    string? MinSupportedVersion,
+    bool Hosted,
+    long? PackageId,
     int DisplayOrder,
     bool Enabled,
     string CreatedAt,
@@ -77,8 +85,35 @@ public sealed record ClientDownloadLinkMutation(
     string? DisplayName,
     string? DownloadUrl,
     string? Description,
+    string? Version,
+    bool? IsLatest,
+    string? ChangelogUrl,
+    string? MinSupportedVersion,
     int? DisplayOrder,
     bool? Enabled);
+
+public sealed record ClientPackageUploadMutation(
+    string? Implementation,
+    string? Platform,
+    string? Arch,
+    string? DisplayName,
+    string? Version,
+    string? Description,
+    int? DisplayOrder,
+    bool? Enabled,
+    bool? IsLatest,
+    string? ChangelogUrl,
+    string? MinSupportedVersion);
+
+public sealed record ClientVersionCheckView(
+    bool UpdateAvailable,
+    bool Mandatory,
+    string? LatestVersion,
+    long? PackageId,
+    string? DownloadUrl,
+    string? Sha256,
+    long FileSize,
+    string? ChangelogUrl);
 
 public sealed record ClientAccountView(
     long Id,
@@ -88,6 +123,7 @@ public sealed record ClientAccountView(
     int ConnectionRateLimitPerMinute,
     bool Online,
     long? ConnectedSinceMs,
+    string? ClientVersion,
     bool MessageSendCapable,
     bool MessageReceiveCapable,
     bool MessageAttachmentsCapable,

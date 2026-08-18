@@ -12,4 +12,8 @@ public class ClientStartupConfig {
     private String peerMeshDevice = "noop";
     private String peerMeshTunName = "specus0";
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;
+    /** Startup + periodic catalogue check. Java phase one only notifies; it never replaces the jar. */
+    private boolean updateCheckEnabled = true;
+    private long updateCheckIntervalHours = 24;
+    private boolean openUpdatePage = true;
 }

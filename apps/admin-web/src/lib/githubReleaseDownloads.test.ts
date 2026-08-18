@@ -35,6 +35,7 @@ describe("mapGithubReleaseToClientDownloads", () => {
       `specus-client-go-${tagName}-windows-x64.zip`,
       `specus-desktop-${tagName}-win-x64.zip`,
       `specus-client-csharp-${tagName}.tar.gz`,
+      `specus-client-android-${tagName}.apk`,
       "SHA256SUMS.txt",
     ];
     const links = mapGithubReleaseToClientDownloads({
@@ -50,6 +51,7 @@ describe("mapGithubReleaseToClientDownloads", () => {
       "Linux ARM64",
       "Windows 桌面版",
       ".NET 命令行客户端",
+      "Android 应用",
     ]);
     expect(links.every((link) => link.enabled)).toBe(true);
     expect(links.every((link) => link.downloadUrl.includes("/devShuai/specus/releases/download/"))).toBe(true);
@@ -72,6 +74,7 @@ describe("mapGithubReleaseToClientDownloads", () => {
         .map((target) => `specus-client-go-${tagName}-${target}`),
       `specus-desktop-${tagName}-win-x64.zip`,
       `specus-client-csharp-${tagName}.tar.gz`,
+      `specus-client-android-${tagName}.apk`,
     ];
     const githubLinks = mapGithubReleaseToClientDownloads({
       tag_name: tagName,

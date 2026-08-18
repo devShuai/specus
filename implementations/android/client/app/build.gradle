@@ -2,6 +2,21 @@ plugins {
     id "com.android.application"
 }
 
+def releaseVersion = providers.gradleProperty("releaseVersion")
+        .orElse(providers.environmentVariable("RELEASE_VERSION"))
+        .orElse("0.1.0")
+        .get()
+        .replaceFirst(/^v/, "")
+def releaseVersionCode = providers.gradleProperty("releaseVersionCode")
+        .orElse(providers.environmentVariable("RELEASE_VERSION_CODE"))
+        .orElse("1")
+        .get()
+        .toInteger()
+def releaseKeystore = providers.environmentVariable("SPECUS_ANDROID_KEYSTORE").orNull
+def releaseKeystorePassword = providers.environmentVariable("SPECUS_ANDROID_KEYSTORE_PASSWORD").orNull
+def releaseKeyAlias = providers.environmentVariable("SPECUS_ANDROID_KEY_ALIAS").orNull
+def releaseKeyPassword = providers.environmentVariable("SPECUS_ANDROID_KEY_PASSWORD").orNull
+
 android {
     namespace "com.theshuai.specus.android"
     compileSdk 35
@@ -10,8 +25,27 @@ android {
         applicationId "com.theshuai.specus.android"
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName "0.1.0"
+        versionCode releaseVersionCode
+        versionName releaseVersion
+    }
+
+    signingConfigs {
+        if (releaseKeystore && releaseKeystorePassword && releaseKeyAlias && releaseKeyPassword) {
+            release {
+                storeFile file(releaseKeystore)
+                storePassword releaseKeystorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (signingConfigs.findByName("release") != null) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
 
     buildFeatures {

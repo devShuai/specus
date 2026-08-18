@@ -184,6 +184,11 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("arch");
 
+                    b.Property<string>("ChangelogUrl")
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("changelog_url");
+
                     b.Property<string>("CreatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -215,11 +220,24 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("enabled");
 
+                    b.Property<long>("FileSize")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("file_size");
+
                     b.Property<string>("Implementation")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("TEXT")
                         .HasColumnName("implementation");
+
+                    b.Property<bool>("IsLatest")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("is_latest");
+
+                    b.Property<string>("MinSupportedVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("min_supported_version");
 
                     b.Property<string>("Platform")
                         .IsRequired()
@@ -227,11 +245,21 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("platform");
 
+                    b.Property<string>("Sha256")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("sha256");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
                         .HasColumnType("TEXT")
                         .HasColumnName("updated_at");
+
+                    b.Property<string>("Version")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("version");
 
                     b.HasKey("Id");
 
@@ -240,6 +268,13 @@ namespace Specus.Server.Data.Migrations
 
                     b.HasIndex("Implementation")
                         .HasDatabaseName("idx_client_download_impl");
+
+                    b.HasIndex("Implementation", "Platform", "Arch", "IsLatest", "Enabled")
+                        .HasDatabaseName("idx_client_download_latest");
+
+                    b.HasIndex("Implementation", "Platform", "Arch", "Version")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_version");
 
                     b.ToTable("client_download_link", (string)null);
                 });

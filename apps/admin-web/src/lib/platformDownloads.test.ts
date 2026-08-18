@@ -60,7 +60,6 @@ describe("detectVisitorDevice", () => {
   });
 
   it.each([
-    ["Android", { userAgentData: { platform: "Android", mobile: true } }, "android"],
     ["ChromeOS", { userAgent: "Mozilla/5.0 (X11; CrOS x86_64 15917.0.0)" }, "chromeos"],
     ["iOS", { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile" }, "ios"],
     ["iPadOS UA", { userAgent: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) Mobile" }, "ipados"],
@@ -76,6 +75,13 @@ describe("detectVisitorDevice", () => {
       arch: "unknown",
       unsupportedPlatform,
     });
+  });
+
+  it("recognizes Android as a supported package target", () => {
+    expect(detectVisitorDevice({
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 9) Mobile",
+      userAgentData: { platform: "Android", mobile: true },
+    })).toEqual({ platform: "android", arch: "unknown" });
   });
 
   it("keeps unsupported or ambiguous architectures unknown", () => {
@@ -104,7 +110,8 @@ describe("recommendClientDownload", () => {
   const linuxX64Go = link(12, "go", "linux", "x64");
   const linuxArmGo = link(13, "go", "linux", "arm64");
   const universalJava = link(20, "java", "any", "any");
-  const links = [windowsX64Go, windowsArmGo, linuxX64Go, linuxArmGo, universalJava, windowsDesktop];
+  const android = link(40, "android", "android", "any");
+  const links = [windowsX64Go, windowsArmGo, linuxX64Go, linuxArmGo, universalJava, windowsDesktop, android];
 
   it("recommends Homebrew on macOS without guessing architecture", () => {
     expect(recommendClientDownload({ platform: "macos", arch: "unknown" }, links)).toEqual({
@@ -150,6 +157,14 @@ describe("recommendClientDownload", () => {
     )).toEqual({ kind: "none", reason: "download-unavailable" });
   });
 
+  it("recommends the universal APK to Android visitors", () => {
+    expect(recommendClientDownload({ platform: "android", arch: "unknown" }, links)).toEqual({
+      kind: "download",
+      reason: "android-app",
+      link: android,
+    });
+  });
+
   it("does not guess when architecture or platform is unavailable", () => {
     expect(recommendClientDownload({ platform: "windows", arch: "unknown" }, links)).toEqual({
       kind: "none",
@@ -162,7 +177,7 @@ describe("recommendClientDownload", () => {
     expect(recommendClientDownload({
       platform: "unsupported",
       arch: "unknown",
-      unsupportedPlatform: "android",
+      unsupportedPlatform: "ios",
     }, links)).toEqual({ kind: "none", reason: "unsupported-platform" });
   });
 });

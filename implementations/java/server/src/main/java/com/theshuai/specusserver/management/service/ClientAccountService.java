@@ -340,6 +340,7 @@ public class ClientAccountService {
                 account.getConnectionRateLimitPerMinute(),
                 online,
                 connectedSinceMs,
+                messageSession == null ? null : messageSession.getClientVersion(),
                 messageSession != null && messageSession.isMessageSendCapable(),
                 messageSession != null && messageSession.isMessageReceiveCapable(),
                 messageSession != null && messageSession.isMessageAttachmentsCapable(),

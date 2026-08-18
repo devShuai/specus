@@ -3,6 +3,7 @@ package com.theshuai.specus.android;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -11,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
@@ -33,6 +35,8 @@ import java.util.ArrayDeque;
 import java.util.Date;
 import java.util.Deque;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 4208;
@@ -73,6 +77,11 @@ public class MainActivity extends Activity {
 
     private final Deque<String> eventLog = new ArrayDeque<>();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.ROOT);
+    private final ExecutorService updateExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "specus-update-check");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -127,6 +136,7 @@ public class MainActivity extends Activity {
             registerReceiver(statusReceiver, statusFilter);
             registerReceiver(chatReceiver, chatFilter);
         }
+        maybeCheckForUpdate();
     }
 
     @Override
@@ -134,6 +144,66 @@ public class MainActivity extends Activity {
         unregisterReceiver(statusReceiver);
         unregisterReceiver(chatReceiver);
         super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        updateExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
+    private void maybeCheckForUpdate() {
+        long claimedAt = System.currentTimeMillis();
+        if (!ConfigStorage.claimUpdateCheck(this, claimedAt)) {
+            return;
+        }
+        final String serverBaseUrl;
+        try {
+            serverBaseUrl = ConfigStorage.parseConfig(ConfigStorage.loadConfig(this))
+                    .optString("serverBaseUrl", "");
+        } catch (Exception ignored) {
+            ConfigStorage.releaseUpdateCheck(this, claimedAt);
+            return;
+        }
+        updateExecutor.execute(() -> {
+            try {
+                ClientUpdateChecker.Result result = ClientUpdateChecker.check(
+                        serverBaseUrl, BuildConfig.VERSION_NAME);
+                if (result.updateAvailable()) {
+                    runOnUiThread(() -> showUpdatePrompt(result));
+                }
+            } catch (Exception ignored) {
+                // Update discovery must never prevent the tunnel from starting. A transient error
+                // releases the 24-hour claim so the next process start can retry.
+                ConfigStorage.releaseUpdateCheck(getApplicationContext(), claimedAt);
+            }
+        });
+    }
+
+    private void showUpdatePrompt(ClientUpdateChecker.Result result) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        String title = result.mandatory() ? "需要更新客户端" : "发现新版本";
+        String message = "当前版本 " + BuildConfig.VERSION_NAME + "，最新版本 "
+                + result.latestVersion() + "。\n\n下载后由 Android 确认安装，现有配置会保留。";
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("下载更新", (ignored, which) -> openExternalUrl(result.downloadUrl()))
+                .setNegativeButton("稍后", null);
+        if (result.changelogUrl() != null) {
+            dialog.setNeutralButton("更新说明", (ignored, which) -> openExternalUrl(result.changelogUrl()));
+        }
+        dialog.show();
+    }
+
+    private void openExternalUrl(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (RuntimeException error) {
+            Toast.makeText(this, "无法打开下载链接", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private View buildContent() {

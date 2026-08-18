@@ -18,6 +18,7 @@ The first Android version focuses on the normal specus-client path:
 - JSONC config editing inside the app, using the public schema URL
 - dashboard-style control UI with connection actions, config summary, JSONC editor, and runtime events
 - ForegroundService runtime with status updates in the app UI
+- a non-blocking update check at app start and at most once every 24 hours; a newer catalogued Android APK is shown in a user-confirmed system download flow and never silently installed
 - Android `VpnService` permission flow and TUN lifecycle only for non-`noop` virtual-device modes; `peerMeshDevice=noop` starts TCP/HTTP and the peer control/UDP path without requesting VPN permission or establishing a TUN
 - peer mesh VPN address setup as `{virtualIp}/32` plus dynamic `/32` routes for online roster peers; the whole mesh CIDR and default route are not installed
 - app traffic is excluded from the VPN with `addDisallowedApplication(...)`, and control/local sockets are protected with `VpnService.protect(...)`
@@ -51,6 +52,22 @@ cd implementations/android/client
 ```
 
 The wrapper is pinned to Gradle 9.4.1 for the Android Gradle Plugin used by this module.
+
+Release builds receive both Android version fields from the release pipeline:
+
+```powershell
+.\gradlew.bat :app:assembleRelease -PreleaseVersion=1.4.0 -PreleaseVersionCode=1400
+```
+
+Signed release builds read `SPECUS_ANDROID_KEYSTORE`, `SPECUS_ANDROID_KEYSTORE_PASSWORD`,
+`SPECUS_ANDROID_KEY_ALIAS`, and `SPECUS_ANDROID_KEY_PASSWORD`. GitHub Actions restores the keystore
+from the `SPECUS_ANDROID_KEYSTORE_BASE64` secret and refuses to publish an unsigned APK. Keep the
+same signing key for every release so Android can install upgrades over an existing app.
+
+The app queries the configured server's anonymous `/api/public/client-version-check` endpoint with
+`implementation=android`, `platform=android`, and `arch=any`. It accepts only HTTPS downloads (or
+loopback HTTP for development) and opens the returned URL through Android's normal download/install
+confirmation; the application itself never bypasses package verification.
 
 Run the local JVM protocol suite with:
 

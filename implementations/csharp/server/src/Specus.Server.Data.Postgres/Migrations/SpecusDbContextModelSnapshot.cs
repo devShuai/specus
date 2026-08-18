@@ -189,6 +189,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(32)")
                         .HasColumnName("arch");
 
+                    b.Property<string>("ChangelogUrl")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("changelog_url");
+
                     b.Property<string>("CreatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -220,11 +225,24 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("enabled");
 
+                    b.Property<long>("FileSize")
+                        .HasColumnType("bigint")
+                        .HasColumnName("file_size");
+
                     b.Property<string>("Implementation")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
                         .HasColumnName("implementation");
+
+                    b.Property<bool>("IsLatest")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_latest");
+
+                    b.Property<string>("MinSupportedVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("min_supported_version");
 
                     b.Property<string>("Platform")
                         .IsRequired()
@@ -232,11 +250,21 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(32)")
                         .HasColumnName("platform");
 
+                    b.Property<string>("Sha256")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("sha256");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)")
                         .HasColumnName("updated_at");
+
+                    b.Property<string>("Version")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("version");
 
                     b.HasKey("Id");
 
@@ -245,6 +273,13 @@ namespace Specus.Server.Data.Postgres.Migrations
 
                     b.HasIndex("Implementation")
                         .HasDatabaseName("idx_client_download_impl");
+
+                    b.HasIndex("Implementation", "Platform", "Arch", "IsLatest", "Enabled")
+                        .HasDatabaseName("idx_client_download_latest");
+
+                    b.HasIndex("Implementation", "Platform", "Arch", "Version")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_version");
 
                     b.ToTable("client_download_link", (string)null);
                 });

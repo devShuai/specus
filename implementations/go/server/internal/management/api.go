@@ -30,32 +30,41 @@ import (
 
 // API holds the dependencies for the admin REST surface.
 type API struct {
-	db              *store.DB
-	sessions        *session.Registry
-	tokens          *security.LocalTokenService
-	oidcAuth        *security.OidcValidator
-	natControl      *nat.ControlService
-	remotePorts     *nat.RemotePortManager
-	oidc            config.OidcConfig
-	authConfig      config.AuthConfig
-	clientAuth      config.ClientAuthConfig
-	traffic         config.TrafficConfig
-	trafficUsage    *nat.TrafficService
-	seedDemo        func(ctx context.Context) error
-	peerMesh        *peermesh.Service
-	attachments     *transfer.Service
-	rooms           *transfer.RoomService
-	mediaCapture    *media.Service
-	turnstile       *security.TurnstileVerifier
-	loginLimiter    *security.LoginRateLimiter
-	addressResolver *security.ClientAddressResolver
-	registration    *registrationService
-	logger          *slog.Logger
+	db               *store.DB
+	sessions         *session.Registry
+	tokens           *security.LocalTokenService
+	oidcAuth         *security.OidcValidator
+	natControl       *nat.ControlService
+	remotePorts      *nat.RemotePortManager
+	oidc             config.OidcConfig
+	authConfig       config.AuthConfig
+	clientAuth       config.ClientAuthConfig
+	traffic          config.TrafficConfig
+	trafficUsage     *nat.TrafficService
+	seedDemo         func(ctx context.Context) error
+	peerMesh         *peermesh.Service
+	attachments      *transfer.Service
+	rooms            *transfer.RoomService
+	mediaCapture     *media.Service
+	turnstile        *security.TurnstileVerifier
+	loginLimiter     *security.LoginRateLimiter
+	addressResolver  *security.ClientAddressResolver
+	registration     *registrationService
+	packageDirectory string
+	downloadLimiter  *publicDownloadRateLimiter
+	logger           *slog.Logger
 }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
 // long-standing NewAPI constructor used by integration tests.
 func (a *API) SetMediaCapture(service *media.Service) { a.mediaCapture = service }
+
+// SetClientPackageDirectory configures the durable filesystem location used by the package
+// catalog. The directory is created lazily on the first upload so read-only deployments that do
+// not use hosted packages do not require an unnecessary writable path.
+func (a *API) SetClientPackageDirectory(directory string) {
+	a.packageDirectory = strings.TrimSpace(directory)
+}
 
 // NewAPI builds the admin API.
 func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalTokenService,
@@ -76,6 +85,7 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
 		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
 		loginLimiter:    security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
+		downloadLimiter: newPublicDownloadRateLimiter(),
 		addressResolver: addressResolver,
 		registration:    registration, logger: logger}
 }
@@ -89,6 +99,9 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /oidc-config", a.handleOidcConfig)
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
 	mux.HandleFunc("GET /api/public/client-downloads", a.handlePublicClientDownloads)
+	mux.HandleFunc("GET /api/public/client-version-check", a.handlePublicClientVersionCheck)
+	mux.HandleFunc("GET /api/public/client-packages/{id}/download", a.handlePublicClientPackageDownload)
+	mux.HandleFunc("HEAD /api/public/client-packages/{id}/download", a.handlePublicClientPackageDownload)
 	mux.HandleFunc("GET /api/public/peer-mesh/stun-config", a.handlePublicPeerMeshStunConfig)
 	mux.HandleFunc("GET /api/public/peer-mesh/nat-probe-config", a.handlePublicPeerMeshNatProbeConfig)
 	mux.HandleFunc("GET /api/public/transfer/ice-config", a.handlePublicTransferIceConfig)
@@ -141,6 +154,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/client-downloads", a.requireAuth(a.handleCreateClientDownload))
 	mux.HandleFunc("PUT /api/admin/client-downloads/{id}", a.requireAuth(a.handleUpdateClientDownload))
 	mux.HandleFunc("DELETE /api/admin/client-downloads/{id}", a.requireAuth(a.handleDeleteClientDownload))
+	mux.HandleFunc("POST /api/admin/client-downloads/{id}/latest", a.requireAuth(a.handleSetLatestClientDownload))
+	mux.HandleFunc("POST /api/admin/client-packages", a.requireAuth(a.handleUploadClientPackage))
 
 	mux.HandleFunc("GET /api/admin/specus-mappings", a.requireAuth(a.handleListSpecusMappings))
 	mux.HandleFunc("POST /api/admin/clients/{id}/specus-mappings", a.requireAuth(a.handleCreateSpecus))
@@ -1150,13 +1165,16 @@ func (a *API) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handlePublicClientDownloads(w http.ResponseWriter, r *http.Request) {
+	if !a.allowPublicDownloadRequest(w, r) {
+		return
+	}
 	links, err := a.db.ListClientDownloadLinks(r.Context(), true)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	views := make([]ClientDownloadLinkView, 0, len(links))
-	for _, link := range links {
+	for _, link := range publicClientDownloadLinks(links) {
 		views = append(views, clientDownloadLinkView(link))
 	}
 	writeJSON(w, http.StatusOK, views)
@@ -1205,7 +1223,7 @@ func (a *API) handleCreateClientDownload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := a.db.InsertClientDownloadLink(r.Context(), link); err != nil {
-		a.fail(w, err)
+		a.failClientDownloadMutation(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, clientDownloadLinkView(link))
@@ -1236,12 +1254,17 @@ func (a *API) handleUpdateClientDownload(w http.ResponseWriter, r *http.Request)
 		a.fail(w, err)
 		return
 	}
+	wasHosted := isHostedClientPackage(*link)
 	if err := applyClientDownloadLinkMutation(link, req); err != nil {
 		a.fail(w, err)
 		return
 	}
+	if wasHosted && !isHostedClientPackage(*link) {
+		a.fail(w, validation("hosted package downloadUrl, sha256 and fileSize are server managed"))
+		return
+	}
 	if err := a.db.UpdateClientDownloadLink(r.Context(), *link); err != nil {
-		a.fail(w, err)
+		a.failClientDownloadMutation(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, clientDownloadLinkView(*link))
@@ -1262,14 +1285,22 @@ func (a *API) handleDeleteClientDownload(w http.ResponseWriter, r *http.Request)
 		a.fail(w, err)
 		return
 	}
-	if _, err := a.db.GetClientDownloadLink(r.Context(), id); err != nil {
+	link, err := a.db.GetClientDownloadLink(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	commitFileDelete, rollbackFileDelete, err := a.stageClientPackageDeletion(*link)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	if err := a.db.DeleteClientDownloadLink(r.Context(), id); err != nil {
+		rollbackFileDelete()
 		a.fail(w, err)
 		return
 	}
+	commitFileDelete()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2244,6 +2275,7 @@ func (a *API) clientView(ctx context.Context, account store.ClientAccount) Clien
 		login := bound.LoginTimeMs()
 		view.ConnectedSinceMs = &login
 		if active, err := a.db.GetOnlineClientSession(ctx, account.TenantID, account.ID, auth.StatusNettyOnline); err == nil && active != nil {
+			view.ClientVersion = active.ClientVersion
 			view.MessageSendCapable = active.MessageSendCapable
 			view.MessageReceiveCapable = active.MessageReceiveCapable
 			view.MessageAttachmentsCapable = active.MessageAttachmentsCapable
@@ -2271,19 +2303,31 @@ func credentialView(credential store.ClientCredential) CredentialView {
 }
 
 func clientDownloadLinkView(link store.ClientDownloadLink) ClientDownloadLinkView {
-	return ClientDownloadLinkView{
-		ID:             link.ID,
-		Implementation: link.Implementation,
-		Platform:       link.Platform,
-		Arch:           link.Arch,
-		DisplayName:    link.DisplayName,
-		DownloadURL:    link.DownloadURL,
-		Description:    link.Description,
-		DisplayOrder:   link.DisplayOrder,
-		Enabled:        link.Enabled,
-		CreatedAt:      link.CreatedAt.Format(time.RFC3339Nano),
-		UpdatedAt:      link.UpdatedAt.Format(time.RFC3339Nano),
+	view := ClientDownloadLinkView{
+		ID:                  link.ID,
+		Implementation:      link.Implementation,
+		Platform:            link.Platform,
+		Arch:                link.Arch,
+		Version:             link.Version,
+		DisplayName:         link.DisplayName,
+		DownloadURL:         link.DownloadURL,
+		Description:         link.Description,
+		SHA256:              link.SHA256,
+		FileSize:            link.FileSize,
+		IsLatest:            link.IsLatest,
+		ChangelogURL:        link.ChangelogURL,
+		MinSupportedVersion: link.MinSupportedVersion,
+		Hosted:              isHostedClientPackage(link),
+		DisplayOrder:        link.DisplayOrder,
+		Enabled:             link.Enabled,
+		CreatedAt:           link.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt:           link.UpdatedAt.Format(time.RFC3339Nano),
 	}
+	if view.Hosted {
+		id := link.ID
+		view.PackageID = &id
+	}
+	return view
 }
 
 func (a *API) fail(w http.ResponseWriter, err error) {
@@ -2733,8 +2777,8 @@ func applyHTTPRouteAuthMutation(mapping *store.HTTPRouteMapping, req httpRouteMu
 }
 
 var (
-	allowedDownloadImplementations = map[string]struct{}{"java": {}, "go": {}, "csharp": {}}
-	allowedDownloadPlatforms       = map[string]struct{}{"windows": {}, "linux": {}, "macos": {}, "any": {}}
+	allowedDownloadImplementations = map[string]struct{}{"java": {}, "go": {}, "csharp": {}, "android": {}}
+	allowedDownloadPlatforms       = map[string]struct{}{"windows": {}, "linux": {}, "macos": {}, "android": {}, "any": {}}
 	allowedDownloadArchitectures   = map[string]struct{}{"x64": {}, "arm64": {}, "any": {}}
 )
 
@@ -2746,6 +2790,7 @@ func newClientDownloadLink(req clientDownloadLinkMutation) (store.ClientDownload
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	link.Version = "0.0.0-legacy." + strconv.FormatInt(link.ID, 36)
 	if err := applyClientDownloadLinkMutation(&link, req); err != nil {
 		return store.ClientDownloadLink{}, err
 	}
@@ -2758,12 +2803,12 @@ func newClientDownloadLink(req clientDownloadLinkMutation) (store.ClientDownload
 
 func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientDownloadLinkMutation) error {
 	implementation, err := requireDownloadEnum(req.Implementation, allowedDownloadImplementations,
-		"implementation must be one of [java go csharp]")
+		"implementation must be one of [java go csharp android]")
 	if err != nil {
 		return err
 	}
 	platform, err := requireDownloadEnum(req.Platform, allowedDownloadPlatforms,
-		"platform must be one of [windows linux macos any]")
+		"platform must be one of [windows linux macos android any]")
 	if err != nil {
 		return err
 	}
@@ -2784,18 +2829,55 @@ func applyClientDownloadLinkMutation(link *store.ClientDownloadLink, req clientD
 		return err
 	}
 	description := normalizeDownloadDescription(req.Description)
+	version := strings.TrimSpace(req.Version)
+	if version != "" {
+		if _, err := parseSemanticVersion(version); err != nil {
+			return validation("version must be a semantic version")
+		}
+		version = strings.TrimPrefix(version, "v")
+	} else {
+		version = strings.TrimSpace(link.Version)
+		if version == "" {
+			return validation("version cannot be blank")
+		}
+	}
+	changelogURL, err := normalizeOptionalDownloadURL(req.ChangelogURL, "changelogUrl")
+	if err != nil {
+		return err
+	}
+	minSupportedVersion := strings.TrimSpace(req.MinSupportedVersion)
+	var minSupportedVersionPtr *string
+	if minSupportedVersion != "" {
+		if _, err := parseSemanticVersion(minSupportedVersion); err != nil {
+			return validation("minSupportedVersion must be a semantic version")
+		}
+		minSupportedVersion = strings.TrimPrefix(minSupportedVersion, "v")
+		minSupportedVersionPtr = &minSupportedVersion
+	}
 
 	link.Implementation = implementation
 	link.Platform = platform
 	link.Arch = arch
+	link.Version = version
 	link.DisplayName = displayName
 	link.DownloadURL = downloadURL
 	link.Description = description
+	link.ChangelogURL = changelogURL
+	link.MinSupportedVersion = minSupportedVersionPtr
 	if req.DisplayOrder != nil {
 		link.DisplayOrder = *req.DisplayOrder
 	}
 	if req.Enabled != nil {
 		link.Enabled = *req.Enabled
+		if !link.Enabled {
+			link.IsLatest = false
+		}
+	}
+	if req.IsLatest != nil {
+		link.IsLatest = *req.IsLatest
+	}
+	if link.IsLatest && !link.Enabled {
+		return validation("disabled package cannot be latest")
 	}
 	link.UpdatedAt = time.Now()
 	return nil
@@ -2821,11 +2903,32 @@ func requireDownloadURL(value string) (string, error) {
 	if err != nil {
 		return "", validation("downloadUrl is not a valid URI: " + err.Error())
 	}
-	if !parsed.IsAbs() || parsed.Host == "" ||
-		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
-		return "", validation("downloadUrl must be an absolute http(s) URL")
+	if parsed.IsAbs() {
+		if parsed.Host == "" || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+			return "", validation("downloadUrl must be an absolute http(s) URL or a root-relative path")
+		}
+		return trimmed, nil
+	}
+	if !strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "//") || parsed.Host != "" {
+		return "", validation("downloadUrl must be an absolute http(s) URL or a root-relative path")
 	}
 	return trimmed, nil
+}
+
+func normalizeOptionalDownloadURL(value, field string) (*string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if len(trimmed) > 1024 {
+		return nil, validation(field + " is too long (max 1024)")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" ||
+		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+		return nil, validation(field + " must be an absolute http(s) URL")
+	}
+	return &trimmed, nil
 }
 
 func normalizeDownloadDescription(value string) *string {

@@ -49,6 +49,7 @@ export interface Client {
   enabled: boolean;
   online: boolean;
   connectedSinceMs: number | null;
+  clientVersion?: string | null;
   messageSendCapable: boolean;
   messageReceiveCapable: boolean;
   messageAttachmentsCapable: boolean;
@@ -728,9 +729,9 @@ export interface HttpRouteMutation {
   pathRewriteEnabled?: boolean;
 }
 
-// 客户端下载链接 —— 登录页/Dashboard 优先映射 GitHub Release；管理员数据作为故障回退。
-export type ClientImplementation = "java" | "go" | "csharp";
-export type ClientPlatform = "windows" | "linux" | "macos" | "any";
+// 客户端版本编目 —— 服务端托管包优先；GitHub Releases 仅补齐或故障回退。
+export type ClientImplementation = "java" | "go" | "csharp" | "android";
+export type ClientPlatform = "windows" | "linux" | "macos" | "android" | "any";
 export type ClientArch = "x64" | "arm64" | "any";
 
 export interface ClientDownloadLink {
@@ -743,6 +744,14 @@ export interface ClientDownloadLink {
   description?: string | null;
   displayOrder: number;
   enabled: boolean;
+  version?: string | null;
+  sha256?: string | null;
+  fileSize?: number | null;
+  isLatest?: boolean;
+  changelogUrl?: string | null;
+  minSupportedVersion?: string | null;
+  hosted?: boolean;
+  packageId?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -756,6 +765,25 @@ export interface ClientDownloadLinkMutation {
   description?: string | null;
   displayOrder?: number;
   enabled?: boolean;
+  version?: string | null;
+  isLatest?: boolean;
+  changelogUrl?: string | null;
+  minSupportedVersion?: string | null;
+}
+
+export interface ClientPackageUpload {
+  file: File;
+  implementation: ClientImplementation;
+  platform: ClientPlatform;
+  arch: ClientArch;
+  version: string;
+  displayName: string;
+  description?: string | null;
+  changelogUrl?: string | null;
+  minSupportedVersion?: string | null;
+  displayOrder?: number;
+  enabled?: boolean;
+  isLatest?: boolean;
 }
 
 // LiveConnectionEvent is the JSON pushed over /ws/connections.

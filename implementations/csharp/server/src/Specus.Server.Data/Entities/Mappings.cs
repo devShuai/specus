@@ -163,6 +163,16 @@ public sealed class ClientDownloadLink
     public string DisplayName { get; set; } = string.Empty;
     public string DownloadUrl { get; set; } = string.Empty;
     public string? Description { get; set; }
+    /// <summary>
+    /// Semantic package version. Nullable only for links created before the package catalogue was
+    /// introduced; newly uploaded packages always carry a validated version.
+    /// </summary>
+    public string? Version { get; set; }
+    public string? Sha256 { get; set; }
+    public long FileSize { get; set; }
+    public bool IsLatest { get; set; }
+    public string? ChangelogUrl { get; set; }
+    public string? MinSupportedVersion { get; set; }
     public int DisplayOrder { get; set; }
     public bool Enabled { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; }

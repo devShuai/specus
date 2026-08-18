@@ -373,6 +373,7 @@ export function ClientsPanel() {
                   subtitle={`${client.ownerUsername || "-"} · #${client.id}`}
                   badges={statusChip(client)}
                   fields={[
+                    { label: "版本", value: client.clientVersion || "未上报" },
                     { label: "每分钟上限", value: client.connectionRateLimitPerMinute || "不限" },
                     { label: "消息", value: messageCapabilityChip(client) },
                     { label: "上传", value: formatBytes(client.uploadBytes) },
@@ -409,6 +410,7 @@ export function ClientsPanel() {
             <TableColumn>客户端</TableColumn>
             <TableColumn>归属</TableColumn>
             <TableColumn>状态</TableColumn>
+            <TableColumn>版本</TableColumn>
             <TableColumn>消息</TableColumn>
             <TableColumn>每分钟上限</TableColumn>
             <TableColumn>上传</TableColumn>
@@ -423,6 +425,7 @@ export function ClientsPanel() {
                 <TableCell>{client.clientName}</TableCell>
                 <TableCell>{client.ownerUsername || "-"}</TableCell>
                 <TableCell>{statusChip(client)}</TableCell>
+                <TableCell><span className="whitespace-nowrap font-mono text-tiny">{client.clientVersion || "未上报"}</span></TableCell>
                 <TableCell>{messageCapabilityChip(client)}</TableCell>
                 <TableCell>{client.connectionRateLimitPerMinute || "不限"}</TableCell>
                 <TableCell>{formatBytes(client.uploadBytes)}</TableCell>

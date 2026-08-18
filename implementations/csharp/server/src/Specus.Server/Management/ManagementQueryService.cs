@@ -39,7 +39,7 @@ public sealed class ManagementQueryService
             .ThenBy(link => link.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        return rows.Select(ToClientDownloadLinkView).ToList();
+        return rows.Select(ClientPackageService.ToView).ToList();
     }
 
     public async Task<IReadOnlyList<ClientAccountView>> ListClientsAsync(ManagementContext context,
@@ -94,6 +94,7 @@ public sealed class ManagementQueryService
                 account.ConnectionRateLimitPerMinute,
                 session is not null,
                 session?.LoginTimeMs,
+                capability?.ClientVersion,
                 capability?.MessageSendCapable ?? false,
                 capability?.MessageReceiveCapable ?? false,
                 capability?.MessageAttachmentsCapable ?? false,
@@ -143,6 +144,7 @@ public sealed class ManagementQueryService
             account.ConnectionRateLimitPerMinute,
             session is not null,
             session?.LoginTimeMs,
+            capability?.ClientVersion,
             capability?.MessageSendCapable ?? false,
             capability?.MessageReceiveCapable ?? false,
             capability?.MessageAttachmentsCapable ?? false,
@@ -717,19 +719,6 @@ public sealed class ManagementQueryService
         usage.UploadBytes,
         usage.DownloadBytes,
         usage.UpdatedAt.ToString("O"));
-
-    private static ClientDownloadLinkView ToClientDownloadLinkView(ClientDownloadLink link) => new(
-        link.Id,
-        link.Implementation,
-        link.Platform,
-        link.Arch,
-        link.DisplayName,
-        link.DownloadUrl,
-        link.Description,
-        link.DisplayOrder,
-        link.Enabled,
-        link.CreatedAt.ToString("O"),
-        link.UpdatedAt.ToString("O"));
 
     private static HttpTrafficExchangeView ToHttpTrafficExchangeView(
         HttpTrafficExchange exchange,

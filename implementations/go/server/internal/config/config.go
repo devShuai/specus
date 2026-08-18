@@ -37,6 +37,9 @@ type Config struct {
 	TrustedProxies   []string `json:"trustedProxies"`
 	PublicAddress    string   `json:"publicAddress"`
 	ConnectionString string   `json:"connectionString"`
+	// DataDirectory stores server-owned files that must survive restarts, including client
+	// packages. Package bytes live below dataDirectory/packages and never inside the database.
+	DataDirectory string `json:"dataDirectory"`
 	// ManagementAddr is the listen address for the admin/HTTP surface (default :8088).
 	ManagementAddr string `json:"managementAddr"`
 }
@@ -547,6 +550,7 @@ func Default() Config {
 		},
 		TLS:              TLSConfig{Mode: "disabled"},
 		ConnectionString: "./specus.db",
+		DataDirectory:    "./data",
 		ManagementAddr:   ":8088",
 	}
 }
@@ -851,6 +855,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 
 	setStr("SPECUS_PUBLIC_ADDRESS", &cfg.PublicAddress)
 	setStr("SPECUS_MANAGEMENT_ADDR", &cfg.ManagementAddr)
+	setStr("SPECUS_DATA_DIRECTORY", &cfg.DataDirectory)
 
 	// Connection string: both SPECUS_CONNECTIONSTRINGS_SPECUS and SPECUS_DB_CONNECTION_STRING.
 	setStr("SPECUS_CONNECTIONSTRINGS_SPECUS", &cfg.ConnectionString)

@@ -10,6 +10,7 @@ final class ConfigStorage {
     private static final String KEY_CONFIG = "client_jsonc";
     private static final String KEY_MACHINE_ID = "machine_id";
     private static final String KEY_LAST_TARGET = "last_target";
+    private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
 
     private ConfigStorage() {
     }
@@ -28,6 +29,24 @@ final class ConfigStorage {
 
     static void saveLastTarget(Context context, String target) {
         prefs(context).edit().putString(KEY_LAST_TARGET, target == null ? "" : target.trim()).apply();
+    }
+
+    static synchronized boolean claimUpdateCheck(Context context, long nowMillis) {
+        SharedPreferences preferences = prefs(context);
+        long lastCheck = preferences.getLong(KEY_LAST_UPDATE_CHECK, 0L);
+        if (!ClientUpdateChecker.shouldCheck(lastCheck, nowMillis)) {
+            return false;
+        }
+        // Persist before the request so multiple Activity instances cannot start duplicate checks.
+        // A failed request is retried on the next process start by clearing this claim.
+        return preferences.edit().putLong(KEY_LAST_UPDATE_CHECK, nowMillis).commit();
+    }
+
+    static void releaseUpdateCheck(Context context, long claimedAtMillis) {
+        SharedPreferences preferences = prefs(context);
+        if (preferences.getLong(KEY_LAST_UPDATE_CHECK, 0L) == claimedAtMillis) {
+            preferences.edit().remove(KEY_LAST_UPDATE_CHECK).apply();
+        }
     }
 
     static String machineId(Context context) {

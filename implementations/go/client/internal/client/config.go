@@ -11,13 +11,21 @@ import (
 )
 
 type Config struct {
-	ServerBaseURL   string           `json:"serverBaseUrl"`
-	APIKey          string           `json:"apiKey"`
-	Secret          string           `json:"secret"`
-	ControlTLS      ControlTLSConfig `json:"controlTls"`
-	PeerMeshDevice  string           `json:"peerMeshDevice"`
-	PeerMeshTunName string           `json:"peerMeshTunName"`
-	PeerMeshMTU     int              `json:"peerMeshMtu"`
+	ServerBaseURL      string           `json:"serverBaseUrl"`
+	APIKey             string           `json:"apiKey"`
+	Secret             string           `json:"secret"`
+	ControlTLS         ControlTLSConfig `json:"controlTls"`
+	PeerMeshDevice     string           `json:"peerMeshDevice"`
+	PeerMeshTunName    string           `json:"peerMeshTunName"`
+	PeerMeshMTU        int              `json:"peerMeshMtu"`
+	UpdateCheckEnabled *bool            `json:"updateCheckEnabled"`
+	AutoUpdate         bool             `json:"autoUpdate"`
+}
+
+// UpdatesEnabled defaults to true so packaged clients participate without requiring a config
+// migration. Operators can explicitly disable polling in service-managed environments.
+func (config Config) UpdatesEnabled() bool {
+	return config.UpdateCheckEnabled == nil || *config.UpdateCheckEnabled
 }
 
 type ControlTLSConfig struct {
