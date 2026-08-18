@@ -91,6 +91,12 @@ public sealed class SpecusOptions
     /// </summary>
     public string? Env { get; set; }
 
+    /// <summary>
+    /// Trusted reverse-proxy CIDRs, comma separated. X-Forwarded-For and X-Real-IP are honoured only
+    /// when the connection peer matches one of them; empty (default) ignores forwarded headers.
+    /// </summary>
+    public string? TrustedProxies { get; set; }
+
     public string? PublicAddress { get; set; }
 }
 

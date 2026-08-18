@@ -3,6 +3,7 @@ package com.theshuai.specusserver.management.controller;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.LoginRateLimiter;
 import com.theshuai.specusserver.security.TurnstileVerifier;
@@ -29,17 +30,20 @@ public class AuthController {
     private final RegistrationService registrationService;
     private final TurnstileVerifier turnstileVerifier;
     private final LoginRateLimiter loginRateLimiter;
+    private final ClientAddressResolver addressResolver;
 
     public AuthController(LocalTokenService localTokenService,
                           ManagementUserService managementUserService,
                           RegistrationService registrationService,
                           TurnstileVerifier turnstileVerifier,
-                          LoginRateLimiter loginRateLimiter) {
+                          LoginRateLimiter loginRateLimiter,
+                          ClientAddressResolver addressResolver) {
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
         this.registrationService = registrationService;
         this.turnstileVerifier = turnstileVerifier;
         this.loginRateLimiter = loginRateLimiter;
+        this.addressResolver = addressResolver;
     }
 
     @PostMapping("/auth/login")
@@ -60,11 +64,9 @@ public class AuthController {
                         .body(Map.of("error", "用户名或密码错误")));
     }
 
-    /**
-     * 限流只使用连接对端地址。转发头在建立统一 trusted-proxy 边界前不可信,不参与配额判定。
-     */
+    /** 与其它安全敏感入口共用同一套可信代理边界,转发头只有来自可信代理时才被采纳。 */
     private String clientIp(HttpServletRequest request) {
-        return request == null ? null : request.getRemoteAddr();
+        return addressResolver.resolve(request);
     }
 
     /**

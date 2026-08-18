@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -31,26 +30,27 @@ import (
 
 // API holds the dependencies for the admin REST surface.
 type API struct {
-	db           *store.DB
-	sessions     *session.Registry
-	tokens       *security.LocalTokenService
-	oidcAuth     *security.OidcValidator
-	natControl   *nat.ControlService
-	remotePorts  *nat.RemotePortManager
-	oidc         config.OidcConfig
-	authConfig   config.AuthConfig
-	clientAuth   config.ClientAuthConfig
-	traffic      config.TrafficConfig
-	trafficUsage *nat.TrafficService
-	seedDemo     func(ctx context.Context) error
-	peerMesh     *peermesh.Service
-	attachments  *transfer.Service
-	rooms        *transfer.RoomService
-	mediaCapture *media.Service
-	turnstile    *security.TurnstileVerifier
-	loginLimiter *security.LoginRateLimiter
-	registration *registrationService
-	logger       *slog.Logger
+	db              *store.DB
+	sessions        *session.Registry
+	tokens          *security.LocalTokenService
+	oidcAuth        *security.OidcValidator
+	natControl      *nat.ControlService
+	remotePorts     *nat.RemotePortManager
+	oidc            config.OidcConfig
+	authConfig      config.AuthConfig
+	clientAuth      config.ClientAuthConfig
+	traffic         config.TrafficConfig
+	trafficUsage    *nat.TrafficService
+	seedDemo        func(ctx context.Context) error
+	peerMesh        *peermesh.Service
+	attachments     *transfer.Service
+	rooms           *transfer.RoomService
+	mediaCapture    *media.Service
+	turnstile       *security.TurnstileVerifier
+	loginLimiter    *security.LoginRateLimiter
+	addressResolver *security.ClientAddressResolver
+	registration    *registrationService
+	logger          *slog.Logger
 }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
@@ -63,7 +63,8 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
 	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
 	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service,
-	rooms *transfer.RoomService, logger *slog.Logger) *API {
+	rooms *transfer.RoomService, addressResolver *security.ClientAddressResolver,
+	logger *slog.Logger) *API {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -74,8 +75,9 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
 		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
-		loginLimiter: security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
-		registration: registration, logger: logger}
+		loginLimiter:    security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
+		addressResolver: addressResolver,
+		registration:    registration, logger: logger}
 }
 
 // Register attaches all auth and admin routes to mux.
@@ -234,16 +236,6 @@ func (a *API) ValidateConnectionWebSocketToken(token string) (wsevents.Access, b
 
 // loginClientIP returns the connection peer address. Forwarded headers are not consulted: without a
 // trusted-proxy boundary they are attacker-controlled and would let a client reset its own quota.
-func loginClientIP(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
-
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -252,7 +244,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	// Throttle before the captcha and credential check so deployments without Turnstile are still
 	// bounded. Connection peer only: forwarded headers are not trusted for quota decisions.
-	if allowed, retryAfter := a.loginLimiter.Allow(loginClientIP(r), req.Username); !allowed {
+	if allowed, retryAfter := a.loginLimiter.Allow(a.addressResolver.Resolve(r), req.Username); !allowed {
 		w.Header().Set("Retry-After", strconv.FormatInt(int64(retryAfter.Seconds()), 10))
 		writeError(w, http.StatusTooManyRequests, security.LoginRateLimitedMessage)
 		return

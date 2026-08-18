@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -25,6 +26,20 @@ namespace Specus.IntegrationTests;
 /// runs don't fight over <c>:8088</c>. The HTTP surface is just the <c>/health</c> endpoint
 /// at this phase — tests don't depend on it yet.</para>
 /// </summary>
+/// <summary>Stamps a loopback remote address on every TestServer request.</summary>
+internal sealed class LoopbackPeerStartupFilter : IStartupFilter
+{
+    public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
+    {
+        app.Use(async (context, nextMiddleware) =>
+        {
+            context.Connection.RemoteIpAddress ??= System.Net.IPAddress.Loopback;
+            await nextMiddleware().ConfigureAwait(false);
+        });
+        next(app);
+    };
+}
+
 internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsyncDisposable
 {
     private readonly IReadOnlyDictionary<string, string?> _configurationOverrides;
@@ -138,6 +153,10 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
                 // Integration tests rely on the demo client/credential seed and on the weak built-in
                 // password; both are only permitted outside prod.
                 ["Specus:Env"] = "test",
+                // TestServer has no real connection peer. Stamp a loopback peer (below) and trust
+                // it so these tests keep exercising the forwarded-header path a real deployment
+                // gets from its reverse proxy.
+                ["Specus:TrustedProxies"] = "127.0.0.1/32",
                 // Listen on an ephemeral TCP control port so we can run in parallel.
                 ["Specus:Netty:Port"] = "0",
                 ["Specus:Auth:PasswordLoginEnabled"] = "true",
@@ -162,6 +181,11 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
         });
 
         builder.ConfigureLogging(logging => logging.ClearProviders());
+
+        // Give every in-memory request a loopback peer so ClientAddressResolver sees a trusted
+        // proxy and honours the X-Real-IP / X-Forwarded-For headers the tests send.
+        builder.ConfigureTestServices(services =>
+            services.AddSingleton<IStartupFilter, LoopbackPeerStartupFilter>());
 
         if (_configureServices is not null)
         {

@@ -65,7 +65,7 @@ func TestOIDCCodeExchangeMintsLocalTokenAndBindsIdentity(t *testing.T) {
 	}
 	tokens := security.NewLocalTokenService(authCfg)
 	api := NewAPI(db, session.NewRegistry(), tokens, security.NewOidcValidator(oidcCfg), nil, nil,
-		oidcCfg, authCfg, config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil, nil)
+		oidcCfg, authCfg, config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	api.Register(mux)
 	server := httptest.NewServer(mux)
@@ -232,7 +232,7 @@ func TestOIDCDirectBearerRequiresBoundEnabledUserAndUsesCurrentAuthorization(t *
 	defer db.Close()
 	api := NewAPI(db, session.NewRegistry(), security.NewLocalTokenService(authCfg),
 		security.NewOidcValidator(oidcCfg), nil, nil, oidcCfg, authCfg, config.ClientAuthConfig{},
-		config.TrafficConfig{}, nil, nil, nil, nil, nil, nil)
+		config.TrafficConfig{}, nil, nil, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	api.Register(mux)
 	server := httptest.NewServer(mux)

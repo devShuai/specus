@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
@@ -63,7 +61,7 @@ func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if err := a.attachments.CheckPresignIPContext(r.Context(), attachmentClientIP(r)); err != nil {
+	if err := a.attachments.CheckPresignIPContext(r.Context(), a.attachmentClientIP(r)); err != nil {
 		a.failAttachment(w, err)
 		return
 	}
@@ -248,19 +246,7 @@ func attachmentLookupError(id int64, err error) error {
 	return errors.New("attachment not found: " + strconv.FormatInt(id, 10))
 }
 
-func attachmentClientIP(r *http.Request) string {
-	if value := strings.TrimSpace(r.Header.Get("X-Real-IP")); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); value != "" {
-		parts := strings.Split(value, ",")
-		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
-			return last
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
-	}
-	return r.RemoteAddr
+// attachmentClientIP resolves the rate-limit identity through the shared trusted-proxy boundary.
+func (a *API) attachmentClientIP(r *http.Request) string {
+	return a.addressResolver.Resolve(r)
 }

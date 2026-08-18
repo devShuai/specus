@@ -1,5 +1,6 @@
 package com.theshuai.specusserver.websocket;
 
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.server.ServerHttpRequest;
 import org.springframework.http.server.ServerHttpResponse;
@@ -17,13 +18,16 @@ public final class WebSocketTicketHandshakeInterceptor implements HandshakeInter
     public static final String ATTR_ADMIN = "admin";
 
     private final WebSocketTicketService ticketService;
+    private final ClientAddressResolver addressResolver;
     private final WebSocketTicketService.Scope scope;
     private final boolean bindRemoteAddress;
 
     public WebSocketTicketHandshakeInterceptor(WebSocketTicketService ticketService,
+                                               ClientAddressResolver addressResolver,
                                                WebSocketTicketService.Scope scope,
                                                boolean bindRemoteAddress) {
         this.ticketService = ticketService;
+        this.addressResolver = addressResolver;
         this.scope = scope;
         this.bindRemoteAddress = bindRemoteAddress;
     }
@@ -38,7 +42,9 @@ public final class WebSocketTicketHandshakeInterceptor implements HandshakeInter
         if (query.size() != 1 || values == null || values.size() != 1) {
             return reject(response, "single-use ticket required");
         }
-        String remoteAddress = bindRemoteAddress ? WebSocketRequestAddress.resolve(request) : null;
+        String remoteAddress = bindRemoteAddress
+                ? WebSocketRequestAddress.resolve(addressResolver, request)
+                : null;
         return ticketService.consume(scope, values.getFirst(), remoteAddress)
                 .map(ticketAttributes -> {
                     attributes.putAll(ticketAttributes);

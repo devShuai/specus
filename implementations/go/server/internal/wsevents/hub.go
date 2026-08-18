@@ -56,7 +56,8 @@ type ClusterTransport struct {
 
 // Hub tracks open admin WebSocket connections and broadcasts events to them.
 type Hub struct {
-	tickets   *security.WebSocketTicketService
+	tickets         *security.WebSocketTicketService
+	addressResolver *security.ClientAddressResolver
 	authorize ReceiverAuthorizer
 	mu        sync.Mutex
 	sockets   map[*websocket.Conn]Access
@@ -64,8 +65,10 @@ type Hub struct {
 }
 
 // NewHub builds a hub that authorizes upgrades with validate.
-func NewHub(tickets *security.WebSocketTicketService, authorize ReceiverAuthorizer) *Hub {
-	return &Hub{tickets: tickets, authorize: authorize, sockets: make(map[*websocket.Conn]Access)}
+func NewHub(tickets *security.WebSocketTicketService, addressResolver *security.ClientAddressResolver,
+	authorize ReceiverAuthorizer) *Hub {
+	return &Hub{tickets: tickets, addressResolver: addressResolver, authorize: authorize,
+		sockets: make(map[*websocket.Conn]Access)}
 }
 
 // ConfigureCluster enables shared delivery through a bounded inbound queue.
@@ -104,7 +107,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims, err := h.tickets.Consume(r.Context(), ticket, security.WebSocketScopeConnections,
-		security.WebSocketRequestAddress(r))
+		security.WebSocketRequestAddress(h.addressResolver, r))
 	if err != nil || claims == nil || claims.Username == "" || claims.TenantID == "" {
 		w.Header().Set("X-Auth-Reason", "invalid ticket")
 		w.WriteHeader(http.StatusForbidden)

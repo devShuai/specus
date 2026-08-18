@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -57,22 +56,10 @@ func ExtractWebSocketTicket(r *http.Request) (string, bool) {
 	return ticket, ticket != ""
 }
 
-// WebSocketRequestAddress must produce the same binding for the ticket POST and upgrade.
-func WebSocketRequestAddress(r *http.Request) string {
-	if value := strings.TrimSpace(r.Header.Get("X-Real-IP")); value != "" {
-		return value
-	}
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		if value := strings.TrimSpace(parts[len(parts)-1]); value != "" {
-			return value
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
+// WebSocketRequestAddress must produce the same binding for the ticket POST and upgrade. Both go
+// through the shared trusted-proxy boundary so a forged header cannot rebind someone else's ticket.
+func WebSocketRequestAddress(resolver *ClientAddressResolver, r *http.Request) string {
+	return resolver.Resolve(r)
 }
 
 type IssuedWebSocketTicket struct {

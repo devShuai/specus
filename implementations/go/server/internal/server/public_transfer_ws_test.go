@@ -418,7 +418,10 @@ func newDiscoveryTestServer(t *testing.T, cfg config.PublicTransferConfig) (*htt
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	tickets := security.NewWebSocketTicketService(db)
-	server := httptest.NewServer(newPublicTransferDiscoveryHub(cfg, tickets))
+	server := httptest.NewServer(newPublicTransferDiscoveryHub(cfg, tickets,
+		// httptest connects from loopback; trusting it lets these cases keep exercising the
+		// forwarded-header path that a real deployment gets from its reverse proxy.
+		security.NewClientAddressResolver([]string{"127.0.0.1/32", "::1/128"}, nil)))
 	t.Cleanup(server.Close)
 	return server, tickets
 }
@@ -452,6 +455,39 @@ func discoveryTicketURLWithClaims(t *testing.T, serverURL string, tickets *secur
 		t.Fatal(err)
 	}
 	return "ws" + strings.TrimPrefix(serverURL, "http") + "/?ticket=" + url.QueryEscape(issued.Ticket)
+}
+
+// A ticket bound to one client address must not be usable from another connection just because
+// that connection claims the original address in a forwarded header.
+func TestPublicTransferDiscoveryRejectsForgedForwardedAddressFromUntrustedPeer(t *testing.T) {
+	db, err := store.Open("sqlite", t.TempDir()+"/discovery-untrusted.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	tickets := security.NewWebSocketTicketService(db)
+	// No trusted proxies: loopback is an ordinary untrusted client here.
+	server := httptest.NewServer(newPublicTransferDiscoveryHub(config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               8,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	}, tickets, security.NewClientAddressResolver(nil, nil)))
+	t.Cleanup(server.Close)
+
+	issuedURL := discoveryTicketURL(t, server.URL, tickets, "room-forge", "token-forge", "victim",
+		"203.0.113.9")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx, issuedURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Real-IP": []string{"203.0.113.9"}},
+	})
+	if err == nil {
+		conn.CloseNow()
+		t.Fatal("a forged X-Real-IP must not satisfy a ticket bound to another address")
+	}
+	if response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %v, want 403", response)
+	}
 }
 
 func dialDiscovery(t *testing.T, rawURL, realIP string) *websocket.Conn {
@@ -751,25 +787,34 @@ func TestPublicTransferDiscoveryHiddenParticipantStaysOutOfRoster(t *testing.T) 
 }
 
 func TestPublicTransferDiscoveryUnknownAddressNeverFormsNet(t *testing.T) {
-	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
-		MaxDiscoveryPeersPerRoom:               8,
-		DiscoveryMessageRateLimitPerConnection: 10,
-		DiscoveryMessageRateLimitWindowSeconds: 60,
-	})
-	// X-Real-IP "unknown" stands in for trustedClientIP's no-usable-address fallback.
-	dial := func(token, peerID string) *websocket.Conn {
-		conn := dialDiscovery(t, discoveryTicketURL(t, server.URL, tickets, "room-u", token, peerID, "unknown"), "unknown")
-		readDiscoveryType(t, conn, "hello")
-		return conn
-	}
-	u1 := dial("token-one", "u1")
-	u2 := dial("token-two", "u2") // same "unknown" address, other token room: must stay invisible
-	u3 := dial("token-one", "u3") // same token room: visible through sameGroup despite the address
-	defer u1.CloseNow()
-	defer u2.CloseNow()
-	defer u3.CloseNow()
+	// With the trusted-proxy boundary in place a live upgrade always resolves a concrete peer
+	// address, so the "no usable address" fallback is exercised directly on the grouping
+	// predicates: it must never merge clients into one net, while an explicit token room still
+	// makes them visible to each other.
+	unknownOne := discoveryParticipant{roomID: "room-u", roomKey: "token:a", peerID: "u1",
+		publicAddress: unknownPublicAddress}
+	unknownTwo := discoveryParticipant{roomID: "room-u", roomKey: "token:b", peerID: "u2",
+		publicAddress: unknownPublicAddress}
+	sameToken := discoveryParticipant{roomID: "room-u", roomKey: "token:a", peerID: "u3",
+		publicAddress: unknownPublicAddress}
+	empty := discoveryParticipant{roomID: "room-u", roomKey: "token:c", peerID: "u4"}
 
-	readRosterUntil(t, u1, map[string]bool{"u1": true, "u3": true})
-	readRosterUntil(t, u2, map[string]bool{"u2": true})
-	readRosterUntil(t, u3, map[string]bool{"u1": true, "u3": true})
+	if unknownOne.sameNet(unknownTwo) || unknownOne.sameNet(sameToken) || empty.sameNet(empty) {
+		t.Fatal("an unknown or empty public address must never form a net")
+	}
+	if unknownOne.sameScope(unknownTwo) {
+		t.Fatal("different token rooms with unknown addresses must stay invisible to each other")
+	}
+	if !unknownOne.sameScope(sameToken) {
+		t.Fatal("the same token room must stay visible regardless of the address")
+	}
+
+	// A concrete shared egress address still forms a net across token rooms.
+	knownOne := discoveryParticipant{roomID: "room-u", roomKey: "token:a", peerID: "k1",
+		publicAddress: "203.0.113.9"}
+	knownTwo := discoveryParticipant{roomID: "room-u", roomKey: "token:b", peerID: "k2",
+		publicAddress: "203.0.113.9"}
+	if !knownOne.sameNet(knownTwo) || !knownOne.sameScope(knownTwo) {
+		t.Fatal("clients behind the same public address must share a net")
+	}
 }

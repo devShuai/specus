@@ -87,7 +87,7 @@ func TestAdminNestedManifestUsesNestedCaptureAsAssetAnchor(t *testing.T) {
 	authCfg := config.AuthConfig{JwtSecret: "media-test-secret"}
 	tokens := security.NewLocalTokenService(authCfg)
 	api := NewAPI(db, session.NewRegistry(), tokens, nil, nil, nil, config.OidcConfig{}, authCfg,
-		config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil,
+		config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mediaCfg := config.Default().MediaCapture
 	mediaCfg.Enabled = true

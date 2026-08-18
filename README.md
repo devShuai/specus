@@ -352,6 +352,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `SPECUS_ENV` | `prod` | 部署环境：`prod` / `dev` / `test`；留空或未知值一律按 `prod` 处理 |
+| `SPECUS_TRUSTED_PROXIES` | （空） | 可信反代 CIDR 列表，逗号分隔（如 `10.0.0.0/8,127.0.0.1/32`）。只有连接对端命中该列表时才采纳 `X-Forwarded-For` / `X-Real-IP`；留空表示完全忽略转发头 |
 | `SPECUS_AUTH_USERNAME` | `admin` | 管理用户名 |
 | `SPECUS_AUTH_PASSWORD` | （空） | 管理密码；默认留空即禁用密码登录。`prod` 下配置为已知默认口令（如 `admin`、`test1234`、`changeme`）会拒绝启动 |
 | `SPECUS_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |

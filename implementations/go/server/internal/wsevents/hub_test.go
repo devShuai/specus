@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,7 +44,7 @@ func TestHubPublishesAndDeliversClusterManagementEvents(t *testing.T) {
 		payload []byte
 	}, 1)
 	reported := make(chan error, 1)
-	hub := NewHub(nil, nil)
+	hub := NewHub(nil, security.NewClientAddressResolver(nil, nil), nil)
 	hub.mu.Lock()
 	hub.sockets[accepted] = Access{TenantID: "tenant-a", Admin: true}
 	hub.mu.Unlock()

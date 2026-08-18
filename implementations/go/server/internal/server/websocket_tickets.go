@@ -46,7 +46,7 @@ func (a *App) handleAdminWebSocketTicket(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "unsupported websocket endpoint", http.StatusBadRequest)
 		return
 	}
-	issued, err := a.webSocketTickets.Issue(r.Context(), scope, security.WebSocketRequestAddress(r),
+	issued, err := a.webSocketTickets.Issue(r.Context(), scope, security.WebSocketRequestAddress(a.addressResolver, r),
 		security.WebSocketTicketClaims{Username: access.Username, TenantID: access.TenantID, Admin: access.Admin})
 	if err != nil {
 		a.logger.Error("issue admin websocket ticket failed", "scope", scope, "err", err)
@@ -80,7 +80,7 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 	// 恒写 publicAddress：取值链与 upgrade 时 trustedClientIP 的重算一致（ticket 已绑定
 	// remote-address，两处必然同值），使跨端共库时 Java 节点消费 Go 票据得到相同的
 	// netId/groupId（对齐 Java WebSocketTicketResource）。
-	claims.PublicAddress = trustedClientIP(r)
+	claims.PublicAddress = a.addressResolver.Resolve(r)
 	if roomToken != "" {
 		// Aligned with Java WebSocketTicketResource: resolve the room credential through the
 		// room service (creating the owner room on first use) instead of hashing the token.
@@ -99,7 +99,7 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 		claims.RoomRole = string(transfer.RoleEditor)
 	}
 	issued, err := a.webSocketTickets.Issue(r.Context(), security.WebSocketScopePublicTransfer,
-		security.WebSocketRequestAddress(r), claims)
+		security.WebSocketRequestAddress(a.addressResolver, r), claims)
 	if err != nil {
 		a.logger.Error("issue public websocket ticket failed", "sharedRoom", claims.SharedRoom, "err", err)
 		http.Error(w, "could not issue websocket ticket", http.StatusInternalServerError)

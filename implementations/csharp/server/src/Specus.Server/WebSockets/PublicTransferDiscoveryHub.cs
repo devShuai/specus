@@ -27,16 +27,19 @@ public sealed class PublicTransferDiscoveryHub
     private readonly object _participantsGate = new();
     private readonly PublicTransferOptions _options;
     private readonly WebSocketTicketService _tickets;
+    private readonly ClientAddressResolver _addressResolver;
     private readonly PublicTransferCoordinationService _coordination;
     private readonly ILogger<PublicTransferDiscoveryHub> _logger;
 
     public PublicTransferDiscoveryHub(IOptions<PublicTransferOptions> options,
         WebSocketTicketService tickets,
+        ClientAddressResolver addressResolver,
         PublicTransferCoordinationService coordination,
         ILogger<PublicTransferDiscoveryHub> logger)
     {
         _options = options.Value;
         _tickets = tickets;
+        _addressResolver = addressResolver;
         _coordination = coordination;
         _logger = logger;
         _coordination.AddListener(HandleCoordinationEventAsync);
@@ -52,7 +55,7 @@ public sealed class PublicTransferDiscoveryHub
 
         var ticket = WebSocketTicketService.ExtractTicket(context.Request);
         var claims = await _tickets.ConsumeAsync(ticket, WebSocketTicketService.PublicTransferScope,
-            WebSocketTicketService.RequestAddress(context), context.RequestAborted).ConfigureAwait(false);
+            WebSocketTicketService.RequestAddress(_addressResolver, context), context.RequestAborted).ConfigureAwait(false);
         if (claims is null || string.IsNullOrWhiteSpace(claims.PeerId)
             || string.IsNullOrWhiteSpace(claims.RoomId))
         {
@@ -62,7 +65,7 @@ public sealed class PublicTransferDiscoveryHub
         }
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
-        var participant = Participant.From(context, socket, claims);
+        var participant = Participant.From(context, socket, claims, _addressResolver);
         PublicTransferClusterRegistration registration;
         try
         {
@@ -908,9 +911,9 @@ public sealed class PublicTransferDiscoveryHub
         }
 
         public static Participant From(HttpContext context, WebSocket socket,
-            WebSocketTicketClaims claims)
+            WebSocketTicketClaims claims, ClientAddressResolver addressResolver)
         {
-            var publicAddress = ResolvePublicAddress(context);
+            var publicAddress = ResolvePublicAddress(context, addressResolver);
             var roomKey = claims.SharedRoom && !string.IsNullOrWhiteSpace(claims.RoomKey)
                 ? claims.RoomKey
                 : "public:" + publicAddress;
@@ -924,24 +927,17 @@ public sealed class PublicTransferDiscoveryHub
         public PublicTransferClusterParticipant ToCluster() => new(LeaseId, PeerId, DisplayName,
             RoomId, PublicAddress, RoomKey, RoomRole, SharedRoom, ConnectedAt);
 
-        private static string ResolvePublicAddress(HttpContext context)
+        /// <summary>
+        /// Resolves the public egress address used for "same network" grouping through the shared
+        /// trusted-proxy boundary, so a forged header cannot place a client into another group.
+        /// </summary>
+        private static string ResolvePublicAddress(HttpContext context,
+            ClientAddressResolver addressResolver)
         {
-            var realIp = context.Request.Headers["X-Real-IP"].FirstOrDefault();
-            if (!string.IsNullOrWhiteSpace(realIp))
-            {
-                return realIp.Trim();
-            }
-            var forwarded = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
-            if (!string.IsNullOrWhiteSpace(forwarded))
-            {
-                var last = forwarded.Split(',').LastOrDefault()?.Trim();
-                if (!string.IsNullOrWhiteSpace(last))
-                {
-                    return last;
-                }
-            }
-            return context.Connection.RemoteIpAddress?.ToString()
-                ?? PublicTransferCoordinationService.UnknownPublicAddress;
+            var resolved = addressResolver.Resolve(context);
+            return string.IsNullOrWhiteSpace(resolved) || resolved == ClientAddressResolver.Unknown
+                ? PublicTransferCoordinationService.UnknownPublicAddress
+                : resolved;
         }
 
         public void Dispose() => SendLock.Dispose();

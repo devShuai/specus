@@ -32,20 +32,22 @@ type clientMessageSocket struct {
 }
 
 type clientMessagesHub struct {
-	db       *store.DB
-	sessions *session.Registry
-	tickets  *security.WebSocketTicketService
-	logger   *slog.Logger
-	mu       sync.Mutex
-	sockets  map[string]map[*clientMessageSocket]struct{}
+	db              *store.DB
+	sessions        *session.Registry
+	tickets         *security.WebSocketTicketService
+	addressResolver *security.ClientAddressResolver
+	logger          *slog.Logger
+	mu              sync.Mutex
+	sockets         map[string]map[*clientMessageSocket]struct{}
 }
 
-func newClientMessagesHub(db *store.DB, sessions *session.Registry, tickets *security.WebSocketTicketService, logger *slog.Logger) *clientMessagesHub {
+func newClientMessagesHub(db *store.DB, sessions *session.Registry, tickets *security.WebSocketTicketService,
+	addressResolver *security.ClientAddressResolver, logger *slog.Logger) *clientMessagesHub {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &clientMessagesHub{
-		db: db, sessions: sessions, tickets: tickets, logger: logger,
+		db: db, sessions: sessions, tickets: tickets, addressResolver: addressResolver, logger: logger,
 		sockets: make(map[string]map[*clientMessageSocket]struct{}),
 	}
 }
@@ -58,7 +60,7 @@ func (h *clientMessagesHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims, err := h.tickets.Consume(r.Context(), ticket, security.WebSocketScopeClientMessages,
-		security.WebSocketRequestAddress(r))
+		security.WebSocketRequestAddress(h.addressResolver, r))
 	if err != nil || claims == nil || claims.Username == "" || claims.TenantID == "" {
 		w.Header().Set("X-Auth-Reason", "invalid ticket")
 		w.WriteHeader(http.StatusForbidden)

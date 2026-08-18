@@ -32,31 +32,34 @@ public class WebSocketConfig implements WebSocketConfigurer {
     private final PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler;
     private final ClientMessagesWebSocketHandler clientMessagesHandler;
     private final WebSocketTicketService ticketService;
+    private final com.theshuai.specusserver.security.ClientAddressResolver addressResolver;
 
     public WebSocketConfig(ConnectionEventsWebSocketHandler connectionEventsHandler,
                            PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler,
                            ClientMessagesWebSocketHandler clientMessagesHandler,
-                           WebSocketTicketService ticketService) {
+                           WebSocketTicketService ticketService,
+                           com.theshuai.specusserver.security.ClientAddressResolver addressResolver) {
         this.connectionEventsHandler = connectionEventsHandler;
         this.publicTransferDiscoveryHandler = publicTransferDiscoveryHandler;
         this.clientMessagesHandler = clientMessagesHandler;
         this.ticketService = ticketService;
+        this.addressResolver = addressResolver;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(connectionEventsHandler, "/ws/connections")
                 .addInterceptors(new WebSocketTicketHandshakeInterceptor(
-                        ticketService, WebSocketTicketService.Scope.CONNECTIONS, true))
+                        ticketService, addressResolver, WebSocketTicketService.Scope.CONNECTIONS, true))
                 // 默认 '*' 同源；显式写出来以示意，不引入 CORS 漏洞
                 .setAllowedOriginPatterns("*");
         registry.addHandler(publicTransferDiscoveryHandler, "/ws/public-transfer/discovery")
                 .addInterceptors(new WebSocketTicketHandshakeInterceptor(
-                        ticketService, WebSocketTicketService.Scope.PUBLIC_TRANSFER, true))
+                        ticketService, addressResolver, WebSocketTicketService.Scope.PUBLIC_TRANSFER, true))
                 .setAllowedOriginPatterns("*");
         registry.addHandler(clientMessagesHandler, "/ws/client-messages")
                 .addInterceptors(new WebSocketTicketHandshakeInterceptor(
-                        ticketService, WebSocketTicketService.Scope.CLIENT_MESSAGES, true))
+                        ticketService, addressResolver, WebSocketTicketService.Scope.CLIENT_MESSAGES, true))
                 .setAllowedOriginPatterns("*");
     }
 }

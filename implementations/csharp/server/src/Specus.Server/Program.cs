@@ -113,6 +113,7 @@ builder.Services.AddScoped<RegistrationService>();
 builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSender>();
 builder.Services.AddSingleton<ITurnstileVerifier, TurnstileVerifier>();
 builder.Services.AddSingleton<LoginRateLimiter>();
+builder.Services.AddSingleton<ClientAddressResolver>();
 builder.Services.AddHostedService<RegistrationChallengeCleanupService>();
 builder.Services.AddSingleton<TurnCredentialService>();
 builder.Services.AddScoped<PeerMeshService>();

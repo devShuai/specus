@@ -29,7 +29,7 @@ func TestBuiltInBearerRequiresCurrentEnabledPasswordConfiguration(t *testing.T) 
 	disabledTokens := security.NewLocalTokenService(disabled)
 	disabledAPI := NewAPI(db, session.NewRegistry(), disabledTokens, nil, nil, nil,
 		config.OidcConfig{}, disabled, config.ClientAuthConfig{}, config.TrafficConfig{},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if _, ok := disabledAPI.authenticate(context.Background(), adminToken); ok {
 		t.Fatal("built-in token remained valid after password login was disabled")
 	}
@@ -39,7 +39,7 @@ func TestBuiltInBearerRequiresCurrentEnabledPasswordConfiguration(t *testing.T) 
 	renamedTokens := security.NewLocalTokenService(renamed)
 	renamedAPI := NewAPI(db, session.NewRegistry(), renamedTokens, nil, nil, nil,
 		config.OidcConfig{}, renamed, config.ClientAuthConfig{}, config.TrafficConfig{},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if _, ok := renamedAPI.authenticate(context.Background(), adminToken); ok {
 		t.Fatal("old built-in username remained privileged after configuration changed")
 	}
@@ -47,7 +47,7 @@ func TestBuiltInBearerRequiresCurrentEnabledPasswordConfiguration(t *testing.T) 
 	userRoleToken := issued.IssueForUser("admin", "default", store.ManagementRoleUser)
 	enabledAPI := NewAPI(db, session.NewRegistry(), issued, nil, nil, nil,
 		config.OidcConfig{}, enabled, config.ClientAuthConfig{}, config.TrafficConfig{},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if _, ok := enabledAPI.authenticate(context.Background(), userRoleToken); ok {
 		t.Fatal("built-in username upgraded a USER token")
 	}

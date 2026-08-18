@@ -3,6 +3,7 @@ package com.theshuai.specusserver.management.controller;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.PublicTransferRoomService;
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import com.theshuai.specusserver.websocket.WebSocketRequestAddress;
 import com.theshuai.specusserver.websocket.WebSocketTicketHandshakeInterceptor;
 import com.theshuai.specusserver.websocket.WebSocketTicketService;
@@ -27,13 +28,16 @@ public class WebSocketTicketResource {
     private final WebSocketTicketService ticketService;
     private final ManagementContextResolver contextResolver;
     private final PublicTransferRoomService roomService;
+    private final ClientAddressResolver addressResolver;
 
     public WebSocketTicketResource(WebSocketTicketService ticketService,
                                    ManagementContextResolver contextResolver,
-                                   PublicTransferRoomService roomService) {
+                                   PublicTransferRoomService roomService,
+                                   ClientAddressResolver addressResolver) {
         this.ticketService = ticketService;
         this.contextResolver = contextResolver;
         this.roomService = roomService;
+        this.addressResolver = addressResolver;
     }
 
     @PostMapping("/api/admin/ws-tickets")
@@ -43,7 +47,7 @@ public class WebSocketTicketResource {
         ManagementContext context = contextResolver.resolve(jwt);
         WebSocketTicketService.Scope scope = WebSocketTicketService.Scope.adminEndpoint(
                 request == null ? null : request.endpoint());
-        String remoteAddress = WebSocketRequestAddress.resolve(servletRequest);
+        String remoteAddress = WebSocketRequestAddress.resolve(addressResolver, servletRequest);
         return ticketService.issue(scope, Map.of(
                 WebSocketTicketHandshakeInterceptor.ATTR_USER, context.username(),
                 WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID, context.tenant().tenantId(),
@@ -62,7 +66,7 @@ public class WebSocketTicketResource {
         String peerId = text(request.peerId(), "", MAX_PEER_ID_LENGTH);
         String displayName = text(request.displayName(), "web", MAX_DISPLAY_NAME_LENGTH);
         String roomToken = text(request.roomToken(), "", MAX_ROOM_TOKEN_LENGTH);
-        String publicAddress = WebSocketRequestAddress.resolve(servletRequest);
+        String publicAddress = WebSocketRequestAddress.resolve(addressResolver, servletRequest);
         boolean sharedRoom = StringUtils.hasText(roomToken);
 
         Map<String, Object> attributes = new LinkedHashMap<>();

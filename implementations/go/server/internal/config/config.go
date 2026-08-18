@@ -31,9 +31,12 @@ type Config struct {
 	TLS              TLSConfig              `json:"tls"`
 	// Env is the deployment environment: prod (default) | dev | test. Unset or unknown values
 	// resolve to prod so a typo never disables a production guard.
-	Env              string                 `json:"env"`
-	PublicAddress    string                 `json:"publicAddress"`
-	ConnectionString string                 `json:"connectionString"`
+	Env string `json:"env"`
+	// TrustedProxies lists reverse-proxy CIDRs whose X-Forwarded-For / X-Real-IP headers may be
+	// trusted. Empty (default) means forwarded headers are ignored and the connection peer is used.
+	TrustedProxies   []string `json:"trustedProxies"`
+	PublicAddress    string   `json:"publicAddress"`
+	ConnectionString string   `json:"connectionString"`
 	// ManagementAddr is the listen address for the admin/HTTP surface (default :8088).
 	ManagementAddr string `json:"managementAddr"`
 }
@@ -333,14 +336,14 @@ type ObjectStorageConfig struct {
 
 // PublicTransferConfig mirrors specus.public-transfer abuse-protection limits.
 type PublicTransferConfig struct {
-	PresignRateLimitPerIP                   int    `json:"presignRateLimitPerIp"`
-	PresignRateLimitWindowSeconds           int64  `json:"presignRateLimitWindowSeconds"`
-	MaxPendingUploadsPerRoom                int    `json:"maxPendingUploadsPerRoom"`
-	MaxDiscoveryPeersPerRoom                int    `json:"maxDiscoveryPeersPerRoom"`
-	DiscoveryMessageRateLimitPerConnection  int    `json:"discoveryMessageRateLimitPerConnection"`
-	DiscoveryMessageRateLimitWindowSeconds  int64  `json:"discoveryMessageRateLimitWindowSeconds"`
-	ClusterEnabled                          bool   `json:"clusterEnabled"`
-	RedisURI                                string `json:"redisUri"`
+	PresignRateLimitPerIP                  int    `json:"presignRateLimitPerIp"`
+	PresignRateLimitWindowSeconds          int64  `json:"presignRateLimitWindowSeconds"`
+	MaxPendingUploadsPerRoom               int    `json:"maxPendingUploadsPerRoom"`
+	MaxDiscoveryPeersPerRoom               int    `json:"maxDiscoveryPeersPerRoom"`
+	DiscoveryMessageRateLimitPerConnection int    `json:"discoveryMessageRateLimitPerConnection"`
+	DiscoveryMessageRateLimitWindowSeconds int64  `json:"discoveryMessageRateLimitWindowSeconds"`
+	ClusterEnabled                         bool   `json:"clusterEnabled"`
+	RedisURI                               string `json:"redisUri"`
 	// RedisKeyPrefix namespaces the coordination keys. The net-merged visibility
 	// indexes (nets/groupnets, global roster revision) are incompatible with
 	// pre-merge nodes: deploy all cluster nodes together, or bump this prefix so
@@ -669,6 +672,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("SPECUS_LOGIN_EXECUTOR_QUEUE", &cfg.Login.ExecutorQueueCapacity)
 
 	setStr("SPECUS_ENV", &cfg.Env)
+	setStrSlice("SPECUS_TRUSTED_PROXIES", &cfg.TrustedProxies)
 
 	setStr("SPECUS_DB_PROVIDER", &cfg.Database.Provider)
 	setBool("SPECUS_DB_SEED_DEMO_CLIENT", &cfg.Database.SeedDemoClient)

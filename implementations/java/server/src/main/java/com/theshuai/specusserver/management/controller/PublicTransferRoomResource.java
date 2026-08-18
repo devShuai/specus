@@ -13,6 +13,7 @@ import com.theshuai.specusserver.management.service.PublicTransferRoomService.Re
 import com.theshuai.specusserver.management.service.PublicTransferRoomService.RedeemPairingCodeResponse;
 import com.theshuai.specusserver.management.service.PublicTransferRoomService.RoomCredential;
 import com.theshuai.specusserver.management.service.PublicTransferRateLimiter;
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
@@ -28,11 +29,14 @@ import java.util.List;
 public class PublicTransferRoomResource {
     private final PublicTransferRoomService service;
     private final PublicTransferRateLimiter rateLimiter;
+    private final ClientAddressResolver addressResolver;
 
     public PublicTransferRoomResource(PublicTransferRoomService service,
-                                      PublicTransferRateLimiter rateLimiter) {
+                                      PublicTransferRateLimiter rateLimiter,
+                                      ClientAddressResolver addressResolver) {
         this.service = service;
         this.rateLimiter = rateLimiter;
+        this.addressResolver = addressResolver;
     }
 
     @PostMapping("/api/public/transfer/rooms/access-tokens/list")
@@ -97,19 +101,7 @@ public class PublicTransferRoomResource {
     }
 
     /** Same trusted-proxy address policy used by the public attachment endpoint and discovery WS. */
-    private static String clientIp(HttpServletRequest request) {
-        String realIp = request.getHeader("X-Real-IP");
-        if (StringUtils.hasText(realIp)) {
-            return realIp.trim();
-        }
-        String forwarded = request.getHeader("X-Forwarded-For");
-        if (StringUtils.hasText(forwarded)) {
-            String[] parts = forwarded.split(",");
-            String last = parts[parts.length - 1].trim();
-            if (StringUtils.hasText(last)) {
-                return last;
-            }
-        }
-        return request.getRemoteAddr();
+    private String clientIp(HttpServletRequest request) {
+        return addressResolver.resolve(request);
     }
 }

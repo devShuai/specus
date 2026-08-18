@@ -183,6 +183,22 @@ HTTP 登录响应通过 `nettyTls` 明确声明 control/data 原始 TCP 端点�
 证书主机名覆盖和仅开发使用的 `insecureSkipVerify`，控制连接与专用数据连接共用同一 TLS 策略和握手超时。
 管理 `serverBaseUrl=https` 不隐含 Netty TLS，因为 HTTPS 可能终止于 HTTP 反向代理。
 
+### 7.1.1 可信代理与真实客户端地址
+
+限流、配对码兑换、上传配额、WebSocket ticket 绑定和互传"同网"分组都使用同一个客户端地址解析组件
+（Java `ClientAddressResolver`、Go `security.ClientAddressResolver`、.NET `ClientAddressResolver`）。
+
+`SPECUS_TRUSTED_PROXIES` 配置可信反代 CIDR，默认空：
+
+- 连接对端不在可信网段时，`X-Forwarded-For` 与 `X-Real-IP` 完全不参与判定，直接使用连接对端地址。
+  直连客户端因此无法通过自带转发头改写自己的来源地址、绕过限流或劫持他人 ticket。
+- 连接对端可信时，按代理链**从右向左**解析 `X-Forwarded-For`：跳过链尾连续的可信代理，第一个非可信地址
+  即真实客户端；客户端在链首伪造的条目不会被采纳。非法地址一律丢弃。
+- 整条链都是可信代理（或没有 `X-Forwarded-For`）时，才使用代理显式覆写的 `X-Real-IP`。
+- 无法解析出地址时返回 `unknown`，该值永远不参与"同网"分组。
+
+部署反代时需要把后端端口限制为仅反代可达，并在反代上覆写这两个头，否则应保持 `SPECUS_TRUSTED_PROXIES` 为空。
+
 ### 7.2 客户端与管理面鉴权
 
 - 客户端 HTTP 登录使用 `ClientCredential` 的 apiKey/secret HMAC；Netty 控制连接只使用 `ClientSession` runtime token。

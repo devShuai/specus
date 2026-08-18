@@ -3,6 +3,7 @@ package com.theshuai.specusserver.management.controller;
 import com.theshuai.specusserver.management.model.TransferAttachmentView;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.PublicTransferRateLimiter;
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import com.theshuai.specusserver.management.service.TransferAttachmentService;
 import com.theshuai.specusserver.management.service.TransferAttachmentService.CompleteAttachmentRequest;
 import com.theshuai.specusserver.management.service.TransferAttachmentService.PresignDownloadRequest;
@@ -32,13 +33,16 @@ public class TransferAttachmentResource {
     private final TransferAttachmentService service;
     private final ManagementContextResolver contextResolver;
     private final PublicTransferRateLimiter rateLimiter;
+    private final ClientAddressResolver addressResolver;
 
     public TransferAttachmentResource(TransferAttachmentService service,
                                       ManagementContextResolver contextResolver,
-                                      PublicTransferRateLimiter rateLimiter) {
+                                      PublicTransferRateLimiter rateLimiter,
+                                      ClientAddressResolver addressResolver) {
         this.service = service;
         this.contextResolver = contextResolver;
         this.rateLimiter = rateLimiter;
+        this.addressResolver = addressResolver;
     }
 
     @PostMapping("/api/public/transfer/attachments/presign-upload")
@@ -79,23 +83,10 @@ public class TransferAttachmentResource {
     }
 
     /**
-     * 取来源 IP:优先可信反代覆写的 X-Real-IP,退而取 X-Forwarded-For 末位,均无则用连接对端。
-     * 与发现信令握手的取值口径一致,避免客户端自带的 XFF 首段伪造。
+     * 取来源 IP:与发现信令握手、房间接口共用同一套可信代理边界,转发头只有来自可信代理时才被采纳。
      */
-    private static String clientIp(HttpServletRequest request) {
-        String realIp = request.getHeader("X-Real-IP");
-        if (StringUtils.hasText(realIp)) {
-            return realIp.trim();
-        }
-        String forwarded = request.getHeader("X-Forwarded-For");
-        if (StringUtils.hasText(forwarded)) {
-            String[] parts = forwarded.split(",");
-            String last = parts[parts.length - 1].trim();
-            if (StringUtils.hasText(last)) {
-                return last;
-            }
-        }
-        return request.getRemoteAddr();
+    private String clientIp(HttpServletRequest request) {
+        return addressResolver.resolve(request);
     }
 
     @PostMapping("/api/public/transfer/attachments/{attachmentId}/complete")

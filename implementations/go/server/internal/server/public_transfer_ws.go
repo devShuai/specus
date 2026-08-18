@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -90,14 +89,15 @@ type discoverySocket struct {
 }
 
 type publicTransferDiscoveryHub struct {
-	cfg          config.PublicTransferConfig
-	tickets      *security.WebSocketTicketService
-	mu           sync.Mutex
-	participants map[*discoverySocket]discoveryParticipant
-	coordination *publicTransferCoordination
-	startupErr   error
-	refreshStop  chan struct{}
-	closeOnce    sync.Once
+	cfg             config.PublicTransferConfig
+	tickets         *security.WebSocketTicketService
+	addressResolver *security.ClientAddressResolver
+	mu              sync.Mutex
+	participants    map[*discoverySocket]discoveryParticipant
+	coordination    *publicTransferCoordination
+	startupErr      error
+	refreshStop     chan struct{}
+	closeOnce       sync.Once
 	// revisions keys local roster counters by netID: every roster push to a recipient
 	// carries a fresh tick of that recipient's own net counter, so a recipient never
 	// sees a regressing revision (aligned with the Java handler).
@@ -109,14 +109,17 @@ type publicTransferClientNameAvailability struct {
 	Available  bool   `json:"available"`
 }
 
-func newPublicTransferDiscoveryHub(cfg config.PublicTransferConfig, tickets *security.WebSocketTicketService) *publicTransferDiscoveryHub {
-	return newPublicTransferDiscoveryHubWithLogger(cfg, tickets, slog.Default())
+func newPublicTransferDiscoveryHub(cfg config.PublicTransferConfig, tickets *security.WebSocketTicketService,
+	addressResolver *security.ClientAddressResolver) *publicTransferDiscoveryHub {
+	return newPublicTransferDiscoveryHubWithLogger(cfg, tickets, addressResolver, slog.Default())
 }
 
-func newPublicTransferDiscoveryHubWithLogger(cfg config.PublicTransferConfig, tickets *security.WebSocketTicketService, logger *slog.Logger) *publicTransferDiscoveryHub {
+func newPublicTransferDiscoveryHubWithLogger(cfg config.PublicTransferConfig, tickets *security.WebSocketTicketService,
+	addressResolver *security.ClientAddressResolver, logger *slog.Logger) *publicTransferDiscoveryHub {
 	coordination, err := newPublicTransferCoordination(cfg, logger)
 	hub := &publicTransferDiscoveryHub{
-		cfg: cfg, tickets: tickets, participants: make(map[*discoverySocket]discoveryParticipant),
+		cfg: cfg, tickets: tickets, addressResolver: addressResolver,
+		participants: make(map[*discoverySocket]discoveryParticipant),
 		coordination: coordination, startupErr: err, refreshStop: make(chan struct{}),
 		revisions: make(map[string]*atomic.Uint64),
 	}
@@ -166,7 +169,7 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 		return
 	}
 	claims, err := h.tickets.Consume(r.Context(), ticket, security.WebSocketScopePublicTransfer,
-		security.WebSocketRequestAddress(r))
+		security.WebSocketRequestAddress(h.addressResolver, r))
 	if err != nil || claims == nil || claims.PeerID == "" || claims.RoomID == "" {
 		w.Header().Set("X-Auth-Reason", "invalid ticket")
 		w.WriteHeader(http.StatusForbidden)
@@ -184,7 +187,7 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 		peerID:        claims.PeerID,
 		displayName:   claims.DisplayName,
 		roomID:        claims.RoomID,
-		publicAddress: trustedClientIP(r),
+		publicAddress: h.trustedClientIP(r),
 		roomKey:       claims.RoomKey,
 		roomRole:      claims.RoomRole,
 		sharedRoom:    claims.SharedRoom,
@@ -778,24 +781,10 @@ func publicAddressKnown(publicAddress string) bool {
 	return publicAddress != "" && publicAddress != unknownPublicAddress
 }
 
-func trustedClientIP(r *http.Request) string {
-	if value := strings.TrimSpace(r.Header.Get("X-Real-IP")); value != "" {
-		return value
-	}
-	if forwarded := r.Header.Get("X-Forwarded-For"); strings.TrimSpace(forwarded) != "" {
-		parts := strings.Split(forwarded, ",")
-		if value := strings.TrimSpace(parts[len(parts)-1]); value != "" {
-			return value
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	if value := strings.TrimSpace(r.RemoteAddr); value != "" {
-		return value
-	}
-	return unknownPublicAddress
+// trustedClientIP resolves the public egress address used for "same network" grouping through the
+// shared trusted-proxy boundary, so a forged header cannot place a client into someone else's group.
+func (h *publicTransferDiscoveryHub) trustedClientIP(r *http.Request) string {
+	return h.addressResolver.Resolve(r)
 }
 
 func randomDiscoveryID() string {

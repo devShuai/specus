@@ -65,6 +65,7 @@ type App struct {
 	rooms                   *transfer.RoomService
 	mediaCapture            *media.Service
 	webSocketTickets        *security.WebSocketTicketService
+	addressResolver         *security.ClientAddressResolver
 }
 
 // New opens the database, applies the schema, seeds the demo client, and builds the app.
@@ -177,10 +178,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 
 	tokens := security.NewLocalTokenService(cfg.Auth)
 	webSocketTickets := security.NewWebSocketTicketService(db)
+	addressResolver := security.NewClientAddressResolver(cfg.TrustedProxies, logger)
 	oidcValidator := security.NewOidcValidator(cfg.Oidc)
 	peerMesh := peermesh.New(cfg.PeerMesh, db, sessions, logger)
 	publicTransferDiscovery := newPublicTransferDiscoveryHubWithLogger(
-		cfg.PublicTransfer, webSocketTickets, logger)
+		cfg.PublicTransfer, webSocketTickets, addressResolver, logger)
 	if publicTransferDiscovery.startupErr != nil {
 		_ = db.Close()
 		return nil, publicTransferDiscovery.startupErr
@@ -231,9 +233,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
-		}, peerMesh, attachments, rooms, logger)
+		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
-	wsHub := wsevents.NewHub(webSocketTickets, func(access wsevents.Access, event wsevents.Event) bool {
+	wsHub := wsevents.NewHub(webSocketTickets, addressResolver, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
 		}
@@ -267,7 +269,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			},
 		})
 	}
-	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, logger)
+	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, addressResolver, logger)
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
 		_ = publicTransferDiscovery.Close()
@@ -329,6 +331,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		rooms:                   rooms,
 		mediaCapture:            mediaCapture,
 		webSocketTickets:        webSocketTickets,
+		addressResolver:         addressResolver,
 	}, nil
 }
 

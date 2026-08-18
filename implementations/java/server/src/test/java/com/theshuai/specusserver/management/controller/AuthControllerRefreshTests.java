@@ -5,6 +5,8 @@ import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
 import com.theshuai.specusserver.config.AuthProperties;
+import com.theshuai.specusserver.config.TrustedProxyProperties;
+import com.theshuai.specusserver.security.ClientAddressResolver;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.LoginRateLimiter;
 import com.theshuai.specusserver.security.TurnstileVerifier;
@@ -36,7 +38,8 @@ class AuthControllerRefreshTests {
                 users,
                 mock(RegistrationService.class),
                 mock(TurnstileVerifier.class),
-                new LoginRateLimiter(new AuthProperties()));
+                new LoginRateLimiter(new AuthProperties()),
+                new ClientAddressResolver(new TrustedProxyProperties()));
     }
 
     @Test

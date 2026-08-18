@@ -34,15 +34,18 @@ public sealed class ClientMessagesHub
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly SessionRegistry _sessions;
     private readonly WebSocketTicketService _tickets;
+    private readonly ClientAddressResolver _addressResolver;
     private readonly ILogger<ClientMessagesHub> _logger;
 
     public ClientMessagesHub(IServiceScopeFactory scopeFactory, SessionRegistry sessions,
         WebSocketTicketService tickets,
+        ClientAddressResolver addressResolver,
         ILogger<ClientMessagesHub> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
         _tickets = tickets;
+        _addressResolver = addressResolver;
         _logger = logger;
     }
 
@@ -56,7 +59,7 @@ public sealed class ClientMessagesHub
 
         var ticket = WebSocketTicketService.ExtractTicket(context.Request);
         var claims = await _tickets.ConsumeAsync(ticket, WebSocketTicketService.ClientMessagesScope,
-            WebSocketTicketService.RequestAddress(context), context.RequestAborted).ConfigureAwait(false);
+            WebSocketTicketService.RequestAddress(_addressResolver, context), context.RequestAborted).ConfigureAwait(false);
         if (claims is null || string.IsNullOrWhiteSpace(claims.Username))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;

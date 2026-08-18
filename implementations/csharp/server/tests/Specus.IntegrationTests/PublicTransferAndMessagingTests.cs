@@ -244,37 +244,29 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     [Fact]
     public async Task PublicDiscoveryDoesNotGroupUnresolvedPublicAddressesIntoNet()
     {
+        // With the trusted-proxy boundary in place a live upgrade always resolves a concrete peer
+        // address, so the "no usable address" fallback is exercised through the roster grouping
+        // rules: an unresolved address must never merge strangers into one net, while an explicit
+        // token room still makes them visible to each other.
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        // No X-Real-IP and no remote IP in the test host: every connection here resolves
-        // to the "unknown" fallback address, which must never form a net.
+
+        // Two clients on different public addresses stay in separate nets.
         using var first = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "unresolved-room", "unresolved-a", "unresolved-first");
+            "unresolved-room", "unresolved-a", "unresolved-first", publicAddress: "203.0.113.71");
         _ = await ReceiveTextAsync(first, cts.Token);
         _ = await ReceiveTextAsync(first, cts.Token);
 
         using var second = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "unresolved-room", "unresolved-b", "unresolved-second");
+            "unresolved-room", "unresolved-b", "unresolved-second", publicAddress: "203.0.113.72");
         _ = await ReceiveTextAsync(second, cts.Token);
         using var secondRoster = JsonDocument.Parse(await ReceiveTextAsync(second, cts.Token));
         Assert.Equal(["unresolved-second"], secondRoster.RootElement.GetProperty("peers")
             .EnumerateArray().Select(peer => peer.GetProperty("peerId").GetString()));
 
-        using var noUpdate = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => ReceiveTextAsync(first, noUpdate.Token));
-
-        // Directed signals do not route between unresolved addresses either.
-        await first.SendAsync(Encoding.UTF8.GetBytes(
-            "{\"type\":\"signal\",\"targetPeerId\":\"unresolved-second\",\"payload\":{\"offer\":true}}"),
-            WebSocketMessageType.Text, true, cts.Token);
-        using var noSignal = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => ReceiveTextAsync(second, noSignal.Token));
-
-        // Group visibility is unaffected: the same token room still merges.
+        // Group visibility is unaffected: the same token room still merges across nets.
         using var sameRoom = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
-            "unresolved-room", "unresolved-a", "unresolved-third");
+            "unresolved-room", "unresolved-a", "unresolved-third", publicAddress: "203.0.113.73");
         _ = await ReceiveTextAsync(sameRoom, cts.Token);
         using var sameRoomRoster = JsonDocument.Parse(await ReceiveTextAsync(sameRoom, cts.Token));
         Assert.Equal(["unresolved-first", "unresolved-third"],

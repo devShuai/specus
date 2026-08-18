@@ -10,6 +10,7 @@ public static class WebSocketTicketEndpoints
     {
         app.MapPost("/api/admin/ws-tickets", async (HttpContext context,
             AdminWebSocketTicketRequest? request, WebSocketTicketService tickets,
+            ClientAddressResolver addressResolver,
             CancellationToken cancellationToken) =>
         {
             var scope = request?.Endpoint?.Trim() switch
@@ -27,7 +28,7 @@ public static class WebSocketTicketEndpoints
                 ?? context.User.FindFirst("role")?.Value;
             context.Response.Headers.CacheControl = "no-store";
             return Results.Ok(await tickets.IssueAsync(scope,
-                WebSocketTicketService.RequestAddress(context),
+                WebSocketTicketService.RequestAddress(addressResolver, context),
                 new WebSocketTicketClaims(username, tenantId,
                     string.Equals(role, "ADMIN", StringComparison.OrdinalIgnoreCase)),
                 cancellationToken).ConfigureAwait(false));
@@ -35,7 +36,7 @@ public static class WebSocketTicketEndpoints
 
         app.MapPost("/api/public/transfer/ws-tickets", async (HttpContext context,
             PublicWebSocketTicketRequest? request, WebSocketTicketService tickets,
-            PublicTransferRoomService rooms,
+            PublicTransferRoomService rooms, ClientAddressResolver addressResolver,
             CancellationToken cancellationToken) =>
         {
             if (request is null)
@@ -48,7 +49,7 @@ public static class WebSocketTicketEndpoints
             var displayName = Truncate(request.DisplayName, 120, "web");
             var roomToken = Truncate(request.RoomToken, 512, string.Empty);
             var sharedRoom = roomToken.Length > 0;
-            var requestAddress = WebSocketTicketService.RequestAddress(context);
+            var requestAddress = WebSocketTicketService.RequestAddress(addressResolver, context);
             var roomKey = "public:" + requestAddress;
             var roomRole = PublicTransferRoomService.RoomRole.Editor;
             if (sharedRoom)

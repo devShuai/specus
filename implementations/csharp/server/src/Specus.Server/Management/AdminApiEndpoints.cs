@@ -733,24 +733,9 @@ public static class AdminApiEndpoints
         return string.IsNullOrWhiteSpace(forwarded) ? context.Request.Host.ToString() : forwarded.Split(',', 2)[0].Trim();
     }
 
-    private static string ClientIp(HttpContext context)
-    {
-        var realIp = context.Request.Headers["X-Real-IP"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(realIp))
-        {
-            return realIp.Trim();
-        }
-        var forwarded = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(forwarded))
-        {
-            var last = forwarded.Split(',').LastOrDefault()?.Trim();
-            if (!string.IsNullOrWhiteSpace(last))
-            {
-                return last;
-            }
-        }
-        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-    }
+    /// <summary>Rate-limit identity resolved through the shared trusted-proxy boundary.</summary>
+    private static string ClientIp(HttpContext context) =>
+        context.RequestServices.GetRequiredService<ClientAddressResolver>().Resolve(context);
 
     private static bool RequiresBearerAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)

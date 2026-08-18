@@ -100,24 +100,12 @@ public sealed class WebSocketTicketService
         return string.IsNullOrWhiteSpace(ticket) ? null : ticket;
     }
 
-    public static string RequestAddress(HttpContext context)
-    {
-        var realIp = context.Request.Headers["X-Real-IP"].FirstOrDefault()?.Trim();
-        if (!string.IsNullOrWhiteSpace(realIp))
-        {
-            return realIp;
-        }
-        var forwarded = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(forwarded))
-        {
-            var last = forwarded.Split(',').LastOrDefault()?.Trim();
-            if (!string.IsNullOrWhiteSpace(last))
-            {
-                return last;
-            }
-        }
-        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-    }
+    /// <summary>
+    /// Must produce the same binding for the ticket POST and the upgrade. Both go through the shared
+    /// trusted-proxy boundary so a forged header cannot rebind someone else's ticket.
+    /// </summary>
+    public static string RequestAddress(ClientAddressResolver resolver, HttpContext context) =>
+        resolver.Resolve(context);
 
     public static string RoomKey(string roomToken) =>
         "token:" + Digest(roomToken).ToLowerInvariant();

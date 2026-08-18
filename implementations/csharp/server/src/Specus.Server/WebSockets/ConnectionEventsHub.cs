@@ -16,14 +16,17 @@ public sealed class ConnectionEventsHub
     private readonly ConcurrentDictionary<Guid, ConnectionEventSubscription> _sockets = new();
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly WebSocketTicketService _tickets;
+    private readonly ClientAddressResolver _addressResolver;
     private readonly PublicTransferCoordinationService _coordination;
     private readonly ILogger<ConnectionEventsHub> _logger;
 
     public ConnectionEventsHub(IServiceScopeFactory scopeFactory, WebSocketTicketService tickets,
+        ClientAddressResolver addressResolver,
         PublicTransferCoordinationService coordination, ILogger<ConnectionEventsHub> logger)
     {
         _scopeFactory = scopeFactory;
         _tickets = tickets;
+        _addressResolver = addressResolver;
         _coordination = coordination;
         _logger = logger;
         _coordination.AddListener(HandleClusterEventAsync);
@@ -39,7 +42,7 @@ public sealed class ConnectionEventsHub
 
         var ticket = WebSocketTicketService.ExtractTicket(context.Request);
         var claims = await _tickets.ConsumeAsync(ticket, WebSocketTicketService.ConnectionsScope,
-            WebSocketTicketService.RequestAddress(context), context.RequestAborted).ConfigureAwait(false);
+            WebSocketTicketService.RequestAddress(_addressResolver, context), context.RequestAborted).ConfigureAwait(false);
         if (claims is null || string.IsNullOrWhiteSpace(claims.Username))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
