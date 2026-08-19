@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -37,11 +36,12 @@ public sealed class ControlConnectionFactoryTests
             Assert.IsType<SslStream>(connection.Stream);
             await server;
         }
-        catch (Exception ex) when (IsUnavailableWindowsTls(ex))
+        catch (Exception ex)
         {
             timeout.Cancel();
             await IgnoreExpectedTlsAbortAsync(server);
-            return;
+            throw new Xunit.Sdk.XunitException(
+                $"the handshake should have completed: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -64,12 +64,6 @@ public sealed class ControlConnectionFactoryTests
             "127.0.0.1", LocalPort(listener), ConnectionRole.Control,
             runtimeNettyTls: false, cancellationToken: timeout.Token));
 
-        if (error is not null && IsUnavailableWindowsTls(error))
-        {
-            timeout.Cancel();
-            await IgnoreExpectedTlsAbortAsync(server);
-            return;
-        }
         Assert.IsType<AuthenticationException>(error);
         await IgnoreExpectedTlsAbortAsync(server);
     }
@@ -88,12 +82,6 @@ public sealed class ControlConnectionFactoryTests
             "127.0.0.1", LocalPort(listener), ConnectionRole.Control,
             runtimeNettyTls: true, cancellationToken: timeout.Token));
 
-        if (error is not null && IsUnavailableWindowsTls(error))
-        {
-            timeout.Cancel();
-            await IgnoreExpectedTlsAbortAsync(server);
-            return;
-        }
         Assert.IsType<AuthenticationException>(error);
         await IgnoreExpectedTlsAbortAsync(server);
     }
@@ -116,12 +104,6 @@ public sealed class ControlConnectionFactoryTests
             "127.0.0.1", LocalPort(listener), ConnectionRole.Data,
             runtimeNettyTls: false, cancellationToken: CancellationToken.None));
 
-        if (error is not null && IsUnavailableWindowsTls(error))
-        {
-            serverCancellation.Cancel();
-            await server;
-            return;
-        }
         var timeoutError = Assert.IsType<TimeoutException>(error);
         Assert.Contains("data", timeoutError.Message, StringComparison.Ordinal);
         serverCancellation.Cancel();
@@ -207,16 +189,6 @@ public sealed class ControlConnectionFactoryTests
         }
     }
 
-    private static bool IsUnavailableWindowsTls(Exception exception)
-        => OperatingSystem.IsWindows()
-           && exception is AuthenticationException
-           {
-               InnerException: Win32Exception
-               {
-                   NativeErrorCode: unchecked((int)0x8009030E),
-               },
-           };
-
     private sealed class TestCertificates : IDisposable
     {
         private TestCertificates(string caPath, X509Certificate2 ca, X509Certificate2 server)
@@ -259,7 +231,13 @@ public sealed class ControlConnectionFactoryTests
             var serial = RandomNumberGenerator.GetBytes(16);
             using var publicServer = serverRequest.Create(
                 ca, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(12), serial);
-            var server = publicServer.CopyWithPrivateKey(serverKey);
+            // Round-tripped through PKCS#12 rather than handed the key object directly:
+            // CopyWithPrivateKey leaves an ephemeral key, and Windows Schannel refuses one as a
+            // server credential. Without this the test server aborts mid-handshake and the client
+            // sees only "unexpected EOF", which is not the failure any of these tests are about.
+            using var ephemeral = publicServer.CopyWithPrivateKey(serverKey);
+            var server = X509CertificateLoader.LoadPkcs12(
+                ephemeral.Export(X509ContentType.Pfx), null);
 
             var caPath = Path.Combine(Path.GetTempPath(), $"specus-ca-{Guid.NewGuid():N}.pem");
             File.WriteAllText(caPath, ca.ExportCertificatePem());
