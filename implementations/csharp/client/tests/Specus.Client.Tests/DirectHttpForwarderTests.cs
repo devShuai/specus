@@ -84,12 +84,10 @@ public class DirectHttpForwarderTests
         Assert.False(handler.UseProxy);
         Assert.False(handler.AllowAutoRedirect);
         Assert.Equal(DecompressionMethods.None, handler.AutomaticDecompression);
-        Assert.NotNull(handler.SslOptions.RemoteCertificateValidationCallback);
-        Assert.True(handler.SslOptions.RemoteCertificateValidationCallback!(
-            sender: new object(),
-            certificate: null,
-            chain: null,
-            sslPolicyErrors: SslPolicyErrors.RemoteCertificateChainErrors));
+        // Both clients now verify upstream certificates. This used to assert the opposite, when
+        // each accepted anything a forwarding target presented; the absence of a callback is what
+        // leaves the platform to perform its normal chain and hostname checks.
+        Assert.Null(handler.SslOptions.RemoteCertificateValidationCallback);
     }
 
     [Theory]

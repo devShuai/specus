@@ -25,6 +25,10 @@ public class NettyClientLifecycle implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+        // Published before any forwarding starts, so the handlers that build their SSL context
+        // statically see the operator's policy rather than the verifying default.
+        UpstreamTlsPolicyHolder.configure(startupConfig.getUpstreamTls());
+
         ControlTlsConfig tls = startupConfig.getControlTls();
         boolean tlsEnabled = tls.resolveEnabled(specusBean.isNettyTls());
         SslContext sslContext = null;

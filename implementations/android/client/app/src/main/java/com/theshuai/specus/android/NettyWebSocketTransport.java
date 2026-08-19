@@ -29,7 +29,6 @@ import io.netty.handler.codec.http.websocketx.WebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.util.ReferenceCountUtil;
 
 import java.io.IOException;
@@ -62,7 +61,7 @@ final class NettyWebSocketTransport {
             "sec-websocket-version", "sec-websocket-extensions",
             "sec-websocket-protocol", "sec-websocket-accept");
     private static final NioEventLoopGroup EVENT_LOOPS = new NioEventLoopGroup(0, daemonFactory());
-    private static final SslContext INSECURE_CLIENT_TLS = buildTlsContext();
+    private static final SslContext UPSTREAM_TLS_CONTEXT = buildTlsContext();
 
     interface SocketProtector {
         void protect(Socket socket) throws IOException;
@@ -144,7 +143,7 @@ final class NettyWebSocketTransport {
                         protect(socketChannel);
                         if ("wss".equalsIgnoreCase(scheme)) {
                             socketChannel.pipeline().addLast(
-                                    INSECURE_CLIENT_TLS.newHandler(socketChannel.alloc(), host, port));
+                                    tlsHandler(socketChannel, host, port));
                         }
                         socketChannel.pipeline().addLast(new HttpClientCodec());
                         socketChannel.pipeline().addLast(new HttpObjectAggregator(65_536));
@@ -465,14 +464,23 @@ final class NettyWebSocketTransport {
         return value.substring(start, end);
     }
 
+    /**
+     * Builds the TLS handler for one upstream connection, with hostname verification enabled. The
+     * trust manager proves a certificate is trusted, not that it belongs to the host being
+     * dialled; without this a valid certificate for any host would be accepted for every host.
+     */
+    private static io.netty.handler.ssl.SslHandler tlsHandler(
+            io.netty.channel.socket.SocketChannel channel, String host, int port) {
+        io.netty.handler.ssl.SslHandler handler =
+                UPSTREAM_TLS_CONTEXT.newHandler(channel.alloc(), host, port);
+        UpstreamTlsPolicy.current().applyHostnameVerification(handler.engine());
+        return handler;
+    }
+
     private static SslContext buildTlsContext() {
-        try {
-            return SslContextBuilder.forClient()
-                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                    .build();
-        } catch (Exception error) {
-            throw new ExceptionInInitializerError(error);
-        }
+        // Verified by default; see UpstreamTlsPolicy for why, and for how a self-signed target is
+        // described. This used to trust every certificate unconditionally.
+        return UpstreamTlsPolicy.current().buildContext();
     }
 
     private static ThreadFactory daemonFactory() {

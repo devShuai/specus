@@ -26,9 +26,9 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import com.theshuai.specusclient.client.UpstreamTlsPolicyHolder;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -185,8 +185,14 @@ final class HttpStreamForwarder implements Runnable {
                     @Override
                     protected void initChannel(SocketChannel channel) {
                         if ("https".equalsIgnoreCase(target.getScheme())) {
-                            channel.pipeline().addLast(LOCAL_HTTP_SSL_CONTEXT.newHandler(
-                                    channel.alloc(), target.getHost(), port));
+                            io.netty.handler.ssl.SslHandler sslHandler = LOCAL_HTTP_SSL_CONTEXT
+                                    .newHandler(channel.alloc(), target.getHost(), port);
+                            // A trust manager proves the certificate is trusted, not that it
+                            // belongs to this host. Without this a valid certificate for any host
+                            // would be accepted for every host.
+                            UpstreamTlsPolicyHolder.current()
+                                    .applyHostnameVerification(sslHandler.engine());
+                            channel.pipeline().addLast(sslHandler);
                         }
                         channel.pipeline().addLast(new HttpClientCodec());
                         channel.pipeline().addLast(new UpstreamResponseHandler(exchange));
@@ -252,13 +258,9 @@ final class HttpStreamForwarder implements Runnable {
     }
 
     private static SslContext buildLocalHttpSslContext() {
-        try {
-            return SslContextBuilder.forClient()
-                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                    .build();
-        } catch (Exception error) {
-            throw new ExceptionInInitializerError(error);
-        }
+        // Verified by default; see UpstreamTlsConfig for why, and for how a self-signed target is
+        // described. This used to trust every certificate unconditionally.
+        return UpstreamTlsPolicyHolder.current().buildContext();
     }
 
     private static boolean shouldForward(String name) {

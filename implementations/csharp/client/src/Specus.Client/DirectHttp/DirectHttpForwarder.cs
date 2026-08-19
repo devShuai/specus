@@ -45,12 +45,9 @@ public sealed class DirectHttpForwarder
             ConnectTimeout = TimeSpan.FromSeconds(5),
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
             UseProxy = false,
-            // Java DirectHttpForwarder trusts operator-configured LAN HTTPS upstreams, which
-            // commonly use self-signed certificates for PVE, NAS, Nacos, and similar services.
-            SslOptions = new SslClientAuthenticationOptions
-            {
-                RemoteCertificateValidationCallback = static (_, _, _, _) => true,
-            },
+            // Verified by default; see UpstreamTlsPolicy for why, and for how a self-signed
+            // target is described. This used to accept every certificate unconditionally.
+            SslOptions = UpstreamTlsPolicy.Current.CreateOptions(string.Empty),
         };
         return handler;
     }

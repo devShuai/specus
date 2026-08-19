@@ -9,6 +9,7 @@ public class ClientStartupConfig {
     private String apiKey;
     private String secret;
     private ControlTlsConfig controlTls = new ControlTlsConfig();
+    private UpstreamTlsConfig upstreamTls = new UpstreamTlsConfig();
     private String peerMeshDevice = "noop";
     private String peerMeshTunName = "specus0";
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;

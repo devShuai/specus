@@ -28,9 +28,9 @@ import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
+import com.theshuai.specusclient.client.UpstreamTlsPolicyHolder;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.bytes.ByteArrayDecoder;
@@ -458,9 +458,14 @@ public class NatClientHandler extends NatCommonHandler {
                                 target, WebSocketVersion.V13, null, true,
                                 buildWsHandshakeHeaders(natMessagePacket), LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES);
                         if ("wss".equalsIgnoreCase(target.getScheme())) {
-                            ch.pipeline().addLast(LOCAL_WS_SSL_CONTEXT.newHandler(
+                            io.netty.handler.ssl.SslHandler sslHandler = LOCAL_WS_SSL_CONTEXT.newHandler(
                                     ch.alloc(), target.getHost(),
-                                    target.getPort() == -1 ? defaultPort(target.getScheme()) : target.getPort()));
+                                    target.getPort() == -1 ? defaultPort(target.getScheme()) : target.getPort());
+                            // See HttpStreamForwarder: the trust manager alone does not check that
+                            // the certificate belongs to the host being dialled.
+                            UpstreamTlsPolicyHolder.current()
+                                    .applyHostnameVerification(sslHandler.engine());
+                            ch.pipeline().addLast(sslHandler);
                         }
                         ch.pipeline().addLast(new HttpClientCodec());
                         ch.pipeline().addLast(new HttpObjectAggregator(65536));
@@ -542,15 +547,9 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     private static SslContext buildLocalWsSslContext() {
-        try {
-            // DirectHttpForwarder also trusts operator-managed LAN endpoints, where
-            // self-signed certificates are common. Keep HTTP and WebSocket behavior aligned.
-            return SslContextBuilder.forClient()
-                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                    .build();
-        } catch (Exception e) {
-            throw new IllegalStateException("failed to initialize local WebSocket TLS", e);
-        }
+        // Verified by default, and aligned with the HTTP forwarding path: both go through the
+        // same policy, so a target configured once behaves the same on either protocol.
+        return UpstreamTlsPolicyHolder.current().buildContext();
     }
 
     private static String withoutQuery(URI uri) {

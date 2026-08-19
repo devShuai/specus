@@ -64,14 +64,14 @@ internal sealed class RawWebSocketConnection : IAsyncDisposable
             Stream stream = tcp.GetStream();
             if (target.Scheme == "wss")
             {
+                // Verified like any other upstream connection, and through the same policy as the
+                // HTTP path, so a target configured once behaves the same on either protocol.
+                var options = UpstreamTlsPolicy.Current.CreateOptions(target.IdnHost);
                 var tls = new SslStream(stream, leaveInnerStreamOpen: false,
-                    AcceptLocalCertificate);
-                await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
-                {
-                    TargetHost = target.IdnHost,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                    CertificateRevocationCheckMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck,
-                }, cancellationToken).ConfigureAwait(false);
+                    options.RemoteCertificateValidationCallback is null
+                        ? null
+                        : new RemoteCertificateValidationCallback(options.RemoteCertificateValidationCallback));
+                await tls.AuthenticateAsClientAsync(options, cancellationToken).ConfigureAwait(false);
                 stream = tls;
             }
 
