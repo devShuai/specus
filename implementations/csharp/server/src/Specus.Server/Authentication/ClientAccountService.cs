@@ -472,6 +472,10 @@ public sealed class ClientAccountService
             MessageAttachmentsCapable = environment.ClientMessageCapabilities.Attachments,
             MessageMediaPreviewCapable = environment.ClientMessageCapabilities.MediaPreview,
             MessageMaxAttachmentBytes = Math.Max(0L, environment.ClientMessageCapabilities.MaxAttachmentBytes),
+            PeerServiceDiscoveryVersion = PeerMeshService.NormalizeDiscoveryVersion(
+                environment.ClientPeerServiceCapabilities.Version),
+            PeerServiceApplications = PeerMeshService.EncodeApplications(
+                environment.ClientPeerServiceCapabilities.Applications),
             HttpLoginAt = DateTimeOffset.UtcNow,
             ExpiresAt = session.ExpiresAt,
         };

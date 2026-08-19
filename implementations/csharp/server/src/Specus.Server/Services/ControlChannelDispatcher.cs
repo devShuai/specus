@@ -100,7 +100,8 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 await using (var scope = _services.CreateAsyncScope())
                 {
                     var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
-                    await peerMesh.HandleSignalAsync(message, context.ClientName!, context.Lifetime)
+                    await peerMesh.HandleSignalAsync(message, context.ClientName!, context.Lifetime,
+                            context.ClientSessionId)
                         .ConfigureAwait(false);
                 }
                 return;

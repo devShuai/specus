@@ -24,6 +24,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private const string TypeTrafficReport = "traffic-report";
     private const string TypeDeviceReport = "device-report";
     private const string TypeClose = "close";
+    private const string TypeServiceCatalog = "service-catalog";
 
     private const string RelayProbePrimary = "primary";
     private const string RelayProbeAlternate = "alternate";
@@ -122,6 +123,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly TurnLongTermAuthenticator _turnAuthenticator = new();
     private readonly NatBehaviorDiscovery _natBehaviorDiscovery = new();
     private readonly PeerUdpProbeRateLimiter _udpProbeRateLimiter = new();
+    private readonly PeerServiceRuntime _serviceRuntime;
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
@@ -157,6 +159,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _logger = logger;
         _observer = observer;
         _portMappingService = new NatPortMappingService(logger);
+        _serviceRuntime = new PeerServiceRuntime(SendServiceReport, logger);
     }
 
     internal Task? ReceiveTask
@@ -186,6 +189,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         UpdateTurnCredentials(runtime.PeerMesh);
         if (!runtime.PeerMesh.Enabled)
         {
+            _serviceRuntime.ApplyConfig(runtime.PeerMesh);
+            _serviceRuntime.SetHasAuthorizedOnlinePeer(false);
             await StopAsync().ConfigureAwait(false);
             return;
         }
@@ -214,6 +219,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _ = TryAcquirePortMappingAsync(CancellationToken.None);
             await RequestRelayCandidatesAsync().ConfigureAwait(false);
             await AnnounceCandidatesAsync().ConfigureAwait(false);
+            _serviceRuntime.ApplyConfig(runtime.PeerMesh);
             return;
         }
 
@@ -324,6 +330,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
         await AnnounceCandidatesAsync().ConfigureAwait(false);
+        _serviceRuntime.ApplyConfig(runtime.PeerMesh);
     }
 
     private void UpdateTurnCredentials(PeerMeshConfig config)
@@ -546,6 +553,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     break;
                 case TypeClose:
                     CloseSession(message);
+                    break;
+                case TypeServiceCatalog:
+                    _serviceRuntime.ApplyCatalog(
+                        message.PublisherClientId,
+                        message.PublisherClientName,
+                        message.PublisherSessionId ?? 0,
+                        message.Revision ?? 0,
+                        message.ExpiresAt,
+                        message.Services);
+                    PublishPeerMeshSnapshot();
                     break;
                 default:
                     _logger.LogDebug("ignored peer-control message type={Type}", message.Type);
@@ -2231,6 +2248,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 }
                 _peers[peer.ClientId] = peer;
             }
+            var onlinePeer = _peers.Values.Any(item => item.Online);
+            _serviceRuntime.SetRoster(_peers.ToDictionary(
+                item => item.Key,
+                item => new PeerServiceRuntime.RosterHint(item.Value.VirtualIp ?? "", item.Value.Online)));
+            _serviceRuntime.SetHasAuthorizedOnlinePeer(onlinePeer);
         }
         PublishPeerMeshSnapshot();
     }
@@ -4541,9 +4563,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    public void SetLocalServicePublished(string serviceId, bool published)
+    {
+        _serviceRuntime.SetLocalPublished(serviceId, published);
+        PublishPeerMeshSnapshot();
+    }
+
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
+        _serviceRuntime.Dispose();
     }
 
     private sealed record StopState(
@@ -4607,10 +4636,52 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         ExpiresAt = item.ExpiresAt,
                     })
                     .ToList(),
+                RemoteServices = _serviceRuntime.RemoteServices()
+                    .Select(item => new PeerRemoteServiceSnapshot
+                    {
+                        PublisherClientId = item.PublisherClientId,
+                        PublisherClientName = item.PublisherClientName,
+                        PublisherSessionId = item.PublisherSessionId,
+                        Application = item.Service.Application,
+                        AccessTarget = item.AccessTarget,
+                        Openable = item.Openable,
+                        Copyable = item.Copyable,
+                        UnavailableReason = item.UnavailableReason,
+                    })
+                    .ToList(),
+                LocalServices = _serviceRuntime.LocalServices
+                    .Select(item => new PeerLocalServiceSnapshot
+                    {
+                        ServiceId = item.ServiceId,
+                        Name = item.Name,
+                        Application = item.Application,
+                        Target = $"{item.TargetHost}:{item.TargetPort}",
+                        PublishedPort = item.PublishedPort,
+                        ConfigEnabled = item.Enabled,
+                        LocallyPublished = _serviceRuntime.IsLocallyPublished(item.ServiceId),
+                    })
+                    .ToList(),
                 UpdatedAt = DateTimeOffset.Now,
             };
         }
         observer.OnPeerMeshChanged(snapshot);
+    }
+
+    private void SendServiceReport(string json)
+    {
+        var runtime = Runtime();
+        var writer = Writer();
+        if (runtime is null || writer is null)
+        {
+            return;
+        }
+        _ = writer.WriteAsync(new MessageRequestPacket
+        {
+            ClientName = runtime.ClientName,
+            ToClientName = "",
+            MessageType = MessageType.PeerControl,
+            Message = json,
+        }, CancellationToken.None);
     }
 
     internal static UdpClient CreatePeerUdpClient()
@@ -5010,6 +5081,23 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public int DataFrameVersion { get; set; } = 2;
         [JsonPropertyName("createdAtMillis")]
         public long CreatedAtMillis { get; set; }
+        [JsonPropertyName("enabled")]
+        public bool? Enabled { get; set; }
+        [JsonPropertyName("revision")]
+        public long? Revision { get; set; }
+        [JsonPropertyName("publisherClientId")]
+        [JsonConverter(typeof(NullToZeroInt64Converter))]
+        public long PublisherClientId { get; set; }
+        [JsonPropertyName("publisherClientName")]
+        public string? PublisherClientName { get; set; }
+        [JsonPropertyName("publisherSessionId")]
+        public long? PublisherSessionId { get; set; }
+        [JsonPropertyName("instanceId")]
+        public string? InstanceId { get; set; }
+        [JsonPropertyName("generatedAt")]
+        public string? GeneratedAt { get; set; }
+        [JsonPropertyName("services")]
+        public List<AdvertisedService> Services { get; set; } = [];
     }
 
     private sealed class NullToZeroInt64Converter : JsonConverter<long>

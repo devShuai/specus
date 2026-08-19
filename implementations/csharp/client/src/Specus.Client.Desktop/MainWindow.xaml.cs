@@ -65,6 +65,10 @@ public partial class MainWindow : Window
 
     public ObservableCollection<PeerSessionSnapshot> PeerSessions { get; } = new();
 
+    public ObservableCollection<PeerRemoteServiceSnapshot> RemotePeerServices { get; } = new();
+
+    public ObservableCollection<PeerLocalServiceSnapshot> LocalPeerServices { get; } = new();
+
     public ObservableCollection<ClientMessageLine> ClientMessages { get; } = new();
 
     public ObservableCollection<LogLine> Logs { get; } = new();
@@ -958,6 +962,8 @@ public partial class MainWindow : Window
             .Where(peer => peer.Online && peer.MessageReceiveCapable)
             .OrderBy(peer => peer.ClientName, StringComparer.OrdinalIgnoreCase));
         Replace(PeerSessions, snapshot.Sessions);
+        Replace(RemotePeerServices, snapshot.RemoteServices);
+        Replace(LocalPeerServices, snapshot.LocalServices);
         PeerCountText.Text = snapshot.Peers.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
         _peerMeshEnabled = snapshot.Enabled;
         PeerMeshSummaryText.Text = snapshot.Enabled
@@ -1009,6 +1015,57 @@ public partial class MainWindow : Window
             string.Equals(peer.ClientName?.Trim(), target, StringComparison.Ordinal));
     }
 
+    private void OpenPeerService_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: PeerRemoteServiceSnapshot service } || !service.Openable
+            || string.IsNullOrWhiteSpace(service.AccessTarget))
+        {
+            return;
+        }
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = service.AccessTarget,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusText("打开失败", ex.Message);
+        }
+    }
+
+    private void LocalPeerServiceToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not CheckBox box
+            || box.Tag is not PeerLocalServiceSnapshot service
+            || string.IsNullOrWhiteSpace(service.ServiceId)
+            || _client is null
+            || !service.ConfigEnabled)
+        {
+            return;
+        }
+        _client.SetLocalPeerServicePublished(service.ServiceId, box.IsChecked == true);
+    }
+
+    private void CopyPeerService_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: PeerRemoteServiceSnapshot service }
+            || string.IsNullOrWhiteSpace(service.AccessTarget))
+        {
+            return;
+        }
+        try
+        {
+            Clipboard.SetText(service.AccessTarget);
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusText("复制失败", ex.Message);
+        }
+    }
+
     private void UpdatePeerMeshStatusBrush()
     {
         PeerMeshStatusDot.Background = (Brush)FindResource(_peerMeshEnabled ? "SuccessBrush" : "TextMutedBrush");
@@ -1030,6 +1087,8 @@ public partial class MainWindow : Window
         PeerRoutes.Clear();
         MessagePeerRoutes.Clear();
         PeerSessions.Clear();
+        RemotePeerServices.Clear();
+        LocalPeerServices.Clear();
         ClientMessages.Clear();
         TcpCountText.Text = "0";
         HttpCountText.Text = "0";

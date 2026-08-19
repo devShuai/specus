@@ -19,7 +19,7 @@ using Specus.Server.Sessions;
 
 namespace Specus.Server.PeerMesh;
 
-public sealed class PeerMeshService
+public sealed partial class PeerMeshService
 {
     public const string PathDirect = "DIRECT";
     public const string PathRelay = "RELAY";
@@ -38,6 +38,9 @@ public sealed class PeerMeshService
     private const string TypeTrafficReport = "traffic-report";
     private const string TypeDeviceReport = "device-report";
     private const string TypeClose = "close";
+    internal const string TypeServiceReport = "service-report";
+    internal const string TypeServiceCatalog = "service-catalog";
+    internal const int PeerServiceDiscoveryVersion = 1;
     private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
     private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations = new();
     private readonly ConcurrentDictionary<long, long> _pendingRelayBytes = new();
@@ -328,7 +331,7 @@ public sealed class PeerMeshService
         id, $"stun:{BracketIpv6(host)}:{port}", host, port, addressSlot, portSlot);
 
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, long? publisherSessionId = null)
     {
         if (!Enabled)
         {
@@ -367,6 +370,12 @@ public sealed class PeerMeshService
                     return;
                 }
                 break;
+            case TypeServiceReport:
+                await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            case TypeServiceCatalog:
+                throw new ArgumentException("service-catalog is server-only");
         }
 
         if (string.IsNullOrWhiteSpace(request.ToClientName))
@@ -860,6 +869,37 @@ public sealed class PeerMeshService
             Cidr = _options.Cidr,
             SessionTtlSeconds = _options.SessionTtlSeconds,
         };
+        var sharing = _db.PeerMeshServiceSharings.AsNoTracking()
+            .FirstOrDefault(row => row.TenantId == account.TenantId);
+        var configured = sharing?.Enabled == true;
+        var deviceEnabled = Enabled && device is { Enabled: true };
+        var effective = Enabled && configured && deviceEnabled;
+        config.PeerServiceDiscoveryVersion = PeerServiceDiscoveryVersion;
+        config.ServiceSharing = new ServiceSharingStatus
+        {
+            DeploymentEnabled = Enabled,
+            ConfiguredEnabled = configured,
+            EffectiveEnabled = effective,
+            MdnsImportEnabled = sharing?.MdnsImportEnabled == true && effective,
+        };
+        config.LocalServices = _db.PeerMeshSharedServices.AsNoTracking()
+            .Where(row => row.TenantId == account.TenantId && row.ClientId == account.Id)
+            .OrderBy(row => row.Name)
+            .Select(row => new LocalPeerService
+            {
+                ServiceId = row.ServiceId,
+                Name = row.Name,
+                Description = row.Description,
+                Transport = row.Transport,
+                Application = row.Application,
+                TargetHost = row.TargetHost,
+                TargetPort = row.TargetPort,
+                PublishedPort = row.PublishedPort,
+                Path = row.Path,
+                Enabled = row.Enabled,
+                Visibility = row.Visibility,
+            })
+            .ToList();
         if (!Enabled || device is null)
         {
             return config;
@@ -1232,7 +1272,9 @@ public sealed class PeerMeshService
                 capability?.MessageReceiveCapable ?? false,
                 capability?.MessageAttachmentsCapable ?? false,
                 capability?.MessageMediaPreviewCapable ?? false,
-                capability?.MessageMaxAttachmentBytes ?? 0L);
+                capability?.MessageMaxAttachmentBytes ?? 0L,
+                capability?.PeerServiceDiscoveryVersion ?? 0,
+                DecodeApplications(capability?.PeerServiceApplications));
         }).ToList();
     }
 
@@ -1909,7 +1951,9 @@ public sealed record RosterItem(
     [property: JsonPropertyName("messageReceiveCapable")] bool MessageReceiveCapable,
     [property: JsonPropertyName("messageAttachmentsCapable")] bool MessageAttachmentsCapable,
     [property: JsonPropertyName("messageMediaPreviewCapable")] bool MessageMediaPreviewCapable,
-    [property: JsonPropertyName("messageMaxAttachmentBytes")] long MessageMaxAttachmentBytes);
+    [property: JsonPropertyName("messageMaxAttachmentBytes")] long MessageMaxAttachmentBytes,
+    [property: JsonPropertyName("peerServiceDiscoveryVersion")] int PeerServiceDiscoveryVersion = 0,
+    [property: JsonPropertyName("peerServiceApplications")] IReadOnlyList<string>? PeerServiceApplications = null);
 
 public sealed record PeerCandidate(
     [property: JsonPropertyName("type")] string? Type,
@@ -2024,4 +2068,34 @@ public sealed class PeerControlMessage
 
     [JsonPropertyName("createdAtMillis")]
     public long CreatedAtMillis { get; set; }
+
+    [JsonPropertyName("enabled")]
+    public bool? Enabled { get; set; }
+
+    [JsonPropertyName("revision")]
+    public long? Revision { get; set; }
+
+    [JsonPropertyName("publisherClientId")]
+    public long PublisherClientId { get; set; }
+
+    [JsonPropertyName("publisherClientName")]
+    public string? PublisherClientName { get; set; }
+
+    [JsonPropertyName("publisherSessionId")]
+    public long? PublisherSessionId { get; set; }
+
+    [JsonPropertyName("instanceId")]
+    public string? InstanceId { get; set; }
+
+    [JsonPropertyName("generatedAt")]
+    public string? GeneratedAt { get; set; }
+
+    [JsonPropertyName("services")]
+    public IReadOnlyList<AdvertisedService>? Services { get; set; }
+
+    [JsonPropertyName("stats")]
+    public IReadOnlyList<PeerServiceStats>? Stats { get; set; }
+
+    [JsonPropertyName("mdnsCandidates")]
+    public IReadOnlyList<PeerMdnsCandidate>? MdnsCandidates { get; set; }
 }

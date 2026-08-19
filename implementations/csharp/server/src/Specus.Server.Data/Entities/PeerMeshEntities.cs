@@ -64,3 +64,34 @@ public sealed class PeerMeshSession
     public DateTimeOffset? LastTrafficAt { get; set; }
     public DateTimeOffset? LastKeepaliveAt { get; set; }
 }
+
+public sealed class PeerMeshServiceSharing
+{
+    public string TenantId { get; set; } = "default";
+    public bool Enabled { get; set; }
+    public bool MdnsImportEnabled { get; set; }
+    public string? UpdatedBy { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class PeerMeshSharedService
+{
+    public long Id { get; set; }
+    public string TenantId { get; set; } = "default";
+    public long ClientId { get; set; }
+    public string ClientName { get; set; } = string.Empty;
+    public string ServiceId { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public string Transport { get; set; } = "tcp";
+    public string Application { get; set; } = "tcp";
+    public string TargetHost { get; set; } = "127.0.0.1";
+    public int TargetPort { get; set; }
+    public int PublishedPort { get; set; }
+    public string Path { get; set; } = string.Empty;
+    public bool Enabled { get; set; }
+    public string Visibility { get; set; } = "OWNER";
+    public string AllowedClientIds { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}

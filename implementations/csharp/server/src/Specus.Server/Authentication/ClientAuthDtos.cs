@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Specus.Server.PeerMesh;
 
 namespace Specus.Server.Authentication;
 
@@ -52,6 +53,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientMessageCapabilities")]
     public ClientMessageCapabilities ClientMessageCapabilities { get; set; } = new();
 
+    [JsonPropertyName("clientPeerServiceCapabilities")]
+    public ClientPeerServiceCapabilities ClientPeerServiceCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -75,6 +79,15 @@ public sealed class ClientMessageCapabilities
 
     [JsonPropertyName("maxAttachmentBytes")]
     public long MaxAttachmentBytes { get; set; }
+}
+
+public sealed class ClientPeerServiceCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("applications")]
+    public List<string> Applications { get; set; } = new();
 }
 
 public sealed class ClientAuthLoginResponse
@@ -186,6 +199,15 @@ public sealed class PeerMeshConfig
 
     [JsonPropertyName("sessionTtlSeconds")]
     public long SessionTtlSeconds { get; set; }
+
+    [JsonPropertyName("peerServiceDiscoveryVersion")]
+    public int PeerServiceDiscoveryVersion { get; set; }
+
+    [JsonPropertyName("serviceSharing")]
+    public ServiceSharingStatus ServiceSharing { get; set; } = new();
+
+    [JsonPropertyName("localServices")]
+    public List<LocalPeerService> LocalServices { get; set; } = new();
 }
 
 public sealed class SpecusEndpoint

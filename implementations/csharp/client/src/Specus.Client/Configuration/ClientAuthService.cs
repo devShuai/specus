@@ -200,6 +200,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientMessageCapabilities")]
     public ClientMessageCapabilities ClientMessageCapabilities { get; set; } = new();
 
+    [JsonPropertyName("clientPeerServiceCapabilities")]
+    public ClientPeerServiceCapabilities ClientPeerServiceCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -222,6 +225,11 @@ public sealed class ClientEnvironmentInfo
             JavaVersion = "",
             PeerPublicKey = PeerKeyStore.PublicKeyBase64(logger),
             ClientMessageCapabilities = (messageCapabilities ?? ClientMessageCapabilities.TextOnlyDefault()).Copy(),
+            ClientPeerServiceCapabilities = new ClientPeerServiceCapabilities
+            {
+                Version = PeerServiceDiscovery.ProtocolVersion,
+                Applications = [.. PeerServiceDiscovery.Applications],
+            },
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -345,4 +353,13 @@ public sealed class ClientMessageCapabilities
         MediaPreview = MediaPreview,
         MaxAttachmentBytes = MaxAttachmentBytes,
     };
+}
+
+public sealed class ClientPeerServiceCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("applications")]
+    public List<string> Applications { get; set; } = new();
 }

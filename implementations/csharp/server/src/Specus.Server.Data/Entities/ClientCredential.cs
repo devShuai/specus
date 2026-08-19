@@ -58,6 +58,8 @@ public sealed class ClientSession
     public bool MessageAttachmentsCapable { get; set; }
     public bool MessageMediaPreviewCapable { get; set; }
     public long MessageMaxAttachmentBytes { get; set; }
+    public int PeerServiceDiscoveryVersion { get; set; }
+    public string? PeerServiceApplications { get; set; }
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

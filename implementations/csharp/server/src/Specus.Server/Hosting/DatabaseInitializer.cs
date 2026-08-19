@@ -1011,6 +1011,46 @@ public sealed class DatabaseInitializer
             "tenant_id, target_client_id", cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_peer_mesh_session_status", "peer_mesh_session",
             "status", cancellationToken).ConfigureAwait(false);
+
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS peer_mesh_service_sharing (
+              tenant_id VARCHAR(80) NOT NULL PRIMARY KEY,
+              enabled {boolType},
+              updated_by VARCHAR(80),
+              updated_at VARCHAR(40) NOT NULL
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS peer_mesh_shared_service (
+              id {idType},
+              tenant_id VARCHAR(80) NOT NULL,
+              client_id BIGINT NOT NULL,
+              client_name VARCHAR(120) NOT NULL,
+              service_id VARCHAR(64) NOT NULL,
+              name VARCHAR(80) NOT NULL,
+              description VARCHAR(200),
+              transport VARCHAR(16) NOT NULL,
+              application VARCHAR(16) NOT NULL,
+              target_host VARCHAR(64) NOT NULL,
+              target_port INTEGER NOT NULL,
+              published_port INTEGER NOT NULL,
+              path VARCHAR(128),
+              enabled {boolType},
+              visibility VARCHAR(16) NOT NULL,
+              created_at VARCHAR(40) NOT NULL,
+              updated_at VARCHAR(40) NOT NULL
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uk_peer_shared_service_id", "peer_mesh_shared_service",
+            "tenant_id, client_id, service_id", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "specus_client_session", "peer_service_discovery_version",
+            "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "specus_client_session", "peer_service_applications",
+            "VARCHAR(160)", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "peer_mesh_service_sharing", "mdns_import_enabled",
+            boolType, cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "peer_mesh_shared_service", "allowed_client_ids",
+            "VARCHAR(512) NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task EnsureIndexAsync(SpecusDbContext db, string indexName, string table,
@@ -1042,7 +1082,8 @@ public sealed class DatabaseInitializer
     private static async Task EnsureColumnAsync(SpecusDbContext db, string table, string column,
         string definition, CancellationToken cancellationToken)
     {
-        if (await ColumnExistsAsync(db, table, column, cancellationToken).ConfigureAwait(false))
+        if (!await TableExistsAsync(db, table, cancellationToken).ConfigureAwait(false)
+            || await ColumnExistsAsync(db, table, column, cancellationToken).ConfigureAwait(false))
         {
             return;
         }
@@ -1055,6 +1096,35 @@ public sealed class DatabaseInitializer
     private static Task ExecuteSchemaSqlAsync(SpecusDbContext db, string sql, CancellationToken cancellationToken)
     {
         return db.Database.ExecuteSqlRawAsync(sql, cancellationToken);
+    }
+
+    private static async Task<bool> TableExistsAsync(SpecusDbContext db, string table,
+        CancellationToken cancellationToken)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await using var command = connection.CreateCommand();
+        if (DatabaseDialect(db.Database.ProviderName) == "sqlite")
+        {
+            command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @table";
+        }
+        else
+        {
+            command.CommandText = """
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_name = @table
+                """;
+        }
+        var tableParameter = command.CreateParameter();
+        tableParameter.ParameterName = "@table";
+        tableParameter.Value = table;
+        command.Parameters.Add(tableParameter);
+        var count = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt64(count) > 0;
     }
 
     private static async Task<bool> ColumnExistsAsync(SpecusDbContext db, string table, string column,

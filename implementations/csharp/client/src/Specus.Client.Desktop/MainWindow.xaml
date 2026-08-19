@@ -445,6 +445,120 @@
                             </Border>
                     </Grid>
                 </TabItem>
+                <TabItem Header="共享服务">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="3*" MinHeight="140" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="2*" MinHeight="100" />
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" Style="{StaticResource TableShellStyle}">
+                            <DataGrid x:Name="PeerRemoteServiceGrid"
+                                      AlternationCount="2"
+                                      ItemsSource="{Binding RemotePeerServices}">
+                                <DataGrid.Columns>
+                                    <DataGridTemplateColumn Header="发布端" SortMemberPath="PublisherClientName" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding PublisherClientName}"
+                                                         ToolTip="{Binding PublisherSessionId}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTextColumn Header="实例" Binding="{Binding PublisherSessionId}" Width="120" />
+                                    <DataGridTemplateColumn Header="应用" SortMemberPath="Application" Width="80">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Application}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="访问地址" SortMemberPath="AccessTarget" Width="3*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding AccessTarget}"
+                                                         ToolTip="{Binding UnavailableReason}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="操作" Width="150">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Button Content="打开"
+                                                            Margin="0,0,6,0"
+                                                            Padding="8,2"
+                                                            IsEnabled="{Binding Openable}"
+                                                            Click="OpenPeerService_Click"
+                                                            Tag="{Binding}" />
+                                                    <Button Content="复制"
+                                                            Padding="8,2"
+                                                            IsEnabled="{Binding Copyable}"
+                                                            Click="CopyPeerService_Click"
+                                                            Tag="{Binding}" />
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Border>
+                        <TextBlock Grid.Row="1"
+                                   Text="本机发布（本实例开关，不改服务端配置）"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   Margin="0,8,0,6" />
+                        <Border Grid.Row="2" Style="{StaticResource TableShellStyle}">
+                            <DataGrid x:Name="PeerLocalServiceGrid"
+                                      AlternationCount="2"
+                                      ItemsSource="{Binding LocalPeerServices}">
+                                <DataGrid.Columns>
+                                    <DataGridTemplateColumn Header="名称" SortMemberPath="Name" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Name}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="应用" SortMemberPath="Application" Width="80">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Application}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Target}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTextColumn Header="发布端口" Binding="{Binding PublishedPort}" Width="90" />
+                                    <DataGridCheckBoxColumn Header="配置启用" Binding="{Binding ConfigEnabled}" Width="80" IsReadOnly="True" />
+                                    <DataGridTemplateColumn Header="本实例发布" Width="90">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox IsChecked="{Binding LocallyPublished, Mode=OneWay}"
+                                                          IsEnabled="{Binding ConfigEnabled}"
+                                                          Click="LocalPeerServiceToggle_Click"
+                                                          Tag="{Binding}"
+                                                          ToolTip="只影响当前运行实例，不会改管理端配置" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Border>
+                    </Grid>
+                </TabItem>
                 <TabItem Header="客户端消息">
                     <Grid>
                         <Grid.RowDefinitions>

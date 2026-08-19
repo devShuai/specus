@@ -60,6 +60,11 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<SpecusControlClient>();
     }
 
+    public void SetLocalPeerServicePublished(string serviceId, bool published)
+    {
+        _peerMesh.SetLocalServicePublished(serviceId, published);
+    }
+
     public async Task<ClientMessageSendResult> SendClientMessageAsync(
         string toClientName,
         string message,

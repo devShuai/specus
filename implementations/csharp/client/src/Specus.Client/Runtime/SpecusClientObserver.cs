@@ -182,6 +182,10 @@ public sealed class SpecusPeerMeshSnapshot
 
     public IReadOnlyList<PeerSessionSnapshot> Sessions { get; init; } = Array.Empty<PeerSessionSnapshot>();
 
+    public IReadOnlyList<PeerRemoteServiceSnapshot> RemoteServices { get; init; } = Array.Empty<PeerRemoteServiceSnapshot>();
+
+    public IReadOnlyList<PeerLocalServiceSnapshot> LocalServices { get; init; } = Array.Empty<PeerLocalServiceSnapshot>();
+
     public DateTimeOffset UpdatedAt { get; init; } = DateTimeOffset.Now;
 
     public static SpecusPeerMeshSnapshot Disabled(string deviceMode, string deviceName)
@@ -218,6 +222,42 @@ public sealed class PeerRouteSnapshot
     public long MessageMaxAttachmentBytes { get; init; }
 
     public int CandidateCount { get; init; }
+}
+
+public sealed class PeerRemoteServiceSnapshot
+{
+    public long PublisherClientId { get; init; }
+
+    public string? PublisherClientName { get; init; }
+
+    public long PublisherSessionId { get; init; }
+
+    public string? Application { get; init; }
+
+    public string? AccessTarget { get; init; }
+
+    public bool Openable { get; init; }
+
+    public bool Copyable { get; init; }
+
+    public string? UnavailableReason { get; init; }
+}
+
+public sealed class PeerLocalServiceSnapshot
+{
+    public string? ServiceId { get; init; }
+
+    public string? Name { get; init; }
+
+    public string? Application { get; init; }
+
+    public string? Target { get; init; }
+
+    public int PublishedPort { get; init; }
+
+    public bool ConfigEnabled { get; init; }
+
+    public bool LocallyPublished { get; init; }
 }
 
 public sealed class PeerSessionSnapshot

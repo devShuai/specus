@@ -38,6 +38,8 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<PeerMeshDevice> PeerMeshDevices => Set<PeerMeshDevice>();
     public DbSet<PeerMeshAcl> PeerMeshAcls => Set<PeerMeshAcl>();
     public DbSet<PeerMeshSession> PeerMeshSessions => Set<PeerMeshSession>();
+    public DbSet<PeerMeshServiceSharing> PeerMeshServiceSharings => Set<PeerMeshServiceSharing>();
+    public DbSet<PeerMeshSharedService> PeerMeshSharedServices => Set<PeerMeshSharedService>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
     public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
     public DbSet<TransferAttachmentDownloadUsage> TransferAttachmentDownloadUsages =>
@@ -189,6 +191,8 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.MessageAttachmentsCapable).HasColumnName("message_attachments_capable").IsRequired();
             b.Property(x => x.MessageMediaPreviewCapable).HasColumnName("message_media_preview_capable").IsRequired();
             b.Property(x => x.MessageMaxAttachmentBytes).HasColumnName("message_max_attachment_bytes").IsRequired();
+            b.Property(x => x.PeerServiceDiscoveryVersion).HasColumnName("peer_service_discovery_version").IsRequired();
+            b.Property(x => x.PeerServiceApplications).HasColumnName("peer_service_applications").HasMaxLength(160);
             b.Property(x => x.HttpLoginAt).HasColumnName("http_login_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.NettyConnectedAt).HasColumnName("netty_connected_at").HasMaxLength(40)
@@ -681,6 +685,47 @@ public sealed class SpecusDbContext : DbContext
             b.HasIndex(x => new { x.TenantId, x.SourceClientId }).HasDatabaseName("idx_peer_mesh_session_source");
             b.HasIndex(x => new { x.TenantId, x.TargetClientId }).HasDatabaseName("idx_peer_mesh_session_target");
             b.HasIndex(x => x.Status).HasDatabaseName("idx_peer_mesh_session_status");
+        });
+
+        modelBuilder.Entity<PeerMeshServiceSharing>(b =>
+        {
+            b.ToTable("peer_mesh_service_sharing");
+            b.HasKey(x => x.TenantId);
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.MdnsImportEnabled).HasColumnName("mdns_import_enabled").IsRequired();
+            b.Property(x => x.UpdatedBy).HasColumnName("updated_by").HasMaxLength(80);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+        });
+
+        modelBuilder.Entity<PeerMeshSharedService>(b =>
+        {
+            b.ToTable("peer_mesh_shared_service");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.ServiceId).HasColumnName("service_id").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Name).HasColumnName("name").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Description).HasColumnName("description").HasMaxLength(200);
+            b.Property(x => x.Transport).HasColumnName("transport").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Application).HasColumnName("application").HasMaxLength(16).IsRequired();
+            b.Property(x => x.TargetHost).HasColumnName("target_host").HasMaxLength(64).IsRequired();
+            b.Property(x => x.TargetPort).HasColumnName("target_port").IsRequired();
+            b.Property(x => x.PublishedPort).HasColumnName("published_port").IsRequired();
+            b.Property(x => x.Path).HasColumnName("path").HasMaxLength(128);
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.Visibility).HasColumnName("visibility").HasMaxLength(16).IsRequired();
+            b.Property(x => x.AllowedClientIds).HasColumnName("allowed_client_ids").HasMaxLength(512);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.ServiceId }).IsUnique()
+                .HasDatabaseName("uk_peer_shared_service_id");
+            b.HasIndex(x => new { x.TenantId, x.ClientId }).HasDatabaseName("idx_peer_shared_service_tenant_client");
         });
 
         modelBuilder.Entity<ConnectionStat>(b =>

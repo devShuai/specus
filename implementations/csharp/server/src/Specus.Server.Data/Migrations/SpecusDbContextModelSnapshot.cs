@@ -274,16 +274,16 @@ namespace Specus.Server.Data.Migrations
                     b.HasIndex("Implementation")
                         .HasDatabaseName("idx_client_download_impl");
 
-                    b.HasIndex("Implementation", "Platform", "Arch", "IsLatest", "Enabled")
-                        .HasDatabaseName("idx_client_download_latest");
+                    b.HasIndex("LatestSlot")
+                        .IsUnique()
+                        .HasDatabaseName("uq_client_download_latest_slot");
 
                     b.HasIndex("Implementation", "Platform", "Arch", "Version")
                         .IsUnique()
                         .HasDatabaseName("uq_client_download_version");
 
-                    b.HasIndex("LatestSlot")
-                        .IsUnique()
-                        .HasDatabaseName("uq_client_download_latest_slot");
+                    b.HasIndex("Implementation", "Platform", "Arch", "IsLatest", "Enabled")
+                        .HasDatabaseName("idx_client_download_latest");
 
                     b.ToTable("client_download_link", (string)null);
                 });
@@ -473,6 +473,15 @@ namespace Specus.Server.Data.Migrations
                         .HasMaxLength(80)
                         .HasColumnType("TEXT")
                         .HasColumnName("os_version");
+
+                    b.Property<string>("PeerServiceApplications")
+                        .HasMaxLength(160)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("peer_service_applications");
+
+                    b.Property<int>("PeerServiceDiscoveryVersion")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("peer_service_discovery_version");
 
                     b.Property<string>("RemoteAddress")
                         .HasMaxLength(255)
@@ -1550,6 +1559,33 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("peer_mesh_device", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshServiceSharing", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("TenantId");
+
+                    b.ToTable("peer_mesh_service_sharing", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshSession", b =>
                 {
                     b.Property<long>("Id")
@@ -1668,6 +1704,111 @@ namespace Specus.Server.Data.Migrations
                         .HasDatabaseName("idx_peer_mesh_session_target");
 
                     b.ToTable("peer_mesh_session", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshSharedService", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Application")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("application");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Description")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("description");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("name");
+
+                    b.Property<string>("Path")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("path");
+
+                    b.Property<int>("PublishedPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("published_port");
+
+                    b.Property<string>("ServiceId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("service_id");
+
+                    b.Property<string>("TargetHost")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("target_host");
+
+                    b.Property<int>("TargetPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("target_port");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Transport")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("transport");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("Visibility")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("visibility");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "ClientId")
+                        .HasDatabaseName("idx_peer_shared_service_tenant_client");
+
+                    b.HasIndex("TenantId", "ClientId", "ServiceId")
+                        .IsUnique()
+                        .HasDatabaseName("uk_peer_shared_service_id");
+
+                    b.ToTable("peer_mesh_shared_service", (string)null);
                 });
 
             modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferDiagramVersion", b =>

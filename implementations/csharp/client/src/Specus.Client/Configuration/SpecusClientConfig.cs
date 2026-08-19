@@ -229,6 +229,97 @@ public sealed class PeerMeshConfig
 
     [JsonPropertyName("sessionTtlSeconds")]
     public long SessionTtlSeconds { get; set; }
+
+    [JsonPropertyName("peerServiceDiscoveryVersion")]
+    public int PeerServiceDiscoveryVersion { get; set; }
+
+    [JsonPropertyName("serviceSharing")]
+    public ServiceSharingStatus ServiceSharing { get; set; } = new();
+
+    [JsonPropertyName("localServices")]
+    public List<LocalPeerService> LocalServices { get; set; } = new();
+}
+
+public sealed class ServiceSharingStatus
+{
+    [JsonPropertyName("deploymentEnabled")]
+    public bool DeploymentEnabled { get; set; }
+
+    [JsonPropertyName("configuredEnabled")]
+    public bool ConfiguredEnabled { get; set; }
+
+    [JsonPropertyName("effectiveEnabled")]
+    public bool EffectiveEnabled { get; set; }
+
+    [JsonPropertyName("mdnsImportEnabled")]
+    public bool MdnsImportEnabled { get; set; }
+
+    public static ServiceSharingStatus Of(bool deploymentEnabled, bool configuredEnabled, bool deviceEnabled) => new()
+    {
+        DeploymentEnabled = deploymentEnabled,
+        ConfiguredEnabled = configuredEnabled,
+        EffectiveEnabled = deploymentEnabled && configuredEnabled && deviceEnabled,
+    };
+}
+
+public sealed class LocalPeerService
+{
+    [JsonPropertyName("serviceId")]
+    public string ServiceId { get; set; } = "";
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+
+    [JsonPropertyName("transport")]
+    public string Transport { get; set; } = "tcp";
+
+    [JsonPropertyName("application")]
+    public string Application { get; set; } = "tcp";
+
+    [JsonPropertyName("targetHost")]
+    public string TargetHost { get; set; } = "";
+
+    [JsonPropertyName("targetPort")]
+    public int TargetPort { get; set; }
+
+    [JsonPropertyName("publishedPort")]
+    public int PublishedPort { get; set; }
+
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("visibility")]
+    public string Visibility { get; set; } = "OWNER";
+}
+
+public sealed class AdvertisedService
+{
+    [JsonPropertyName("serviceId")]
+    public string ServiceId { get; set; } = "";
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+
+    [JsonPropertyName("transport")]
+    public string Transport { get; set; } = "tcp";
+
+    [JsonPropertyName("application")]
+    public string Application { get; set; } = "tcp";
+
+    [JsonPropertyName("publishedPort")]
+    public int PublishedPort { get; set; }
+
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
 }
 
 public sealed class SpecusConfigSnapshot

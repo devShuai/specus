@@ -817,6 +817,56 @@ public static class AdminApiEndpoints
                 PeerMeshService service, CancellationToken cancellationToken) =>
                 service.CloseOpenSessionsAsync(ManagementContext.From(context, authOptions.Value),
                     cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/service-sharing",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.SharingStatusAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapPut("/api/admin/peer-mesh/service-sharing",
+            (HttpContext context, PeerMeshSharingMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.SetSharingAsync(ManagementContext.From(context, authOptions.Value),
+                    request, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/services",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListSharedServicesAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapPost("/api/admin/peer-mesh/services",
+            (HttpContext context, PeerMeshServiceMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.CreateSharedServiceAsync(ManagementContext.From(context, authOptions.Value), request,
+                    cancellationToken));
+
+        app.MapPut("/api/admin/peer-mesh/services/{id:long}",
+            (HttpContext context, long id, PeerMeshServiceMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.UpdateSharedServiceAsync(ManagementContext.From(context, authOptions.Value), id, request,
+                    cancellationToken));
+
+        app.MapDelete("/api/admin/peer-mesh/services/{id:long}",
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteSharedServiceAsync(ManagementContext.From(context, authOptions.Value), id,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Ok();
+            });
+
+        app.MapPost("/api/admin/peer-mesh/services/import",
+            (HttpContext context, PeerMeshImportMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.ImportCandidatesAsync(ManagementContext.From(context, authOptions.Value),
+                    request.ClientId ?? throw new ArgumentException("clientId is required"),
+                    request.Source, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/service-audit",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service) =>
+                Results.Ok(service.RecentAudits(ManagementContext.From(context, authOptions.Value))));
     }
 
     private static string? FirstText(string? first, string? second) =>
