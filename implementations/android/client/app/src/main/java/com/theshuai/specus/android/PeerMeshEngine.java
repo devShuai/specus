@@ -59,6 +59,7 @@ final class PeerMeshEngine implements Closeable {
     private static final String TYPE_SESSION_GRANT = "session-grant";
     private static final String TYPE_CANDIDATES = "candidates";
     private static final String TYPE_CLOSE = "close";
+    private static final String TYPE_SERVICE_CATALOG = "service-catalog";
     private static final String PROBE_MAGIC = "specus-peer-mesh";
     private static final int MAX_PENDING_PACKETS = 32;
     private static final long PENDING_PACKET_TTL_MS = 30_000L;
@@ -178,6 +179,7 @@ final class PeerMeshEngine implements Closeable {
     private volatile Thread maintenanceThread;
     private volatile ScheduledFuture<?> directKeepaliveTask;
     private volatile long lastDeviceReportMillis;
+    private final PeerServiceRuntime serviceRuntime;
 
     PeerMeshEngine(SpecusCore.SpecusSession specusSession,
                    SpecusCore.VpnPlatform vpnPlatform,
@@ -193,11 +195,23 @@ final class PeerMeshEngine implements Closeable {
         this.appMessageSink = appMessageSink;
         this.keyMaterial = KeyStore.keyMaterial();
         this.localKeyEpoch = newKeyEpoch();
+        this.serviceRuntime = new PeerServiceRuntime((to, message) -> controlSender.send(to, message), json -> {
+            Context context = AppContextHolder.context;
+            if (context == null) {
+                return;
+            }
+            android.content.Intent intent = new android.content.Intent(PeerServiceEvents.ACTION_SERVICES);
+            intent.setPackage(context.getPackageName());
+            intent.putExtra(PeerServiceEvents.EXTRA_JSON, json);
+            context.sendBroadcast(intent);
+        });
     }
 
     synchronized void startOrUpdate(SpecusCore.PeerMeshConfig nextConfig) throws Exception {
         if (nextConfig == null || !nextConfig.enabled) {
             stop();
+            serviceRuntime.applyConfig(nextConfig);
+            serviceRuntime.setHasAuthorizedOnlinePeer(false);
             return;
         }
         boolean stunConfigChanged = config == null
@@ -235,6 +249,7 @@ final class PeerMeshEngine implements Closeable {
         requestPeerServerCandidates();
         announceCandidatesToOnlinePeers();
         publish("Peer mesh enabled", nextConfig.virtualIp + " " + nextConfig.cidr);
+        serviceRuntime.applyConfig(nextConfig);
     }
 
     void handleControlMessage(String message) throws Exception {
@@ -253,6 +268,10 @@ final class PeerMeshEngine implements Closeable {
             if (enabled.get()) {
                 updateRoster(roster);
             }
+            return;
+        }
+        if (TYPE_SERVICE_CATALOG.equals(type)) {
+            serviceRuntime.applyCatalog(json);
             return;
         }
         if (!enabled.get()) {
@@ -387,6 +406,16 @@ final class PeerMeshEngine implements Closeable {
         refreshVpnRoutes();
         announceCandidatesToOnlinePeers();
         refreshSessionKeys();
+        Map<Long, PeerServiceRuntime.RosterHint> hints = new HashMap<>();
+        boolean onlinePeer = false;
+        for (PeerInfo peer : peers.values()) {
+            hints.put(peer.clientId, new PeerServiceRuntime.RosterHint(peer.virtualIp, peer.online));
+            if (peer.online) {
+                onlinePeer = true;
+            }
+        }
+        serviceRuntime.setRoster(hints);
+        serviceRuntime.setHasAuthorizedOnlinePeer(onlinePeer);
         publish("Peer roster", peers.size() + " peer(s)");
     }
 
@@ -3154,6 +3183,7 @@ final class PeerMeshEngine implements Closeable {
     @Override
     public void close() {
         stop();
+        serviceRuntime.close();
         pathMtuScheduler.shutdownNow();
     }
 

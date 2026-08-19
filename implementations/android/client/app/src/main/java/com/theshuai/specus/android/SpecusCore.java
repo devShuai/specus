@@ -872,6 +872,7 @@ public final class SpecusCore {
         String javaVersion;
         String peerPublicKey;
         ClientMessageCapabilities clientMessageCapabilities = new ClientMessageCapabilities();
+        ClientPeerServiceCapabilities clientPeerServiceCapabilities = new ClientPeerServiceCapabilities();
         List<String> localAddresses = new ArrayList<>();
         String startedAt;
 
@@ -889,6 +890,7 @@ public final class SpecusCore {
             info.javaVersion = System.getProperty("java.version", "");
             info.peerPublicKey = PeerMeshEngine.KeyStore.publicKeyBase64(context);
             info.clientMessageCapabilities = ClientMessageCapabilities.androidDefault();
+            info.clientPeerServiceCapabilities = ClientPeerServiceCapabilities.androidDefault();
             info.localAddresses = localAddresses();
             info.startedAt = Instant.now().toString();
             return info;
@@ -906,6 +908,7 @@ public final class SpecusCore {
             json.put("javaVersion", javaVersion);
             json.put("peerPublicKey", peerPublicKey);
             json.put("clientMessageCapabilities", clientMessageCapabilities.toJson());
+            json.put("clientPeerServiceCapabilities", clientPeerServiceCapabilities.toJson());
             json.put("localAddresses", new JSONArray(localAddresses));
             json.put("startedAt", startedAt);
             return json;
@@ -956,6 +959,85 @@ public final class SpecusCore {
             json.put("mediaPreview", mediaPreview);
             json.put("maxAttachmentBytes", maxAttachmentBytes);
             return json;
+        }
+    }
+
+    static final class ClientPeerServiceCapabilities {
+        int version;
+        List<String> applications = new ArrayList<>();
+
+        static ClientPeerServiceCapabilities androidDefault() {
+            ClientPeerServiceCapabilities capabilities = new ClientPeerServiceCapabilities();
+            capabilities.version = 1;
+            capabilities.applications = List.of("http", "https", "ssh", "tcp", "udp");
+            return capabilities;
+        }
+
+        JSONObject toJson() throws Exception {
+            JSONObject json = new JSONObject();
+            json.put("version", version);
+            json.put("applications", new JSONArray(applications));
+            return json;
+        }
+    }
+
+    static final class ServiceSharingStatus {
+        boolean deploymentEnabled;
+        boolean configuredEnabled;
+        boolean effectiveEnabled;
+        boolean mdnsImportEnabled;
+
+        static ServiceSharingStatus parse(JSONObject json) {
+            ServiceSharingStatus status = new ServiceSharingStatus();
+            if (json == null) {
+                return status;
+            }
+            status.deploymentEnabled = json.optBoolean("deploymentEnabled", false);
+            status.configuredEnabled = json.optBoolean("configuredEnabled", false);
+            status.effectiveEnabled = json.optBoolean("effectiveEnabled", false);
+            status.mdnsImportEnabled = json.optBoolean("mdnsImportEnabled", false);
+            return status;
+        }
+    }
+
+    static final class LocalPeerService {
+        String serviceId;
+        String name;
+        String description;
+        String transport;
+        String application;
+        String targetHost;
+        int targetPort;
+        int publishedPort;
+        String path;
+        boolean enabled;
+        String visibility;
+
+        static List<LocalPeerService> parseList(JSONArray array) {
+            List<LocalPeerService> services = new ArrayList<>();
+            if (array == null) {
+                return services;
+            }
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject item = array.optJSONObject(i);
+                if (item == null) {
+                    continue;
+                }
+                LocalPeerService service = new LocalPeerService();
+                service.serviceId = item.optString("serviceId", "");
+                service.name = item.optString("name", "");
+                service.description = item.optString("description", "");
+                service.transport = item.optString("transport", "tcp");
+                service.application = item.optString("application", "tcp");
+                service.targetHost = item.optString("targetHost", "");
+                service.targetPort = item.optInt("targetPort", 0);
+                service.publishedPort = item.optInt("publishedPort", 0);
+                service.path = item.optString("path", "");
+                service.enabled = item.optBoolean("enabled", false);
+                service.visibility = item.optString("visibility", "OWNER");
+                services.add(service);
+            }
+            return services;
         }
     }
 
@@ -1190,6 +1272,9 @@ public final class SpecusCore {
         public long sessionTtlSeconds;
         public int mtu = DEFAULT_MTU;
         public volatile List<String> peerRoutes = List.of();
+        public int peerServiceDiscoveryVersion;
+        public ServiceSharingStatus serviceSharing = new ServiceSharingStatus();
+        public List<LocalPeerService> localServices = new ArrayList<>();
 
         static int normalizeMtu(int mtu) {
             return mtu > 0 ? Math.max(MIN_MTU, Math.min(mtu, MAX_MTU)) : DEFAULT_MTU;
@@ -1255,6 +1340,9 @@ public final class SpecusCore {
             config.iceRealm = json.optString("iceRealm", "");
             config.iceNonce = json.optString("iceNonce", "");
             config.sessionTtlSeconds = json.optLong("sessionTtlSeconds", 0L);
+            config.peerServiceDiscoveryVersion = json.optInt("peerServiceDiscoveryVersion", 0);
+            config.serviceSharing = ServiceSharingStatus.parse(json.optJSONObject("serviceSharing"));
+            config.localServices = LocalPeerService.parseList(json.optJSONArray("localServices"));
             return config;
         }
 

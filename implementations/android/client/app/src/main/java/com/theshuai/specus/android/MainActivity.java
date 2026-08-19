@@ -5,6 +5,8 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -28,6 +30,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.text.SimpleDateFormat;
@@ -74,6 +77,7 @@ public class MainActivity extends Activity {
     private TextView advancedChevron;
     private EditText configEditor;
     private TextView eventLogView;
+    private LinearLayout servicesList;
 
     private final Deque<String> eventLog = new ArrayDeque<>();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.ROOT);
@@ -93,6 +97,16 @@ public class MainActivity extends Activity {
                     intent.getStringExtra(StatusEvents.EXTRA_STATUS),
                     intent.getStringExtra(StatusEvents.EXTRA_DETAIL),
                     intent.getBooleanExtra(StatusEvents.EXTRA_RUNNING, false));
+        }
+    };
+
+    private final BroadcastReceiver servicesReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!PeerServiceEvents.ACTION_SERVICES.equals(intent.getAction())) {
+                return;
+            }
+            renderServices(intent.getStringExtra(PeerServiceEvents.EXTRA_JSON));
         }
     };
 
@@ -119,6 +133,7 @@ public class MainActivity extends Activity {
         fillSettingsFromConfig();
         targetEditor.setText(ConfigStorage.loadLastTarget(this));
         updateStatus("就绪", "未连接", false);
+        renderServices(PeerServiceRuntime.lastSnapshotJson());
     }
 
     @Override
@@ -127,14 +142,17 @@ public class MainActivity extends Activity {
         super.onStart();
         IntentFilter statusFilter = new IntentFilter(StatusEvents.ACTION_STATUS);
         IntentFilter chatFilter = new IntentFilter(ChatEvents.ACTION_CHAT);
+        IntentFilter servicesFilter = new IntentFilter(PeerServiceEvents.ACTION_SERVICES);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(statusReceiver, statusFilter, Context.RECEIVER_NOT_EXPORTED);
             registerReceiver(chatReceiver, chatFilter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(servicesReceiver, servicesFilter, Context.RECEIVER_NOT_EXPORTED);
         } else {
             // The flags overload is API 33. Older releases use the compatible overload; these
             // receivers only handle in-process status events and are unregistered on stop.
             registerReceiver(statusReceiver, statusFilter);
             registerReceiver(chatReceiver, chatFilter);
+            registerReceiver(servicesReceiver, servicesFilter);
         }
         maybeCheckForUpdate();
     }
@@ -143,6 +161,7 @@ public class MainActivity extends Activity {
     protected void onStop() {
         unregisterReceiver(statusReceiver);
         unregisterReceiver(chatReceiver);
+        unregisterReceiver(servicesReceiver);
         super.onStop();
     }
 
@@ -222,6 +241,8 @@ public class MainActivity extends Activity {
 
         root.addView(buildStatusCard());
         root.addView(space(8));
+        root.addView(buildServicesCard());
+        root.addView(space(8));
         root.addView(buildChatCard());
         root.addView(space(8));
         root.addView(buildSettingsCard());
@@ -256,6 +277,150 @@ public class MainActivity extends Activity {
         statusDetail.setSingleLine(true);
         panel.addView(statusDetail, matchWrap());
         return panel;
+    }
+
+    private View buildServicesCard() {
+        LinearLayout panel = panel(COLOR_PANEL, 14, COLOR_LINE);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(10));
+        panel.addView(label("共享服务", COLOR_INK, 14, Typeface.BOLD), matchWrap());
+        TextView hint = label("对端按运行实例分组。本机开关只影响当前实例。", COLOR_MUTED, 12, Typeface.NORMAL);
+        hint.setPadding(0, dp(2), 0, dp(4));
+        panel.addView(hint, matchWrap());
+        servicesList = new LinearLayout(this);
+        servicesList.setOrientation(LinearLayout.VERTICAL);
+        panel.addView(servicesList, matchWrap());
+        TextView empty = label("暂无对端服务", COLOR_MUTED, 12, Typeface.NORMAL);
+        empty.setPadding(0, dp(6), 0, 0);
+        servicesList.addView(empty, matchWrap());
+        return panel;
+    }
+
+    private void renderServices(String json) {
+        if (servicesList == null) {
+            return;
+        }
+        servicesList.removeAllViews();
+        JSONArray remotes = new JSONArray();
+        JSONArray locals = new JSONArray();
+        try {
+            String raw = json == null || json.isBlank() ? "{}" : json.trim();
+            if (raw.startsWith("[")) {
+                remotes = new JSONArray(raw);
+            } else {
+                JSONObject root = new JSONObject(raw);
+                remotes = root.optJSONArray("remotes");
+                locals = root.optJSONArray("locals");
+                if (remotes == null) {
+                    remotes = new JSONArray();
+                }
+                if (locals == null) {
+                    locals = new JSONArray();
+                }
+            }
+        } catch (Exception ignored) {
+            remotes = new JSONArray();
+            locals = new JSONArray();
+        }
+        if (remotes.length() == 0) {
+            TextView empty = label("暂无对端服务", COLOR_MUTED, 12, Typeface.NORMAL);
+            empty.setPadding(0, dp(6), 0, 0);
+            servicesList.addView(empty, matchWrap());
+        } else {
+            for (int i = 0; i < remotes.length(); i++) {
+                JSONObject item = remotes.optJSONObject(i);
+                if (item != null) {
+                    servicesList.addView(serviceRow(item), matchWrap());
+                }
+            }
+        }
+        if (locals.length() > 0) {
+            TextView localTitle = label("本机发布", COLOR_INK, 13, Typeface.BOLD);
+            localTitle.setPadding(0, dp(10), 0, dp(4));
+            servicesList.addView(localTitle, matchWrap());
+            for (int i = 0; i < locals.length(); i++) {
+                JSONObject item = locals.optJSONObject(i);
+                if (item != null) {
+                    servicesList.addView(localRow(item), matchWrap());
+                }
+            }
+        }
+    }
+
+    private View serviceRow(JSONObject item) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(0, dp(8), 0, dp(4));
+
+        String publisher = item.optString("publisherClientName", "-");
+        long sessionId = item.optLong("publisherSessionId", 0L);
+        String application = item.optString("application", "tcp");
+        String target = item.optString("accessTarget", "");
+        String reason = item.optString("unavailableReason", "");
+        boolean openable = item.optBoolean("openable", false);
+        boolean copyable = item.optBoolean("copyable", false);
+
+        TextView title = label(publisher + " · 实例 " + sessionId + " · " + application, COLOR_INK, 13, Typeface.BOLD);
+        row.addView(title, matchWrap());
+        TextView detail = label(target.isEmpty() ? reason : target, COLOR_MUTED, 12, Typeface.NORMAL);
+        row.addView(detail, matchWrap());
+        if (!reason.isEmpty()) {
+            TextView reasonView = label(reason, COLOR_DANGER, 12, Typeface.NORMAL);
+            row.addView(reasonView, matchWrap());
+        }
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setPadding(0, dp(6), 0, 0);
+        row.addView(actions, matchWrap());
+
+        Button open = actionButton("打开", COLOR_MESH, Color.WHITE);
+        open.setEnabled(openable);
+        open.setOnClickListener(v -> openExternalUrl(target));
+        actions.addView(open, new LinearLayout.LayoutParams(dp(88), dp(48)));
+        actions.addView(space(8, 1));
+        Button copy = actionButton("复制", Color.rgb(232, 240, 243), COLOR_INK);
+        copy.setEnabled(copyable);
+        copy.setOnClickListener(v -> {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("peer-service", target));
+                Toast.makeText(this, "已复制 " + target, Toast.LENGTH_SHORT).show();
+            }
+        });
+        actions.addView(copy, new LinearLayout.LayoutParams(dp(88), dp(48)));
+        return row;
+    }
+
+    private View localRow(JSONObject item) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(8), 0, dp(4));
+        row.setMinimumHeight(dp(48));
+
+        String serviceId = item.optString("serviceId", "");
+        String name = item.optString("name", serviceId);
+        String target = item.optString("target", "");
+        boolean configEnabled = item.optBoolean("configEnabled", false);
+        boolean locallyPublished = item.optBoolean("locallyPublished", true);
+
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        text.addView(label(name + " · " + item.optString("application", "tcp"), COLOR_INK, 13, Typeface.BOLD), matchWrap());
+        text.addView(label(target + " → :" + item.optInt("publishedPort", 0)
+                + (configEnabled ? "" : "（配置关闭）"), COLOR_MUTED, 12, Typeface.NORMAL), matchWrap());
+        row.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Switch publish = new Switch(this);
+        publish.setMinHeight(dp(48));
+        publish.setEnabled(configEnabled);
+        publish.setOnCheckedChangeListener(null);
+        publish.setChecked(configEnabled && locallyPublished);
+        publish.setOnCheckedChangeListener((button, checked) ->
+                PeerServiceRuntime.setActiveLocalPublished(serviceId, checked));
+        row.addView(publish, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return row;
     }
 
     private View buildChatCard() {
