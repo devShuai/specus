@@ -83,6 +83,27 @@
         }
       }
     },
+    "ClientPeerServiceCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "客户端支持的 Peer 服务发现协议版本；0 表示不支持。"
+        },
+        "applications": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["http", "https", "ssh", "tcp"]
+          },
+          "uniqueItems": true,
+          "default": []
+        }
+      }
+    },
     "ClientEnvironmentInfo": {
       "type": "object",
       "additionalProperties": false,
@@ -124,6 +145,10 @@
         "clientMessageCapabilities": {
           "$ref": "#/$defs/ClientMessageCapabilities",
           "description": "客户端消息、附件和媒体预览能力；缺省时按全部关闭处理。"
+        },
+        "clientPeerServiceCapabilities": {
+          "$ref": "#/$defs/ClientPeerServiceCapabilities",
+          "description": "客户端 Peer 本地服务发现能力；缺省时 version=0 且 applications 为空。"
         },
         "localAddresses": {
           "type": "array",
@@ -328,6 +353,56 @@
         "sessionTtlSeconds": {
           "type": "integer",
           "minimum": 0
+        },
+        "peerServiceDiscoveryVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "serviceSharing": {
+          "$ref": "#/$defs/PeerServiceSharingStatus"
+        },
+        "localServices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocalPeerService"
+          },
+          "default": []
+        }
+      }
+    },
+    "LocalPeerService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceId": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "transport": { "type": "string" },
+        "application": { "type": "string" },
+        "targetHost": { "type": "string" },
+        "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "publishedPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "path": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "visibility": { "type": "string" }
+      }
+    },
+    "PeerServiceSharingStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploymentEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "configuredEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "effectiveEnabled": {
+          "type": "boolean",
+          "default": false
         }
       }
     },

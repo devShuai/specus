@@ -309,6 +309,86 @@ export interface PeerMeshStatus {
   enabled: boolean;
 }
 
+export interface PeerMeshServiceSharing {
+  deploymentEnabled: boolean;
+  configuredEnabled: boolean;
+  effectiveEnabled: boolean;
+  peerServiceDiscoveryVersion: number;
+  supportedApplications: string[];
+  enabledServiceCount: number;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  mdnsImportEnabled?: boolean;
+}
+
+export interface PeerMeshSharedServiceInstance {
+  publisherSessionId: number;
+  instanceId?: string;
+  online: boolean;
+  advertised: boolean;
+  revision: number;
+  lastReportedAt?: string | null;
+  expiresAt?: string | null;
+  bytesIn?: number;
+  bytesOut?: number;
+  activeConnections?: number;
+  totalConnections?: number;
+}
+
+export interface PeerMeshServiceImportResult {
+  created: number;
+  skipped: number;
+  services: PeerMeshSharedService[];
+}
+
+export interface PeerMeshServiceAuditEvent {
+  at: string;
+  action: string;
+  tenantId?: string;
+  clientId?: number | null;
+  sessionId?: number | null;
+  serviceId?: string | null;
+  reason?: string;
+}
+
+export interface PeerMeshSharedService {
+  id: number;
+  serviceId: string;
+  clientId: number;
+  clientName: string;
+  name: string;
+  description: string;
+  transport: string;
+  application: string;
+  targetHost: string | null;
+  targetPort: number;
+  publishedPort: number;
+  path: string;
+  enabled: boolean;
+  visibility: "OWNER" | "ACL" | string;
+  allowedClientIds?: number[];
+  publishedAddress: string | null;
+  instances?: PeerMeshSharedServiceInstance[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PeerMeshSharedServiceMutation {
+  clientId?: number;
+  serviceId?: string;
+  name?: string;
+  description?: string;
+  transport?: string;
+  application?: string;
+  targetHost?: string;
+  targetPort?: number;
+  publishedPort?: number;
+  path?: string;
+  enabled?: boolean;
+  visibility?: "OWNER" | "ACL";
+  allowedClientIds?: number[];
+}
+
 export interface PublicPeerStunConfig {
   peerMeshEnabled: boolean;
   selfHostedStunServer: string;

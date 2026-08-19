@@ -27,6 +27,12 @@
     },
     {
       "$ref": "#/$defs/Close"
+    },
+    {
+      "$ref": "#/$defs/ServiceReport"
+    },
+    {
+      "$ref": "#/$defs/ServiceCatalog"
     }
   ],
   "$defs": {
@@ -195,6 +201,89 @@
           "type": "integer",
           "minimum": 0,
           "default": 0
+        },
+        "peerServiceDiscoveryVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "peerServiceApplications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PeerServiceApplication"
+          },
+          "uniqueItems": true,
+          "default": []
+        }
+      }
+    },
+    "PeerServiceTransport": {
+      "type": "string",
+      "enum": ["tcp", "udp"]
+    },
+    "PeerServiceApplication": {
+      "type": "string",
+      "enum": ["http", "https", "ssh", "tcp", "udp"]
+    },
+    "PeerAdvertisedService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceId",
+        "name",
+        "transport",
+        "application",
+        "publishedPort"
+      ],
+      "properties": {
+        "serviceId": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "transport": {
+          "$ref": "#/$defs/PeerServiceTransport"
+        },
+        "application": {
+          "$ref": "#/$defs/PeerServiceApplication"
+        },
+        "publishedPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^/[A-Za-z0-9._~/-]*$"
+        }
+      }
+    },
+    "PeerServiceSharingStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploymentEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "configuredEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "effectiveEnabled": {
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -297,6 +386,83 @@
         "sessionTtlSeconds": {
           "type": "integer",
           "minimum": 0
+        },
+        "peerServiceDiscoveryVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "serviceSharing": {
+          "$ref": "#/$defs/PeerServiceSharingStatus"
+        },
+        "localServices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocalPeerService"
+          },
+          "default": []
+        }
+      }
+    },
+    "LocalPeerService": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceId",
+        "name",
+        "transport",
+        "application",
+        "targetHost",
+        "targetPort",
+        "publishedPort",
+        "enabled"
+      ],
+      "properties": {
+        "serviceId": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "transport": {
+          "$ref": "#/$defs/PeerServiceTransport"
+        },
+        "application": {
+          "$ref": "#/$defs/PeerServiceApplication"
+        },
+        "targetHost": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "targetPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "publishedPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["OWNER", "ACL"]
         }
       }
     },
@@ -607,6 +773,157 @@
             },
             "reason": {
               "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "ServiceReport": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "enabled",
+            "revision",
+            "services"
+          ],
+          "properties": {
+            "type": {
+              "const": "service-report"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "publisherSessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "instanceId": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "generatedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "services": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "$ref": "#/$defs/PeerAdvertisedService"
+              }
+            },
+            "stats": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "$ref": "#/$defs/PeerServiceStats"
+              }
+            },
+            "mdnsCandidates": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "$ref": "#/$defs/PeerMdnsCandidate"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PeerMdnsCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "transport", "application", "targetHost", "targetPort"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "transport": { "$ref": "#/$defs/PeerServiceTransport" },
+        "application": { "$ref": "#/$defs/PeerServiceApplication" },
+        "targetHost": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "PeerServiceStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceId"
+      ],
+      "properties": {
+        "serviceId": {
+          "type": "string"
+        },
+        "bytesIn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytesOut": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeConnections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "totalConnections": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ServiceCatalog": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "publisherClientId",
+            "publisherSessionId",
+            "revision",
+            "services"
+          ],
+          "properties": {
+            "type": {
+              "const": "service-catalog"
+            },
+            "publisherClientId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "publisherClientName": {
+              "type": "string",
+              "minLength": 1
+            },
+            "publisherSessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "services": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "$ref": "#/$defs/PeerAdvertisedService"
+              }
             }
           }
         }

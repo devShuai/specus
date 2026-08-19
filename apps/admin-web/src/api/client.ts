@@ -38,6 +38,11 @@ import type {
   PeerMeshSessionPage,
   PeerMeshSession,
   PeerMeshStatus,
+  PeerMeshServiceSharing,
+  PeerMeshSharedService,
+  PeerMeshSharedServiceMutation,
+  PeerMeshServiceImportResult,
+  PeerMeshServiceAuditEvent,
   PublicTransferIceConfig,
   PublicTransferClientNameAvailability,
   PublicTransferCreatedAccessToken,
@@ -467,6 +472,27 @@ export const adminApi = {
   },
   closePeerMeshSession: (id: number) => request<PeerMeshSession>(`/peer-mesh/sessions/${id}`, { method: "DELETE" }),
   closeOpenPeerMeshSessions: () => request<PeerMeshSession[]>("/peer-mesh/sessions", { method: "DELETE" }),
+  peerMeshServiceSharing: () => request<PeerMeshServiceSharing>("/peer-mesh/service-sharing"),
+  updatePeerMeshServiceSharing: (enabled?: boolean, mdnsImportEnabled?: boolean) =>
+    request<PeerMeshServiceSharing>("/peer-mesh/service-sharing", {
+      method: "PUT",
+      body: JSON.stringify({
+        ...(enabled === undefined ? {} : { enabled }),
+        ...(mdnsImportEnabled === undefined ? {} : { mdnsImportEnabled }),
+      }),
+    }),
+  listPeerMeshServices: () => request<PeerMeshSharedService[]>("/peer-mesh/services"),
+  createPeerMeshService: (body: PeerMeshSharedServiceMutation) =>
+    request<PeerMeshSharedService>("/peer-mesh/services", { method: "POST", body: JSON.stringify(body) }),
+  updatePeerMeshService: (id: number, body: PeerMeshSharedServiceMutation) =>
+    request<PeerMeshSharedService>(`/peer-mesh/services/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deletePeerMeshService: (id: number) => request<null>(`/peer-mesh/services/${id}`, { method: "DELETE" }),
+  importPeerMeshServices: (clientId: number, source = "tcp-http") =>
+    request<PeerMeshServiceImportResult>("/peer-mesh/services/import", {
+      method: "POST",
+      body: JSON.stringify({ clientId, source }),
+    }),
+  listPeerMeshServiceAudit: () => request<PeerMeshServiceAuditEvent[]>("/peer-mesh/service-audit"),
 
   listClientDownloads: () => request<ClientDownloadLink[]>(`/client-downloads`),
   createClientDownload: (body: ClientDownloadLinkMutation) =>

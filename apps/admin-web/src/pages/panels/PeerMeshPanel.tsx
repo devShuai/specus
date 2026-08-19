@@ -29,6 +29,7 @@ import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { EmptyState } from "../../components/EmptyState";
 import { useNowTick } from "../../hooks/useNowTick";
+import { PeerMeshServicesTab } from "./PeerMeshServicesTab";
 import {
   NAT_BEHAVIOR_AXES,
   natBehaviorDiscoveryLabel,
@@ -48,7 +49,7 @@ const peerNatFilterOptions = [
 ] as const;
 
 type PeerNatFilterKey = (typeof peerNatFilterOptions)[number]["key"];
-type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat";
+type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat" | "services";
 const SESSION_PAGE_SIZE = 20;
 const PEER_SESSION_FRESH_MILLIS = 120_000;
 
@@ -355,10 +356,15 @@ export function PeerMeshPanel() {
         onSelectionChange={(key) => setPeerView(String(key) as PeerMeshViewKey)}
       >
         <Tab key="devices" title="设备拓扑" />
+        <Tab key="services" title="服务" />
         <Tab key="sessions" title={`活跃会话 ${globalActiveSessions}`} />
         <Tab key="acl" title={`ACL ${acls.length}`} />
         <Tab key="nat" title="NAT 诊断" />
       </Tabs>
+
+      {peerView === "services" && (
+        <PeerMeshServicesTab deploymentEnabled={Boolean(status?.enabled)} devices={devices} />
+      )}
 
       {peerView === "nat" && (
       <PeerNatInsight
