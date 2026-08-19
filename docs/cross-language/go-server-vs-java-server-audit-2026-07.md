@@ -1,6 +1,6 @@
 # Go Server vs Java Server 实现比对审计（2026-07-22）
 
-> 历史快照：本文只记录 2026-07-22 当时的审计批次、测试数量和取舍，不再作为当前能力或剩余差异清单。2026-08 之后的 OIDC 本地身份绑定、Direct HTTP WebSocket、TLS/数据库兼容与最终验证结果，以 [`cross-language-java-alignment-plan.md`](cross-language-java-alignment-plan.md) 的“当前验证”和“当前仍存在的不一致”为准。
+> 历史快照：本文只记录 2026-07-22 当时的审计批次、测试数量和取舍，不再作为当前能力或剩余差异清单。2026-08 之后的 OIDC 本地身份绑定、Direct HTTP WebSocket、TLS/数据库兼容与最终验证结果，以 [`alignment/environment-verification.md`](alignment/environment-verification.md) 的“当前验证”和“当前仍存在的不一致”为准。
 
 最后复核：2026-07-22（含本轮 Go/Java 对齐改动，全部计划批次已实施）
 

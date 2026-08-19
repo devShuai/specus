@@ -30,7 +30,11 @@
 
 ## cross-language/ — 多语言移植与一致性
 
-* [cross-language-java-alignment-plan.md](cross-language/cross-language-java-alignment-plan.md) — 以 Java 为参考实现的对齐计划。
+* [cross-language-java-alignment-plan.md](cross-language/cross-language-java-alignment-plan.md) — 以 Java 为参考实现的对齐索引，按关注点分为四篇：
+  * [协议兼容](cross-language/alignment/protocol-compatibility.md) — 必须逐字节一致的线上格式
+  * [运行时语义](cross-language/alignment/runtime-semantics.md) — 协议之外必须表现相同的行为
+  * [安全差异](cross-language/alignment/security-differences.md) — 必须一致、故意不同，以及为什么
+  * [环境验证](cross-language/alignment/environment-verification.md) — 实际跑过什么，以及结论的边界
 * [cross-language-e2e-acceptance-matrix.md](cross-language/cross-language-e2e-acceptance-matrix.md) — 三语言 server/client 端到端验收矩阵。
 * [specus-server-go-port-plan.md](cross-language/specus-server-go-port-plan.md) — Go 服务端移植计划。
 * [specus-server-csharp-port-plan.md](cross-language/specus-server-csharp-port-plan.md) — C# 服务端重写计划(原文件名 eventual-tickling-waffle.md,已更正)。
