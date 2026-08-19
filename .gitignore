@@ -113,7 +113,9 @@ client2.jsonc
 BenchmarkDotNet.Artifacts/
 __pycache__/
 *.py[cod]
-/.codex/config.toml
+# Local agent tooling. Ignored wholesale rather than per-file: the previous rules named
+# config.toml and one skill directory, so a later skill was committed without anyone noticing.
+/.codex/
 /.zcode/
 local.properties
 **/bin/
@@ -129,4 +131,3 @@ node_modules/
 /implementations/csharp/server/src/Specus.Server/wwwroot/
 
 .reorg-backup/
-/.codex/skills/anthropic-skills/
