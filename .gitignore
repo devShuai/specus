@@ -52,6 +52,11 @@ specus.db-journal
 /deploy/go-server/remote/specus-server.env
 /deploy/go-server/remote/*.local.env
 
+### Android release keystores (never commit) ###
+*.jks
+*.p12
+*.keystore
+
 ### Local client credentials ###
 specusClientConfig.json
 specusClientConfig*.json
