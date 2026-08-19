@@ -107,16 +107,6 @@ public static class TlsCertificateLoader
             ServerKeyStorageFlags, Pkcs12LoaderLimits.Defaults);
     }
 
-    /// <summary>Discards the generated identity so the next load creates a new one. Tests only.</summary>
-    internal static void ResetSelfSignedCertificateForTests()
-    {
-        lock (CertificateGate)
-        {
-            _cachedSelfSignedPkcs12 = null;
-            _cachedSignature = null;
-        }
-    }
-
     private static X509Certificate2 LoadFromFile(TlsOptions options)
     {
         if (string.IsNullOrWhiteSpace(options.Keystore))
