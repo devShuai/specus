@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,12 @@ type priorityWriter struct {
 type Client struct {
 	config Config
 	logger *log.Logger
+
+	// Trust policy for connections to the forwarding target, built once from the configuration.
+	upstreamTLSOnce sync.Once
+	upstreamTLS     *upstreamTLSFactory
+	forwardHTTPOnce sync.Once
+	forwardHTTP     *http.Client
 
 	routesMu sync.RWMutex
 	routes   map[string]string

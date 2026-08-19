@@ -11,16 +11,17 @@ import (
 )
 
 type Config struct {
-	ServerBaseURL            string           `json:"serverBaseUrl"`
-	APIKey                   string           `json:"apiKey"`
-	Secret                   string           `json:"secret"`
-	ControlTLS               ControlTLSConfig `json:"controlTls"`
-	PeerMeshDevice           string           `json:"peerMeshDevice"`
-	PeerMeshTunName          string           `json:"peerMeshTunName"`
-	PeerMeshMTU              int              `json:"peerMeshMtu"`
-	UpdateCheckEnabled       *bool            `json:"updateCheckEnabled"`
-	AutoUpdate               bool             `json:"autoUpdate"`
-	UpdateCheckIntervalHours int              `json:"updateCheckIntervalHours"`
+	ServerBaseURL            string            `json:"serverBaseUrl"`
+	APIKey                   string            `json:"apiKey"`
+	Secret                   string            `json:"secret"`
+	ControlTLS               ControlTLSConfig  `json:"controlTls"`
+	UpstreamTLS              UpstreamTLSConfig `json:"upstreamTls"`
+	PeerMeshDevice           string            `json:"peerMeshDevice"`
+	PeerMeshTunName          string            `json:"peerMeshTunName"`
+	PeerMeshMTU              int               `json:"peerMeshMtu"`
+	UpdateCheckEnabled       *bool             `json:"updateCheckEnabled"`
+	AutoUpdate               bool              `json:"autoUpdate"`
+	UpdateCheckIntervalHours int               `json:"updateCheckIntervalHours"`
 }
 
 // UpdatesEnabled defaults to true so packaged clients participate without requiring a config

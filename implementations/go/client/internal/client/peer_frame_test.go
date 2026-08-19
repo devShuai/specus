@@ -81,14 +81,14 @@ func TestPeerDataFrameRejectsWrongKey(t *testing.T) {
 
 func TestPeerDataFrameCanonicalVector(t *testing.T) {
 	var vector struct {
-		SessionKeyHex string `json:"sessionKeyHex"`
-		SessionID     int64  `json:"sessionId"`
-		FromClientID  int64  `json:"fromClientId"`
-		ToClientID    int64  `json:"toClientId"`
+		SessionKeyHex  string `json:"sessionKeyHex"`
+		SessionID      int64  `json:"sessionId"`
+		FromClientID   int64  `json:"fromClientId"`
+		ToClientID     int64  `json:"toClientId"`
 		SenderKeyEpoch string `json:"senderKeyEpoch"`
-		Sequence      uint64 `json:"sequence"`
-		PlaintextUTF8 string `json:"plaintextUtf8"`
-		FrameHex      string `json:"frameHex"`
+		Sequence       uint64 `json:"sequence"`
+		PlaintextUTF8  string `json:"plaintextUtf8"`
+		FrameHex       string `json:"frameHex"`
 	}
 	readRepositoryJSON(t, "protocol/test-vectors/peer-mesh-spm2.json", &vector)
 	key := decodeVectorHex(t, vector.SessionKeyHex)

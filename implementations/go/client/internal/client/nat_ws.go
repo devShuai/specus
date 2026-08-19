@@ -89,7 +89,8 @@ func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint3
 		client.sendNatReset(connection, streamID, 4, "invalid websocket target")
 		return
 	}
-	localConnection, err := dialLocalWebSocket(target, webSocketHandshakeHeaders(metadata))
+	localConnection, err := dialLocalWebSocket(target, webSocketHandshakeHeaders(metadata),
+		client.upstreamTLSFactory())
 	if err != nil {
 		client.logger.Printf("[ws-specus][client] connect local ws failed channelId=%q route=%q target=%s: %v",
 			channelID, route, targetWithoutRawQuery(target), err)
@@ -180,7 +181,8 @@ func webSocketHandshakeHeaders(metadata map[string]any) []string {
 	return headers
 }
 
-func dialLocalWebSocket(target *url.URL, headers []string) (*webSocketLocalConnection, error) {
+func dialLocalWebSocket(target *url.URL, headers []string,
+	upstreamTLS *upstreamTLSFactory) (*webSocketLocalConnection, error) {
 	address := target.Host
 	if _, _, err := net.SplitHostPort(address); err != nil {
 		switch strings.ToLower(target.Scheme) {
@@ -195,10 +197,13 @@ func dialLocalWebSocket(target *url.URL, headers []string) (*webSocketLocalConne
 	var conn net.Conn
 	var err error
 	if strings.EqualFold(target.Scheme, "wss") {
-		conn, err = tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
-			ServerName:         target.Hostname(),
-			InsecureSkipVerify: true,
-		})
+		// Verified like any other upstream connection; see upstream_tls.go for why this is not
+		// simply skipped and how a self-signed target is configured.
+		tlsConfig, configErr := upstreamTLS.forHost(target.Hostname())
+		if configErr != nil {
+			return nil, configErr
+		}
+		conn, err = tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
 	} else {
 		conn, err = dialer.Dial("tcp", address)
 	}

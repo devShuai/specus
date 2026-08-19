@@ -22,16 +22,39 @@ const (
 	httpRequestQueueChunks  = 32
 )
 
-var forwardingHTTPClient = &http.Client{
-	Transport: &http.Transport{
+// newForwardingHTTPClient builds the client used to reach the forwarding target.
+//
+// Upstream certificates are verified. This used to be a package-level client with verification
+// disabled, which meant anything able to answer on the target address was accepted and the tunnel
+// carried the result to a remote user who could not tell. A self-signed target is still supported
+// through the upstreamTls section: a private CA, a certificate pin, or an explicit opt-out.
+func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory) *http.Client {
+	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // Operator-configured LAN targets may use self-signed HTTPS.
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 20 * time.Second,
-	},
-	CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			host = address
+		}
+		tlsConfig, err := tlsFactory.forHost(host)
+		if err != nil {
+			return nil, err
+		}
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second},
+			Config:    tlsConfig,
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
+	return &http.Client{
+		Transport:     transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 type httpRequestStream struct {
@@ -173,7 +196,7 @@ func (stream *httpRequestStream) forward() {
 		request.Header.Set("Range", rangeHeader)
 	}
 
-	upstream, err := forwardingHTTPClient.Do(request)
+	upstream, err := stream.client.forwardingHTTPClient().Do(request)
 	if err != nil {
 		if stream.ctx.Err() == nil {
 			stream.fail(26, err.Error())
