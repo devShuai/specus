@@ -1,0 +1,209 @@
+name: Dependency audit
+
+# A new advisory can land against unchanged code, so this runs on a schedule as well as on
+# changes to any manifest. Each ecosystem both reports its dependencies and fails the build on a
+# high or critical advisory, so an advisory cannot be silenced by ignoring a warning.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "implementations/android/client/**/build.gradle"
+      - "implementations/csharp/**/*.csproj"
+      - "implementations/csharp/**/Directory.Build.props"
+      - "implementations/go/**/go.mod"
+      - "implementations/go/**/go.sum"
+      - "implementations/java/**/pom.xml"
+      - "pom.xml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "implementations/android/client/**/build.gradle"
+      - "implementations/csharp/**/*.csproj"
+      - "implementations/csharp/**/Directory.Build.props"
+      - "implementations/go/**/go.mod"
+      - "implementations/go/**/go.sum"
+      - "implementations/java/**/pom.xml"
+      - "pom.xml"
+  schedule:
+    # Monday 03:17 UTC. An odd minute avoids the top-of-hour scheduling backlog.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned rather than latest: a scanner that changes under us turns a green build red without a
+  # commit, and the version is what makes a report reproducible.
+  OSV_SCANNER_VERSION: "2.5.1"
+
+jobs:
+  go:
+    name: Go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [server, client]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/${{ matrix.module }}/go.mod
+          cache-dependency-path: implementations/go/${{ matrix.module }}/go.sum
+
+      - name: Create placeholder web assets for go:embed
+        if: matrix.module == 'server'
+        run: |
+          mkdir -p implementations/go/server/web/static
+          printf '<!doctype html><title>ci-placeholder</title>\n' > implementations/go/server/web/static/index.html
+
+      - name: Record the dependency set
+        working-directory: implementations/go/${{ matrix.module }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sca"
+          go list -m -json all > "$RUNNER_TEMP/sca/go-${{ matrix.module }}-modules.json"
+
+      # govulncheck reports only vulnerabilities the code can actually reach, so a finding here is
+      # a call path rather than a version match, and exits non-zero when it finds one.
+      - name: Scan for reachable vulnerabilities
+        working-directory: implementations/go/${{ matrix.module }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -format json ./... > "$RUNNER_TEMP/sca/go-${{ matrix.module }}-vulns.json" || true
+          govulncheck ./...
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-go-${{ matrix.module }}
+          path: ${{ runner.temp }}/sca
+          if-no-files-found: warn
+
+  dotnet:
+    name: .NET
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Record the dependency set
+        working-directory: implementations/csharp/server
+        run: |
+          mkdir -p "$RUNNER_TEMP/sca"
+          dotnet list package --include-transitive \
+            > "$RUNNER_TEMP/sca/dotnet-packages.txt"
+          dotnet list package --vulnerable --include-transitive \
+            > "$RUNNER_TEMP/sca/dotnet-vulnerable.txt"
+          cat "$RUNNER_TEMP/sca/dotnet-vulnerable.txt"
+
+      # Directory.Build.props sets NuGetAuditLevel to high and promotes NU1903/NU1904 to errors, so
+      # restoring is itself the gate. Auditing is deliberately not disabled here, unlike in the
+      # protocol workflow where the point is to test protocol behaviour rather than dependencies.
+      - name: Fail on a high or critical advisory
+        working-directory: implementations/csharp/server
+        run: dotnet restore
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-dotnet
+          path: ${{ runner.temp }}/sca
+          if-no-files-found: warn
+
+  java:
+    name: Java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # A resolved SBOM rather than the declared versions in the pom, so transitive dependencies
+      # are scanned too. This is the artifact the audit is run against.
+      - name: Build the SBOM
+        run: |
+          mkdir -p "$RUNNER_TEMP/sca"
+          mvn -B -ntp -DskipTests -Dspecus.server.web.skip=true \
+            org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
+            -DoutputFormat=json -DoutputName=java-sbom
+          cp target/java-sbom.json "$RUNNER_TEMP/sca/java-sbom.cdx.json"
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o /usr/local/bin/osv-scanner             "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      # osv-scanner exits non-zero for any finding, including low-severity advisories that often
+      # have no fixed version. The gate applies the threshold this repository releases against and
+      # still prints everything, so nothing is hidden by not failing on it.
+      - name: Fail on a high or critical advisory
+        run: |
+          osv-scanner scan source --lockfile="$RUNNER_TEMP/sca/java-sbom.cdx.json" --format=json --output-file="$RUNNER_TEMP/sca/java-osv.json" || true
+          python3 tools/sca/fail_on_severity.py "$RUNNER_TEMP/sca/java-osv.json" --label java
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-java
+          path: ${{ runner.temp }}/sca
+          if-no-files-found: warn
+
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Scoped to the classpath that actually ships; see the cyclonedxBom block in app/build.gradle.
+      - name: Build the SBOM and record the runtime classpath
+        working-directory: implementations/android/client
+        run: |
+          mkdir -p "$RUNNER_TEMP/sca"
+          ./gradlew --no-daemon :app:cyclonedxBom
+          cp app/build/reports/android-sbom.json "$RUNNER_TEMP/sca/android-sbom.cdx.json"
+          ./gradlew --no-daemon :app:dependencies \
+            --configuration releaseRuntimeClasspath \
+            > "$RUNNER_TEMP/sca/android-dependencies.txt"
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o /usr/local/bin/osv-scanner             "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Fail on a high or critical advisory
+        run: |
+          osv-scanner scan source --lockfile="$RUNNER_TEMP/sca/android-sbom.cdx.json" --format=json --output-file="$RUNNER_TEMP/sca/android-osv.json" || true
+          python3 tools/sca/fail_on_severity.py "$RUNNER_TEMP/sca/android-osv.json" --label android
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-android
+          path: ${{ runner.temp }}/sca
+          if-no-files-found: warn

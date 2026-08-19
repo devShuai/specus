@@ -1,0 +1,22 @@
+<Project>
+
+  <!--
+    Dependency auditing for every project in this tree.
+
+    NuGet's audit is what turns a published advisory into a build failure. It is enabled here
+    rather than per project so a new project cannot quietly ship without it, and the level is set
+    to the severity this repository treats as releasable: moderate and low advisories are reported
+    as warnings, high and critical fail the build.
+
+    Suppressing an advisory with NoWarn is deliberately not the pattern. When one fires, pin the
+    patched package instead; if no patch exists yet, the suppression belongs in the single project
+    that needs it, with the advisory id and the condition for removing it.
+  -->
+  <PropertyGroup>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>high</NuGetAuditLevel>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1903;NU1904</WarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

@@ -1,5 +1,16 @@
 plugins {
     id "com.android.application"
+    id "org.cyclonedx.bom"
+}
+
+// The SBOM the dependency audit scans. Scoped to the classpath that actually ships: by default the
+// plugin reports every configuration, which drags in the Android Gradle Plugin's own build-time
+// dependencies. Those never reach the APK, and holding CI red over versions we do not control
+// would train people to ignore the gate.
+cyclonedxBom {
+    includeConfigs = ["releaseRuntimeClasspath"]
+    outputFormat = "json"
+    outputName = "android-sbom"
 }
 
 def releaseVersion = providers.gradleProperty("releaseVersion")
@@ -73,8 +84,8 @@ android {
 }
 
 dependencies {
-    implementation "io.netty:netty-codec-http:4.1.121.Final"
-    implementation "io.netty:netty-handler:4.1.121.Final"
+    implementation "io.netty:netty-codec-http:4.1.137.Final"
+    implementation "io.netty:netty-handler:4.1.137.Final"
     testImplementation "junit:junit:4.13.2"
     // Android's org.json classes are stubs in local JVM tests. Use the matching
     // standalone implementation so protocol JSON is exercised for real.

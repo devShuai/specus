@@ -1,3 +1,5 @@
 plugins {
     id "com.android.application" version '9.2.1' apply false
+    // Produces the SBOM the dependency audit scans; osv-scanner cannot read build.gradle itself.
+    id "org.cyclonedx.bom" version '2.3.1' apply false
 }

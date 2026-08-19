@@ -27,7 +27,39 @@
         <maven.compiler.release>21</maven.compiler.release>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
+        <!--
+            Overrides of the Spring Boot managed versions, each raising a dependency past a high
+            severity advisory that the managed version still carries. They live in the root pom
+            because every module inherits the same Boot BOM, and a fix applied to one module would
+            leave the others on the vulnerable version.
+
+            netty      4.2.15 -> 4.2.17: GHSA-2qj4-mmr9-4v2f plus fourteen more across the codecs
+            httpcore5  5.4.2  -> 5.4.3:  GHSA-hf6x-8p5f-cgmf, GHSA-v3jc-474w-2wm6
+            postgresql 42.7.11 -> 42.7.12: GHSA-j92g-9f8w-j867
+
+            Drop an override once the Boot BOM catches up. The dependency audit workflow is what
+            reports that it has, and what fails the build if one of these regresses.
+        -->
+        <netty.version>4.2.17.Final</netty.version>
+        <httpcore5.version>5.4.3</httpcore5.version>
+        <postgresql.version>42.7.12</postgresql.version>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!--
+                netty-all pins its own codec versions, so the netty.version property alone does not
+                reach them. Importing the BOM is what keeps every Netty artifact on one version.
+            -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <dependency>

@@ -103,7 +103,6 @@ jobs:
           dotnet test
           implementations/csharp/server/tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj
           -p:SpecusServerWebSkip=true
-          -p:NuGetAudit=false
           --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests|FullyQualifiedName~PublicTransferClusterFaultToleranceTests"
           --verbosity minimal
 
@@ -219,5 +218,4 @@ jobs:
           dotnet build
           implementations/csharp/client/benchmarks/Specus.Client.Benchmarks/Specus.Client.Benchmarks.csproj
           -c Release
-          -p:NuGetAudit=false
           --verbosity minimal
