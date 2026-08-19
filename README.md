@@ -192,12 +192,26 @@ Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | --- | --- |
 | `serverBaseUrl` | 服务端管理 HTTP 地址，客户端会调用 `/api/client/auth/login` 获取运行时连接信息 |
 | `apiKey` | 管理后台创建的客户端启动凭证 key |
-| `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
+| `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求。支持三种写法：直接写明文、`env:变量名` 从环境变量读取、`file:路径` 从单独的文件读取，详见下方“机器凭据的存放”|
 | `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`mac-utun`、`macos-utun`、`darwin-utun`、`utun`、`auto` |
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `specus0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
 > 完整示例见 `implementations/java/client/client.example.jsonc`、`implementations/go/client/client.example.jsonc`、`implementations/csharp/client/src/Specus.Client/client.example.jsonc` 和 `implementations/android/client/client.example.jsonc`。
+
+#### 机器凭据的存放
+
+`secret` 是这台机器对服务端的身份。它最初只能明文写在 `client.jsonc` 里，而没有任何东西检查还有谁能读到这个文件——真正的暴露面就在这里：配置文件会被复制到新机器、被提交进仓库、或者在共享主机上留成 group 可读，凭据就跟着一起走了。
+
+现在有两种办法，值得说清楚各自解决了什么：
+
+**把密钥挪出配置文件**，作用更大。写 `env:SPECUS_CLIENT_SECRET` 从环境变量取，或写 `file:/etc/specus/secret` 从单独的文件取，于是被复制来复制去的那个文件里装的是一个引用，不是凭据本身。
+
+**拒绝读取其他本地账号也能读的密钥文件**，是在磁盘上真正保护它的机制。加密文件做不到这一点：密钥必须放在本进程无需协助就能拿到的地方，因此任何以该用户身份运行的人同样能解密，而读不到文件的人本来也读不到密钥。文件权限才是真正区分这两种情况的东西——OpenSSH 对权限过宽的私钥选择拒绝而不是默认加密，正是这个道理。
+
+因此在类 Unix 系统上，`file:` 指向的文件如果 group 或 other 有任何权限，客户端会拒绝启动并提示 `chmod 600`。这是拒绝而不是告警：一个每个本地账号都能读的凭据已经泄露了，告警只会滚过去。Windows 上 mode 位没有意义，客户端自己写出的密钥文件在创建时就收紧了 ACL（见 `writeSecretFile`）。
+
+**轮换**：客户端保存的是引用而不是解析后的值，每次登录都会重新读取来源。因此在服务端轮换凭据后，把新密钥写进那个文件（或替换环境变量并重启 unit），下一次重连就会生效，不需要重装或改配置。
 
 macOS 推荐通过 Homebrew 安装 Go 客户端；同一条命令会自动选择 Apple Silicon 或 Intel 版本：
 

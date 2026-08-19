@@ -11,9 +11,12 @@ import (
 )
 
 type Config struct {
-	ServerBaseURL            string            `json:"serverBaseUrl"`
-	APIKey                   string            `json:"apiKey"`
-	Secret                   string            `json:"secret"`
+	ServerBaseURL string `json:"serverBaseUrl"`
+	APIKey        string `json:"apiKey"`
+	Secret        string `json:"secret"`
+	// SecretIsIndirect records that Secret names the credential rather than being it, so the
+	// client knows a rotation can be picked up by re-reading the source.
+	SecretIsIndirect         bool              `json:"-"`
 	ControlTLS               ControlTLSConfig  `json:"controlTls"`
 	UpstreamTLS              UpstreamTLSConfig `json:"upstreamTls"`
 	PeerMeshDevice           string            `json:"peerMeshDevice"`
@@ -130,6 +133,13 @@ func LoadConfig(path string) (Config, error) {
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}
+	// Resolved once here so a bad reference fails at startup rather than at the first login, but
+	// the reference itself is kept: a rotated secret has to be picked up without a restart, and
+	// that is only possible if the client still knows where the secret came from.
+	if _, err := resolveSecret(config.Secret); err != nil {
+		return Config{}, fmt.Errorf("resolve secret: %w", err)
+	}
+	config.SecretIsIndirect = secretIsIndirect(config.Secret)
 	return config, nil
 }
 

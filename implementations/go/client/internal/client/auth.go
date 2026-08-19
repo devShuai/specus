@@ -79,7 +79,13 @@ func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 		Timestamp:   fmt.Sprintf("%d", time.Now().UnixMilli()),
 		Nonce:       randomHex(16),
 	}
-	request.Signature = signAPIKey(request.APIKey, request.Timestamp, request.Nonce, environment, strings.TrimSpace(client.config.Secret))
+	// Re-resolved per login rather than cached at startup: rotating the credential should take
+	// effect on the next reconnect, not on the next restart. An inline secret resolves to itself.
+	secret, secretErr := resolveSecret(client.config.Secret)
+	if secretErr != nil {
+		return RuntimeConfig{}, fmt.Errorf("resolve secret: %w", secretErr)
+	}
+	request.Signature = signAPIKey(request.APIKey, request.Timestamp, request.Nonce, environment, strings.TrimSpace(secret))
 
 	body, err := json.Marshal(request)
 	if err != nil {
