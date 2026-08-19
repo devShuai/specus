@@ -1,0 +1,83 @@
+{
+  "name": "adversarial-inputs-v1",
+  "comment": "Malformed and hostile inputs shared by the Java, Go, .NET and Android test suites. One implementation rejecting an input does not mean the input is handled: an attacker picks whichever node runs the most permissive implementation, so these run everywhere. expect=reject means the decoder must refuse. expect=parse-or-reject means either answer is correct but an unhandled exception, a crash, or a half-built object the caller then trusts is not. No case may take longer than a few milliseconds to decide.",
+  "cases": [
+    {
+      "name": "empty",
+      "kind": "spm2",
+      "payloadHex": "",
+      "expect": "reject",
+      "why": "A zero-length datagram is what a closed socket or a stripped packet produces."
+    },
+    {
+      "name": "magic-only",
+      "kind": "spm2",
+      "payloadHex": "53504d32",
+      "expect": "reject",
+      "why": "The magic alone carries no header; accepting it would read past the buffer."
+    },
+    {
+      "name": "truncated-header",
+      "kind": "spm2",
+      "payloadHex": "53504d32010203",
+      "expect": "reject",
+      "why": "A header cut mid-field is what a path MTU drop produces."
+    },
+    {
+      "name": "magic-in-turn-channeldata-range",
+      "kind": "spm2",
+      "payloadHex": "53504d3200000000000000000000000000000000000000000000000000000000",
+      "expect": "parse-or-reject",
+      "why": "SPM2 magic opens with 0x5350, inside the TURN ChannelData range 0x4000-0x7fff. Demultiplexing must decide by whether the parse succeeds, not by the range; deciding by range alone made the Go client claim and then drop every direct data frame."
+    },
+    {
+      "name": "turn-channeldata-valid-shape",
+      "kind": "turn-channeldata",
+      "payloadHex": "400100040a0b0c0d",
+      "expect": "parse-or-reject",
+      "why": "A well-formed ChannelData frame must not be mistaken for a data frame either."
+    },
+    {
+      "name": "turn-channeldata-length-overrun",
+      "kind": "turn-channeldata",
+      "payloadHex": "4001ffff0a0b",
+      "expect": "reject",
+      "why": "A declared length far beyond the datagram is the classic length-field attack."
+    },
+    {
+      "name": "all-zero-64",
+      "kind": "any",
+      "payloadHex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "expect": "reject",
+      "why": "Zeros hit any code that treats a zero length or zero epoch as a sentinel."
+    },
+    {
+      "name": "all-ones-64",
+      "kind": "any",
+      "payloadHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "reject",
+      "why": "0xFF fills exercise signed/unsigned confusion and maximum-value length fields."
+    },
+    {
+      "name": "ascii-json-fragment",
+      "kind": "any",
+      "payloadHex": "7b2274797065223a",
+      "expect": "reject",
+      "why": "A JSON fragment reaches decoders that sniff for a leading brace."
+    },
+    {
+      "name": "stun-magic-cookie-only",
+      "kind": "stun",
+      "payloadHex": "0001000021124442",
+      "expect": "reject",
+      "why": "A STUN header truncated right after the magic cookie, with no transaction id."
+    },
+    {
+      "name": "stun-attribute-length-overrun",
+      "kind": "stun",
+      "payloadHex": "000100082112442400112233445566778899aabb0006ffff",
+      "expect": "reject",
+      "why": "An attribute claiming more bytes than the message holds."
+    }
+  ]
+}

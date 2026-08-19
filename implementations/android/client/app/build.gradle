@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.PathSensitivity
+
 plugins {
     id "com.android.application"
     id "org.cyclonedx.bom"
@@ -7,6 +9,16 @@ plugins {
 // plugin reports every configuration, which drags in the Android Gradle Plugin's own build-time
 // dependencies. Those never reach the APK, and holding CI red over versions we do not control
 // would train people to ignore the gate.
+// The shared adversarial and protocol vectors live outside this module, so Gradle's up-to-date
+// check cannot see them: editing a vector would leave the tests reported as passing without having
+// run. Declaring the directory as an input is what makes a new case actually execute here, which is
+// the entire point of sharing the corpus across the four implementations.
+tasks.withType(Test).configureEach {
+    inputs.dir(layout.settingsDirectory.dir("../../../protocol/test-vectors"))
+            .withPropertyName("sharedProtocolVectors")
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
 cyclonedxBom {
     includeConfigs = ["releaseRuntimeClasspath"]
     outputFormat = "json"

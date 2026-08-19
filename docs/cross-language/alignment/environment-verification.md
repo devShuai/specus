@@ -30,7 +30,7 @@
 - .NET 的内存 TestServer/TestHost 不提供生产 Kestrel 使用的原始 HTTP Upgrade feature；生产路径使用自实现 RFC 6455 transport，控制帧与边界由低层确定性测试覆盖，仍需在部署环境补 Kestrel 端到端 Upgrade 验收。
 - Android 已补真实测试 CA/hostname TLS 握手；生产 CA、L4 TLS 终止与多平台证书存储仍需环境验收。
 - 真实 MySQL/PostgreSQL、RustFS/OSS/Elasticsearch、跨 NAT direct/relay、真机 VPN/TUN 和长时间压力仍属于发布验收，不作为源码单测通过的替代结论。
-- C server 按用户要求冻结为轻量兼容子集，不纳入本次“全量对齐 Java”门禁；它缺少 TLS、ES/对象存储、live discovery/client-message、HTTP 媒体采集和 Peer Mesh 数据面等能力。
+- C server 按用户要求冻结为轻量兼容子集，不纳入本文任何验证结论；它缺少 TLS、ES/对象存储、live discovery/client-message、HTTP 媒体采集和 Peer Mesh 数据面等能力。
 
 ## 此前轮次历史验证记录（已被上节替代，仅供追溯）
 
