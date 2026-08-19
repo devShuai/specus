@@ -73,8 +73,8 @@ android {
 }
 
 dependencies {
-    implementation "io.netty:netty-codec-http:4.1.110.Final"
-    implementation "io.netty:netty-handler:4.1.110.Final"
+    implementation "io.netty:netty-codec-http:4.1.121.Final"
+    implementation "io.netty:netty-handler:4.1.121.Final"
     testImplementation "junit:junit:4.13.2"
     // Android's org.json classes are stubs in local JVM tests. Use the matching
     // standalone implementation so protocol JSON is exercised for real.

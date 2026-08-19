@@ -7,13 +7,6 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <RootNamespace>Specus.Server.Data</RootNamespace>
-    <!--
-      EF Core 10.0.9 transitively pulls SQLitePCLRaw.lib.e_sqlite3 2.1.11, which carries
-      GHSA-2m69-gcr7-jv3q. No patched 2.1.x has shipped to nuget yet. Until the upstream
-      bundles ship a fixed version, suppress NU1903 here so warnings-as-errors doesn't
-      block the build. Revisit when SQLitePCLRaw 2.1.12+ is available.
-    -->
-    <NoWarn>$(NoWarn);NU1903</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,6 +15,14 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.9" />
+    <!--
+      EF Core pulls SQLitePCLRaw 2.1.11 transitively, which carries GHSA-2m69-gcr7-jv3q. A direct
+      reference to the patched bundle wins over the transitive one, so the advisory is resolved
+      rather than suppressed: NU1903 is now free to fail the build if a vulnerable package
+      reappears here.
+    -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.13" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
   </ItemGroup>
 
 </Project>
