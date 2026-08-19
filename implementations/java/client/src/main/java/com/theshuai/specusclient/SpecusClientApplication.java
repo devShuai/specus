@@ -6,6 +6,7 @@ import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusclient.bean.ClientStartupConfig;
+import com.theshuai.specusclient.bean.MachineCredential;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.bean.SpecusConfig;
@@ -96,12 +97,14 @@ public class SpecusClientApplication {
         String nonce = UUID.randomUUID().toString().replace("-", "");
         loginRequest.setTimestamp(timestamp);
         loginRequest.setNonce(nonce);
+        // Resolved per login rather than cached: rotating the credential should take effect on the
+        // next reconnect, not the next restart. An inline secret resolves to itself.
         loginRequest.setSignature(ClientAuthSigner.signApiKey(
                 loginRequest.getApiKey(),
                 timestamp,
                 nonce,
                 environment,
-                startupConfig.getSecret().trim()
+                MachineCredential.resolve(startupConfig.getSecret())
         ));
 
         ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest);

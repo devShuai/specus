@@ -74,12 +74,14 @@ public sealed class ClientAuthService
                 System.Globalization.CultureInfo.InvariantCulture),
             Nonce = Guid.NewGuid().ToString("N"),
         };
+        // Resolved per login rather than cached: rotating the credential should take effect on the
+        // next reconnect, not the next restart. An inline secret resolves to itself.
         request.Signature = SignApiKey(
             request.ApiKey,
             request.Timestamp,
             request.Nonce,
             environment,
-            _config.Secret?.Trim());
+            MachineCredential.Resolve(_config.Secret));
 
         var url = $"{TrimTrailingSlash(_config.ServerBaseUrl)}/api/client/auth/login";
         using var response = await _http.PostAsJsonAsync(url, request, JsonOptions, cancellationToken)

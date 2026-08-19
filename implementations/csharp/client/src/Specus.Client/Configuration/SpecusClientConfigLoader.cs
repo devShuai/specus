@@ -75,6 +75,17 @@ public static class SpecusClientConfigLoader
         {
             throw new InvalidDataException($"{path}: 必须配置 secret");
         }
+        // Resolved once here so a bad reference fails at startup, where an operator sees it,
+        // rather than at the first login in the field. The reference itself is kept, because
+        // rotation depends on the client still knowing where the secret came from.
+        try
+        {
+            MachineCredential.Resolve(config.Secret);
+        }
+        catch (InvalidDataException error)
+        {
+            throw new InvalidDataException($"{path}: {error.Message}", error);
+        }
 
         ControlTlsSettings.Validate(config, path);
     }
