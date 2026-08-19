@@ -10,6 +10,7 @@ import com.theshuai.specusclient.bean.MachineCredential;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.bean.SpecusConfig;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.specusclient.peer.PeerKeyStore;
 import com.theshuai.specusclient.update.ClientUpdateChecker;
 import com.theshuai.specusclient.update.DesktopUpdateNotifier;
@@ -186,6 +187,11 @@ public class SpecusClientApplication {
         info.setLocalAddresses(localAddresses());
         info.setPeerPublicKey(PeerKeyStore.publicKeyBase64());
         info.setStartedAt(Instant.now().toString());
+        ClientEnvironmentInfo.ClientPeerServiceCapabilities discovery =
+                new ClientEnvironmentInfo.ClientPeerServiceCapabilities();
+        discovery.setVersion(PeerServiceDiscovery.PROTOCOL_VERSION);
+        discovery.setApplications(new ArrayList<>(PeerServiceDiscovery.APPLICATIONS));
+        info.setClientPeerServiceCapabilities(discovery);
         return info;
     }
 

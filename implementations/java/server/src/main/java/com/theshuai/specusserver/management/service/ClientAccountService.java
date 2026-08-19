@@ -266,6 +266,11 @@ public class ClientAccountService {
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
     }
 
+    @Transactional(readOnly = true)
+    public List<ClientAccount> listTenantAccounts(TenantContext tenant) {
+        return clientAccountRepository.findByTenantIdOrderByIdDesc(tenant.tenantId());
+    }
+
     public ClientAccount findClientById(ManagementContext context, long id) {
         Optional<ClientAccount> account = context.isAdmin()
                 ? clientAccountRepository.findByIdAndTenantId(id, context.tenant().tenantId())

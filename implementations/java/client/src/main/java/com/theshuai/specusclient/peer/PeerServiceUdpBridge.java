@@ -1,0 +1,127 @@
+package com.theshuai.specusclient.peer;
+
+import com.theshuai.common.peermesh.LocalPeerService;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
+import com.theshuai.common.peermesh.PeerServiceStats;
+import lombok.extern.slf4j.Slf4j;
+
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Slf4j
+final class PeerServiceUdpBridge implements PeerServiceForwarder {
+    private final String virtualIp;
+    private final LocalPeerService service;
+    private final DatagramSocket inbound;
+    private final InetSocketAddress target;
+    private final ExecutorService executor;
+    private final AtomicBoolean open = new AtomicBoolean(true);
+    private final ConcurrentHashMap<SocketAddress, DatagramSocket> peers = new ConcurrentHashMap<>();
+    private final AtomicLong bytesIn = new AtomicLong();
+    private final AtomicLong bytesOut = new AtomicLong();
+    private final AtomicLong totalConnections = new AtomicLong();
+
+    private PeerServiceUdpBridge(String virtualIp, LocalPeerService service, DatagramSocket inbound) {
+        this.virtualIp = virtualIp;
+        this.service = service;
+        this.inbound = inbound;
+        this.target = new InetSocketAddress(service.getTargetHost(), service.getTargetPort());
+        this.executor = Executors.newCachedThreadPool(r -> {
+            Thread thread = new Thread(r, "peer-service-udp-" + service.getServiceId());
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.execute(this::acceptLoop);
+    }
+
+    static PeerServiceUdpBridge bind(String virtualIp, LocalPeerService service) throws Exception {
+        PeerServiceDiscovery.requireTargetHost(service.getTargetHost());
+        PeerServiceDiscovery.requirePort(service.getTargetPort(), "targetPort");
+        PeerServiceDiscovery.requirePort(service.getPublishedPort(), "publishedPort");
+        DatagramSocket socket = new DatagramSocket(new InetSocketAddress(InetAddress.getByName(virtualIp),
+                service.getPublishedPort()));
+        socket.setReuseAddress(true);
+        return new PeerServiceUdpBridge(virtualIp, service, socket);
+    }
+
+    public boolean matches(String virtualIp, LocalPeerService service) {
+        return Objects.equals(this.virtualIp, virtualIp)
+                && Objects.equals(this.service.getServiceId(), service.getServiceId())
+                && this.service.getPublishedPort() == service.getPublishedPort()
+                && Objects.equals(this.service.getTargetHost(), service.getTargetHost())
+                && this.service.getTargetPort() == service.getTargetPort();
+    }
+
+    public PeerServiceStats stats() {
+        PeerServiceStats stats = new PeerServiceStats();
+        stats.setServiceId(service.getServiceId());
+        stats.setBytesIn(bytesIn.get());
+        stats.setBytesOut(bytesOut.get());
+        stats.setActiveConnections(peers.size());
+        stats.setTotalConnections(totalConnections.get());
+        return stats;
+    }
+
+    private void acceptLoop() {
+        byte[] buffer = new byte[65507];
+        while (open.get() && !inbound.isClosed()) {
+            try {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                inbound.receive(packet);
+                bytesIn.addAndGet(packet.getLength());
+                DatagramSocket outbound = peers.computeIfAbsent(packet.getSocketAddress(), this::openPeerSocket);
+                outbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), target));
+            } catch (Exception e) {
+                if (open.get()) {
+                    log.debug("Peer-only UDP 桥接结束: {}", e.getMessage());
+                }
+                return;
+            }
+        }
+    }
+
+    private DatagramSocket openPeerSocket(SocketAddress peer) {
+        try {
+            DatagramSocket socket = new DatagramSocket();
+            socket.setReuseAddress(true);
+            socket.connect(target);
+            totalConnections.incrementAndGet();
+            executor.execute(() -> replyLoop(socket, peer));
+            return socket;
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private void replyLoop(DatagramSocket socket, SocketAddress peer) {
+        byte[] buffer = new byte[65507];
+        while (open.get() && !socket.isClosed()) {
+            try {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet);
+                bytesOut.addAndGet(packet.getLength());
+                inbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), peer));
+            } catch (Exception ignored) {
+                return;
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        open.set(false);
+        inbound.close();
+        peers.values().forEach(DatagramSocket::close);
+        peers.clear();
+        executor.shutdownNow();
+    }
+}

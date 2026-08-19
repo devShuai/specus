@@ -17,6 +17,7 @@ public class ClientEnvironmentInfo {
     private String javaVersion;
     private String peerPublicKey;
     private ClientMessageCapabilities clientMessageCapabilities = new ClientMessageCapabilities();
+    private ClientPeerServiceCapabilities clientPeerServiceCapabilities = new ClientPeerServiceCapabilities();
     private List<String> localAddresses = new ArrayList<>();
     private String startedAt;
 
@@ -27,5 +28,11 @@ public class ClientEnvironmentInfo {
         private boolean attachments;
         private boolean mediaPreview;
         private long maxAttachmentBytes;
+    }
+
+    @Data
+    public static class ClientPeerServiceCapabilities {
+        private int version;
+        private List<String> applications = new ArrayList<>();
     }
 }

@@ -13,6 +13,8 @@ import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.peer.TurnCredentialService;
@@ -43,6 +45,8 @@ class PeerMeshServiceTests {
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
     private final TurnCredentialService turnCredentialService = mock(TurnCredentialService.class);
     private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
+    private final PeerMeshServiceSharingRepository sharingRepository = mock(PeerMeshServiceSharingRepository.class);
+    private final PeerMeshSharedServiceRepository sharedServiceRepository = mock(PeerMeshSharedServiceRepository.class);
     private final PeerMeshProperties properties = new PeerMeshProperties();
     private final PlatformTransactionManager transactionManager = transactionManager();
     private final PeerMeshService service = new PeerMeshService(
@@ -53,9 +57,16 @@ class PeerMeshServiceTests {
             clientAccountRepository,
             turnCredentialService,
             clientSessionRepository,
+            sharingRepository,
+            sharedServiceRepository,
             transactionManager,
             new SimpleMeterRegistry()
     );
+
+    {
+        when(sharingRepository.findById(any())).thenReturn(Optional.empty());
+        when(sharedServiceRepository.findByTenantIdAndClientIdOrderByNameAsc(any(), any())).thenReturn(List.of());
+    }
 
     @Test
     void sameOwnerCanPeerByDefault() {
@@ -89,6 +100,7 @@ class PeerMeshServiceTests {
     @Test
     void loginConfigAllocatesVirtualIpButLeavesDeviceDisabledByDefault() {
         properties.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.empty());
         when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.empty());
         when(deviceRepository.findByTenantIdAndVirtualIp(any(), any())).thenReturn(Optional.empty());
         when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
@@ -104,6 +116,10 @@ class PeerMeshServiceTests {
         assertThat(config.getCidr()).isEqualTo("100.96.0.0/11");
         assertThat(config.getClientPublicKey()).isEqualTo("public-key");
         assertThat(config.getStunPort()).isEqualTo(3478);
+        assertThat(config.getServiceSharing().isDeploymentEnabled()).isTrue();
+        assertThat(config.getServiceSharing().isConfiguredEnabled()).isFalse();
+        assertThat(config.getServiceSharing().isEffectiveEnabled()).isFalse();
+        assertThat(config.getPeerServiceDiscoveryVersion()).isEqualTo(1);
     }
 
     @Test
@@ -121,6 +137,7 @@ class PeerMeshServiceTests {
         device.setVirtualIp("100.96.0.10");
         device.setCidr("100.96.0.0/11");
         device.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.empty());
         when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device));
         when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
@@ -152,6 +169,7 @@ class PeerMeshServiceTests {
         device.setVirtualIp("100.96.0.10");
         device.setCidr("100.96.0.0/11");
         device.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.empty());
         when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device));
         when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
@@ -413,6 +431,8 @@ class PeerMeshServiceTests {
                 clientAccountRepository,
                 turnCredentialService,
                 clientSessionRepository,
+                sharingRepository,
+                sharedServiceRepository,
                 transactionManager(),
                 meterRegistry);
 

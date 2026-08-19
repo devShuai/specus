@@ -88,6 +88,7 @@ public class PeerMeshClient implements AutoCloseable {
     private final AtomicLong dataWorkerQueueHighWater = new AtomicLong();
     private final Object tunWriteLock = new Object();
     private final ControlSender controlSender;
+    private final PeerServiceRuntime serviceRuntime;
     private final PeerKeyStore.KeyMaterial keyMaterial;
     /**
      * 本次运行实例的 SPM2 key epoch。进程内固定、重启后必然变化，是 AES-GCM nonce 唯一性的锚点：
@@ -177,6 +178,13 @@ public class PeerMeshClient implements AutoCloseable {
                           ControlSender controlSender,
                           PeerVirtualDeviceOptions virtualDeviceOptions) {
         this.controlSender = controlSender;
+        this.serviceRuntime = new PeerServiceRuntime(controlSender);
+        this.serviceRuntime.setRosterLookup(clientId -> {
+            PeerInfo peer = peerIndex.byId().get(clientId);
+            return peer == null
+                    ? PeerServiceRuntime.RosterHint.unknown()
+                    : new PeerServiceRuntime.RosterHint(peer.virtualIp(), peer.online());
+        });
         this.keyMaterial = PeerKeyStore.keyMaterial();
         this.virtualDeviceOptions = virtualDeviceOptions == null
                 ? new PeerVirtualDeviceOptions("noop", "specus0", PeerVirtualDeviceOptions.DEFAULT_MTU)
@@ -233,6 +241,8 @@ public class PeerMeshClient implements AutoCloseable {
             stopMaintenance();
             stopUdpSocket();
             closeVirtualDevice();
+            serviceRuntime.applyConfig(nextConfig);
+            serviceRuntime.setHasAuthorizedOnlinePeer(false);
             return;
         }
         String nextRuntimeConfigKey = runtimeConfigKey(nextConfig);
@@ -244,6 +254,7 @@ public class PeerMeshClient implements AutoCloseable {
             announceCandidatesToOnlinePeers();
             log.debug("Peer mesh 配置未变化，已执行轻量刷新: client={}, virtualIp={}",
                     nextConfig.getClientName(), nextConfig.getVirtualIp());
+            serviceRuntime.applyConfig(nextConfig);
             return;
         }
         if (!sameRuntimeConfig) {
@@ -279,6 +290,7 @@ public class PeerMeshClient implements AutoCloseable {
                 udpSocket == null ? "-" : udpSocket.getLocalPort(),
                 activeDevice.name());
         announceCandidatesToOnlinePeers();
+        serviceRuntime.applyConfig(nextConfig);
     }
 
     public boolean isRunning() {
@@ -323,6 +335,7 @@ public class PeerMeshClient implements AutoCloseable {
             }
             case PeerControlMessage.TYPE_CANDIDATES -> handleCandidates(control);
             case PeerControlMessage.TYPE_CLOSE -> closeSession(control);
+            case PeerControlMessage.TYPE_SERVICE_CATALOG -> serviceRuntime.applyCatalog(control);
             default -> log.debug("收到 peer mesh 信令: type={}, source={}, target={}",
                     type,
                     root.path("sourceClientName").asText("-"),
@@ -360,6 +373,11 @@ public class PeerMeshClient implements AutoCloseable {
         syncVirtualDeviceRoutes();
         refreshSessionKeys();
         announceCandidatesToOnlinePeers();
+        serviceRuntime.setHasAuthorizedOnlinePeer(peerIndex.byId().values().stream().anyMatch(PeerInfo::online));
+    }
+
+    public PeerServiceRuntime serviceRuntime() {
+        return serviceRuntime;
     }
 
     private String runtimeConfigKey(ClientAuthLoginResponse.PeerMeshConfig value) {
@@ -413,6 +431,7 @@ public class PeerMeshClient implements AutoCloseable {
 
     @Override
     public void close() {
+        serviceRuntime.close();
         running = false;
         runtimeConfigKey = "";
         peerIndex = PeerIndex.empty();

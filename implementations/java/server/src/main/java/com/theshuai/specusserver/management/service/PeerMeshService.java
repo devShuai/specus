@@ -4,6 +4,8 @@ import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
+import com.theshuai.common.peermesh.PeerServiceSharingStatus;
 import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.specusserver.config.PeerMeshProperties;
@@ -14,12 +16,17 @@ import com.theshuai.specusserver.management.model.PeerMeshAclView;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshDeviceView;
 import com.theshuai.specusserver.management.model.PeerMeshPathStatsView;
+import com.theshuai.specusserver.management.model.PeerMeshServiceSharing;
 import com.theshuai.specusserver.management.model.PeerMeshSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
+import com.theshuai.common.peermesh.LocalPeerService;
+import com.theshuai.specusserver.management.model.PeerMeshSharedService;
+import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.peer.TurnCredentialService;
@@ -72,6 +79,8 @@ public class PeerMeshService {
     private final ClientAccountRepository clientAccountRepository;
     private final TurnCredentialService turnCredentialService;
     private final ClientSessionRepository clientSessionRepository;
+    private final PeerMeshServiceSharingRepository sharingRepository;
+    private final PeerMeshSharedServiceRepository sharedServiceRepository;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, AtomicLong> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
@@ -87,6 +96,8 @@ public class PeerMeshService {
                            ClientAccountRepository clientAccountRepository,
                            TurnCredentialService turnCredentialService,
                            ClientSessionRepository clientSessionRepository,
+                           PeerMeshServiceSharingRepository sharingRepository,
+                           PeerMeshSharedServiceRepository sharedServiceRepository,
                            PlatformTransactionManager transactionManager,
                            MeterRegistry meterRegistry) {
         this.properties = properties;
@@ -96,6 +107,8 @@ public class PeerMeshService {
         this.clientAccountRepository = clientAccountRepository;
         this.turnCredentialService = turnCredentialService;
         this.clientSessionRepository = clientSessionRepository;
+        this.sharingRepository = sharingRepository;
+        this.sharedServiceRepository = sharedServiceRepository;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.relayTrafficFlushFailures = Counter.builder("specus.peer_mesh.relay.traffic.flush.failures")
                 .description("Relay traffic batches restored after a persistence failure")
@@ -113,6 +126,33 @@ public class PeerMeshService {
 
     public boolean isEnabled() {
         return properties.isEnabled();
+    }
+
+    private List<LocalPeerService> localServices(ClientAccount account) {
+        if (account == null || sharedServiceRepository == null) {
+            return List.of();
+        }
+        return sharedServiceRepository
+                .findByTenantIdAndClientIdOrderByNameAsc(account.getTenantId(), account.getId())
+                .stream()
+                .map(this::toLocalService)
+                .toList();
+    }
+
+    private LocalPeerService toLocalService(PeerMeshSharedService row) {
+        LocalPeerService service = new LocalPeerService();
+        service.setServiceId(row.getServiceId());
+        service.setName(row.getName());
+        service.setDescription(row.getDescription());
+        service.setTransport(row.getTransport());
+        service.setApplication(row.getApplication());
+        service.setTargetHost(row.getTargetHost());
+        service.setTargetPort(row.getTargetPort());
+        service.setPublishedPort(row.getPublishedPort());
+        service.setPath(row.getPath());
+        service.setEnabled(row.isEnabled());
+        service.setVisibility(row.getVisibility());
+        return service;
     }
 
     @Transactional
@@ -146,6 +186,17 @@ public class PeerMeshService {
         config.setCidr(properties.getCidr());
         config.setSessionTtlSeconds(properties.getSessionTtlSeconds());
         config.setPublicStunServers(publicStunServers());
+        boolean configuredSharing = sharingRepository.findById(account.getTenantId())
+                .map(PeerMeshServiceSharing::isEnabled)
+                .orElse(false);
+        boolean mdnsImport = sharingRepository.findById(account.getTenantId())
+                .map(PeerMeshServiceSharing::isMdnsImportEnabled)
+                .orElse(false);
+        boolean deviceEnabled = properties.isEnabled() && device != null && device.isEnabled();
+        config.setPeerServiceDiscoveryVersion(PeerServiceDiscovery.PROTOCOL_VERSION);
+        config.setServiceSharing(PeerServiceSharingStatus.of(
+                properties.isEnabled(), configuredSharing, deviceEnabled, mdnsImport));
+        config.setLocalServices(localServices(account));
         if (!properties.isEnabled() || device == null) {
             return config;
         }
@@ -1003,7 +1054,11 @@ public class PeerMeshService {
                             online && session != null && session.isMessageReceiveCapable(),
                             online && session != null && session.isMessageAttachmentsCapable(),
                             online && session != null && session.isMessageMediaPreviewCapable(),
-                            online && session != null ? session.getMessageMaxAttachmentBytes() : 0);
+                            online && session != null ? session.getMessageMaxAttachmentBytes() : 0,
+                            online && session != null ? session.getPeerServiceDiscoveryVersion() : 0,
+                            online && session != null
+                                    ? PeerServiceDiscovery.decodeApplications(session.getPeerServiceApplications())
+                                    : List.of());
                 })
                 .toList();
     }
@@ -1013,6 +1068,12 @@ public class PeerMeshService {
             return right;
         }
         if (right == null) {
+            return left;
+        }
+        if (right.getPeerServiceDiscoveryVersion() > left.getPeerServiceDiscoveryVersion()) {
+            return right;
+        }
+        if (right.getPeerServiceDiscoveryVersion() < left.getPeerServiceDiscoveryVersion()) {
             return left;
         }
         if (right.isMessageReceiveCapable() && !left.isMessageReceiveCapable()) {
@@ -1400,7 +1461,9 @@ public class PeerMeshService {
                                  boolean messageReceiveCapable,
                                  boolean messageAttachmentsCapable,
                                  boolean messageMediaPreviewCapable,
-                                 long messageMaxAttachmentBytes) {
+                                 long messageMaxAttachmentBytes,
+                                 int peerServiceDiscoveryVersion,
+                                 List<String> peerServiceApplications) {
     }
 
     public record PeerSessionGrant(PeerMeshSessionView session, String token) {

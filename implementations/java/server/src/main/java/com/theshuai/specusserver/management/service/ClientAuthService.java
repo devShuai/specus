@@ -4,6 +4,7 @@ import com.theshuai.common.clientauth.ClientAuthLoginRequest;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.specusserver.config.ClientAuthProperties;
@@ -436,6 +437,9 @@ public class ClientAuthService {
         if (environment.getClientMessageCapabilities() == null) {
             environment.setClientMessageCapabilities(new ClientEnvironmentInfo.ClientMessageCapabilities());
         }
+        if (environment.getClientPeerServiceCapabilities() == null) {
+            environment.setClientPeerServiceCapabilities(new ClientEnvironmentInfo.ClientPeerServiceCapabilities());
+        }
         return environment;
     }
 
@@ -456,6 +460,11 @@ public class ClientAuthService {
         session.setMessageAttachmentsCapable(messages.isAttachments());
         session.setMessageMediaPreviewCapable(messages.isMediaPreview());
         session.setMessageMaxAttachmentBytes(Math.max(0L, messages.getMaxAttachmentBytes()));
+        ClientEnvironmentInfo.ClientPeerServiceCapabilities discovery = environment.getClientPeerServiceCapabilities();
+        int version = PeerServiceDiscovery.normalizeVersion(discovery.getVersion());
+        session.setPeerServiceDiscoveryVersion(version);
+        session.setPeerServiceApplications(PeerServiceDiscovery.encodeApplications(
+                version < 1 ? List.of() : discovery.getApplications()));
     }
 
     private List<ClientAuthLoginResponse.SpecusEndpoint> loadTcpMappings(ClientAccount account) {

@@ -7,11 +7,14 @@ import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.session.Session;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
+import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -25,10 +28,17 @@ import java.util.Map;
 public class PeerSignalService {
     private final ClientAccountService clientAccountService;
     private final PeerMeshService peerMeshService;
+    private final PeerServiceDiscoveryService peerServiceDiscoveryService;
+    private final ClientSessionRepository clientSessionRepository;
 
-    public PeerSignalService(ClientAccountService clientAccountService, PeerMeshService peerMeshService) {
+    public PeerSignalService(ClientAccountService clientAccountService,
+                             PeerMeshService peerMeshService,
+                             PeerServiceDiscoveryService peerServiceDiscoveryService,
+                             ClientSessionRepository clientSessionRepository) {
         this.clientAccountService = clientAccountService;
         this.peerMeshService = peerMeshService;
+        this.peerServiceDiscoveryService = peerServiceDiscoveryService;
+        this.clientSessionRepository = clientSessionRepository;
     }
 
     @Transactional
@@ -61,6 +71,13 @@ public class PeerSignalService {
             if (!StringUtils.hasText(request.getToClientName())) {
                 return;
             }
+        }
+        if (PeerControlMessage.TYPE_SERVICE_REPORT.equals(signal.getType())) {
+            pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
+            return;
+        }
+        if (PeerControlMessage.TYPE_SERVICE_CATALOG.equals(signal.getType())) {
+            throw new IllegalArgumentException("service-catalog is server-only");
         }
 
         if (!StringUtils.hasText(request.getToClientName())) {
@@ -134,7 +151,49 @@ public class PeerSignalService {
         for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
             pushRoster(target);
         }
+        if (enabled) {
+            pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(account.getTenantId()));
+        } else {
+            pushCatalogs(peerServiceDiscoveryService.withdrawClient(
+                    account.getTenantId(), account.getId(), "device-disabled"));
+        }
         return closedSessions;
+    }
+
+    public void onClientDisconnected(Long sessionId) {
+        if (sessionId == null || sessionId <= 0) {
+            return;
+        }
+        ClientSession session = clientSessionRepository.findById(sessionId).orElse(null);
+        if (session == null || !StringUtils.hasText(session.getClientName())) {
+            return;
+        }
+        clientAccountService.findClientByName(session.getClientName()).ifPresent(account ->
+                pushCatalogs(peerServiceDiscoveryService.onClientDisconnected(account, sessionId)));
+    }
+
+    public void pushSharingConfig(ManagementContext context) {
+        for (ClientAccount account : clientAccountService.listTenantAccounts(context.tenant())) {
+            pushConfig(account);
+        }
+    }
+
+    public void pushCatalogs(List<PeerServiceDiscoveryService.CatalogDelivery> deliveries) {
+        if (deliveries == null || deliveries.isEmpty()) {
+            return;
+        }
+        for (PeerServiceDiscoveryService.CatalogDelivery delivery : deliveries) {
+            Channel channel = SessionUtil.getChannel(delivery.recipient().getClientName());
+            if (channel == null || !SessionUtil.hasLogin(channel)) {
+                continue;
+            }
+            sendSignal(channel, "server", delivery.recipient().getClientName(), delivery.catalog());
+        }
+    }
+
+    @Scheduled(fixedDelay = 30_000)
+    public void expirePeerServiceCatalogs() {
+        pushCatalogs(peerServiceDiscoveryService.expireStale());
     }
 
     public void pushConfig(ClientAccount account) {

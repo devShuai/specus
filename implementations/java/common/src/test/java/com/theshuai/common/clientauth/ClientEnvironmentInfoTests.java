@@ -24,5 +24,11 @@ class ClientEnvironmentInfoTests {
         assertTrue(capabilities.has("maxAttachmentBytes"));
         assertTrue(capabilities.path("maxAttachmentBytes").canConvertToLong());
         assertEquals(0L, capabilities.path("maxAttachmentBytes").asLong(-1));
+
+        JsonNode discovery = json.path("environment").path("clientPeerServiceCapabilities");
+        assertTrue(discovery.isObject());
+        assertEquals(0, discovery.path("version").asInt(-1));
+        assertTrue(discovery.path("applications").isArray());
+        assertEquals(0, discovery.path("applications").size());
     }
 }

@@ -170,7 +170,11 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             submit(() -> connectionRecordService.recordDisconnect(recordId, reason));
         }
         if (clientSessionId != null && !dataConnection) {
-            submit(() -> clientAuthService.markNettyDisconnected(clientSessionId));
+            long sessionId = clientSessionId;
+            submit(() -> {
+                clientAuthService.markNettyDisconnected(sessionId);
+                peerSignalService.onClientDisconnected(sessionId);
+            });
         }
         Session session = SessionUtil.getSession(ctx.channel());
         if (!dataConnection && session != null) {

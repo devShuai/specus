@@ -31,6 +31,7 @@ public class DatabaseInitializer {
     private final JdbcTemplate jdbcTemplate;
     private final ManagementUserSchemaMigrator managementUserSchemaMigrator;
     private final ClientDownloadSchemaMigrator clientDownloadSchemaMigrator;
+    private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
     private final boolean seedDemoClient;
     private final String databasePlatform;
@@ -43,6 +44,7 @@ public class DatabaseInitializer {
                                JdbcTemplate jdbcTemplate,
                                ManagementUserSchemaMigrator managementUserSchemaMigrator,
                                ClientDownloadSchemaMigrator clientDownloadSchemaMigrator,
+                               PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
@@ -55,6 +57,7 @@ public class DatabaseInitializer {
         this.jdbcTemplate = jdbcTemplate;
         this.managementUserSchemaMigrator = managementUserSchemaMigrator;
         this.clientDownloadSchemaMigrator = clientDownloadSchemaMigrator;
+        this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
@@ -78,6 +81,7 @@ public class DatabaseInitializer {
         backfillDefaultTenant();
         managementUserSchemaMigrator.migrate();
         clientDownloadSchemaMigrator.migrate();
+        peerServiceDiscoverySchemaMigrator.migrate();
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();
@@ -137,7 +141,9 @@ public class DatabaseInitializer {
                 "specus_traffic_usage",
                 "peer_mesh_device",
                 "peer_mesh_acl",
-                "peer_mesh_session")) {
+                "peer_mesh_session",
+                "peer_mesh_service_sharing",
+                "peer_mesh_shared_service")) {
             try {
                 int rows = jdbcTemplate.update(
                         "update " + table + " set tenant_id = ? where tenant_id is null or tenant_id = ''",

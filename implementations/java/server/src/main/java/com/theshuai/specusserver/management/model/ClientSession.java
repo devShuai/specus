@@ -83,6 +83,12 @@ public class ClientSession {
     @Column(name = "message_max_attachment_bytes", nullable = false)
     private long messageMaxAttachmentBytes;
 
+    @Column(name = "peer_service_discovery_version", nullable = false)
+    private int peerServiceDiscoveryVersion;
+
+    @Column(name = "peer_service_applications", length = 160)
+    private String peerServiceApplications;
+
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;
 

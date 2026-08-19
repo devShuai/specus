@@ -15,6 +15,8 @@ public class PeerControlMessage {
     public static final String TYPE_TRAFFIC_REPORT = "traffic-report";
     public static final String TYPE_DEVICE_REPORT = "device-report";
     public static final String TYPE_CLOSE = "close";
+    public static final String TYPE_SERVICE_REPORT = "service-report";
+    public static final String TYPE_SERVICE_CATALOG = "service-catalog";
 
     private String type;
     private Long sessionId;
@@ -55,4 +57,14 @@ public class PeerControlMessage {
     private int dataFrameVersion = 2;
     private List<PeerCandidate> candidates = List.of();
     private List<?> peers = List.of();
+    private Boolean enabled;
+    private Long revision;
+    private Long publisherClientId;
+    private String publisherClientName;
+    private Long publisherSessionId;
+    private String instanceId;
+    private String generatedAt;
+    private List<PeerAdvertisedService> services = List.of();
+    private List<PeerServiceStats> stats = List.of();
+    private List<PeerMdnsCandidate> mdnsCandidates = List.of();
 }

@@ -3,9 +3,12 @@ package com.theshuai.specusserver.management.controller;
 import com.theshuai.specusserver.management.model.PeerMeshAclView;
 import com.theshuai.specusserver.management.model.PeerMeshDeviceView;
 import com.theshuai.specusserver.management.model.PeerMeshPathStatsView;
+import com.theshuai.specusserver.management.model.PeerMeshServiceSharingView;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
+import com.theshuai.specusserver.management.model.PeerMeshSharedServiceView;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.PeerMeshService;
+import com.theshuai.specusserver.management.service.PeerServiceDiscoveryService;
 import com.theshuai.specusserver.management.service.PeerSignalService;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
@@ -28,13 +31,16 @@ import java.util.Map;
 public class PeerMeshResource {
     private final PeerMeshService peerMeshService;
     private final PeerSignalService peerSignalService;
+    private final PeerServiceDiscoveryService peerServiceDiscoveryService;
     private final ManagementContextResolver contextResolver;
 
     public PeerMeshResource(PeerMeshService peerMeshService,
                             PeerSignalService peerSignalService,
+                            PeerServiceDiscoveryService peerServiceDiscoveryService,
                             ManagementContextResolver contextResolver) {
         this.peerMeshService = peerMeshService;
         this.peerSignalService = peerSignalService;
+        this.peerServiceDiscoveryService = peerServiceDiscoveryService;
         this.contextResolver = contextResolver;
     }
 
@@ -70,12 +76,17 @@ public class PeerMeshResource {
     @PostMapping("/acls")
     public PeerMeshAclView createAcl(@AuthenticationPrincipal Jwt jwt,
                                      @RequestBody PeerMeshService.AclMutation request) {
-        return peerMeshService.createAcl(contextResolver.resolve(jwt), request);
+        var context = contextResolver.resolve(jwt);
+        PeerMeshAclView created = peerMeshService.createAcl(context, request);
+        peerSignalService.pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
+        return created;
     }
 
     @DeleteMapping("/acls/{id}")
     public void deleteAcl(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        peerMeshService.deleteAcl(contextResolver.resolve(jwt), id);
+        var context = contextResolver.resolve(jwt);
+        peerMeshService.deleteAcl(context, id);
+        peerSignalService.pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
     }
 
     /** 打洞/路径聚合统计：activeDirectRatio 即当前活跃会话的直连占比 */
@@ -109,5 +120,67 @@ public class PeerMeshResource {
     @DeleteMapping("/sessions")
     public List<PeerMeshSessionView> closeOpenSessions(@AuthenticationPrincipal Jwt jwt) {
         return peerSignalService.forceCloseOpenSessions(contextResolver.resolve(jwt));
+    }
+
+    @GetMapping("/service-sharing")
+    public PeerMeshServiceSharingView serviceSharing(@AuthenticationPrincipal Jwt jwt) {
+        return peerServiceDiscoveryService.sharingStatus(contextResolver.resolve(jwt));
+    }
+
+    @PutMapping("/service-sharing")
+    public PeerMeshServiceSharingView updateServiceSharing(@AuthenticationPrincipal Jwt jwt,
+                                                           @RequestBody Map<String, Object> body) {
+        var context = contextResolver.resolve(jwt);
+        Object raw = body == null ? null : body.get("enabled");
+        Boolean enabled = raw instanceof Boolean flag ? flag : null;
+        Object mdnsRaw = body == null ? null : body.get("mdnsImportEnabled");
+        Boolean mdnsImportEnabled = mdnsRaw instanceof Boolean flag ? flag : null;
+        var result = peerServiceDiscoveryService.setSharing(context, enabled, mdnsImportEnabled);
+        if (result.pushConfig()) {
+            peerSignalService.pushSharingConfig(context);
+        }
+        peerSignalService.pushCatalogs(result.catalogs());
+        return result.status();
+    }
+
+    @GetMapping("/services")
+    public List<PeerMeshSharedServiceView> services(@AuthenticationPrincipal Jwt jwt) {
+        return peerServiceDiscoveryService.listServices(contextResolver.resolve(jwt));
+    }
+
+    @PostMapping("/services")
+    public PeerMeshSharedServiceView createService(@AuthenticationPrincipal Jwt jwt,
+                                                   @RequestBody PeerServiceDiscoveryService.ServiceMutation request) {
+        return peerServiceDiscoveryService.createService(contextResolver.resolve(jwt), request);
+    }
+
+    @PutMapping("/services/{id}")
+    public PeerMeshSharedServiceView updateService(@AuthenticationPrincipal Jwt jwt,
+                                                   @PathVariable long id,
+                                                   @RequestBody PeerServiceDiscoveryService.ServiceMutation request) {
+        var result = peerServiceDiscoveryService.updateService(contextResolver.resolve(jwt), id, request);
+        peerSignalService.pushCatalogs(result.catalogs());
+        return result.service();
+    }
+
+    @DeleteMapping("/services/{id}")
+    public void deleteService(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
+        var result = peerServiceDiscoveryService.deleteService(contextResolver.resolve(jwt), id);
+        peerSignalService.pushCatalogs(result.catalogs());
+    }
+
+    @PostMapping("/services/import")
+    public PeerServiceDiscoveryService.ImportResult importServices(@AuthenticationPrincipal Jwt jwt,
+                                                                   @RequestBody Map<String, Object> body) {
+        Object raw = body == null ? null : body.get("clientId");
+        Long clientId = raw instanceof Number number ? number.longValue() : null;
+        Object sourceRaw = body == null ? null : body.get("source");
+        String source = sourceRaw instanceof String value ? value : "tcp-http";
+        return peerServiceDiscoveryService.importCandidates(contextResolver.resolve(jwt), clientId, source);
+    }
+
+    @GetMapping("/service-audit")
+    public List<PeerServiceDiscoveryService.AuditEvent> serviceAudit(@AuthenticationPrincipal Jwt jwt) {
+        return peerServiceDiscoveryService.recentAudits(contextResolver.resolve(jwt));
     }
 }

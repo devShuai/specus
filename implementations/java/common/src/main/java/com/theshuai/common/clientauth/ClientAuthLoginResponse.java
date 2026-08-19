@@ -1,5 +1,8 @@
 package com.theshuai.common.clientauth;
 
+import com.theshuai.common.peermesh.LocalPeerService;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
+import com.theshuai.common.peermesh.PeerServiceSharingStatus;
 import lombok.Data;
 
 import java.util.ArrayList;
@@ -61,5 +64,8 @@ public class ClientAuthLoginResponse {
         private String serverPublicKey;
         private String clientPublicKey;
         private long sessionTtlSeconds;
+        private int peerServiceDiscoveryVersion = PeerServiceDiscovery.PROTOCOL_VERSION;
+        private PeerServiceSharingStatus serviceSharing = new PeerServiceSharingStatus();
+        private List<LocalPeerService> localServices = new ArrayList<>();
     }
 }
