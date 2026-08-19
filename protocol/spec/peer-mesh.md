@@ -87,6 +87,12 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `GET` | `/api/admin/peer-mesh/sessions` | 查看 active session |
 | `DELETE` | `/api/admin/peer-mesh/sessions/{id}` | 强制关闭单个 session |
 | `DELETE` | `/api/admin/peer-mesh/sessions` | 清理所有可见未关闭 session |
+| `GET` | `/api/admin/peer-mesh/service-sharing` | 查看 Peer 服务共享状态 |
+| `PUT` | `/api/admin/peer-mesh/service-sharing` | 启停租户服务共享总开关；仅租户 ADMIN |
+| `GET` | `/api/admin/peer-mesh/services` | 查看本机服务定义与运行实例 |
+| `POST` | `/api/admin/peer-mesh/services` | 新增本机服务定义；仅租户 ADMIN；默认关闭 |
+| `PUT` | `/api/admin/peer-mesh/services/{id}` | 编辑/启停服务定义；仅租户 ADMIN |
+| `DELETE` | `/api/admin/peer-mesh/services/{id}` | 删除服务定义；仅租户 ADMIN |
 
 ## 登录配置
 
@@ -106,6 +112,10 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `serverPublicKey` | 服务端标识用 public key 摘要，目前不参与业务加密 |
 | `clientPublicKey` | 当前客户端 public key |
 | `sessionTtlSeconds` | peer session TTL |
+| `peerServiceDiscoveryVersion` | 服务端支持的本地服务发现协议版本；当前为 `1`，旧服务端缺省按 `0` |
+| `serviceSharing` | 租户服务共享状态：`deploymentEnabled` / `configuredEnabled` / `effectiveEnabled` / `mdnsImportEnabled` |
+
+`serviceSharing.effectiveEnabled` 为 true 当且仅当部署端 Peer Mesh 开启、租户总开关已开、且当前设备已启用私有组网。客户端只在该值为 true 且存在获授权在线对端时探测并上报本机服务。总开关变更后服务端立即下发 `peer-config`，不能等到下次登录。
 
 运行中启停设备时，服务端会通过 `PEER_CONTROL` 下发 `peer-config`，客户端收到后立即启停 Peer Mesh 和虚拟网卡。
 
@@ -133,7 +143,9 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "messageReceiveCapable": true,
       "messageAttachmentsCapable": true,
       "messageMediaPreviewCapable": true,
-      "messageMaxAttachmentBytes": 536870912
+      "messageMaxAttachmentBytes": 536870912,
+      "peerServiceDiscoveryVersion": 1,
+      "peerServiceApplications": ["http", "https", "ssh", "tcp"]
     }
   ]
 }
@@ -143,7 +155,11 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 
 五个 `message*` 字段来自 peer 当前在线 session 上报的
 `environment.clientMessageCapabilities`；peer 离线或没有匹配的在线 session 时为 `false` / `0`。
-旧服务端缺省这些字段时，客户端也按 `false` / `0` 处理。
+旧服务端缺省这些字段时，客户端也按 `false` / `0` 处理。Go 服务端必须投影与 Java 相同的能力字段，不能省略。
+
+`peerServiceDiscoveryVersion` 和 `peerServiceApplications` 来自
+`environment.clientPeerServiceCapabilities`。版本 `0` 或缺省表示该 peer 不支持服务发现；
+一期应用类型仅允许 `http`、`https`、`ssh`、`tcp`。
 
 ### `candidates`
 
@@ -298,6 +314,124 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 ```
 
 服务端标记 session 为 `CLOSED`，并向双方在线客户端转发 close 信令。
+
+## 本地服务发现（默认关闭）
+
+Peer Mesh 设备互联不等于本机服务目录。一期发布用户在控制页显式配置、且实际可探测到的 TCP/UDP 服务，
+不扫描局域网、对端或 `1..65535` 全端口。C 实现不纳入一期。mDNS 候选导入默认关闭。
+
+产品约束：
+
+- 租户「Peer 服务共享」总开关独立于 `SPECUS_PEER_MESH_ENABLED` 和设备「启用私有组网」开关，默认关闭。
+  新安装和存量升级都必须保持关闭。
+- 对端能看到并访问服务，必须同时满足：部署端 Peer Mesh 可用、租户总开关已开、单个服务显式启用、
+  发布设备在线且已有获授权在线对端、ACL 允许该方向。
+- 默认关闭时不枚举、不探测、不发布。开启但没有获授权在线对端时，客户端不周期广播，也不做无意义扫描。
+- 关闭总开关时立即撤回服务目录、拒绝新的服务桥接，并关闭由本功能建立的活动流；基础 Peer Mesh
+  和无关流量不随之关闭。
+- 服务广告只负责发现，不替代服务自身认证。
+
+### 服务定义
+
+持久化按 `tenantId + clientId` 归属。`serviceId` 稳定且不可由显示名推导。`targetHost` /
+`targetPort` 仅管理端和发布设备本机客户端可见；一期 `targetHost` 只允许 loopback 或本机单播地址，
+禁止主机名（`localhost` 除外）、URL、通配地址和组播。向对端发布的目录不得包含 `targetHost`、任意 URL、
+命令、用户名、token 或进程信息。
+
+| 字段 | 说明 |
+| --- | --- |
+| `serviceId` | 8..64 字符，`[A-Za-z0-9._-]` |
+| `name` / `description` | 展示名称 1..80，说明最长 200；禁止控制字符 |
+| `transport` | `tcp` 或 `udp` |
+| `application` | `http` / `https` / `ssh` / `tcp` / `udp`；`udp` 必须搭配 UDP 传输 |
+| `allowedClientIds` | 可选。`visibility=ACL` 时再限制到这些 clientId；空表示现有 Peer ACL 范围内全部对端 |
+| `targetHost` / `targetPort` | 发布设备本机目标；对端不可见 |
+| `publishedPort` | Peer 虚拟 IP 上提供给对端的端口，同一设备内已启用服务不可冲突 |
+| `path` | HTTP(S) 可选安全路径，必须以 `/` 开头，禁止完整 URL、`..`、反斜杠和空白 |
+| `enabled` | 单服务开关，默认 `false` |
+| `visibility` | `OWNER`（同归属用户）或 `ACL`（现有 Peer ACL 范围内）；不得扩大现有 ACL |
+
+### `service-report`
+
+客户端在有效共享开启且存在获授权在线对端后，向服务端上报当前实例可发布的服务快照。
+`toClientName` 必须为空；服务端绑定已认证的 `publisherClientId` / `publisherSessionId`，
+不信任消息体里的 source 身份。
+
+```json
+{
+  "type": "service-report",
+  "enabled": true,
+  "revision": 3,
+  "publisherSessionId": 1868708022931423400,
+  "instanceId": "runtime-1",
+  "generatedAt": "2026-08-19T09:00:00Z",
+  "expiresAt": "2026-08-19T09:05:00Z",
+  "services": [
+    {
+      "serviceId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "name": "local-ssh",
+      "description": "本机 SSH",
+      "transport": "tcp",
+      "application": "ssh",
+      "publishedPort": 2222
+    }
+  ]
+}
+```
+
+可选 `stats[]` 仅出现在 `service-report`，携带每个已发布服务的本机桥接计数（`bytesIn` /
+`bytesOut` / `activeConnections` / `totalConnections`）。服务端只用于管理端健康与流量展示，
+不得写入 `service-catalog`。
+
+可选 `mdnsCandidates[]` 也只出现在 `service-report`：租户打开「允许 mDNS 候选导入」后，发布端
+可把本机 mDNS/DNS-SD 发现的 loopback/本机地址候选交给服务端，供管理员导入为默认关闭的服务定义。
+候选含 `targetHost`，不得进入 `service-catalog`。默认关闭时客户端不做 mDNS 查询。
+
+UDP 服务在虚拟 IP 的 `publishedPort` 上做 Peer-only 数据报转发，不走 TCP 探测；未启用的 UDP 端口
+同样不能借此功能访问。
+
+`revision` 在同一控制 session 内必须单调递增。小于或等于上次接受值的快照幂等忽略。
+每个 session 最多 32 个服务，单快照 JSON 不超过 16 KiB。服务端按持久化定义校验 `serviceId`，
+丢弃未配置、未启用或不属于该设备的项，并用服务端字段重写名称、类型、端口和 path。
+
+发布设备通过登录响应和后续 `peer-config` 的 `peerMesh.localServices` 收到本机服务定义（含
+`targetHost` / `targetPort`）。该列表只发给所属客户端，不得出现在 `service-catalog` 或其它对端可见载荷中。
+客户端仅在 `serviceSharing.effectiveEnabled` 为真且存在获授权在线对端时，对已启用项做探测：TCP 服务
+做 TCP 连接探测，UDP 服务做数据报探测。探测成功后上报不含目标地址的 `service-report`，并在本机虚拟
+IP 的 `publishedPort` 上绑定 Peer-only TCP 或 UDP 桥。`mdnsImportEnabled` 为真时才允许本机 mDNS
+浏览，候选只出现在 `service-report.mdnsCandidates`，不得进入 `service-catalog`。
+
+### `service-catalog`
+
+服务端向每个获授权对端下发个性化全量快照，不把动态目录塞进登录 `environment`：
+
+```json
+{
+  "type": "service-catalog",
+  "publisherClientId": 1,
+  "publisherClientName": "client-a",
+  "publisherSessionId": 1868708022931423400,
+  "revision": 3,
+  "expiresAt": "2026-08-19T09:05:00Z",
+  "services": [
+    {
+      "serviceId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "name": "local-ssh",
+      "transport": "tcp",
+      "application": "ssh",
+      "publishedPort": 2222
+    }
+  ]
+}
+```
+
+发送者下线、session 被替换、设备停用、ACL 撤销、总开关关闭或 TTL 到期时，立即发送 `services: []`
+并清理目录。重连时发送当前全量快照。多实例按 `(publisherClientId, publisherSessionId, serviceId)`
+隔离。`service-catalog` 只能由服务端发出；客户端上报该类型必须拒绝。老客户端不认识新 type 时
+安全忽略，不影响基础组网。
+
+HTTP(S)「打开」按钮只能由权威 `virtualIp + publishedPort + 安全 path` 构造，禁止打开对端上报的
+任意 URL。SSH/TCP 默认复制 `virtualIp:publishedPort`。
 
 ## STUN/TURN UDP 协议与 direct check
 

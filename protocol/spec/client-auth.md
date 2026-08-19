@@ -72,6 +72,10 @@ Content-Type: application/json
       "mediaPreview": false,
       "maxAttachmentBytes": 0
     },
+    "clientPeerServiceCapabilities": {
+      "version": 0,
+      "applications": []
+    },
     "localAddresses": ["192.168.1.10"],
     "startedAt": "2026-06-24T00:00:00Z"
   }
@@ -125,6 +129,16 @@ signature = HEX(HMAC_SHA256(key, message))
 不实现消息功能的客户端必须明确上报全部 `false` 和大小 `0`；Java CLI 属于此类。只有 `attachments=true` 才表示附件能力可用；
 若同时 `maxAttachmentBytes=0`，发送端不能据此承诺任意大小，只能依赖服务端上传接口的配置上限和实际返回结果。
 
+`environment.clientPeerServiceCapabilities` 声明本地服务发现能力：
+
+| 字段 | 说明 |
+| --- | --- |
+| `version` | 客户端支持的服务发现协议版本；`0` 或缺省表示不支持 |
+| `applications` | 该客户端可发布/消费的应用类型；一期仅 `http`、`https`、`ssh`、`tcp` |
+
+不实现服务发现的客户端必须上报 `version=0` 和空数组。服务端把规范化后的值写入 `ClientSession`，
+并投影到 Peer Mesh roster 的 `peerServiceDiscoveryVersion` / `peerServiceApplications`。
+
 ## HTTP 登录响应
 
 响应体：
@@ -165,7 +179,14 @@ signature = HEX(HMAC_SHA256(key, message))
     "iceNonce": null,
     "serverPublicKey": null,
     "clientPublicKey": null,
-    "sessionTtlSeconds": 3600
+    "sessionTtlSeconds": 3600,
+    "peerServiceDiscoveryVersion": 1,
+    "serviceSharing": {
+      "deploymentEnabled": false,
+      "configuredEnabled": false,
+      "effectiveEnabled": false
+    },
+    "localServices": []
   }
 }
 ```
