@@ -36,9 +36,10 @@ type clientEnvironmentInfo struct {
 	ClientVersion             string                    `json:"clientVersion"`
 	JavaVersion               string                    `json:"javaVersion"`
 	PeerPublicKey             string                    `json:"peerPublicKey"`
-	ClientMessageCapabilities clientMessageCapabilities `json:"clientMessageCapabilities"`
-	LocalAddresses            []string                  `json:"localAddresses"`
-	StartedAt                 string                    `json:"startedAt"`
+	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
+	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
+	LocalAddresses                []string                      `json:"localAddresses"`
+	StartedAt                     string                        `json:"startedAt"`
 }
 
 type clientMessageCapabilities struct {
@@ -47,6 +48,11 @@ type clientMessageCapabilities struct {
 	Attachments        bool  `json:"attachments"`
 	MediaPreview       bool  `json:"mediaPreview"`
 	MaxAttachmentBytes int64 `json:"maxAttachmentBytes"`
+}
+
+type clientPeerServiceCapabilities struct {
+	Version      int      `json:"version"`
+	Applications []string `json:"applications"`
 }
 
 type clientAuthLoginResponse struct {
@@ -174,7 +180,9 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		MessageReceiveCapable:      request.Environment.ClientMessageCapabilities.ReceiveMessages,
 		MessageAttachmentsCapable:  request.Environment.ClientMessageCapabilities.Attachments,
 		MessageMediaPreviewCapable: request.Environment.ClientMessageCapabilities.MediaPreview,
-		MessageMaxAttachmentBytes:  max64(0, request.Environment.ClientMessageCapabilities.MaxAttachmentBytes),
+		MessageMaxAttachmentBytes:   max64(0, request.Environment.ClientMessageCapabilities.MaxAttachmentBytes),
+		PeerServiceDiscoveryVersion: peermesh.NormalizePeerServiceVersion(request.Environment.ClientPeerServiceCapabilities.Version),
+		PeerServiceApplications:     peermesh.EncodePeerServiceApplications(request.Environment.ClientPeerServiceCapabilities.Applications),
 		HTTPLoginAt:                now,
 		ExpiresAt:                  session.ExpiresAt,
 	}); err != nil {

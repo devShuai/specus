@@ -36,6 +36,10 @@ const (
 	TypeTrafficReport = "traffic-report"
 	TypeDeviceReport  = "device-report"
 	TypeClose         = "close"
+	TypeServiceReport = "service-report"
+	TypeServiceCatalog = "service-catalog"
+
+	peerServiceDiscoveryVersion = 1
 
 	PathDirect = "DIRECT"
 	PathRelay  = "RELAY"
@@ -70,9 +74,27 @@ type LoginConfig struct {
 	IceCredential     string   `json:"iceCredential"`
 	IceRealm          string   `json:"iceRealm"`
 	IceNonce          string   `json:"iceNonce"`
-	ServerPublicKey   string   `json:"serverPublicKey"`
-	ClientPublicKey   string   `json:"clientPublicKey"`
-	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`
+	ServerPublicKey              string               `json:"serverPublicKey"`
+	ClientPublicKey              string               `json:"clientPublicKey"`
+	SessionTTLSeconds            int64                `json:"sessionTtlSeconds"`
+	PeerServiceDiscoveryVersion  int                  `json:"peerServiceDiscoveryVersion"`
+	ServiceSharing               ServiceSharingStatus `json:"serviceSharing"`
+	LocalServices                []LocalPeerService   `json:"localServices"`
+}
+
+// LocalPeerService is the owner-only definition pushed in login/peer-config.
+type LocalPeerService struct {
+	ServiceID     string `json:"serviceId"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Transport     string `json:"transport"`
+	Application   string `json:"application"`
+	TargetHost    string `json:"targetHost"`
+	TargetPort    int    `json:"targetPort"`
+	PublishedPort int    `json:"publishedPort"`
+	Path          string `json:"path,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Visibility    string `json:"visibility,omitempty"`
 }
 
 type DeviceView struct {
@@ -206,11 +228,136 @@ type IceServer struct {
 }
 
 type RosterItem struct {
-	ClientID   int64   `json:"clientId"`
-	ClientName string  `json:"clientName"`
-	VirtualIP  string  `json:"virtualIp"`
-	PublicKey  *string `json:"publicKey,omitempty"`
-	Online     bool    `json:"online"`
+	ClientID                     int64    `json:"clientId"`
+	ClientName                   string   `json:"clientName"`
+	VirtualIP                    string   `json:"virtualIp"`
+	PublicKey                    *string  `json:"publicKey,omitempty"`
+	Online                       bool     `json:"online"`
+	MessageSendCapable           bool     `json:"messageSendCapable"`
+	MessageReceiveCapable        bool     `json:"messageReceiveCapable"`
+	MessageAttachmentsCapable    bool     `json:"messageAttachmentsCapable"`
+	MessageMediaPreviewCapable   bool     `json:"messageMediaPreviewCapable"`
+	MessageMaxAttachmentBytes    int64    `json:"messageMaxAttachmentBytes"`
+	PeerServiceDiscoveryVersion  int      `json:"peerServiceDiscoveryVersion"`
+	PeerServiceApplications      []string `json:"peerServiceApplications"`
+}
+
+type ServiceSharingStatus struct {
+	DeploymentEnabled bool `json:"deploymentEnabled"`
+	ConfiguredEnabled bool `json:"configuredEnabled"`
+	EffectiveEnabled  bool `json:"effectiveEnabled"`
+	MdnsImportEnabled bool `json:"mdnsImportEnabled"`
+}
+
+type MdnsCandidate struct {
+	Name        string `json:"name"`
+	Transport   string `json:"transport"`
+	Application string `json:"application"`
+	TargetHost  string `json:"targetHost"`
+	TargetPort  int    `json:"targetPort"`
+}
+
+type AdvertisedService struct {
+	ServiceID     string `json:"serviceId"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Transport     string `json:"transport"`
+	Application   string `json:"application"`
+	PublishedPort int    `json:"publishedPort"`
+	Path          string `json:"path,omitempty"`
+}
+
+type ServiceStats struct {
+	ServiceID         string `json:"serviceId"`
+	BytesIn           int64  `json:"bytesIn"`
+	BytesOut          int64  `json:"bytesOut"`
+	ActiveConnections int    `json:"activeConnections"`
+	TotalConnections  int64  `json:"totalConnections"`
+}
+
+type ServiceInstanceView struct {
+	PublisherSessionID int64  `json:"publisherSessionId"`
+	InstanceID         string `json:"instanceId"`
+	Online             bool   `json:"online"`
+	Advertised         bool   `json:"advertised"`
+	Revision           int64  `json:"revision"`
+	LastReportedAt     string `json:"lastReportedAt"`
+	ExpiresAt          string `json:"expiresAt"`
+	BytesIn            int64  `json:"bytesIn"`
+	BytesOut           int64  `json:"bytesOut"`
+	ActiveConnections  int    `json:"activeConnections"`
+	TotalConnections   int64  `json:"totalConnections"`
+}
+
+type ImportResult struct {
+	Created  int                `json:"created"`
+	Skipped  int                `json:"skipped"`
+	Services []SharedServiceView `json:"services"`
+}
+
+type AuditEvent struct {
+	At        string `json:"at"`
+	Action    string `json:"action"`
+	TenantID  string `json:"tenantId"`
+	ClientID  *int64 `json:"clientId"`
+	SessionID *int64 `json:"sessionId"`
+	ServiceID string `json:"serviceId"`
+	Reason    string `json:"reason"`
+}
+
+type SharedServiceView struct {
+	ID               int64                 `json:"id"`
+	ServiceID        string                `json:"serviceId"`
+	ClientID         int64                 `json:"clientId"`
+	ClientName       string                `json:"clientName"`
+	Name             string                `json:"name"`
+	Description      string                `json:"description"`
+	Transport        string                `json:"transport"`
+	Application      string                `json:"application"`
+	TargetHost       *string               `json:"targetHost"`
+	TargetPort       int                   `json:"targetPort"`
+	PublishedPort    int                   `json:"publishedPort"`
+	Path             string                `json:"path"`
+	Enabled          bool                  `json:"enabled"`
+	Visibility       string                `json:"visibility"`
+	AllowedClientIDs []int64               `json:"allowedClientIds"`
+	PublishedAddress *string               `json:"publishedAddress"`
+	Instances        []ServiceInstanceView `json:"instances"`
+	CreatedAt        string                `json:"createdAt"`
+	UpdatedAt        string                `json:"updatedAt"`
+}
+
+type ServiceMutation struct {
+	ClientID      *int64  `json:"clientId"`
+	ServiceID     *string `json:"serviceId"`
+	Name          *string `json:"name"`
+	Description   *string `json:"description"`
+	Transport     *string `json:"transport"`
+	Application   *string `json:"application"`
+	TargetHost    *string `json:"targetHost"`
+	TargetPort    *int    `json:"targetPort"`
+	PublishedPort *int    `json:"publishedPort"`
+	Path          *string `json:"path"`
+	Enabled          *bool    `json:"enabled"`
+	Visibility       *string  `json:"visibility"`
+	AllowedClientIDs []int64  `json:"allowedClientIds"`
+}
+
+type SharingMutation struct {
+	Enabled           *bool `json:"enabled"`
+	MdnsImportEnabled *bool `json:"mdnsImportEnabled"`
+}
+
+type ServiceSharingView struct {
+	DeploymentEnabled            bool     `json:"deploymentEnabled"`
+	ConfiguredEnabled            bool     `json:"configuredEnabled"`
+	EffectiveEnabled             bool     `json:"effectiveEnabled"`
+	PeerServiceDiscoveryVersion  int      `json:"peerServiceDiscoveryVersion"`
+	SupportedApplications        []string `json:"supportedApplications"`
+	EnabledServiceCount          int64    `json:"enabledServiceCount"`
+	UpdatedAt                    *string  `json:"updatedAt"`
+	UpdatedBy                    *string  `json:"updatedBy"`
+	MdnsImportEnabled            bool     `json:"mdnsImportEnabled"`
 }
 
 type Candidate struct {
@@ -259,6 +406,16 @@ type ControlMessage struct {
 	Peers                []RosterItem `json:"peers,omitempty"`
 	Reason               string       `json:"reason,omitempty"`
 	CreatedAtMillis      int64        `json:"createdAtMillis,omitempty"`
+	Enabled              *bool        `json:"enabled,omitempty"`
+	Revision             *int64       `json:"revision,omitempty"`
+	PublisherClientID    int64        `json:"publisherClientId,omitempty"`
+	PublisherClientName  string       `json:"publisherClientName,omitempty"`
+	PublisherSessionID   *int64       `json:"publisherSessionId,omitempty"`
+	InstanceID           string       `json:"instanceId,omitempty"`
+	GeneratedAt          string       `json:"generatedAt,omitempty"`
+	Services             []AdvertisedService `json:"services,omitempty"`
+	Stats                []ServiceStats      `json:"stats,omitempty"`
+	MdnsCandidates       []MdnsCandidate     `json:"mdnsCandidates,omitempty"`
 }
 
 type DeviceMutation struct {
@@ -290,6 +447,10 @@ type Service struct {
 	// 与 Java PeerMeshService.sessionTokenCache 对齐：create 时 put、close 时 remove。
 	sessionTokenCache   map[int64]string
 	sessionTokenCacheMu sync.RWMutex
+	catalogMu           sync.Mutex
+	catalogs            map[catalogKey]catalogSnapshot
+	auditMu             sync.Mutex
+	audits              []AuditEvent
 }
 
 type relayAuthorization struct {
@@ -332,6 +493,8 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 		pendingRelayBytes:   make(map[int64]int64),
 		turnCredentials:     credentials,
 		sessionTokenCache:   make(map[int64]string),
+		catalogs:            make(map[catalogKey]catalogSnapshot),
+		audits:              []AuditEvent{},
 	}
 }
 
@@ -507,6 +670,9 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 		CIDR:              s.cfg.CIDR,
 		SessionTTLSeconds: s.cfg.SessionTTLSeconds,
 	}
+	cfg.PeerServiceDiscoveryVersion = peerServiceDiscoveryVersion
+	cfg.ServiceSharing = s.sharingStatusFor(account, device)
+	cfg.LocalServices = s.localServicesFor(account)
 	if !s.Enabled() || device == nil {
 		return cfg
 	}
@@ -715,6 +881,10 @@ func (s *Service) EnsureDevice(ctx context.Context, account store.ClientAccount,
 }
 
 func (s *Service) HandleSignal(ctx context.Context, request protocol.MessageRequest, sourceClientName string) error {
+	return s.HandleSignalSession(ctx, request, sourceClientName, 0)
+}
+
+func (s *Service) HandleSignalSession(ctx context.Context, request protocol.MessageRequest, sourceClientName string, publisherSessionID int64) error {
 	if !s.Enabled() {
 		return errors.New("peer mesh is disabled")
 	}
@@ -745,6 +915,10 @@ func (s *Service) HandleSignal(ctx context.Context, request protocol.MessageRequ
 		if err != nil || strings.TrimSpace(request.ToClientName) == "" {
 			return err
 		}
+	case TypeServiceReport:
+		return s.handleServiceReport(ctx, *source, signal, publisherSessionID)
+	case TypeServiceCatalog:
+		return errors.New("service-catalog is server-only")
 	}
 
 	targetName := strings.TrimSpace(request.ToClientName)
@@ -843,6 +1017,7 @@ func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clien
 		for _, item := range closed {
 			s.sendClose(item)
 		}
+		s.withdrawClient(ctx, account.TenantID, account.ID)
 	}
 	for _, target := range s.rosterRefreshTargets(ctx, *account) {
 		s.PushRoster(ctx, target)
@@ -1514,13 +1689,39 @@ func (s *Service) AllowedRoster(ctx context.Context, account store.ClientAccount
 		}
 	}
 	delete(byID, account.ID)
+	clientIDs := make([]int64, 0, len(byID))
+	for id := range byID {
+		clientIDs = append(clientIDs, id)
+	}
+	onlineSessions, err := s.db.ListClientSessionsByClientIDsAndStatus(ctx, account.TenantID, clientIDs, "NETTY_ONLINE")
+	if err != nil {
+		return nil, err
+	}
+	bySession := make(map[int64]store.ClientSession, len(onlineSessions))
+	for _, session := range onlineSessions {
+		current, ok := bySession[session.ClientID]
+		if !ok || session.PeerServiceDiscoveryVersion > current.PeerServiceDiscoveryVersion {
+			bySession[session.ClientID] = session
+		}
+	}
 	out := make([]RosterItem, 0, len(byID))
 	for _, device := range byID {
 		_, online := s.sessions.Find(device.ClientName)
-		out = append(out, RosterItem{
+		session := bySession[device.ClientID]
+		item := RosterItem{
 			ClientID: device.ClientID, ClientName: device.ClientName, VirtualIP: device.VirtualIP,
 			PublicKey: device.PublicKey, Online: online,
-		})
+		}
+		if online {
+			item.MessageSendCapable = session.MessageSendCapable
+			item.MessageReceiveCapable = session.MessageReceiveCapable
+			item.MessageAttachmentsCapable = session.MessageAttachmentsCapable
+			item.MessageMediaPreviewCapable = session.MessageMediaPreviewCapable
+			item.MessageMaxAttachmentBytes = session.MessageMaxAttachmentBytes
+			item.PeerServiceDiscoveryVersion = session.PeerServiceDiscoveryVersion
+			item.PeerServiceApplications = decodeApplications(session.PeerServiceApplications)
+		}
+		out = append(out, item)
 	}
 	return out, nil
 }

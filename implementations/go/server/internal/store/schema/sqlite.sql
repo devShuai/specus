@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   message_attachments_capable INTEGER NOT NULL DEFAULT 0,
   message_media_preview_capable INTEGER NOT NULL DEFAULT 0,
   message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,
+  peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,
+  peer_service_applications TEXT,
   http_login_at TEXT NOT NULL,
   netty_connected_at TEXT,
   disconnected_at TEXT,
@@ -527,6 +529,38 @@ CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_tenant ON peer_mesh_session (te
 CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_source ON peer_mesh_session (tenant_id, source_client_id);
 CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_target ON peer_mesh_session (tenant_id, target_client_id);
 CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_status ON peer_mesh_session (status);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_service_sharing (
+  tenant_id TEXT NOT NULL PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  mdns_import_enabled INTEGER NOT NULL DEFAULT 0,
+  updated_by TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_shared_service (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  client_id INTEGER NOT NULL,
+  client_name TEXT NOT NULL,
+  service_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  transport TEXT NOT NULL,
+  application TEXT NOT NULL,
+  target_host TEXT NOT NULL,
+  target_port INTEGER NOT NULL,
+  published_port INTEGER NOT NULL,
+  path TEXT,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  visibility TEXT NOT NULL,
+  allowed_client_ids TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (tenant_id, client_id, service_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_shared_service_tenant_client ON peer_mesh_shared_service (tenant_id, client_id);
 
 CREATE TABLE IF NOT EXISTS specus_connection_stat (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

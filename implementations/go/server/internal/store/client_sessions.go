@@ -15,9 +15,10 @@ func (db *DB) InsertClientSession(ctx context.Context, session ClientSession) er
 		 machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version,
 		 java_version, local_addresses, message_send_capable, message_receive_capable,
 		 message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
+		 peer_service_discovery_version, peer_service_applications,
 		 http_login_at, netty_connected_at, disconnected_at,
 		 expires_at, channel_id, remote_address)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query,
 		session.ID, defaultTenant(session.TenantID), session.CredentialID, session.IdentityID,
 		session.ClientID, session.ClientName, session.TokenHash, session.Status,
@@ -27,6 +28,7 @@ func (db *DB) InsertClientSession(ctx context.Context, session ClientSession) er
 		db.clientMessageCapabilityValue(session.MessageReceiveCapable),
 		db.clientMessageCapabilityValue(session.MessageAttachmentsCapable),
 		db.clientMessageCapabilityValue(session.MessageMediaPreviewCapable), session.MessageMaxAttachmentBytes,
+		session.PeerServiceDiscoveryVersion, nullableSessionText(session.PeerServiceApplications),
 		formatTime(session.HTTPLoginAt), nullableTime(session.NettyConnectedAt),
 		nullableTime(session.DisconnectedAt), formatTime(session.ExpiresAt), session.ChannelID,
 		session.RemoteAddress)
@@ -39,6 +41,7 @@ func (db *DB) GetClientSession(ctx context.Context, id int64) (*ClientSession, e
 		token_hash, status, machine_fingerprint, os_user, hostname, os_name, os_version, os_arch,
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
+		peer_service_discovery_version, peer_service_applications,
 		http_login_at, netty_connected_at,
 		disconnected_at, expires_at, channel_id, remote_address
 		FROM specus_client_session WHERE id = ?`)
@@ -58,6 +61,7 @@ func (db *DB) GetOnlineClientSession(ctx context.Context, tenantID string, clien
 		token_hash, status, machine_fingerprint, os_user, hostname, os_name, os_version, os_arch,
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
+		peer_service_discovery_version, peer_service_applications,
 		http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
 		FROM specus_client_session
 		WHERE tenant_id = ? AND client_id = ? AND status = ?
@@ -73,6 +77,38 @@ func (db *DB) GetOnlineClientSession(ctx context.Context, tenantID string, clien
 }
 
 // ClientHasOnlineMessageReceiveCapability matches Java's anyMatch across all online sessions.
+func (db *DB) ListClientSessionsByClientIDsAndStatus(ctx context.Context, tenantID string, clientIDs []int64, status string) ([]ClientSession, error) {
+	if len(clientIDs) == 0 {
+		return nil, nil
+	}
+	query := db.rebind(`SELECT id, tenant_id, credential_id, identity_id, client_id, client_name,
+		token_hash, status, machine_fingerprint, os_user, hostname, os_name, os_version, os_arch,
+		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
+		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
+		peer_service_discovery_version, peer_service_applications,
+		http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
+		FROM specus_client_session
+		WHERE tenant_id = ? AND status = ? AND client_id IN (` + placeholders(len(clientIDs)) + `)`)
+	args := []any{defaultTenant(tenantID), status}
+	for _, id := range clientIDs {
+		args = append(args, id)
+	}
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sessions []ClientSession
+	for rows.Next() {
+		session, err := scanClientSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
 func (db *DB) ClientHasOnlineMessageReceiveCapability(ctx context.Context, tenantID string, clientID int64, status string) (bool, error) {
 	query := db.rebind(`SELECT COUNT(*) FROM specus_client_session
 		WHERE tenant_id = ? AND client_id = ? AND status = ? AND ` + db.clientMessageReceivePredicate())
@@ -163,6 +199,7 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 		httpLoginAt, expiresAt              string
 		messageSend, messageReceive         databaseBoolean
 		messageAttachments, messagePreview  databaseBoolean
+		peerApplications                    sql.NullString
 	)
 	err := scanner.Scan(&session.ID, &session.TenantID, &session.CredentialID, &session.IdentityID,
 		&session.ClientID, &session.ClientName, &session.TokenHash, &session.Status,
@@ -170,6 +207,7 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 		&clientVersion, &javaVersion, &localAddresses, &messageSend,
 		&messageReceive, &messageAttachments,
 		&messagePreview, &session.MessageMaxAttachmentBytes,
+		&session.PeerServiceDiscoveryVersion, &peerApplications,
 		&httpLoginAt, &nettyAt, &disconnectedAt,
 		&expiresAt, &channelID, &remoteAddress)
 	if err != nil {
@@ -186,6 +224,9 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 	session.MessageReceiveCapable = bool(messageReceive)
 	session.MessageAttachmentsCapable = bool(messageAttachments)
 	session.MessageMediaPreviewCapable = bool(messagePreview)
+	if peerApplications.Valid {
+		session.PeerServiceApplications = peerApplications.String
+	}
 	session.HTTPLoginAt = parseTime(httpLoginAt)
 	session.NettyConnectedAt = nullTimePtr(nettyAt)
 	session.DisconnectedAt = nullTimePtr(disconnectedAt)

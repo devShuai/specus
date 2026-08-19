@@ -201,6 +201,14 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshSessions))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions/{id}", a.requireAuth(a.handlePeerMeshCloseSession))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshCloseSessions))
+	mux.HandleFunc("GET /api/admin/peer-mesh/service-sharing", a.requireAuth(a.handlePeerMeshServiceSharing))
+	mux.HandleFunc("PUT /api/admin/peer-mesh/service-sharing", a.requireAuth(a.handlePeerMeshUpdateServiceSharing))
+	mux.HandleFunc("GET /api/admin/peer-mesh/services", a.requireAuth(a.handlePeerMeshServices))
+	mux.HandleFunc("POST /api/admin/peer-mesh/services", a.requireAuth(a.handlePeerMeshCreateService))
+	mux.HandleFunc("PUT /api/admin/peer-mesh/services/{id}", a.requireAuth(a.handlePeerMeshUpdateService))
+	mux.HandleFunc("DELETE /api/admin/peer-mesh/services/{id}", a.requireAuth(a.handlePeerMeshDeleteService))
+	mux.HandleFunc("POST /api/admin/peer-mesh/services/import", a.requireAuth(a.handlePeerMeshImportServices))
+	mux.HandleFunc("GET /api/admin/peer-mesh/service-audit", a.requireAuth(a.handlePeerMeshServiceAudit))
 }
 
 func (a *API) handlePublicPeerMeshStunConfig(w http.ResponseWriter, r *http.Request) {
@@ -2261,6 +2269,174 @@ func (a *API) handlePeerMeshCloseSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+func (a *API) handlePeerMeshServiceSharing(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	view, err := a.peerMesh.SharingStatus(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerMeshUpdateServiceSharing(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	if !principal.Admin {
+		writeError(w, http.StatusForbidden, "只有管理员可以修改 Peer 服务共享")
+		return
+	}
+	var req peermesh.SharingMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.Enabled == nil && req.MdnsImportEnabled == nil) {
+		writeError(w, http.StatusBadRequest, "enabled or mdnsImportEnabled is required")
+		return
+	}
+	view, err := a.peerMesh.SetSharingOptions(r.Context(), a.peerAccess(principal), req.Enabled, req.MdnsImportEnabled)
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerMeshServices(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	items, err := a.peerMesh.ListSharedServices(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (a *API) handlePeerMeshCreateService(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	if !principal.Admin {
+		writeError(w, http.StatusForbidden, "只有管理员可以修改 Peer 服务共享")
+		return
+	}
+	var req peermesh.ServiceMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	view, err := a.peerMesh.CreateSharedService(r.Context(), a.peerAccess(principal), req)
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerMeshUpdateService(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	if !principal.Admin {
+		writeError(w, http.StatusForbidden, "只有管理员可以修改 Peer 服务共享")
+		return
+	}
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var req peermesh.ServiceMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	view, err := a.peerMesh.UpdateSharedService(r.Context(), a.peerAccess(principal), id, req)
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerMeshDeleteService(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	if !principal.Admin {
+		writeError(w, http.StatusForbidden, "只有管理员可以修改 Peer 服务共享")
+		return
+	}
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.peerMesh.DeleteSharedService(r.Context(), a.peerAccess(principal), id); err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *API) failPeerService(w http.ResponseWriter, err error) {
+	var forbidden peermesh.ForbiddenError
+	if errors.As(err, &forbidden) {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
+}
+
+func (a *API) handlePeerMeshImportServices(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	if !principal.Admin {
+		writeError(w, http.StatusForbidden, "只有管理员可以修改 Peer 服务共享")
+		return
+	}
+	var req struct {
+		ClientID *int64 `json:"clientId"`
+		Source   string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ClientID == nil {
+		writeError(w, http.StatusBadRequest, "clientId is required")
+		return
+	}
+	view, err := a.peerMesh.ImportCandidatesFrom(r.Context(), a.peerAccess(principal), *req.ClientID, req.Source)
+	if err != nil {
+		a.failPeerService(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerMeshServiceAudit(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.peerMesh.RecentAudits(a.peerAccess(principal)))
 }
 
 func (a *API) handlePeerMeshCloseSessions(w http.ResponseWriter, r *http.Request) {

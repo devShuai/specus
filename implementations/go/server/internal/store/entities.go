@@ -239,6 +239,8 @@ type ClientSession struct {
 	MessageAttachmentsCapable  bool
 	MessageMediaPreviewCapable bool
 	MessageMaxAttachmentBytes  int64
+	PeerServiceDiscoveryVersion int
+	PeerServiceApplications     string
 	HTTPLoginAt                time.Time
 	NettyConnectedAt           *time.Time
 	DisconnectedAt             *time.Time
@@ -309,6 +311,37 @@ type PeerMeshSession struct {
 	DirectBytes      int64
 	RelayBytes       int64
 	LastTrafficAt    *time.Time
+}
+
+// PeerMeshServiceSharing is the tenant-level service-sharing toggle. Missing rows mean disabled.
+type PeerMeshServiceSharing struct {
+	TenantID           string
+	Enabled            bool
+	MdnsImportEnabled  bool
+	UpdatedBy          *string
+	UpdatedAt          time.Time
+}
+
+// PeerMeshSharedService is a persisted local service definition.
+type PeerMeshSharedService struct {
+	ID               int64
+	TenantID         string
+	ClientID         int64
+	ClientName       string
+	ServiceID        string
+	Name             string
+	Description      string
+	Transport        string
+	Application      string
+	TargetHost       string
+	TargetPort       int
+	PublishedPort    int
+	Path             string
+	Enabled          bool
+	Visibility       string
+	AllowedClientIDs string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // ConnectionRecord mirrors specus_connection_record.

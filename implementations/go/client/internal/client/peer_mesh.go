@@ -144,6 +144,7 @@ type peerMeshClient struct {
 	pathMTUCache       map[string]cachedPeerPathMTU
 	messageHandler     func(ClientMessage)
 	turnAuth           turnAuthCredentials
+	services           *peerServiceRuntime
 }
 
 type peerMeshPeer struct {
@@ -203,6 +204,14 @@ type peerControlMessage struct {
 	DataFrameVersion     int             `json:"dataFrameVersion"`
 	Reason               string          `json:"reason,omitempty"`
 	CreatedAtMillis      int64           `json:"createdAtMillis,omitempty"`
+	Enabled              *bool           `json:"enabled,omitempty"`
+	Revision             *int64          `json:"revision,omitempty"`
+	PublisherClientID    int64           `json:"publisherClientId,omitempty"`
+	PublisherClientName  string          `json:"publisherClientName,omitempty"`
+	PublisherSessionID   *int64          `json:"publisherSessionId,omitempty"`
+	InstanceID           string          `json:"instanceId,omitempty"`
+	GeneratedAt          string          `json:"generatedAt,omitempty"`
+	Services             []peerAdvertisedService `json:"services,omitempty"`
 }
 
 type peerMeshSession struct {
@@ -365,6 +374,7 @@ func newPeerMeshClient(config Config, logger *log.Logger) *peerMeshClient {
 		logger:             logger,
 		portMappingService: newNatPortMappingService(logger),
 		localKeyEpoch:      newPeerMeshKeyEpoch(),
+		services:           newPeerServiceRuntime(logger, nil),
 	}
 }
 
@@ -412,8 +422,13 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.mu.Lock()
 	mesh.updateTurnAuthLocked(runtime.PeerMesh)
 	mesh.mu.Unlock()
+	mesh.ensureServices().setSend(func(msg any) error {
+		return sender(conn, "", msg)
+	})
 	if !runtime.PeerMesh.Enabled {
 		mesh.stop()
+		mesh.ensureServices().applyConfig(runtime.PeerMesh)
+		mesh.ensureServices().setHasAuthorizedOnlinePeer(false)
 		return
 	}
 	nextRuntimeConfigKey := mesh.runtimeConfigKeyFor(runtime.PeerMesh)
@@ -430,6 +445,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 		mesh.tryAcquirePortMappingAsync()
 		mesh.requestRelayCandidates()
 		mesh.announceCandidates()
+		mesh.ensureServices().applyConfig(runtime.PeerMesh)
 		return
 	}
 	mesh.mu.Unlock()
@@ -507,6 +523,14 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.tryAcquirePortMappingAsync()
 	mesh.requestRelayCandidates()
 	mesh.announceCandidates()
+	mesh.ensureServices().applyConfig(runtime.PeerMesh)
+}
+
+func (mesh *peerMeshClient) ensureServices() *peerServiceRuntime {
+	if mesh.services == nil {
+		mesh.services = newPeerServiceRuntime(mesh.logger, nil)
+	}
+	return mesh.services
 }
 
 func (mesh *peerMeshClient) stop() {
@@ -640,6 +664,8 @@ func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base Ru
 		mesh.reciprocateCandidates(mesh.peerIDFromControl(message))
 	case peerControlTypeClose:
 		mesh.closeSession(message)
+	case peerControlTypeServiceCatalog:
+		mesh.ensureServices().applyCatalog(message)
 	default:
 		mesh.logger.Printf("ignored peer-control message type=%q", message.Type)
 	}
@@ -2047,7 +2073,17 @@ func (mesh *peerMeshClient) mergeRoster(items []peerMeshPeer) {
 		next[item.ClientID] = &copy
 	}
 	mesh.peers = next
+	hints := make(map[int64]peerServiceRosterHint, len(next))
+	onlinePeer := false
+	for id, peer := range next {
+		hints[id] = peerServiceRosterHint{virtualIP: peer.VirtualIP, online: peer.Online}
+		if peer.Online {
+			onlinePeer = true
+		}
+	}
 	mesh.mu.Unlock()
+	mesh.ensureServices().setRoster(hints)
+	mesh.ensureServices().setHasAuthorizedOnlinePeer(onlinePeer)
 	mesh.syncVirtualDeviceRoutes()
 }
 

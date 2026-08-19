@@ -318,9 +318,14 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 
 	dispatcher.SetNatHandler(coordinator.Handle)
 	dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
-		return peerMesh.HandleSignal(conn.Context(), request, conn.ClientName())
+		return peerMesh.HandleSignalSession(conn.Context(), request, conn.ClientName(), conn.ClientSessionID())
 	})
-	dispatcher.SetOnDisconnect(coordinator.Close)
+	dispatcher.SetOnDisconnect(func(conn *control.Conn) {
+		coordinator.Close(conn)
+		if peerMesh != nil {
+			peerMesh.OnClientDisconnected(conn.Context(), conn.ClientName(), conn.ClientSessionID())
+		}
+	})
 	dispatcher.SetOnDataLoginSuccess(coordinator.Attach)
 	dispatcher.SetClientMessageHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
 		return (&App{db: db, sessions: sessions, peerMesh: peerMesh, clientMessages: clientMessages, logger: logger}).handleClientMessage(conn, request)

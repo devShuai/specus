@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   message_attachments_capable TINYINT(1) NOT NULL DEFAULT 0,
   message_media_preview_capable TINYINT(1) NOT NULL DEFAULT 0,
   message_max_attachment_bytes BIGINT NOT NULL DEFAULT 0,
+  peer_service_discovery_version INT NOT NULL DEFAULT 0,
+  peer_service_applications VARCHAR(160),
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),
@@ -505,6 +507,38 @@ CREATE TABLE IF NOT EXISTS peer_mesh_session (
   KEY idx_peer_mesh_session_source (tenant_id, source_client_id),
   KEY idx_peer_mesh_session_target (tenant_id, target_client_id),
   KEY idx_peer_mesh_session_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS peer_mesh_service_sharing (
+  tenant_id VARCHAR(80) NOT NULL,
+  enabled TINYINT(1) NOT NULL DEFAULT 0,
+  mdns_import_enabled TINYINT(1) NOT NULL DEFAULT 0,
+  updated_by VARCHAR(80),
+  updated_at VARCHAR(40) NOT NULL,
+  PRIMARY KEY (tenant_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS peer_mesh_shared_service (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  client_id BIGINT NOT NULL,
+  client_name VARCHAR(120) NOT NULL,
+  service_id VARCHAR(64) NOT NULL,
+  name VARCHAR(80) NOT NULL,
+  description VARCHAR(200),
+  transport VARCHAR(16) NOT NULL,
+  application VARCHAR(16) NOT NULL,
+  target_host VARCHAR(64) NOT NULL,
+  target_port INT NOT NULL,
+  published_port INT NOT NULL,
+  path VARCHAR(128),
+  enabled TINYINT(1) NOT NULL DEFAULT 0,
+  visibility VARCHAR(16) NOT NULL,
+  allowed_client_ids VARCHAR(512),
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_peer_shared_service_id (tenant_id, client_id, service_id),
+  KEY idx_peer_shared_service_tenant_client (tenant_id, client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS specus_connection_stat (

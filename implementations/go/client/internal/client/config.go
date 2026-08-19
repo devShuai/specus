@@ -116,9 +116,33 @@ type PeerMeshConfig struct {
 	IceCredential     string   `json:"iceCredential"`
 	IceRealm          string   `json:"iceRealm"`
 	IceNonce          string   `json:"iceNonce"`
-	ServerPublicKey   string   `json:"serverPublicKey"`
-	ClientPublicKey   string   `json:"clientPublicKey"`
-	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`
+	ServerPublicKey              string               `json:"serverPublicKey"`
+	ClientPublicKey              string               `json:"clientPublicKey"`
+	SessionTTLSeconds            int64                `json:"sessionTtlSeconds"`
+	PeerServiceDiscoveryVersion  int                  `json:"peerServiceDiscoveryVersion"`
+	ServiceSharing               ServiceSharingStatus `json:"serviceSharing"`
+	LocalServices                []LocalPeerService   `json:"localServices"`
+}
+
+type ServiceSharingStatus struct {
+	DeploymentEnabled bool `json:"deploymentEnabled"`
+	ConfiguredEnabled bool `json:"configuredEnabled"`
+	EffectiveEnabled  bool `json:"effectiveEnabled"`
+	MdnsImportEnabled bool `json:"mdnsImportEnabled"`
+}
+
+type LocalPeerService struct {
+	ServiceID     string `json:"serviceId"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Transport     string `json:"transport"`
+	Application   string `json:"application"`
+	TargetHost    string `json:"targetHost"`
+	TargetPort    int    `json:"targetPort"`
+	PublishedPort int    `json:"publishedPort"`
+	Path          string `json:"path,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Visibility    string `json:"visibility,omitempty"`
 }
 
 func LoadConfig(path string) (Config, error) {

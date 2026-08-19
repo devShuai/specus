@@ -38,9 +38,10 @@ type clientEnvironmentInfo struct {
 	ClientVersion             string                    `json:"clientVersion"`
 	JavaVersion               string                    `json:"javaVersion"`
 	PeerPublicKey             string                    `json:"peerPublicKey"`
-	ClientMessageCapabilities clientMessageCapabilities `json:"clientMessageCapabilities"`
-	LocalAddresses            []string                  `json:"localAddresses"`
-	StartedAt                 string                    `json:"startedAt"`
+	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
+	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
+	LocalAddresses                []string                      `json:"localAddresses"`
+	StartedAt                     string                        `json:"startedAt"`
 }
 
 type clientMessageCapabilities struct {
@@ -49,6 +50,11 @@ type clientMessageCapabilities struct {
 	Attachments        bool  `json:"attachments"`
 	MediaPreview       bool  `json:"mediaPreview"`
 	MaxAttachmentBytes int64 `json:"maxAttachmentBytes"`
+}
+
+type clientPeerServiceCapabilities struct {
+	Version      int      `json:"version"`
+	Applications []string `json:"applications"`
 }
 
 var authHTTPClient = &http.Client{Timeout: 20 * time.Second}
@@ -156,6 +162,10 @@ func collectEnvironment() clientEnvironmentInfo {
 		PeerPublicKey:      peerPublicKeyBase64(),
 		ClientMessageCapabilities: clientMessageCapabilities{
 			SendMessages: true, ReceiveMessages: true,
+		},
+		ClientPeerServiceCapabilities: clientPeerServiceCapabilities{
+			Version:      1,
+			Applications: []string{"http", "https", "ssh", "tcp", "udp"},
 		},
 		LocalAddresses: localAddresses(),
 		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
