@@ -42,10 +42,11 @@ func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
 	if err != nil {
 		t.Fatalf("new app: %v", err)
 	}
-	t.Cleanup(func() { app.Close() })
-
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		app.Close()
+	})
 	go func() { _ = app.Run(ctx) }()
 
 	deadline := time.Now().Add(5 * time.Second)
