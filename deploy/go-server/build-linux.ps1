@@ -87,6 +87,85 @@ function Restore-EnvironmentValue {
     }
 }
 
+function Remove-LegacyWorkspaceModuleCache {
+    param(
+        [Parameter(Mandatory = $true)][string]$CacheRoot,
+        [Parameter(Mandatory = $true)][string]$LegacyModuleCache
+    )
+
+    $resolvedCacheRoot = [System.IO.Path]::GetFullPath($CacheRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $resolvedLegacyModuleCache = [System.IO.Path]::GetFullPath($LegacyModuleCache)
+    $expectedPrefix = $resolvedCacheRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedLegacyModuleCache.StartsWith(
+        $expectedPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to clean legacy Go module cache outside build cache root: $resolvedLegacyModuleCache"
+    }
+    if (-not (Test-Path -LiteralPath $resolvedLegacyModuleCache)) {
+        return
+    }
+
+    Write-BuildLog "Removing legacy workspace-local Go module cache"
+    try {
+        Get-ChildItem -LiteralPath $resolvedLegacyModuleCache -Recurse -Force -File |
+            ForEach-Object {
+                if ($_.IsReadOnly) {
+                    $_.IsReadOnly = $false
+                }
+            }
+        $removed = $false
+        for ($attempt = 1; $attempt -le 12; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $resolvedLegacyModuleCache -Recurse -Force -ErrorAction Stop
+                $removed = $true
+                break
+            } catch {
+                if ($attempt -eq 12) {
+                    throw
+                }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        if (-not $removed) {
+            throw "Legacy Go module cache still exists after cleanup"
+        }
+    } catch {
+        throw "Unable to remove legacy Go module cache. Close processes that are indexing '$resolvedLegacyModuleCache' and rerun the build. $($_.Exception.Message)"
+    }
+}
+
+function Assert-GoModuleCacheOutsideRepository {
+    param(
+        [Parameter(Mandatory = $true)][string]$GoCommand,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot
+    )
+
+    $moduleCache = (& $GoCommand env GOMODCACHE).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($moduleCache)) {
+        throw "Unable to resolve the effective Go module cache"
+    }
+    $resolvedRepositoryRoot = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $resolvedModuleCache = [System.IO.Path]::GetFullPath($moduleCache)
+    $repositoryPrefix = $resolvedRepositoryRoot + [System.IO.Path]::DirectorySeparatorChar
+    if ($resolvedModuleCache.Equals(
+        $resolvedRepositoryRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or $resolvedModuleCache.StartsWith(
+        $repositoryPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "GOMODCACHE must be outside the repository. Unset GOMODCACHE or point it to a user-level cache before building: $resolvedModuleCache"
+    }
+    Write-BuildLog "Using external Go module cache: $resolvedModuleCache"
+}
+
 $go = Require-Command "go"
 $git = Require-Command "git"
 
@@ -123,18 +202,20 @@ if (-not $SkipFrontend) {
 
 $cacheRoot = Join-Path $RepoRoot ".tmp/go-server-build"
 New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+# Never place GOMODCACHE below the repository. Go intentionally makes extracted modules
+# read-only, while IDE module discovery may treat their nested go.mod files as project roots.
+$legacyGoModCache = Join-Path $cacheRoot "mod-cache"
+Remove-LegacyWorkspaceModuleCache $cacheRoot $legacyGoModCache
+Assert-GoModuleCacheOutsideRepository $go $RepoRoot
 $hadGoCache = Test-Path -LiteralPath "Env:GOCACHE"
-$hadGoModCache = Test-Path -LiteralPath "Env:GOMODCACHE"
 $hadGoOs = Test-Path -LiteralPath "Env:GOOS"
 $hadGoArch = Test-Path -LiteralPath "Env:GOARCH"
 $hadCgoEnabled = Test-Path -LiteralPath "Env:CGO_ENABLED"
 $originalGoCache = $env:GOCACHE
-$originalGoModCache = $env:GOMODCACHE
 $originalGoOs = $env:GOOS
 $originalGoArch = $env:GOARCH
 $originalCgoEnabled = $env:CGO_ENABLED
 $env:GOCACHE = Join-Path $cacheRoot "go-cache"
-$env:GOMODCACHE = Join-Path $cacheRoot "mod-cache"
 $env:GOOS = ""
 $env:GOARCH = ""
 $env:CGO_ENABLED = "0"
@@ -143,7 +224,7 @@ Push-Location $ServerRoot
 try {
     if (-not $SkipTests) {
         Write-BuildLog "Running Go server tests on the build host"
-        Invoke-Checked $go @("test", "./...")
+        Invoke-Checked $go @("test", "-mod=readonly", "./...")
     }
 
     New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
@@ -165,6 +246,7 @@ try {
     $env:GOARCH = $Architecture
     Invoke-Checked $go @(
         "build",
+        "-mod=readonly",
         "-trimpath",
         "-ldflags=-s -w",
         "-o", $BinaryPath,
@@ -173,7 +255,6 @@ try {
 } finally {
     Pop-Location
     Restore-EnvironmentValue "GOCACHE" $hadGoCache $originalGoCache
-    Restore-EnvironmentValue "GOMODCACHE" $hadGoModCache $originalGoModCache
     Restore-EnvironmentValue "GOOS" $hadGoOs $originalGoOs
     Restore-EnvironmentValue "GOARCH" $hadGoArch $originalGoArch
     Restore-EnvironmentValue "CGO_ENABLED" $hadCgoEnabled $originalCgoEnabled
