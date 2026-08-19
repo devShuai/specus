@@ -253,7 +253,7 @@ public class LocalStreamBackpressureTest {
 
         // Fill the socket buffers so a write genuinely parks rather than completing instantly.
         byte[] chunk = new byte[64 * 1024];
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 128; i++) {
             try {
                 stream.write(chunk);
             } catch (IOException bounded) {
@@ -262,7 +262,7 @@ public class LocalStreamBackpressureTest {
         }
 
         assertTrue("the stalled write was never abandoned",
-                channel.reset.await(15, TimeUnit.SECONDS));
+                channel.reset.await(20, TimeUnit.SECONDS));
         assertNotNull(channel.resetReason.get());
         assertTrue("unexpected reset reason: " + channel.resetReason.get(),
                 channel.resetReason.get().contains("timed out")

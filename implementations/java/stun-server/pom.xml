@@ -37,7 +37,7 @@
                 <executions>
                     <execution>
                         <id>embed-stun-core</id>
-                        <phase>process-classes</phase>
+                        <phase>prepare-package</phase>
                         <goals>
                             <goal>unpack</goal>
                         </goals>

@@ -1,9 +1,12 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 
 namespace Specus.Client.Updates;
 
 public static class ClientUpdateRuntime
 {
+    [UnconditionalSuppressMessage("SingleFile", "IL3000",
+        Justification = "Assembly.Location is empty for the single-file desktop apphost; ProcessPath is the fallback.")]
     public static ClientUpdateInstallationRequest CreateCurrentProcessRequest()
     {
         var applicationDirectory = Path.TrimEndingDirectorySeparator(
@@ -17,7 +20,7 @@ public static class ClientUpdateRuntime
 
         // Assembly.Location is empty for the single-file desktop release. In that case the
         // apphost itself is both the restart command and the package entry we require.
-        var assemblyPath = Assembly.GetEntryAssembly()?.Location;
+        var assemblyPath = EntryAssemblyLocation();
         var entryPath = ExistingContainedFile(assemblyPath, applicationDirectory)
             ?? ExistingContainedFile(processPath, applicationDirectory)
             ?? throw new InvalidOperationException("The current client entry file cannot be located");
@@ -41,6 +44,10 @@ public static class ClientUpdateRuntime
             restartArguments,
             Environment.ProcessId);
     }
+
+    [UnconditionalSuppressMessage("SingleFile", "IL3000",
+        Justification = "Location is only used when it is a real filesystem path; single-file falls back to ProcessPath.")]
+    private static string? EntryAssemblyLocation() => Assembly.GetEntryAssembly()?.Location;
 
     private static string? ExistingContainedFile(string? path, string directory)
     {

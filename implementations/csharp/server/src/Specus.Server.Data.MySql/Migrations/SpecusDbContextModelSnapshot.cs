@@ -1572,6 +1572,10 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("tinyint(1)")
                         .HasColumnName("enabled");
 
+                    b.Property<bool>("MdnsImportEnabled")
+                        .HasColumnType("tinyint(1)")
+                        .HasColumnName("mdns_import_enabled");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -1718,6 +1722,12 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasMaxLength(16)
                         .HasColumnType("varchar(16)")
                         .HasColumnName("application");
+
+                    b.Property<string>("AllowedClientIds")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("varchar(512)")
+                        .HasColumnName("allowed_client_ids");
 
                     b.Property<long>("ClientId")
                         .HasColumnType("bigint")

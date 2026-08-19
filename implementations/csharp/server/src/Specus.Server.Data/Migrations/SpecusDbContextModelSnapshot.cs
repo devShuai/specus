@@ -1570,6 +1570,10 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("enabled");
 
+                    b.Property<bool>("MdnsImportEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("mdns_import_enabled");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -1716,6 +1720,12 @@ namespace Specus.Server.Data.Migrations
                         .HasMaxLength(16)
                         .HasColumnType("TEXT")
                         .HasColumnName("application");
+
+                    b.Property<string>("AllowedClientIds")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("allowed_client_ids");
 
                     b.Property<long>("ClientId")
                         .HasColumnType("INTEGER")

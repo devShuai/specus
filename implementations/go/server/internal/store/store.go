@@ -82,6 +82,10 @@ func Open(provider, connectionString string) (*DB, error) {
 	if dialect == DialectSQLite {
 		// SQLite is single-writer; one connection avoids "database is locked".
 		handle.SetMaxOpenConns(1)
+		if _, err := handle.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+			handle.Close()
+			return nil, fmt.Errorf("sqlite busy_timeout: %w", err)
+		}
 	}
 	if err := handle.Ping(); err != nil {
 		handle.Close()
