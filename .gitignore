@@ -76,6 +76,23 @@ client2.jsonc
 /deploy/go-server/out/
 
 ### Local build caches ###
+#
+# Some of these are repository-local on purpose, some are only leftovers. All are safe to delete;
+# what differs is what it costs you.
+#
+#   .nuget/    deliberate. scripts/publish-desktop-win-x64.ps1 points NUGET_PACKAGES here so a
+#              publish cannot pick up packages from another checkout. Deleting it re-downloads.
+#   .gocache/  deliberate. deploy/go-server/build-linux.ps1 points GOCACHE at a workspace path.
+#              Deleting it only costs a slower next build.
+#   .gomodcache/ must NOT be here, and the same script refuses to build if GOMODCACHE resolves
+#              below the repository: Go marks extracted modules read-only, which makes the
+#              workspace painful to delete. The pattern stays so a stray one is never committed.
+#   .m2/       not the live repository. Maven resolves from the user-level ~/.m2 (visible in any
+#              surefire classpath), so this is residue from an ad-hoc run and is pure dead weight.
+#   /.tmp/     scratch from integration runs: dependencies compiled from source, migration smoke
+#              tests. Nothing here is reused between runs.
+#
+# The rest are per-tool home directories created by whatever was run in this folder.
 .appdata/
 .dotnet/
 .dotnet-home/
