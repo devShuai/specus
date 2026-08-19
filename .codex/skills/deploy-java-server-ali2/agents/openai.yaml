@@ -1,4 +1,0 @@
-interface:
-  display_name: "Deploy Java Server to ali2"
-  short_description: "Project-local workflow for packaging the Java specus-server and updating ali2."
-  default_prompt: "Package server and deploy to ali2"
