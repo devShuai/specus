@@ -36,6 +36,7 @@
   * [安全差异](cross-language/alignment/security-differences.md) — 必须一致、故意不同，以及为什么
   * [环境验证](cross-language/alignment/environment-verification.md) — 实际跑过什么，以及结论的边界
 * [peer-mesh-client-decomposition-plan.md](cross-language/peer-mesh-client-decomposition-plan.md) — Peer Mesh 客户端在四端都长到 4000-5000 行，按变更节奏拆分的分阶段方案。
+* [adversarial-test-matrix.md](cross-language/adversarial-test-matrix.md) — 恶意输入与故障注入的场景 × 实现覆盖矩阵，以及已知空白。
 * [cross-language-e2e-acceptance-matrix.md](cross-language/cross-language-e2e-acceptance-matrix.md) — 三语言 server/client 端到端验收矩阵。
 * [specus-server-go-port-plan.md](cross-language/specus-server-go-port-plan.md) — Go 服务端移植计划。
 * [specus-server-csharp-port-plan.md](cross-language/specus-server-csharp-port-plan.md) — C# 服务端重写计划(原文件名 eventual-tickling-waffle.md,已更正)。
