@@ -49,4 +49,21 @@ class PeerControlMessageServiceDiscoveryTests {
         assertEquals("future-signal", parsed.getType());
         assertTrue(parsed.getServices() == null || parsed.getServices().isEmpty());
     }
+
+    @Test
+    void realClientServiceReportOmitsServerBoundSessionAndUsesV2Applications() {
+        PeerControlMessage report = new PeerControlMessage();
+        report.setType(PeerControlMessage.TYPE_SERVICE_REPORT);
+        report.setEnabled(true);
+        report.setRevision(1L);
+        report.setInstanceId("instance-a");
+        report.setServices(List.of());
+
+        JsonNode node = JsonUtil.readString(JsonUtil.objectToString(report));
+
+        assertEquals("service-report", node.path("type").asText());
+        assertFalse(node.has("publisherSessionId"));
+        assertEquals(2, PeerServiceDiscovery.PROTOCOL_VERSION);
+        assertEquals(List.of("http", "https", "ssh", "tcp", "udp"), PeerServiceDiscovery.APPLICATIONS);
+    }
 }

@@ -284,6 +284,10 @@
         "effectiveEnabled": {
           "type": "boolean",
           "default": false
+        },
+        "mdnsImportEnabled": {
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -415,7 +419,8 @@
         "targetHost",
         "targetPort",
         "publishedPort",
-        "enabled"
+        "enabled",
+        "allowedPeerVirtualIps"
       ],
       "properties": {
         "serviceId": {
@@ -463,6 +468,17 @@
         "visibility": {
           "type": "string",
           "enum": ["OWNER", "ACL"]
+        },
+        "allowedPeerVirtualIps": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 45
+          },
+          "default": []
         }
       }
     },
@@ -803,6 +819,7 @@
               "minimum": 1
             },
             "publisherSessionId": {
+              "description": "服务端根据认证控制连接绑定；客户端 service-report 必须省略。",
               "$ref": "#/$defs/LongId"
             },
             "instanceId": {

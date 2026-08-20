@@ -97,7 +97,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["http", "https", "ssh", "tcp"]
+            "enum": ["http", "https", "ssh", "tcp", "udp"]
           },
           "uniqueItems": true,
           "default": []
@@ -385,7 +385,14 @@
         "publishedPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "path": { "type": "string" },
         "enabled": { "type": "boolean" },
-        "visibility": { "type": "string" }
+        "visibility": { "type": "string" },
+        "allowedPeerVirtualIps": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 2, "maxLength": 45 },
+          "default": []
+        }
       }
     },
     "PeerServiceSharingStatus": {
@@ -401,6 +408,10 @@
           "default": false
         },
         "effectiveEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mdnsImportEnabled": {
           "type": "boolean",
           "default": false
         }

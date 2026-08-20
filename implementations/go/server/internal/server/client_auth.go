@@ -27,15 +27,15 @@ type clientAuthLoginRequest struct {
 }
 
 type clientEnvironmentInfo struct {
-	MachineFingerprint        string                    `json:"machineFingerprint"`
-	Hostname                  string                    `json:"hostname"`
-	OSUser                    string                    `json:"osUser"`
-	OSName                    string                    `json:"osName"`
-	OSVersion                 string                    `json:"osVersion"`
-	OSArch                    string                    `json:"osArch"`
-	ClientVersion             string                    `json:"clientVersion"`
-	JavaVersion               string                    `json:"javaVersion"`
-	PeerPublicKey             string                    `json:"peerPublicKey"`
+	MachineFingerprint            string                        `json:"machineFingerprint"`
+	Hostname                      string                        `json:"hostname"`
+	OSUser                        string                        `json:"osUser"`
+	OSName                        string                        `json:"osName"`
+	OSVersion                     string                        `json:"osVersion"`
+	OSArch                        string                        `json:"osArch"`
+	ClientVersion                 string                        `json:"clientVersion"`
+	JavaVersion                   string                        `json:"javaVersion"`
+	PeerPublicKey                 string                        `json:"peerPublicKey"`
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
@@ -137,7 +137,8 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		a.failClientAuthInternal(w, "load-http-routes", "加载 HTTP 路由失败", err)
 		return
 	}
-	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host)
+	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host,
+		request.Environment.ClientPeerServiceCapabilities.Version)
 	if err != nil {
 		a.failClientAuthInternal(w, "load-peer-mesh", "加载私有组网配置失败", err)
 		return
@@ -159,32 +160,32 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		ttl)
 	now := time.Now()
 	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
-		ID:                         session.ID,
-		TenantID:                   session.TenantID,
-		CredentialID:               credential.ID,
-		IdentityID:                 identity.ID,
-		ClientID:                   account.ID,
-		ClientName:                 account.ClientName,
-		TokenHash:                  session.TokenHash,
-		Status:                     auth.StatusHTTPAuthenticated,
-		MachineFingerprint:         machineFingerprint,
-		OSUser:                     osUser,
-		Hostname:                   limitedTextPtr(request.Environment.Hostname, 160),
-		OSName:                     limitedTextPtr(request.Environment.OSName, 120),
-		OSVersion:                  limitedTextPtr(request.Environment.OSVersion, 80),
-		OSArch:                     limitedTextPtr(request.Environment.OSArch, 60),
-		ClientVersion:              limitedTextPtr(request.Environment.ClientVersion, 80),
-		JavaVersion:                limitedTextPtr(request.Environment.JavaVersion, 80),
-		LocalAddresses:             limitedTextPtr(strings.Join(request.Environment.LocalAddresses, ","), 2000),
-		MessageSendCapable:         request.Environment.ClientMessageCapabilities.SendMessages,
-		MessageReceiveCapable:      request.Environment.ClientMessageCapabilities.ReceiveMessages,
-		MessageAttachmentsCapable:  request.Environment.ClientMessageCapabilities.Attachments,
-		MessageMediaPreviewCapable: request.Environment.ClientMessageCapabilities.MediaPreview,
+		ID:                          session.ID,
+		TenantID:                    session.TenantID,
+		CredentialID:                credential.ID,
+		IdentityID:                  identity.ID,
+		ClientID:                    account.ID,
+		ClientName:                  account.ClientName,
+		TokenHash:                   session.TokenHash,
+		Status:                      auth.StatusHTTPAuthenticated,
+		MachineFingerprint:          machineFingerprint,
+		OSUser:                      osUser,
+		Hostname:                    limitedTextPtr(request.Environment.Hostname, 160),
+		OSName:                      limitedTextPtr(request.Environment.OSName, 120),
+		OSVersion:                   limitedTextPtr(request.Environment.OSVersion, 80),
+		OSArch:                      limitedTextPtr(request.Environment.OSArch, 60),
+		ClientVersion:               limitedTextPtr(request.Environment.ClientVersion, 80),
+		JavaVersion:                 limitedTextPtr(request.Environment.JavaVersion, 80),
+		LocalAddresses:              limitedTextPtr(strings.Join(request.Environment.LocalAddresses, ","), 2000),
+		MessageSendCapable:          request.Environment.ClientMessageCapabilities.SendMessages,
+		MessageReceiveCapable:       request.Environment.ClientMessageCapabilities.ReceiveMessages,
+		MessageAttachmentsCapable:   request.Environment.ClientMessageCapabilities.Attachments,
+		MessageMediaPreviewCapable:  request.Environment.ClientMessageCapabilities.MediaPreview,
 		MessageMaxAttachmentBytes:   max64(0, request.Environment.ClientMessageCapabilities.MaxAttachmentBytes),
 		PeerServiceDiscoveryVersion: peermesh.NormalizePeerServiceVersion(request.Environment.ClientPeerServiceCapabilities.Version),
 		PeerServiceApplications:     peermesh.EncodePeerServiceApplications(request.Environment.ClientPeerServiceCapabilities.Applications),
-		HTTPLoginAt:                now,
-		ExpiresAt:                  session.ExpiresAt,
+		HTTPLoginAt:                 now,
+		ExpiresAt:                   session.ExpiresAt,
 	}); err != nil {
 		// The token is already live in memory; drop it so a failed login leaves nothing usable.
 		a.clientAuth.Discard(session.ID)

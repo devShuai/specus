@@ -133,8 +133,11 @@ signature = HEX(HMAC_SHA256(key, message))
 
 | 字段 | 说明 |
 | --- | --- |
-| `version` | 客户端支持的服务发现协议版本；`0` 或缺省表示不支持 |
-| `applications` | 该客户端可发布/消费的应用类型；一期仅 `http`、`https`、`ssh`、`tcp` |
+| `version` | 客户端支持的服务发现协议版本；`0` 或缺省表示不支持；当前安全版本为 `2` |
+| `applications` | 该客户端可发布/消费的应用类型；v2 为 `http`、`https`、`ssh`、`tcp`、`udp` |
+
+服务发现 v2 同时支持 TCP/UDP 本地桥；mDNS 仅作为管理员显式开启的候选导入来源，默认关闭，
+候选地址不会直接进入对端目录。v1 不具备数据面 ACL，服务端不得向 v1 客户端下发本地服务定义。
 
 不实现服务发现的客户端必须上报 `version=0` 和空数组。服务端把规范化后的值写入 `ClientSession`，
 并投影到 Peer Mesh roster 的 `peerServiceDiscoveryVersion` / `peerServiceApplications`。
@@ -180,7 +183,7 @@ signature = HEX(HMAC_SHA256(key, message))
     "serverPublicKey": null,
     "clientPublicKey": null,
     "sessionTtlSeconds": 3600,
-    "peerServiceDiscoveryVersion": 1,
+    "peerServiceDiscoveryVersion": 2,
     "serviceSharing": {
       "deploymentEnabled": false,
       "configuredEnabled": false,

@@ -1,5 +1,6 @@
 package com.theshuai.common.peermesh;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import lombok.Data;
 
@@ -61,6 +62,7 @@ public class PeerControlMessage {
     private Long revision;
     private Long publisherClientId;
     private String publisherClientName;
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     private Long publisherSessionId;
     private String instanceId;
     private String generatedAt;

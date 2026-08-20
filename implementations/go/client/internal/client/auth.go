@@ -29,15 +29,15 @@ type authLoginRequest struct {
 }
 
 type clientEnvironmentInfo struct {
-	MachineFingerprint        string                    `json:"machineFingerprint"`
-	Hostname                  string                    `json:"hostname"`
-	OSUser                    string                    `json:"osUser"`
-	OSName                    string                    `json:"osName"`
-	OSVersion                 string                    `json:"osVersion"`
-	OSArch                    string                    `json:"osArch"`
-	ClientVersion             string                    `json:"clientVersion"`
-	JavaVersion               string                    `json:"javaVersion"`
-	PeerPublicKey             string                    `json:"peerPublicKey"`
+	MachineFingerprint            string                        `json:"machineFingerprint"`
+	Hostname                      string                        `json:"hostname"`
+	OSUser                        string                        `json:"osUser"`
+	OSName                        string                        `json:"osName"`
+	OSVersion                     string                        `json:"osVersion"`
+	OSArch                        string                        `json:"osArch"`
+	ClientVersion                 string                        `json:"clientVersion"`
+	JavaVersion                   string                        `json:"javaVersion"`
+	PeerPublicKey                 string                        `json:"peerPublicKey"`
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
@@ -164,7 +164,7 @@ func collectEnvironment() clientEnvironmentInfo {
 			SendMessages: true, ReceiveMessages: true,
 		},
 		ClientPeerServiceCapabilities: clientPeerServiceCapabilities{
-			Version:      1,
+			Version:      2,
 			Applications: []string{"http", "https", "ssh", "tcp", "udp"},
 		},
 		LocalAddresses: localAddresses(),

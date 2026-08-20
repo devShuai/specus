@@ -21,6 +21,8 @@ class PeerServiceDiscoveryTests {
         assertEquals("127.0.0.1", PeerServiceDiscovery.requireTargetHost("127.0.0.1"));
         assertEquals("localhost", PeerServiceDiscovery.requireTargetHost("localhost"));
         assertEquals("192.168.1.10", PeerServiceDiscovery.requireTargetHost("192.168.1.10"));
+        assertTrue(PeerServiceDiscovery.isLocalInterfaceTarget("127.0.0.1"));
+        assertFalse(PeerServiceDiscovery.isLocalInterfaceTarget("10.255.255.254"));
     }
 
     @Test
@@ -97,8 +99,8 @@ class PeerServiceDiscoveryTests {
     @Test
     void unknownApplicationsAndOldVersionsNormalizeToUnsupported() {
         assertEquals(0, PeerServiceDiscovery.normalizeVersion(0));
-        assertEquals(1, PeerServiceDiscovery.normalizeVersion(9));
-        assertTrue(PeerServiceDiscovery.normalizeApplications(List.of("http", "ftp", "SSH"), 1)
+        assertEquals(2, PeerServiceDiscovery.normalizeVersion(9));
+        assertTrue(PeerServiceDiscovery.normalizeApplications(List.of("http", "ftp", "SSH", "UDP"), 2)
                 .containsAll(List.of("http", "ssh")));
         assertTrue(PeerServiceDiscovery.normalizeApplications(List.of("http"), 0).isEmpty());
     }

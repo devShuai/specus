@@ -112,7 +112,7 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `serverPublicKey` | 服务端标识用 public key 摘要，目前不参与业务加密 |
 | `clientPublicKey` | 当前客户端 public key |
 | `sessionTtlSeconds` | peer session TTL |
-| `peerServiceDiscoveryVersion` | 服务端支持的本地服务发现协议版本；当前为 `1`，旧服务端缺省按 `0` |
+| `peerServiceDiscoveryVersion` | 服务端支持的本地服务发现协议版本；当前为 `2`，旧服务端缺省按 `0` |
 | `serviceSharing` | 租户服务共享状态：`deploymentEnabled` / `configuredEnabled` / `effectiveEnabled` / `mdnsImportEnabled` |
 
 `serviceSharing.effectiveEnabled` 为 true 当且仅当部署端 Peer Mesh 开启、租户总开关已开、且当前设备已启用私有组网。客户端只在该值为 true 且存在获授权在线对端时探测并上报本机服务。总开关变更后服务端立即下发 `peer-config`，不能等到下次登录。
@@ -144,8 +144,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "messageAttachmentsCapable": true,
       "messageMediaPreviewCapable": true,
       "messageMaxAttachmentBytes": 536870912,
-      "peerServiceDiscoveryVersion": 1,
-      "peerServiceApplications": ["http", "https", "ssh", "tcp"]
+      "peerServiceDiscoveryVersion": 2,
+      "peerServiceApplications": ["http", "https", "ssh", "tcp", "udp"]
     }
   ]
 }
@@ -158,7 +158,9 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 旧服务端缺省这些字段时，客户端也按 `false` / `0` 处理。Go 服务端必须投影与 Java 相同的能力字段，不能省略。
 
 `peerServiceDiscoveryVersion` 和 `peerServiceApplications` 来自
-`environment.clientPeerServiceCapabilities`。版本 `0` 或缺省表示该 peer 不支持服务发现；
+`environment.clientPeerServiceCapabilities`。版本 `0` 或缺省表示该 peer 不支持服务发现；正式 v2
+支持 TCP/UDP 桥及默认关闭的 mDNS 候选导入，并要求服务端下发的数据面来源 ACL；版本 `2`
+增加发布端数据面 ACL，服务端不得向版本低于 `2` 的客户端下发 `localServices`；
 一期应用类型仅允许 `http`、`https`、`ssh`、`tcp`。
 
 ### `candidates`
@@ -350,11 +352,13 @@ Peer Mesh 设备互联不等于本机服务目录。一期发布用户在控制�
 | `path` | HTTP(S) 可选安全路径，必须以 `/` 开头，禁止完整 URL、`..`、反斜杠和空白 |
 | `enabled` | 单服务开关，默认 `false` |
 | `visibility` | `OWNER`（同归属用户）或 `ACL`（现有 Peer ACL 范围内）；不得扩大现有 ACL |
+| `allowedPeerVirtualIps` | 仅服务端写入 `localServices` 的数据面来源白名单；客户端必须按源虚拟 IP 拒绝未列入的 TCP/UDP 流量，空数组按拒绝全部处理 |
 
 ### `service-report`
 
 客户端在有效共享开启且存在获授权在线对端后，向服务端上报当前实例可发布的服务快照。
-`toClientName` 必须为空；服务端绑定已认证的 `publisherClientId` / `publisherSessionId`，
+`toClientName` 必须为空；客户端必须省略 `publisherSessionId`，服务端从已认证且声明 v2 能力的
+当前控制连接绑定 `publisherClientId` / `publisherSessionId`，
 不信任消息体里的 source 身份。
 
 ```json
@@ -395,7 +399,11 @@ UDP 服务在虚拟 IP 的 `publishedPort` 上做 Peer-only 数据报转发，�
 丢弃未配置、未启用或不属于该设备的项，并用服务端字段重写名称、类型、端口和 path。
 
 发布设备通过登录响应和后续 `peer-config` 的 `peerMesh.localServices` 收到本机服务定义（含
-`targetHost` / `targetPort`）。该列表只发给所属客户端，不得出现在 `service-catalog` 或其它对端可见载荷中。
+`targetHost` / `targetPort` / `allowedPeerVirtualIps`）。该列表只发给所属客户端，不得出现在
+`service-catalog` 或其它对端可见载荷中。`allowedPeerVirtualIps` 必须由服务端按基础 Peer ACL 与
+服务级可见范围的交集生成；目录不可见和数据面不可访问必须同时成立。
+解密后的 IP 包还必须满足：源地址等于已认证对端会话获分配的虚拟 IP，目标地址等于本机会话
+获分配的虚拟 IP。不得仅信任包内源地址，否则对端可伪造其他获授权虚拟 IP 绕过数据面 ACL。
 客户端仅在 `serviceSharing.effectiveEnabled` 为真且存在获授权在线对端时，对已启用项做探测：TCP 服务
 做 TCP 连接探测，UDP 服务做数据报探测。探测成功后上报不含目标地址的 `service-report`，并在本机虚拟
 IP 的 `publishedPort` 上绑定 Peer-only TCP 或 UDP 桥。`mdnsImportEnabled` 为真时才允许本机 mDNS
