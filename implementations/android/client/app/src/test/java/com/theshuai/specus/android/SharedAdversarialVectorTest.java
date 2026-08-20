@@ -5,6 +5,7 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
 
 /**
  * The shared adversarial corpus in {@code protocol/test-vectors/adversarial-inputs.json}.
@@ -32,6 +33,12 @@ public class SharedAdversarialVectorTest {
             long startedAt = System.nanoTime();
             decodeAllReachable(payload);
             long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+            if (testCase.has("turnChannelDataExpected")) {
+                boolean claimed = PeerMeshEngine.TurnChannelData.parse(payload) != null;
+                assertEquals(name + " TURN ChannelData classification",
+                        testCase.getBoolean("turnChannelDataExpected"), claimed);
+            }
 
             assertTrue(name + " took " + elapsedMillis + "ms to decide; a hostile input must not "
                     + "stall a receive loop", elapsedMillis < 1_000L);

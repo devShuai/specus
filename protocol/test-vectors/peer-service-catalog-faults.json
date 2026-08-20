@@ -1,0 +1,24 @@
+{
+  "name": "peer-service-catalog-faults-v1",
+  "comment": "Fault-injection sequences shared by Java, Go, .NET and Android. Each event is a complete service-catalog snapshot delivered in the listed order. The sequences model duplicate delivery, network reordering and a late packet after authorization withdrawal. A runtime must finish with exactly expectedServiceCount visible entries for the publisher session.",
+  "cases": [
+    {
+      "name": "stale-withdrawal-cannot-roll-back-newer-catalog",
+      "events": [
+        { "revision": 2, "servicePresent": true },
+        { "revision": 1, "servicePresent": false }
+      ],
+      "expectedServiceCount": 1
+    },
+    {
+      "name": "late-and-duplicate-publish-cannot-revive-withdrawal",
+      "events": [
+        { "revision": 2, "servicePresent": true },
+        { "revision": 3, "servicePresent": false },
+        { "revision": 2, "servicePresent": true },
+        { "revision": 3, "servicePresent": true }
+      ],
+      "expectedServiceCount": 0
+    }
+  ]
+}

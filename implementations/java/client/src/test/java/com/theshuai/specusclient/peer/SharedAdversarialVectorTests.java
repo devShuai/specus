@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.theshuai.common.stun.TurnChannelData;
 import com.theshuai.common.util.JsonUtil;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +11,7 @@ import java.nio.file.Path;
 import java.util.HexFormat;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * The shared adversarial corpus in {@code protocol/test-vectors/adversarial-inputs.json}.
@@ -38,6 +40,12 @@ class SharedAdversarialVectorTests {
             long startedAt = System.nanoTime();
             decodeAllReachable(payload);
             long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+            if (testCase.has("turnChannelDataExpected")) {
+                boolean claimed = TurnChannelData.parse(payload, 0, payload.length) != null;
+                assertEquals(testCase.get("turnChannelDataExpected").asBoolean(), claimed,
+                        name + " TURN ChannelData classification");
+            }
 
             assertTrue(elapsedMillis < 1_000L, name + " took " + elapsedMillis
                     + "ms to decide; a hostile input must not stall a receive loop");

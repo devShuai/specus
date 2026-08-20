@@ -111,24 +111,37 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
-    public void CatalogRevisionTombstoneRejectsRollbackAndLateRevival()
+    public void SharedCatalogFaultVectorsRejectRollbackAndLateRevival()
     {
-        using var runtime = new PeerServiceRuntime(_ => { });
-        runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
-        runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
-        runtime.SetHasAuthorizedOnlinePeer(true);
-        var service = new AdvertisedService
-        {
-            ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http",
-            PublishedPort = 8080, Path = "/app",
-        };
-        runtime.ApplyCatalog(2, "client-b", 9, 2, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
-        runtime.ApplyCatalog(2, "client-b", 9, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), []);
-        Assert.Single(runtime.RemoteServices());
+        var vectors = ProtocolVectorTestHelper.Read<CatalogFaultVectors>(
+            "protocol/test-vectors/peer-service-catalog-faults.json");
+        Assert.NotEmpty(vectors.Cases);
 
-        runtime.ApplyCatalog(2, "client-b", 9, 3, DateTimeOffset.UtcNow.ToString("O"), []);
-        runtime.ApplyCatalog(2, "client-b", 9, 2, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
-        Assert.Empty(runtime.RemoteServices());
+        foreach (var testCase in vectors.Cases)
+        {
+            using var runtime = new PeerServiceRuntime(_ => { });
+            runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+            runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
+            runtime.SetHasAuthorizedOnlinePeer(true);
+            var service = new AdvertisedService
+            {
+                ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http",
+                PublishedPort = 8080, Path = "/app",
+            };
+
+            foreach (var faultEvent in testCase.Events)
+            {
+                runtime.ApplyCatalog(
+                    2,
+                    "client-b",
+                    9,
+                    faultEvent.Revision,
+                    DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"),
+                    faultEvent.ServicePresent ? [service] : []);
+            }
+
+            Assert.Equal(testCase.ExpectedServiceCount, runtime.RemoteServices().Count);
+        }
     }
 
     [Fact]
@@ -612,5 +625,23 @@ public class PeerServiceRuntimeTests
     private sealed class LegacyCompatibilityVector
     {
         public JsonElement UnknownMessage { get; set; }
+    }
+
+    private sealed class CatalogFaultVectors
+    {
+        public CatalogFaultCase[] Cases { get; set; } = [];
+    }
+
+    private sealed class CatalogFaultCase
+    {
+        public string Name { get; set; } = "";
+        public CatalogFaultEvent[] Events { get; set; } = [];
+        public int ExpectedServiceCount { get; set; }
+    }
+
+    private sealed class CatalogFaultEvent
+    {
+        public long Revision { get; set; }
+        public bool ServicePresent { get; set; }
     }
 }

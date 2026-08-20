@@ -13,9 +13,9 @@
 | 认证与授权 | 越权、租户越界、限流、口令降级 | 拒绝，且不因失败路径泄露信息 |
 | 故障注入 | 事务回滚、超时、停顿、断连、关停 | 不留半完成状态，不静默丢数据 |
 
-## 当前覆盖
+## 数量快照
 
-按测试方法名归类统计（2026-08-19）：
+按测试方法名归类统计（2026-08-19 历史快照；场景矩阵已更新至 2026-08-20）：
 
 | 类别 | Go | Java | Android | .NET |
 | --- | --- | --- | --- | --- |
@@ -35,12 +35,12 @@
 | 场景 | Go | Java | Android | .NET |
 | --- | --- | --- | --- | --- |
 | SPM2 帧截断/变异 | `peer_frame_test.go` | `PeerDataFrameCodecTests` | `MalformedFrameTest` | `PeerDataFrameHeaderTests` |
-| TURN ChannelData 误认领 | `turn_channel_data_test.go` | — | — | — |
+| TURN ChannelData / SPM2 误认领 | `adversarial_vector_test.go` | `SharedAdversarialVectorTests` | `SharedAdversarialVectorTest` | `SharedAdversarialVectorTests` |
 | UDP probe 越界 offset/length | `peer_probe_rate_limiter_test.go` | — | `MalformedFrameTest` | `PeerUdpProbeSecurityTests` |
 | 随机字节 fuzz | `peer_packet_test.go` | — | `MalformedFrameTest` | — |
 | STUN/TURN 报文畸形 | `stun_turn_*_test.go` | `StunTurnServerTests` | — | `StunTurnResilienceTests` |
 
-**TURN ChannelData 误认领只有 Go 有测试**，因为这个缺陷是在 Go 上发现的：SPM2 的 magic `0x53504d32` 开头是 `0x5350`，落在 TURN ChannelData 的 `0x4000-0x7fff` 区间内，只看区间的分类逻辑会认领每一个直连数据帧然后把它丢掉。Java 和 .NET 当时按"解析成功才认领"实现，所以没有这个 bug——但也因此没有防止它回归的测试。**这是本矩阵里优先级最高的空白。**
+四端现在都直接读取 `protocol/test-vectors/adversarial-inputs.json`。其中 TURN/SPM2 三个向量不只要求“不崩溃”，还断言分类结果：SPM2 magic 虽落在 TURN ChannelData 的类型区间内，也只有完整 ChannelData 解析成功时才能认领；截断或长度越界必须拒绝。这把曾在 Go 上真实发生过的误认领缺陷变成了四端共享回归门禁。
 
 ### 超尺寸输入
 
@@ -82,22 +82,24 @@
 | 本地写入停顿超时 | `peer_data_plane_test.go` | — | `LocalStreamBackpressureTest` | — |
 | 前台服务超时 | 不适用 | 不适用 | `ForegroundServiceTimeoutInstrumentationTest` | 不适用 |
 | 重复重连 | `reconnect_integrity_test.go` | — | — | — |
+| 服务目录乱序、重复与撤回后迟到 | `peer_service_test.go` | `PeerServiceRuntimeTests` | `PeerServiceRuntimeTest` | `PeerServiceRuntimeTests` |
 
-**服务端故障注入只有 Go 有覆盖。** Java 与 .NET 服务端的事务回滚、关停刷盘和重复重连语义目前依赖代码审查而不是测试。这是第二优先的空白。
+服务目录这一行由四端共同读取 `protocol/test-vectors/peer-service-catalog-faults.json`，并把乱序、重复以及撤回后的迟到快照依次喂给真实运行时。测试要求旧 revision 不能回滚新目录、重复快照幂等、撤回后迟到包不能复活服务。
+
+**服务端事务与关停类故障注入仍以 Go 覆盖为主。** Java 已有 relay 流量刷盘失败/重试测试，.NET 也覆盖部分消息刷盘失败，但三端尚没有一份适用于不同存储模型的共同事务/关停序列；这类平台相关故障继续保留为后续加固项，不与已经落地的四端共享目录故障向量混为一谈。
 
 ## 已知空白与优先级
 
-1. **TURN ChannelData 误认领的回归测试**（Java、Android、.NET 缺）——已在 Go 上真实发生过的缺陷，另外三端目前只是碰巧正确。
-2. **服务端故障注入**（Java、.NET 缺）——事务回滚与关停刷盘。
-3. **Java 客户端资源上限**——先确认是设计差异还是空白。
-4. **Java 畸形帧**（当前仅 2 条）——相对其它三端明显偏低。
-5. **Java 请求/响应体上限**——搜索 Java 客户端测试目录没有找到任何 body 上限断言，另外三端都有。
+1. **服务端故障注入**——事务回滚与关停刷盘仍缺跨存储实现的共享注入协议。
+2. **Java 客户端资源上限**——先确认依赖 Netty water mark 是否是有意设计，或还需要独立准入上限。
+3. **Java 畸形帧广度**——共享语料已执行，但 Java 专属解码器的定向变异覆盖仍少于其它三端。
+4. **Java HTTP body 边界测试**——生产代码已有 16 MiB 请求、64 MiB 响应上限，但尚缺直接命中两个边界的定向测试。
 
 这些没有在本次一并补齐，是因为每一条都需要在对应实现里搭出注入点，而不是照抄一份断言；列在这里是为了它们可被排期，而不是被遗忘。
 
 ## 维护方式
 
-新增一条对抗性测试时，把它填进上面的场景表；发现一个新的攻击面时，先加一行场景再补测试，四端都留空也比不写下来好——**一个没记录的空白，和一个不存在的防护，对使用者是同一回事**。
+新增一条对抗性测试时，把它填进上面的场景表；能跨实现表达的输入或故障序列优先放进 `protocol/test-vectors/`，由四端读取同一文件；实现或平台特有的注入点再保留各自测试。发现一个新的攻击面时，先加一行场景再补测试，四端都留空也比不写下来好——**一个没记录的空白，和一个不存在的防护，对使用者是同一回事**。
 
 统计表用一段脚本从方法名重新生成，命名约定见类别表；命名不落在约定里的测试不会被统计到，这是统计的已知限制，也是它只用来发现空白、不用来比较质量的原因。
 

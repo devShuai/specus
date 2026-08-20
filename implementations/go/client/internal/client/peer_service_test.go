@@ -140,27 +140,50 @@ func TestPeerServiceRuntimeEmptyCatalogAndOfflinePublisher(t *testing.T) {
 	}
 }
 
-func TestPeerServiceRuntimeRejectsStaleCatalogAfterWithdrawal(t *testing.T) {
-	runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
-	runtime.applyConfig(testPeerMeshConfig(true, 1, false))
-	sessionID := int64(9)
-	revision2 := int64(2)
-	catalog := peerControlMessage{
-		Type: peerControlTypeServiceCatalog, PublisherClientID: 2, PublisherClientName: "client-b",
-		PublisherSessionID: &sessionID, Revision: &revision2,
-		ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
-		Services:  []peerAdvertisedService{{ServiceID: "svc-http01", Application: "http", PublishedPort: 8080}},
+func TestPeerServiceRuntimeSharedCatalogFaultVectors(t *testing.T) {
+	var vectors struct {
+		Cases []struct {
+			Name   string `json:"name"`
+			Events []struct {
+				Revision       int64 `json:"revision"`
+				ServicePresent bool  `json:"servicePresent"`
+			} `json:"events"`
+			ExpectedServiceCount int `json:"expectedServiceCount"`
+		} `json:"cases"`
 	}
-	runtime.applyCatalog(catalog)
-	revision3 := int64(3)
-	catalog.Revision = &revision3
-	catalog.Services = nil
-	runtime.applyCatalog(catalog)
-	catalog.Revision = &revision2
-	catalog.Services = []peerAdvertisedService{{ServiceID: "svc-http01", Application: "http", PublishedPort: 8080}}
-	runtime.applyCatalog(catalog)
-	if len(runtime.remoteServices()) != 0 {
-		t.Fatal("stale catalog revived a withdrawn service")
+	readRepositoryJSON(t, "protocol/test-vectors/peer-service-catalog-faults.json", &vectors)
+	if len(vectors.Cases) == 0 {
+		t.Fatal("shared catalog fault corpus is empty")
+	}
+
+	for _, testCase := range vectors.Cases {
+		t.Run(testCase.Name, func(t *testing.T) {
+			runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
+			runtime.applyConfig(testPeerMeshConfig(true, 1, false))
+			runtime.setRoster(map[int64]peerServiceRosterHint{2: {virtualIP: "100.96.0.2", online: true}})
+			runtime.setHasAuthorizedOnlinePeer(true)
+			sessionID := int64(9)
+
+			for _, event := range testCase.Events {
+				revision := event.Revision
+				services := []peerAdvertisedService(nil)
+				if event.ServicePresent {
+					services = []peerAdvertisedService{{
+						ServiceID: "svc-http01", Application: "http", PublishedPort: 8080,
+					}}
+				}
+				runtime.applyCatalog(peerControlMessage{
+					Type: peerControlTypeServiceCatalog, PublisherClientID: 2,
+					PublisherClientName: "client-b", PublisherSessionID: &sessionID,
+					Revision: &revision, ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+					Services: services,
+				})
+			}
+
+			if got := len(runtime.remoteServices()); got != testCase.ExpectedServiceCount {
+				t.Fatalf("visible service count = %d, want %d", got, testCase.ExpectedServiceCount)
+			}
+		})
 	}
 }
 

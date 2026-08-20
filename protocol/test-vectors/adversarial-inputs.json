@@ -28,6 +28,7 @@
       "kind": "spm2",
       "payloadHex": "53504d3200000000000000000000000000000000000000000000000000000000",
       "expect": "parse-or-reject",
+      "turnChannelDataExpected": false,
       "why": "SPM2 magic opens with 0x5350, inside the TURN ChannelData range 0x4000-0x7fff. Demultiplexing must decide by whether the parse succeeds, not by the range; deciding by range alone made the Go client claim and then drop every direct data frame."
     },
     {
@@ -35,6 +36,7 @@
       "kind": "turn-channeldata",
       "payloadHex": "400100040a0b0c0d",
       "expect": "parse-or-reject",
+      "turnChannelDataExpected": true,
       "why": "A well-formed ChannelData frame must not be mistaken for a data frame either."
     },
     {
@@ -42,6 +44,7 @@
       "kind": "turn-channeldata",
       "payloadHex": "4001ffff0a0b",
       "expect": "reject",
+      "turnChannelDataExpected": false,
       "why": "A declared length far beyond the datagram is the classic length-field attack."
     },
     {

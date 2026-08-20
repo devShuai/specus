@@ -117,27 +117,35 @@ public class PeerServiceRuntimeTest {
     }
 
     @Test
-    public void catalogRevisionTombstoneRejectsRollbackAndLateRevival() throws Exception {
-        runtime = newRuntime();
-        runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
-        runtime.applyConfig(config(true, freePort(), false));
-        runtime.setHasAuthorizedOnlinePeer(true);
-        JSONObject current = catalogJson();
-        current.put("revision", 2L);
-        runtime.applyCatalog(current);
+    public void sharedCatalogFaultVectorsRejectRollbackAndLateRevival() throws Exception {
+        org.json.JSONArray cases = ProtocolVectorTestSupport.read("peer-service-catalog-faults.json")
+                .getJSONArray("cases");
+        assertTrue(cases.length() > 0);
 
-        JSONObject staleWithdrawal = catalogJson();
-        staleWithdrawal.put("revision", 1L);
-        staleWithdrawal.put("services", new org.json.JSONArray());
-        runtime.applyCatalog(staleWithdrawal);
-        assertEquals(1, runtime.remoteServices().size());
+        for (int caseIndex = 0; caseIndex < cases.length(); caseIndex++) {
+            if (runtime != null) {
+                runtime.close();
+            }
+            runtime = newRuntime();
+            runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
+            runtime.applyConfig(config(true, freePort(), false));
+            runtime.setHasAuthorizedOnlinePeer(true);
 
-        JSONObject withdrawal = catalogJson();
-        withdrawal.put("revision", 3L);
-        withdrawal.put("services", new org.json.JSONArray());
-        runtime.applyCatalog(withdrawal);
-        runtime.applyCatalog(current);
-        assertTrue(runtime.remoteServices().isEmpty());
+            JSONObject testCase = cases.getJSONObject(caseIndex);
+            org.json.JSONArray events = testCase.getJSONArray("events");
+            for (int eventIndex = 0; eventIndex < events.length(); eventIndex++) {
+                JSONObject event = events.getJSONObject(eventIndex);
+                JSONObject catalog = catalogJson();
+                catalog.put("revision", event.getLong("revision"));
+                if (!event.getBoolean("servicePresent")) {
+                    catalog.put("services", new org.json.JSONArray());
+                }
+                runtime.applyCatalog(catalog);
+            }
+
+            assertEquals(testCase.getString("name"),
+                    testCase.getInt("expectedServiceCount"), runtime.remoteServices().size());
+        }
     }
 
     @Test

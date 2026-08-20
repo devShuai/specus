@@ -15,11 +15,12 @@ type adversarialVectors struct {
 	Name    string `json:"name"`
 	Comment string `json:"comment"`
 	Cases   []struct {
-		Name       string `json:"name"`
-		Kind       string `json:"kind"`
-		PayloadHex string `json:"payloadHex"`
-		Expect     string `json:"expect"`
-		Why        string `json:"why"`
+		Name                    string `json:"name"`
+		Kind                    string `json:"kind"`
+		PayloadHex              string `json:"payloadHex"`
+		Expect                  string `json:"expect"`
+		Why                     string `json:"why"`
+		TurnChannelDataExpected *bool  `json:"turnChannelDataExpected"`
 	} `json:"cases"`
 }
 
@@ -42,6 +43,13 @@ func TestSharedAdversarialVectorsAreHandled(t *testing.T) {
 			// normal panic path, which is exactly the outcome being ruled out.
 			start := time.Now()
 			decodeAllReachable(payload)
+			if testCase.TurnChannelDataExpected != nil {
+				_, parseErr := parseTurnChannelData(payload)
+				if claimed := parseErr == nil; claimed != *testCase.TurnChannelDataExpected {
+					t.Fatalf("case %s TURN ChannelData classification = %v, want %v",
+						testCase.Name, claimed, *testCase.TurnChannelDataExpected)
+				}
+			}
 			if elapsed := time.Since(start); elapsed > time.Second {
 				t.Fatalf("case %s took %v to decide; a hostile input must not stall a receive loop",
 					testCase.Name, elapsed)

@@ -33,6 +33,11 @@ public sealed class SharedAdversarialVectorTests
             DecodeAllReachable(payload);
             stopwatch.Stop();
 
+            if (testCase.TurnChannelDataExpected is { } expected)
+            {
+                Assert.Equal(expected, TurnChannelData.Parse(payload) is not null);
+            }
+
             Assert.True(stopwatch.ElapsedMilliseconds < 1_000,
                 $"{testCase.Name} took {stopwatch.ElapsedMilliseconds}ms to decide; a hostile "
                 + "input must not stall a receive loop");
@@ -65,5 +70,6 @@ public sealed class SharedAdversarialVectorTests
         public required string PayloadHex { get; init; }
         public required string Expect { get; init; }
         public required string Why { get; init; }
+        public bool? TurnChannelDataExpected { get; init; }
     }
 }

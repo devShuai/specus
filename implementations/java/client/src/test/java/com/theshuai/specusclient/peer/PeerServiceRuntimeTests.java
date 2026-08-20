@@ -1,11 +1,13 @@
 package com.theshuai.specusclient.peer;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.peermesh.LocalPeerService;
 import com.theshuai.common.peermesh.PeerAdvertisedService;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.peermesh.PeerServiceSharingStatus;
+import com.theshuai.common.util.JsonUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -17,6 +19,8 @@ import java.net.DatagramSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -183,23 +187,32 @@ class PeerServiceRuntimeTests {
     }
 
     @Test
-    void staleCatalogCannotRollBackOrReviveWithdrawnServices() {
-        runtime = newRuntime();
-        runtime.applyConfig(config(true, localService(1, false)));
-        PeerControlMessage newest = catalogMessage();
-        newest.setRevision(2L);
-        runtime.applyCatalog(newest);
-        PeerControlMessage stale = catalogMessage();
-        stale.setRevision(1L);
-        runtime.applyCatalog(stale);
-        assertThat(runtime.remoteServices()).hasSize(1);
+    void sharedCatalogFaultVectorsRejectRollbackAndLateRevival() throws IOException {
+        JsonNode cases = readVector("peer-service-catalog-faults.json").get("cases");
+        assertThat(cases).isNotNull().isNotEmpty();
 
-        PeerControlMessage withdrawn = catalogMessage();
-        withdrawn.setRevision(3L);
-        withdrawn.setServices(List.of());
-        runtime.applyCatalog(withdrawn);
-        runtime.applyCatalog(newest);
-        assertThat(runtime.remoteServices()).isEmpty();
+        for (JsonNode testCase : cases) {
+            if (runtime != null) {
+                runtime.close();
+            }
+            runtime = newRuntime();
+            runtime.applyConfig(config(true, localService(1, false)));
+            runtime.setRosterLookup(id -> new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+            runtime.setHasAuthorizedOnlinePeer(true);
+
+            for (JsonNode event : testCase.get("events")) {
+                PeerControlMessage catalog = catalogMessage();
+                catalog.setRevision(event.get("revision").asLong());
+                if (!event.get("servicePresent").asBoolean()) {
+                    catalog.setServices(List.of());
+                }
+                runtime.applyCatalog(catalog);
+            }
+
+            assertThat(runtime.remoteServices())
+                    .as(testCase.get("name").asText())
+                    .hasSize(testCase.get("expectedServiceCount").asInt());
+        }
     }
 
     @Test
@@ -472,6 +485,17 @@ class PeerServiceRuntimeTests {
         catalog.setExpiresAt(Instant.now().plusSeconds(60).toString());
         catalog.setServices(List.of(service));
         return catalog;
+    }
+
+    private static JsonNode readVector(String name) throws IOException {
+        Path current = Path.of("").toAbsolutePath();
+        for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
+            Path candidate = current.resolve("protocol/test-vectors").resolve(name);
+            if (Files.isRegularFile(candidate)) {
+                return JsonUtil.readString(Files.readString(candidate));
+            }
+        }
+        throw new IllegalStateException("cannot locate protocol vector: " + name);
     }
 
     private static int freePort() throws Exception {
