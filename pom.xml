@@ -57,6 +57,12 @@
         <jackson-bom.version>3.1.5</jackson-bom.version>
         <log4j2.version>2.25.5</log4j2.version>
         <httpclient5.version>5.6.4</httpclient5.version>
+        <!--
+            Not a security fix. MySQL switched to a year-based scheme, so 26.7.0 follows 9.7.0
+            rather than preceding it; the jump in the number is calendar, not eighteen majors of
+            breaking change.
+        -->
+        <mysql.version>26.7.0</mysql.version>
     </properties>
 
     <dependencyManagement>
