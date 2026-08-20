@@ -21,6 +21,103 @@
    仍会命中，浅底上就出现白字。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ── Apple 风格标定 ────────────────────────────────────────────────────────
+   Tailwind 4 取消了 JS 配置，HeroUI 3 也不再有 heroui() 插件；原先写在
+   tailwind.config.js 里的色板、字体栈与显示字号改在这里声明（旧文件留作
+   tailwind.config.v2.js.bak 备查）。
+
+   @theme 生成工具类（font-sans、text-display-lg、bg-cyan-500 …），
+   下面的 :root/.dark 覆盖 HeroUI 的语义 token。两者分工不同，都需要。 */
+@theme {
+  /* Inter 变体字体 + CJK 系统回退（中文走系统字体，不内嵌巨型 CJK 字体）。 */
+  --font-sans: "Inter Variable", "Inter", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", system-ui, sans-serif;
+
+  /* 历史页面仍使用 cyan-* 工具类，映射为编辑器蓝以保留原有状态选择器。 */
+  --color-cyan-50: #f0f7ff;
+  --color-cyan-100: #e1efff;
+  --color-cyan-200: #bfddff;
+  --color-cyan-300: #8ec4ff;
+  --color-cyan-400: #5aa8ff;
+  --color-cyan-500: #2997ff;
+  --color-cyan-600: #0077ed;
+  --color-cyan-700: #0066cc;
+  --color-cyan-800: #0055aa;
+  --color-cyan-900: #00447f;
+
+  /* 语义色阶：HeroUI 的 soft 变体和调用点的 -100/-600 工具类都依赖它们。 */
+  --color-primary-50: #f0f7ff;
+  --color-primary-100: #e1efff;
+  --color-primary-200: #bfddff;
+  --color-primary-300: #8ec4ff;
+  --color-primary-400: #5aa8ff;
+  --color-primary-500: #2997ff;
+  --color-primary-600: #0077ed;
+  --color-primary-700: #0066cc;
+  --color-primary-800: #0055aa;
+  --color-primary-900: #00447f;
+  --color-primary: #0066cc;
+  --color-primary-foreground: #ffffff;
+
+  --color-default-50: #fafafa;
+  --color-default-100: #f4f4f5;
+  --color-default-200: #e4e4e7;
+  --color-default-300: #d4d4d8;
+  --color-default-400: #a1a1aa;
+  --color-default-500: #71717a;
+  --color-default-600: #52525b;
+  --color-default-700: #3f3f46;
+  --color-default-800: #27272a;
+  --color-default-900: #18181b;
+
+  --color-content1: #ffffff;
+  --color-content2: #fbfbfd;
+  --color-content3: #f5f5f7;
+}
+
+/* HeroUI 3 的语义 token。hover 与 soft 档由根色 color-mix 派生，
+   所以只需覆盖根色，整条链跟着走。 */
+:root,
+.light,
+[data-theme="light"] {
+  --accent: #0066cc;
+  --accent-foreground: #ffffff;
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
+  --surface: #ffffff;
+  --surface-secondary: #fbfbfd;
+  --surface-tertiary: #f5f5f7;
+  --overlay: #ffffff;
+  --default: #e8e8ed;
+  --default-foreground: #1d1d1f;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #f43f5e;
+  --border: #e5e5e7;
+  --separator: #e5e5e7;
+  --focus: #0066cc;
+}
+
+.dark,
+[data-theme="dark"] {
+  --accent: #2997ff;
+  --accent-foreground: #ffffff;
+  --background: #1d1d1f;
+  --foreground: #f5f5f7;
+  --surface: #2c2c2e;
+  --surface-secondary: #242426;
+  --surface-tertiary: #323234;
+  --overlay: #2c2c2e;
+  --default: #34343a;
+  --default-foreground: #f7f8f8;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #f43f5e;
+  --border: #3a3a3c;
+  --separator: #3a3a3c;
+  --focus: #2997ff;
+}
+
 /* 扫描范围：@source 需要 glob 而不是目录，写成目录会一条工具类都扫不出来。 */
 @source "./**/*.{ts,tsx}";
 @source "../index.html";
