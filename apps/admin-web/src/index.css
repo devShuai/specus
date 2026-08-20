@@ -135,8 +135,8 @@ html {
 body {
   margin: 0;
   overflow-x: hidden;
-  background-color: hsl(var(--heroui-background));
-  color: hsl(var(--heroui-foreground));
+  background-color: var(--background);
+  color: var(--foreground);
 }
 
 /* Modal dismiss is a neutral editor control; destructive actions keep the red semantic color. */
@@ -277,8 +277,8 @@ body {
  * 这里为键盘焦点（focus-visible）补回可见 ring，鼠标点击仍保持无杂边。 */
 .dark [data-slot="input-wrapper"][data-focus-visible="true"] {
   box-shadow:
-    0 0 0 2px hsl(var(--heroui-background)),
-    0 0 0 4px hsl(var(--heroui-primary)) !important;
+    0 0 0 2px var(--background),
+    0 0 0 4px var(--accent) !important;
 }
 
 .light [data-slot="input"],
@@ -4026,7 +4026,7 @@ body {
 }
 
 .clipboard-rich-preview :where(blockquote, pre) {
-  border-left: 2px solid color-mix(in srgb, hsl(var(--heroui-primary)) 45%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
   padding-left: 0.65rem;
 }
 

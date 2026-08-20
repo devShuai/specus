@@ -8,9 +8,9 @@ import { notifyError } from "../../components/toast";
 import { EmptyState } from "../../components/EmptyState";
 
 /** 全局面指标配色常量：趋势图与占比环保持一致。 */
-const TOTAL_COLOR = "hsl(var(--heroui-primary))";
-const DOWNLOAD_COLOR = "hsl(var(--heroui-secondary))";
-const UPLOAD_COLOR = "hsl(var(--heroui-success))";
+const TOTAL_COLOR = "var(--accent)";
+const DOWNLOAD_COLOR = "var(--muted)";
+const UPLOAD_COLOR = "var(--success)";
 
 interface MetricCard {
   label: string;
@@ -253,7 +253,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
           return (
             <g key={ratio}>
               <line
-                stroke="hsl(var(--heroui-default-200))"
+                stroke="var(--border)"
                 strokeWidth="1"
                 x1={padding.left}
                 x2={width - padding.right}
@@ -261,7 +261,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
                 y2={lineY}
               />
               <text
-                fill="hsl(var(--heroui-default-500))"
+                fill="var(--muted)"
                 fontSize={tickFontSize}
                 textAnchor="end"
                 x={padding.left - 8}
@@ -281,7 +281,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
             <circle cx={x(index)} cy={y(day.totalBytes)} fill={TOTAL_COLOR} r="4" />
             {index % xLabelEvery === 0 ? (
               <text
-                fill="hsl(var(--heroui-default-500))"
+                fill="var(--muted)"
                 fontSize={tickFontSize}
                 textAnchor="middle"
                 x={x(index)}
@@ -310,8 +310,8 @@ function DonutChart({
   primaryText,
   primaryDetail,
   secondaryDetail,
-  primaryColor = "hsl(var(--heroui-success))",
-  secondaryColor = "hsl(var(--heroui-danger))",
+  primaryColor = "var(--success)",
+  secondaryColor = "var(--danger)",
 }: {
   total: number;
   primaryValue: number;
@@ -342,7 +342,7 @@ function DonutChart({
           cy="70"
           fill="none"
           r={radius}
-          stroke={clampedTotal > 0 ? secondaryColor : "hsl(var(--heroui-default-200))"}
+          stroke={clampedTotal > 0 ? secondaryColor : "var(--border)"}
           strokeWidth="18"
         />
         {clampedTotal > 0 && (
@@ -358,10 +358,10 @@ function DonutChart({
             transform="rotate(-90 70 70)"
           />
         )}
-        <text fill="hsl(var(--heroui-foreground))" fontSize="20" fontWeight="700" textAnchor="middle" x="70" y="66">
+        <text fill="var(--foreground)" fontSize="20" fontWeight="700" textAnchor="middle" x="70" y="66">
           {primaryText}
         </text>
-        <text fill="hsl(var(--heroui-default-500))" fontSize="11" textAnchor="middle" x="70" y="84">
+        <text fill="var(--muted)" fontSize="11" textAnchor="middle" x="70" y="84">
           {primaryLabel}
         </text>
       </svg>
