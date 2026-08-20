@@ -51,6 +51,53 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public void ServiceReportEnvelopeAndCollectionsAreBounded()
+    {
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateServiceReportEnvelope(new MessageRequestPacket
+        {
+            Message = "{\"type\":\"service-report\",\"padding\":\"" + new string('x', 16 * 1024) + "\"}",
+        }));
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateReportCollections(new PeerControlMessage
+        {
+            Stats = Enumerable.Range(0, 33).Select(index => new PeerServiceStats
+            {
+                ServiceId = $"svc-stat{index:00}",
+            }).ToArray(),
+        }));
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateReportCollections(new PeerControlMessage
+        {
+            InstanceId = new string('x', 65),
+        }));
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateReportCollections(new PeerControlMessage
+        {
+            InstanceId = "bad/instance",
+        }));
+    }
+
+    [Fact]
+    public async Task ServiceReportRateAndAuditStateAreBounded()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        for (var index = 0; index < 20; index++)
+        {
+            fixture.Service.EnforceServiceReportRate(7001);
+        }
+        for (var index = 0; index < 100; index++)
+        {
+            Assert.Throws<ArgumentException>(() => fixture.Service.EnforceServiceReportRate(7001));
+        }
+        Assert.True(fixture.State.Audits.Count <= 80);
+
+        fixture.State.ServiceReportWindows.Clear();
+        for (var index = 0; index < 4096; index++)
+        {
+            fixture.State.ServiceReportWindows[index + 10_000] = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        }
+        Assert.Throws<ArgumentException>(() => fixture.Service.EnforceServiceReportRate(99_999));
+        Assert.Equal(4096, fixture.State.ServiceReportWindows.Count);
+    }
+
+    [Fact]
     public async Task PeerServiceReportCatalogAndAuditSurviveAcrossScopedServiceInstances()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();

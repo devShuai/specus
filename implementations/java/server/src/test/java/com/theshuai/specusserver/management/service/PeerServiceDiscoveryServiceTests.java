@@ -2,6 +2,7 @@ package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.peermesh.PeerAdvertisedService;
 import com.theshuai.common.peermesh.PeerControlMessage;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshServiceSharing;
@@ -107,6 +108,25 @@ class PeerServiceDiscoveryServiceTests {
                 new PeerServiceDiscoveryService.ServiceMutation(
                         1L, null, "web", "", "tcp", "http", "127.0.0.1", 80, 8080, "javascript:alert(1)", false, "OWNER", null)))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void serviceReportRateAndStateTablesAreBounded() {
+        for (int index = 0; index < PeerServiceDiscovery.REPORT_RATE_LIMIT; index++) {
+            service.enforceRateLimit(7001L);
+        }
+        for (int index = 0; index < 100; index++) {
+            assertThatThrownBy(() -> service.enforceRateLimit(7001L))
+                    .isInstanceOf(RateLimitedException.class);
+        }
+        assertThat(service.recentAudits(admin())).hasSizeLessThanOrEqualTo(50);
+
+        for (long sessionId = 10_000L; service.reportRateWindowCount() < 4096; sessionId++) {
+            service.enforceRateLimit(sessionId);
+        }
+        assertThatThrownBy(() -> service.enforceRateLimit(99_999L))
+                .isInstanceOf(RateLimitedException.class);
+        assertThat(service.reportRateWindowCount()).isEqualTo(4096);
     }
 
     @Test

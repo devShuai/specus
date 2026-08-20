@@ -400,7 +400,10 @@ UDP 服务在虚拟 IP 的 `publishedPort` 上做 Peer-only 数据报转发，�
 同样不能借此功能访问。
 
 `revision` 在同一控制 session 内必须单调递增。小于或等于上次接受值的快照幂等忽略。
-每个 session 最多 32 个服务，单快照 JSON 不超过 16 KiB。服务端按持久化定义校验 `serviceId`，
+每个 session 最多 32 个服务、32 个统计项和 32 个 mDNS 候选，单快照 UTF-8 JSON 不超过 16 KiB；
+限制必须在反序列化前后分别执行。每个控制 session 每分钟最多接受 20 个报告，报告窗口、revision
+高水位和审计缓存都必须设置进程级硬上限（当前报告窗口最多 4096 个 session、审计最近 80 条），
+重复拒绝日志按相同主体和原因每分钟至多记录一次。服务端按持久化定义校验 `serviceId`，
 丢弃未配置、未启用或不属于该设备的项，并用服务端字段重写名称、类型、端口和 path。
 
 发布设备通过登录响应和后续 `peer-config` 的 `peerMesh.localServices` 收到本机服务定义（含
@@ -410,9 +413,16 @@ UDP 服务在虚拟 IP 的 `publishedPort` 上做 Peer-only 数据报转发，�
 解密后的 IP 包还必须满足：源地址等于已认证对端会话获分配的虚拟 IP，目标地址等于本机会话
 获分配的虚拟 IP。不得仅信任包内源地址，否则对端可伪造其他获授权虚拟 IP 绕过数据面 ACL。
 客户端仅在 `serviceSharing.effectiveEnabled` 为真且存在获授权在线对端时，对已启用项做探测：TCP 服务
-做 TCP 连接探测，UDP 服务做数据报探测。探测成功后上报不含目标地址的 `service-report`，并在本机虚拟
+做 TCP 连接探测，UDP 服务必须收到目标响应后才算成功，单纯发送成功不得发布。目标地址必须在一次解析后
+固定为 loopback 或本机网络接口当前拥有的单播地址；禁止任意主机名、非本机 LAN/Peer/public 地址、
+unspecified、multicast 和 broadcast，连接与探测不得二次解析形成 DNS rebinding。探测成功后上报不含目标地址的 `service-report`，并在本机虚拟
 IP 的 `publishedPort` 上绑定 Peer-only TCP 或 UDP 桥。`mdnsImportEnabled` 为真时才允许本机 mDNS
 浏览，候选只出现在 `service-report.mdnsCandidates`，不得进入 `service-catalog`。
+
+桥接资源采用四端一致的硬边界：TCP 与 UDP 各自全进程最多 256 个活动映射，每个服务最多 64 个，
+同一来源虚拟 IP 最多 8 个；TCP connect timeout 为 3 秒、双向 idle timeout 为 60 秒，UDP 来源映射
+idle TTL 为 60 秒。关闭总开关、单服务、设备或 ACL 时必须停止监听、拒绝新连接并主动关闭该服务全部
+TCP/UDP 活动映射，所有计数与租约必须在成功、失败、超时和取消路径释放。
 
 ### `service-catalog`
 

@@ -17,21 +17,25 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
 {
     private readonly string _virtualIp;
     private readonly LocalPeerService _service;
+    private readonly IPAddress _targetAddress;
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger? _logger;
     private readonly ConcurrentDictionary<TcpClient, TcpClient> _splices = new();
-    private readonly SemaphoreSlim _slots = new(64, 64);
+    private readonly SemaphoreSlim _slots = new(PeerServiceResourceLimiter.MaxTcpPerService,
+        PeerServiceResourceLimiter.MaxTcpPerService);
     private readonly ConcurrentDictionary<string, byte> _auditedAccessEvents = new(StringComparer.Ordinal);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
     private int _disposed;
 
-    private PeerServiceBridge(string virtualIp, LocalPeerService service, TcpListener listener, ILogger? logger)
+    private PeerServiceBridge(string virtualIp, LocalPeerService service, IPAddress targetAddress,
+        TcpListener listener, ILogger? logger)
     {
         _virtualIp = virtualIp;
         _service = service;
+        _targetAddress = targetAddress;
         _listener = listener;
         _logger = logger;
         _ = AcceptLoopAsync();
@@ -39,14 +43,14 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
 
     public static PeerServiceBridge Bind(string virtualIp, LocalPeerService service, ILogger? logger)
     {
-        if (!PeerServiceDiscovery.IsLocalInterfaceTarget(service.TargetHost))
+        if (!PeerServiceDiscovery.TryResolveLocalInterfaceTarget(service.TargetHost, out var targetAddress))
         {
             throw new InvalidOperationException("targetHost is not assigned to this device");
         }
         var listener = new TcpListener(IPAddress.Parse(virtualIp), service.PublishedPort);
         listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         listener.Start();
-        return new PeerServiceBridge(virtualIp, service, listener, logger);
+        return new PeerServiceBridge(virtualIp, service, targetAddress, listener, logger);
     }
 
     public string ServiceId => _service.ServiceId;
@@ -93,7 +97,14 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
                 inbound.Dispose();
                 continue;
             }
-            _ = SpliceAsync(inbound);
+            var lease = PeerServiceResourceLimiter.TryAcquireTcp(remote.Address);
+            if (lease is null)
+            {
+                _slots.Release();
+                inbound.Dispose();
+                continue;
+            }
+            _ = SpliceAsync(inbound, lease);
         }
     }
 
@@ -109,8 +120,9 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         }
     }
 
-    private async Task SpliceAsync(TcpClient inbound)
+    private async Task SpliceAsync(TcpClient inbound, PeerServiceResourceLimiter.Lease lease)
     {
+        using var resourceLease = lease;
         using var inboundClient = inbound;
         using var outbound = new TcpClient();
         if (_cts.IsCancellationRequested || !_splices.TryAdd(inboundClient, outbound))
@@ -122,8 +134,8 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         {
             inboundClient.NoDelay = true;
             outbound.NoDelay = true;
-            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-            await outbound.ConnectAsync(_service.TargetHost, _service.TargetPort, connectCts.Token).ConfigureAwait(false);
+            using var connectCts = new CancellationTokenSource(PeerServiceResourceLimiter.ConnectTimeout);
+            await outbound.ConnectAsync(_targetAddress, _service.TargetPort, connectCts.Token).ConfigureAwait(false);
             await using var inboundStream = inboundClient.GetStream();
             await using var outboundStream = outbound.GetStream();
             var up = CopyCountedAsync(inboundStream, outboundStream, incrementIn: true);
@@ -146,12 +158,15 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         var buffer = new byte[8192];
         while (!_cts.IsCancellationRequested)
         {
-            var read = await from.ReadAsync(buffer, _cts.Token).ConfigureAwait(false);
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            idle.CancelAfter(PeerServiceResourceLimiter.IdleTimeout);
+            var read = await from.ReadAsync(buffer, idle.Token).ConfigureAwait(false);
             if (read <= 0)
             {
                 return;
             }
-            await to.WriteAsync(buffer.AsMemory(0, read), _cts.Token).ConfigureAwait(false);
+            idle.CancelAfter(PeerServiceResourceLimiter.IdleTimeout);
+            await to.WriteAsync(buffer.AsMemory(0, read), idle.Token).ConfigureAwait(false);
             if (incrementIn)
             {
                 Interlocked.Add(ref _bytesIn, read);

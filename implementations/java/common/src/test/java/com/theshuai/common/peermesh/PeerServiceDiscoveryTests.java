@@ -19,10 +19,35 @@ class PeerServiceDiscoveryTests {
         assertThrows(IllegalArgumentException.class, () -> PeerServiceDiscovery.requireTargetHost("http://127.0.0.1"));
         assertThrows(IllegalArgumentException.class, () -> PeerServiceDiscovery.requireTargetHost("0.0.0.0"));
         assertEquals("127.0.0.1", PeerServiceDiscovery.requireTargetHost("127.0.0.1"));
-        assertEquals("localhost", PeerServiceDiscovery.requireTargetHost("localhost"));
+        assertEquals("127.0.0.1", PeerServiceDiscovery.requireTargetHost("localhost"));
         assertEquals("192.168.1.10", PeerServiceDiscovery.requireTargetHost("192.168.1.10"));
+        assertThrows(IllegalArgumentException.class, () -> PeerServiceDiscovery.requireTargetHost("203.0.113.10"));
+        assertThrows(IllegalArgumentException.class, () -> PeerServiceDiscovery.requireTargetHost("224.0.0.1"));
         assertTrue(PeerServiceDiscovery.isLocalInterfaceTarget("127.0.0.1"));
         assertFalse(PeerServiceDiscovery.isLocalInterfaceTarget("10.255.255.254"));
+    }
+
+    @Test
+    void udpProbeRequiresAReplyInsteadOfTreatingSendAsAvailability() throws Exception {
+        try (java.net.DatagramSocket silent = new java.net.DatagramSocket(
+                new java.net.InetSocketAddress("127.0.0.1", 0))) {
+            assertFalse(PeerServiceDiscovery.probeUdp("127.0.0.1", silent.getLocalPort(), 100));
+        }
+        try (java.net.DatagramSocket echo = new java.net.DatagramSocket(
+                new java.net.InetSocketAddress("127.0.0.1", 0))) {
+            Thread responder = new Thread(() -> {
+                try {
+                    java.net.DatagramPacket request = new java.net.DatagramPacket(new byte[1], 1);
+                    echo.receive(request);
+                    echo.send(new java.net.DatagramPacket(new byte[]{1}, 1, request.getSocketAddress()));
+                } catch (Exception ignored) {
+                }
+            });
+            responder.setDaemon(true);
+            responder.start();
+            assertTrue(PeerServiceDiscovery.probeUdp("localhost", echo.getLocalPort(), 500));
+            responder.join(1_000);
+        }
     }
 
     @Test

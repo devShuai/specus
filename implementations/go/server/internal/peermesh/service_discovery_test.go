@@ -3,6 +3,7 @@ package peermesh
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,55 @@ func TestValidateServiceReportEnvelopeRejectsClientControlledRoutingAndIdentity(
 		if err := validateServiceReportEnvelope(request); err == nil {
 			t.Errorf("field %s was accepted", field)
 		}
+	}
+	oversized := valid
+	oversized.Message = `{"type":"service-report","padding":"` + strings.Repeat("x", 16*1024) + `"}`
+	if err := validateServiceReportEnvelope(oversized); err == nil {
+		t.Fatal("oversized raw service-report was accepted")
+	}
+	stats := make([]ServiceStats, 33)
+	for index := range stats {
+		stats[index].ServiceID = fmt.Sprintf("svc-stat%02d", index)
+	}
+	if err := validateServiceReportCollections(ControlMessage{Stats: stats}); err == nil {
+		t.Fatal("oversized stats collection was accepted")
+	}
+	if err := validateServiceReportCollections(ControlMessage{InstanceID: strings.Repeat("x", 65)}); err == nil {
+		t.Fatal("oversized instanceId was accepted")
+	}
+	if err := validateServiceReportCollections(ControlMessage{InstanceID: "bad/instance"}); err == nil {
+		t.Fatal("unsafe instanceId was accepted")
+	}
+}
+
+func TestServiceReportRateAndAuditStateAreBounded(t *testing.T) {
+	service := New(config.PeerMeshConfig{}, nil, session.NewRegistry(), nil)
+	now := time.Now()
+	for index := 0; index < 20; index++ {
+		if err := service.enforceServiceReportRate(7001, now); err != nil {
+			t.Fatalf("report %d was unexpectedly limited: %v", index, err)
+		}
+	}
+	for index := 0; index < 100; index++ {
+		if err := service.enforceServiceReportRate(7001, now); err == nil {
+			t.Fatal("high-rate report was accepted")
+		}
+	}
+	if len(service.audits) > 80 {
+		t.Fatalf("audit buffer exceeded limit: %d", len(service.audits))
+	}
+
+	service.catalogMu.Lock()
+	clear(service.serviceReportRates)
+	for index := int64(0); index < 4096; index++ {
+		service.serviceReportRates[index+10_000] = []time.Time{now}
+	}
+	service.catalogMu.Unlock()
+	if err := service.enforceServiceReportRate(99_999, now); err == nil {
+		t.Fatal("rate table capacity was bypassed")
+	}
+	if len(service.serviceReportRates) != 4096 {
+		t.Fatalf("rate table exceeded limit: %d", len(service.serviceReportRates))
 	}
 }
 
@@ -301,6 +351,12 @@ func TestRequireTargetHostAcceptsLoopbackOnly(t *testing.T) {
 	}
 	if _, err := requireTargetHost("http://127.0.0.1"); err == nil {
 		t.Fatal("url should be rejected")
+	}
+	if value, err := requireTargetHost("localhost"); err != nil || value != "127.0.0.1" {
+		t.Fatalf("localhost was not canonicalized: %q %v", value, err)
+	}
+	if _, err := requireTargetHost("203.0.113.10"); err == nil {
+		t.Fatal("public target should be rejected")
 	}
 	if _, err := requirePath("javascript:alert(1)", "http"); err == nil {
 		t.Fatal("script path should be rejected")

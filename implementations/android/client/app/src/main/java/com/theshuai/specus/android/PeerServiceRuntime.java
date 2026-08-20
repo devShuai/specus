@@ -285,11 +285,12 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     static boolean probeTcp(String host, int port, int timeoutMillis) {
-        if (!isLocalServiceTarget(host) || port < 1 || port > 65535) {
+        InetAddress target = resolveLocalServiceTarget(host);
+        if (target == null || port < 1 || port > 65535) {
             return false;
         }
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), Math.max(50, timeoutMillis));
+            socket.connect(new InetSocketAddress(target, port), Math.max(50, timeoutMillis));
             return socket.isConnected();
         } catch (Exception ignored) {
             return false;
@@ -297,28 +298,43 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     static boolean probeUdp(String host, int port, int timeoutMillis) {
-        if (!isLocalServiceTarget(host) || port < 1 || port > 65535) {
+        InetAddress target = resolveLocalServiceTarget(host);
+        if (target == null || port < 1 || port > 65535) {
             return false;
         }
         try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
             socket.setSoTimeout(Math.max(50, timeoutMillis));
-            socket.connect(new InetSocketAddress(host, port));
+            socket.connect(new InetSocketAddress(target, port));
             socket.send(new java.net.DatagramPacket(new byte[]{0}, 1));
-            return true;
+            java.net.DatagramPacket response = new java.net.DatagramPacket(new byte[1], 1);
+            socket.receive(response);
+            return response.getLength() > 0;
         } catch (Exception ignored) {
             return false;
         }
     }
 
     static boolean isLocalServiceTarget(String host) {
+        return resolveLocalServiceTarget(host) != null;
+    }
+
+    static InetAddress resolveLocalServiceTarget(String host) {
         if (host == null || host.isBlank()) {
-            return false;
+            return null;
         }
         try {
-            InetAddress address = InetAddress.getByName(host.trim());
-            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null;
+            String value = host.trim();
+            if ("localhost".equalsIgnoreCase(value)) {
+                value = "127.0.0.1";
+            } else if (!(value.contains(":") || value.matches("[0-9.]+"))) {
+                return null;
+            }
+            InetAddress address = InetAddress.getByName(value);
+            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null
+                    ? address
+                    : null;
         } catch (Exception ignored) {
-            return false;
+            return null;
         }
     }
 

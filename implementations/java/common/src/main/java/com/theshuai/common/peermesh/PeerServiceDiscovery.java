@@ -29,6 +29,16 @@ public final class PeerServiceDiscovery {
     public static final int MAX_SERVICE_ID_LENGTH = 64;
     public static final int MIN_SERVICE_ID_LENGTH = 8;
     public static final int MAX_INSTANCE_ID_LENGTH = 64;
+    public static final int MAX_STATS_PER_REPORT = 32;
+    public static final int MAX_MDNS_CANDIDATES = 32;
+    public static final int MAX_TCP_CONNECTIONS_GLOBAL = 256;
+    public static final int MAX_TCP_CONNECTIONS_PER_SERVICE = 64;
+    public static final int MAX_TCP_CONNECTIONS_PER_SOURCE = 8;
+    public static final int MAX_UDP_PEERS_GLOBAL = 256;
+    public static final int MAX_UDP_PEERS_PER_SERVICE = 64;
+    public static final int MAX_UDP_PEERS_PER_SOURCE = 8;
+    public static final int CONNECT_TIMEOUT_MILLIS = 3_000;
+    public static final int IDLE_TIMEOUT_MILLIS = 60_000;
     public static final Duration CATALOG_TTL = Duration.ofMinutes(5);
     public static final int REPORT_RATE_LIMIT = 20;
     public static final Duration REPORT_RATE_WINDOW = Duration.ofMinutes(1);
@@ -177,8 +187,11 @@ public final class PeerServiceDiscovery {
         if (value.startsWith("[") && value.endsWith("]")) {
             value = value.substring(1, value.length() - 1);
         }
-        if ("localhost".equalsIgnoreCase(value) || "::1".equals(value) || "127.0.0.1".equals(value)) {
-            return value;
+        if ("localhost".equalsIgnoreCase(value)) {
+            return "127.0.0.1";
+        }
+        if (!(value.contains(":") || value.matches("[0-9.]+"))) {
+            throw new IllegalArgumentException("targetHost must be a numeric local address or localhost");
         }
         InetAddress address;
         try {
@@ -196,7 +209,7 @@ public final class PeerServiceDiscovery {
                 || isUniqueLocalIpv6(address))) {
             throw new IllegalArgumentException("targetHost must be loopback or a local interface address");
         }
-        return value;
+        return address.getHostAddress();
     }
 
     public static String normalizePath(String raw, String application) {
@@ -355,7 +368,12 @@ public final class PeerServiceDiscovery {
             return false;
         }
         try (java.net.Socket socket = new java.net.Socket()) {
-            socket.connect(new java.net.InetSocketAddress(host, port), Math.max(50, timeoutMillis));
+            String target = resolveLocalInterfaceTarget(host);
+            if (target == null) {
+                return false;
+            }
+            socket.connect(new java.net.InetSocketAddress(InetAddress.getByName(target), port),
+                    Math.max(50, timeoutMillis));
             return socket.isConnected();
         } catch (Exception ignored) {
             return false;
@@ -368,9 +386,15 @@ public final class PeerServiceDiscovery {
         }
         try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
             socket.setSoTimeout(Math.max(50, timeoutMillis));
-            socket.connect(new java.net.InetSocketAddress(host, port));
+            String target = resolveLocalInterfaceTarget(host);
+            if (target == null) {
+                return false;
+            }
+            socket.connect(new java.net.InetSocketAddress(InetAddress.getByName(target), port));
             socket.send(new java.net.DatagramPacket(new byte[]{0}, 1));
-            return true;
+            java.net.DatagramPacket response = new java.net.DatagramPacket(new byte[1], 1);
+            socket.receive(response);
+            return response.getLength() > 0;
         } catch (Exception ignored) {
             return false;
         }
@@ -378,15 +402,22 @@ public final class PeerServiceDiscovery {
 
     /** Publisher-side boundary: a configured target may not turn the client into a LAN proxy. */
     public static boolean isLocalInterfaceTarget(String raw) {
+        return resolveLocalInterfaceTarget(raw) != null;
+    }
+
+    /** Resolve once and return the canonical numeric address used by both validation and forwarding. */
+    public static String resolveLocalInterfaceTarget(String raw) {
         if (raw == null || raw.isBlank()) {
-            return false;
+            return null;
         }
         try {
             String value = requireTargetHost(raw);
             InetAddress address = InetAddress.getByName(value);
-            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null;
+            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null
+                    ? address.getHostAddress()
+                    : null;
         } catch (Exception ignored) {
-            return false;
+            return null;
         }
     }
 
@@ -397,7 +428,7 @@ public final class PeerServiceDiscovery {
         LinkedHashSet<String> keys = new LinkedHashSet<>();
         List<PeerMdnsCandidate> sanitized = new ArrayList<>();
         for (PeerMdnsCandidate item : raw) {
-            if (item == null || sanitized.size() >= MAX_SERVICES_PER_SESSION) {
+            if (item == null || sanitized.size() >= MAX_MDNS_CANDIDATES) {
                 continue;
             }
             try {

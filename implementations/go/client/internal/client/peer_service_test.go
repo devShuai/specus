@@ -2,9 +2,11 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -214,6 +216,9 @@ func TestProbeTCPDetectsOpenAndClosedPorts(t *testing.T) {
 	if isLocalServiceTarget("10.255.255.254") {
 		t.Fatal("unassigned private address must not be accepted as a local service target")
 	}
+	if isLocalServiceTarget("example.invalid") {
+		t.Fatal("hostnames must not be resolved as service targets")
+	}
 	port, err := freePort()
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +233,109 @@ func TestProbeTCPDetectsOpenAndClosedPorts(t *testing.T) {
 	defer listener.Close()
 	if !probeTCP("127.0.0.1", port, 400*time.Millisecond) {
 		t.Fatal("open port should probe true")
+	}
+}
+
+func TestProbeUDPRequiresReplyAndResourceBudgetsRecover(t *testing.T) {
+	silent, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probeUDP("127.0.0.1", silent.LocalAddr().(*net.UDPAddr).Port, 100*time.Millisecond) {
+		t.Fatal("send-only UDP target was reported available")
+	}
+	_ = silent.Close()
+
+	echo, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		buffer := make([]byte, 1)
+		n, peer, readErr := echo.ReadFromUDP(buffer)
+		if readErr == nil {
+			_, _ = echo.WriteToUDP(buffer[:n], peer)
+		}
+	}()
+	if !probeUDP("127.0.0.1", echo.LocalAddr().(*net.UDPAddr).Port, 500*time.Millisecond) {
+		t.Fatal("UDP echo target was not reported available")
+	}
+
+	source := netip.MustParseAddr("127.0.0.1")
+	releases := make([]func(), 0, peerServiceTCPPerSourceLimit)
+	for index := 0; index < peerServiceTCPPerSourceLimit; index++ {
+		release, ok := acquirePeerServiceResource(false, source)
+		if !ok {
+			t.Fatalf("tcp lease %d rejected", index)
+		}
+		releases = append(releases, release)
+	}
+	if release, ok := acquirePeerServiceResource(false, source); ok {
+		release()
+		t.Fatal("per-source TCP limit was bypassed")
+	}
+	for _, release := range releases {
+		release()
+	}
+	if release, ok := acquirePeerServiceResource(false, source); !ok {
+		t.Fatal("released TCP budget did not recover")
+	} else {
+		release()
+	}
+
+	releases = releases[:0]
+	for index := 0; index < peerServiceUDPPerSourceLimit; index++ {
+		release, ok := acquirePeerServiceResource(true, source)
+		if !ok {
+			t.Fatalf("udp lease %d rejected", index)
+		}
+		releases = append(releases, release)
+	}
+	if release, ok := acquirePeerServiceResource(true, source); ok {
+		release()
+		t.Fatal("per-source UDP limit was bypassed")
+	}
+	for _, release := range releases {
+		release()
+	}
+
+	globalReleases := make([]func(), 0, peerServiceTCPGlobalLimit)
+	for sourceIndex := 1; sourceIndex <= peerServiceTCPGlobalLimit/peerServiceTCPPerSourceLimit; sourceIndex++ {
+		address := netip.MustParseAddr(fmt.Sprintf("127.0.1.%d", sourceIndex))
+		for slot := 0; slot < peerServiceTCPPerSourceLimit; slot++ {
+			release, ok := acquirePeerServiceResource(false, address)
+			if !ok {
+				t.Fatalf("global tcp lease source=%d slot=%d rejected", sourceIndex, slot)
+			}
+			globalReleases = append(globalReleases, release)
+		}
+	}
+	if release, ok := acquirePeerServiceResource(false, netip.MustParseAddr("127.0.2.1")); ok {
+		release()
+		t.Fatal("global TCP limit was bypassed")
+	}
+	for _, release := range globalReleases {
+		release()
+	}
+
+	globalReleases = globalReleases[:0]
+	for sourceIndex := 1; sourceIndex <= peerServiceUDPGlobalLimit/peerServiceUDPPerSourceLimit; sourceIndex++ {
+		address := netip.MustParseAddr(fmt.Sprintf("127.0.3.%d", sourceIndex))
+		for slot := 0; slot < peerServiceUDPPerSourceLimit; slot++ {
+			release, ok := acquirePeerServiceResource(true, address)
+			if !ok {
+				t.Fatalf("global udp lease source=%d slot=%d rejected", sourceIndex, slot)
+			}
+			globalReleases = append(globalReleases, release)
+		}
+	}
+	if release, ok := acquirePeerServiceResource(true, netip.MustParseAddr("127.0.4.1")); ok {
+		release()
+		t.Fatal("global UDP limit was bypassed")
+	}
+	for _, release := range globalReleases {
+		release()
 	}
 }
 

@@ -34,23 +34,25 @@ interface PeerServiceForwarder extends AutoCloseable {
  */
 @Slf4j
 final class PeerServiceBridge implements PeerServiceForwarder {
-    private static final int MAX_ACTIVE_CONNECTIONS = 64;
     private final String virtualIp;
     private final LocalPeerService service;
+    private final InetAddress targetAddress;
     private final ServerSocket serverSocket;
     private final Set<InetAddress> allowedPeerAddresses;
     private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
-    private final Semaphore slots = new Semaphore(MAX_ACTIVE_CONNECTIONS);
+    private final Semaphore slots = new Semaphore(PeerServiceDiscovery.MAX_TCP_CONNECTIONS_PER_SERVICE);
     private final AtomicLong bytesIn = new AtomicLong();
     private final AtomicLong bytesOut = new AtomicLong();
     private final AtomicLong totalConnections = new AtomicLong();
 
-    private PeerServiceBridge(String virtualIp, LocalPeerService service, ServerSocket serverSocket) {
+    private PeerServiceBridge(String virtualIp, LocalPeerService service, InetAddress targetAddress,
+                              ServerSocket serverSocket) {
         this.virtualIp = virtualIp;
         this.service = service;
+        this.targetAddress = targetAddress;
         this.serverSocket = serverSocket;
         this.allowedPeerAddresses = allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
@@ -62,7 +64,8 @@ final class PeerServiceBridge implements PeerServiceForwarder {
     }
 
     static PeerServiceBridge bind(String virtualIp, LocalPeerService service) throws IOException {
-        if (!PeerServiceDiscovery.isLocalInterfaceTarget(service.getTargetHost())) {
+        String target = PeerServiceDiscovery.resolveLocalInterfaceTarget(service.getTargetHost());
+        if (target == null) {
             throw new IOException("targetHost is not assigned to this device");
         }
         PeerServiceDiscovery.requirePort(service.getTargetPort(), "targetPort");
@@ -70,7 +73,7 @@ final class PeerServiceBridge implements PeerServiceForwarder {
         ServerSocket server = new ServerSocket();
         server.setReuseAddress(true);
         server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.getPublishedPort()));
-        return new PeerServiceBridge(virtualIp, service, server);
+        return new PeerServiceBridge(virtualIp, service, InetAddress.getByName(target), server);
     }
 
     public PeerServiceStats stats() {
@@ -106,9 +109,17 @@ final class PeerServiceBridge implements PeerServiceForwarder {
                     closeQuietly(inbound);
                     continue;
                 }
+                PeerServiceResourceLimiter.Lease lease =
+                        PeerServiceResourceLimiter.tryAcquireTcp(inbound.getInetAddress());
+                if (lease == null) {
+                    slots.release();
+                    closeQuietly(inbound);
+                    continue;
+                }
                 try {
-                    executor.execute(() -> splice(inbound));
+                    executor.execute(() -> splice(inbound, lease));
                 } catch (RuntimeException rejected) {
+                    lease.close();
                     slots.release();
                     closeQuietly(inbound);
                 }
@@ -153,14 +164,17 @@ final class PeerServiceBridge implements PeerServiceForwarder {
         return Set.copyOf(addresses);
     }
 
-    private void splice(Socket inbound) {
+    private void splice(Socket inbound, PeerServiceResourceLimiter.Lease lease) {
         Socket outbound = new Socket();
         splices.put(inbound, outbound);
         totalConnections.incrementAndGet();
         try {
             inbound.setTcpNoDelay(true);
+            inbound.setSoTimeout(PeerServiceDiscovery.IDLE_TIMEOUT_MILLIS);
             outbound.setTcpNoDelay(true);
-            outbound.connect(new InetSocketAddress(service.getTargetHost(), service.getTargetPort()), 3_000);
+            outbound.setSoTimeout(PeerServiceDiscovery.IDLE_TIMEOUT_MILLIS);
+            outbound.connect(new InetSocketAddress(targetAddress, service.getTargetPort()),
+                    PeerServiceDiscovery.CONNECT_TIMEOUT_MILLIS);
             Thread reply = new Thread(() -> copy(outbound, inbound, bytesOut), "peer-service-up-" + service.getServiceId());
             reply.setDaemon(true);
             reply.start();
@@ -173,6 +187,7 @@ final class PeerServiceBridge implements PeerServiceForwarder {
             closeQuietly(outbound);
             splices.remove(inbound);
             slots.release();
+            lease.close();
         }
     }
 

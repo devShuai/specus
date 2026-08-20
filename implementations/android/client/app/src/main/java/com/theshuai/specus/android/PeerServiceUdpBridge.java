@@ -14,8 +14,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 final class PeerServiceUdpBridge implements AutoCloseable {
-    private static final int MAX_PEERS = 64;
-    private static final int PEER_IDLE_TIMEOUT_MILLIS = 60_000;
     private static final Logger LOG = Logger.getLogger(PeerServiceUdpBridge.class.getName());
     private final String virtualIp;
     private final SpecusCore.LocalPeerService service;
@@ -25,13 +23,14 @@ final class PeerServiceUdpBridge implements AutoCloseable {
     private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
-    private final ConcurrentHashMap<SocketAddress, DatagramSocket> peers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SocketAddress, UdpPeer> peers = new ConcurrentHashMap<>();
 
-    private PeerServiceUdpBridge(String virtualIp, SpecusCore.LocalPeerService service, DatagramSocket inbound) {
+    private PeerServiceUdpBridge(String virtualIp, SpecusCore.LocalPeerService service, InetAddress targetAddress,
+                                 DatagramSocket inbound) {
         this.virtualIp = virtualIp;
         this.service = service;
         this.inbound = inbound;
-        this.target = new InetSocketAddress(service.targetHost, service.targetPort);
+        this.target = new InetSocketAddress(targetAddress, service.targetPort);
         this.allowedPeerAddresses = PeerServiceBridge.allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread thread = new Thread(r, "peer-service-udp-" + service.serviceId);
@@ -42,13 +41,14 @@ final class PeerServiceUdpBridge implements AutoCloseable {
     }
 
     static PeerServiceUdpBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws Exception {
-        if (!PeerServiceRuntime.isLocalServiceTarget(service.targetHost)) {
+        InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
+        if (target == null) {
             throw new IllegalArgumentException("targetHost is not assigned to this device");
         }
         DatagramSocket socket = new DatagramSocket(new InetSocketAddress(InetAddress.getByName(virtualIp),
                 service.publishedPort));
         socket.setReuseAddress(true);
-        return new PeerServiceUdpBridge(virtualIp, service, socket);
+        return new PeerServiceUdpBridge(virtualIp, service, target, socket);
     }
 
     boolean matches(String virtualIp, SpecusCore.LocalPeerService service) {
@@ -70,27 +70,59 @@ final class PeerServiceUdpBridge implements AutoCloseable {
                     auditAccessOnce("deny", packet.getSocketAddress(), "source-not-allowed");
                     continue;
                 }
-                if (!peers.containsKey(packet.getSocketAddress()) && peers.size() >= MAX_PEERS) {
+                if (!peers.containsKey(packet.getSocketAddress())
+                        && peers.size() >= PeerServiceResourceLimiter.MAX_UDP_PER_SERVICE) {
                     continue;
                 }
-                DatagramSocket outbound = peers.computeIfAbsent(packet.getSocketAddress(), this::openPeer);
-                outbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), target));
+                UdpPeer binding = peers.get(packet.getSocketAddress());
+                if (binding == null) {
+                    binding = openPeer(packet.getSocketAddress(), packet.getAddress());
+                    if (binding == null) {
+                        continue;
+                    }
+                    UdpPeer raced = peers.putIfAbsent(packet.getSocketAddress(), binding);
+                    if (raced != null) {
+                        binding.close();
+                        binding = raced;
+                    } else {
+                        UdpPeer accepted = binding;
+                        SocketAddress peer = packet.getSocketAddress();
+                        try {
+                            executor.execute(() -> replyLoop(accepted, peer));
+                        } catch (RuntimeException rejected) {
+                            peers.remove(peer, accepted);
+                            accepted.close();
+                            continue;
+                        }
+                    }
+                }
+                binding.socket.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), target));
             } catch (Exception e) {
                 return;
             }
         }
     }
 
-    private DatagramSocket openPeer(SocketAddress peer) {
+    private UdpPeer openPeer(SocketAddress peer, InetAddress source) {
+        PeerServiceResourceLimiter.Lease lease = PeerServiceResourceLimiter.tryAcquireUdp(source);
+        if (lease == null) {
+            return null;
+        }
+        DatagramSocket socket = null;
         try {
             auditAccessOnce("allow", peer, "acl-authorized");
-            DatagramSocket socket = new DatagramSocket();
+            socket = new DatagramSocket();
             socket.connect(target);
-            socket.setSoTimeout(PEER_IDLE_TIMEOUT_MILLIS);
-            executor.execute(() -> replyLoop(socket, peer));
-            return socket;
+            socket.setSoTimeout(PeerServiceResourceLimiter.IDLE_TIMEOUT_MILLIS);
+            return new UdpPeer(socket, lease);
         } catch (Exception e) {
-            throw new IllegalStateException(e);
+            if (socket != null) {
+                socket.close();
+            }
+            lease.close();
+            LOG.fine("Peer-only UDP source mapping failed service=" + service.serviceId
+                    + " source=" + peer + ": " + e.getMessage());
+            return null;
         }
     }
 
@@ -105,19 +137,19 @@ final class PeerServiceUdpBridge implements AutoCloseable {
         }
     }
 
-    private void replyLoop(DatagramSocket socket, SocketAddress peer) {
+    private void replyLoop(UdpPeer binding, SocketAddress peer) {
         byte[] buffer = new byte[65507];
         try {
-            while (open.get() && !socket.isClosed()) {
+            while (open.get() && !binding.socket.isClosed()) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
+                binding.socket.receive(packet);
                 inbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), peer));
             }
         } catch (Exception ignored) {
             // idle or closed
         } finally {
-            peers.remove(peer, socket);
-            socket.close();
+            peers.remove(peer, binding);
+            binding.close();
         }
     }
 
@@ -130,8 +162,27 @@ final class PeerServiceUdpBridge implements AutoCloseable {
                 + " activePeers=" + peers.size()
                 + " reason=config-withdrawn-or-shutdown");
         inbound.close();
-        peers.values().forEach(DatagramSocket::close);
+        peers.values().forEach(UdpPeer::close);
         peers.clear();
         executor.shutdownNow();
+    }
+
+    private static final class UdpPeer implements AutoCloseable {
+        private final DatagramSocket socket;
+        private final PeerServiceResourceLimiter.Lease lease;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private UdpPeer(DatagramSocket socket, PeerServiceResourceLimiter.Lease lease) {
+            this.socket = socket;
+            this.lease = lease;
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                socket.close();
+                lease.close();
+            }
+        }
     }
 }

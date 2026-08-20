@@ -50,14 +50,14 @@ internal static class PeerServiceDiscovery
 
     public static bool ProbeTcp(string? host, int port, int timeoutMillis)
     {
-        if (!IsLocalInterfaceTarget(host) || port is < 1 or > 65535)
+        if (!TryResolveLocalInterfaceTarget(host, out var target) || port is < 1 or > 65535)
         {
             return false;
         }
         try
         {
             using var client = new TcpClient();
-            var task = client.ConnectAsync(host!, port);
+            var task = client.ConnectAsync(target, port);
             return task.Wait(Math.Max(50, timeoutMillis)) && client.Connected;
         }
         catch
@@ -68,7 +68,7 @@ internal static class PeerServiceDiscovery
 
     public static bool ProbeUdp(string? host, int port, int timeoutMillis)
     {
-        if (!IsLocalInterfaceTarget(host) || port is < 1 or > 65535)
+        if (!TryResolveLocalInterfaceTarget(host, out var target) || port is < 1 or > 65535)
         {
             return false;
         }
@@ -76,9 +76,10 @@ internal static class PeerServiceDiscovery
         {
             using var client = new UdpClient();
             client.Client.ReceiveTimeout = Math.Max(50, timeoutMillis);
-            client.Connect(host!, port);
+            client.Connect(target, port);
             client.Send([0], 1);
-            return true;
+            var remote = new IPEndPoint(IPAddress.Any, 0);
+            return client.Receive(ref remote).Length > 0;
         }
         catch
         {
@@ -86,30 +87,38 @@ internal static class PeerServiceDiscovery
         }
     }
 
-    public static bool IsLocalInterfaceTarget(string? host)
+    public static bool IsLocalInterfaceTarget(string? host) => TryResolveLocalInterfaceTarget(host, out _);
+
+    public static bool TryResolveLocalInterfaceTarget(string? host, out IPAddress address)
     {
         if (string.Equals(host?.Trim(), "localhost", StringComparison.OrdinalIgnoreCase))
         {
+            address = IPAddress.Loopback;
             return true;
         }
         if (!IPAddress.TryParse(host?.Trim(), out var parsed))
         {
+            address = IPAddress.None;
             return false;
         }
         parsed = NormalizeAddress(parsed);
         if (IPAddress.IsLoopback(parsed))
         {
+            address = parsed;
             return true;
         }
         try
         {
-            return NetworkInterface.GetAllNetworkInterfaces()
+            var found = NetworkInterface.GetAllNetworkInterfaces()
                 .SelectMany(item => item.GetIPProperties().UnicastAddresses)
                 .Select(item => NormalizeAddress(item.Address))
                 .Contains(parsed);
+            address = found ? parsed : IPAddress.None;
+            return found;
         }
         catch (NetworkInformationException)
         {
+            address = IPAddress.None;
             return false;
         }
     }

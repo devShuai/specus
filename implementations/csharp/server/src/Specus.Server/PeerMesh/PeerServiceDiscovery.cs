@@ -12,6 +12,7 @@ namespace Specus.Server.PeerMesh;
 public sealed partial class PeerMeshService
 {
     private static readonly Regex ServiceIdPattern = new("^[A-Za-z0-9._-]{8,64}$", RegexOptions.Compiled);
+    private static readonly Regex InstanceIdPattern = new("^[A-Za-z0-9._-]{1,64}$", RegexOptions.Compiled);
     private static readonly Regex PathPattern = new("^/[A-Za-z0-9._~/-]*$", RegexOptions.Compiled);
     private static readonly string[] PeerServiceApps = ["http", "https", "ssh", "tcp", "udp"];
     private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), PeerMeshServiceCatalogSnapshot> _serviceCatalogs;
@@ -191,6 +192,7 @@ public sealed partial class PeerMeshService
     internal async Task HandleServiceReportAsync(ClientAccount source, PeerControlMessage report,
         long? publisherSessionId, CancellationToken cancellationToken)
     {
+        ValidateReportCollections(report);
         var sessionId = publisherSessionId is > 0
             ? publisherSessionId.Value
             : throw new ArgumentException("publisher session is required");
@@ -239,7 +241,7 @@ public sealed partial class PeerMeshService
             var advertised = await AdvertisedFromReportAsync(source, report.Services, cancellationToken)
                 .ConfigureAwait(false);
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
-            _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(revision, report.InstanceId ?? "", DateTimeOffset.UtcNow,
+            _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(revision, NormalizeInstanceId(report.InstanceId), DateTimeOffset.UtcNow,
                 expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
                 SanitizeMdns(report.MdnsCandidates));
             Audit("service-report", source.TenantId, source.Id, sessionId, null,
@@ -250,6 +252,32 @@ public sealed partial class PeerMeshService
         finally
         {
             gate.Release();
+        }
+    }
+
+    internal static void ValidateReportCollections(PeerControlMessage report)
+    {
+        if ((report.Services?.Count ?? 0) > 32)
+        {
+            throw new ArgumentException("at most 32 services per session");
+        }
+        if ((report.Stats?.Count ?? 0) > 32)
+        {
+            throw new ArgumentException("at most 32 service stats per report");
+        }
+        if ((report.MdnsCandidates?.Count ?? 0) > 32)
+        {
+            throw new ArgumentException("at most 32 mDNS candidates per report");
+        }
+        _ = NormalizeInstanceId(report.InstanceId);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in report.Stats ?? [])
+        {
+            var id = RequireServiceId(item.ServiceId);
+            if (!seen.Add(id))
+            {
+                throw new ArgumentException("duplicate service stats");
+            }
         }
     }
 
@@ -524,7 +552,7 @@ public sealed partial class PeerMeshService
     private SemaphoreSlim CatalogMutationGate((string TenantId, long ClientId, long SessionId) key) =>
         _serviceCatalogMutationGates.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
 
-    private void EnforceServiceReportRate(long sessionId)
+    internal void EnforceServiceReportRate(long sessionId)
     {
         const int limit = 20;
         const int maxSessions = 4096;
@@ -805,6 +833,7 @@ public sealed partial class PeerMeshService
         var ids = advertised.Select(item => item.ServiceId).ToHashSet(StringComparer.Ordinal);
         return (raw ?? [])
             .Where(item => item is not null && ids.Contains(item.ServiceId))
+            .Take(32)
             .Select(item => new PeerServiceStats
             {
                 ServiceId = item.ServiceId,
@@ -1043,13 +1072,36 @@ public sealed partial class PeerMeshService
             throw new ArgumentException("targetHost must be a local address, not a URL");
         }
         if (string.Equals(value, "localhost", StringComparison.OrdinalIgnoreCase)
-            || value is "127.0.0.1" or "::1")
+            || value is "127.0.0.1")
         {
-            return value;
+            return "127.0.0.1";
         }
-        if (!IPAddress.TryParse(value, out var ip) || IPAddress.Any.Equals(ip) || ip.IsIPv6Multicast)
+        if (!IPAddress.TryParse(value, out var ip) || IPAddress.Any.Equals(ip) || IPAddress.IPv6Any.Equals(ip)
+            || ip.IsIPv6Multicast)
         {
             throw new ArgumentException("targetHost must be a unicast IP or localhost");
+        }
+        ip = ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip;
+        var bytes = ip.GetAddressBytes();
+        var privateOrLocal = IPAddress.IsLoopback(ip)
+            || (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                && (bytes[0] == 10 || (bytes[0] == 172 && bytes[1] is >= 16 and <= 31)
+                    || (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 169 && bytes[1] == 254)))
+            || (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                && ((bytes[0] & 0xfe) == 0xfc || (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80)));
+        if (!privateOrLocal)
+        {
+            throw new ArgumentException("targetHost must be loopback or a local interface address");
+        }
+        return ip.ToString();
+    }
+
+    private static string NormalizeInstanceId(string? raw)
+    {
+        var value = raw?.Trim() ?? "";
+        if (value.Length > 0 && !InstanceIdPattern.IsMatch(value))
+        {
+            throw new ArgumentException("invalid instanceId");
         }
         return value;
     }

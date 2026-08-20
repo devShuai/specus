@@ -10,21 +10,26 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
 {
     private readonly string _virtualIp;
     private readonly LocalPeerService _service;
+    private readonly IPAddress _targetAddress;
     private readonly UdpClient _inbound;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger? _logger;
     private readonly ConcurrentDictionary<string, UdpPeer> _peers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _auditedAccessEvents = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _slots = new(PeerServiceResourceLimiter.MaxUdpPerService,
+        PeerServiceResourceLimiter.MaxUdpPerService);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
     private int _active;
     private int _disposed;
 
-    private PeerServiceUdpBridge(string virtualIp, LocalPeerService service, UdpClient inbound, ILogger? logger)
+    private PeerServiceUdpBridge(string virtualIp, LocalPeerService service, IPAddress targetAddress,
+        UdpClient inbound, ILogger? logger)
     {
         _virtualIp = virtualIp;
         _service = service;
+        _targetAddress = targetAddress;
         _inbound = inbound;
         _logger = logger;
         _ = AcceptLoopAsync();
@@ -32,13 +37,13 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
 
     public static PeerServiceUdpBridge Bind(string virtualIp, LocalPeerService service, ILogger? logger)
     {
-        if (!PeerServiceDiscovery.IsLocalInterfaceTarget(service.TargetHost))
+        if (!PeerServiceDiscovery.TryResolveLocalInterfaceTarget(service.TargetHost, out var targetAddress))
         {
             throw new InvalidOperationException("targetHost is not assigned to this device");
         }
         var inbound = new UdpClient(new IPEndPoint(IPAddress.Parse(virtualIp), service.PublishedPort));
         inbound.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        return new PeerServiceUdpBridge(virtualIp, service, inbound, logger);
+        return new PeerServiceUdpBridge(virtualIp, service, targetAddress, inbound, logger);
     }
 
     public string ServiceId => _service.ServiceId;
@@ -56,7 +61,7 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
 
     private async Task AcceptLoopAsync()
     {
-        var target = new IPEndPoint(IPAddress.Parse(Resolve(_service.TargetHost)), _service.TargetPort);
+        var target = new IPEndPoint(_targetAddress, _service.TargetPort);
         while (!_cts.IsCancellationRequested)
         {
             UdpReceiveResult packet;
@@ -82,17 +87,37 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
             var key = packet.RemoteEndPoint.ToString();
             if (!_peers.TryGetValue(key, out var binding))
             {
-                if (_peers.Count >= 64)
+                if (!_slots.Wait(0))
                 {
                     continue;
                 }
-                var outbound = new UdpClient();
-                outbound.Connect(target);
-                binding = new UdpPeer(outbound);
+                var lease = PeerServiceResourceLimiter.TryAcquireUdp(packet.RemoteEndPoint.Address);
+                if (lease is null)
+                {
+                    _slots.Release();
+                    continue;
+                }
+                UdpClient? outbound = null;
+                try
+                {
+                    outbound = new UdpClient();
+                    outbound.Connect(target);
+                    binding = new UdpPeer(outbound, lease, _slots);
+                }
+                catch
+                {
+                    outbound?.Dispose();
+                    lease.Dispose();
+                    _slots.Release();
+                    continue;
+                }
                 if (!_peers.TryAdd(key, binding))
                 {
-                    outbound.Dispose();
-                    binding = _peers[key];
+                    binding.Dispose();
+                    if (!_peers.TryGetValue(key, out binding))
+                    {
+                        continue;
+                    }
                 }
                 else
                 {
@@ -152,12 +177,9 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         {
             _peers.TryRemove(new KeyValuePair<string, UdpPeer>(key, binding));
             Interlocked.Decrement(ref _active);
-            binding.Client.Dispose();
+            binding.Dispose();
         }
     }
-
-    private static string Resolve(string host) =>
-        string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) ? "127.0.0.1" : host;
 
     public void Dispose()
     {
@@ -172,17 +194,30 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         _inbound.Dispose();
         foreach (var peer in _peers.Values)
         {
-            peer.Client.Dispose();
+            peer.Dispose();
         }
         _peers.Clear();
         _cts.Dispose();
     }
 
-    private sealed class UdpPeer(UdpClient client)
+    private sealed class UdpPeer(UdpClient client, PeerServiceResourceLimiter.Lease lease,
+        SemaphoreSlim serviceSlots) : IDisposable
     {
         private long _lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         public UdpClient Client { get; } = client;
         public DateTimeOffset LastSeen => DateTimeOffset.FromUnixTimeMilliseconds(Interlocked.Read(ref _lastSeen));
         public void Touch() => Interlocked.Exchange(ref _lastSeen, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+            Client.Dispose();
+            lease.Dispose();
+            serviceSlots.Release();
+        }
     }
 }

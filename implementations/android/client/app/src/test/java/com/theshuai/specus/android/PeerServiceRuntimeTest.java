@@ -13,6 +13,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,6 +24,8 @@ import java.util.concurrent.ScheduledExecutorService;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class PeerServiceRuntimeTest {
@@ -285,6 +288,72 @@ public class PeerServiceRuntimeTest {
         try (ServerSocket ignored = listen(port)) {
             assertTrue(PeerServiceRuntime.probeTcp("127.0.0.1", port, 400));
         }
+    }
+
+    @Test
+    public void udpProbeRequiresReplyAndResourceBudgetsRecover() throws Exception {
+        try (DatagramSocket silent = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            assertFalse(PeerServiceRuntime.probeUdp("127.0.0.1", silent.getLocalPort(), 100));
+        }
+        try (DatagramSocket echo = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            Thread responder = new Thread(() -> {
+                try {
+                    DatagramPacket request = new DatagramPacket(new byte[1], 1);
+                    echo.receive(request);
+                    echo.send(new DatagramPacket(new byte[]{1}, 1, request.getSocketAddress()));
+                } catch (Exception ignored) {
+                }
+            });
+            responder.setDaemon(true);
+            responder.start();
+            assertTrue(PeerServiceRuntime.probeUdp("localhost", echo.getLocalPort(), 500));
+            responder.join(1_000);
+        }
+
+        List<PeerServiceResourceLimiter.Lease> tcp = new ArrayList<>();
+        for (int i = 0; i < PeerServiceResourceLimiter.MAX_TCP_PER_SOURCE; i++) {
+            PeerServiceResourceLimiter.Lease lease =
+                    PeerServiceResourceLimiter.tryAcquireTcp(InetAddress.getLoopbackAddress());
+            assertNotNull(lease);
+            tcp.add(lease);
+        }
+        assertNull(PeerServiceResourceLimiter.tryAcquireTcp(InetAddress.getLoopbackAddress()));
+        tcp.forEach(PeerServiceResourceLimiter.Lease::close);
+        PeerServiceResourceLimiter.Lease recovered =
+                PeerServiceResourceLimiter.tryAcquireTcp(InetAddress.getLoopbackAddress());
+        assertNotNull(recovered);
+        recovered.close();
+
+        List<PeerServiceResourceLimiter.Lease> udp = new ArrayList<>();
+        for (int i = 0; i < PeerServiceResourceLimiter.MAX_UDP_PER_SOURCE; i++) {
+            udp.add(PeerServiceResourceLimiter.tryAcquireUdp(InetAddress.getLoopbackAddress()));
+        }
+        assertNull(PeerServiceResourceLimiter.tryAcquireUdp(InetAddress.getLoopbackAddress()));
+        udp.forEach(PeerServiceResourceLimiter.Lease::close);
+
+        List<PeerServiceResourceLimiter.Lease> globalTcp = new ArrayList<>();
+        for (int source = 1; source <= PeerServiceResourceLimiter.MAX_TCP_GLOBAL
+                / PeerServiceResourceLimiter.MAX_TCP_PER_SOURCE; source++) {
+            InetAddress address = InetAddress.getByName("127.0.1." + source);
+            for (int slot = 0; slot < PeerServiceResourceLimiter.MAX_TCP_PER_SOURCE; slot++) {
+                globalTcp.add(PeerServiceResourceLimiter.tryAcquireTcp(address));
+            }
+        }
+        assertFalse(globalTcp.contains(null));
+        assertNull(PeerServiceResourceLimiter.tryAcquireTcp(InetAddress.getByName("127.0.2.1")));
+        globalTcp.forEach(PeerServiceResourceLimiter.Lease::close);
+
+        List<PeerServiceResourceLimiter.Lease> globalUdp = new ArrayList<>();
+        for (int source = 1; source <= PeerServiceResourceLimiter.MAX_UDP_GLOBAL
+                / PeerServiceResourceLimiter.MAX_UDP_PER_SOURCE; source++) {
+            InetAddress address = InetAddress.getByName("127.0.3." + source);
+            for (int slot = 0; slot < PeerServiceResourceLimiter.MAX_UDP_PER_SOURCE; slot++) {
+                globalUdp.add(PeerServiceResourceLimiter.tryAcquireUdp(address));
+            }
+        }
+        assertFalse(globalUdp.contains(null));
+        assertNull(PeerServiceResourceLimiter.tryAcquireUdp(InetAddress.getByName("127.0.4.1")));
+        globalUdp.forEach(PeerServiceResourceLimiter.Lease::close);
     }
 
     @Test

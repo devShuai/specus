@@ -34,9 +34,10 @@ type catalogSnapshot struct {
 }
 
 var (
-	serviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{8,64}$`)
-	pathPattern      = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
-	peerServiceApps  = []string{"http", "https", "ssh", "tcp", "udp"}
+	serviceIDPattern  = regexp.MustCompile(`^[A-Za-z0-9._-]{8,64}$`)
+	instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	pathPattern       = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
+	peerServiceApps   = []string{"http", "https", "ssh", "tcp", "udp"}
 )
 
 func (s *Service) SharingStatus(ctx context.Context, access AccessContext) (ServiceSharingView, error) {
@@ -262,6 +263,9 @@ func (s *Service) OnClientDisconnected(ctx context.Context, clientName string, s
 }
 
 func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAccount, report ControlMessage, publisherSessionID int64) error {
+	if err := validateServiceReportCollections(report); err != nil {
+		return err
+	}
 	if publisherSessionID <= 0 {
 		online, err := s.db.GetOnlineClientSession(ctx, source.TenantID, source.ID, "NETTY_ONLINE")
 		if err != nil {
@@ -327,13 +331,41 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 	expiresAt := now.Add(5 * time.Minute)
 	s.catalogMu.Lock()
 	s.catalogs[key] = catalogSnapshot{
-		revision: revision, instanceID: report.InstanceID, generatedAt: now, expiresAt: expiresAt,
+		revision: revision, instanceID: strings.TrimSpace(report.InstanceID), generatedAt: now, expiresAt: expiresAt,
 		services: advertised, publisherClientName: source.ClientName, stats: copyServiceStats(report.Stats, advertised),
 		mdns: sanitizeMdnsCandidates(report.MdnsCandidates),
 	}
 	s.audit("service-report", source.TenantID, &source.ID, &publisherSessionID, "", "published")
 	s.catalogMu.Unlock()
 	s.fanoutCatalog(ctx, source, publisherSessionID, revision, advertised, expiresAt)
+	return nil
+}
+
+func validateServiceReportCollections(report ControlMessage) error {
+	if len(report.Services) > 32 {
+		return errors.New("at most 32 services per session")
+	}
+	if len(report.Stats) > 32 {
+		return errors.New("at most 32 service stats per report")
+	}
+	if len(report.MdnsCandidates) > 32 {
+		return errors.New("at most 32 mDNS candidates per report")
+	}
+	instanceID := strings.TrimSpace(report.InstanceID)
+	if instanceID != "" && !instanceIDPattern.MatchString(instanceID) {
+		return errors.New("invalid instanceId")
+	}
+	seen := make(map[string]struct{}, len(report.Stats))
+	for _, item := range report.Stats {
+		normalized := strings.TrimSpace(item.ServiceID)
+		if !serviceIDPattern.MatchString(normalized) {
+			return errors.New("invalid service stats serviceId")
+		}
+		if _, exists := seen[normalized]; exists {
+			return errors.New("duplicate service stats")
+		}
+		seen[normalized] = struct{}{}
+	}
 	return nil
 }
 
@@ -1059,15 +1091,15 @@ func requireTargetHost(raw string) (string, error) {
 	if value == "" || strings.ContainsAny(lower, "/@?#") || strings.Contains(lower, "://") {
 		return "", errors.New("targetHost must be a local address, not a URL")
 	}
-	if strings.EqualFold(value, "localhost") || value == "127.0.0.1" || value == "::1" {
-		return value, nil
+	if strings.EqualFold(value, "localhost") {
+		return "127.0.0.1", nil
 	}
 	ip := net.ParseIP(value)
 	if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
 		return "", errors.New("targetHost must be a unicast IP or localhost")
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-		return value, nil
+		return ip.String(), nil
 	}
 	return "", errors.New("targetHost must be loopback or a local interface address")
 }

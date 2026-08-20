@@ -18,21 +18,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 final class PeerServiceBridge implements AutoCloseable {
-    private static final int MAX_ACTIVE_CONNECTIONS = 64;
     private static final Logger LOG = Logger.getLogger(PeerServiceBridge.class.getName());
     private final String virtualIp;
     private final SpecusCore.LocalPeerService service;
+    private final InetAddress targetAddress;
     private final ServerSocket serverSocket;
     private final Set<InetAddress> allowedPeerAddresses;
     private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
-    private final Semaphore slots = new Semaphore(MAX_ACTIVE_CONNECTIONS);
+    private final Semaphore slots = new Semaphore(PeerServiceResourceLimiter.MAX_TCP_PER_SERVICE);
 
-    private PeerServiceBridge(String virtualIp, SpecusCore.LocalPeerService service, ServerSocket serverSocket) {
+    private PeerServiceBridge(String virtualIp, SpecusCore.LocalPeerService service, InetAddress targetAddress,
+                              ServerSocket serverSocket) {
         this.virtualIp = virtualIp;
         this.service = service;
+        this.targetAddress = targetAddress;
         this.serverSocket = serverSocket;
         this.allowedPeerAddresses = allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
@@ -44,13 +46,14 @@ final class PeerServiceBridge implements AutoCloseable {
     }
 
     static PeerServiceBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws IOException {
-        if (!PeerServiceRuntime.isLocalServiceTarget(service.targetHost)) {
+        InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
+        if (target == null) {
             throw new IOException("targetHost is not assigned to this device");
         }
         ServerSocket server = new ServerSocket();
         server.setReuseAddress(true);
         server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
-        return new PeerServiceBridge(virtualIp, service, server);
+        return new PeerServiceBridge(virtualIp, service, target, server);
     }
 
     boolean matches(String virtualIp, SpecusCore.LocalPeerService service) {
@@ -76,9 +79,17 @@ final class PeerServiceBridge implements AutoCloseable {
                     closeQuietly(inbound);
                     continue;
                 }
+                PeerServiceResourceLimiter.Lease lease =
+                        PeerServiceResourceLimiter.tryAcquireTcp(inbound.getInetAddress());
+                if (lease == null) {
+                    slots.release();
+                    closeQuietly(inbound);
+                    continue;
+                }
                 try {
-                    executor.execute(() -> splice(inbound));
+                    executor.execute(() -> splice(inbound, lease));
                 } catch (RuntimeException rejected) {
+                    lease.close();
                     slots.release();
                     closeQuietly(inbound);
                 }
@@ -116,13 +127,16 @@ final class PeerServiceBridge implements AutoCloseable {
         }
     }
 
-    private void splice(Socket inbound) {
+    private void splice(Socket inbound, PeerServiceResourceLimiter.Lease lease) {
         Socket outbound = new Socket();
         splices.put(inbound, outbound);
         try {
             inbound.setTcpNoDelay(true);
+            inbound.setSoTimeout(PeerServiceResourceLimiter.IDLE_TIMEOUT_MILLIS);
             outbound.setTcpNoDelay(true);
-            outbound.connect(new InetSocketAddress(service.targetHost, service.targetPort), 3_000);
+            outbound.setSoTimeout(PeerServiceResourceLimiter.IDLE_TIMEOUT_MILLIS);
+            outbound.connect(new InetSocketAddress(targetAddress, service.targetPort),
+                    PeerServiceResourceLimiter.CONNECT_TIMEOUT_MILLIS);
             Thread reply = new Thread(() -> copy(outbound, inbound), "peer-service-up-" + service.serviceId);
             reply.setDaemon(true);
             reply.start();
@@ -134,6 +148,7 @@ final class PeerServiceBridge implements AutoCloseable {
             closeQuietly(outbound);
             splices.remove(inbound);
             slots.release();
+            lease.close();
         }
     }
 

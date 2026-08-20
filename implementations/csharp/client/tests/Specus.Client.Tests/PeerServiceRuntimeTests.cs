@@ -363,6 +363,79 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
+    public async Task UdpProbeRequiresReplyAndResourceBudgetsRecover()
+    {
+        using (var silent = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)))
+        {
+            Assert.False(PeerServiceDiscovery.ProbeUdp("127.0.0.1",
+                ((IPEndPoint)silent.Client.LocalEndPoint!).Port, 100));
+        }
+        using (var echo = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)))
+        {
+            var responder = Task.Run(async () =>
+            {
+                var request = await echo.ReceiveAsync();
+                await echo.SendAsync([1], 1, request.RemoteEndPoint);
+            });
+            Assert.True(PeerServiceDiscovery.ProbeUdp("localhost",
+                ((IPEndPoint)echo.Client.LocalEndPoint!).Port, 500));
+            await responder;
+        }
+        Assert.False(PeerServiceDiscovery.TryResolveLocalInterfaceTarget("example.invalid", out _));
+        Assert.False(PeerServiceDiscovery.TryResolveLocalInterfaceTarget("10.255.255.254", out _));
+
+        var tcp = new List<PeerServiceResourceLimiter.Lease>();
+        for (var index = 0; index < PeerServiceResourceLimiter.MaxTcpPerSource; index++)
+        {
+            var lease = PeerServiceResourceLimiter.TryAcquireTcp(IPAddress.Loopback);
+            Assert.NotNull(lease);
+            tcp.Add(lease);
+        }
+        Assert.Null(PeerServiceResourceLimiter.TryAcquireTcp(IPAddress.Loopback));
+        tcp.ForEach(item => item.Dispose());
+        using (var recovered = PeerServiceResourceLimiter.TryAcquireTcp(IPAddress.Loopback))
+        {
+            Assert.NotNull(recovered);
+        }
+
+        var udp = new List<PeerServiceResourceLimiter.Lease>();
+        for (var index = 0; index < PeerServiceResourceLimiter.MaxUdpPerSource; index++)
+        {
+            udp.Add(PeerServiceResourceLimiter.TryAcquireUdp(IPAddress.Loopback)!);
+        }
+        Assert.Null(PeerServiceResourceLimiter.TryAcquireUdp(IPAddress.Loopback));
+        udp.ForEach(item => item.Dispose());
+
+        var globalTcp = new List<PeerServiceResourceLimiter.Lease>();
+        for (var source = 1; source <= PeerServiceResourceLimiter.MaxTcpGlobal
+                / PeerServiceResourceLimiter.MaxTcpPerSource; source++)
+        {
+            var address = IPAddress.Parse($"127.0.1.{source}");
+            for (var slot = 0; slot < PeerServiceResourceLimiter.MaxTcpPerSource; slot++)
+            {
+                globalTcp.Add(PeerServiceResourceLimiter.TryAcquireTcp(address)!);
+            }
+        }
+        Assert.DoesNotContain(globalTcp, item => item is null);
+        Assert.Null(PeerServiceResourceLimiter.TryAcquireTcp(IPAddress.Parse("127.0.2.1")));
+        globalTcp.ForEach(item => item.Dispose());
+
+        var globalUdp = new List<PeerServiceResourceLimiter.Lease>();
+        for (var source = 1; source <= PeerServiceResourceLimiter.MaxUdpGlobal
+                / PeerServiceResourceLimiter.MaxUdpPerSource; source++)
+        {
+            var address = IPAddress.Parse($"127.0.3.{source}");
+            for (var slot = 0; slot < PeerServiceResourceLimiter.MaxUdpPerSource; slot++)
+            {
+                globalUdp.Add(PeerServiceResourceLimiter.TryAcquireUdp(address)!);
+            }
+        }
+        Assert.DoesNotContain(globalUdp, item => item is null);
+        Assert.Null(PeerServiceResourceLimiter.TryAcquireUdp(IPAddress.Parse("127.0.4.1")));
+        globalUdp.ForEach(item => item.Dispose());
+    }
+
+    [Fact]
     public async Task TcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow()
     {
         using var target = Listen(0);

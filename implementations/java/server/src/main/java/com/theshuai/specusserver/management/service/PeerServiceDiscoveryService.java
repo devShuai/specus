@@ -59,6 +59,7 @@ public class PeerServiceDiscoveryService {
     private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
     private final Map<CatalogKey, List<com.theshuai.common.peermesh.PeerMdnsCandidate>> mdnsCandidates = new ConcurrentHashMap<>();
     private final Map<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
+    private final Map<String, Long> auditLogTimestamps = new ConcurrentHashMap<>();
     private final ConcurrentLinkedDeque<AuditEvent> audits = new ConcurrentLinkedDeque<>();
 
     public PeerServiceDiscoveryService(PeerMeshService peerMeshService,
@@ -217,6 +218,7 @@ public class PeerServiceDiscoveryService {
         if (publisherSessionId <= 0) {
             throw new IllegalArgumentException("publisher session is required");
         }
+        validateReportCollections(report);
         enforceRateLimit(publisherSessionId);
         long revision = report.getRevision() == null ? 0L : report.getRevision();
         if (revision < 1) {
@@ -568,22 +570,64 @@ public class PeerServiceDiscoveryService {
         return sessionId;
     }
 
-    private void enforceRateLimit(long sessionId) {
+    void enforceRateLimit(long sessionId) {
         long now = System.currentTimeMillis();
         long windowStart = now - PeerServiceDiscovery.REPORT_RATE_WINDOW.toMillis();
-        ConcurrentLinkedDeque<Long> stamps = reportTimestamps.computeIfAbsent(sessionId, ignored -> new ConcurrentLinkedDeque<>());
-        while (true) {
-            Long first = stamps.peekFirst();
-            if (first == null || first >= windowStart) {
-                break;
+        ConcurrentLinkedDeque<Long> stamps = reportTimestamps.get(sessionId);
+        if (stamps == null) {
+            synchronized (reportTimestamps) {
+                stamps = reportTimestamps.get(sessionId);
+                if (stamps == null) {
+                    if (reportTimestamps.size() >= 4096) {
+                        audit("service-report", null, null, sessionId, null, "rate-table-full");
+                        throw new RateLimitedException("service-report rate limited", 30);
+                    }
+                    stamps = new ConcurrentLinkedDeque<>();
+                    reportTimestamps.put(sessionId, stamps);
+                }
             }
-            stamps.pollFirst();
         }
-        if (stamps.size() >= PeerServiceDiscovery.REPORT_RATE_LIMIT) {
-            audit("service-report", null, null, sessionId, null, "rate-limited");
-            throw new RateLimitedException("service-report rate limited", 30);
+        synchronized (stamps) {
+            while (true) {
+                Long first = stamps.peekFirst();
+                if (first == null || first >= windowStart) {
+                    break;
+                }
+                stamps.pollFirst();
+            }
+            if (stamps.size() >= PeerServiceDiscovery.REPORT_RATE_LIMIT) {
+                audit("service-report", null, null, sessionId, null, "rate-limited");
+                throw new RateLimitedException("service-report rate limited", 30);
+            }
+            stamps.addLast(now);
         }
-        stamps.addLast(now);
+    }
+
+    int reportRateWindowCount() {
+        return reportTimestamps.size();
+    }
+
+    static void validateReportCollections(PeerControlMessage report) {
+        if (report.getServices() != null
+                && report.getServices().size() > PeerServiceDiscovery.MAX_SERVICES_PER_SESSION) {
+            throw new IllegalArgumentException("at most 32 services per session");
+        }
+        if (report.getStats() != null && report.getStats().size() > PeerServiceDiscovery.MAX_STATS_PER_REPORT) {
+            throw new IllegalArgumentException("at most 32 service stats per report");
+        }
+        if (report.getMdnsCandidates() != null
+                && report.getMdnsCandidates().size() > PeerServiceDiscovery.MAX_MDNS_CANDIDATES) {
+            throw new IllegalArgumentException("at most 32 mDNS candidates per report");
+        }
+        PeerServiceDiscovery.normalizeInstanceId(report.getInstanceId());
+        Set<String> statsIds = new LinkedHashSet<>();
+        if (report.getStats() != null) {
+            for (PeerServiceStats item : report.getStats()) {
+                if (item == null || !statsIds.add(PeerServiceDiscovery.requireServiceId(item.getServiceId()))) {
+                    throw new IllegalArgumentException("invalid or duplicate service stats");
+                }
+            }
+        }
     }
 
     private void applyDefinition(PeerMeshSharedService row, ServiceMutation mutation, boolean creating) {
@@ -730,8 +774,18 @@ public class PeerServiceDiscoveryService {
     }
 
     private void audit(String action, String tenantId, Long clientId, Long sessionId, String serviceId, String reason) {
-        log.info("[peer-service-audit] action={} tenant={} client={} session={} serviceId={} reason={}",
-                action, tenantId, clientId, sessionId, serviceId, reason);
+        long now = System.currentTimeMillis();
+        String logKey = action + '|' + tenantId + '|' + clientId + '|' + sessionId + '|' + serviceId + '|' + reason;
+        if (auditLogTimestamps.size() >= 4096 && !auditLogTimestamps.containsKey(logKey)) {
+            auditLogTimestamps.entrySet().removeIf(entry -> now - entry.getValue() >= 60_000L);
+        }
+        Long previous = auditLogTimestamps.get(logKey);
+        if ((previous == null || now - previous >= 60_000L)
+                && (previous != null || auditLogTimestamps.size() < 4096)) {
+            auditLogTimestamps.put(logKey, now);
+            log.info("[peer-service-audit] action={} tenant={} client={} session={} serviceId={} reason={}",
+                    action, tenantId, clientId, sessionId, serviceId, reason);
+        }
         audits.addFirst(new AuditEvent(Instant.now().toString(), action, tenantId, clientId, sessionId, serviceId, reason));
         while (audits.size() > 80) {
             audits.pollLast();
@@ -892,6 +946,9 @@ public class PeerServiceDiscoveryService {
         Set<String> ids = advertised.stream().map(PeerAdvertisedService::getServiceId).collect(Collectors.toSet());
         List<PeerServiceStats> copy = new ArrayList<>();
         for (PeerServiceStats item : raw) {
+            if (copy.size() >= PeerServiceDiscovery.MAX_STATS_PER_REPORT) {
+                break;
+            }
             if (item == null || item.getServiceId() == null || !ids.contains(item.getServiceId())) {
                 continue;
             }
