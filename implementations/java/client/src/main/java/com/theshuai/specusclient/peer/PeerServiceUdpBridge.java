@@ -10,7 +10,9 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,10 +21,13 @@ import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 final class PeerServiceUdpBridge implements PeerServiceForwarder {
+    private static final int MAX_PEERS = 64;
+    private static final int PEER_IDLE_TIMEOUT_MILLIS = 60_000;
     private final String virtualIp;
     private final LocalPeerService service;
     private final DatagramSocket inbound;
     private final InetSocketAddress target;
+    private final Set<InetAddress> allowedPeerAddresses;
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<SocketAddress, DatagramSocket> peers = new ConcurrentHashMap<>();
@@ -35,6 +40,7 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
         this.service = service;
         this.inbound = inbound;
         this.target = new InetSocketAddress(service.getTargetHost(), service.getTargetPort());
+        this.allowedPeerAddresses = allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread thread = new Thread(r, "peer-service-udp-" + service.getServiceId());
             thread.setDaemon(true);
@@ -44,7 +50,9 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
     }
 
     static PeerServiceUdpBridge bind(String virtualIp, LocalPeerService service) throws Exception {
-        PeerServiceDiscovery.requireTargetHost(service.getTargetHost());
+        if (!PeerServiceDiscovery.isLocalInterfaceTarget(service.getTargetHost())) {
+            throw new IllegalArgumentException("targetHost is not assigned to this device");
+        }
         PeerServiceDiscovery.requirePort(service.getTargetPort(), "targetPort");
         PeerServiceDiscovery.requirePort(service.getPublishedPort(), "publishedPort");
         DatagramSocket socket = new DatagramSocket(new InetSocketAddress(InetAddress.getByName(virtualIp),
@@ -58,7 +66,8 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
                 && Objects.equals(this.service.getServiceId(), service.getServiceId())
                 && this.service.getPublishedPort() == service.getPublishedPort()
                 && Objects.equals(this.service.getTargetHost(), service.getTargetHost())
-                && this.service.getTargetPort() == service.getTargetPort();
+                && this.service.getTargetPort() == service.getTargetPort()
+                && allowedPeerAddresses.equals(allowedPeerAddresses(service));
     }
 
     public PeerServiceStats stats() {
@@ -77,6 +86,12 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 inbound.receive(packet);
+                if (!allowedPeerAddresses.contains(packet.getAddress())) {
+                    continue;
+                }
+                if (!peers.containsKey(packet.getSocketAddress()) && peers.size() >= MAX_PEERS) {
+                    continue;
+                }
                 bytesIn.addAndGet(packet.getLength());
                 DatagramSocket outbound = peers.computeIfAbsent(packet.getSocketAddress(), this::openPeerSocket);
                 outbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), target));
@@ -89,10 +104,28 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
         }
     }
 
+    private static Set<InetAddress> allowedPeerAddresses(LocalPeerService service) {
+        Set<InetAddress> addresses = new HashSet<>();
+        if (service == null || service.getAllowedPeerVirtualIps() == null) {
+            return Set.of();
+        }
+        for (String raw : service.getAllowedPeerVirtualIps()) {
+            try {
+                if (raw != null && !raw.isBlank()) {
+                    addresses.add(InetAddress.getByName(raw.trim()));
+                }
+            } catch (Exception ignored) {
+                // Invalid server-authored entries are ignored; an empty result is fail-closed.
+            }
+        }
+        return Set.copyOf(addresses);
+    }
+
     private DatagramSocket openPeerSocket(SocketAddress peer) {
         try {
             DatagramSocket socket = new DatagramSocket();
             socket.setReuseAddress(true);
+            socket.setSoTimeout(PEER_IDLE_TIMEOUT_MILLIS);
             socket.connect(target);
             totalConnections.incrementAndGet();
             executor.execute(() -> replyLoop(socket, peer));
@@ -104,15 +137,18 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
 
     private void replyLoop(DatagramSocket socket, SocketAddress peer) {
         byte[] buffer = new byte[65507];
-        while (open.get() && !socket.isClosed()) {
-            try {
+        try {
+            while (open.get() && !socket.isClosed()) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
                 bytesOut.addAndGet(packet.getLength());
                 inbound.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), peer));
-            } catch (Exception ignored) {
-                return;
             }
+        } catch (Exception ignored) {
+            // idle or closed
+        } finally {
+            peers.remove(peer, socket);
+            socket.close();
         }
     }
 

@@ -3,6 +3,7 @@ package com.theshuai.common.peermesh;
 import com.theshuai.common.util.JsonUtil;
 
 import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -18,7 +19,8 @@ import java.util.regex.Pattern;
  * tests and the server share one set of limits.
  */
 public final class PeerServiceDiscovery {
-    public static final int PROTOCOL_VERSION = 1;
+    /** Version 2 adds publisher-side data-plane ACL enforcement. */
+    public static final int PROTOCOL_VERSION = 2;
     public static final int MAX_SERVICES_PER_SESSION = 32;
     public static final int MAX_SNAPSHOT_BYTES = 16 * 1024;
     public static final int MAX_NAME_LENGTH = 80;
@@ -338,7 +340,7 @@ public final class PeerServiceDiscovery {
     }
 
     public static boolean probe(LocalPeerService local, int timeoutMillis) {
-        if (local == null) {
+        if (local == null || !isLocalInterfaceTarget(local.getTargetHost())) {
             return false;
         }
         String transport = local.getTransport() == null ? "" : local.getTransport().trim();
@@ -349,7 +351,7 @@ public final class PeerServiceDiscovery {
     }
 
     public static boolean probeTcp(String host, int port, int timeoutMillis) {
-        if (host == null || host.isBlank() || port < 1 || port > 65535) {
+        if (!isLocalInterfaceTarget(host) || port < 1 || port > 65535) {
             return false;
         }
         try (java.net.Socket socket = new java.net.Socket()) {
@@ -361,7 +363,7 @@ public final class PeerServiceDiscovery {
     }
 
     public static boolean probeUdp(String host, int port, int timeoutMillis) {
-        if (host == null || host.isBlank() || port < 1 || port > 65535) {
+        if (!isLocalInterfaceTarget(host) || port < 1 || port > 65535) {
             return false;
         }
         try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
@@ -369,6 +371,20 @@ public final class PeerServiceDiscovery {
             socket.connect(new java.net.InetSocketAddress(host, port));
             socket.send(new java.net.DatagramPacket(new byte[]{0}, 1));
             return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /** Publisher-side boundary: a configured target may not turn the client into a LAN proxy. */
+    public static boolean isLocalInterfaceTarget(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        try {
+            String value = requireTargetHost(raw);
+            InetAddress address = InetAddress.getByName(value);
+            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null;
         } catch (Exception ignored) {
             return false;
         }

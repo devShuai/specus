@@ -296,6 +296,9 @@ public sealed class LocalPeerService
 
     [JsonPropertyName("visibility")]
     public string Visibility { get; set; } = "OWNER";
+
+    [JsonPropertyName("allowedPeerVirtualIps")]
+    public List<string> AllowedPeerVirtualIps { get; set; } = [];
 }
 
 public sealed class AdvertisedService

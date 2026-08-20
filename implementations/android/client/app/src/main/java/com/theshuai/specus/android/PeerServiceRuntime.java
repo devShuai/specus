@@ -4,6 +4,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.net.InetSocketAddress;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.net.Socket;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -26,6 +28,8 @@ final class PeerServiceRuntime implements AutoCloseable {
     static final int PROBE_TIMEOUT_MILLIS = 400;
     private static final long PROBE_INTERVAL_SECONDS = 15;
     private static final long CATALOG_TTL_SECONDS = 300;
+    private static final long REPORT_REFRESH_MILLIS = TimeUnit.SECONDS.toMillis(CATALOG_TTL_SECONDS / 2);
+    private static final int MAX_CATALOG_REVISIONS = 4096;
 
     private static final AtomicReference<String> LAST_SNAPSHOT_JSON = new AtomicReference<>("{\"remotes\":[],\"locals\":[]}");
     private static volatile PeerServiceRuntime active;
@@ -38,6 +42,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     private final AtomicLong revision = new AtomicLong();
     private final AtomicBoolean hasAuthorizedOnlinePeer = new AtomicBoolean();
     private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
+    private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
     private final Map<String, AutoCloseable> bridges = new ConcurrentHashMap<>();
     private final Map<String, SpecusCore.LocalPeerService> bridgeLocals = new ConcurrentHashMap<>();
     private final Object lock = new Object();
@@ -45,6 +50,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     private volatile Map<Long, RosterHint> roster = Map.of();
     private volatile ScheduledFuture<?> probeTask;
     private volatile List<String> lastReportedIds = List.of();
+    private volatile long lastReportAtMillis;
     private final Set<String> locallyPaused = ConcurrentHashMap.newKeySet();
 
     PeerServiceRuntime(Sender sender, CatalogListener catalogListener) {
@@ -79,6 +85,7 @@ final class PeerServiceRuntime implements AutoCloseable {
                 stopProbeLocked();
                 closeBridges();
                 catalogs.clear();
+                catalogRevisions.clear();
                 publishSnapshot();
                 if (!lastReportedIds.isEmpty() || revision.get() > 0) {
                     sendWithdrawLocked();
@@ -101,6 +108,9 @@ final class PeerServiceRuntime implements AutoCloseable {
             if (!effectiveSharing() || !onlinePeer) {
                 stopProbeLocked();
                 closeBridges();
+                catalogs.clear();
+                catalogRevisions.clear();
+                publishSnapshot();
                 return;
             }
             reconcileBridgesLocked();
@@ -115,7 +125,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     void applyCatalog(JSONObject catalog) {
-        if (catalog == null) {
+        if (catalog == null || !effectiveSharing()) {
             return;
         }
         long publisherClientId = catalog.optLong("publisherClientId", 0L);
@@ -124,6 +134,10 @@ final class PeerServiceRuntime implements AutoCloseable {
             return;
         }
         CatalogKey key = new CatalogKey(publisherClientId, publisherSessionId);
+        long catalogRevision = catalog.optLong("revision", 0L);
+        if (catalogRevision < 1 || !acceptCatalogRevision(key, catalogRevision)) {
+            return;
+        }
         List<AdvertisedService> services = parseServices(catalog.optJSONArray("services"));
         if (services.isEmpty()) {
             catalogs.remove(key);
@@ -136,7 +150,7 @@ final class PeerServiceRuntime implements AutoCloseable {
                 publisherClientId,
                 catalog.optString("publisherClientName", ""),
                 publisherSessionId,
-                catalog.optLong("revision", 0L),
+                catalogRevision,
                 expiresAt,
                 services));
         publishSnapshot();
@@ -180,6 +194,10 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     void probeAndReport() {
+        boolean catalogChanged = pruneExpiredCatalogs(Instant.now());
+        if (catalogChanged) {
+            publishSnapshot();
+        }
         synchronized (lock) {
             if (!effectiveSharing() || !hasAuthorizedOnlinePeer.get()) {
                 closeBridges();
@@ -196,7 +214,8 @@ final class PeerServiceRuntime implements AutoCloseable {
             for (AdvertisedService service : reachable) {
                 ids.add(service.serviceId);
             }
-            if (ids.equals(lastReportedIds) && revision.get() > 0) {
+            if (ids.equals(lastReportedIds) && revision.get() > 0
+                    && System.currentTimeMillis() - lastReportAtMillis < REPORT_REFRESH_MILLIS) {
                 reconcileBridgesLocked();
                 return;
             }
@@ -212,6 +231,7 @@ final class PeerServiceRuntime implements AutoCloseable {
             stopProbeLocked();
             closeBridges();
             catalogs.clear();
+            catalogRevisions.clear();
             publishSnapshot();
         }
         if (ownScheduler) {
@@ -219,6 +239,31 @@ final class PeerServiceRuntime implements AutoCloseable {
         }
         if (active == this) {
             active = null;
+        }
+    }
+
+    void forceReportRefreshForTest() {
+        lastReportAtMillis = 0L;
+    }
+
+    private boolean acceptCatalogRevision(CatalogKey key, long next) {
+        if (!catalogRevisions.containsKey(key) && catalogRevisions.size() >= MAX_CATALOG_REVISIONS) {
+            return false;
+        }
+        for (;;) {
+            Long current = catalogRevisions.get(key);
+            if (current == null) {
+                if (catalogRevisions.putIfAbsent(key, next) == null) {
+                    return true;
+                }
+                continue;
+            }
+            if (next <= current) {
+                return false;
+            }
+            if (catalogRevisions.replace(key, current, next)) {
+                return true;
+            }
         }
     }
 
@@ -230,7 +275,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     static boolean probe(SpecusCore.LocalPeerService local, int timeoutMillis) {
-        if (local == null) {
+        if (local == null || !isLocalServiceTarget(local.targetHost)) {
             return false;
         }
         if ("udp".equalsIgnoreCase(local.transport) || "udp".equalsIgnoreCase(local.application)) {
@@ -240,7 +285,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     static boolean probeTcp(String host, int port, int timeoutMillis) {
-        if (host == null || host.isBlank() || port < 1 || port > 65535) {
+        if (!isLocalServiceTarget(host) || port < 1 || port > 65535) {
             return false;
         }
         try (Socket socket = new Socket()) {
@@ -252,7 +297,7 @@ final class PeerServiceRuntime implements AutoCloseable {
     }
 
     static boolean probeUdp(String host, int port, int timeoutMillis) {
-        if (host == null || host.isBlank() || port < 1 || port > 65535) {
+        if (!isLocalServiceTarget(host) || port < 1 || port > 65535) {
             return false;
         }
         try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
@@ -260,6 +305,18 @@ final class PeerServiceRuntime implements AutoCloseable {
             socket.connect(new InetSocketAddress(host, port));
             socket.send(new java.net.DatagramPacket(new byte[]{0}, 1));
             return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    static boolean isLocalServiceTarget(String host) {
+        if (host == null || host.isBlank()) {
+            return false;
+        }
+        try {
+            InetAddress address = InetAddress.getByName(host.trim());
+            return address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null;
         } catch (Exception ignored) {
             return false;
         }
@@ -320,6 +377,8 @@ final class PeerServiceRuntime implements AutoCloseable {
                 && current.publishedPort == next.publishedPort
                 && Objects.equals(current.targetHost, next.targetHost)
                 && current.targetPort == next.targetPort
+                && PeerServiceBridge.allowedPeerAddresses(current)
+                .equals(PeerServiceBridge.allowedPeerAddresses(next))
                 && Objects.equals(config.virtualIp, virtualIp);
     }
 
@@ -363,6 +422,7 @@ final class PeerServiceRuntime implements AutoCloseable {
 
     private void sendReportLocked(boolean enabled, List<AdvertisedService> services) {
         try {
+            lastReportAtMillis = System.currentTimeMillis();
             JSONObject report = new JSONObject();
             report.put("type", "service-report");
             report.put("enabled", enabled);
@@ -415,7 +475,9 @@ final class PeerServiceRuntime implements AutoCloseable {
                 item.put("target", local.targetHost + ":" + local.targetPort);
                 item.put("publishedPort", local.publishedPort);
                 item.put("configEnabled", local.enabled);
-                item.put("locallyPublished", isLocallyPublished(local.serviceId));
+                item.put("canToggle", effectiveSharing() && local.enabled);
+                item.put("locallyPublished", effectiveSharing() && local.enabled
+                        && isLocallyPublished(local.serviceId));
                 locals.put(item);
             }
             root.put("remotes", remotes);
@@ -427,6 +489,17 @@ final class PeerServiceRuntime implements AutoCloseable {
         if (catalogListener != null) {
             catalogListener.onCatalogChanged(json);
         }
+    }
+
+    boolean pruneExpiredCatalogs(Instant now) {
+        boolean changed = false;
+        for (Map.Entry<CatalogKey, CatalogSnapshot> entry : catalogs.entrySet()) {
+            CatalogSnapshot snapshot = entry.getValue();
+            if (!snapshot.expiresAt.isAfter(now) && catalogs.remove(entry.getKey(), snapshot)) {
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     private static AdvertisedService advertised(SpecusCore.LocalPeerService local) {
@@ -617,6 +690,8 @@ final class PeerServiceRuntime implements AutoCloseable {
             json.put("publisherClientId", publisherClientId);
             json.put("publisherClientName", publisherClientName);
             json.put("publisherSessionId", publisherSessionId);
+            json.put("serviceId", service.serviceId);
+            json.put("name", service.name);
             json.put("application", service.application);
             json.put("accessTarget", accessTarget);
             json.put("openable", openable);

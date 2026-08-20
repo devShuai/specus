@@ -100,6 +100,13 @@ final class PeerIpPacket {
                 + (packet[15] & 0xFF);
     }
 
+    static boolean matchesAuthenticatedEndpoints(byte[] packet, String peerVirtualIp, String localVirtualIp) {
+        return peerVirtualIp != null
+                && localVirtualIp != null
+                && peerVirtualIp.equals(sourceIpv4(packet))
+                && localVirtualIp.equals(destinationIpv4(packet));
+    }
+
     static byte[] icmpEchoReplyFor(byte[] packet, String localVirtualIp) {
         if (!isIcmpEchoRequestFor(packet, localVirtualIp)) {
             return null;

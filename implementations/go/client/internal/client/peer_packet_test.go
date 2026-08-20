@@ -42,6 +42,19 @@ func TestPeerPacketICMPEchoReplyForRejectsNonLocalTarget(t *testing.T) {
 	}
 }
 
+func TestPeerPacketMatchesAuthenticatedEndpoints(t *testing.T) {
+	packet := minimalICMPEchoRequestPacket("100.103.117.15", "100.112.186.105")
+	if !peerPacketMatchesAuthenticatedEndpoints(packet, "100.103.117.15", "100.112.186.105") {
+		t.Fatal("matching authenticated endpoints were rejected")
+	}
+	if peerPacketMatchesAuthenticatedEndpoints(packet, "100.103.117.16", "100.112.186.105") {
+		t.Fatal("spoofed source virtual IP was accepted")
+	}
+	if peerPacketMatchesAuthenticatedEndpoints(packet, "100.103.117.15", "100.112.186.106") {
+		t.Fatal("wrong local virtual IP was accepted")
+	}
+}
+
 func TestPeerPacketClampsMSSAndBuildsFragmentationNeeded(t *testing.T) {
 	packet := make([]byte, 44)
 	packet[0] = 0x45

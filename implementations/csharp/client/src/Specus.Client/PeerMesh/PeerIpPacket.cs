@@ -31,6 +31,13 @@ internal static class PeerIpPacket
         return new IPAddress(packet.Slice(12, 4)).ToString();
     }
 
+    public static bool MatchesAuthenticatedEndpoints(ReadOnlySpan<byte> packet, string? peerVirtualIp,
+        string? localVirtualIp) =>
+        !string.IsNullOrWhiteSpace(peerVirtualIp)
+        && !string.IsNullOrWhiteSpace(localVirtualIp)
+        && string.Equals(SourceIPv4(packet), peerVirtualIp, StringComparison.Ordinal)
+        && string.Equals(DestinationIPv4(packet), localVirtualIp, StringComparison.Ordinal);
+
     public static string FlowKey(ReadOnlySpan<byte> packet)
     {
         var source = SourceIPv4(packet);

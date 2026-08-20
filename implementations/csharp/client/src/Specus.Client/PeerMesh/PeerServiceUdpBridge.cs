@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Specus.Client.Configuration;
 
@@ -12,7 +13,7 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
     private readonly UdpClient _inbound;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger? _logger;
-    private readonly Dictionary<string, UdpClient> _peers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, UdpPeer> _peers = new(StringComparer.Ordinal);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
@@ -29,6 +30,10 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
 
     public static PeerServiceUdpBridge Bind(string virtualIp, LocalPeerService service, ILogger? logger)
     {
+        if (!PeerServiceDiscovery.IsLocalInterfaceTarget(service.TargetHost))
+        {
+            throw new InvalidOperationException("targetHost is not assigned to this device");
+        }
         var inbound = new UdpClient(new IPEndPoint(IPAddress.Parse(virtualIp), service.PublishedPort));
         inbound.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         return new PeerServiceUdpBridge(virtualIp, service, inbound, logger);
@@ -44,7 +49,8 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         && _service.ServiceId == service.ServiceId
         && _service.PublishedPort == service.PublishedPort
         && _service.TargetHost == service.TargetHost
-        && _service.TargetPort == service.TargetPort;
+        && _service.TargetPort == service.TargetPort
+        && PeerServiceDiscovery.SameAllowedPeers(_service, service);
 
     private async Task AcceptLoopAsync()
     {
@@ -65,20 +71,37 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
                 _logger?.LogDebug(ex, "Peer-only UDP 桥接结束 service={ServiceId}", _service.ServiceId);
                 return;
             }
+            if (!PeerServiceDiscovery.IsSourceAllowed(packet.RemoteEndPoint.Address, _service))
+            {
+                continue;
+            }
             Interlocked.Add(ref _bytesIn, packet.Buffer.Length);
             var key = packet.RemoteEndPoint.ToString();
-            if (!_peers.TryGetValue(key, out var outbound))
+            if (!_peers.TryGetValue(key, out var binding))
             {
-                outbound = new UdpClient();
+                if (_peers.Count >= 64)
+                {
+                    continue;
+                }
+                var outbound = new UdpClient();
                 outbound.Connect(target);
-                _peers[key] = outbound;
-                Interlocked.Increment(ref _totalConnections);
-                Interlocked.Increment(ref _active);
-                _ = ReplyLoopAsync(outbound, packet.RemoteEndPoint);
+                binding = new UdpPeer(outbound);
+                if (!_peers.TryAdd(key, binding))
+                {
+                    outbound.Dispose();
+                    binding = _peers[key];
+                }
+                else
+                {
+                    Interlocked.Increment(ref _totalConnections);
+                    Interlocked.Increment(ref _active);
+                    _ = ReplyLoopAsync(key, binding, packet.RemoteEndPoint);
+                }
             }
+            binding.Touch();
             try
             {
-                await outbound.SendAsync(packet.Buffer, packet.Buffer.Length).ConfigureAwait(false);
+                await binding.Client.SendAsync(packet.Buffer, packet.Buffer.Length).ConfigureAwait(false);
             }
             catch
             {
@@ -87,13 +110,20 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         }
     }
 
-    private async Task ReplyLoopAsync(UdpClient outbound, IPEndPoint peer)
+    private async Task ReplyLoopAsync(string key, UdpPeer binding, IPEndPoint peer)
     {
         try
         {
             while (!_cts.IsCancellationRequested)
             {
-                var packet = await outbound.ReceiveAsync(_cts.Token).ConfigureAwait(false);
+                var receive = binding.Client.ReceiveAsync(_cts.Token).AsTask();
+                var completed = await Task.WhenAny(receive, Task.Delay(TimeSpan.FromSeconds(60), _cts.Token))
+                    .ConfigureAwait(false);
+                if (completed != receive || DateTimeOffset.UtcNow - binding.LastSeen > TimeSpan.FromSeconds(60))
+                {
+                    return;
+                }
+                var packet = await receive.ConfigureAwait(false);
                 Interlocked.Add(ref _bytesOut, packet.Buffer.Length);
                 await _inbound.SendAsync(packet.Buffer, packet.Buffer.Length, peer).ConfigureAwait(false);
             }
@@ -104,8 +134,9 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         }
         finally
         {
+            _peers.TryRemove(new KeyValuePair<string, UdpPeer>(key, binding));
             Interlocked.Decrement(ref _active);
-            outbound.Dispose();
+            binding.Client.Dispose();
         }
     }
 
@@ -118,9 +149,17 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
         _inbound.Dispose();
         foreach (var peer in _peers.Values)
         {
-            peer.Dispose();
+            peer.Client.Dispose();
         }
         _peers.Clear();
         _cts.Dispose();
+    }
+
+    private sealed class UdpPeer(UdpClient client)
+    {
+        private long _lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        public UdpClient Client { get; } = client;
+        public DateTimeOffset LastSeen => DateTimeOffset.FromUnixTimeMilliseconds(Interlocked.Read(ref _lastSeen));
+        public void Touch() => Interlocked.Exchange(ref _lastSeen, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 }

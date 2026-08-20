@@ -39,6 +39,12 @@ func peerPacketSourceIPv4(packet []byte) string {
 	return net.IPv4(packet[12], packet[13], packet[14], packet[15]).String()
 }
 
+func peerPacketMatchesAuthenticatedEndpoints(packet []byte, peerVirtualIP, localVirtualIP string) bool {
+	return peerVirtualIP != "" && localVirtualIP != "" &&
+		peerPacketSourceIPv4(packet) == peerVirtualIP &&
+		peerPacketDestinationIPv4(packet) == localVirtualIP
+}
+
 func peerPacketProtocol(packet []byte) int {
 	if len(packet) < 20 || packet[0]>>4 != 4 {
 		return 0

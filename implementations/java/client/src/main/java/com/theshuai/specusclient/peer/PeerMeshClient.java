@@ -2466,6 +2466,16 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
 
+        PeerInfo authenticatedPeer = peerIndex.byId().get(session.peerId());
+        ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
+        if (authenticatedPeer == null || currentConfig == null
+                || !PeerIpPacket.matchesAuthenticatedEndpoints(
+                frame.plaintext(), authenticatedPeer.virtualIp(), currentConfig.getVirtualIp())) {
+            logPayloadDrop(authenticatedPeer == null ? "" : authenticatedPeer.virtualIp(),
+                    "authenticated-ip-mismatch");
+            return;
+        }
+
         PeerVirtualDevice device = virtualDevice;
         if (device != null && !(device instanceof NoopPeerVirtualDevice)) {
             long writeStartedNanos = System.nanoTime();

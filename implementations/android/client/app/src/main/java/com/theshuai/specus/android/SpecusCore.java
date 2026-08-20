@@ -968,7 +968,7 @@ public final class SpecusCore {
 
         static ClientPeerServiceCapabilities androidDefault() {
             ClientPeerServiceCapabilities capabilities = new ClientPeerServiceCapabilities();
-            capabilities.version = 1;
+            capabilities.version = 2;
             capabilities.applications = List.of("http", "https", "ssh", "tcp", "udp");
             return capabilities;
         }
@@ -1012,6 +1012,7 @@ public final class SpecusCore {
         String path;
         boolean enabled;
         String visibility;
+        List<String> allowedPeerVirtualIps = new ArrayList<>();
 
         static List<LocalPeerService> parseList(JSONArray array) {
             List<LocalPeerService> services = new ArrayList<>();
@@ -1035,6 +1036,15 @@ public final class SpecusCore {
                 service.path = item.optString("path", "");
                 service.enabled = item.optBoolean("enabled", false);
                 service.visibility = item.optString("visibility", "OWNER");
+                JSONArray allowed = item.optJSONArray("allowedPeerVirtualIps");
+                if (allowed != null) {
+                    for (int j = 0; j < allowed.length(); j++) {
+                        String address = allowed.optString(j, "").trim();
+                        if (!address.isEmpty()) {
+                            service.allowedPeerVirtualIps.add(address);
+                        }
+                    }
+                }
                 services.add(service);
             }
             return services;

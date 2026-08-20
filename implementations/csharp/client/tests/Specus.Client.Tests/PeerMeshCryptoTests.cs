@@ -146,6 +146,9 @@ public sealed class PeerMeshCryptoTests
         Assert.Equal("100.112.186.105", PeerIpPacket.DestinationIPv4(packet));
         Assert.Equal("100.103.117.15", PeerIpPacket.SourceIPv4(packet));
         Assert.Equal("100.103.117.15:51000->100.112.186.105:8006/6", PeerIpPacket.FlowKey(packet));
+        Assert.True(PeerIpPacket.MatchesAuthenticatedEndpoints(packet, "100.103.117.15", "100.112.186.105"));
+        Assert.False(PeerIpPacket.MatchesAuthenticatedEndpoints(packet, "100.103.117.16", "100.112.186.105"));
+        Assert.False(PeerIpPacket.MatchesAuthenticatedEndpoints(packet, "100.103.117.15", "100.112.186.106"));
     }
 
     [Fact]

@@ -1249,6 +1249,13 @@ final class PeerMeshEngine implements Closeable {
         if (handlePeerAppMessage(frame.plaintext, session, relayFromAllocationId)) {
             return;
         }
+        PeerInfo authenticatedPeer = peers.get(session.peerId);
+        if (authenticatedPeer == null
+                || !IpPacket.matchesAuthenticatedEndpoints(
+                frame.plaintext, authenticatedPeer.virtualIp, current.virtualIp)) {
+            publish("Peer packet dropped", "authenticated virtual endpoint mismatch: " + session.peerId);
+            return;
+        }
         if (vpnPlatform != null && specusSession.usesVpnDevice()) {
             vpnPlatform.writeVpnPacket(frame.plaintext);
         }
@@ -4658,6 +4665,23 @@ final class PeerMeshEngine implements Closeable {
                     + (packet[17] & 0xFF) + "."
                     + (packet[18] & 0xFF) + "."
                     + (packet[19] & 0xFF);
+        }
+
+        static String sourceIpv4(byte[] packet) {
+            if (!isIpv4(packet)) {
+                return "";
+            }
+            return (packet[12] & 0xFF) + "."
+                    + (packet[13] & 0xFF) + "."
+                    + (packet[14] & 0xFF) + "."
+                    + (packet[15] & 0xFF);
+        }
+
+        static boolean matchesAuthenticatedEndpoints(byte[] packet, String peerVirtualIp, String localVirtualIp) {
+            return !isBlank(peerVirtualIp)
+                    && !isBlank(localVirtualIp)
+                    && peerVirtualIp.equals(sourceIpv4(packet))
+                    && localVirtualIp.equals(destinationIpv4(packet));
         }
 
         static byte[] clampTcpMss(byte[] packet, int pathMtu) {

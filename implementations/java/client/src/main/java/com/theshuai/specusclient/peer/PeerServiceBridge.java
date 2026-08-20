@@ -12,10 +12,14 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -30,12 +34,15 @@ interface PeerServiceForwarder extends AutoCloseable {
  */
 @Slf4j
 final class PeerServiceBridge implements PeerServiceForwarder {
+    private static final int MAX_ACTIVE_CONNECTIONS = 64;
     private final String virtualIp;
     private final LocalPeerService service;
     private final ServerSocket serverSocket;
+    private final Set<InetAddress> allowedPeerAddresses;
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
+    private final Semaphore slots = new Semaphore(MAX_ACTIVE_CONNECTIONS);
     private final AtomicLong bytesIn = new AtomicLong();
     private final AtomicLong bytesOut = new AtomicLong();
     private final AtomicLong totalConnections = new AtomicLong();
@@ -44,6 +51,7 @@ final class PeerServiceBridge implements PeerServiceForwarder {
         this.virtualIp = virtualIp;
         this.service = service;
         this.serverSocket = serverSocket;
+        this.allowedPeerAddresses = allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread thread = new Thread(r, "peer-service-bridge-" + service.getServiceId());
             thread.setDaemon(true);
@@ -53,7 +61,9 @@ final class PeerServiceBridge implements PeerServiceForwarder {
     }
 
     static PeerServiceBridge bind(String virtualIp, LocalPeerService service) throws IOException {
-        PeerServiceDiscovery.requireTargetHost(service.getTargetHost());
+        if (!PeerServiceDiscovery.isLocalInterfaceTarget(service.getTargetHost())) {
+            throw new IOException("targetHost is not assigned to this device");
+        }
         PeerServiceDiscovery.requirePort(service.getTargetPort(), "targetPort");
         PeerServiceDiscovery.requirePort(service.getPublishedPort(), "publishedPort");
         ServerSocket server = new ServerSocket();
@@ -77,14 +87,28 @@ final class PeerServiceBridge implements PeerServiceForwarder {
                 && Objects.equals(this.service.getServiceId(), service.getServiceId())
                 && this.service.getPublishedPort() == service.getPublishedPort()
                 && Objects.equals(this.service.getTargetHost(), service.getTargetHost())
-                && this.service.getTargetPort() == service.getTargetPort();
+                && this.service.getTargetPort() == service.getTargetPort()
+                && allowedPeerAddresses.equals(allowedPeerAddresses(service));
     }
 
     private void acceptLoop() {
         while (open.get() && !serverSocket.isClosed()) {
             try {
                 Socket inbound = serverSocket.accept();
-                executor.execute(() -> splice(inbound));
+                if (!isAllowed(inbound.getRemoteSocketAddress())) {
+                    closeQuietly(inbound);
+                    continue;
+                }
+                if (!slots.tryAcquire()) {
+                    closeQuietly(inbound);
+                    continue;
+                }
+                try {
+                    executor.execute(() -> splice(inbound));
+                } catch (RuntimeException rejected) {
+                    slots.release();
+                    closeQuietly(inbound);
+                }
             } catch (IOException e) {
                 if (open.get()) {
                     log.debug("Peer-only 桥接 accept 结束: {}", e.getMessage());
@@ -92,6 +116,29 @@ final class PeerServiceBridge implements PeerServiceForwarder {
                 return;
             }
         }
+    }
+
+    private boolean isAllowed(SocketAddress remoteAddress) {
+        return remoteAddress instanceof InetSocketAddress inet
+                && inet.getAddress() != null
+                && allowedPeerAddresses.contains(inet.getAddress());
+    }
+
+    private static Set<InetAddress> allowedPeerAddresses(LocalPeerService service) {
+        Set<InetAddress> addresses = new HashSet<>();
+        if (service == null || service.getAllowedPeerVirtualIps() == null) {
+            return Set.of();
+        }
+        for (String raw : service.getAllowedPeerVirtualIps()) {
+            try {
+                if (raw != null && !raw.isBlank()) {
+                    addresses.add(InetAddress.getByName(raw.trim()));
+                }
+            } catch (Exception ignored) {
+                // Invalid server-authored entries are ignored; an empty result is fail-closed.
+            }
+        }
+        return Set.copyOf(addresses);
     }
 
     private void splice(Socket inbound) {
@@ -113,6 +160,7 @@ final class PeerServiceBridge implements PeerServiceForwarder {
             closeQuietly(inbound);
             closeQuietly(outbound);
             splices.remove(inbound);
+            slots.release();
         }
     }
 

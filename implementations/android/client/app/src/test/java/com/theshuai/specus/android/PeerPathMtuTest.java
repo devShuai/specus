@@ -8,6 +8,7 @@ import java.util.Arrays;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
@@ -65,6 +66,13 @@ public class PeerPathMtuTest {
     @Test
     public void tcpSynMssIsClampedAndChecksumIsRecomputed() throws Exception {
         byte[] packet = tcpSynWithMss("100.103.117.15", "100.112.186.105", 1460);
+
+        assertTrue(PeerMeshEngine.IpPacket.matchesAuthenticatedEndpoints(
+                packet, "100.103.117.15", "100.112.186.105"));
+        assertFalse(PeerMeshEngine.IpPacket.matchesAuthenticatedEndpoints(
+                packet, "100.103.117.16", "100.112.186.105"));
+        assertFalse(PeerMeshEngine.IpPacket.matchesAuthenticatedEndpoints(
+                packet, "100.103.117.15", "100.112.186.106"));
 
         byte[] clamped = PeerMeshEngine.IpPacket.clampTcpMss(packet, 1280);
 

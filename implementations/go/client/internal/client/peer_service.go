@@ -1,9 +1,12 @@
 package client
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ const (
 	peerServiceProbeTimeout       = 400 * time.Millisecond
 	peerServiceProbeInterval      = 15 * time.Second
 	peerServiceCatalogTTL         = 5 * time.Minute
+	peerServiceReportRefresh      = peerServiceCatalogTTL / 2
 )
 
 type peerAdvertisedService struct {
@@ -92,19 +96,21 @@ type remotePeerServiceView struct {
 }
 
 type peerServiceRuntime struct {
-	mu              sync.Mutex
-	logger          *log.Logger
-	send            func(any) error
-	config          PeerMeshConfig
-	instanceID      string
-	revision        atomic.Int64
-	onlinePeer      atomic.Bool
-	catalogs        map[peerServiceCatalogKey]peerServiceCatalogSnapshot
-	bridges         map[string]*peerServiceBridge
-	roster          map[int64]peerServiceRosterHint
-	probeStop       chan struct{}
-	lastReportedIDs []string
-	locallyPaused   map[string]struct{}
+	mu               sync.Mutex
+	logger           *log.Logger
+	send             func(any) error
+	config           PeerMeshConfig
+	instanceID       string
+	revision         atomic.Int64
+	onlinePeer       atomic.Bool
+	catalogs         map[peerServiceCatalogKey]peerServiceCatalogSnapshot
+	catalogRevisions map[peerServiceCatalogKey]int64
+	bridges          map[string]*peerServiceBridge
+	roster           map[int64]peerServiceRosterHint
+	probeStop        chan struct{}
+	lastReportedIDs  []string
+	lastReportAt     time.Time
+	locallyPaused    map[string]struct{}
 }
 
 type peerServiceBridge struct {
@@ -117,6 +123,10 @@ type peerServiceBridge struct {
 	bytesOut  atomic.Int64
 	total     atomic.Int64
 	active    atomic.Int64
+	connMu    sync.Mutex
+	conns     map[net.Conn]struct{}
+	tcpSlots  chan struct{}
+	udpPeers  sync.Map
 }
 
 func newPeerServiceRuntime(logger *log.Logger, send func(any) error) *peerServiceRuntime {
@@ -124,13 +134,14 @@ func newPeerServiceRuntime(logger *log.Logger, send func(any) error) *peerServic
 		logger = log.Default()
 	}
 	return &peerServiceRuntime{
-		logger:     logger,
-		send:       send,
-		instanceID: newPeerMeshKeyEpoch(),
-		catalogs:   make(map[peerServiceCatalogKey]peerServiceCatalogSnapshot),
-		bridges:    make(map[string]*peerServiceBridge),
-		roster:         make(map[int64]peerServiceRosterHint),
-		locallyPaused:  make(map[string]struct{}),
+		logger:           logger,
+		send:             send,
+		instanceID:       newPeerMeshKeyEpoch(),
+		catalogs:         make(map[peerServiceCatalogKey]peerServiceCatalogSnapshot),
+		catalogRevisions: make(map[peerServiceCatalogKey]int64),
+		bridges:          make(map[string]*peerServiceBridge),
+		roster:           make(map[int64]peerServiceRosterHint),
+		locallyPaused:    make(map[string]struct{}),
 	}
 }
 
@@ -169,6 +180,8 @@ func (r *peerServiceRuntime) setHasAuthorizedOnlinePeer(online bool) {
 	if !r.effectiveSharingLocked() || !online {
 		r.stopProbeLocked()
 		r.closeBridgesLocked()
+		r.catalogs = make(map[peerServiceCatalogKey]peerServiceCatalogSnapshot)
+		r.catalogRevisions = make(map[peerServiceCatalogKey]int64)
 		r.mu.Unlock()
 		return
 	}
@@ -195,6 +208,23 @@ func (r *peerServiceRuntime) applyCatalog(message peerControlMessage) {
 	key := peerServiceCatalogKey{message.PublisherClientID, *message.PublisherSessionID}
 	services := append([]peerAdvertisedService(nil), message.Services...)
 	r.mu.Lock()
+	if !r.effectiveSharingLocked() {
+		r.mu.Unlock()
+		return
+	}
+	revision := int64(0)
+	if message.Revision != nil {
+		revision = *message.Revision
+	}
+	if _, exists := r.catalogRevisions[key]; !exists && len(r.catalogRevisions) >= 4096 {
+		r.mu.Unlock()
+		return
+	}
+	if revision < 1 || revision <= r.catalogRevisions[key] {
+		r.mu.Unlock()
+		return
+	}
+	r.catalogRevisions[key] = revision
 	if len(services) == 0 {
 		delete(r.catalogs, key)
 		r.mu.Unlock()
@@ -204,10 +234,6 @@ func (r *peerServiceRuntime) applyCatalog(message peerControlMessage) {
 	expiresAt := time.Now().Add(peerServiceCatalogTTL)
 	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(message.ExpiresAt)); err == nil {
 		expiresAt = parsed
-	}
-	revision := int64(0)
-	if message.Revision != nil {
-		revision = *message.Revision
 	}
 	r.catalogs[key] = peerServiceCatalogSnapshot{
 		publisherClientID:   message.PublisherClientID,
@@ -260,7 +286,8 @@ func (r *peerServiceRuntime) probeAndReport() {
 	for _, service := range reachable {
 		ids = append(ids, service.ServiceID)
 	}
-	if equalStringSlice(ids, r.lastReportedIDs) && r.revision.Load() > 0 {
+	refreshDue := r.lastReportAt.IsZero() || !time.Now().Before(r.lastReportAt.Add(peerServiceReportRefresh))
+	if !refreshDue && equalStringSlice(ids, r.lastReportedIDs) && r.revision.Load() > 0 {
 		r.reconcileBridgesLocked()
 		return
 	}
@@ -405,6 +432,7 @@ func (r *peerServiceRuntime) sendReportLocked(enabled bool, services []peerAdver
 		MdnsCandidates:  mdns,
 		CreatedAtMillis: time.Now().UnixMilli(),
 	}
+	r.lastReportAt = time.Now()
 	send := r.send
 	if send == nil {
 		return
@@ -480,10 +508,44 @@ func peerServiceAccessURL(virtualIP string, service peerAdvertisedService) strin
 }
 
 func probeLocal(service LocalPeerService, timeout time.Duration) bool {
+	if !isLocalServiceTarget(service.TargetHost) {
+		return false
+	}
 	if strings.EqualFold(service.Transport, "udp") || strings.EqualFold(service.Application, "udp") {
 		return probeUDP(service.TargetHost, service.TargetPort, timeout)
 	}
 	return probeTCP(service.TargetHost, service.TargetPort, timeout)
+}
+
+func isLocalServiceTarget(host string) bool {
+	value := strings.TrimSpace(host)
+	if strings.EqualFold(value, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, raw := range addresses {
+		var candidate net.IP
+		switch address := raw.(type) {
+		case *net.IPNet:
+			candidate = address.IP
+		case *net.IPAddr:
+			candidate = address.IP
+		}
+		if candidate != nil && candidate.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func probeTCP(host string, port int, timeout time.Duration) bool {
@@ -513,6 +575,9 @@ func probeUDP(host string, port int, timeout time.Duration) bool {
 }
 
 func bindPeerServiceBridge(virtualIP string, service LocalPeerService, logger *log.Logger) (*peerServiceBridge, error) {
+	if !isLocalServiceTarget(service.TargetHost) {
+		return nil, errors.New("targetHost is not assigned to this device")
+	}
 	if strings.EqualFold(service.Transport, "udp") || strings.EqualFold(service.Application, "udp") {
 		return bindPeerServiceUDP(virtualIP, service, logger)
 	}
@@ -520,7 +585,8 @@ func bindPeerServiceBridge(virtualIP string, service LocalPeerService, logger *l
 	if err != nil {
 		return nil, err
 	}
-	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, listener: listener}
+	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, listener: listener,
+		conns: make(map[net.Conn]struct{}), tcpSlots: make(chan struct{}, 64)}
 	go bridge.acceptLoop(logger)
 	return bridge, nil
 }
@@ -534,7 +600,8 @@ func bindPeerServiceUDP(virtualIP string, service LocalPeerService, logger *log.
 	if err != nil {
 		return nil, err
 	}
-	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, udp: conn}
+	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, udp: conn,
+		tcpSlots: make(chan struct{}, 64)}
 	go bridge.udpLoop(logger)
 	return bridge, nil
 }
@@ -544,7 +611,8 @@ func (b *peerServiceBridge) matches(virtualIP string, service LocalPeerService) 
 		b.service.ServiceID == service.ServiceID &&
 		b.service.PublishedPort == service.PublishedPort &&
 		b.service.TargetHost == service.TargetHost &&
-		b.service.TargetPort == service.TargetPort
+		b.service.TargetPort == service.TargetPort &&
+		equalNormalizedIPs(b.service.AllowedPeerVirtualIPs, service.AllowedPeerVirtualIPs)
 }
 
 func (b *peerServiceBridge) acceptLoop(logger *log.Logger) {
@@ -552,6 +620,16 @@ func (b *peerServiceBridge) acceptLoop(logger *log.Logger) {
 		inbound, err := b.listener.Accept()
 		if err != nil {
 			return
+		}
+		if !peerServiceSourceAllowed(inbound.RemoteAddr(), b.service.AllowedPeerVirtualIPs) {
+			_ = inbound.Close()
+			continue
+		}
+		select {
+		case b.tcpSlots <- struct{}{}:
+		default:
+			_ = inbound.Close()
+			continue
 		}
 		go b.splice(inbound, logger)
 	}
@@ -568,7 +646,6 @@ func (b *peerServiceBridge) stats() peerServiceStats {
 }
 
 func (b *peerServiceBridge) udpLoop(_ *log.Logger) {
-	peers := map[string]*net.UDPConn{}
 	buf := make([]byte, 65507)
 	target, err := net.ResolveUDPAddr("udp", net.JoinHostPort(b.service.TargetHost, strconv.Itoa(b.service.TargetPort)))
 	if err != nil {
@@ -579,27 +656,75 @@ func (b *peerServiceBridge) udpLoop(_ *log.Logger) {
 		if err != nil {
 			return
 		}
+		peerAddr, ok := netip.AddrFromSlice(peer.IP)
+		if !ok || !peerServiceIPAllowed(peerAddr.Unmap(), b.service.AllowedPeerVirtualIPs) {
+			continue
+		}
 		b.bytesIn.Add(int64(n))
-		outbound, ok := peers[peer.String()]
+		key := peer.String()
+		value, ok := b.udpPeers.Load(key)
+		var outbound *net.UDPConn
 		if !ok {
+			if b.active.Load() >= 64 {
+				continue
+			}
 			outbound, err = net.DialUDP("udp", nil, target)
 			if err != nil {
 				continue
 			}
-			peers[peer.String()] = outbound
+			_ = outbound.SetReadDeadline(time.Now().Add(time.Minute))
+			b.udpPeers.Store(key, outbound)
 			b.total.Add(1)
 			b.active.Add(1)
-			go b.udpReply(outbound, peer)
+			go b.udpReply(key, outbound, peer)
+		} else {
+			outbound = value.(*net.UDPConn)
+			_ = outbound.SetReadDeadline(time.Now().Add(time.Minute))
 		}
 		_, _ = outbound.Write(buf[:n])
 	}
-	for _, conn := range peers {
-		_ = conn.Close()
-	}
+	b.udpPeers.Range(func(_, value any) bool {
+		_ = value.(*net.UDPConn).Close()
+		return true
+	})
 }
 
-func (b *peerServiceBridge) udpReply(outbound *net.UDPConn, peer *net.UDPAddr) {
+func peerServiceSourceAllowed(remote net.Addr, allowed []string) bool {
+	host, _, err := net.SplitHostPort(remote.String())
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	return err == nil && peerServiceIPAllowed(addr.Unmap(), allowed)
+}
+
+func peerServiceIPAllowed(addr netip.Addr, allowed []string) bool {
+	for _, raw := range allowed {
+		candidate, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err == nil && candidate.Unmap() == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func equalNormalizedIPs(left, right []string) bool {
+	normalize := func(values []string) []string {
+		out := make([]string, 0, len(values))
+		for _, raw := range values {
+			if addr, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil {
+				out = append(out, addr.Unmap().String())
+			}
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+	return slices.Equal(normalize(left), normalize(right))
+}
+
+func (b *peerServiceBridge) udpReply(key string, outbound *net.UDPConn, peer *net.UDPAddr) {
 	defer func() {
+		b.udpPeers.CompareAndDelete(key, outbound)
 		_ = outbound.Close()
 		b.active.Add(-1)
 	}()
@@ -615,8 +740,17 @@ func (b *peerServiceBridge) udpReply(outbound *net.UDPConn, peer *net.UDPAddr) {
 }
 
 func (b *peerServiceBridge) splice(inbound net.Conn, logger *log.Logger) {
-	defer inbound.Close()
+	defer func() { <-b.tcpSlots }()
+	if !b.trackConn(inbound) {
+		return
+	}
+	defer func() {
+		b.untrackConn(inbound)
+		_ = inbound.Close()
+	}()
 	b.total.Add(1)
+	b.active.Add(1)
+	defer b.active.Add(-1)
 	outbound, err := net.DialTimeout("tcp", net.JoinHostPort(b.service.TargetHost, strconv.Itoa(b.service.TargetPort)), 3*time.Second)
 	if err != nil {
 		if logger != nil {
@@ -624,7 +758,14 @@ func (b *peerServiceBridge) splice(inbound net.Conn, logger *log.Logger) {
 		}
 		return
 	}
-	defer outbound.Close()
+	if !b.trackConn(outbound) {
+		_ = outbound.Close()
+		return
+	}
+	defer func() {
+		b.untrackConn(outbound)
+		_ = outbound.Close()
+	}()
 	done := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(&countingWriter{dst: outbound, n: &b.bytesIn}, inbound)
@@ -632,6 +773,23 @@ func (b *peerServiceBridge) splice(inbound net.Conn, logger *log.Logger) {
 	}()
 	_, _ = io.Copy(&countingWriter{dst: inbound, n: &b.bytesOut}, outbound)
 	<-done
+}
+
+func (b *peerServiceBridge) trackConn(conn net.Conn) bool {
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	if b.closed.Load() {
+		_ = conn.Close()
+		return false
+	}
+	b.conns[conn] = struct{}{}
+	return true
+}
+
+func (b *peerServiceBridge) untrackConn(conn net.Conn) {
+	b.connMu.Lock()
+	delete(b.conns, conn)
+	b.connMu.Unlock()
 }
 
 type countingWriter struct {
@@ -655,6 +813,12 @@ func (b *peerServiceBridge) close() {
 	if b.udp != nil {
 		_ = b.udp.Close()
 	}
+	b.connMu.Lock()
+	for conn := range b.conns {
+		_ = conn.Close()
+	}
+	clear(b.conns)
+	b.connMu.Unlock()
 }
 
 func equalStringSlice(left, right []string) bool {

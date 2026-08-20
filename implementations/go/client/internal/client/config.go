@@ -102,26 +102,26 @@ type ClientPolicy struct {
 }
 
 type PeerMeshConfig struct {
-	Enabled           bool     `json:"enabled"`
-	ClientID          int64    `json:"clientId"`
-	ClientName        string   `json:"clientName"`
-	VirtualIP         string   `json:"virtualIp"`
-	CIDR              string   `json:"cidr"`
-	StunHost          string   `json:"stunHost"`
-	StunPort          int      `json:"stunPort"`
-	TurnHost          string   `json:"turnHost"`
-	TurnPort          int      `json:"turnPort"`
-	PublicStunServers []string `json:"publicStunServers"`
-	IceUsername       string   `json:"iceUsername"`
-	IceCredential     string   `json:"iceCredential"`
-	IceRealm          string   `json:"iceRealm"`
-	IceNonce          string   `json:"iceNonce"`
-	ServerPublicKey              string               `json:"serverPublicKey"`
-	ClientPublicKey              string               `json:"clientPublicKey"`
-	SessionTTLSeconds            int64                `json:"sessionTtlSeconds"`
-	PeerServiceDiscoveryVersion  int                  `json:"peerServiceDiscoveryVersion"`
-	ServiceSharing               ServiceSharingStatus `json:"serviceSharing"`
-	LocalServices                []LocalPeerService   `json:"localServices"`
+	Enabled                     bool                 `json:"enabled"`
+	ClientID                    int64                `json:"clientId"`
+	ClientName                  string               `json:"clientName"`
+	VirtualIP                   string               `json:"virtualIp"`
+	CIDR                        string               `json:"cidr"`
+	StunHost                    string               `json:"stunHost"`
+	StunPort                    int                  `json:"stunPort"`
+	TurnHost                    string               `json:"turnHost"`
+	TurnPort                    int                  `json:"turnPort"`
+	PublicStunServers           []string             `json:"publicStunServers"`
+	IceUsername                 string               `json:"iceUsername"`
+	IceCredential               string               `json:"iceCredential"`
+	IceRealm                    string               `json:"iceRealm"`
+	IceNonce                    string               `json:"iceNonce"`
+	ServerPublicKey             string               `json:"serverPublicKey"`
+	ClientPublicKey             string               `json:"clientPublicKey"`
+	SessionTTLSeconds           int64                `json:"sessionTtlSeconds"`
+	PeerServiceDiscoveryVersion int                  `json:"peerServiceDiscoveryVersion"`
+	ServiceSharing              ServiceSharingStatus `json:"serviceSharing"`
+	LocalServices               []LocalPeerService   `json:"localServices"`
 }
 
 type ServiceSharingStatus struct {
@@ -132,17 +132,18 @@ type ServiceSharingStatus struct {
 }
 
 type LocalPeerService struct {
-	ServiceID     string `json:"serviceId"`
-	Name          string `json:"name"`
-	Description   string `json:"description,omitempty"`
-	Transport     string `json:"transport"`
-	Application   string `json:"application"`
-	TargetHost    string `json:"targetHost"`
-	TargetPort    int    `json:"targetPort"`
-	PublishedPort int    `json:"publishedPort"`
-	Path          string `json:"path,omitempty"`
-	Enabled       bool   `json:"enabled"`
-	Visibility    string `json:"visibility,omitempty"`
+	ServiceID             string   `json:"serviceId"`
+	Name                  string   `json:"name"`
+	Description           string   `json:"description,omitempty"`
+	Transport             string   `json:"transport"`
+	Application           string   `json:"application"`
+	TargetHost            string   `json:"targetHost"`
+	TargetPort            int      `json:"targetPort"`
+	PublishedPort         int      `json:"publishedPort"`
+	Path                  string   `json:"path,omitempty"`
+	Enabled               bool     `json:"enabled"`
+	Visibility            string   `json:"visibility,omitempty"`
+	AllowedPeerVirtualIPs []string `json:"allowedPeerVirtualIps"`
 }
 
 func LoadConfig(path string) (Config, error) {

@@ -120,6 +120,9 @@ class PeerDataFrameCodecTests {
         assertEquals("100.96.0.2", PeerIpPacket.destinationIpv4(packet));
         assertEquals(PeerIpPacket.ipv4ToInt("100.96.0.2"),
                 PeerIpPacket.destinationIpv4Int(wrapped, 4, packet.length));
+        assertTrue(PeerIpPacket.matchesAuthenticatedEndpoints(packet, "100.96.0.1", "100.96.0.2"));
+        assertFalse(PeerIpPacket.matchesAuthenticatedEndpoints(packet, "100.96.0.3", "100.96.0.2"));
+        assertFalse(PeerIpPacket.matchesAuthenticatedEndpoints(packet, "100.96.0.1", "100.96.0.4"));
     }
 
     private static SecretKeySpec sessionKey() {

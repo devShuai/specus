@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Specus.Client.Configuration;
 
@@ -19,6 +20,8 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger? _logger;
+    private readonly ConcurrentDictionary<TcpClient, TcpClient> _splices = new();
+    private readonly SemaphoreSlim _slots = new(64, 64);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
@@ -34,6 +37,10 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
 
     public static PeerServiceBridge Bind(string virtualIp, LocalPeerService service, ILogger? logger)
     {
+        if (!PeerServiceDiscovery.IsLocalInterfaceTarget(service.TargetHost))
+        {
+            throw new InvalidOperationException("targetHost is not assigned to this device");
+        }
         var listener = new TcpListener(IPAddress.Parse(virtualIp), service.PublishedPort);
         listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         listener.Start();
@@ -43,14 +50,16 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     public string ServiceId => _service.ServiceId;
 
     public (long BytesIn, long BytesOut, int Active, long Total) Snapshot() =>
-        (Interlocked.Read(ref _bytesIn), Interlocked.Read(ref _bytesOut), 0, Interlocked.Read(ref _totalConnections));
+        (Interlocked.Read(ref _bytesIn), Interlocked.Read(ref _bytesOut), _splices.Count,
+            Interlocked.Read(ref _totalConnections));
 
     public bool Matches(string virtualIp, LocalPeerService service) =>
         _virtualIp == virtualIp
         && _service.ServiceId == service.ServiceId
         && _service.PublishedPort == service.PublishedPort
         && _service.TargetHost == service.TargetHost
-        && _service.TargetPort == service.TargetPort;
+        && _service.TargetPort == service.TargetPort
+        && PeerServiceDiscovery.SameAllowedPeers(_service, service);
 
     private async Task AcceptLoopAsync()
     {
@@ -69,6 +78,17 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
             {
                 return;
             }
+            if (inbound.Client.RemoteEndPoint is not IPEndPoint remote
+                || !PeerServiceDiscovery.IsSourceAllowed(remote.Address, _service))
+            {
+                inbound.Dispose();
+                continue;
+            }
+            if (!_slots.Wait(0))
+            {
+                inbound.Dispose();
+                continue;
+            }
             _ = SpliceAsync(inbound);
         }
     }
@@ -77,6 +97,10 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     {
         using var inboundClient = inbound;
         using var outbound = new TcpClient();
+        if (_cts.IsCancellationRequested || !_splices.TryAdd(inboundClient, outbound))
+        {
+            return;
+        }
         Interlocked.Increment(ref _totalConnections);
         try
         {
@@ -93,6 +117,11 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger?.LogDebug(ex, "Peer-only 桥接转发失败 service={ServiceId}", _service.ServiceId);
+        }
+        finally
+        {
+            _splices.TryRemove(inboundClient, out _);
+            _slots.Release();
         }
     }
 
@@ -129,6 +158,12 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         {
             // ignored
         }
+        foreach (var splice in _splices)
+        {
+            splice.Key.Dispose();
+            splice.Value.Dispose();
+        }
+        _splices.Clear();
         _cts.Dispose();
     }
 }

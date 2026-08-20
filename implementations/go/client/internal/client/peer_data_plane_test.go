@@ -116,6 +116,14 @@ func encodeInbound(t *testing.T, session *peerMeshSession, sequence uint64, payl
 	return frame
 }
 
+func authenticatedPeerTestPacket() []byte {
+	packet := make([]byte, 64)
+	packet[0] = 0x45
+	copy(packet[12:16], net.IPv4(100, 96, 0, 2).To4())
+	copy(packet[16:20], net.IPv4(100, 96, 0, 1).To4())
+	return packet
+}
+
 // A stalled virtual-device write must not stop the receive loop from serving STUN, keepalive and
 // probe traffic — those are exactly what path switching depends on when a path degrades.
 func TestSlowVirtualDeviceWriteDoesNotBlockTheReceiveLoop(t *testing.T) {
@@ -125,8 +133,7 @@ func TestSlowVirtualDeviceWriteDoesNotBlockTheReceiveLoop(t *testing.T) {
 	remote := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 40000}
 
 	// Enough frames to occupy both workers and fill the queues, so the pool is fully stalled.
-	payload := make([]byte, 64)
-	payload[0] = 0x45
+	payload := authenticatedPeerTestPacket()
 	for sequence := uint64(1); sequence <= 64; sequence++ {
 		mesh.handleUDP(encodeInbound(t, session, sequence, payload), remote)
 	}
@@ -169,8 +176,7 @@ func TestPeerDataFrameFloodIsBoundedAndNonBlocking(t *testing.T) {
 	mesh, session := newDataPlaneTestMesh(t, device)
 	remote := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 8), Port: 41000}
 
-	payload := make([]byte, 64)
-	payload[0] = 0x45
+	payload := authenticatedPeerTestPacket()
 	frames := make([][]byte, 0, 2000)
 	for sequence := uint64(1); sequence <= 2000; sequence++ {
 		frames = append(frames, encodeInbound(t, session, sequence, payload))
@@ -272,8 +278,7 @@ func TestDirectDataFrameIsNotMistakenForTurnChannelData(t *testing.T) {
 	mesh, session := newDataPlaneTestMesh(t, device)
 	remote := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 42000}
 
-	packet := make([]byte, 64)
-	packet[0] = 0x45
+	packet := authenticatedPeerTestPacket()
 	copy(packet[20:], []byte("payload-marker"))
 	frame := encodeInbound(t, session, 1, packet)
 
@@ -320,8 +325,7 @@ func TestTurnChannelDataStillReachesTheRelayBranch(t *testing.T) {
 	}
 	mesh.mu.Unlock()
 
-	packet := make([]byte, 64)
-	packet[0] = 0x45
+	packet := authenticatedPeerTestPacket()
 	copy(packet[20:], []byte("relayed-marker"))
 	inner := encodeInbound(t, session, 1, packet)
 	channelData, err := encodeTurnChannelData(0x4001, inner)

@@ -8,23 +8,30 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Objects;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class PeerServiceBridge implements AutoCloseable {
+    private static final int MAX_ACTIVE_CONNECTIONS = 64;
     private final String virtualIp;
     private final SpecusCore.LocalPeerService service;
     private final ServerSocket serverSocket;
+    private final Set<InetAddress> allowedPeerAddresses;
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
+    private final Semaphore slots = new Semaphore(MAX_ACTIVE_CONNECTIONS);
 
     private PeerServiceBridge(String virtualIp, SpecusCore.LocalPeerService service, ServerSocket serverSocket) {
         this.virtualIp = virtualIp;
         this.service = service;
         this.serverSocket = serverSocket;
+        this.allowedPeerAddresses = allowedPeerAddresses(service);
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread thread = new Thread(r, "peer-service-bridge-" + service.serviceId);
             thread.setDaemon(true);
@@ -34,6 +41,9 @@ final class PeerServiceBridge implements AutoCloseable {
     }
 
     static PeerServiceBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws IOException {
+        if (!PeerServiceRuntime.isLocalServiceTarget(service.targetHost)) {
+            throw new IOException("targetHost is not assigned to this device");
+        }
         ServerSocket server = new ServerSocket();
         server.setReuseAddress(true);
         server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
@@ -45,18 +55,49 @@ final class PeerServiceBridge implements AutoCloseable {
                 && Objects.equals(this.service.serviceId, service.serviceId)
                 && this.service.publishedPort == service.publishedPort
                 && Objects.equals(this.service.targetHost, service.targetHost)
-                && this.service.targetPort == service.targetPort;
+                && this.service.targetPort == service.targetPort
+                && allowedPeerAddresses.equals(allowedPeerAddresses(service));
     }
 
     private void acceptLoop() {
         while (open.get() && !serverSocket.isClosed()) {
             try {
                 Socket inbound = serverSocket.accept();
-                executor.execute(() -> splice(inbound));
+                if (!allowedPeerAddresses.contains(inbound.getInetAddress())) {
+                    closeQuietly(inbound);
+                    continue;
+                }
+                if (!slots.tryAcquire()) {
+                    closeQuietly(inbound);
+                    continue;
+                }
+                try {
+                    executor.execute(() -> splice(inbound));
+                } catch (RuntimeException rejected) {
+                    slots.release();
+                    closeQuietly(inbound);
+                }
             } catch (IOException e) {
                 return;
             }
         }
+    }
+
+    static Set<InetAddress> allowedPeerAddresses(SpecusCore.LocalPeerService service) {
+        Set<InetAddress> addresses = new HashSet<>();
+        if (service == null || service.allowedPeerVirtualIps == null) {
+            return Set.of();
+        }
+        for (String raw : service.allowedPeerVirtualIps) {
+            try {
+                if (raw != null && !raw.isBlank()) {
+                    addresses.add(InetAddress.getByName(raw.trim()));
+                }
+            } catch (Exception ignored) {
+                // Invalid server-authored entries are ignored; empty is fail-closed.
+            }
+        }
+        return Set.copyOf(addresses);
     }
 
     private void splice(Socket inbound) {
@@ -76,6 +117,7 @@ final class PeerServiceBridge implements AutoCloseable {
             closeQuietly(inbound);
             closeQuietly(outbound);
             splices.remove(inbound);
+            slots.release();
         }
     }
 

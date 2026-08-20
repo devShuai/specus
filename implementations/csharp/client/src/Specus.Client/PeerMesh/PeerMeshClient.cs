@@ -215,11 +215,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await ReportDeviceAsync(runtime, writer, DeviceStatus(), _device?.Error ?? "", "", "", cancellationToken)
                 .ConfigureAwait(false);
             await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
+            _serviceRuntime.ApplyConfig(runtime.PeerMesh);
             PublishPeerMeshSnapshot();
             _ = TryAcquirePortMappingAsync(CancellationToken.None);
             await RequestRelayCandidatesAsync().ConfigureAwait(false);
             await AnnounceCandidatesAsync().ConfigureAwait(false);
-            _serviceRuntime.ApplyConfig(runtime.PeerMesh);
             return;
         }
 
@@ -326,11 +326,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         await ReportDeviceAsync(runtime, writer, DeviceStatus(), FirstNonEmpty(deviceError, device.Error), "", "", cancellationToken).ConfigureAwait(false);
         await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
+        _serviceRuntime.ApplyConfig(runtime.PeerMesh);
         PublishPeerMeshSnapshot();
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
         await AnnounceCandidatesAsync().ConfigureAwait(false);
-        _serviceRuntime.ApplyConfig(runtime.PeerMesh);
     }
 
     private void UpdateTurnCredentials(PeerMeshConfig config)
@@ -722,6 +722,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
                 var now = DateTimeOffset.UtcNow;
+                if (_serviceRuntime.PruneExpiredCatalogs(now))
+                {
+                    PublishPeerMeshSnapshot();
+                }
                 if (lastMaintenance == DateTimeOffset.MinValue || now - lastMaintenance >= MaintenanceInterval)
                 {
                     lastMaintenance = now;
@@ -2025,6 +2029,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         if (ready is not null
             && await HandlePeerAppMessageAsync(frame.Payload, ready, relayFrom, runtime).ConfigureAwait(false))
         {
+            return;
+        }
+        if (ready is null || !PeerIpPacket.MatchesAuthenticatedEndpoints(
+                frame.Payload, ready.PeerVirtualIp, runtime.PeerMesh.VirtualIp))
+        {
+            _logger.LogWarning("Peer Mesh dropped packet with unauthenticated virtual endpoints: session={Session} peer={Peer}",
+                session.Id, session.PeerId);
             return;
         }
         if (device is NoopPeerVirtualDevice)
@@ -4642,6 +4653,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         PublisherClientId = item.PublisherClientId,
                         PublisherClientName = item.PublisherClientName,
                         PublisherSessionId = item.PublisherSessionId,
+                        ServiceId = item.Service.ServiceId,
+                        Name = item.Service.Name,
                         Application = item.Service.Application,
                         AccessTarget = item.AccessTarget,
                         Openable = item.Openable,
@@ -4658,7 +4671,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         Target = $"{item.TargetHost}:{item.TargetPort}",
                         PublishedPort = item.PublishedPort,
                         ConfigEnabled = item.Enabled,
-                        LocallyPublished = _serviceRuntime.IsLocallyPublished(item.ServiceId),
+                        CanToggle = _serviceRuntime.EffectiveSharing && item.Enabled,
+                        LocallyPublished = _serviceRuntime.EffectiveSharing && item.Enabled
+                            && _serviceRuntime.IsLocallyPublished(item.ServiceId),
                     })
                     .ToList(),
                 UpdatedAt = DateTimeOffset.Now,

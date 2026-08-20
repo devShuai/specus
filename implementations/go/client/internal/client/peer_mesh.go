@@ -169,48 +169,48 @@ type peerCandidate struct {
 }
 
 type peerControlMessage struct {
-	Type                 string          `json:"type"`
-	SourceClientID       int64           `json:"sourceClientId,omitempty"`
-	SourceClientName     string          `json:"sourceClientName,omitempty"`
-	SourceVirtualIP      string          `json:"sourceVirtualIp,omitempty"`
-	SourcePublicKey      string          `json:"sourcePublicKey,omitempty"`
-	SourceKeyEpoch       string          `json:"sourceKeyEpoch,omitempty"`
-	TargetClientID       int64           `json:"targetClientId,omitempty"`
-	TargetClientName     string          `json:"targetClientName,omitempty"`
-	TargetVirtualIP      string          `json:"targetVirtualIp,omitempty"`
-	TargetPublicKey      string          `json:"targetPublicKey,omitempty"`
-	SessionID            *int64          `json:"sessionId,omitempty"`
-	Token                string          `json:"token,omitempty"`
-	ExpiresAt            string          `json:"expiresAt,omitempty"`
-	PathType             string          `json:"pathType,omitempty"`
-	Status               string          `json:"status,omitempty"`
-	RTTMillis            *int64          `json:"rttMillis,omitempty"`
-	LocalEndpoint        string          `json:"localEndpoint,omitempty"`
-	RemoteEndpoint       string          `json:"remoteEndpoint,omitempty"`
-	DirectBytes          int64           `json:"directBytes,omitempty"`
-	RelayBytes           int64           `json:"relayBytes,omitempty"`
-	NatType              string          `json:"natType,omitempty"`
-	NatMappingBehavior   string          `json:"natMappingBehavior,omitempty"`
-	NatFilteringBehavior string          `json:"natFilteringBehavior,omitempty"`
-	NatBehaviorDiscovery string          `json:"natBehaviorDiscovery,omitempty"`
-	LastEndpoint         string          `json:"lastEndpoint,omitempty"`
-	VirtualDeviceMode    string          `json:"virtualDeviceMode,omitempty"`
-	VirtualDeviceName    string          `json:"virtualDeviceName,omitempty"`
-	VirtualDeviceStatus  string          `json:"virtualDeviceStatus,omitempty"`
-	VirtualDeviceError   string          `json:"virtualDeviceError,omitempty"`
-	PeerMesh             *PeerMeshConfig `json:"peerMesh,omitempty"`
-	Peers                []peerMeshPeer  `json:"peers,omitempty"`
-	Candidates           []peerCandidate `json:"candidates,omitempty"`
-	DataFrameVersion     int             `json:"dataFrameVersion"`
-	Reason               string          `json:"reason,omitempty"`
-	CreatedAtMillis      int64           `json:"createdAtMillis,omitempty"`
-	Enabled              *bool           `json:"enabled,omitempty"`
-	Revision             *int64          `json:"revision,omitempty"`
-	PublisherClientID    int64           `json:"publisherClientId,omitempty"`
-	PublisherClientName  string          `json:"publisherClientName,omitempty"`
-	PublisherSessionID   *int64          `json:"publisherSessionId,omitempty"`
-	InstanceID           string          `json:"instanceId,omitempty"`
-	GeneratedAt          string          `json:"generatedAt,omitempty"`
+	Type                 string                  `json:"type"`
+	SourceClientID       int64                   `json:"sourceClientId,omitempty"`
+	SourceClientName     string                  `json:"sourceClientName,omitempty"`
+	SourceVirtualIP      string                  `json:"sourceVirtualIp,omitempty"`
+	SourcePublicKey      string                  `json:"sourcePublicKey,omitempty"`
+	SourceKeyEpoch       string                  `json:"sourceKeyEpoch,omitempty"`
+	TargetClientID       int64                   `json:"targetClientId,omitempty"`
+	TargetClientName     string                  `json:"targetClientName,omitempty"`
+	TargetVirtualIP      string                  `json:"targetVirtualIp,omitempty"`
+	TargetPublicKey      string                  `json:"targetPublicKey,omitempty"`
+	SessionID            *int64                  `json:"sessionId,omitempty"`
+	Token                string                  `json:"token,omitempty"`
+	ExpiresAt            string                  `json:"expiresAt,omitempty"`
+	PathType             string                  `json:"pathType,omitempty"`
+	Status               string                  `json:"status,omitempty"`
+	RTTMillis            *int64                  `json:"rttMillis,omitempty"`
+	LocalEndpoint        string                  `json:"localEndpoint,omitempty"`
+	RemoteEndpoint       string                  `json:"remoteEndpoint,omitempty"`
+	DirectBytes          int64                   `json:"directBytes,omitempty"`
+	RelayBytes           int64                   `json:"relayBytes,omitempty"`
+	NatType              string                  `json:"natType,omitempty"`
+	NatMappingBehavior   string                  `json:"natMappingBehavior,omitempty"`
+	NatFilteringBehavior string                  `json:"natFilteringBehavior,omitempty"`
+	NatBehaviorDiscovery string                  `json:"natBehaviorDiscovery,omitempty"`
+	LastEndpoint         string                  `json:"lastEndpoint,omitempty"`
+	VirtualDeviceMode    string                  `json:"virtualDeviceMode,omitempty"`
+	VirtualDeviceName    string                  `json:"virtualDeviceName,omitempty"`
+	VirtualDeviceStatus  string                  `json:"virtualDeviceStatus,omitempty"`
+	VirtualDeviceError   string                  `json:"virtualDeviceError,omitempty"`
+	PeerMesh             *PeerMeshConfig         `json:"peerMesh,omitempty"`
+	Peers                []peerMeshPeer          `json:"peers,omitempty"`
+	Candidates           []peerCandidate         `json:"candidates,omitempty"`
+	DataFrameVersion     int                     `json:"dataFrameVersion"`
+	Reason               string                  `json:"reason,omitempty"`
+	CreatedAtMillis      int64                   `json:"createdAtMillis,omitempty"`
+	Enabled              *bool                   `json:"enabled,omitempty"`
+	Revision             *int64                  `json:"revision,omitempty"`
+	PublisherClientID    int64                   `json:"publisherClientId,omitempty"`
+	PublisherClientName  string                  `json:"publisherClientName,omitempty"`
+	PublisherSessionID   *int64                  `json:"publisherSessionId,omitempty"`
+	InstanceID           string                  `json:"instanceId,omitempty"`
+	GeneratedAt          string                  `json:"generatedAt,omitempty"`
 	Services             []peerAdvertisedService `json:"services,omitempty"`
 }
 
@@ -1363,6 +1363,10 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 		return
 	}
 	if mesh.handlePeerAppMessage(frame, current, runtime) {
+		return
+	}
+	if !peerPacketMatchesAuthenticatedEndpoints(frame.Payload, current.PeerVirtualIP, runtime.PeerMesh.VirtualIP) {
+		mesh.logger.Printf("Peer Mesh dropped packet with unauthenticated virtual endpoints: session=%d peer=%d", frame.SessionID, peerID)
 		return
 	}
 	if _, noop := device.(*noopPeerVirtualDevice); !noop {
