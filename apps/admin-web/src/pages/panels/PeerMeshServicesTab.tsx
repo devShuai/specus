@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Chip,
@@ -25,40 +25,35 @@ import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
 import { notify, notifyError } from "../../components/toast";
 import { copyTextWithFeedback } from "../../lib/clipboard";
+import {
+  groupPeerMeshServices,
+  PeerMeshOperationLocks,
+  peerServiceAvailability,
+  peerServiceSharingControl,
+  type PeerMeshServiceInstanceRow,
+} from "./peerMeshServicesModel";
 
 const applications = ["http", "https", "ssh", "tcp", "udp"] as const;
 
-function healthChip(service: PeerMeshSharedService, sharingEnabled: boolean): { color: "success" | "warning" | "default"; text: string } {
-  if (!sharingEnabled) {
-    return { color: "default", text: "全局已关闭" };
+function instanceSummary(row: PeerMeshServiceInstanceRow): string {
+  const instance = row.instance;
+  if (!instance) {
+    return row.availability.reason;
   }
-  if (!service.enabled) {
-    return { color: "default", text: "已关闭" };
-  }
-  const instances = service.instances ?? [];
-  if (instances.some((item) => item.advertised && item.online)) {
-    return { color: "success", text: "已发布" };
-  }
-  if (instances.some((item) => item.online)) {
-    return { color: "warning", text: "在线未探测到" };
-  }
-  return { color: "default", text: "已启用 · 未上报" };
+  const bytes = (instance.bytesIn ?? 0) + (instance.bytesOut ?? 0);
+  const traffic = bytes > 0 ? ` · ${formatBytes(bytes)}` : "";
+  const conns = instance.activeConnections ? ` · ${instance.activeConnections} 个活动连接` : "";
+  return `${row.availability.reason}${traffic}${conns}`;
 }
 
-function instanceSummary(service: PeerMeshSharedService): string {
-  const instances = service.instances ?? [];
-  if (instances.length === 0) {
-    return "无上报实例";
+function statusChip(row: PeerMeshServiceInstanceRow): { color: "success" | "warning" | "default"; text: string } {
+  if (row.availability.available) {
+    return { color: "success", text: "目录可用" };
   }
-  return instances
-    .map((item) => {
-      const state = !item.online ? "离线" : item.advertised ? "已发布" : "在线未发布";
-      const bytes = (item.bytesIn ?? 0) + (item.bytesOut ?? 0);
-      const traffic = bytes > 0 ? ` · ${formatBytes(bytes)}` : "";
-      const conns = item.activeConnections ? ` · ${item.activeConnections} 连接` : "";
-      return `${item.publisherSessionId} ${state}${traffic}${conns}`;
-    })
-    .join("；");
+  if (row.availability.state === "offline" || row.availability.state === "expired") {
+    return { color: "warning", text: row.availability.reason };
+  }
+  return { color: "default", text: row.availability.reason };
 }
 
 function formatBytes(bytes: number): string {
@@ -86,7 +81,12 @@ export function PeerMeshServicesTab({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [updatingShare, setUpdatingShare] = useState(false);
   const [updatingServices, setUpdatingServices] = useState<Set<number>>(new Set());
+  const [testingInstances, setTestingInstances] = useState<Set<string>>(new Set());
+  const [deletingServices, setDeletingServices] = useState<Set<number>>(new Set());
+  const [savingService, setSavingService] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const loadInFlight = useRef<Promise<void> | null>(null);
+  const operationLocks = useRef(new PeerMeshOperationLocks());
   const [confirm, setConfirm] = useState<{
     title: string;
     description: string;
@@ -108,30 +108,42 @@ export function PeerMeshServicesTab({
     allowedClientIds: [] as string[],
   });
 
-  const load = useCallback(async (silent = false) => {
+  const load = useCallback((silent = false): Promise<void> => {
+    if (loadInFlight.current) {
+      return loadInFlight.current;
+    }
     if (!silent) {
       setLoading(true);
     }
-    try {
-      const [nextSharing, nextServices, nextAudits] = await Promise.all([
-        adminApi.peerMeshServiceSharing(),
-        adminApi.listPeerMeshServices(),
-        adminApi.listPeerMeshServiceAudit().catch(() => []),
-      ]);
-      setSharing(nextSharing);
-      setServices(nextServices);
-      setAudits(nextAudits);
-      setLoadError(null);
-    } catch (error) {
-      if (!silent) {
+    const pending = (async () => {
+      try {
+        const [nextSharing, nextServices, nextAudits] = await Promise.all([
+          adminApi.peerMeshServiceSharing(),
+          adminApi.listPeerMeshServices(),
+          adminApi.listPeerMeshServiceAudit().catch(() => []),
+        ]);
+        setSharing(nextSharing);
+        setServices(nextServices);
+        setAudits(nextAudits);
+        setLoadError(null);
+      } catch (error) {
         setLoadError(error instanceof Error ? error.message : "无法读取 Peer 服务状态");
-        notifyError(error, "加载 Peer 服务失败");
+        if (!silent) {
+          notifyError(error, "加载 Peer 服务失败");
+        }
+      } finally {
+        if (!silent) {
+          setLoading(false);
+        }
       }
-    } finally {
-      if (!silent) {
-        setLoading(false);
+    })();
+    loadInFlight.current = pending;
+    void pending.finally(() => {
+      if (loadInFlight.current === pending) {
+        loadInFlight.current = null;
       }
-    }
+    });
+    return pending;
   }, []);
 
   useEffect(() => {
@@ -140,19 +152,13 @@ export function PeerMeshServicesTab({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const grouped = useMemo(() => {
-    const map = new Map<string, PeerMeshSharedService[]>();
-    for (const service of services) {
-      const key = `${service.clientId}:${service.clientName}`;
-      const list = map.get(key) ?? [];
-      list.push(service);
-      map.set(key, list);
-    }
-    return [...map.entries()];
-  }, [services]);
+  const grouped = useMemo(
+    () => groupPeerMeshServices(services, Boolean(sharing?.effectiveEnabled)),
+    [services, sharing?.effectiveEnabled],
+  );
 
   const setSharingEnabled = (enabled: boolean) => {
-    if (!sharing) {
+    if (!sharing || updatingShare || confirm) {
       return;
     }
     const enabledCount = sharing.enabledServiceCount;
@@ -166,6 +172,9 @@ export function PeerMeshServicesTab({
       confirmLabel: enabled ? "开启" : "关闭并撤回",
       danger: !enabled,
       action: async () => {
+        if (!operationLocks.current.acquire("sharing")) {
+          return;
+        }
         setUpdatingShare(true);
         try {
           const next = await adminApi.updatePeerMeshServiceSharing(enabled);
@@ -180,15 +189,22 @@ export function PeerMeshServicesTab({
           throw error;
         } finally {
           setUpdatingShare(false);
+          operationLocks.current.release("sharing");
         }
       },
     });
   };
 
   const saveService = async () => {
+    if (!operationLocks.current.acquire("save")) {
+      return;
+    }
+    setSavingService(true);
     const clientId = Number(draft.clientId);
     if (!clientId) {
       notifyError(new Error("请选择设备"), "新增服务失败");
+      setSavingService(false);
+      operationLocks.current.release("save");
       return;
     }
     try {
@@ -215,6 +231,9 @@ export function PeerMeshServicesTab({
       notify(editingId == null ? "服务已创建（默认关闭）" : "服务设置已保存");
     } catch (error) {
       notifyError(error, "新增服务失败");
+    } finally {
+      setSavingService(false);
+      operationLocks.current.release("save");
     }
   };
 
@@ -275,7 +294,8 @@ export function PeerMeshServicesTab({
   };
 
   const toggleService = async (service: PeerMeshSharedService, enabled: boolean) => {
-    if (updatingServices.has(service.id)) {
+    const lockKey = `service:${service.id}`;
+    if (!operationLocks.current.acquire(lockKey)) {
       return;
     }
     setUpdatingServices((current) => new Set(current).add(service.id));
@@ -296,6 +316,7 @@ export function PeerMeshServicesTab({
         next.delete(service.id);
         return next;
       });
+      operationLocks.current.release(lockKey);
     }
   };
 
@@ -321,29 +342,77 @@ export function PeerMeshServicesTab({
       confirmLabel: "删除",
       danger: true,
       action: async () => {
-        await adminApi.deletePeerMeshService(service.id);
-        setServices((items) => items.filter((item) => item.id !== service.id));
-        notify("服务已删除");
+        const lockKey = `service:${service.id}`;
+        if (!operationLocks.current.acquire(lockKey)) {
+          return;
+        }
+        setDeletingServices((current) => new Set(current).add(service.id));
+        try {
+          await adminApi.deletePeerMeshService(service.id);
+          setServices((items) => items.filter((item) => item.id !== service.id));
+          notify("服务已删除");
+        } catch (error) {
+          notifyError(error, "删除服务失败");
+          throw error;
+        } finally {
+          setDeletingServices((current) => {
+            const next = new Set(current);
+            next.delete(service.id);
+            return next;
+          });
+          operationLocks.current.release(lockKey);
+        }
       },
     });
   };
 
-  const copyAddress = async (service: PeerMeshSharedService) => {
-    if (!service.publishedAddress) {
-      notifyError(new Error("设备尚未分配虚拟 IP"), "复制地址失败");
+  const copyAddress = async (row: PeerMeshServiceInstanceRow) => {
+    if (!row.availability.available || !row.service.publishedAddress) {
+      notifyError(new Error(row.availability.reason), "复制地址失败");
       return;
     }
-    await copyTextWithFeedback(service.publishedAddress, "已复制虚拟地址");
+    await copyTextWithFeedback(row.service.publishedAddress, "已复制虚拟地址");
   };
 
-  const shareDisabled = !deploymentEnabled || updatingShare || !isAdmin || loadError != null;
-  const shareLabel = loadError
-    ? "状态未知 · 重新加载后才能操作"
-    : !deploymentEnabled
-    ? "部署端未启用 Peer Mesh，不能开启服务共享"
-    : sharing?.configuredEnabled
-      ? "已开启 · 仅向在线且 ACL 允许的对端发布已启用服务"
-      : "已关闭（默认）· 不会上报本机服务";
+  const testAvailability = async (row: PeerMeshServiceInstanceRow) => {
+    const lockKey = `test:${row.key}`;
+    if (!operationLocks.current.acquire(lockKey)) {
+      return;
+    }
+    setTestingInstances((current) => new Set(current).add(row.key));
+    try {
+      const latest = await adminApi.listPeerMeshServices();
+      setServices(latest);
+      const service = latest.find((item) => item.id === row.service.id);
+      const instance = service?.instances?.find((item) =>
+        item.publisherSessionId === row.instance?.publisherSessionId) ?? null;
+      const availability = service
+        ? peerServiceAvailability(service, instance, Boolean(sharing?.effectiveEnabled))
+        : { available: false, reason: "服务已撤回或删除" };
+      if (!availability.available) {
+        throw new Error(availability.reason);
+      }
+      notify(`目录可用：${service?.name} · 实例 ${instance?.publisherSessionId}`);
+    } catch (error) {
+      notifyError(error, "可用性检查失败");
+    } finally {
+      setTestingInstances((current) => {
+        const next = new Set(current);
+        next.delete(row.key);
+        return next;
+      });
+      operationLocks.current.release(lockKey);
+    }
+  };
+
+  const sharingControl = peerServiceSharingControl({
+    deploymentEnabled,
+    isAdmin,
+    loading,
+    loadError,
+    updating: updatingShare,
+    sharing,
+  });
 
   return (
     <section className="space-y-4" aria-busy={loading || updatingShare}>
@@ -360,14 +429,15 @@ export function PeerMeshServicesTab({
           <div>
             <h3 className="text-base font-semibold">Peer 服务共享</h3>
             <p id="peer-service-sharing-help" className="text-small text-default-500">
-              {shareLabel}
+              {sharingControl.label}
             </p>
           </div>
           <Switch
             aria-label="Peer 服务共享"
             aria-describedby="peer-service-sharing-help"
-            isSelected={Boolean(sharing?.configuredEnabled)}
-            isDisabled={shareDisabled || loading}
+            aria-busy={updatingShare}
+            isSelected={sharingControl.selected}
+            isDisabled={sharingControl.disabled}
             onValueChange={(enabled) => setSharingEnabled(enabled)}
           />
         </div>
@@ -378,9 +448,13 @@ export function PeerMeshServicesTab({
           <Switch
             aria-label="允许 mDNS 候选导入"
             aria-describedby="peer-mdns-help"
+            aria-busy={updatingShare}
             isSelected={Boolean(sharing?.mdnsImportEnabled)}
-            isDisabled={shareDisabled || loading || !sharing?.configuredEnabled}
+            isDisabled={sharingControl.disabled || !sharing?.configuredEnabled}
             onValueChange={async (enabled) => {
+              if (!operationLocks.current.acquire("sharing")) {
+                return;
+              }
               setUpdatingShare(true);
               try {
                 const next = await adminApi.updatePeerMeshServiceSharing(undefined, enabled);
@@ -390,6 +464,7 @@ export function PeerMeshServicesTab({
                 notifyError(error, "更新 mDNS 导入失败");
               } finally {
                 setUpdatingShare(false);
+                operationLocks.current.release("sharing");
               }
             }}
           />
@@ -465,11 +540,11 @@ export function PeerMeshServicesTab({
             </Select>
           )}
           <div className="flex items-end">
-            <Button color="primary" onPress={() => void saveService()}>
+            <Button color="primary" isLoading={savingService} isDisabled={savingService} onPress={() => void saveService()}>
               {editingId == null ? "新增（默认关闭）" : "保存更改"}
             </Button>
             {editingId != null && (
-              <Button variant="light" onPress={() => setEditingId(null)}>取消编辑</Button>
+              <Button variant="light" isDisabled={savingService} onPress={() => setEditingId(null)}>取消编辑</Button>
             )}
           </div>
           <div className="flex items-end gap-2">
@@ -494,10 +569,19 @@ export function PeerMeshServicesTab({
       {grouped.length === 0 ? (
         <EmptyState title="暂无本机服务" description="服务默认关闭。管理员添加并显式启用后，才会向获授权对端发布。" />
       ) : (
-        grouped.map(([group, items]) => (
-          <div key={group} className="space-y-2">
-            <h4 className="text-small font-semibold text-default-600">{items[0]?.clientName}</h4>
-            <Table aria-label={`${items[0]?.clientName} 的 Peer 服务`} removeWrapper>
+        grouped.map((group) => (
+          <div key={group.key} className="space-y-2 rounded-md border border-default-200 p-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h4 className="text-small font-semibold text-default-700">
+                {group.publisherClientName} · 客户端 #{group.publisherClientId}
+              </h4>
+              <span className="font-mono text-tiny text-default-500">
+                {group.publisherSessionId == null
+                  ? "尚无运行实例"
+                  : `会话 ${group.publisherSessionId}${group.instanceId ? ` · 实例 ${group.instanceId}` : ""}`}
+              </span>
+            </div>
+            <Table aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`} removeWrapper>
               <TableHeader>
                 <TableColumn>服务</TableColumn>
                 <TableColumn>类型</TableColumn>
@@ -508,8 +592,14 @@ export function PeerMeshServicesTab({
                 <TableColumn>操作</TableColumn>
               </TableHeader>
               <TableBody>
-                {items.map((service) => (
-                  <TableRow key={service.id}>
+                {group.rows.map((row) => {
+                  const service = row.service;
+                  const chip = statusChip(row);
+                  const rowBusy = updatingServices.has(service.id)
+                    || deletingServices.has(service.id)
+                    || testingInstances.has(row.key);
+                  return (
+                  <TableRow key={row.key} aria-busy={rowBusy}>
                     <TableCell>
                       <div className="flex flex-col">
                         <span>{service.name}</span>
@@ -527,40 +617,76 @@ export function PeerMeshServicesTab({
                         : "同归属"}
                     </TableCell>
                     <TableCell>
-                      <Chip size="sm" color={healthChip(service, Boolean(sharing?.configuredEnabled)).color} variant="flat">
-                        {healthChip(service, Boolean(sharing?.configuredEnabled)).text}
+                      <Chip size="sm" color={chip.color} variant="flat">
+                        {chip.text}
                       </Chip>
                     </TableCell>
                     <TableCell>
-                      <span className="text-tiny text-default-500">{instanceSummary(service)}</span>
+                      <span className="text-tiny text-default-500">{instanceSummary(row)}</span>
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap items-center gap-2">
                         {isAdmin && (
                           <Switch
                             aria-label={`启用 ${service.name}`}
+                            aria-busy={updatingServices.has(service.id)}
                             isSelected={service.enabled}
-                            isDisabled={updatingServices.has(service.id) || updatingShare || loadError != null}
+                            isDisabled={rowBusy || updatingShare || loadError != null}
                             onValueChange={(enabled) => void toggleService(service, enabled)}
                           />
                         )}
                         {isAdmin && (
-                          <Button size="sm" variant="light" onPress={() => editService(service)}>
+                          <Button size="sm" variant="light" isDisabled={rowBusy} onPress={() => editService(service)}>
                             编辑
                           </Button>
                         )}
-                        <Button size="sm" variant="flat" onPress={() => void copyAddress(service)}>
+                        {isAdmin && service.enabled && (
+                          <Button
+                            size="sm"
+                            color="warning"
+                            variant="light"
+                            isDisabled={rowBusy || updatingShare || loadError != null}
+                            onPress={() => void toggleService(service, false)}
+                          >
+                            撤回
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          title={row.availability.available ? "复制当前发布地址" : row.availability.reason}
+                          isDisabled={rowBusy || !row.availability.available}
+                          onPress={() => void copyAddress(row)}
+                        >
                           复制地址
                         </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          title={!sharing?.effectiveEnabled ? "全局服务共享已关闭" : "刷新并核对该运行实例的目录状态"}
+                          isLoading={testingInstances.has(row.key)}
+                          isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null}
+                          onPress={() => void testAvailability(row)}
+                        >
+                          测试可用性
+                        </Button>
                         {isAdmin && (
-                          <Button size="sm" color="danger" variant="light" onPress={() => removeService(service)}>
+                          <Button
+                            size="sm"
+                            color="danger"
+                            variant="light"
+                            isLoading={deletingServices.has(service.id)}
+                            isDisabled={rowBusy}
+                            onPress={() => removeService(service)}
+                          >
                             删除
                           </Button>
                         )}
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>

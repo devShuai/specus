@@ -40,6 +40,7 @@ import java.util.Deque;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 4208;
@@ -54,6 +55,7 @@ public class MainActivity extends Activity {
     private static final int COLOR_BUBBLE_OUT = Color.rgb(29, 119, 109);
     private static final int COLOR_DANGER = Color.rgb(176, 62, 71);
     private static final int COLOR_CODE = Color.rgb(15, 24, 31);
+    private static volatile Supplier<String> peerServicesSnapshotSource = PeerServiceRuntime::lastSnapshotJson;
 
     private View statusDot;
     private TextView statusTitle;
@@ -133,7 +135,7 @@ public class MainActivity extends Activity {
         fillSettingsFromConfig();
         targetEditor.setText(ConfigStorage.loadLastTarget(this));
         updateStatus("就绪", "未连接", false);
-        renderServices(PeerServiceRuntime.lastSnapshotJson());
+        reconcilePeerServices();
     }
 
     @Override
@@ -156,7 +158,7 @@ public class MainActivity extends Activity {
         }
         // A full snapshot is authoritative. Broadcasts received while this Activity was stopped
         // are intentionally not queued, so always reconcile the UI when returning to foreground.
-        renderServices(PeerServiceRuntime.lastSnapshotJson());
+        reconcilePeerServices();
         maybeCheckForUpdate();
     }
 
@@ -291,6 +293,7 @@ public class MainActivity extends Activity {
         panel.addView(hint, matchWrap());
         servicesList = new LinearLayout(this);
         servicesList.setOrientation(LinearLayout.VERTICAL);
+        servicesList.setContentDescription("Peer 服务列表");
         panel.addView(servicesList, matchWrap());
         TextView empty = label("暂无对端服务", COLOR_MUTED, 12, Typeface.NORMAL);
         empty.setPadding(0, dp(6), 0, 0);
@@ -298,7 +301,15 @@ public class MainActivity extends Activity {
         return panel;
     }
 
-    private void renderServices(String json) {
+    void reconcilePeerServices() {
+        renderServices(peerServicesSnapshotSource.get());
+    }
+
+    static void setPeerServicesSnapshotSourceForTest(Supplier<String> source) {
+        peerServicesSnapshotSource = source == null ? PeerServiceRuntime::lastSnapshotJson : source;
+    }
+
+    void renderServices(String json) {
         if (servicesList == null) {
             return;
         }
@@ -382,11 +393,13 @@ public class MainActivity extends Activity {
         row.addView(actions, matchWrap());
 
         Button open = actionButton("打开", COLOR_MESH, Color.WHITE);
+        open.setContentDescription("打开服务 " + serviceName);
         open.setEnabled(openable);
         open.setOnClickListener(v -> openExternalUrl(target));
         actions.addView(open, new LinearLayout.LayoutParams(dp(88), dp(48)));
         actions.addView(space(8, 1));
         Button copy = actionButton("复制", Color.rgb(232, 240, 243), COLOR_INK);
+        copy.setContentDescription("复制服务地址 " + serviceName);
         copy.setEnabled(copyable);
         copy.setOnClickListener(v -> {
             ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -412,12 +425,17 @@ public class MainActivity extends Activity {
         boolean configEnabled = item.optBoolean("configEnabled", false);
         boolean locallyPublished = item.optBoolean("locallyPublished", false);
         boolean canToggle = item.optBoolean("canToggle", false);
+        String publicationStatus = !configEnabled ? "配置已关闭"
+                : !canToggle ? "已配置但未发布 · 全局共享关闭"
+                : locallyPublished ? "已启用本实例发布资格"
+                : "已配置但未发布 · 本实例已暂停";
 
         LinearLayout text = new LinearLayout(this);
         text.setOrientation(LinearLayout.VERTICAL);
         text.addView(label(name + " · " + item.optString("application", "tcp"), COLOR_INK, 13, Typeface.BOLD), matchWrap());
         text.addView(label(target + " → :" + item.optInt("publishedPort", 0)
                 + (configEnabled ? "" : "（配置关闭）"), COLOR_MUTED, 12, Typeface.NORMAL), matchWrap());
+        text.addView(label(publicationStatus, COLOR_MUTED, 12, Typeface.NORMAL), matchWrap());
         row.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         Switch publish = new Switch(this);

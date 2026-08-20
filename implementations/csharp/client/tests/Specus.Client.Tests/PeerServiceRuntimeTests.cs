@@ -218,6 +218,47 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
+    public void DesktopSnapshotKeepsPublisherSessionAndServiceIdentity()
+    {
+        using var runtime = new PeerServiceRuntime(_ => { });
+        runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+        runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
+        runtime.SetHasAuthorizedOnlinePeer(true);
+        runtime.ApplyCatalog(22, "same-name", 901, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"),
+        [
+            new AdvertisedService
+            {
+                ServiceId = "svc-desktop01",
+                Name = "Desktop status",
+                Transport = "tcp",
+                Application = "http",
+                PublishedPort = 8080,
+                Path = "/status",
+            },
+        ]);
+
+        var snapshot = Assert.Single(PeerServiceSnapshotPresenter.Remote(runtime));
+        Assert.Equal(22, snapshot.PublisherClientId);
+        Assert.Equal(901, snapshot.PublisherSessionId);
+        Assert.Equal("svc-desktop01", snapshot.ServiceId);
+        Assert.Equal("Desktop status", snapshot.Name);
+        Assert.True(snapshot.Openable);
+    }
+
+    [Fact]
+    public void DesktopSnapshotShowsConfiguredServiceAsNotPublishedWhenGlobalSharingIsOff()
+    {
+        using var runtime = new PeerServiceRuntime(_ => { });
+        runtime.ApplyConfig(Config(sharing: false, FreePort(), enabled: true));
+
+        var snapshot = Assert.Single(PeerServiceSnapshotPresenter.Local(runtime));
+        Assert.True(snapshot.ConfigEnabled);
+        Assert.False(snapshot.CanToggle);
+        Assert.False(snapshot.LocallyPublished);
+        Assert.Equal("已配置但未发布 · 全局共享关闭", snapshot.PublicationStatus);
+    }
+
+    [Fact]
     public async Task OnlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds()
     {
         using var firstTarget = Listen(0);

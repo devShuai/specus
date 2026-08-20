@@ -264,6 +264,8 @@ public sealed class PeerLocalServiceSnapshot
     public bool CanToggle { get; init; }
 
     public bool LocallyPublished { get; init; }
+
+    public string PublicationStatus { get; init; } = "";
 }
 
 public sealed class PeerSessionSnapshot

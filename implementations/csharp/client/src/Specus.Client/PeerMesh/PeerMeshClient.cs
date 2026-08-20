@@ -4647,35 +4647,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         ExpiresAt = item.ExpiresAt,
                     })
                     .ToList(),
-                RemoteServices = _serviceRuntime.RemoteServices()
-                    .Select(item => new PeerRemoteServiceSnapshot
-                    {
-                        PublisherClientId = item.PublisherClientId,
-                        PublisherClientName = item.PublisherClientName,
-                        PublisherSessionId = item.PublisherSessionId,
-                        ServiceId = item.Service.ServiceId,
-                        Name = item.Service.Name,
-                        Application = item.Service.Application,
-                        AccessTarget = item.AccessTarget,
-                        Openable = item.Openable,
-                        Copyable = item.Copyable,
-                        UnavailableReason = item.UnavailableReason,
-                    })
-                    .ToList(),
-                LocalServices = _serviceRuntime.LocalServices
-                    .Select(item => new PeerLocalServiceSnapshot
-                    {
-                        ServiceId = item.ServiceId,
-                        Name = item.Name,
-                        Application = item.Application,
-                        Target = $"{item.TargetHost}:{item.TargetPort}",
-                        PublishedPort = item.PublishedPort,
-                        ConfigEnabled = item.Enabled,
-                        CanToggle = _serviceRuntime.EffectiveSharing && item.Enabled,
-                        LocallyPublished = _serviceRuntime.EffectiveSharing && item.Enabled
-                            && _serviceRuntime.IsLocallyPublished(item.ServiceId),
-                    })
-                    .ToList(),
+                RemoteServices = PeerServiceSnapshotPresenter.Remote(_serviceRuntime),
+                LocalServices = PeerServiceSnapshotPresenter.Local(_serviceRuntime),
                 UpdatedAt = DateTimeOffset.Now,
             };
         }

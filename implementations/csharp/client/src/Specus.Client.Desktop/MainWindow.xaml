@@ -554,6 +554,15 @@
                                     </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="发布端口" Binding="{Binding PublishedPort}" Width="90" />
                                     <DataGridCheckBoxColumn Header="配置启用" Binding="{Binding ConfigEnabled}" Width="80" IsReadOnly="True" />
+                                    <DataGridTemplateColumn Header="状态" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding PublicationStatus}"
+                                                           TextWrapping="Wrap"
+                                                           AutomationProperties.Name="{Binding PublicationStatus}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTemplateColumn Header="本实例发布" Width="90">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -562,7 +571,7 @@
                                                           AutomationProperties.Name="{Binding Name, StringFormat=发布服务 {0}}"
                                                           Click="LocalPeerServiceToggle_Click"
                                                           Tag="{Binding}"
-                                                          ToolTip="只影响当前运行实例，不会改管理端配置" />
+                                                          ToolTip="{Binding PublicationStatus}" />
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
