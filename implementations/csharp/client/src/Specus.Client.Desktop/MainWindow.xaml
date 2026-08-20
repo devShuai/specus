@@ -467,6 +467,15 @@
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="实例" Binding="{Binding PublisherSessionId}" Width="120" />
+                                    <DataGridTemplateColumn Header="服务" SortMemberPath="Name" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Name}"
+                                                         ToolTip="{Binding ServiceId}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTemplateColumn Header="应用" SortMemberPath="Application" Width="80">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -492,11 +501,13 @@
                                                             Margin="0,0,6,0"
                                                             Padding="8,2"
                                                             IsEnabled="{Binding Openable}"
+                                                            AutomationProperties.HelpText="{Binding UnavailableReason}"
                                                             Click="OpenPeerService_Click"
                                                             Tag="{Binding}" />
                                                     <Button Content="复制"
                                                             Padding="8,2"
                                                             IsEnabled="{Binding Copyable}"
+                                                            AutomationProperties.HelpText="{Binding UnavailableReason}"
                                                             Click="CopyPeerService_Click"
                                                             Tag="{Binding}" />
                                                 </StackPanel>
@@ -547,7 +558,8 @@
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
                                                 <CheckBox IsChecked="{Binding LocallyPublished, Mode=OneWay}"
-                                                          IsEnabled="{Binding ConfigEnabled}"
+                                                          IsEnabled="{Binding CanToggle}"
+                                                          AutomationProperties.Name="{Binding Name, StringFormat=发布服务 {0}}"
                                                           Click="LocalPeerServiceToggle_Click"
                                                           Tag="{Binding}"
                                                           ToolTip="只影响当前运行实例，不会改管理端配置" />

@@ -232,6 +232,10 @@ public sealed class PeerRemoteServiceSnapshot
 
     public long PublisherSessionId { get; init; }
 
+    public string? ServiceId { get; init; }
+
+    public string? Name { get; init; }
+
     public string? Application { get; init; }
 
     public string? AccessTarget { get; init; }
@@ -256,6 +260,8 @@ public sealed class PeerLocalServiceSnapshot
     public int PublishedPort { get; init; }
 
     public bool ConfigEnabled { get; init; }
+
+    public bool CanToggle { get; init; }
 
     public bool LocallyPublished { get; init; }
 }

@@ -154,6 +154,9 @@ public class MainActivity extends Activity {
             registerReceiver(chatReceiver, chatFilter);
             registerReceiver(servicesReceiver, servicesFilter);
         }
+        // A full snapshot is authoritative. Broadcasts received while this Activity was stopped
+        // are intentionally not queued, so always reconcile the UI when returning to foreground.
+        renderServices(PeerServiceRuntime.lastSnapshotJson());
         maybeCheckForUpdate();
     }
 
@@ -353,14 +356,19 @@ public class MainActivity extends Activity {
 
         String publisher = item.optString("publisherClientName", "-");
         long sessionId = item.optLong("publisherSessionId", 0L);
+        String serviceId = item.optString("serviceId", "");
+        String serviceName = item.optString("name", serviceId.isBlank() ? "未命名服务" : serviceId);
         String application = item.optString("application", "tcp");
         String target = item.optString("accessTarget", "");
         String reason = item.optString("unavailableReason", "");
         boolean openable = item.optBoolean("openable", false);
         boolean copyable = item.optBoolean("copyable", false);
 
-        TextView title = label(publisher + " · 实例 " + sessionId + " · " + application, COLOR_INK, 13, Typeface.BOLD);
+        TextView title = label(publisher + " · 实例 " + sessionId, COLOR_INK, 13, Typeface.BOLD);
         row.addView(title, matchWrap());
+        TextView service = label(serviceName + " · " + application, COLOR_INK, 12, Typeface.BOLD);
+        service.setContentDescription("服务 " + serviceName + "，发布实例 " + publisher + " " + sessionId);
+        row.addView(service, matchWrap());
         TextView detail = label(target.isEmpty() ? reason : target, COLOR_MUTED, 12, Typeface.NORMAL);
         row.addView(detail, matchWrap());
         if (!reason.isEmpty()) {
@@ -402,7 +410,8 @@ public class MainActivity extends Activity {
         String name = item.optString("name", serviceId);
         String target = item.optString("target", "");
         boolean configEnabled = item.optBoolean("configEnabled", false);
-        boolean locallyPublished = item.optBoolean("locallyPublished", true);
+        boolean locallyPublished = item.optBoolean("locallyPublished", false);
+        boolean canToggle = item.optBoolean("canToggle", false);
 
         LinearLayout text = new LinearLayout(this);
         text.setOrientation(LinearLayout.VERTICAL);
@@ -413,7 +422,8 @@ public class MainActivity extends Activity {
 
         Switch publish = new Switch(this);
         publish.setMinHeight(dp(48));
-        publish.setEnabled(configEnabled);
+        publish.setEnabled(configEnabled && canToggle);
+        publish.setContentDescription("发布本机服务 " + name);
         publish.setOnCheckedChangeListener(null);
         publish.setChecked(configEnabled && locallyPublished);
         publish.setOnCheckedChangeListener((button, checked) ->
