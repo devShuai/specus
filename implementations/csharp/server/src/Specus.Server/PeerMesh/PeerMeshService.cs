@@ -40,7 +40,7 @@ public sealed partial class PeerMeshService
     private const string TypeClose = "close";
     internal const string TypeServiceReport = "service-report";
     internal const string TypeServiceCatalog = "service-catalog";
-    internal const int PeerServiceDiscoveryVersion = 1;
+    internal const int PeerServiceDiscoveryVersion = 2;
     private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
     private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations = new();
     private readonly ConcurrentDictionary<long, long> _pendingRelayBytes = new();
@@ -52,13 +52,19 @@ public sealed partial class PeerMeshService
     private readonly ILogger<PeerMeshService> _logger;
 
     public PeerMeshService(SpecusDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
-        ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null)
+        ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null,
+        PeerMeshServiceState? state = null)
     {
         _db = db;
         _sessions = sessions;
         _options = options.Value;
         _turnCredentials = turnCredentials ?? new TurnCredentialService(options);
         _logger = logger;
+        state ??= new PeerMeshServiceState();
+        _serviceCatalogs = state.ServiceCatalogs;
+        _serviceCatalogRevisions = state.ServiceCatalogRevisions;
+        _audits = state.Audits;
+        _serviceReportWindows = state.ServiceReportWindows;
     }
 
     public bool Enabled => _options.Enabled;
@@ -206,7 +212,9 @@ public sealed partial class PeerMeshService
             device = await EnsureDeviceAsync(account, environment.PeerPublicKey, cancellationToken)
                 .ConfigureAwait(false);
         }
-        return BuildConfig(account, device, requestServerName);
+        var clientProtocolVersion = NormalizeDiscoveryVersion(environment.ClientPeerServiceCapabilities.Version);
+        return await BuildConfigAsync(account, device, requestServerName, clientProtocolVersion, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task<PeerMeshConfig> BuildRuntimeConfigAsync(ClientAccount account, CancellationToken cancellationToken)
@@ -220,7 +228,14 @@ public sealed partial class PeerMeshService
                 .ConfigureAwait(false)
                 ?? await CreateDeviceAsync(account, cancellationToken).ConfigureAwait(false);
         }
-        return BuildConfig(account, device, null);
+        var clientProtocolVersion = await _db.ClientSessions.AsNoTracking()
+            .Where(session => session.TenantId == account.TenantId && session.ClientId == account.Id
+                && session.Status == ClientAccountService.StatusNettyOnline)
+            .Select(session => (int?)session.PeerServiceDiscoveryVersion)
+            .MaxAsync(cancellationToken)
+            .ConfigureAwait(false) ?? 0;
+        return await BuildConfigAsync(account, device, null, clientProtocolVersion, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public PublicStunConfig PublicStunConfig(string? requestHost)
@@ -371,6 +386,18 @@ public sealed partial class PeerMeshService
                 }
                 break;
             case TypeServiceReport:
+                if (System.Text.Encoding.UTF8.GetByteCount(request.Message) > 16 * 1024)
+                {
+                    throw new ArgumentException("service-report exceeds 16384 bytes");
+                }
+                if (!string.IsNullOrWhiteSpace(request.ToClientName))
+                {
+                    throw new ArgumentException("service-report toClientName must be empty");
+                }
+                if (signal.PublisherSessionId is not null)
+                {
+                    throw new ArgumentException("service-report publisherSessionId is server-bound");
+                }
                 await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
                     .ConfigureAwait(false);
                 return;
@@ -454,6 +481,7 @@ public sealed partial class PeerMeshService
             return;
         }
         await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
+        await PushCurrentCatalogsAsync(account, cancellationToken).ConfigureAwait(false);
         var targets = await RosterRefreshTargetsAsync(account, cancellationToken).ConfigureAwait(false);
         foreach (var target in targets)
         {
@@ -561,6 +589,7 @@ public sealed partial class PeerMeshService
         }
         acl.UpdatedAt = now;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
         return AclView(acl);
     }
 
@@ -575,6 +604,45 @@ public sealed partial class PeerMeshService
         }
         _db.PeerMeshAcls.Remove(acl);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task RefreshAuthorizationAsync(ManagementContext context, CancellationToken cancellationToken)
+    {
+        var clients = await _db.ClientAccounts.AsNoTracking()
+            .Where(account => account.TenantId == context.TenantId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var byId = clients.ToDictionary(account => account.Id);
+        foreach (var client in clients)
+        {
+            await PushConfigAsync(client, cancellationToken).ConfigureAwait(false);
+            await PushRosterAsync(client, cancellationToken).ConfigureAwait(false);
+        }
+        var sessions = await _db.PeerMeshSessions
+            .Where(session => session.TenantId == context.TenantId && session.Status != StatusClosed)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var closed = new List<PeerMeshSessionView>();
+        var now = DateTimeOffset.UtcNow;
+        foreach (var session in sessions)
+        {
+            var allowed = byId.TryGetValue(session.SourceClientId, out var source)
+                && byId.TryGetValue(session.TargetClientId, out var target)
+                && await CanPeerAsync(source, target, cancellationToken).ConfigureAwait(false);
+            if (!allowed)
+            {
+                MarkClosed(session, now);
+                closed.Add(SessionView(session));
+            }
+        }
+        if (closed.Count > 0)
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var session in closed)
+            {
+                await SendCloseAsync(session, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        await OnAuthorizationChangedAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<PeerMeshSessionView>> ListSessionsAsync(ManagementContext context, int? limit,
@@ -859,7 +927,8 @@ public sealed partial class PeerMeshService
         return views;
     }
 
-    private PeerMeshConfig BuildConfig(ClientAccount account, PeerMeshDevice? device, string? requestServerName)
+    private async Task<PeerMeshConfig> BuildConfigAsync(ClientAccount account, PeerMeshDevice? device,
+        string? requestServerName, int clientProtocolVersion, CancellationToken cancellationToken)
     {
         var config = new PeerMeshConfig
         {
@@ -882,24 +951,9 @@ public sealed partial class PeerMeshService
             EffectiveEnabled = effective,
             MdnsImportEnabled = sharing?.MdnsImportEnabled == true && effective,
         };
-        config.LocalServices = _db.PeerMeshSharedServices.AsNoTracking()
-            .Where(row => row.TenantId == account.TenantId && row.ClientId == account.Id)
-            .OrderBy(row => row.Name)
-            .Select(row => new LocalPeerService
-            {
-                ServiceId = row.ServiceId,
-                Name = row.Name,
-                Description = row.Description,
-                Transport = row.Transport,
-                Application = row.Application,
-                TargetHost = row.TargetHost,
-                TargetPort = row.TargetPort,
-                PublishedPort = row.PublishedPort,
-                Path = row.Path,
-                Enabled = row.Enabled,
-                Visibility = row.Visibility,
-            })
-            .ToList();
+        config.LocalServices = clientProtocolVersion < 2
+            ? []
+            : await BuildLocalServicesAsync(account, cancellationToken).ConfigureAwait(false);
         if (!Enabled || device is null)
         {
             return config;
@@ -924,6 +978,70 @@ public sealed partial class PeerMeshService
         config.ServerPublicKey = ServerPublicKey();
         config.ClientPublicKey = device.PublicKey;
         return config;
+    }
+
+    private async Task<List<LocalPeerService>> BuildLocalServicesAsync(ClientAccount publisher,
+        CancellationToken cancellationToken)
+    {
+        var definitions = await _db.PeerMeshSharedServices.AsNoTracking()
+            .Where(row => row.TenantId == publisher.TenantId && row.ClientId == publisher.Id)
+            .OrderBy(row => row.Name)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var recipients = await _db.ClientAccounts.AsNoTracking()
+            .Where(row => row.TenantId == publisher.TenantId && row.Id != publisher.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var result = new List<LocalPeerService>(definitions.Count);
+        foreach (var row in definitions)
+        {
+            var explicitIds = DecodeClientIds(row.AllowedClientIds);
+            var allowedIps = new List<string>();
+            if (row.Enabled)
+            {
+                foreach (var recipient in recipients)
+                {
+                    if (!await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false))
+                    {
+                        continue;
+                    }
+                    var visible = string.Equals(row.Visibility, "OWNER", StringComparison.OrdinalIgnoreCase)
+                        ? string.Equals(NormalizeOwner(publisher.OwnerUsername), NormalizeOwner(recipient.OwnerUsername),
+                            StringComparison.Ordinal)
+                        : explicitIds.Count == 0 || explicitIds.Contains(recipient.Id);
+                    if (!visible)
+                    {
+                        continue;
+                    }
+                    var virtualIp = await _db.PeerMeshDevices.AsNoTracking()
+                        .Where(candidate => candidate.TenantId == publisher.TenantId
+                            && candidate.ClientId == recipient.Id && candidate.Enabled)
+                        .Select(candidate => candidate.VirtualIp)
+                        .FirstOrDefaultAsync(cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(virtualIp))
+                    {
+                        allowedIps.Add(virtualIp.Trim());
+                    }
+                }
+            }
+            result.Add(new LocalPeerService
+            {
+                ServiceId = row.ServiceId,
+                Name = row.Name,
+                Description = row.Description,
+                Transport = row.Transport,
+                Application = row.Application,
+                TargetHost = row.TargetHost,
+                TargetPort = row.TargetPort,
+                PublishedPort = row.PublishedPort,
+                Path = row.Path,
+                Enabled = row.Enabled,
+                Visibility = row.Visibility,
+                AllowedPeerVirtualIps = allowedIps.Distinct(StringComparer.Ordinal).Order().ToList(),
+            });
+        }
+        return result;
     }
 
     private async Task<PeerMeshDevice> EnsureDeviceAsync(ClientAccount account, string? peerPublicKey,

@@ -28,18 +28,19 @@ import (
 )
 
 const (
-	TypeCandidates    = "candidates"
-	TypeSessionGrant  = "session-grant"
-	TypeRoster        = "roster"
-	TypeConfig        = "peer-config"
-	TypePathReport    = "path-report"
-	TypeTrafficReport = "traffic-report"
-	TypeDeviceReport  = "device-report"
-	TypeClose         = "close"
-	TypeServiceReport = "service-report"
+	TypeCandidates     = "candidates"
+	TypeSessionGrant   = "session-grant"
+	TypeRoster         = "roster"
+	TypeConfig         = "peer-config"
+	TypePathReport     = "path-report"
+	TypeTrafficReport  = "traffic-report"
+	TypeDeviceReport   = "device-report"
+	TypeClose          = "close"
+	TypeServiceReport  = "service-report"
 	TypeServiceCatalog = "service-catalog"
 
-	peerServiceDiscoveryVersion = 1
+	// Version 2 adds publisher-side data-plane ACL enforcement.
+	peerServiceDiscoveryVersion = 2
 
 	PathDirect = "DIRECT"
 	PathRelay  = "RELAY"
@@ -60,41 +61,42 @@ type AccessContext struct {
 
 // LoginConfig is the client-auth peerMesh object.
 type LoginConfig struct {
-	Enabled           bool     `json:"enabled"`
-	ClientID          int64    `json:"clientId"`
-	ClientName        string   `json:"clientName"`
-	VirtualIP         string   `json:"virtualIp"`
-	CIDR              string   `json:"cidr"`
-	StunHost          string   `json:"stunHost"`
-	StunPort          int      `json:"stunPort"`
-	TurnHost          string   `json:"turnHost"`
-	TurnPort          int      `json:"turnPort"`
-	PublicStunServers []string `json:"publicStunServers"`
-	IceUsername       string   `json:"iceUsername"`
-	IceCredential     string   `json:"iceCredential"`
-	IceRealm          string   `json:"iceRealm"`
-	IceNonce          string   `json:"iceNonce"`
-	ServerPublicKey              string               `json:"serverPublicKey"`
-	ClientPublicKey              string               `json:"clientPublicKey"`
-	SessionTTLSeconds            int64                `json:"sessionTtlSeconds"`
-	PeerServiceDiscoveryVersion  int                  `json:"peerServiceDiscoveryVersion"`
-	ServiceSharing               ServiceSharingStatus `json:"serviceSharing"`
-	LocalServices                []LocalPeerService   `json:"localServices"`
+	Enabled                     bool                 `json:"enabled"`
+	ClientID                    int64                `json:"clientId"`
+	ClientName                  string               `json:"clientName"`
+	VirtualIP                   string               `json:"virtualIp"`
+	CIDR                        string               `json:"cidr"`
+	StunHost                    string               `json:"stunHost"`
+	StunPort                    int                  `json:"stunPort"`
+	TurnHost                    string               `json:"turnHost"`
+	TurnPort                    int                  `json:"turnPort"`
+	PublicStunServers           []string             `json:"publicStunServers"`
+	IceUsername                 string               `json:"iceUsername"`
+	IceCredential               string               `json:"iceCredential"`
+	IceRealm                    string               `json:"iceRealm"`
+	IceNonce                    string               `json:"iceNonce"`
+	ServerPublicKey             string               `json:"serverPublicKey"`
+	ClientPublicKey             string               `json:"clientPublicKey"`
+	SessionTTLSeconds           int64                `json:"sessionTtlSeconds"`
+	PeerServiceDiscoveryVersion int                  `json:"peerServiceDiscoveryVersion"`
+	ServiceSharing              ServiceSharingStatus `json:"serviceSharing"`
+	LocalServices               []LocalPeerService   `json:"localServices"`
 }
 
 // LocalPeerService is the owner-only definition pushed in login/peer-config.
 type LocalPeerService struct {
-	ServiceID     string `json:"serviceId"`
-	Name          string `json:"name"`
-	Description   string `json:"description,omitempty"`
-	Transport     string `json:"transport"`
-	Application   string `json:"application"`
-	TargetHost    string `json:"targetHost"`
-	TargetPort    int    `json:"targetPort"`
-	PublishedPort int    `json:"publishedPort"`
-	Path          string `json:"path,omitempty"`
-	Enabled       bool   `json:"enabled"`
-	Visibility    string `json:"visibility,omitempty"`
+	ServiceID             string   `json:"serviceId"`
+	Name                  string   `json:"name"`
+	Description           string   `json:"description,omitempty"`
+	Transport             string   `json:"transport"`
+	Application           string   `json:"application"`
+	TargetHost            string   `json:"targetHost"`
+	TargetPort            int      `json:"targetPort"`
+	PublishedPort         int      `json:"publishedPort"`
+	Path                  string   `json:"path,omitempty"`
+	Enabled               bool     `json:"enabled"`
+	Visibility            string   `json:"visibility,omitempty"`
+	AllowedPeerVirtualIPs []string `json:"allowedPeerVirtualIps"`
 }
 
 type DeviceView struct {
@@ -228,18 +230,18 @@ type IceServer struct {
 }
 
 type RosterItem struct {
-	ClientID                     int64    `json:"clientId"`
-	ClientName                   string   `json:"clientName"`
-	VirtualIP                    string   `json:"virtualIp"`
-	PublicKey                    *string  `json:"publicKey,omitempty"`
-	Online                       bool     `json:"online"`
-	MessageSendCapable           bool     `json:"messageSendCapable"`
-	MessageReceiveCapable        bool     `json:"messageReceiveCapable"`
-	MessageAttachmentsCapable    bool     `json:"messageAttachmentsCapable"`
-	MessageMediaPreviewCapable   bool     `json:"messageMediaPreviewCapable"`
-	MessageMaxAttachmentBytes    int64    `json:"messageMaxAttachmentBytes"`
-	PeerServiceDiscoveryVersion  int      `json:"peerServiceDiscoveryVersion"`
-	PeerServiceApplications      []string `json:"peerServiceApplications"`
+	ClientID                    int64    `json:"clientId"`
+	ClientName                  string   `json:"clientName"`
+	VirtualIP                   string   `json:"virtualIp"`
+	PublicKey                   *string  `json:"publicKey,omitempty"`
+	Online                      bool     `json:"online"`
+	MessageSendCapable          bool     `json:"messageSendCapable"`
+	MessageReceiveCapable       bool     `json:"messageReceiveCapable"`
+	MessageAttachmentsCapable   bool     `json:"messageAttachmentsCapable"`
+	MessageMediaPreviewCapable  bool     `json:"messageMediaPreviewCapable"`
+	MessageMaxAttachmentBytes   int64    `json:"messageMaxAttachmentBytes"`
+	PeerServiceDiscoveryVersion int      `json:"peerServiceDiscoveryVersion"`
+	PeerServiceApplications     []string `json:"peerServiceApplications"`
 }
 
 type ServiceSharingStatus struct {
@@ -290,8 +292,8 @@ type ServiceInstanceView struct {
 }
 
 type ImportResult struct {
-	Created  int                `json:"created"`
-	Skipped  int                `json:"skipped"`
+	Created  int                 `json:"created"`
+	Skipped  int                 `json:"skipped"`
 	Services []SharedServiceView `json:"services"`
 }
 
@@ -328,19 +330,19 @@ type SharedServiceView struct {
 }
 
 type ServiceMutation struct {
-	ClientID      *int64  `json:"clientId"`
-	ServiceID     *string `json:"serviceId"`
-	Name          *string `json:"name"`
-	Description   *string `json:"description"`
-	Transport     *string `json:"transport"`
-	Application   *string `json:"application"`
-	TargetHost    *string `json:"targetHost"`
-	TargetPort    *int    `json:"targetPort"`
-	PublishedPort *int    `json:"publishedPort"`
-	Path          *string `json:"path"`
-	Enabled          *bool    `json:"enabled"`
-	Visibility       *string  `json:"visibility"`
-	AllowedClientIDs []int64  `json:"allowedClientIds"`
+	ClientID         *int64  `json:"clientId"`
+	ServiceID        *string `json:"serviceId"`
+	Name             *string `json:"name"`
+	Description      *string `json:"description"`
+	Transport        *string `json:"transport"`
+	Application      *string `json:"application"`
+	TargetHost       *string `json:"targetHost"`
+	TargetPort       *int    `json:"targetPort"`
+	PublishedPort    *int    `json:"publishedPort"`
+	Path             *string `json:"path"`
+	Enabled          *bool   `json:"enabled"`
+	Visibility       *string `json:"visibility"`
+	AllowedClientIDs []int64 `json:"allowedClientIds"`
 }
 
 type SharingMutation struct {
@@ -349,15 +351,15 @@ type SharingMutation struct {
 }
 
 type ServiceSharingView struct {
-	DeploymentEnabled            bool     `json:"deploymentEnabled"`
-	ConfiguredEnabled            bool     `json:"configuredEnabled"`
-	EffectiveEnabled             bool     `json:"effectiveEnabled"`
-	PeerServiceDiscoveryVersion  int      `json:"peerServiceDiscoveryVersion"`
-	SupportedApplications        []string `json:"supportedApplications"`
-	EnabledServiceCount          int64    `json:"enabledServiceCount"`
-	UpdatedAt                    *string  `json:"updatedAt"`
-	UpdatedBy                    *string  `json:"updatedBy"`
-	MdnsImportEnabled            bool     `json:"mdnsImportEnabled"`
+	DeploymentEnabled           bool     `json:"deploymentEnabled"`
+	ConfiguredEnabled           bool     `json:"configuredEnabled"`
+	EffectiveEnabled            bool     `json:"effectiveEnabled"`
+	PeerServiceDiscoveryVersion int      `json:"peerServiceDiscoveryVersion"`
+	SupportedApplications       []string `json:"supportedApplications"`
+	EnabledServiceCount         int64    `json:"enabledServiceCount"`
+	UpdatedAt                   *string  `json:"updatedAt"`
+	UpdatedBy                   *string  `json:"updatedBy"`
+	MdnsImportEnabled           bool     `json:"mdnsImportEnabled"`
 }
 
 type Candidate struct {
@@ -372,47 +374,47 @@ type Candidate struct {
 }
 
 type ControlMessage struct {
-	Type                 string       `json:"type"`
-	SourceClientID       int64        `json:"sourceClientId,omitempty"`
-	SourceClientName     string       `json:"sourceClientName,omitempty"`
-	SourceVirtualIP      string       `json:"sourceVirtualIp,omitempty"`
-	SourcePublicKey      *string      `json:"sourcePublicKey,omitempty"`
-	TargetClientID       int64        `json:"targetClientId,omitempty"`
-	TargetClientName     string       `json:"targetClientName,omitempty"`
-	TargetVirtualIP      string       `json:"targetVirtualIp,omitempty"`
-	TargetPublicKey      *string      `json:"targetPublicKey,omitempty"`
-	SessionID            *int64       `json:"sessionId,omitempty"`
-	Token                string       `json:"token,omitempty"`
-	ExpiresAt            string       `json:"expiresAt,omitempty"`
-	PathType             string       `json:"pathType,omitempty"`
-	Status               string       `json:"status,omitempty"`
-	RTTMillis            *int64       `json:"rttMillis,omitempty"`
-	LocalEndpoint        *string      `json:"localEndpoint,omitempty"`
-	RemoteEndpoint       *string      `json:"remoteEndpoint,omitempty"`
-	DirectBytes          int64        `json:"directBytes,omitempty"`
-	RelayBytes           int64        `json:"relayBytes,omitempty"`
-	NatType              *string      `json:"natType,omitempty"`
-	NatMappingBehavior   *string      `json:"natMappingBehavior,omitempty"`
-	NatFilteringBehavior *string      `json:"natFilteringBehavior,omitempty"`
-	NatBehaviorDiscovery *string      `json:"natBehaviorDiscovery,omitempty"`
-	LastEndpoint         *string      `json:"lastEndpoint,omitempty"`
-	VirtualDeviceMode    *string      `json:"virtualDeviceMode,omitempty"`
-	VirtualDeviceName    *string      `json:"virtualDeviceName,omitempty"`
-	VirtualDeviceStatus  *string      `json:"virtualDeviceStatus,omitempty"`
-	VirtualDeviceError   *string      `json:"virtualDeviceError,omitempty"`
-	PeerMesh             *LoginConfig `json:"peerMesh,omitempty"`
-	DataFrameVersion     int          `json:"dataFrameVersion,omitempty"`
-	Candidates           []Candidate  `json:"candidates,omitempty"`
-	Peers                []RosterItem `json:"peers,omitempty"`
-	Reason               string       `json:"reason,omitempty"`
-	CreatedAtMillis      int64        `json:"createdAtMillis,omitempty"`
-	Enabled              *bool        `json:"enabled,omitempty"`
-	Revision             *int64       `json:"revision,omitempty"`
-	PublisherClientID    int64        `json:"publisherClientId,omitempty"`
-	PublisherClientName  string       `json:"publisherClientName,omitempty"`
-	PublisherSessionID   *int64       `json:"publisherSessionId,omitempty"`
-	InstanceID           string       `json:"instanceId,omitempty"`
-	GeneratedAt          string       `json:"generatedAt,omitempty"`
+	Type                 string              `json:"type"`
+	SourceClientID       int64               `json:"sourceClientId,omitempty"`
+	SourceClientName     string              `json:"sourceClientName,omitempty"`
+	SourceVirtualIP      string              `json:"sourceVirtualIp,omitempty"`
+	SourcePublicKey      *string             `json:"sourcePublicKey,omitempty"`
+	TargetClientID       int64               `json:"targetClientId,omitempty"`
+	TargetClientName     string              `json:"targetClientName,omitempty"`
+	TargetVirtualIP      string              `json:"targetVirtualIp,omitempty"`
+	TargetPublicKey      *string             `json:"targetPublicKey,omitempty"`
+	SessionID            *int64              `json:"sessionId,omitempty"`
+	Token                string              `json:"token,omitempty"`
+	ExpiresAt            string              `json:"expiresAt,omitempty"`
+	PathType             string              `json:"pathType,omitempty"`
+	Status               string              `json:"status,omitempty"`
+	RTTMillis            *int64              `json:"rttMillis,omitempty"`
+	LocalEndpoint        *string             `json:"localEndpoint,omitempty"`
+	RemoteEndpoint       *string             `json:"remoteEndpoint,omitempty"`
+	DirectBytes          int64               `json:"directBytes,omitempty"`
+	RelayBytes           int64               `json:"relayBytes,omitempty"`
+	NatType              *string             `json:"natType,omitempty"`
+	NatMappingBehavior   *string             `json:"natMappingBehavior,omitempty"`
+	NatFilteringBehavior *string             `json:"natFilteringBehavior,omitempty"`
+	NatBehaviorDiscovery *string             `json:"natBehaviorDiscovery,omitempty"`
+	LastEndpoint         *string             `json:"lastEndpoint,omitempty"`
+	VirtualDeviceMode    *string             `json:"virtualDeviceMode,omitempty"`
+	VirtualDeviceName    *string             `json:"virtualDeviceName,omitempty"`
+	VirtualDeviceStatus  *string             `json:"virtualDeviceStatus,omitempty"`
+	VirtualDeviceError   *string             `json:"virtualDeviceError,omitempty"`
+	PeerMesh             *LoginConfig        `json:"peerMesh,omitempty"`
+	DataFrameVersion     int                 `json:"dataFrameVersion,omitempty"`
+	Candidates           []Candidate         `json:"candidates,omitempty"`
+	Peers                []RosterItem        `json:"peers,omitempty"`
+	Reason               string              `json:"reason,omitempty"`
+	CreatedAtMillis      int64               `json:"createdAtMillis,omitempty"`
+	Enabled              *bool               `json:"enabled,omitempty"`
+	Revision             *int64              `json:"revision,omitempty"`
+	PublisherClientID    int64               `json:"publisherClientId,omitempty"`
+	PublisherClientName  string              `json:"publisherClientName,omitempty"`
+	PublisherSessionID   *int64              `json:"publisherSessionId,omitempty"`
+	InstanceID           string              `json:"instanceId,omitempty"`
+	GeneratedAt          string              `json:"generatedAt,omitempty"`
 	Services             []AdvertisedService `json:"services,omitempty"`
 	Stats                []ServiceStats      `json:"stats,omitempty"`
 	MdnsCandidates       []MdnsCandidate     `json:"mdnsCandidates,omitempty"`
@@ -449,6 +451,8 @@ type Service struct {
 	sessionTokenCacheMu sync.RWMutex
 	catalogMu           sync.Mutex
 	catalogs            map[catalogKey]catalogSnapshot
+	catalogRevisions    map[catalogKey]int64
+	serviceReportRates  map[int64][]time.Time
 	auditMu             sync.Mutex
 	audits              []AuditEvent
 }
@@ -494,6 +498,8 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 		turnCredentials:     credentials,
 		sessionTokenCache:   make(map[int64]string),
 		catalogs:            make(map[catalogKey]catalogSnapshot),
+		catalogRevisions:    make(map[catalogKey]int64),
+		serviceReportRates:  make(map[int64][]time.Time),
 		audits:              []AuditEvent{},
 	}
 }
@@ -611,6 +617,8 @@ func (s *Service) Run(ctx context.Context) {
 	defer sessionTicker.Stop()
 	relayTicker := time.NewTicker(time.Duration(s.cfg.RelayTrafficFlushIntervalMs) * time.Millisecond)
 	defer relayTicker.Stop()
+	catalogTicker := time.NewTicker(30 * time.Second)
+	defer catalogTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -628,11 +636,13 @@ func (s *Service) Run(ctx context.Context) {
 			if err := s.FlushRelayTraffic(ctx); err != nil {
 				s.logger.Warn("peer mesh relay traffic flush failed", "err", err)
 			}
+		case <-catalogTicker.C:
+			s.expireServiceCatalogs(ctx, time.Now())
 		}
 	}
 }
 
-func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAccount, peerPublicKey, requestHost string) (LoginConfig, error) {
+func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAccount, peerPublicKey, requestHost string, clientProtocolVersion int) (LoginConfig, error) {
 	var device *store.PeerMeshDevice
 	var err error
 	if s.Enabled() {
@@ -641,7 +651,7 @@ func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAcco
 			return LoginConfig{}, err
 		}
 	}
-	return s.buildConfig(account, device, requestHost), nil
+	return s.buildConfig(ctx, account, device, requestHost, NormalizePeerServiceVersion(clientProtocolVersion)), nil
 }
 
 func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAccount) (LoginConfig, error) {
@@ -659,10 +669,16 @@ func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAc
 			}
 		}
 	}
-	return s.buildConfig(account, device, ""), nil
+	clientProtocolVersion := 0
+	if online, lookupErr := s.db.GetOnlineClientSession(ctx, account.TenantID, account.ID, auth.StatusNettyOnline); lookupErr != nil {
+		return LoginConfig{}, lookupErr
+	} else if online != nil {
+		clientProtocolVersion = online.PeerServiceDiscoveryVersion
+	}
+	return s.buildConfig(ctx, account, device, "", clientProtocolVersion), nil
 }
 
-func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMeshDevice, requestHost string) LoginConfig {
+func (s *Service) buildConfig(ctx context.Context, account store.ClientAccount, device *store.PeerMeshDevice, requestHost string, clientProtocolVersion int) LoginConfig {
 	cfg := LoginConfig{
 		Enabled:           false,
 		ClientID:          account.ID,
@@ -672,7 +688,7 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 	}
 	cfg.PeerServiceDiscoveryVersion = peerServiceDiscoveryVersion
 	cfg.ServiceSharing = s.sharingStatusFor(account, device)
-	cfg.LocalServices = s.localServicesFor(account)
+	cfg.LocalServices = s.localServicesFor(ctx, account, clientProtocolVersion)
 	if !s.Enabled() || device == nil {
 		return cfg
 	}
@@ -916,6 +932,15 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 			return err
 		}
 	case TypeServiceReport:
+		if len([]byte(request.Message)) > 16*1024 {
+			return errors.New("service-report exceeds 16384 bytes")
+		}
+		if strings.TrimSpace(request.ToClientName) != "" {
+			return errors.New("service-report toClientName must be empty")
+		}
+		if signal.PublisherSessionID != nil {
+			return errors.New("service-report publisherSessionId is server-bound")
+		}
 		return s.handleServiceReport(ctx, *source, signal, publisherSessionID)
 	case TypeServiceCatalog:
 		return errors.New("service-catalog is server-only")
@@ -997,6 +1022,7 @@ func (s *Service) PushOnLogin(ctx context.Context, account store.ClientAccount) 
 		return
 	}
 	s.PushConfig(ctx, account)
+	s.pushCurrentCatalogs(ctx, account)
 	for _, target := range s.rosterRefreshTargets(ctx, account) {
 		s.PushRoster(ctx, target)
 	}
@@ -1143,6 +1169,9 @@ func (s *Service) CreateACL(ctx context.Context, access AccessContext, mutation 
 	if err != nil {
 		return ACLView{}, err
 	}
+	if err := s.refreshAuthorization(ctx, access); err != nil {
+		return ACLView{}, err
+	}
 	return aclView(*acl), nil
 }
 
@@ -1154,7 +1183,50 @@ func (s *Service) DeleteACL(ctx context.Context, access AccessContext, id int64)
 	if acl.TenantID != access.TenantID || (!access.Admin && acl.OwnerUsername != access.Username) {
 		return store.ErrNotFound
 	}
-	return s.db.DeletePeerMeshACL(ctx, id)
+	if err := s.db.DeletePeerMeshACL(ctx, id); err != nil {
+		return err
+	}
+	return s.refreshAuthorization(ctx, access)
+}
+
+func (s *Service) refreshAuthorization(ctx context.Context, access AccessContext) error {
+	clients, err := s.db.ListClients(ctx)
+	if err != nil {
+		return err
+	}
+	byID := make(map[int64]store.ClientAccount)
+	for _, client := range clients {
+		if client.TenantID == access.TenantID {
+			byID[client.ID] = client
+			s.PushConfig(ctx, client)
+			s.PushRoster(ctx, client)
+		}
+	}
+	open, err := s.db.ListOpenPeerMeshSessions(ctx, access.TenantID, nil, StatusClosed)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, item := range open {
+		source, sourceOK := byID[item.SourceClientID]
+		target, targetOK := byID[item.TargetClientID]
+		allowed := false
+		if sourceOK && targetOK {
+			allowed, err = s.CanPeer(ctx, source, target)
+			if err != nil {
+				return err
+			}
+		}
+		if !allowed {
+			s.markClosed(&item, now)
+			if err := s.db.UpdatePeerMeshSession(ctx, item); err != nil {
+				return err
+			}
+			s.sendClose(sessionView(item))
+		}
+	}
+	s.onAuthorizationChanged(ctx, access.TenantID)
+	return nil
 }
 
 func (s *Service) ListSessions(ctx context.Context, access AccessContext, limit int) ([]SessionView, error) {

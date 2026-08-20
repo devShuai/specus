@@ -2,6 +2,7 @@ package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.peermesh.PeerControlMessage;
+import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.session.Session;
@@ -18,6 +19,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+
+import java.nio.charset.StandardCharsets;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -73,6 +76,16 @@ public class PeerSignalService {
             }
         }
         if (PeerControlMessage.TYPE_SERVICE_REPORT.equals(signal.getType())) {
+            if (request.getMessage().getBytes(StandardCharsets.UTF_8).length
+                    > PeerServiceDiscovery.MAX_SNAPSHOT_BYTES) {
+                throw new IllegalArgumentException("service-report exceeds 16384 bytes");
+            }
+            if (StringUtils.hasText(request.getToClientName())) {
+                throw new IllegalArgumentException("service-report toClientName must be empty");
+            }
+            if (signal.getPublisherSessionId() != null) {
+                throw new IllegalArgumentException("service-report publisherSessionId is server-bound");
+            }
             pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
             return;
         }
@@ -132,6 +145,7 @@ public class PeerSignalService {
             return;
         }
         pushConfig(account);
+        pushCatalogs(peerServiceDiscoveryService.catalogsForRecipient(account));
         for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
             pushRoster(target);
         }
@@ -176,6 +190,24 @@ public class PeerSignalService {
         for (ClientAccount account : clientAccountService.listTenantAccounts(context.tenant())) {
             pushConfig(account);
         }
+    }
+
+    public void pushServiceConfig(ManagementContext context, long clientId) {
+        clientAccountService.listTenantAccounts(context.tenant()).stream()
+                .filter(account -> account.getId() == clientId)
+                .findFirst()
+                .ifPresent(this::pushConfig);
+    }
+
+    public void refreshAuthorization(ManagementContext context) {
+        for (ClientAccount account : clientAccountService.listTenantAccounts(context.tenant())) {
+            pushConfig(account);
+            pushRoster(account);
+        }
+        for (PeerMeshSessionView closed : peerMeshService.closeUnauthorizedSessions(context)) {
+            sendClose(closed);
+        }
+        pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
     }
 
     public void pushCatalogs(List<PeerServiceDiscoveryService.CatalogDelivery> deliveries) {
