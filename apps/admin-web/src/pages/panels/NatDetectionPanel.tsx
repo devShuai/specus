@@ -1466,7 +1466,7 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
         <Tooltip
           key={item.label}
         >
-          <TooltipTrigger><div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
+          <TooltipTrigger tabIndex={0}><div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
             <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
               <span>{item.label}</span>
               <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
@@ -1774,7 +1774,7 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                   <th className="px-2 py-1.5 text-left font-medium">
                     <Tooltip
                     >
-                      <TooltipTrigger><span className="inline-flex cursor-help items-center gap-1">
+                      <TooltipTrigger tabIndex={0}><span className="inline-flex cursor-help items-center gap-1">
                         关联地址
                         <InfoIcon className="h-3 w-3 opacity-60" />
                       </span></TooltipTrigger>
@@ -1800,7 +1800,7 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                     <td className="px-2 py-2 align-top">
                       <Tooltip
                       >
-                        <TooltipTrigger><Chip size="sm" color={candidateColor(item.candidate.type)} variant="soft" className="cursor-help">
+                        <TooltipTrigger tabIndex={0}><Chip size="sm" color={candidateColor(item.candidate.type)} variant="soft" className="cursor-help">
                           {item.candidate.type}
                         </Chip></TooltipTrigger>
                         <TooltipContent placement="top">{<div className="max-w-60 py-0.5 text-tiny">{candidateTypeHint(item.candidate.type)}</div>}</TooltipContent>

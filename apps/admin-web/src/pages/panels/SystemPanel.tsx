@@ -1,5 +1,5 @@
 import { useEffect, useState, type DragEvent } from "react";
-import { Button, Card, Chip, FieldError, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextArea, TextField, useOverlayState } from "@heroui/react";
+import { Button, Card, Chip, FieldError, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextArea, TextField, useOverlayState } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type {
   ClientArch,
@@ -331,66 +331,68 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           {/* desktop: 表格 */}
           <div className="hidden overflow-x-auto lg:block">
             <Table
-              aria-label="管理用户"
             >
-              <TableHeader>
-                <TableColumn>用户名</TableColumn>
-                <TableColumn>租户</TableColumn>
-                <TableColumn>角色</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>更新时间</TableColumn>
-                <TableColumn className="text-right">操作</TableColumn>
-              </TableHeader>
-              <TableBody items={users} renderEmptyState={() => (loadingUsers ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无用户" />)}>
-                {(user) => (
-                  <TableRow key={user.username}>
-                    <TableCell>
-                      <div className="font-medium text-foreground">{user.username}</div>
-                      {user.builtIn ? <div className="text-tiny text-default-500">配置文件内置账号</div> : null}
-                    </TableCell>
-                    <TableCell>{user.tenantId}</TableCell>
-                    <TableCell>
-                      <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
-                    </TableCell>
-                    <TableCell>
-                      <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap text-default-500">{formatDateTime(user.updatedAt)}</TableCell>
-                    <TableCell>
-                      <div className="flex justify-end gap-2">
-                        <Button
-                          isDisabled={user.builtIn}
-                          size="sm" variant="secondary"
-                          onPress={() => confirmToggleRole(user)}
-                        >
-                          {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
-                        </Button>
-                        <Button
-                          isDisabled={user.builtIn}
-                          size="sm" variant="secondary"
-                          onPress={() => confirmToggleEnabled(user)}
-                        >
-                          {user.enabled ? "停用" : "启用"}
-                        </Button>
-                        <Button
-                          isDisabled={user.builtIn}
-                          size="sm" variant="secondary"
-                          onPress={() => setResetTarget(user)}
-                        >
-                          重置密码
-                        </Button>
-                        <Button
-                          isDisabled={user.builtIn}
-                          size="sm" variant="danger-soft"
-                          onPress={() => deleteUser(user)}
-                        >
-                          删除
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
+              <TableContent aria-label="管理用户">
+                <TableHeader>
+                  <TableColumn isRowHeader>用户名</TableColumn>
+                  <TableColumn>租户</TableColumn>
+                  <TableColumn>角色</TableColumn>
+                  <TableColumn>状态</TableColumn>
+                  <TableColumn>更新时间</TableColumn>
+                  <TableColumn className="text-right">操作</TableColumn>
+                </TableHeader>
+                <TableBody items={users} renderEmptyState={() => (loadingUsers ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无用户" />)}>
+                  {(user) => (
+                    <TableRow key={user.username}>
+                      <TableCell>
+                        <div className="font-medium text-foreground">{user.username}</div>
+                        {user.builtIn ? <div className="text-tiny text-default-500">配置文件内置账号</div> : null}
+                      </TableCell>
+                      <TableCell>{user.tenantId}</TableCell>
+                      <TableCell>
+                        <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
+                      </TableCell>
+                      <TableCell>
+                        <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-default-500">{formatDateTime(user.updatedAt)}</TableCell>
+                      <TableCell>
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            isDisabled={user.builtIn}
+                            size="sm" variant="secondary"
+                            onPress={() => confirmToggleRole(user)}
+                          >
+                            {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
+                          </Button>
+                          <Button
+                            isDisabled={user.builtIn}
+                            size="sm" variant="secondary"
+                            onPress={() => confirmToggleEnabled(user)}
+                          >
+                            {user.enabled ? "停用" : "启用"}
+                          </Button>
+                          <Button
+                            isDisabled={user.builtIn}
+                            size="sm" variant="secondary"
+                            onPress={() => setResetTarget(user)}
+                          >
+                            重置密码
+                          </Button>
+                          <Button
+                            isDisabled={user.builtIn}
+                            size="sm" variant="danger-soft"
+                            onPress={() => deleteUser(user)}
+                          >
+                            删除
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+            
+              </TableContent>
             </Table>
           </div>
         </Card.Content>
@@ -513,93 +515,95 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         {/* desktop: 表格 */}
         <div className="hidden overflow-x-auto lg:block">
           <Table
-            aria-label="客户端发布版本"
           >
-            <TableHeader>
-              <TableColumn>实现</TableColumn>
-              <TableColumn>平台 / 架构</TableColumn>
-              <TableColumn>名称</TableColumn>
-              <TableColumn>版本</TableColumn>
-              <TableColumn>URL</TableColumn>
-              <TableColumn>校验</TableColumn>
-              <TableColumn>启用</TableColumn>
-              <TableColumn className="text-right">操作</TableColumn>
-            </TableHeader>
-            <TableBody items={downloadLinks} renderEmptyState={() => (loadingDownloads ? <Spinner size="sm" /> : <EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />)}>
-              {(link) => {
-                const pending = pendingLinkIds.has(link.id);
-                return (
-                <TableRow key={link.id}>
-                  <TableCell>
-                    <Chip size="sm" variant="soft" color="accent">
-                      {implementationLabel(link.implementation)}
-                    </Chip>
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      <Chip size="sm" variant="soft">{platformLabel(link.platform)}</Chip>
-                      <Chip size="sm" variant="soft">{archLabel(link.arch)}</Chip>
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <div className="font-medium">{link.displayName}</div>
-                    {link.description ? (
-                      <div className="text-tiny text-default-500">{link.description}</div>
-                    ) : null}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="soft">
-                        {link.version ? `v${link.version}` : "未标版本"}
+            <TableContent aria-label="客户端发布版本">
+              <TableHeader>
+                <TableColumn isRowHeader>实现</TableColumn>
+                <TableColumn>平台 / 架构</TableColumn>
+                <TableColumn>名称</TableColumn>
+                <TableColumn>版本</TableColumn>
+                <TableColumn>URL</TableColumn>
+                <TableColumn>校验</TableColumn>
+                <TableColumn>启用</TableColumn>
+                <TableColumn className="text-right">操作</TableColumn>
+              </TableHeader>
+              <TableBody items={downloadLinks} renderEmptyState={() => (loadingDownloads ? <Spinner size="sm" /> : <EmptyState icon="generic" title="暂无客户端版本" description="上传第一个发布包后会出现在公开下载页" />)}>
+                {(link) => {
+                  const pending = pendingLinkIds.has(link.id);
+                  return (
+                  <TableRow key={link.id}>
+                    <TableCell>
+                      <Chip size="sm" variant="soft" color="accent">
+                        {implementationLabel(link.implementation)}
                       </Chip>
-                      {link.hosted ? <Chip size="sm" color="default" variant="soft">托管</Chip> : null}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <a
-                      className="block max-w-64 truncate font-mono text-tiny text-primary hover:underline"
-                      href={link.downloadUrl}
-                      rel="noopener noreferrer"
-                      target="_blank"
-                      title={link.downloadUrl}
-                    >
-                      {link.downloadUrl}
-                    </a>
-                  </TableCell>
-                  <TableCell>
-                    <div className="text-tiny text-default-500">{link.fileSize ? formatBytes(link.fileSize) : "外部文件"}</div>
-                    {link.sha256 ? <div className="max-w-32 truncate font-mono text-tiny" title={link.sha256}>{link.sha256}</div> : null}
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      aria-label="启用"
-                      isSelected={link.enabled}
-                      isDisabled={pending}
-                      onChange={() => void toggleLinkEnabled(link)}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex justify-end gap-2">
-                      <Button size="sm" variant="secondary" onPress={() => openEditLink(link)}>
-                        编辑
-                      </Button>
-                      {!link.isLatest && link.version ? (
-                        <Button size="sm" variant="secondary" onPress={() => void markLinkLatest(link)}>
-                          设为最新
-                        </Button>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        <Chip size="sm" variant="soft">{platformLabel(link.platform)}</Chip>
+                        <Chip size="sm" variant="soft">{archLabel(link.arch)}</Chip>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="font-medium">{link.displayName}</div>
+                      {link.description ? (
+                        <div className="text-tiny text-default-500">{link.description}</div>
                       ) : null}
-                      <Button
-                        size="sm" variant="danger-soft"
-                        onPress={() => deleteLink(link)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="soft">
+                          {link.version ? `v${link.version}` : "未标版本"}
+                        </Chip>
+                        {link.hosted ? <Chip size="sm" color="default" variant="soft">托管</Chip> : null}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <a
+                        className="block max-w-64 truncate font-mono text-tiny text-primary hover:underline"
+                        href={link.downloadUrl}
+                        rel="noopener noreferrer"
+                        target="_blank"
+                        title={link.downloadUrl}
                       >
-                        删除
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-                );
-              }}
-            </TableBody>
+                        {link.downloadUrl}
+                      </a>
+                    </TableCell>
+                    <TableCell>
+                      <div className="text-tiny text-default-500">{link.fileSize ? formatBytes(link.fileSize) : "外部文件"}</div>
+                      {link.sha256 ? <div className="max-w-32 truncate font-mono text-tiny" title={link.sha256}>{link.sha256}</div> : null}
+                    </TableCell>
+                    <TableCell>
+                      <Switch
+                        aria-label="启用"
+                        isSelected={link.enabled}
+                        isDisabled={pending}
+                        onChange={() => void toggleLinkEnabled(link)}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-2">
+                        <Button size="sm" variant="secondary" onPress={() => openEditLink(link)}>
+                          编辑
+                        </Button>
+                        {!link.isLatest && link.version ? (
+                          <Button size="sm" variant="secondary" onPress={() => void markLinkLatest(link)}>
+                            设为最新
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="sm" variant="danger-soft"
+                          onPress={() => deleteLink(link)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                  );
+                }}
+              </TableBody>
+          
+            </TableContent>
           </Table>
         </div>
       </Card.Content>

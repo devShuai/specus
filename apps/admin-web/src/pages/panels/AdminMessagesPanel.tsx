@@ -504,7 +504,7 @@ export function AdminMessagesPanel() {
             </div>
             {selectedClient && (
               <Tooltip>
-                <TooltipTrigger><Chip size="sm" color="accent" variant="soft">
+                <TooltipTrigger tabIndex={0}><Chip size="sm" color="accent" variant="soft">
                   可聊天
                 </Chip></TooltipTrigger>
                 <TooltipContent>{`附件 ${selectedClient.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${selectedClient.messageMediaPreviewCapable ? "支持" : "不支持"}`}</TooltipContent>

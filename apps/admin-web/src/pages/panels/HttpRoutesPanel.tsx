@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Button, Chip, Description, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, FieldError, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField, useOverlayState } from "@heroui/react";
+import { Button, Chip, Description, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, FieldError, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField, buttonVariants, cn, useOverlayState } from "@heroui/react";
 import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { HttpRoute } from "../../api/types";
@@ -190,7 +190,7 @@ export function HttpRoutesPanel() {
           <SelectPopover>
             <ListBox>
               {clients.map((client) => (
-            <ListBoxItem id={String(client.id)}>{client.clientName}</ListBoxItem>
+            <ListBoxItem key={String(client.id)} id={String(client.id)}>{client.clientName}</ListBoxItem>
           ))}
             </ListBox>
           </SelectPopover>
@@ -280,7 +280,7 @@ export function HttpRoutesPanel() {
           </SelectTrigger>
           <SelectPopover>
             <ListBox items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}>
-              {(item) => <ListBoxItem id={item.id}>{item.clientName}</ListBoxItem>}
+              {(item) => <ListBoxItem key={item.id} id={item.id}>{item.clientName}</ListBoxItem>}
             </ListBox>
           </SelectPopover>
         </Select>
@@ -390,110 +390,112 @@ export function HttpRoutesPanel() {
       {/* desktop: 表格优先自适应，长文本单行省略 */}
       <div className="hidden min-w-0 xl:block">
         <Table
-          aria-label="HTTP 路由列表"
         >
-        <TableHeader>
-          <TableColumn className="w-[5%]">ID</TableColumn>
-          <TableColumn className="w-[10%]">
-            <ClientFilterHeader
-              clients={clients}
-              selectedClientId={filterClientId}
-              onSelect={setFilterClientId}
-            />
-          </TableColumn>
-          <TableColumn className="w-[7%]">路由名</TableColumn>
-          <TableColumn className="w-[12%]">目标地址</TableColumn>
-          <TableColumn className="w-[14%]">访问链接</TableColumn>
-          <TableColumn className="w-[8%]">认证</TableColumn>
-          <TableColumn className="w-[6%]">启用</TableColumn>
-          <TableColumn className="w-[6%]">明细</TableColumn>
-          <TableColumn className="w-[6%]">媒体</TableColumn>
-          <TableColumn className="w-[6%]">改写</TableColumn>
-          <TableColumn className="w-[10%]">更新时间</TableColumn>
-          <TableColumn className="w-[10%]">操作</TableColumn>
-        </TableHeader>
-        <TableBody items={pagedRoutes} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />)}>
-          {(item) => {
-            return (
-            <TableRow key={item.id}>
-              <TableCell>
-                <span className="block truncate font-mono text-tiny" title={String(item.id)}>
-                  {item.id}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={item.clientName}>
-                  {item.clientName}
-                </span>
-              </TableCell>
-              <TableCell>
-                <code className="block truncate" title={item.route}>
-                  {item.route}
-                </code>
-              </TableCell>
-              <TableCell>
-                <code className="block truncate" title={item.targetBaseUrl || "-"}>
-                  {item.targetBaseUrl || "-"}
-                </code>
-              </TableCell>
-              <TableCell>
-                <HttpRouteAccessLink route={item} />
-              </TableCell>
-              <TableCell>
-                <HttpRouteAuthChip enabled={Boolean(item.authEnabled)} />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="启用"
-                  isSelected={item.enabled}
-                  isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
-                  onChange={() => void toggle(item)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="明细采集"
-                  isSelected={Boolean(item.detailCaptureEnabled)}
-                  isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
-                  onChange={() => void toggleDetailCapture(item)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="媒体采集"
-                  isSelected={Boolean(item.mediaCaptureEnabled)}
-                  isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
-                  onChange={() => void toggleMediaCapture(item)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="路径改写"
-                  isSelected={Boolean(item.pathRewriteEnabled)}
-                  isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
-                  onChange={() => void togglePathRewrite(item)}
-                />
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={formatDateTime(item.updatedAt || item.createdAt)}>
-                  {formatDateTime(item.updatedAt || item.createdAt)}
-                </span>
-              </TableCell>
-              <TableCell>
-                <div className="flex gap-1">
-                  <Button className="min-w-0 px-2" size="sm" variant="secondary" onPress={() => { setEditing(item); editModal.open(); }}>
-                    编辑
-                  </Button>
-                  <Button className="min-w-0 px-2" size="sm" variant="danger-soft" onPress={() => remove(item)}>
-                    删除
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-            );
-          }}
-        </TableBody>
-      </Table>
+          <TableContent aria-label="HTTP 路由列表">
+          <TableHeader>
+            <TableColumn isRowHeader className="w-[5%]">ID</TableColumn>
+            <TableColumn className="w-[10%]">
+              <ClientFilterHeader
+                clients={clients}
+                selectedClientId={filterClientId}
+                onSelect={setFilterClientId}
+              />
+            </TableColumn>
+            <TableColumn className="w-[7%]">路由名</TableColumn>
+            <TableColumn className="w-[12%]">目标地址</TableColumn>
+            <TableColumn className="w-[14%]">访问链接</TableColumn>
+            <TableColumn className="w-[8%]">认证</TableColumn>
+            <TableColumn className="w-[6%]">启用</TableColumn>
+            <TableColumn className="w-[6%]">明细</TableColumn>
+            <TableColumn className="w-[6%]">媒体</TableColumn>
+            <TableColumn className="w-[6%]">改写</TableColumn>
+            <TableColumn className="w-[10%]">更新时间</TableColumn>
+            <TableColumn className="w-[10%]">操作</TableColumn>
+          </TableHeader>
+          <TableBody items={pagedRoutes} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />)}>
+            {(item) => {
+              return (
+              <TableRow key={item.id}>
+                <TableCell>
+                  <span className="block truncate font-mono text-tiny" title={String(item.id)}>
+                    {item.id}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <span className="block truncate" title={item.clientName}>
+                    {item.clientName}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <code className="block truncate" title={item.route}>
+                    {item.route}
+                  </code>
+                </TableCell>
+                <TableCell>
+                  <code className="block truncate" title={item.targetBaseUrl || "-"}>
+                    {item.targetBaseUrl || "-"}
+                  </code>
+                </TableCell>
+                <TableCell>
+                  <HttpRouteAccessLink route={item} />
+                </TableCell>
+                <TableCell>
+                  <HttpRouteAuthChip enabled={Boolean(item.authEnabled)} />
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="启用"
+                    isSelected={item.enabled}
+                    isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
+                    onChange={() => void toggle(item)}
+                  />
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="明细采集"
+                    isSelected={Boolean(item.detailCaptureEnabled)}
+                    isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
+                    onChange={() => void toggleDetailCapture(item)}
+                  />
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="媒体采集"
+                    isSelected={Boolean(item.mediaCaptureEnabled)}
+                    isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
+                    onChange={() => void toggleMediaCapture(item)}
+                  />
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="路径改写"
+                    isSelected={Boolean(item.pathRewriteEnabled)}
+                    isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
+                    onChange={() => void togglePathRewrite(item)}
+                  />
+                </TableCell>
+                <TableCell>
+                  <span className="block truncate" title={formatDateTime(item.updatedAt || item.createdAt)}>
+                    {formatDateTime(item.updatedAt || item.createdAt)}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <div className="flex gap-1">
+                    <Button className="min-w-0 px-2" size="sm" variant="secondary" onPress={() => { setEditing(item); editModal.open(); }}>
+                      编辑
+                    </Button>
+                    <Button className="min-w-0 px-2" size="sm" variant="danger-soft" onPress={() => remove(item)}>
+                      删除
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+              );
+            }}
+          </TableBody>
+      
+          </TableContent>
+        </Table>
       </div>
 
       {totalPages > 1 ? (
@@ -586,15 +588,10 @@ function ClientFilterHeader({
         {label}
       </span>
       <Dropdown>
-        <DropdownTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选客户端"
-            className="h-7 min-w-7 text-default-500"
-            size="sm" variant={selectedClientId ? "secondary" : "ghost"}>
+        <DropdownTrigger
+            aria-label="筛选客户端" className={cn(buttonVariants({ variant: selectedClientId ? "secondary" : "ghost", size: "sm", isIconOnly: true }), "h-7 min-w-7 text-default-500")}>
             <FilterIcon />
-          </Button>
-        </DropdownTrigger>
+          </DropdownTrigger>
         <DropdownPopover placement="bottom start">
           <DropdownMenu
             aria-label="筛选 HTTP 路由客户端"

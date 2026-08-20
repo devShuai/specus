@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Avatar, AvatarFallback, Button, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownSection, DropdownTrigger, Spinner } from "@heroui/react";
+import { Avatar, AvatarFallback, Button, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownSection, DropdownTrigger, Spinner, buttonVariants, cn } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
 import { useTheme } from "../theme/ThemeContext";
 import { adminApi } from "../api/client";
@@ -215,9 +215,20 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
   const mode = userOverride ? theme : "system";
   return (
     <Dropdown>
-      <DropdownTrigger>
+      <DropdownTrigger
+        aria-label="个人菜单"
+        className={cn(
+          buttonVariants({
+            variant: variant === "block" ? "ghost" : "secondary",
+            isIconOnly: variant !== "block",
+          }),
+          variant === "block"
+            ? "h-auto w-full justify-start gap-2.5 px-2.5 py-2"
+            : "h-10 w-10 min-w-10 rounded-full",
+        )}
+      >
         {variant === "block" ? (
-          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2.5 py-2" variant="ghost">
+          <>
             <Avatar className="h-8 w-8 shrink-0 bg-primary-500 text-primary-foreground">
               <AvatarFallback>{initials}</AvatarFallback>
             </Avatar>
@@ -225,13 +236,11 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
               <span className="w-full truncate text-left text-small font-medium text-foreground">{name}</span>
               <span className="w-full truncate text-left text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"}</span>
             </span>
-          </Button>
+          </>
         ) : (
-          <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" variant="secondary">
-            <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground">
-              <AvatarFallback>{initials}</AvatarFallback>
-            </Avatar>
-          </Button>
+          <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground">
+            <AvatarFallback>{initials}</AvatarFallback>
+          </Avatar>
         )}
       </DropdownTrigger>
       <DropdownPopover placement={variant === "block" ? "top start" : "bottom end"}>

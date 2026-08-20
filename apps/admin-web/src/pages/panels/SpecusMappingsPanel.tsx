@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Button, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField, useOverlayState } from "@heroui/react";
+import { Button, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField, useOverlayState } from "@heroui/react";
 import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { Specus } from "../../api/types";
@@ -135,7 +135,7 @@ export function SpecusMappingsPanel() {
           <SelectPopover>
             <ListBox>
               {clients.map((client) => (
-            <ListBoxItem id={String(client.id)}>{client.clientName}</ListBoxItem>
+            <ListBoxItem key={String(client.id)} id={String(client.id)}>{client.clientName}</ListBoxItem>
           ))}
             </ListBox>
           </SelectPopover>
@@ -217,59 +217,62 @@ export function SpecusMappingsPanel() {
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="端口映射列表">
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>公网端口</TableColumn>
-          <TableColumn>内网目标</TableColumn>
-          <TableColumn>启用</TableColumn>
-          <TableColumn>明细采集</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-          <TableColumn>操作</TableColumn>
-        </TableHeader>
-        <TableBody items={pagedSpecusMappings} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />)}>
-          {(specus) => {
-            const pending = pendingIds.has(specus.id);
-            return (
-            <TableRow key={specus.id}>
-              <TableCell>{specus.id}</TableCell>
-              <TableCell>{specus.clientName}</TableCell>
-              <TableCell>{specus.listenPort}</TableCell>
-              <TableCell>
-                <code>{specus.targetAddress}:{specus.targetPort}</code>
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="启用"
-                  isSelected={specus.enabled}
-                  isDisabled={pending}
-                  onChange={() => void toggle(specus)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="明细采集"
-                  isSelected={Boolean(specus.detailCaptureEnabled)}
-                  isDisabled={pending}
-                  onChange={() => void toggleDetailCapture(specus)}
-                />
-              </TableCell>
-              <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
-              <TableCell>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="secondary" onPress={() => { setEditing(specus); editModal.open(); }}>
-                    编辑
-                  </Button>
-                  <Button size="sm" variant="danger-soft" onPress={() => remove(specus)}>
-                    删除
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-            );
-          }}
-        </TableBody>
+      <Table>
+        <TableContent aria-label="端口映射列表">
+          <TableHeader>
+            <TableColumn isRowHeader>ID</TableColumn>
+            <TableColumn>客户端</TableColumn>
+            <TableColumn>公网端口</TableColumn>
+            <TableColumn>内网目标</TableColumn>
+            <TableColumn>启用</TableColumn>
+            <TableColumn>明细采集</TableColumn>
+            <TableColumn>更新时间</TableColumn>
+            <TableColumn>操作</TableColumn>
+          </TableHeader>
+          <TableBody items={pagedSpecusMappings} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />)}>
+            {(specus) => {
+              const pending = pendingIds.has(specus.id);
+              return (
+              <TableRow key={specus.id}>
+                <TableCell>{specus.id}</TableCell>
+                <TableCell>{specus.clientName}</TableCell>
+                <TableCell>{specus.listenPort}</TableCell>
+                <TableCell>
+                  <code>{specus.targetAddress}:{specus.targetPort}</code>
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="启用"
+                    isSelected={specus.enabled}
+                    isDisabled={pending}
+                    onChange={() => void toggle(specus)}
+                  />
+                </TableCell>
+                <TableCell>
+                  <Switch
+                    aria-label="明细采集"
+                    isSelected={Boolean(specus.detailCaptureEnabled)}
+                    isDisabled={pending}
+                    onChange={() => void toggleDetailCapture(specus)}
+                  />
+                </TableCell>
+                <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
+                <TableCell>
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="secondary" onPress={() => { setEditing(specus); editModal.open(); }}>
+                      编辑
+                    </Button>
+                    <Button size="sm" variant="danger-soft" onPress={() => remove(specus)}>
+                      删除
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+              );
+            }}
+          </TableBody>
+      
+        </TableContent>
       </Table>
       </div>
 

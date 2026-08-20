@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Chip, Input, Label, ListBox, ListBoxItem, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField } from "@heroui/react";
+import { Button, Chip, Input, Label, ListBox, ListBoxItem, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type {
   PeerMeshDevice,
@@ -493,7 +493,7 @@ export function PeerMeshServicesTab({
             <SelectPopover>
               <ListBox>
                 {applications.map((item) => (
-              <ListBoxItem id={item}>{item}</ListBoxItem>
+              <ListBoxItem key={item} id={item}>{item}</ListBoxItem>
             ))}
               </ListBox>
             </SelectPopover>
@@ -595,101 +595,104 @@ export function PeerMeshServicesTab({
                   : `会话 ${group.publisherSessionId}${group.instanceId ? ` · 实例 ${group.instanceId}` : ""}`}
               </span>
             </div>
-            <Table aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`}>
-              <TableHeader>
-                <TableColumn>服务</TableColumn>
-                <TableColumn>类型</TableColumn>
-                <TableColumn>发布地址</TableColumn>
-                <TableColumn>可见范围</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>运行实例</TableColumn>
-                <TableColumn>操作</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {group.rows.map((row) => {
-                  const service = row.service;
-                  const chip = statusChip(row);
-                  const rowBusy = updatingServices.has(service.id)
-                    || deletingServices.has(service.id)
-                    || testingInstances.has(row.key);
-                  return (
-                  <TableRow key={row.key} aria-busy={rowBusy}>
-                    <TableCell>
-                      <div className="flex flex-col">
-                        <span>{service.name}</span>
-                        <span className="font-mono text-tiny text-default-400">{service.serviceId}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {service.application}
-                      {service.transport === "udp" ? " / udp" : ""}
-                    </TableCell>
-                    <TableCell className="font-mono">{service.publishedAddress || "-"}</TableCell>
-                    <TableCell>
-                      {service.visibility === "ACL"
-                        ? `ACL${service.allowedClientIds?.length ? ` · ${service.allowedClientIds.length} 台` : ""}`
-                        : "同归属"}
-                    </TableCell>
-                    <TableCell>
-                      <Chip size="sm" color={chip.color} variant="soft">
-                        {chip.text}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-tiny text-default-500">{instanceSummary(row)}</span>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap items-center gap-2">
-                        {isAdmin && (
-                          <Switch
-                            aria-label={`启用 ${service.name}`}
-                            aria-busy={updatingServices.has(service.id)}
-                            isSelected={service.enabled}
-                            isDisabled={rowBusy || updatingShare || loadError != null}
-                            onChange={(enabled) => void toggleService(service, enabled)}
-                          />
-                        )}
-                        {isAdmin && (
-                          <Button size="sm" variant="ghost" isDisabled={rowBusy} onPress={() => editService(service)}>
-                            编辑
-                          </Button>
-                        )}
-                        {isAdmin && service.enabled && (
+            <Table>
+              <TableContent aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`}>
+                <TableHeader>
+                  <TableColumn isRowHeader>服务</TableColumn>
+                  <TableColumn>类型</TableColumn>
+                  <TableColumn>发布地址</TableColumn>
+                  <TableColumn>可见范围</TableColumn>
+                  <TableColumn>状态</TableColumn>
+                  <TableColumn>运行实例</TableColumn>
+                  <TableColumn>操作</TableColumn>
+                </TableHeader>
+                <TableBody>
+                  {group.rows.map((row) => {
+                    const service = row.service;
+                    const chip = statusChip(row);
+                    const rowBusy = updatingServices.has(service.id)
+                      || deletingServices.has(service.id)
+                      || testingInstances.has(row.key);
+                    return (
+                    <TableRow key={row.key} aria-busy={rowBusy}>
+                      <TableCell>
+                        <div className="flex flex-col">
+                          <span>{service.name}</span>
+                          <span className="font-mono text-tiny text-default-400">{service.serviceId}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        {service.application}
+                        {service.transport === "udp" ? " / udp" : ""}
+                      </TableCell>
+                      <TableCell className="font-mono">{service.publishedAddress || "-"}</TableCell>
+                      <TableCell>
+                        {service.visibility === "ACL"
+                          ? `ACL${service.allowedClientIds?.length ? ` · ${service.allowedClientIds.length} 台` : ""}`
+                          : "同归属"}
+                      </TableCell>
+                      <TableCell>
+                        <Chip size="sm" color={chip.color} variant="soft">
+                          {chip.text}
+                        </Chip>
+                      </TableCell>
+                      <TableCell>
+                        <span className="text-tiny text-default-500">{instanceSummary(row)}</span>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {isAdmin && (
+                            <Switch
+                              aria-label={`启用 ${service.name}`}
+                              aria-busy={updatingServices.has(service.id)}
+                              isSelected={service.enabled}
+                              isDisabled={rowBusy || updatingShare || loadError != null}
+                              onChange={(enabled) => void toggleService(service, enabled)}
+                            />
+                          )}
+                          {isAdmin && (
+                            <Button size="sm" variant="ghost" isDisabled={rowBusy} onPress={() => editService(service)}>
+                              编辑
+                            </Button>
+                          )}
+                          {isAdmin && service.enabled && (
+                            <Button
+                              size="sm" variant="ghost"
+                              isDisabled={rowBusy || updatingShare || loadError != null}
+                              onPress={() => void toggleService(service, false)}
+                            >
+                              撤回
+                            </Button>
+                          )}
                           <Button
-                            size="sm" variant="ghost"
-                            isDisabled={rowBusy || updatingShare || loadError != null}
-                            onPress={() => void toggleService(service, false)}
+                            size="sm" variant="secondary"
+                            isDisabled={rowBusy || !row.availability.available}
+                            onPress={() => void copyAddress(row)}
                           >
-                            撤回
+                            复制地址
                           </Button>
-                        )}
-                        <Button
-                          size="sm" variant="secondary"
-                          isDisabled={rowBusy || !row.availability.available}
-                          onPress={() => void copyAddress(row)}
-                        >
-                          复制地址
-                        </Button>
-                        <Button
-                          size="sm" variant="secondary" isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null || testingInstances.has(row.key)}
-                          onPress={() => void testAvailability(row)}
-                        >{testingInstances.has(row.key) ? <Spinner size="sm" /> : null}
-                          测试可用性
-                        </Button>
-                        {isAdmin && (
                           <Button
-                            size="sm" variant="danger" isDisabled={rowBusy || deletingServices.has(service.id)}
-                            onPress={() => removeService(service)}
-                          >{deletingServices.has(service.id) ? <Spinner size="sm" /> : null}
-                            删除
+                            size="sm" variant="secondary" isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null || testingInstances.has(row.key)}
+                            onPress={() => void testAvailability(row)}
+                          >{testingInstances.has(row.key) ? <Spinner size="sm" /> : null}
+                            测试可用性
                           </Button>
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                  );
-                })}
-              </TableBody>
+                          {isAdmin && (
+                            <Button
+                              size="sm" variant="danger" isDisabled={rowBusy || deletingServices.has(service.id)}
+                              onPress={() => removeService(service)}
+                            >{deletingServices.has(service.id) ? <Spinner size="sm" /> : null}
+                              删除
+                            </Button>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                    );
+                  })}
+                </TableBody>
+            
+              </TableContent>
             </Table>
           </div>
         ))

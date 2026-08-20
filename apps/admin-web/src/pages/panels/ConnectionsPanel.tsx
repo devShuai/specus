@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Button, Card, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Input, Label, ListBox, ListBoxItem, Popover, PopoverContent, PopoverTrigger, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField } from "@heroui/react";
+import { Button, Card, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Input, Label, ListBox, ListBoxItem, Popover, PopoverContent, PopoverTrigger, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField, buttonVariants, cn } from "@heroui/react";
 import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { ConnectionRecord, LiveConnectionEvent } from "../../api/types";
@@ -266,7 +266,7 @@ export function ConnectionsPanel() {
               </SelectTrigger>
               <SelectPopover>
                 <ListBox items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}>
-                  {(item) => <ListBoxItem id={item.id}>{item.clientName}</ListBoxItem>}
+                  {(item) => <ListBoxItem key={item.id} id={item.id}>{item.clientName}</ListBoxItem>}
                 </ListBox>
               </SelectPopover>
             </Select>
@@ -354,67 +354,69 @@ export function ConnectionsPanel() {
         </div>
         <Table
           key={tableCollectionKey}
-          aria-label="连接记录"
         >
-        <TableHeader>
-          <TableColumn className="w-[6%]">ID</TableColumn>
-          <TableColumn className="w-[16%]">
-            <ConnectionClientFilterHeader clients={clients} selectedClientId={clientId} onSelect={changeClientId} />
-          </TableColumn>
-          <TableColumn className="w-[10%]">
-            <ConnectionResultFilterHeader selectedResult={result} onSelect={changeResult} />
-          </TableColumn>
-          <TableColumn className="w-[15%]">远端地址</TableColumn>
-          <TableColumn className="w-[15%]">
-            <ConnectionDateFilterHeader fromDate={fromDate} toDate={toDate} onFromChange={changeFromDate} onToChange={changeToDate} />
-          </TableColumn>
-          <TableColumn className="w-[15%]">断开时间</TableColumn>
-          <TableColumn className="w-[11%]">持续时长</TableColumn>
-          <TableColumn>原因</TableColumn>
-        </TableHeader>
-        <TableBody key={tableCollectionKey} items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />)}>
-          {(record) => (
-            <TableRow key={record.tableKey}>
-              <TableCell>{record.id}</TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.clientName}>
-                  {record.clientName}
-                </span>
-              </TableCell>
-              <TableCell>
-                <Chip size="sm" variant="soft" color={record.success ? "success" : "danger"}>
-                  {record.success ? "成功" : "失败"}
-                </Chip>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.remoteAddress || "-"}>
-                  {record.remoteAddress || "-"}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={formatDateTime(record.connectedAt)}>
-                  {formatDateTime(record.connectedAt)}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}>
-                  {record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}
-                </span>
-              </TableCell>
-              <TableCell>{formatDuration(record.connectedAt, record.disconnectedAt, now)}</TableCell>
-              <TableCell>
-                <span className="block truncate" title={record.success
-                  ? record.disconnectReasonText || "-"
-                  : record.failureReason || record.disconnectReasonText || "登录失败"}>
-                {record.success
-                  ? record.disconnectReasonText || "-"
-                  : record.failureReason || record.disconnectReasonText || "登录失败"}
-                </span>
-              </TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
+          <TableContent aria-label="连接记录">
+          <TableHeader>
+            <TableColumn isRowHeader className="w-[6%]">ID</TableColumn>
+            <TableColumn className="w-[16%]">
+              <ConnectionClientFilterHeader clients={clients} selectedClientId={clientId} onSelect={changeClientId} />
+            </TableColumn>
+            <TableColumn className="w-[10%]">
+              <ConnectionResultFilterHeader selectedResult={result} onSelect={changeResult} />
+            </TableColumn>
+            <TableColumn className="w-[15%]">远端地址</TableColumn>
+            <TableColumn className="w-[15%]">
+              <ConnectionDateFilterHeader fromDate={fromDate} toDate={toDate} onFromChange={changeFromDate} onToChange={changeToDate} />
+            </TableColumn>
+            <TableColumn className="w-[15%]">断开时间</TableColumn>
+            <TableColumn className="w-[11%]">持续时长</TableColumn>
+            <TableColumn>原因</TableColumn>
+          </TableHeader>
+          <TableBody key={tableCollectionKey} items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />)}>
+            {(record) => (
+              <TableRow key={record.tableKey}>
+                <TableCell>{record.id}</TableCell>
+                <TableCell>
+                  <span className="block truncate" title={record.clientName}>
+                    {record.clientName}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <Chip size="sm" variant="soft" color={record.success ? "success" : "danger"}>
+                    {record.success ? "成功" : "失败"}
+                  </Chip>
+                </TableCell>
+                <TableCell>
+                  <span className="block truncate" title={record.remoteAddress || "-"}>
+                    {record.remoteAddress || "-"}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <span className="block truncate" title={formatDateTime(record.connectedAt)}>
+                    {formatDateTime(record.connectedAt)}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <span className="block truncate" title={record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}>
+                    {record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-"}
+                  </span>
+                </TableCell>
+                <TableCell>{formatDuration(record.connectedAt, record.disconnectedAt, now)}</TableCell>
+                <TableCell>
+                  <span className="block truncate" title={record.success
+                    ? record.disconnectReasonText || "-"
+                    : record.failureReason || record.disconnectReasonText || "登录失败"}>
+                  {record.success
+                    ? record.disconnectReasonText || "-"
+                    : record.failureReason || record.disconnectReasonText || "登录失败"}
+                  </span>
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+      
+          </TableContent>
+        </Table>
         </Card.Content>
       </Card>
       </div>
@@ -453,15 +455,10 @@ function ConnectionClientFilterHeader({
   return (
     <TableFilterHeader label={label} active={Boolean(selectedClientId)} title="筛选客户端">
       <Dropdown>
-        <DropdownTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选客户端"
-            className="h-7 min-w-7 text-default-500"
-            size="sm" variant={selectedClientId ? "secondary" : "ghost"}>
+        <DropdownTrigger
+            aria-label="筛选客户端" className={cn(buttonVariants({ variant: selectedClientId ? "secondary" : "ghost", size: "sm", isIconOnly: true }), "h-7 min-w-7 text-default-500")}>
             <FilterIcon />
-          </Button>
-        </DropdownTrigger>
+          </DropdownTrigger>
         <DropdownPopover placement="bottom start">
           <DropdownMenu
             aria-label="筛选连接记录客户端"
@@ -495,15 +492,10 @@ function ConnectionResultFilterHeader({
   return (
     <TableFilterHeader label={label} active={Boolean(selectedResult)} title="筛选结果">
       <Dropdown>
-        <DropdownTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选结果"
-            className="h-7 min-w-7 text-default-500"
-            size="sm" variant={selectedResult ? "secondary" : "ghost"}>
+        <DropdownTrigger
+            aria-label="筛选结果" className={cn(buttonVariants({ variant: selectedResult ? "secondary" : "ghost", size: "sm", isIconOnly: true }), "h-7 min-w-7 text-default-500")}>
             <FilterIcon />
-          </Button>
-        </DropdownTrigger>
+          </DropdownTrigger>
         <DropdownPopover placement="bottom start">
           <DropdownMenu
             aria-label="筛选连接记录结果"

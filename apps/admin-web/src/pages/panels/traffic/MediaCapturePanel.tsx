@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@heroui/react";
+import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@heroui/react";
 import { Pager } from "../../../components/Pager";
 import {
   Gauge,
@@ -177,69 +177,72 @@ export function MediaCapturePanel() {
       </div>
 
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="HTTP 媒体采集记录">
-          <TableHeader>
-            <TableColumn>来源</TableColumn>
-            <TableColumn>类型</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>范围</TableColumn>
-            <TableColumn>大小</TableColumn>
-            <TableColumn>时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无媒体采集记录")}>
-            {(row) => (
-              <TableRow key={row.id}>
-                <TableCell>
-                  <div className="flex max-w-[34rem] min-w-0 flex-col">
-                    <span className="truncate font-medium" title={row.sourceUrl}>{row.sourceUrl}</span>
-                    <span className="truncate text-tiny text-default-400">
-                      {row.clientName} · {row.route} · #{row.id}
-                    </span>
-                  </div>
-                </TableCell>
-                <TableCell><MediaKindChip kind={row.mediaKind} /></TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col gap-1">
-                    <MediaStateChip row={row} />
-                    {row.failureReason ? (
-                      <span className="max-w-52 truncate text-tiny text-danger" title={row.failureReason}>
-                        {row.failureReason}
+        <Table>
+          <TableContent aria-label="HTTP 媒体采集记录">
+            <TableHeader>
+              <TableColumn isRowHeader>来源</TableColumn>
+              <TableColumn>类型</TableColumn>
+              <TableColumn>状态</TableColumn>
+              <TableColumn>范围</TableColumn>
+              <TableColumn>大小</TableColumn>
+              <TableColumn>时间</TableColumn>
+              <TableColumn>操作</TableColumn>
+            </TableHeader>
+            <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无媒体采集记录")}>
+              {(row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    <div className="flex max-w-[34rem] min-w-0 flex-col">
+                      <span className="truncate font-medium" title={row.sourceUrl}>{row.sourceUrl}</span>
+                      <span className="truncate text-tiny text-default-400">
+                        {row.clientName} · {row.route} · #{row.id}
                       </span>
-                    ) : null}
-                    {row.playbackMessage ? (
-                      <span
-                        className={`max-w-52 truncate text-tiny ${
-                          row.playable ? "text-warning-600" : "text-danger"
-                        }`}
-                        title={row.playbackMessage}
-                      >
-                        {row.playbackMessage}
+                    </div>
+                  </TableCell>
+                  <TableCell><MediaKindChip kind={row.mediaKind} /></TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <MediaStateChip row={row} />
+                      {row.failureReason ? (
+                        <span className="max-w-52 truncate text-tiny text-danger" title={row.failureReason}>
+                          {row.failureReason}
+                        </span>
+                      ) : null}
+                      {row.playbackMessage ? (
+                        <span
+                          className={`max-w-52 truncate text-tiny ${
+                            row.playable ? "text-warning-600" : "text-danger"
+                          }`}
+                          title={row.playbackMessage}
+                        >
+                          {row.playbackMessage}
+                        </span>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell><span className="whitespace-nowrap font-mono text-tiny">{mediaRangeLabel(row)}</span></TableCell>
+                  <TableCell>{formatBytes(row.capturedBytes)}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-col whitespace-nowrap">
+                      <span>{formatDateTime(row.capturedAt)}</span>
+                      <span className="text-tiny text-default-400">
+                        保留至 {formatDateTime(row.expiresAt)}
                       </span>
-                    ) : null}
-                  </div>
-                </TableCell>
-                <TableCell><span className="whitespace-nowrap font-mono text-tiny">{mediaRangeLabel(row)}</span></TableCell>
-                <TableCell>{formatBytes(row.capturedBytes)}</TableCell>
-                <TableCell>
-                  <div className="flex flex-col whitespace-nowrap">
-                    <span>{formatDateTime(row.capturedAt)}</span>
-                    <span className="text-tiny text-default-400">
-                      保留至 {formatDateTime(row.expiresAt)}
-                    </span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <Button
-                    size="sm" variant="secondary" isDisabled={!canPlay(row) || ticketLoadingId === row.id}
-                    onPress={() => void openPlayer(row)}
-                  >{ticketLoadingId === row.id ? <Spinner size="sm" /> : null}
-                    播放
-                  </Button>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      size="sm" variant="secondary" isDisabled={!canPlay(row) || ticketLoadingId === row.id}
+                      onPress={() => void openPlayer(row)}
+                    >{ticketLoadingId === row.id ? <Spinner size="sm" /> : null}
+                      播放
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+        
+          </TableContent>
         </Table>
       </div>
 

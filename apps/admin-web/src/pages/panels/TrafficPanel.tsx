@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Button, Card, Chip, Input, Label, Modal, Popover, PopoverContent, PopoverTrigger, Spinner, Switch, Tab, TabList, TabPanel, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, Tabs, TextField } from "@heroui/react";
+import { Button, Card, Chip, Input, Label, Modal, Popover, PopoverContent, PopoverTrigger, Spinner, Switch, Tab, TabList, TabPanel, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, Tabs, TextField } from "@heroui/react";
 import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type {
@@ -543,27 +543,30 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="客户端流量使用">
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>日期（UTC）</TableColumn>
-          <TableColumn>上传</TableColumn>
-          <TableColumn>下载</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-        </TableHeader>
-        <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无数据")}>
-          {(row) => (
-            <TableRow key={row.id}>
-              <TableCell>{row.id}</TableCell>
-              <TableCell>{row.clientName}</TableCell>
-              <TableCell>{row.usageDate}</TableCell>
-              <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
-              <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
-              <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
-            </TableRow>
-          )}
-        </TableBody>
+      <Table>
+        <TableContent aria-label="客户端流量使用">
+          <TableHeader>
+            <TableColumn isRowHeader>ID</TableColumn>
+            <TableColumn>客户端</TableColumn>
+            <TableColumn>日期（UTC）</TableColumn>
+            <TableColumn>上传</TableColumn>
+            <TableColumn>下载</TableColumn>
+            <TableColumn>更新时间</TableColumn>
+          </TableHeader>
+          <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无数据")}>
+            {(row) => (
+              <TableRow key={row.id}>
+                <TableCell>{row.id}</TableCell>
+                <TableCell>{row.clientName}</TableCell>
+                <TableCell>{row.usageDate}</TableCell>
+                <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
+                <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
+                <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+      
+        </TableContent>
       </Table>
       </div>
     </div>
@@ -712,38 +715,41 @@ function ResourceTrafficSection({
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label={`${type} 流量明细`}>
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>资源</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>日期（UTC）</TableColumn>
-          <TableColumn>上传</TableColumn>
-          <TableColumn>下载</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-        </TableHeader>
-        <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : emptyContent)}>
-          {(row) => (
-            <TableRow key={row.id}>
-              <TableCell>{row.id}</TableCell>
-              <TableCell>
-                <div className="flex min-w-0 flex-col">
-                  <span className="max-w-96 whitespace-normal break-all font-medium" title={row.resourceName}>
-                    {row.resourceName}
-                  </span>
-                  <span className="break-all text-tiny text-default-400" title={row.resourceKey}>
-                    {row.resourceKey}
-                  </span>
-                </div>
-              </TableCell>
-              <TableCell>{row.clientName}</TableCell>
-              <TableCell>{row.usageDate}</TableCell>
-              <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
-              <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
-              <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
-            </TableRow>
-          )}
-        </TableBody>
+      <Table>
+        <TableContent aria-label={`${type} 流量明细`}>
+          <TableHeader>
+            <TableColumn isRowHeader>ID</TableColumn>
+            <TableColumn>资源</TableColumn>
+            <TableColumn>客户端</TableColumn>
+            <TableColumn>日期（UTC）</TableColumn>
+            <TableColumn>上传</TableColumn>
+            <TableColumn>下载</TableColumn>
+            <TableColumn>更新时间</TableColumn>
+          </TableHeader>
+          <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : emptyContent)}>
+            {(row) => (
+              <TableRow key={row.id}>
+                <TableCell>{row.id}</TableCell>
+                <TableCell>
+                  <div className="flex min-w-0 flex-col">
+                    <span className="max-w-96 whitespace-normal break-all font-medium" title={row.resourceName}>
+                      {row.resourceName}
+                    </span>
+                    <span className="break-all text-tiny text-default-400" title={row.resourceKey}>
+                      {row.resourceKey}
+                    </span>
+                  </div>
+                </TableCell>
+                <TableCell>{row.clientName}</TableCell>
+                <TableCell>{row.usageDate}</TableCell>
+                <TableCell>{formatBytes(row.uploadBytes)}</TableCell>
+                <TableCell>{formatBytes(row.downloadBytes)}</TableCell>
+                <TableCell>{formatDateTime(row.updatedAt)}</TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+      
+        </TableContent>
       </Table>
       </div>
     </div>
@@ -963,99 +969,101 @@ function HttpExchangeTable({
 
         <div className="hidden min-w-0 lg:block">
         <Table
-          aria-label="HTTP 协议记录"
         >
-          <TableHeader>
-            <TableColumn className="w-[14%]">时间</TableColumn>
-            <TableColumn className="w-[22%]">
-              <HttpSearchFilterHeader
-                activeSearch={activeSearch}
-                activeSearchField={activeSearchField}
-                onResetSearch={onResetSearch}
-                onSearch={onSearch}
-                onSearchDraftChange={onSearchDraftChange}
-                onSearchFieldChange={onSearchFieldChange}
-                searchDraft={searchDraft}
-                searchField={searchField}
-                searchFieldOption={searchFieldOption}
-              />
-            </TableColumn>
-            <TableColumn className="w-[8%]">状态</TableColumn>
-            <TableColumn className="w-[11%]">
-              <HttpResponseTypeFilterHeader
-                activeResponseType={activeResponseType}
-                onResetSearch={onResetSearch}
-                onSearch={onSearch}
-                onResponseTypeChange={onResponseTypeChange}
-                responseType={responseType}
-              />
-            </TableColumn>
-            <TableColumn className="w-[21%]">资源</TableColumn>
-            <TableColumn className="w-[10%]">流量</TableColumn>
-            <TableColumn className="w-[6%]">耗时</TableColumn>
-            <TableColumn className="w-[8%]">协议详情</TableColumn>
-          </TableHeader>
-          <TableBody
-            key={tableCollectionKey}
-            items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <div className="flex flex-col items-center gap-2 py-3">
-                <span>{hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}</span>
-                {hasActiveFilters && (
-                  <Button size="sm" variant="ghost" onPress={onResetSearch}>
-                    重置筛选
-                  </Button>
-                )}
-              </div>)}>
-            {(row) => (
-              <TableRow key={row.tableKey}>
-                <TableCell>
-                  <span className="block truncate" title={formatDateTime(row.capturedAt)}>
-                    {formatDateTime(row.capturedAt)}
-                  </span>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="font-mono text-small font-semibold">{row.method}</span>
-                    <span className="block max-w-full truncate font-mono text-tiny text-default-500" title={httpPath(row)}>{httpPath(row)}</span>
-                    {row.remoteAddress && <span className="block truncate text-tiny text-default-400" title={row.remoteAddress}>{row.remoteAddress}</span>}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <Chip color={httpStatusColor(row)} size="sm" variant="soft">
-                    {row.statusCode}
-                  </Chip>
-                </TableCell>
-                <TableCell>
-                  <HttpResponseTypeChip
-                    value={row.responseBodyType}
-                    contentType={row.responseContentType}
-                    bytes={row.responseBytes}
-                  />
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="block max-w-full truncate font-medium" title={row.resourceName}>
-                      {row.resourceName}
+          <TableContent aria-label="HTTP 协议记录">
+            <TableHeader>
+              <TableColumn isRowHeader className="w-[14%]">时间</TableColumn>
+              <TableColumn className="w-[22%]">
+                <HttpSearchFilterHeader
+                  activeSearch={activeSearch}
+                  activeSearchField={activeSearchField}
+                  onResetSearch={onResetSearch}
+                  onSearch={onSearch}
+                  onSearchDraftChange={onSearchDraftChange}
+                  onSearchFieldChange={onSearchFieldChange}
+                  searchDraft={searchDraft}
+                  searchField={searchField}
+                  searchFieldOption={searchFieldOption}
+                />
+              </TableColumn>
+              <TableColumn className="w-[8%]">状态</TableColumn>
+              <TableColumn className="w-[11%]">
+                <HttpResponseTypeFilterHeader
+                  activeResponseType={activeResponseType}
+                  onResetSearch={onResetSearch}
+                  onSearch={onSearch}
+                  onResponseTypeChange={onResponseTypeChange}
+                  responseType={responseType}
+                />
+              </TableColumn>
+              <TableColumn className="w-[21%]">资源</TableColumn>
+              <TableColumn className="w-[10%]">流量</TableColumn>
+              <TableColumn className="w-[6%]">耗时</TableColumn>
+              <TableColumn className="w-[8%]">协议详情</TableColumn>
+            </TableHeader>
+            <TableBody
+              key={tableCollectionKey}
+              items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <div className="flex flex-col items-center gap-2 py-3">
+                  <span>{hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}</span>
+                  {hasActiveFilters && (
+                    <Button size="sm" variant="ghost" onPress={onResetSearch}>
+                      重置筛选
+                    </Button>
+                  )}
+                </div>)}>
+              {(row) => (
+                <TableRow key={row.tableKey}>
+                  <TableCell>
+                    <span className="block truncate" title={formatDateTime(row.capturedAt)}>
+                      {formatDateTime(row.capturedAt)}
                     </span>
-                    <span className="block truncate text-tiny text-default-400" title={row.clientName}>{row.clientName}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-col text-small">
-                    <span>请求 {formatBytes(row.requestBytes)}</span>
-                    <span>响应 {formatBytes(row.responseBytes)}</span>
-                  </div>
-                </TableCell>
-                <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
-                <TableCell>
-                  <Button
-                    size="sm" variant="secondary"
-                    onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
-                    详情
-                  </Button>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col">
+                      <span className="font-mono text-small font-semibold">{row.method}</span>
+                      <span className="block max-w-full truncate font-mono text-tiny text-default-500" title={httpPath(row)}>{httpPath(row)}</span>
+                      {row.remoteAddress && <span className="block truncate text-tiny text-default-400" title={row.remoteAddress}>{row.remoteAddress}</span>}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Chip color={httpStatusColor(row)} size="sm" variant="soft">
+                      {row.statusCode}
+                    </Chip>
+                  </TableCell>
+                  <TableCell>
+                    <HttpResponseTypeChip
+                      value={row.responseBodyType}
+                      contentType={row.responseContentType}
+                      bytes={row.responseBytes}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col">
+                      <span className="block max-w-full truncate font-medium" title={row.resourceName}>
+                        {row.resourceName}
+                      </span>
+                      <span className="block truncate text-tiny text-default-400" title={row.clientName}>{row.clientName}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-col text-small">
+                      <span>请求 {formatBytes(row.requestBytes)}</span>
+                      <span>响应 {formatBytes(row.responseBytes)}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
+                  <TableCell>
+                    <Button
+                      size="sm" variant="secondary"
+                      onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
+                      详情
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+        
+          </TableContent>
         </Table>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -2231,84 +2239,87 @@ function TcpFrameTable({
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="TCP 数据帧">
-          <TableHeader>
-            <TableColumn>时间</TableColumn>
-            <TableColumn>方向</TableColumn>
-            <TableColumn>端口</TableColumn>
-            <TableColumn>连接</TableColumn>
-            <TableColumn>流位置</TableColumn>
-            <TableColumn>长度</TableColumn>
-            <TableColumn>ASCII / 文本</TableColumn>
-            <TableColumn>HEX</TableColumn>
-            <TableColumn>解析</TableColumn>
-          </TableHeader>
-          <TableBody items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无 TCP 数据帧")}>
-            {(row) => (
-              <TableRow key={row.tableKey}>
-                <TableCell>{formatDateTime(row.frameTime)}</TableCell>
-                <TableCell>
-                  <Chip
-                    size="sm"
-                    variant="soft" color={row.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
-                    {directionLabel(row.direction)}
-                  </Chip>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="font-semibold">{row.listenPort}</span>
-                    <span className="max-w-64 whitespace-normal break-all text-tiny text-default-400" title={row.resourceName}>
-                      {row.resourceName}
-                    </span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="max-w-48 truncate font-mono text-tiny">{shortChannel(row.channelId)}</span>
-                    <span className="max-w-72 whitespace-normal break-all text-tiny text-default-500" title={tcpFlowLabel(row)}>
-                      {tcpFlowLabel(row)}
-                    </span>
-                    {row.remoteAddress && <span className="max-w-48 truncate text-tiny text-default-400">peer {row.remoteAddress}</span>}
-                    <span className="text-tiny text-default-400">{row.clientName}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col font-mono text-tiny">
-                    <span>#{row.frameIndex ?? 0}</span>
-                    <span className="text-default-400">{tcpStreamRange(row)}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  {formatBytes(row.payloadBytes)}
-                  {row.truncated && !row.payloadBase64 && <span className="ml-1 text-tiny text-warning">仅预览</span>}
-                </TableCell>
-                <TableCell>
-                  <pre className="max-h-24 max-w-80 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
-                    {row.payloadPreviewText || "-"}
-                  </pre>
-                </TableCell>
-                <TableCell>
-                  <pre className="max-h-24 max-w-96 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
-                    {row.payloadPreviewHex || "-"}
-                  </pre>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      size="sm" variant="secondary"
-                      onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
-                      详情
-                    </Button>
-                    <Button
-                      size="sm" variant="secondary"
-                      onPress={() => onOpenStream(row)} isDisabled={streamLoadingChannel === row.channelId}>{streamLoadingChannel === row.channelId ? <Spinner size="sm" /> : null}
-                      串流
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+        <Table>
+          <TableContent aria-label="TCP 数据帧">
+            <TableHeader>
+              <TableColumn isRowHeader>时间</TableColumn>
+              <TableColumn>方向</TableColumn>
+              <TableColumn>端口</TableColumn>
+              <TableColumn>连接</TableColumn>
+              <TableColumn>流位置</TableColumn>
+              <TableColumn>长度</TableColumn>
+              <TableColumn>ASCII / 文本</TableColumn>
+              <TableColumn>HEX</TableColumn>
+              <TableColumn>解析</TableColumn>
+            </TableHeader>
+            <TableBody items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无 TCP 数据帧")}>
+              {(row) => (
+                <TableRow key={row.tableKey}>
+                  <TableCell>{formatDateTime(row.frameTime)}</TableCell>
+                  <TableCell>
+                    <Chip
+                      size="sm"
+                      variant="soft" color={row.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
+                      {directionLabel(row.direction)}
+                    </Chip>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col">
+                      <span className="font-semibold">{row.listenPort}</span>
+                      <span className="max-w-64 whitespace-normal break-all text-tiny text-default-400" title={row.resourceName}>
+                        {row.resourceName}
+                      </span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col">
+                      <span className="max-w-48 truncate font-mono text-tiny">{shortChannel(row.channelId)}</span>
+                      <span className="max-w-72 whitespace-normal break-all text-tiny text-default-500" title={tcpFlowLabel(row)}>
+                        {tcpFlowLabel(row)}
+                      </span>
+                      {row.remoteAddress && <span className="max-w-48 truncate text-tiny text-default-400">peer {row.remoteAddress}</span>}
+                      <span className="text-tiny text-default-400">{row.clientName}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col font-mono text-tiny">
+                      <span>#{row.frameIndex ?? 0}</span>
+                      <span className="text-default-400">{tcpStreamRange(row)}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    {formatBytes(row.payloadBytes)}
+                    {row.truncated && !row.payloadBase64 && <span className="ml-1 text-tiny text-warning">仅预览</span>}
+                  </TableCell>
+                  <TableCell>
+                    <pre className="max-h-24 max-w-80 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
+                      {row.payloadPreviewText || "-"}
+                    </pre>
+                  </TableCell>
+                  <TableCell>
+                    <pre className="max-h-24 max-w-96 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
+                      {row.payloadPreviewHex || "-"}
+                    </pre>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        size="sm" variant="secondary"
+                        onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
+                        详情
+                      </Button>
+                      <Button
+                        size="sm" variant="secondary"
+                        onPress={() => onOpenStream(row)} isDisabled={streamLoadingChannel === row.channelId}>{streamLoadingChannel === row.channelId ? <Spinner size="sm" /> : null}
+                        串流
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+        
+          </TableContent>
         </Table>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3">

@@ -1,5 +1,5 @@
-import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ButtonHTMLAttributes } from "react";
+import {type ComponentProps, useCallback, useEffect, useMemo, useRef, useState} from "react";
+
 import { createPortal } from "react-dom";
 import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Popover, PopoverContent, PopoverTrigger } from "@heroui/react";
 import {
@@ -1666,9 +1666,12 @@ export function SyncedWhiteboard({
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
             <Dropdown>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="insert" label={insertMenuLabel} active={isInsertMenuActive} />
-              </DropdownTrigger>
+              <DropdownTrigger
+                  aria-label={insertMenuLabel + "菜单"}
+                  className={whiteboardMenuTriggerClass(isInsertMenuActive)}
+                >
+                  <WhiteboardMenuTriggerContent icon="insert" label={insertMenuLabel} />
+                </DropdownTrigger>
               <DropdownPopover placement="bottom start">
                 <DropdownMenu
                   aria-label="插入内容"
@@ -1850,9 +1853,12 @@ export function SyncedWhiteboard({
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
             <Dropdown>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="file" label="文件" />
-              </DropdownTrigger>
+              <DropdownTrigger
+                  aria-label={"文件" + "菜单"}
+                  className={whiteboardMenuTriggerClass(false)}
+                >
+                  <WhiteboardMenuTriggerContent icon="file" label="文件" />
+                </DropdownTrigger>
               <DropdownPopover placement="bottom end">
                 <DropdownMenu
                   aria-label="白板文件"
@@ -1877,9 +1883,12 @@ export function SyncedWhiteboard({
             </Dropdown>
 
             <Dropdown>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="edit" label="编辑" />
-              </DropdownTrigger>
+              <DropdownTrigger
+                  aria-label={"编辑" + "菜单"}
+                  className={whiteboardMenuTriggerClass(false)}
+                >
+                  <WhiteboardMenuTriggerContent icon="edit" label="编辑" />
+                </DropdownTrigger>
               <DropdownPopover placement="bottom end">
                 <DropdownMenu
                   aria-label="编辑白板"
@@ -2409,39 +2418,35 @@ function WhiteboardToolButton({
   );
 }
 
-interface WhiteboardMenuTriggerProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  icon: "insert" | "file" | "edit";
+interface WhiteboardMenuTriggerProps {
+  icon: ComponentProps<typeof ToolGlyph>["name"];
   label: string;
   active?: boolean;
 }
 
-const WhiteboardMenuTrigger = forwardRef<HTMLButtonElement, WhiteboardMenuTriggerProps>(function WhiteboardMenuTrigger({
-  icon,
-  label,
-  active = false,
-  className = "",
-  ...buttonProps
-}, ref) {
+/** Class list for a whiteboard menu trigger. HeroUI 3's DropdownTrigger renders
+ *  the <button> itself, so this contributes styling and content, not an element —
+ *  nesting a second button inside the trigger is invalid HTML. */
+export function whiteboardMenuTriggerClass(active = false, className = ""): string {
   return (
-    <button
-      {...buttonProps}
-      ref={ref}
-      type="button"
-      aria-label={label + "菜单"}
-      className={
-        "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
-        + (active
-          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
-          : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
-        + (className ? " " + className : "")
-      }
-    >
+    "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500 "
+    + (active
+      ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
+      : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
+    + (className ? " " + className : "")
+  );
+}
+
+/** The inner content of a whiteboard menu trigger: glyph, label, chevron. */
+function WhiteboardMenuTriggerContent({ icon, label }: WhiteboardMenuTriggerProps) {
+  return (
+    <>
       <ToolGlyph name={icon} />
       <span className="hidden sm:inline">{label}</span>
       <MenuChevronGlyph />
-    </button>
+    </>
   );
-});
+}
 
 function FlowchartPanel({
   className = "",

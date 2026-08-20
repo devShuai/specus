@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Button, Chip, Description, FieldError, Input, Label, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField, Tooltip, TooltipContent, TooltipTrigger, useOverlayState } from "@heroui/react";
+import { Button, Chip, Description, FieldError, Input, Label, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField, Tooltip, TooltipContent, TooltipTrigger, useOverlayState } from "@heroui/react";
 import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { Client, ClientCredential } from "../../api/types";
@@ -202,7 +202,7 @@ export function ClientsPanel() {
       </StatusChip>
     );
     return tooltip ? <Tooltip>
-      <TooltipTrigger>{chip}</TooltipTrigger>
+      <TooltipTrigger tabIndex={0}>{chip}</TooltipTrigger>
       <TooltipContent>{tooltip}</TooltipContent>
     </Tooltip> : chip;
   };
@@ -210,7 +210,7 @@ export function ClientsPanel() {
   const messageCapabilityChip = (client: Client) => (
     <Tooltip
     >
-      <TooltipTrigger><Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="soft">
+      <TooltipTrigger tabIndex={0}><Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="soft">
         {client.messageReceiveCapable ? "可聊天" : "不可聊天"}
       </Chip></TooltipTrigger>
       <TooltipContent>{client.messageReceiveCapable
@@ -295,42 +295,45 @@ export function ClientsPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="接入凭证列表">
-          <TableHeader>
-            <TableColumn>ID</TableColumn>
-            <TableColumn>apiKey</TableColumn>
-            <TableColumn>归属</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>在线实例上限</TableColumn>
-            <TableColumn>创建时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={credentialPagination.paged} renderEmptyState={() => (loadingCredentials ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />)}>
-            {(credential) => (
-              <TableRow key={credential.id}>
-                <TableCell>{credential.id}</TableCell>
-                <TableCell className="font-mono">{credential.apiKey}</TableCell>
-                <TableCell>{credential.ownerUsername || "-"}</TableCell>
-                <TableCell>
-                  <StatusChip tone={enabledTone(credential.enabled)}>
-                    {credential.enabled ? "启用" : "停用"}
-                  </StatusChip>
-                </TableCell>
-                <TableCell>{credential.maxOnlineInstances}</TableCell>
-                <TableCell>{formatDateTime(credential.createdAt)}</TableCell>
-                <TableCell>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="secondary" onPress={() => openCredentialEdit(credential)}>
-                      编辑
-                    </Button>
-                    <Button size="sm" variant="danger-soft" onPress={() => removeCredential(credential)}>
-                      删除
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+        <Table>
+          <TableContent aria-label="接入凭证列表">
+            <TableHeader>
+              <TableColumn isRowHeader>ID</TableColumn>
+              <TableColumn>apiKey</TableColumn>
+              <TableColumn>归属</TableColumn>
+              <TableColumn>状态</TableColumn>
+              <TableColumn>在线实例上限</TableColumn>
+              <TableColumn>创建时间</TableColumn>
+              <TableColumn>操作</TableColumn>
+            </TableHeader>
+            <TableBody items={credentialPagination.paged} renderEmptyState={() => (loadingCredentials ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />)}>
+              {(credential) => (
+                <TableRow key={credential.id}>
+                  <TableCell>{credential.id}</TableCell>
+                  <TableCell className="font-mono">{credential.apiKey}</TableCell>
+                  <TableCell>{credential.ownerUsername || "-"}</TableCell>
+                  <TableCell>
+                    <StatusChip tone={enabledTone(credential.enabled)}>
+                      {credential.enabled ? "启用" : "停用"}
+                    </StatusChip>
+                  </TableCell>
+                  <TableCell>{credential.maxOnlineInstances}</TableCell>
+                  <TableCell>{formatDateTime(credential.createdAt)}</TableCell>
+                  <TableCell>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="secondary" onPress={() => openCredentialEdit(credential)}>
+                        编辑
+                      </Button>
+                      <Button size="sm" variant="danger-soft" onPress={() => removeCredential(credential)}>
+                        删除
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+        
+          </TableContent>
         </Table>
         </div>
         {credentialPagination.pager}
@@ -388,52 +391,55 @@ export function ClientsPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="客户端实例列表">
-          <TableHeader>
-            <TableColumn>ID</TableColumn>
-            <TableColumn>客户端</TableColumn>
-            <TableColumn>归属</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>版本</TableColumn>
-            <TableColumn>消息</TableColumn>
-            <TableColumn>每分钟上限</TableColumn>
-            <TableColumn>上传</TableColumn>
-            <TableColumn>下载</TableColumn>
-            <TableColumn>创建时间</TableColumn>
-            <TableColumn>操作</TableColumn>
-          </TableHeader>
-          <TableBody items={clientPagination.paged} renderEmptyState={() => (loadingClients ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />)}>
-            {(client) => (
-              <TableRow key={client.id}>
-                <TableCell>{client.id}</TableCell>
-                <TableCell>{client.clientName}</TableCell>
-                <TableCell>{client.ownerUsername || "-"}</TableCell>
-                <TableCell>{statusChip(client)}</TableCell>
-                <TableCell><span className="whitespace-nowrap font-mono text-tiny">{client.clientVersion || "未上报"}</span></TableCell>
-                <TableCell>{messageCapabilityChip(client)}</TableCell>
-                <TableCell>{client.connectionRateLimitPerMinute || "不限"}</TableCell>
-                <TableCell>{formatBytes(client.uploadBytes)}</TableCell>
-                <TableCell>{formatBytes(client.downloadBytes)}</TableCell>
-                <TableCell>{formatDateTime(client.createdAt)}</TableCell>
-                <TableCell>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="secondary" onPress={() => setDetailClient(client)}>
-                      详情
-                    </Button>
-                    <Button size="sm" variant="secondary" onPress={() => openClientEdit(client)}>
-                      编辑
-                    </Button>
-                    <Button size="sm" variant="secondary" onPress={() => void pushNat(client)}>
-                      下发映射
-                    </Button>
-                    <Button size="sm" variant="danger-soft" onPress={() => removeClient(client)}>
-                      删除
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+        <Table>
+          <TableContent aria-label="客户端实例列表">
+            <TableHeader>
+              <TableColumn isRowHeader>ID</TableColumn>
+              <TableColumn>客户端</TableColumn>
+              <TableColumn>归属</TableColumn>
+              <TableColumn>状态</TableColumn>
+              <TableColumn>版本</TableColumn>
+              <TableColumn>消息</TableColumn>
+              <TableColumn>每分钟上限</TableColumn>
+              <TableColumn>上传</TableColumn>
+              <TableColumn>下载</TableColumn>
+              <TableColumn>创建时间</TableColumn>
+              <TableColumn>操作</TableColumn>
+            </TableHeader>
+            <TableBody items={clientPagination.paged} renderEmptyState={() => (loadingClients ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />)}>
+              {(client) => (
+                <TableRow key={client.id}>
+                  <TableCell>{client.id}</TableCell>
+                  <TableCell>{client.clientName}</TableCell>
+                  <TableCell>{client.ownerUsername || "-"}</TableCell>
+                  <TableCell>{statusChip(client)}</TableCell>
+                  <TableCell><span className="whitespace-nowrap font-mono text-tiny">{client.clientVersion || "未上报"}</span></TableCell>
+                  <TableCell>{messageCapabilityChip(client)}</TableCell>
+                  <TableCell>{client.connectionRateLimitPerMinute || "不限"}</TableCell>
+                  <TableCell>{formatBytes(client.uploadBytes)}</TableCell>
+                  <TableCell>{formatBytes(client.downloadBytes)}</TableCell>
+                  <TableCell>{formatDateTime(client.createdAt)}</TableCell>
+                  <TableCell>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="secondary" onPress={() => setDetailClient(client)}>
+                        详情
+                      </Button>
+                      <Button size="sm" variant="secondary" onPress={() => openClientEdit(client)}>
+                        编辑
+                      </Button>
+                      <Button size="sm" variant="secondary" onPress={() => void pushNat(client)}>
+                        下发映射
+                      </Button>
+                      <Button size="sm" variant="danger-soft" onPress={() => removeClient(client)}>
+                        删除
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+        
+          </TableContent>
         </Table>
         </div>
         {clientPagination.pager}
