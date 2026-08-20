@@ -15,6 +15,8 @@ on:
       - "implementations/go/**/go.sum"
       - "implementations/java/**/pom.xml"
       - "pom.xml"
+      - "apps/admin-web/package.json"
+      - "apps/admin-web/package-lock.json"
   push:
     branches: [main]
     paths:
@@ -26,6 +28,8 @@ on:
       - "implementations/go/**/go.sum"
       - "implementations/java/**/pom.xml"
       - "pom.xml"
+      - "apps/admin-web/package.json"
+      - "apps/admin-web/package-lock.json"
   schedule:
     # Monday 03:17 UTC. An odd minute avoids the top-of-hour scheduling backlog.
     - cron: "17 3 * * 1"
@@ -205,5 +209,51 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sca-android
+          path: ${{ runner.temp }}/sca
+          if-no-files-found: warn
+
+  frontend:
+    name: Frontend (npm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - name: Install
+        working-directory: apps/admin-web
+        run: npm ci
+
+      - name: Record both audits
+        working-directory: apps/admin-web
+        run: |
+          mkdir -p "$RUNNER_TEMP/sca"
+          npm audit --omit=dev --json > "$RUNNER_TEMP/sca/npm-production.json" || true
+          npm audit --json > "$RUNNER_TEMP/sca/npm-all.json" || true
+          echo "--- production dependencies ---"
+          npm audit --omit=dev || true
+          echo "--- including devDependencies (reported, not gated) ---"
+          npm audit || true
+
+      # Only the production tree gates. A devDependency advisory is real but its blast radius is a
+      # developer's machine, not the deployed admin UI, and gating on it means a vitest advisory can
+      # block an unrelated backend change — which is how a gate stops being taken seriously. The
+      # distinction is not theoretical here: when this job was added the tree carried a critical and
+      # a high, all in devDependencies, while the one advisory that actually reached a browser was a
+      # moderate in dompurify pulled in through jspdf.
+      - name: Fail on a high or critical advisory in shipped dependencies
+        working-directory: apps/admin-web
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-frontend
           path: ${{ runner.temp }}/sca
           if-no-files-found: warn
