@@ -226,6 +226,79 @@ func TestPeerServiceRuntimeWithdrawsWhenSharingTurnsOff(t *testing.T) {
 	})
 }
 
+func TestPeerServiceRuntimeOnlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds(t *testing.T) {
+	_, firstTarget := mustListen(t)
+	defer firstTarget.Close()
+	_, secondTarget := mustListen(t)
+	defer secondTarget.Close()
+	firstPublishedPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPublishedPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
+	defer runtime.close()
+	runtime.setHasAuthorizedOnlinePeer(true)
+
+	first := testPeerMeshConfig(true, firstTarget.Addr().(*net.TCPAddr).Port, true)
+	first.LocalServices[0].PublishedPort = firstPublishedPort
+	first.LocalServices[0].AllowedPeerVirtualIPs = []string{"127.0.0.1"}
+	started := time.Now()
+	runtime.applyConfig(first)
+	firstCaller, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(firstPublishedPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstCaller.Close()
+	_ = firstTarget.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
+	firstForwarded, err := firstTarget.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstForwarded.Close()
+	if time.Since(started) >= 5*time.Second {
+		t.Fatal("online service was not published within five seconds")
+	}
+
+	replacement := testPeerMeshConfig(true, secondTarget.Addr().(*net.TCPAddr).Port, true)
+	replacement.LocalServices[0].PublishedPort = secondPublishedPort
+	replacement.LocalServices[0].AllowedPeerVirtualIPs = []string{"127.0.0.1"}
+	runtime.applyConfig(replacement)
+	_ = firstCaller.SetReadDeadline(time.Now().Add(time.Second))
+	if _, readErr := firstCaller.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("replaced service left the old flow active")
+	}
+	if retry, retryErr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(firstPublishedPort)), time.Second); retryErr == nil {
+		retry.Close()
+		t.Fatal("replaced service left the old listener open")
+	}
+
+	secondCaller, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(secondPublishedPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondCaller.Close()
+	_ = secondTarget.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
+	secondForwarded, err := secondTarget.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondForwarded.Close()
+	replacement.LocalServices[0].Enabled = false
+	runtime.applyConfig(replacement)
+	_ = secondCaller.SetReadDeadline(time.Now().Add(time.Second))
+	if _, readErr := secondCaller.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("disabled service left its active flow open")
+	}
+	if retry, retryErr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(secondPublishedPort)), time.Second); retryErr == nil {
+		retry.Close()
+		t.Fatal("disabled service accepted a new connection")
+	}
+}
+
 func TestPeerServiceRuntimeLocalPauseStopsReporting(t *testing.T) {
 	port, listener := mustListen(t)
 	defer listener.Close()

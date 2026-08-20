@@ -17,6 +17,7 @@ import java.net.DatagramSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -116,6 +117,51 @@ class PeerServiceRuntimeTests {
             waitUntil(() -> sent.stream().anyMatch(body -> body.contains("\"enabled\":false")));
             assertThat(sent.getLast()).contains("service-report");
             assertThat(sent.getLast()).contains("\"enabled\":false");
+        }
+    }
+
+    @Test
+    void onlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds() throws Exception {
+        int firstPublishedPort = freePort();
+        int secondPublishedPort = freePort();
+        try (ServerSocket firstTarget = listen(freePort());
+             ServerSocket secondTarget = listen(freePort())) {
+            firstTarget.setSoTimeout(5_000);
+            secondTarget.setSoTimeout(5_000);
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+
+            LocalPeerService first = localService(firstTarget.getLocalPort(), true);
+            first.setPublishedPort(firstPublishedPort);
+            first.setAllowedPeerVirtualIps(List.of("127.0.0.1"));
+            Instant started = Instant.now();
+            runtime.applyConfig(config(true, first));
+            try (Socket firstCaller = new Socket("127.0.0.1", firstPublishedPort);
+                 Socket firstForwarded = firstTarget.accept()) {
+                assertThat(Duration.between(started, Instant.now())).isLessThan(Duration.ofSeconds(5));
+
+                LocalPeerService replacement = localService(secondTarget.getLocalPort(), true);
+                replacement.setPublishedPort(secondPublishedPort);
+                replacement.setAllowedPeerVirtualIps(List.of("127.0.0.1"));
+                runtime.applyConfig(config(true, replacement));
+                firstCaller.setSoTimeout(1_000);
+                assertThat(readClosed(firstCaller)).isTrue();
+                assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> new Socket("127.0.0.1", firstPublishedPort)))
+                        .isInstanceOf(IOException.class);
+
+                try (Socket secondCaller = new Socket("127.0.0.1", secondPublishedPort);
+                     Socket secondForwarded = secondTarget.accept()) {
+                    assertThat(secondForwarded.isConnected()).isTrue();
+                    replacement.setEnabled(false);
+                    runtime.applyConfig(config(true, replacement));
+                    secondCaller.setSoTimeout(1_000);
+                    assertThat(readClosed(secondCaller)).isTrue();
+                }
+                assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> new Socket("127.0.0.1", secondPublishedPort)))
+                        .isInstanceOf(IOException.class);
+            }
         }
     }
 
@@ -322,6 +368,14 @@ class PeerServiceRuntimeTests {
     private static int freeUdpPort() throws IOException {
         try (DatagramSocket socket = new DatagramSocket(0)) {
             return socket.getLocalPort();
+        }
+    }
+
+    private static boolean readClosed(Socket socket) {
+        try {
+            return socket.getInputStream().read() == -1;
+        } catch (IOException closed) {
+            return true;
         }
     }
 

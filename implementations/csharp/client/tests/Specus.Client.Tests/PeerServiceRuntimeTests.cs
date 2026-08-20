@@ -200,6 +200,52 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
+    public async Task OnlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds()
+    {
+        using var firstTarget = Listen(0);
+        using var secondTarget = Listen(0);
+        var firstPublishedPort = FreePort();
+        var secondPublishedPort = FreePort();
+        using var runtime = new PeerServiceRuntime(_ => { });
+        runtime.SetHasAuthorizedOnlinePeer(true);
+
+        var first = Config(sharing: true, ((IPEndPoint)firstTarget.LocalEndpoint).Port, enabled: true);
+        first.LocalServices![0].PublishedPort = firstPublishedPort;
+        first.LocalServices[0].AllowedPeerVirtualIps = ["127.0.0.1"];
+        var started = DateTimeOffset.UtcNow;
+        runtime.ApplyConfig(first);
+        using var firstCaller = new TcpClient();
+        await firstCaller.ConnectAsync(IPAddress.Loopback, firstPublishedPort);
+        using var firstAcceptTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var firstForwarded = await firstTarget.AcceptTcpClientAsync(firstAcceptTimeout.Token);
+        Assert.True(DateTimeOffset.UtcNow - started < TimeSpan.FromSeconds(5));
+
+        var replacement = Config(sharing: true, ((IPEndPoint)secondTarget.LocalEndpoint).Port, enabled: true);
+        replacement.LocalServices![0].PublishedPort = secondPublishedPort;
+        replacement.LocalServices[0].AllowedPeerVirtualIps = ["127.0.0.1"];
+        runtime.ApplyConfig(replacement);
+        Assert.True(await ReadClosedAsync(firstCaller));
+        await Assert.ThrowsAnyAsync<SocketException>(async () =>
+        {
+            using var retry = new TcpClient();
+            await retry.ConnectAsync(IPAddress.Loopback, firstPublishedPort);
+        });
+
+        using var secondCaller = new TcpClient();
+        await secondCaller.ConnectAsync(IPAddress.Loopback, secondPublishedPort);
+        using var secondAcceptTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var secondForwarded = await secondTarget.AcceptTcpClientAsync(secondAcceptTimeout.Token);
+        replacement.LocalServices[0].Enabled = false;
+        runtime.ApplyConfig(replacement);
+        Assert.True(await ReadClosedAsync(secondCaller));
+        await Assert.ThrowsAnyAsync<SocketException>(async () =>
+        {
+            using var retry = new TcpClient();
+            await retry.ConnectAsync(IPAddress.Loopback, secondPublishedPort);
+        });
+    }
+
+    [Fact]
     public void CollectedEnvironmentAdvertisesPeerServiceCapabilities()
     {
         var environment = ClientEnvironmentInfo.Collect(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
@@ -336,6 +382,19 @@ public class PeerServiceRuntimeTests
         {
             client.Dispose();
             throw;
+        }
+    }
+
+    private static async Task<bool> ReadClosedAsync(TcpClient client)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            return await client.GetStream().ReadAsync(new byte[1], timeout.Token) == 0;
+        }
+        catch (Exception exception) when (exception is IOException or SocketException)
+        {
+            return true;
         }
     }
 

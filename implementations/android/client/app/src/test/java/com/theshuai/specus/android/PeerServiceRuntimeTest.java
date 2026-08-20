@@ -181,6 +181,48 @@ public class PeerServiceRuntimeTest {
     }
 
     @Test
+    public void onlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds() throws Exception {
+        int firstPublishedPort = freePort();
+        int secondPublishedPort = freePort();
+        try (ServerSocket firstTarget = listen(freePort());
+             ServerSocket secondTarget = listen(freePort())) {
+            firstTarget.setSoTimeout(5_000);
+            secondTarget.setSoTimeout(5_000);
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+
+            SpecusCore.PeerMeshConfig first = config(true, firstTarget.getLocalPort(), true);
+            first.localServices.get(0).publishedPort = firstPublishedPort;
+            first.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+            long started = System.nanoTime();
+            runtime.applyConfig(first);
+            try (Socket firstCaller = new Socket("127.0.0.1", firstPublishedPort);
+                 Socket firstForwarded = firstTarget.accept()) {
+                assertTrue(java.time.Duration.ofNanos(System.nanoTime() - started).compareTo(
+                        java.time.Duration.ofSeconds(5)) < 0);
+
+                SpecusCore.PeerMeshConfig replacement = config(true, secondTarget.getLocalPort(), true);
+                replacement.localServices.get(0).publishedPort = secondPublishedPort;
+                replacement.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+                runtime.applyConfig(replacement);
+                firstCaller.setSoTimeout(1_000);
+                assertTrue(readClosed(firstCaller));
+                assertConnectRejected(firstPublishedPort);
+
+                try (Socket secondCaller = new Socket("127.0.0.1", secondPublishedPort);
+                     Socket secondForwarded = secondTarget.accept()) {
+                    assertTrue(secondForwarded.isConnected());
+                    replacement.localServices.get(0).enabled = false;
+                    runtime.applyConfig(replacement);
+                    secondCaller.setSoTimeout(1_000);
+                    assertTrue(readClosed(secondCaller));
+                }
+                assertConnectRejected(secondPublishedPort);
+            }
+        }
+    }
+
+    @Test
     public void expiredCatalogIsPrunedAndSnapshotUpdated() throws Exception {
         runtime = newRuntime();
         runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
@@ -344,6 +386,22 @@ public class PeerServiceRuntimeTest {
     private static int freeUdpPort() throws IOException {
         try (DatagramSocket socket = new DatagramSocket(0)) {
             return socket.getLocalPort();
+        }
+    }
+
+    private static boolean readClosed(Socket socket) {
+        try {
+            return socket.getInputStream().read() == -1;
+        } catch (IOException closed) {
+            return true;
+        }
+    }
+
+    private static void assertConnectRejected(int port) throws Exception {
+        try (Socket ignored = new Socket("127.0.0.1", port)) {
+            throw new AssertionError("closed peer service accepted a new connection");
+        } catch (IOException expected) {
+            // expected
         }
     }
 
