@@ -8,8 +8,14 @@ const CHUNK_BUDGETS_KIB = new Map([
   // These packages publish their browser player as one pre-bundled ESM module. They are
   // loaded only after the user starts the matching media type, so splitting them further
   // would only add artificial request boundaries without reducing transferred code.
+  //
+  // media-hls was 550 while hls.js sat on 1.6.x and built to 512.7 KiB. 1.7.1 builds to
+  // 580.3 KiB, a 13% jump that no local change caused, so the budget follows upstream rather
+  // than pinning the library. 620 keeps roughly the same 7% headroom the old pair had, which
+  // is the point of the number: enough room for a patch release, not so much that the next
+  // real regression slips through unnoticed.
   ["media-dash", 900],
-  ["media-hls", 550],
+  ["media-hls", 620],
 ]);
 // Guard the static transitive graph too: several medium chunks can regress a route even when
 // every individual file remains below the default limit.
