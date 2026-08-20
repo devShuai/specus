@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader } from "@heroui/react";
+import { Button, Modal, Spinner } from "@heroui/react";
 
 export interface ConfirmModalProps {
   isOpen: boolean;
@@ -42,25 +42,35 @@ export function ConfirmModal({
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} size="sm" placement="center">
-      <ModalContent>
-        <ModalHeader className="text-base">{title}</ModalHeader>
-        <ModalBody>
-          {description ? (
-            <div className="text-small text-default-600">{description}</div>
-          ) : (
-            <p className="text-small text-default-600">该操作执行后无法撤销，请确认。</p>
-          )}
-        </ModalBody>
-        <ModalFooter>
-          <Button variant="flat" onPress={onClose} isDisabled={pending}>
-            {cancelLabel}
-          </Button>
-          <Button color={danger ? "danger" : "primary"} onPress={() => void handleConfirm()} isLoading={pending}>
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+      <Modal.Backdrop>
+        <Modal.Container size="sm" placement="center">
+          <Modal.Dialog>
+            <Modal.Header className="text-base">{title}</Modal.Header>
+            <Modal.Body>
+              {description ? (
+                <div className="text-small text-default-600">{description}</div>
+              ) : (
+                <p className="text-small text-default-600">该操作执行后无法撤销，请确认。</p>
+              )}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose} isDisabled={pending}>
+                {cancelLabel}
+              </Button>
+              <Button
+                variant={danger ? "danger" : "primary"}
+                onPress={() => void handleConfirm()}
+                isDisabled={pending}
+              >
+                {pending ? <Spinner size="sm" /> : null}
             {confirmLabel}
-          </Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
+            </Button>
+            </Modal.Footer>
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }

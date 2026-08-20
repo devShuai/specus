@@ -9,31 +9,8 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Pagination,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-  Switch,
-  Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tabs,
-} from "@heroui/react";
+import { Button, Card, Chip, Input, Label, Modal, Popover, PopoverContent, PopoverTrigger, Spinner, Switch, Tab, TabList, TabPanel, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, Tabs, TextField } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type {
   HttpTrafficExchange,
@@ -381,20 +358,21 @@ export function TrafficPanel() {
       <div className="flex min-h-10 flex-wrap items-center justify-between gap-3">
         <Tabs
           aria-label="流量观测维度"
-          classNames={{ base: "min-w-0 max-w-full overflow-x-auto", tabList: "gap-4 sm:gap-6" }}
           selectedKey={trafficView}
-          variant="underlined"
+          variant="secondary"
           onSelectionChange={(key) => setTrafficView(String(key) as TrafficViewKey)}
         >
-          {TRAFFIC_VIEW_TABS.map((item) => (
-            <Tab key={item.key} title={item.label} />
-          ))}
+          <TabList>
+            {TRAFFIC_VIEW_TABS.map((item) => (
+              <Tab key={item.key} id={item.key}>{item.label}</Tab>
+            ))}
+          </TabList>
         </Tabs>
         <div className="flex shrink-0 items-center gap-3">
-          <Switch aria-label="自动刷新" isSelected={autoRefresh} size="sm" onValueChange={setAutoRefresh}>
+          <Switch aria-label="自动刷新" isSelected={autoRefresh} onChange={setAutoRefresh}>
             自动刷新
           </Switch>
-          <Button className="shrink-0" size="sm" variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
+          <Button className="shrink-0" size="sm" variant="secondary" onPress={() => void refresh()} isDisabled={refreshing}>{refreshing ? <Spinner size="sm" /> : null}
             刷新
           </Button>
         </div>
@@ -565,7 +543,7 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="客户端流量使用" isHeaderSticky removeWrapper>
+      <Table aria-label="客户端流量使用">
         <TableHeader>
           <TableColumn>ID</TableColumn>
           <TableColumn>客户端</TableColumn>
@@ -574,7 +552,7 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
           <TableColumn>下载</TableColumn>
           <TableColumn>更新时间</TableColumn>
         </TableHeader>
-        <TableBody items={rows} isLoading={loading} emptyContent="暂无数据">
+        <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无数据")}>
           {(row) => (
             <TableRow key={row.id}>
               <TableCell>{row.id}</TableCell>
@@ -597,8 +575,8 @@ function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatu
   const droppedTotal = (status?.droppedHttp ?? 0) + (status?.droppedTcp ?? 0);
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="grid gap-2 p-3 md:grid-cols-4">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="grid gap-2 p-3 md:grid-cols-4">
         <TrafficStatusItem
           label="明细采集"
           value={status?.enabled ? "全局开启" : "已关闭"}
@@ -623,7 +601,7 @@ function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatu
           tone="default"
           hint="查询不再强制 flush"
         />
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -657,7 +635,7 @@ function TrafficStatusItem({
         <div className="truncate text-small font-semibold text-foreground">{value}</div>
         <div className="truncate text-tiny text-default-400">{hint}</div>
       </div>
-      <Chip color={tone} size="sm" variant="flat">
+      <Chip color={tone} size="sm" variant="soft">
         {trafficToneLabel(tone)}
       </Chip>
     </div>
@@ -690,8 +668,8 @@ function ResourceTrafficSection({
     <div className="flex flex-col gap-2">
       <MetricCards summary={summary} resourceLabel={type === "TCP_SPECUS" ? "映射" : "路由"} />
 
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="gap-2 p-2.5">
+      <Card className="rounded-md border border-default-200">
+        <Card.Content className="gap-2 p-2.5">
           <div>
             <h3 className="text-small font-semibold">资源流量排行</h3>
             <p className="text-tiny text-default-500">
@@ -700,7 +678,7 @@ function ResourceTrafficSection({
             </p>
           </div>
           <ResourceBars items={totals.slice(0, 8)} />
-        </CardBody>
+        </Card.Content>
       </Card>
 
       {/* mobile: 卡片 */}
@@ -734,7 +712,7 @@ function ResourceTrafficSection({
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label={`${type} 流量明细`} isHeaderSticky removeWrapper>
+      <Table aria-label={`${type} 流量明细`}>
         <TableHeader>
           <TableColumn>ID</TableColumn>
           <TableColumn>资源</TableColumn>
@@ -744,7 +722,7 @@ function ResourceTrafficSection({
           <TableColumn>下载</TableColumn>
           <TableColumn>更新时间</TableColumn>
         </TableHeader>
-        <TableBody items={rows} isLoading={loading} emptyContent={emptyContent}>
+        <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : emptyContent)}>
           {(row) => (
             <TableRow key={row.id}>
               <TableCell>{row.id}</TableCell>
@@ -844,8 +822,8 @@ function HttpExchangeTable({
   }, [rows, tableScopeKey]);
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-3 p-3">
         <div className="flex flex-col gap-1">
           <div>
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
@@ -880,25 +858,21 @@ function HttpExchangeTable({
                 ))}
               </select>
             </label>
-            <Input
-              classNames={{ inputWrapper: "h-9 min-h-9" }}
-              className="w-full sm:w-64 lg:w-72"
-              label="搜索"
+            <TextField value={searchDraft} onChange={onSearchDraftChange} className="w-full sm:w-64 lg:w-72">
+              <Label>搜索</Label>
+              <Input
               placeholder={searchFieldOption.placeholder}
-              size="sm"
-              value={searchDraft}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   onSearch();
                 }
-              }}
-              onValueChange={onSearchDraftChange}
-            />
+              }} />
+            </TextField>
             <div className="flex items-center gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={onSearch}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={onSearch}>
                 搜索
               </Button>
-              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={onResetSearch}>
                 重置
               </Button>
             </div>
@@ -907,11 +881,11 @@ function HttpExchangeTable({
         {hasActiveFilters && (
           <div className="flex flex-wrap items-center gap-2 text-tiny text-default-500">
             <span>当前搜索</span>
-            <Chip size="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {activeSearchFieldOption.label}
             </Chip>
             {activeSearch && (
-              <Chip size="sm" variant="flat">
+              <Chip size="sm" variant="soft">
                 {activeSearch}
               </Chip>
             )}
@@ -948,7 +922,7 @@ function HttpExchangeTable({
                   }
                   badges={
                     <>
-                      <Chip color={httpStatusColor(row)} size="sm" variant="flat">
+                      <Chip color={httpStatusColor(row)} size="sm" variant="soft">
                         {row.statusCode}
                       </Chip>
                       <HttpResponseTypeChip
@@ -976,11 +950,8 @@ function HttpExchangeTable({
                   ]}
                   actions={
                     <Button
-                      isLoading={detailLoadingId === row.id}
-                      size="sm"
-                      variant="flat"
-                      onPress={() => onOpenDetails(row)}
-                    >
+                      size="sm" variant="secondary"
+                      onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
                       协议详情
                     </Button>
                   }
@@ -993,9 +964,6 @@ function HttpExchangeTable({
         <div className="hidden min-w-0 lg:block">
         <Table
           aria-label="HTTP 协议记录"
-          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
-          isHeaderSticky
-          removeWrapper
         >
           <TableHeader>
             <TableColumn className="w-[14%]">时间</TableColumn>
@@ -1029,19 +997,14 @@ function HttpExchangeTable({
           </TableHeader>
           <TableBody
             key={tableCollectionKey}
-            items={tableRows}
-            isLoading={loading}
-            emptyContent={
-              <div className="flex flex-col items-center gap-2 py-3">
+            items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <div className="flex flex-col items-center gap-2 py-3">
                 <span>{hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}</span>
                 {hasActiveFilters && (
-                  <Button size="sm" variant="light" onPress={onResetSearch}>
+                  <Button size="sm" variant="ghost" onPress={onResetSearch}>
                     重置筛选
                   </Button>
                 )}
-              </div>
-            }
-          >
+              </div>)}>
             {(row) => (
               <TableRow key={row.tableKey}>
                 <TableCell>
@@ -1057,7 +1020,7 @@ function HttpExchangeTable({
                   </div>
                 </TableCell>
                 <TableCell>
-                  <Chip color={httpStatusColor(row)} size="sm" variant="flat">
+                  <Chip color={httpStatusColor(row)} size="sm" variant="soft">
                     {row.statusCode}
                   </Chip>
                 </TableCell>
@@ -1085,11 +1048,8 @@ function HttpExchangeTable({
                 <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
                 <TableCell>
                   <Button
-                    isLoading={detailLoadingId === row.id}
-                    size="sm"
-                    variant="flat"
-                    onPress={() => onOpenDetails(row)}
-                  >
+                    size="sm" variant="secondary"
+                    onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
                     详情
                   </Button>
                 </TableCell>
@@ -1102,14 +1062,13 @@ function HttpExchangeTable({
           <span className="text-small text-default-500">
             {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
           </span>
-          <Pagination
-            showControls
+          <Pager
             page={page + 1}
             total={Math.max(1, totalPages)}
             onChange={(value) => onPageChange(value - 1)}
-          />
+           />
         </div>
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1141,21 +1100,17 @@ function HttpSearchFilterHeader({
 
   return (
     <TrafficTableFilterHeader label={label} active={active} title="搜索 HTTP 记录">
-      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
+      <Popover isOpen={popoverOpen} onOpenChange={setPopoverOpen}>
         <PopoverTrigger>
           <Button
             isIconOnly
             aria-label="搜索 HTTP 记录"
             className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="搜索 HTTP 记录"
-            variant={active ? "flat" : "light"}
-          >
+            size="sm" variant={active ? "secondary" : "ghost"}>
             <TrafficFilterIcon />
           </Button>
         </PopoverTrigger>
-        <PopoverContent className="w-80 p-3">
+        <PopoverContent placement="bottom start" className="w-80 p-3">
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold">HTTP 记录搜索</div>
             <label className="flex flex-col gap-1">
@@ -1172,23 +1127,20 @@ function HttpSearchFilterHeader({
                 ))}
               </select>
             </label>
-            <Input
-              label="搜索内容"
-              placeholder={searchFieldOption.placeholder}
-              size="sm"
-              value={searchDraft}
+            <TextField value={searchDraft} onChange={onSearchDraftChange}>
+              <Label>搜索内容</Label>
+              <Input placeholder={searchFieldOption.placeholder}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   onSearch();
                 }
-              }}
-              onValueChange={onSearchDraftChange}
-            />
+              }} />
+            </TextField>
             <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
                 重置
               </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={() => { onSearch(); setPopoverOpen(false); }}>
                 应用
               </Button>
             </div>
@@ -1218,21 +1170,17 @@ function HttpResponseTypeFilterHeader({
 
   return (
     <TrafficTableFilterHeader label={label} active={active} title="筛选返回类型">
-      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
+      <Popover isOpen={popoverOpen} onOpenChange={setPopoverOpen}>
         <PopoverTrigger>
           <Button
             isIconOnly
             aria-label="筛选返回类型"
             className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="筛选返回类型"
-            variant={active ? "flat" : "light"}
-          >
+            size="sm" variant={active ? "secondary" : "ghost"}>
             <TrafficFilterIcon />
           </Button>
         </PopoverTrigger>
-        <PopoverContent className="w-64 p-3">
+        <PopoverContent placement="bottom start" className="w-64 p-3">
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold">返回类型筛选</div>
             <label className="flex flex-col gap-1">
@@ -1250,10 +1198,10 @@ function HttpResponseTypeFilterHeader({
               </select>
             </label>
             <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
                 重置
               </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
+              <Button className="h-9" size="sm" variant="secondary" onPress={() => { onSearch(); setPopoverOpen(false); }}>
                 应用
               </Button>
             </div>
@@ -1307,7 +1255,7 @@ function HttpResponseTypeChip({
     <Chip
       className={httpResponseTypeChipClass(value, contentType, bytes)}
       size="sm"
-      variant="flat"
+      variant="soft"
     >
       {httpResponseTypeLabel(value, contentType, bytes)}
     </Chip>
@@ -1325,16 +1273,18 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
 
   return (
     <>
-      <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(row)} onClose={onClose} size="5xl" scrollBehavior="inside">
-        <ModalContent className="max-w-[min(96vw,1180px)] overflow-hidden">
-          {row && (
-            <>
-              <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
+      <Modal.Root isOpen={Boolean(row)} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+        <Modal.Backdrop>
+          <Modal.Container size="cover" scroll="inside" className={TRAFFIC_MODAL_CLASS_NAMES?.base}>
+            <Modal.Dialog className="max-w-[min(96vw,1180px)] overflow-hidden">
+              {row && (
+              <>
+              <Modal.Header className="flex min-w-0 flex-col gap-2 pr-12">
                 <div className="grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-start gap-2">
-                  <Chip className="mt-0.5" color="primary" size="sm" variant="flat">
+                  <Chip className="mt-0.5" color="accent" size="sm" variant="soft">
                     {row.method}
                   </Chip>
-                  <Chip className="mt-0.5" color={httpStatusColor(row)} size="sm" variant="flat">
+                  <Chip className="mt-0.5" color={httpStatusColor(row)} size="sm" variant="soft">
                     {row.statusCode}
                   </Chip>
                   <span
@@ -1344,71 +1294,74 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                     {httpPath(row)}
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-tiny font-normal text-default-500">
-                  <span>{formatDateTime(row.capturedAt)}</span>
-                  <span>{row.clientName}</span>
-                  <span>{row.route}</span>
-                  {row.remoteAddress && <span>{row.remoteAddress}</span>}
-                </div>
-              </ModalHeader>
-              <ModalBody className="gap-3 overflow-y-auto">
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-tiny font-normal text-default-500">
+                <span>{formatDateTime(row.capturedAt)}</span>
+                <span>{row.clientName}</span>
+                <span>{row.route}</span>
+                {row.remoteAddress && <span>{row.remoteAddress}</span>}
+              </div>
+              </Modal.Header>
+              <Modal.Body className="gap-3 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
                   <HttpSummaryTile label="请求大小" value={formatBytes(row.requestBytes)} />
                   <HttpSummaryTile label="响应大小" value={formatBytes(row.responseBytes)} />
-                  <HttpSummaryTile
-                    label="返回类型"
-                    value={httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                  />
-                  <HttpSummaryTile label="耗时" value={formatElapsedMs(row.elapsedMs)} />
-                  <HttpSummaryTile label="资源" value={row.resourceName} wrapValue />
-                </div>
+              <HttpSummaryTile
+              label="返回类型"
+              value={httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
+              />
+              <HttpSummaryTile label="耗时" value={formatElapsedMs(row.elapsedMs)} />
+              <HttpSummaryTile label="资源" value={row.resourceName} wrapValue />
+              </div>
 
-                {row.error && (
-                  <div className="rounded-small border border-danger-200 bg-danger-50 p-3 text-small text-danger">
-                    {row.error}
-                  </div>
-                )}
+              {row.error && (
+              <div className="rounded-small border border-danger-200 bg-danger-50 p-3 text-small text-danger">
+                {row.error}
+              </div>
+              )}
 
-                <div className="grid items-stretch gap-3 xl:grid-cols-2">
-                  <HttpMessagePanel
-                    title="Request"
-                    meta={[row.requestContentType, `${row.method} ${httpPath(row)}`]}
-                    bytes={row.requestBytes}
-                    headers={row.requestHeaders}
-                    previewHex={row.requestPreviewHex}
-                    previewText={row.requestPreviewText}
-                    truncated={row.requestTruncated}
-                    contentType={row.requestContentType}
-                    bodyMaxHeightClass="h-full"
-                    onPreview={setBodyPreview}
-                  />
-                  <HttpMessagePanel
-                    title="Response"
-                    meta={[
-                      row.responseContentType,
-                      httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes),
-                      `HTTP ${row.statusCode}`,
-                    ]}
-                    bytes={row.responseBytes}
-                    headers={row.responseHeaders}
-                    previewHex={row.responsePreviewHex}
-                    previewText={row.responsePreviewText}
-                    truncated={row.responseTruncated}
-                    contentType={row.responseContentType}
-                    bodyMaxHeightClass="h-full"
-                    onPreview={setBodyPreview}
-                  />
-                </div>
-              </ModalBody>
-              <ModalFooter>
-                <Button variant="flat" onPress={onClose}>
+              <div className="grid items-stretch gap-3 xl:grid-cols-2">
+                <HttpMessagePanel
+                  title="Request"
+                  meta={[row.requestContentType, `${row.method} ${httpPath(row)}`]}
+                  bytes={row.requestBytes}
+                  headers={row.requestHeaders}
+                  previewHex={row.requestPreviewHex}
+                  previewText={row.requestPreviewText}
+                  truncated={row.requestTruncated}
+                  contentType={row.requestContentType}
+                  bodyMaxHeightClass="h-full"
+                  onPreview={setBodyPreview}
+                />
+                <HttpMessagePanel
+                  title="Response"
+                  meta={[
+                    row.responseContentType,
+                    httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes),
+                    `HTTP ${row.statusCode}`,
+                  ]}
+                  bytes={row.responseBytes}
+                  headers={row.responseHeaders}
+                  previewHex={row.responsePreviewHex}
+                  previewText={row.responsePreviewText}
+                  truncated={row.responseTruncated}
+                  contentType={row.responseContentType}
+                  bodyMaxHeightClass="h-full"
+                  onPreview={setBodyPreview}
+                />
+              </div>
+              </Modal.Body>
+              <Modal.Footer>
+                <Button variant="secondary" onPress={onClose}>
                   关闭
                 </Button>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              </Modal.Footer>
+              </>
+              )}
+
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
       <BodyPreviewModal target={bodyPreview} onClose={() => setBodyPreview(null)} />
     </>
   );
@@ -1471,7 +1424,7 @@ function HttpMessagePanel({
             ))}
           </div>
         </div>
-        <Chip className="shrink-0" size="sm" variant="flat">
+        <Chip className="shrink-0" size="sm" variant="soft">
           {formatBytes(bytes)}
         </Chip>
       </div>
@@ -1497,15 +1450,12 @@ function HttpMessagePanel({
           action={
             <div className="flex flex-wrap items-center justify-end gap-2">
               {contentEncoding && (
-                <Chip color="secondary" size="sm" variant="flat">
+                <Chip color="default" size="sm" variant="soft">
                   Content-Encoding {contentEncoding}
                 </Chip>
               )}
-              <Button
-                isDisabled={!hasBody || bodyDisplay.status === "pending"}
-                isLoading={bodyDisplay.status === "pending"}
-                size="sm"
-                variant="flat"
+              <Button isDisabled={!hasBody || bodyDisplay.status === "pending"}
+                size="sm" variant="secondary"
                 onPress={() =>
                   onPreview({
                     title: `${title} Body`,
@@ -1518,7 +1468,7 @@ function HttpMessagePanel({
                     decodeStatus: bodyDisplay.status,
                   })
                 }
-              >
+              >{bodyDisplay.status === "pending" ? <Spinner size="sm" /> : null}
                 {previewButtonText(previewKind)}
               </Button>
             </div>
@@ -1535,26 +1485,28 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
   const label = previewKindLabel(kind);
 
   return (
-    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
-      <ModalContent className="max-w-[min(96vw,1180px)]">
-        {target && (
-          <>
-            <ModalHeader className="flex flex-col gap-2">
+    <Modal.Root isOpen={Boolean(target)} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+      <Modal.Backdrop>
+        <Modal.Container size="cover" scroll="inside" className={TRAFFIC_MODAL_CLASS_NAMES?.base}>
+          <Modal.Dialog className="max-w-[min(96vw,1180px)]">
+            {target && (
+            <>
+            <Modal.Header className="flex flex-col gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-semibold">{target.title}</span>
-                <Chip color="primary" size="sm" variant="flat">
+                <Chip color="accent" size="sm" variant="soft">
                   {label}
                 </Chip>
-                <Chip size="sm" variant="flat">
+                <Chip size="sm" variant="soft">
                   {formatBytes(target.bytes)}
                 </Chip>
                 {target.contentEncoding && (
-                  <Chip color="secondary" size="sm" variant="flat">
+                  <Chip color="default" size="sm" variant="soft">
                     Content-Encoding {target.contentEncoding}
                   </Chip>
                 )}
                 {target.truncated && (
-                  <Chip color="warning" size="sm" variant="flat">
+                  <Chip color="warning" size="sm" variant="soft">
                     已截断
                   </Chip>
                 )}
@@ -1574,20 +1526,23 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
                 >
                   {target.decodeMessage}
                 </div>
-              )}
-            </ModalHeader>
-            <ModalBody className="overflow-y-auto">
+            )}
+            </Modal.Header>
+            <Modal.Body className="overflow-y-auto">
               <BodyPreviewContent kind={kind} content={content} contentType={target.contentType} />
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
                 关闭
               </Button>
-            </ModalFooter>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+            </Modal.Footer>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -1903,7 +1858,7 @@ function JsonBodyPreview({ content }: { content: string }) {
   if (!parsed.ok) {
     return (
       <div className="grid gap-3">
-        <Chip color="warning" size="sm" variant="flat">
+        <Chip color="warning" size="sm" variant="soft">
           JSON 解析失败
         </Chip>
         <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
@@ -1953,11 +1908,11 @@ function MultipartBodyPreview({ content, contentType }: { content: string; conte
       {parts.map((part) => (
         <div key={part.id} className="grid gap-2 rounded-small border border-default-200 p-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Chip color="primary" size="sm" variant="flat">
+            <Chip color="accent" size="sm" variant="soft">
               {part.name || `part ${part.id}`}
             </Chip>
             {part.filename && (
-              <Chip size="sm" variant="flat">
+              <Chip size="sm" variant="soft">
                 {part.filename}
               </Chip>
             )}
@@ -1974,17 +1929,21 @@ function MultipartBodyPreview({ content, contentType }: { content: string; conte
 
 function HtmlBodyPreview({ content }: { content: string }) {
   return (
-    <Tabs aria-label="HTML body preview" destroyInactiveTabPanel={false} variant="underlined">
-      <Tab key="rendered" title="渲染">
+    <Tabs aria-label="HTML body preview" variant="secondary">
+      <TabList>
+        <Tab id="rendered">{"渲染"}</Tab>
+        <Tab id="source">{"源码"}</Tab>
+      </TabList>
+      <TabPanel id="rendered">
         <div className="mt-3 overflow-hidden rounded-small border border-default-200 bg-white">
-          <iframe className="h-[52dvh] w-full bg-white" sandbox="" srcDoc={content} title="HTML body preview" />
-        </div>
-      </Tab>
-      <Tab key="source" title="源码">
+                  <iframe className="h-[52dvh] w-full bg-white" sandbox="" srcDoc={content} title="HTML body preview" />
+                </div>
+      </TabPanel>
+      <TabPanel id="source">
         <div className="mt-3">
-          <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
-        </div>
-      </Tab>
+                  <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
+                </div>
+      </TabPanel>
     </Tabs>
   );
 }
@@ -2008,7 +1967,7 @@ function ImageBodyPreview({ content, contentType }: { content: string; contentTy
   }
   return (
     <div className="grid gap-3">
-      <Chip color="warning" size="sm" variant="flat">
+      <Chip color="warning" size="sm" variant="soft">
         图片二进制无法直接渲染
       </Chip>
       <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
@@ -2169,8 +2128,8 @@ function TcpFrameTable({
   );
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-3 p-3">
         <div>
           <h3 className="text-small font-semibold">TCP 数据帧</h3>
           <p className="text-tiny text-default-500">按公网连接 channelId 展示双向 payload 预览</p>
@@ -2201,10 +2160,8 @@ function TcpFrameTable({
                   }
                   badges={
                     <Chip
-                      color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
                       size="sm"
-                      variant="flat"
-                    >
+                      variant="soft" color={row.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
                       {directionLabel(row.direction)}
                     </Chip>
                   }
@@ -2255,19 +2212,13 @@ function TcpFrameTable({
                   actions={
                     <>
                       <Button
-                        isLoading={detailLoadingId === row.id}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => onOpenDetails(row)}
-                      >
+                        size="sm" variant="secondary"
+                        onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
                         详情
                       </Button>
                       <Button
-                        isLoading={streamLoadingChannel === row.channelId}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => onOpenStream(row)}
-                      >
+                        size="sm" variant="secondary"
+                        onPress={() => onOpenStream(row)} isDisabled={streamLoadingChannel === row.channelId}>{streamLoadingChannel === row.channelId ? <Spinner size="sm" /> : null}
                         串流
                       </Button>
                     </>
@@ -2280,7 +2231,7 @@ function TcpFrameTable({
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
+        <Table aria-label="TCP 数据帧">
           <TableHeader>
             <TableColumn>时间</TableColumn>
             <TableColumn>方向</TableColumn>
@@ -2292,16 +2243,14 @@ function TcpFrameTable({
             <TableColumn>HEX</TableColumn>
             <TableColumn>解析</TableColumn>
           </TableHeader>
-          <TableBody items={tableRows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
+          <TableBody items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无 TCP 数据帧")}>
             {(row) => (
               <TableRow key={row.tableKey}>
                 <TableCell>{formatDateTime(row.frameTime)}</TableCell>
                 <TableCell>
                   <Chip
-                    color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
                     size="sm"
-                    variant="flat"
-                  >
+                    variant="soft" color={row.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
                     {directionLabel(row.direction)}
                   </Chip>
                 </TableCell>
@@ -2346,19 +2295,13 @@ function TcpFrameTable({
                 <TableCell>
                   <div className="flex flex-wrap gap-2">
                     <Button
-                      isLoading={detailLoadingId === row.id}
-                      size="sm"
-                      variant="flat"
-                      onPress={() => onOpenDetails(row)}
-                    >
+                      size="sm" variant="secondary"
+                      onPress={() => onOpenDetails(row)} isDisabled={detailLoadingId === row.id}>{detailLoadingId === row.id ? <Spinner size="sm" /> : null}
                       详情
                     </Button>
                     <Button
-                      isLoading={streamLoadingChannel === row.channelId}
-                      size="sm"
-                      variant="flat"
-                      onPress={() => onOpenStream(row)}
-                    >
+                      size="sm" variant="secondary"
+                      onPress={() => onOpenStream(row)} isDisabled={streamLoadingChannel === row.channelId}>{streamLoadingChannel === row.channelId ? <Spinner size="sm" /> : null}
                       串流
                     </Button>
                   </div>
@@ -2372,14 +2315,13 @@ function TcpFrameTable({
           <span className="text-small text-default-500">
             {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
           </span>
-          <Pagination
-            showControls
+          <Pager
             page={page + 1}
             total={Math.max(1, totalPages)}
             onChange={(value) => onPageChange(value - 1)}
-          />
+           />
         </div>
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -2388,61 +2330,71 @@ function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose:
   const analysis = useMemo(() => (row ? analyzeTcpPayload(row) : null), [row]);
 
   return (
-    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={row != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
-      <ModalContent className="max-w-[min(96vw,1180px)]">
-        {(close) =>
-          row && analysis ? (
+    <Modal.Root isOpen={row != null} onOpenChange={(open) => !open && onClose()}>
+      <Modal.Backdrop>
+        <Modal.Container size="cover" scroll="inside" className={TRAFFIC_MODAL_CLASS_NAMES?.base}>
+          <Modal.Dialog className="max-w-[min(96vw,1180px)]">
+            {
+            row && analysis ? (
             <>
-              <ModalHeader className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Chip color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
-                    {directionLabel(row.direction)}
-                  </Chip>
-                  <span className="font-semibold">TCP 数据帧 #{row.id}</span>
-                </div>
-                <div className="flex flex-wrap gap-4 text-small font-normal text-default-500">
-                  <span>{formatDateTime(row.frameTime)}</span>
-                  <span>{row.listenPort}</span>
-                  <span>{row.clientName}</span>
-                  <span>{tcpFlowLabel(row)}</span>
-                </div>
-              </ModalHeader>
-              <ModalBody className="gap-3 overflow-y-auto">
-                <div className="grid gap-2 md:grid-cols-4 xl:grid-cols-6">
-                  <HttpSummaryTile label="长度" value={formatBytes(row.payloadBytes)} />
-                  <HttpSummaryTile label="解析类型" value={tcpPayloadKindLabel(analysis.kind)} />
-                  <HttpSummaryTile label="资源" value={row.resourceName || "-"} />
-                  <HttpSummaryTile label="Channel" value={shortChannel(row.channelId)} />
-                  <HttpSummaryTile label="Frame" value={`#${row.frameIndex ?? 0}`} />
-                  <HttpSummaryTile label="Offset" value={tcpStreamRange(row)} />
-                </div>
-                {!analysis.fullAvailable && (
-                  <div className="rounded-small border border-warning-200 bg-warning-50 px-3 py-2 text-small text-warning-700">
-                    这条历史记录没有完整二进制字段，只能展示旧版保存的 payload 预览。
-                  </div>
-                )}
-                <Tabs aria-label="TCP payload 预览" destroyInactiveTabPanel={false} variant="underlined">
-                  <Tab key="parsed" title="解析">
-                    <TcpParsedPayload analysis={analysis} />
-                  </Tab>
-                  <Tab key="text" title="文本">
-                    <TextPreview content={analysis.text || row.payloadPreviewText || ""} maxHeightClass="max-h-[52dvh]" />
-                  </Tab>
-                  <Tab key="hex" title="Hexdump">
-                    <TextPreview content={analysis.hexDump || row.payloadPreviewHex || ""} maxHeightClass="max-h-[52dvh]" />
-                  </Tab>
-                </Tabs>
-              </ModalBody>
-              <ModalFooter>
-                <Button variant="flat" onPress={close}>
-                  关闭
-                </Button>
-              </ModalFooter>
+            <Modal.Header className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Chip size="sm" variant="soft" color={row.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
+                  {directionLabel(row.direction)}
+                </Chip>
+                <span className="font-semibold">TCP 数据帧 #{row.id}</span>
+              </div>
+              <div className="flex flex-wrap gap-4 text-small font-normal text-default-500">
+                <span>{formatDateTime(row.frameTime)}</span>
+                <span>{row.listenPort}</span>
+                <span>{row.clientName}</span>
+                <span>{tcpFlowLabel(row)}</span>
+              </div>
+            </Modal.Header>
+            <Modal.Body className="gap-3 overflow-y-auto">
+              <div className="grid gap-2 md:grid-cols-4 xl:grid-cols-6">
+                <HttpSummaryTile label="长度" value={formatBytes(row.payloadBytes)} />
+                <HttpSummaryTile label="解析类型" value={tcpPayloadKindLabel(analysis.kind)} />
+            <HttpSummaryTile label="资源" value={row.resourceName || "-"} />
+            <HttpSummaryTile label="Channel" value={shortChannel(row.channelId)} />
+            <HttpSummaryTile label="Frame" value={`#${row.frameIndex ?? 0}`} />
+            <HttpSummaryTile label="Offset" value={tcpStreamRange(row)} />
+            </div>
+            {!analysis.fullAvailable && (
+            <div className="rounded-small border border-warning-200 bg-warning-50 px-3 py-2 text-small text-warning-700">
+              这条历史记录没有完整二进制字段，只能展示旧版保存的 payload 预览。
+            </div>
+            )}
+            <Tabs aria-label="TCP payload 预览" variant="secondary">
+              <TabList>
+                <Tab id="parsed">{"解析"}</Tab>
+                <Tab id="text">{"文本"}</Tab>
+                <Tab id="hex">{"Hexdump"}</Tab>
+              </TabList>
+              <TabPanel id="parsed">
+                <TcpParsedPayload analysis={analysis} />
+              </TabPanel>
+            <TabPanel id="text">
+              <TextPreview content={analysis.text || row.payloadPreviewText || ""} maxHeightClass="max-h-[52dvh]" />
+            </TabPanel>
+            <TabPanel id="hex">
+              <TextPreview content={analysis.hexDump || row.payloadPreviewHex || ""} maxHeightClass="max-h-[52dvh]" />
+            </TabPanel>
+            </Tabs>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
+                关闭
+              </Button>
+            </Modal.Footer>
             </>
-          ) : null
-        }
-      </ModalContent>
-    </Modal>
+            ) : null
+            }
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -2478,72 +2430,81 @@ function TcpStreamModal({
   const totalBytes = frames.reduce((sum, frame) => sum + frame.payloadBytes, 0);
 
   return (
-    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={stream != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
-      <ModalContent className="max-w-[min(96vw,1180px)]">
-        {(close) =>
-          stream ? (
+    <Modal.Root isOpen={stream != null} onOpenChange={(open) => !open && onClose()}>
+      <Modal.Backdrop>
+        <Modal.Container size="cover" scroll="inside" className={TRAFFIC_MODAL_CLASS_NAMES?.base}>
+          <Modal.Dialog className="max-w-[min(96vw,1180px)]">
+            {
+            stream ? (
             <>
-              <ModalHeader className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold">TCP 数据流</span>
-                  <Chip color="primary" size="sm" variant="flat">
-                    {shortChannel(stream.channelId)}
+            <Modal.Header className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold">TCP 数据流</span>
+                <Chip color="accent" size="sm" variant="soft">
+                  {shortChannel(stream.channelId)}
+                </Chip>
+                {stream.truncated && (
+                  <Chip color="warning" size="sm" variant="soft">
+                    后续分页可用
                   </Chip>
-                  {stream.truncated && (
-                    <Chip color="warning" size="sm" variant="flat">
-                      后续分页可用
-                    </Chip>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-small font-normal text-default-500">
-                  <span>
-                    第 {stream.page + 1} / {Math.max(1, stream.totalPages)} 页
-                  </span>
-                  <span>
-                    {stream.total} 帧中的 {frames.length} 帧
-                  </span>
-                  <span>{formatBytes(totalBytes)}</span>
-                  {frames[0] && <span>{frames[0].resourceName}</span>}
-                </div>
-              </ModalHeader>
-              <ModalBody className="gap-3 overflow-y-auto">
-                <div className="grid gap-2 md:grid-cols-4">
-                  <HttpSummaryTile label="总帧数" value={`${frames.length}`} />
-                  <HttpSummaryTile label="总流量" value={formatBytes(totalBytes)} />
-                  <HttpSummaryTile label="公网 -> 内网" value={`${publicFrames.length} 帧`} />
-                  <HttpSummaryTile label="内网 -> 公网" value={`${clientFrames.length} 帧`} />
-                </div>
-                <Tabs aria-label="TCP 数据流视图" destroyInactiveTabPanel={false} variant="underlined">
-                  <Tab key="timeline" title="时间线">
-                    <TcpStreamTimeline frames={frames} />
-                  </Tab>
-                  <Tab key="public" title="公网 -> 内网">
-                    <TcpStreamPayload frames={publicFrames} />
-                  </Tab>
-                  <Tab key="client" title="内网 -> 公网">
-                    <TcpStreamPayload frames={clientFrames} />
-                  </Tab>
-                </Tabs>
-              </ModalBody>
-              <ModalFooter>
-                {stream.totalPages > 1 && (
-                  <Pagination
-                    showControls
-                    isDisabled={loading}
-                    page={stream.page + 1}
-                    total={Math.max(1, stream.totalPages)}
-                    onChange={(page) => onPageChange(Math.max(0, page - 1))}
-                  />
                 )}
-                <Button variant="flat" onPress={close}>
-                  关闭
-                </Button>
-              </ModalFooter>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-small font-normal text-default-500">
+                <span>
+                  第 {stream.page + 1} / {Math.max(1, stream.totalPages)} 页
+                </span>
+                <span>
+                  {stream.total} 帧中的 {frames.length} 帧
+                </span>
+                <span>{formatBytes(totalBytes)}</span>
+                {frames[0] && <span>{frames[0].resourceName}</span>}
+              </div>
+            </Modal.Header>
+            <Modal.Body className="gap-3 overflow-y-auto">
+              <div className="grid gap-2 md:grid-cols-4">
+                <HttpSummaryTile label="总帧数" value={`${frames.length}`} />
+                <HttpSummaryTile label="总流量" value={formatBytes(totalBytes)} />
+            <HttpSummaryTile label="公网 -> 内网" value={`${publicFrames.length} 帧`} />
+            <HttpSummaryTile label="内网 -> 公网" value={`${clientFrames.length} 帧`} />
+          </div>
+          <Tabs aria-label="TCP 数据流视图" variant="secondary">
+            <TabList>
+              <Tab id="timeline">{"时间线"}</Tab>
+              <Tab id="public">{"公网 -> 内网"}</Tab>
+              <Tab id="client">{"内网 -> 公网"}</Tab>
+            </TabList>
+            <TabPanel id="timeline">
+              <TcpStreamTimeline frames={frames} />
+            </TabPanel>
+            <TabPanel id="public">
+              <TcpStreamPayload frames={publicFrames} />
+            </TabPanel>
+            <TabPanel id="client">
+              <TcpStreamPayload frames={clientFrames} />
+            </TabPanel>
+            </Tabs>
+            </Modal.Body>
+            <Modal.Footer>
+              {stream.totalPages > 1 && (
+                <Pager
+                  isDisabled={loading}
+                  page={stream.page + 1}
+                  total={Math.max(1, stream.totalPages)}
+                  onChange={(page) => onPageChange(Math.max(0, page - 1))}
+                 />
+              )}
+              <Button variant="secondary" onPress={onClose}>
+                关闭
+              </Button>
+            </Modal.Footer>
             </>
-          ) : null
-        }
-      </ModalContent>
-    </Modal>
+            ) : null
+            }
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -2569,7 +2530,7 @@ function TcpStreamTimeline({ frames }: { frames: TcpTrafficFrame[] }) {
             <tr key={frame.id} className="border-b border-default-100 last:border-b-0">
               <td className="whitespace-nowrap px-3 py-2 text-tiny">{formatDateTime(frame.frameTime)}</td>
               <td className="px-3 py-2">
-                <Chip color={frame.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
+                <Chip size="sm" variant="soft" color={frame.direction === "PUBLIC_TO_CLIENT" ? "accent" : "default"}>
                   {directionLabel(frame.direction)}
                 </Chip>
               </td>
@@ -2602,49 +2563,54 @@ function TcpStreamPayload({ frames }: { frames: TcpTrafficFrame[] }) {
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Chip color="primary" size="sm" variant="flat">
+        <Chip color="accent" size="sm" variant="soft">
           {frames.length} 帧
         </Chip>
-        <Chip size="sm" variant="flat">
+        <Chip size="sm" variant="soft">
           {formatBytes(bytes.length)}
         </Chip>
         {!fullAvailable && (
-          <Chip color="warning" size="sm" variant="flat">
+          <Chip color="warning" size="sm" variant="soft">
             含旧版预览数据
           </Chip>
         )}
       </div>
-      <Tabs aria-label="TCP 拼接 payload 预览" destroyInactiveTabPanel={false} variant="underlined">
-        <Tab key="parsed" title="解析">
+      <Tabs aria-label="TCP 拼接 payload 预览" variant="secondary">
+        <TabList>
+          <Tab id="parsed">{"解析"}</Tab>
+          <Tab id="text">{"文本"}</Tab>
+          <Tab id="hex">{"Hexdump"}</Tab>
+        </TabList>
+        <TabPanel id="parsed">
           {http ? (
-            <TcpParsedPayload
-              analysis={{
-                binaryLabel: "HTTP",
-                bytes,
-                fullAvailable,
-                hexDump,
-                http,
-                imageDataUrl: null,
-                imageMime: null,
-                jsonPretty: null,
-                kind: "http",
-                text,
-              }}
-            />
-          ) : jsonPretty ? (
-            <JsonHighlightedPreview content={jsonPretty} maxHeightClass="max-h-[52dvh]" />
-          ) : looksLikeTextPayload(bytes) ? (
-            <TextPreview content={text} maxHeightClass="max-h-[52dvh]" />
-          ) : (
-            <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
-          )}
-        </Tab>
-        <Tab key="text" title="文本">
+                      <TcpParsedPayload
+                        analysis={{
+                          binaryLabel: "HTTP",
+                          bytes,
+                          fullAvailable,
+                          hexDump,
+                          http,
+                          imageDataUrl: null,
+                          imageMime: null,
+                          jsonPretty: null,
+                          kind: "http",
+                          text,
+                        }}
+                      />
+                    ) : jsonPretty ? (
+                      <JsonHighlightedPreview content={jsonPretty} maxHeightClass="max-h-[52dvh]" />
+                    ) : looksLikeTextPayload(bytes) ? (
+                      <TextPreview content={text} maxHeightClass="max-h-[52dvh]" />
+                    ) : (
+                      <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
+                    )}
+        </TabPanel>
+        <TabPanel id="text">
           <TextPreview content={text} maxHeightClass="max-h-[52dvh]" />
-        </Tab>
-        <Tab key="hex" title="Hexdump">
+        </TabPanel>
+        <TabPanel id="hex">
           <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
-        </Tab>
+        </TabPanel>
       </Tabs>
     </div>
   );
@@ -2681,7 +2647,7 @@ function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
     return (
       <div className="grid gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <Chip color="primary" size="sm" variant="flat">
+          <Chip color="accent" size="sm" variant="soft">
             {analysis.imageMime}
           </Chip>
           <span className="text-small text-default-500">已按图片魔数识别并渲染</span>
@@ -2700,7 +2666,7 @@ function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Chip color="default" size="sm" variant="flat">
+        <Chip color="default" size="sm" variant="soft">
           {analysis.binaryLabel}
         </Chip>
         <span className="text-small text-default-500">无法可靠解析为文本协议，展示二进制 hexdump。</span>
@@ -2762,64 +2728,65 @@ function HeaderBlock({ content }: { content: string | null }) {
     <div className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] gap-1">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-tiny font-semibold text-default-500">Headers</span>
-        <Chip size="sm" variant="flat">
+        <Chip size="sm" variant="soft">
           {rows.length} 项
         </Chip>
       </div>
       <Tabs
         aria-label="Header 展示方式"
-        classNames={{ base: "min-h-0", panel: "min-h-0 py-0" }}
-        destroyInactiveTabPanel={false}
-        size="sm"
-        variant="underlined"
+        variant="secondary"
       >
-        <Tab key="form" title="表单">
+        <TabList>
+          <Tab id="form">{"表单"}</Tab>
+          <Tab id="raw">{"Raw"}</Tab>
+        </TabList>
+        <TabPanel id="form">
           <div className="mt-2 grid h-[12.75rem] min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
-            {rows.length === 0 ? (
-              <div className="rounded-small bg-background p-3 text-tiny text-default-400">暂无 Header</div>
-            ) : (
-              rows.map((row) => (
-                <div key={row.id} className="grid min-w-0 gap-2 rounded-small border border-default-100 bg-background p-3">
-                  <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="break-all font-mono text-tiny font-semibold">{row.name}</div>
-                      <div className="mt-1 text-tiny leading-relaxed text-default-500">{row.info.summary}</div>
+                      {rows.length === 0 ? (
+                        <div className="rounded-small bg-background p-3 text-tiny text-default-400">暂无 Header</div>
+                      ) : (
+                        rows.map((row) => (
+                          <div key={row.id} className="grid min-w-0 gap-2 rounded-small border border-default-100 bg-background p-3">
+                            <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="break-all font-mono text-tiny font-semibold">{row.name}</div>
+                                <div className="mt-1 text-tiny leading-relaxed text-default-500">{row.info.summary}</div>
+                              </div>
+                              {row.info.links.length > 0 && (
+                                <div className="flex shrink-0 flex-wrap gap-1">
+                                  {row.info.links.map((link) => (
+                                    <a
+                                      key={link.url}
+                                      className="rounded-small bg-primary-50 px-2 py-1 text-[11px] font-medium text-primary hover:bg-primary-100"
+                                      href={link.url}
+                                      rel="noreferrer"
+                                      target="_blank"
+                                    >
+                                      {link.label}
+                                    </a>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <pre className="max-h-28 min-w-0 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-[11px] leading-relaxed">
+                              {row.value || "-"}
+                            </pre>
+                            <p className="text-tiny leading-relaxed text-default-500">{row.info.details}</p>
+                          </div>
+                        ))
+                      )}
                     </div>
-                    {row.info.links.length > 0 && (
-                      <div className="flex shrink-0 flex-wrap gap-1">
-                        {row.info.links.map((link) => (
-                          <a
-                            key={link.url}
-                            className="rounded-small bg-primary-50 px-2 py-1 text-[11px] font-medium text-primary hover:bg-primary-100"
-                            href={link.url}
-                            rel="noreferrer"
-                            target="_blank"
-                          >
-                            {link.label}
-                          </a>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <pre className="max-h-28 min-w-0 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-[11px] leading-relaxed">
-                    {row.value || "-"}
-                  </pre>
-                  <p className="text-tiny leading-relaxed text-default-500">{row.info.details}</p>
-                </div>
-              ))
-            )}
-          </div>
-        </Tab>
-        <Tab key="raw" title="Raw">
+        </TabPanel>
+        <TabPanel id="raw">
           <div className="mt-2 h-[12.75rem]">
-            <ProtocolBlock
-              className="h-full grid-rows-[auto_minmax(0,1fr)]"
-              content={value}
-              maxHeightClass="h-full"
-              title="Raw Headers"
-            />
-          </div>
-        </Tab>
+                      <ProtocolBlock
+                        className="h-full grid-rows-[auto_minmax(0,1fr)]"
+                        content={value}
+                        maxHeightClass="h-full"
+                        title="Raw Headers"
+                      />
+                    </div>
+        </TabPanel>
       </Tabs>
     </div>
   );
@@ -3431,12 +3398,12 @@ function MetricCards({ resourceLabel, summary }: { resourceLabel: string; summar
   return (
     <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
       {cards.map((card) => (
-        <Card key={card.label} shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-0.5 p-2.5">
+        <Card key={card.label} className="rounded-md border border-default-200">
+          <Card.Content className="gap-0.5 p-2.5">
             <span className="text-small text-default-500">{card.label}</span>
             <span className="text-lg font-semibold">{card.value}</span>
             <span className="text-tiny text-default-400">{card.hint}</span>
-          </CardBody>
+          </Card.Content>
         </Card>
       ))}
     </div>
@@ -3469,7 +3436,7 @@ function ResourceBars({ items }: { items: ResourceTotal[] }) {
               <div className="h-full rounded-small bg-primary" style={{ width }} />
             </div>
             <div className="flex flex-wrap items-center gap-2 text-tiny text-default-400">
-              <Chip size="sm" variant="flat">
+              <Chip size="sm" variant="soft">
                 {item.clientName}
               </Chip>
               <span>上传 {formatBytes(item.uploadBytes)}</span>

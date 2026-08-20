@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer";
 import type { OutputChunk } from "rollup";
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+// Tailwind 4 的官方 Vite 插件。走 PostCSS 时 Vite 没有应用 postcss.config.js，
+// @source 指令原样落进产物、工具类一条都没生成；这个插件是官方推荐的接法。
+import tailwindcss from "@tailwindcss/vite";
 
 const DEFAULT_CHUNK_BUDGET_KIB = 500;
 const CHUNK_BUDGETS_KIB = new Map([
@@ -41,6 +44,11 @@ function staticChunkGraphBytes(entry: OutputChunk, chunks: Map<string, OutputChu
     pending.push(...chunk.imports);
   }
   return bytes;
+}
+
+/** Matches a package directory under node_modules, on either path separator. */
+function NM(pkg: string): RegExp {
+  return new RegExp(`[\\/]node_modules[\\/]${pkg}[\\/]`);
 }
 
 function enforceChunkBudgets(): Plugin {
@@ -94,7 +102,7 @@ export default defineConfig(({ mode }) => {
     Object.fromEntries(paths.map((path) => [path, { target, changeOrigin: true, ws }]));
 
   return {
-    plugins: [react(), enforceChunkBudgets()],
+    plugins: [tailwindcss(),react(), enforceChunkBudgets()],
     base: "/",
     server: {
       port: 5173,
@@ -117,73 +125,45 @@ export default defineConfig(({ mode }) => {
       },
       rollupOptions: {
         output: {
-          manualChunks(id) {
-            const normalized = id.replace(/\\/g, "/");
-            if (normalized.includes("vite/preload-helper")) {
-              return "vite-runtime";
-            }
-            if (!normalized.includes("/node_modules/")) {
-              return undefined;
-            }
+          // rolldown replaced manualChunks with codeSplitting. The difference that
+          // matters here: a group is a hard assignment, so React's small entry
+          // shims (jsx-runtime, react-dom) stay in react-vendor instead of being
+          // copied into whichever vendor chunk imports them. With manualChunks the
+          // public download route ended up importing two of those copies out of
+          // heroui-vendor, which put the whole 438 KiB component library in its
+          // static graph even though the page renders no HeroUI component.
+          //
+          // Groups are matched in order, so the list reads like the old if-chain.
+          // Anything unmatched stays with its actual route or dynamic importer —
+          // a generic vendor bucket would couple unrelated, rarely used features.
+          codeSplitting: {
+            groups: [
+              { name: "vite-runtime", test: /vite[\/]preload-helper/ },
 
-            if (normalized.includes("/node_modules/@maxgraph/core/")) {
-              return "diagram-engine";
-            }
-            if (
-              normalized.includes("/node_modules/yjs/")
-              || normalized.includes("/node_modules/lib0/")
-              || normalized.includes("/node_modules/isomorphic.js/")
-            ) {
-              return "diagram-collaboration";
-            }
-            if (normalized.includes("/node_modules/pako/")) {
-              return "diagram-compression";
-            }
-            if (normalized.includes("/node_modules/fflate/")) {
-              return "diagram-archive";
-            }
-            if (normalized.includes("/node_modules/hls.js/")) {
-              return "media-hls";
-            }
-            if (normalized.includes("/node_modules/dashjs/")) {
-              return "media-dash";
-            }
-            if (normalized.includes("/node_modules/mp4box/")) {
-              return "media-mp4";
-            }
+              { name: "react-vendor", test: NM("(react|react-dom|scheduler|use-sync-external-store)") },
 
-            if (
-              normalized.includes("/node_modules/react/") ||
-              normalized.includes("/node_modules/react-dom/") ||
-              normalized.includes("/node_modules/scheduler/") ||
-              normalized.includes("/node_modules/use-sync-external-store/")
-            ) {
-              return "react-vendor";
-            }
-            if (normalized.includes("/node_modules/framer-motion/")) {
-              return "motion-vendor";
-            }
-            if (normalized.includes("/node_modules/@heroui/")) {
-              return "heroui-vendor";
-            }
-            if (normalized.includes("/node_modules/@react-aria/")) {
-              return "react-aria";
-            }
-            if (normalized.includes("/node_modules/@react-stately/")) {
-              return "react-stately";
-            }
-            if (normalized.includes("/node_modules/@react-types/")) {
-              return "react-types";
-            }
-            if (normalized.includes("/node_modules/@internationalized/")) {
-              return "intl-vendor";
-            }
-            if (normalized.includes("/node_modules/@floating-ui/")) {
-              return "floating-ui";
-            }
-            // Let Rollup keep remaining dependencies with their actual route or dynamic
-            // importer. A generic vendor bucket couples unrelated, rarely used features.
-            return undefined;
+              { name: "diagram-engine", test: NM("@maxgraph[\/]core") },
+              { name: "diagram-collaboration", test: NM("(yjs|lib0|isomorphic\.js)") },
+              { name: "diagram-compression", test: NM("pako") },
+              { name: "diagram-archive", test: NM("fflate") },
+              { name: "media-hls", test: NM("hls\.js") },
+              { name: "media-dash", test: NM("dashjs") },
+              { name: "media-mp4", test: NM("mp4box") },
+
+              { name: "motion-vendor", test: NM("framer-motion") },
+              // tailwind-variants and tailwind-merge ship CJS; keeping them out of
+              // heroui-vendor stops their interop helpers from anchoring the whole
+              // component library into a route that only needed a helper.
+              { name: "style-utils", test: NM("(tailwind-variants|tailwind-merge)") },
+              { name: "heroui-vendor", test: NM("(@heroui|@radix-ui|input-otp)") },
+              // HeroUI 3 builds on react-aria-components, a top-level package that
+              // the scoped @react-aria/* pattern does not cover.
+              { name: "react-aria", test: NM("(react-aria-components|react-aria|@react-aria)") },
+              { name: "react-stately", test: NM("@react-stately") },
+              { name: "react-types", test: NM("@react-types") },
+              { name: "intl-vendor", test: NM("@internationalized") },
+              { name: "floating-ui", test: NM("@floating-ui") },
+            ],
           },
         },
       },

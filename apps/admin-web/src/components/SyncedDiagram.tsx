@@ -1,18 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
-import {
-  Button,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-} from "@heroui/react";
+import { Button, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Modal } from "@heroui/react";
 import {
   Cell,
   Clipboard,
@@ -4103,7 +4092,7 @@ export function SyncedDiagram({
             <DiagramToolbarMenu
               label="更多"
               compact
-              placement="bottom-end"
+              placement="bottom end"
               items={[
                 { key: "undo", label: "编辑 · 撤销", shortcut: undoShortcut, disabled: isReadOnly || !canUndo },
                 { key: "redo", label: "编辑 · 重做", shortcut: redoShortcut, disabled: isReadOnly || !canRedo },
@@ -4174,7 +4163,7 @@ export function SyncedDiagram({
               label={cloudMenuLabel}
               mobileLabel={authed ? "账号" : "登录"}
               compact
-              placement="bottom-end"
+              placement="bottom end"
               items={!authReady
                 ? [{ key: "auth-loading", label: "正在读取账号", disabled: true }]
                 : authed
@@ -5128,81 +5117,64 @@ export function SyncedDiagram({
           }}
         />
 
-        <Modal
-          isOpen={templatePreviewId !== null}
-          size="sm"
-          backdrop="blur"
-          onOpenChange={(open) => { if (!open) setTemplatePreviewId(null); }}
-          classNames={{
-            wrapper: "!z-[220] px-4 py-6",
-            backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-            base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
-          }}
-        >
-          <ModalContent>
-            {(onClose) => {
-              const templateId = templatePreviewId ?? "approval";
-              const template = DIAGRAM_TEMPLATES[templateId];
-              return (
+        <Modal.Root isOpen={templatePreviewId !== null} onOpenChange={(open) => { if (!open) setTemplatePreviewId(null); }}>
+          <Modal.Backdrop>
+            <Modal.Container size="sm">
+              <Modal.Dialog>
+                {({ close: onClose }) => {
+                const templateId = templatePreviewId ?? "approval";
+                const template = DIAGRAM_TEMPLATES[templateId];
+                return (
                 <>
-                  <ModalHeader>{template.name}</ModalHeader>
-                  <ModalBody>
-                    <div className="rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-blue-soft)] p-4">
-                      <DiagramTemplateThumbnail template={template} />
-                    </div>
-                    <p className="text-[12px] leading-5 text-zinc-500 dark:text-zinc-400">
-                      {template.detail} · {template.nodes.length} 个节点，{template.edges.length} 条连线。插入当前页时会自动避开已有内容。
-                    </p>
-                  </ModalBody>
-                  <ModalFooter className="flex-wrap">
-                    <Button variant="light" radius="sm" onPress={onClose}>取消</Button>
-                    <Button
-                      variant="flat"
-                      radius="sm"
-                      isDisabled={pages.length >= MAX_DIAGRAM_PAGES}
-                      onPress={() => {
-                        const pageId = addPage();
-                        if (!pageId) return;
-                        setPendingTemplateInsertion({ templateId, pageId });
-                        onClose();
-                      }}
-                    >
-                      新页面插入
-                    </Button>
-                    <Button
-                      color="primary"
-                      radius="sm"
-                      onPress={() => {
-                        insertTemplate(templateId);
-                        onClose();
-                        setCompactPanel(null);
-                      }}
-                    >
-                      插入当前页
-                    </Button>
-                  </ModalFooter>
+                <Modal.Header>{template.name}</Modal.Header>
+                <Modal.Body>
+                  <div className="rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-blue-soft)] p-4">
+                    <DiagramTemplateThumbnail template={template} />
+                  </div>
+                <p className="text-[12px] leading-5 text-zinc-500 dark:text-zinc-400">
+                  {template.detail} · {template.nodes.length} 个节点，{template.edges.length} 条连线。插入当前页时会自动避开已有内容。
+                </p>
+                </Modal.Body>
+                <Modal.Footer className="flex-wrap">
+                  <Button variant="ghost" onPress={onClose}>取消</Button>
+                  <Button variant="secondary"
+                    isDisabled={pages.length >= MAX_DIAGRAM_PAGES}
+                    onPress={() => {
+                      const pageId = addPage();
+                      if (!pageId) return;
+                      setPendingTemplateInsertion({ templateId, pageId });
+                      onClose();
+                    }}
+                  >
+                    新页面插入
+                  </Button>
+                <Button variant="primary"
+                onPress={() => {
+                insertTemplate(templateId);
+                onClose();
+                setCompactPanel(null);
+                }}
+                >
+                插入当前页
+                </Button>
+                </Modal.Footer>
                 </>
-              );
-            }}
-          </ModalContent>
-        </Modal>
+                );
+                }}
+        
+              </Modal.Dialog>
+            </Modal.Container>
+          </Modal.Backdrop>
+        </Modal.Root>
 
-        <Modal
-          isOpen={exportDialogOpen}
-          size="md"
-          backdrop="blur"
-          onOpenChange={setExportDialogOpen}
-          classNames={{
-            wrapper: "!z-[220] px-4 py-6",
-            backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-            base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
-          }}
-        >
-          <ModalContent>
-            {(onClose) => (
-              <>
-                <ModalHeader>导出流程图</ModalHeader>
-                <ModalBody>
+        <Modal.Root isOpen={exportDialogOpen} onOpenChange={setExportDialogOpen}>
+          <Modal.Backdrop>
+            <Modal.Container size="md">
+              <Modal.Dialog>
+                {({ close: onClose }) => (
+                <>
+                <Modal.Header>导出流程图</Modal.Header>
+                <Modal.Body>
                   <p className="text-[12px] leading-5 text-zinc-500 dark:text-zinc-400">选择适合后续编辑、演示或代码协作的格式。</p>
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     {([
@@ -5234,14 +5206,17 @@ export function SyncedDiagram({
                       </button>
                     ))}
                   </div>
-                </ModalBody>
-                <ModalFooter>
-                  <Button variant="light" radius="sm" onPress={onClose}>取消</Button>
-                </ModalFooter>
-              </>
-            )}
-          </ModalContent>
-        </Modal>
+                </Modal.Body>
+                <Modal.Footer>
+                  <Button variant="ghost" onPress={onClose}>取消</Button>
+                </Modal.Footer>
+                </>
+                )}
+        
+              </Modal.Dialog>
+            </Modal.Container>
+          </Modal.Backdrop>
+        </Modal.Root>
 
         {dialogRequest ? (
           <DiagramEditorDialog
@@ -5291,7 +5266,7 @@ export function SyncedDiagram({
               <DiagramToolbarMenu
                 label={`${pages.length} 页`}
                 compact
-                placement="top-end"
+                placement="top end"
                 items={[
                   { key: "add", label: "新增页面", disabled: isReadOnly },
                   { key: "rename", label: "重命名当前页", disabled: isReadOnly },
@@ -6075,23 +6050,18 @@ function DiagramToolbarMenu({
   items,
   compact = false,
   mobileLabel,
-  placement = "bottom-start",
+  placement = "bottom start",
   onAction,
 }: {
   label: string;
   items: DiagramToolbarMenuItem[];
   compact?: boolean;
   mobileLabel?: string;
-  placement?: "bottom-start" | "bottom-end" | "top-end";
+  placement?: "bottom start" | "bottom end" | "top end";
   onAction: (key: string) => void;
 }) {
   return (
     <Dropdown
-      placement={placement}
-      shouldBlockScroll={false}
-      classNames={{
-        content: "diagram-apple-context-menu min-w-48 rounded-lg border p-1.5 shadow-xl",
-      }}
     >
       <DropdownTrigger>
         <button
@@ -6106,31 +6076,30 @@ function DiagramToolbarMenu({
           </svg>
         </button>
       </DropdownTrigger>
-      <DropdownMenu
-        aria-label={`${label}菜单`}
-        items={items}
-        disabledKeys={items.filter((item) => item.disabled).map((item) => item.key)}
-        onAction={(key) => onAction(String(key))}
-      >
-        {(item) => (
-          <DropdownItem
-            key={item.key}
-            textValue={item.label}
-            color={item.danger ? "danger" : "default"}
-            className={`rounded-md px-2.5 py-2 text-[11px] data-[hover=true]:bg-[var(--diagram-apple-blue-soft)] data-[hover=true]:text-[var(--diagram-apple-blue)] ${item.danger ? "text-[var(--diagram-apple-danger)]" : "text-[var(--diagram-apple-ink)]"}`}
-            endContent={item.selected ? (
-              <svg className="h-3.5 w-3.5 text-primary" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
-                <path d="m3 8 3 3 7-7" />
-              </svg>
-            ) : item.shortcut ? <span className="text-[11px] text-zinc-400">{item.shortcut}</span> : null}
-          >
-            <span className="min-w-0">
-              {item.section ? <span className="mb-1 block text-[11px] font-semibold uppercase text-zinc-400">{item.section}</span> : null}
-              <span className="block">{item.label}</span>
-            </span>
-          </DropdownItem>
-        )}
-      </DropdownMenu>
+      <DropdownPopover placement={placement}>
+        <DropdownMenu
+          aria-label={`${label}菜单`}
+          items={items}
+          disabledKeys={items.filter((item) => item.disabled).map((item) => item.key)}
+          onAction={(key) => onAction(String(key))}
+        >
+          {(item) => (
+            <DropdownItem
+              key={item.key}
+              className={`rounded-md px-2.5 py-2 text-[11px] data-[hover=true]:bg-[var(--diagram-apple-blue-soft)] data-[hover=true]:text-[var(--diagram-apple-blue)] ${item.danger ? "text-[var(--diagram-apple-danger)]" : "text-[var(--diagram-apple-ink)]"}`}
+            >
+              <span className="min-w-0">
+                {item.section ? <span className="mb-1 block text-[11px] font-semibold uppercase text-zinc-400">{item.section}</span> : null}
+                <span className="block">{item.label}</span>
+              </span>
+            {item.selected ? (
+                <svg className="h-3.5 w-3.5 text-primary" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="m3 8 3 3 7-7" />
+                </svg>
+              ) : item.shortcut ? <span className="text-[11px] text-zinc-400">{item.shortcut}</span> : null}</DropdownItem>
+          )}
+        </DropdownMenu>
+      </DropdownPopover>
     </Dropdown>
   );
 }

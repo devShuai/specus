@@ -1,23 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Button,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Modal,
-  ModalContent,
-  Pagination,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tooltip,
-} from "@heroui/react";
+import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, Tooltip, TooltipContent, TooltipTrigger } from "@heroui/react";
+import { Pager } from "../../../components/Pager";
 import {
   Gauge,
   LoaderCircle,
@@ -146,7 +129,7 @@ export function MediaCapturePanel() {
           <span>可回放 {completeCount} 条</span>
           <span>已采集 {formatBytes(capturedBytes)}</span>
         </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
+        <Button size="sm" variant="secondary" onPress={() => void load(true)} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
       </div>
@@ -181,14 +164,9 @@ export function MediaCapturePanel() {
                 ]}
                 actions={
                   <Button
-                    size="sm"
-                    color="primary"
-                    variant="flat"
-                    isDisabled={!canPlay(row)}
-                    title={row.playbackMessage ?? undefined}
-                    isLoading={ticketLoadingId === row.id}
+                    size="sm" variant="secondary" isDisabled={!canPlay(row) || ticketLoadingId === row.id}
                     onPress={() => void openPlayer(row)}
-                  >
+                  >{ticketLoadingId === row.id ? <Spinner size="sm" /> : null}
                     播放
                   </Button>
                 }
@@ -199,7 +177,7 @@ export function MediaCapturePanel() {
       </div>
 
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="HTTP 媒体采集记录" isHeaderSticky removeWrapper>
+        <Table aria-label="HTTP 媒体采集记录">
           <TableHeader>
             <TableColumn>来源</TableColumn>
             <TableColumn>类型</TableColumn>
@@ -209,7 +187,7 @@ export function MediaCapturePanel() {
             <TableColumn>时间</TableColumn>
             <TableColumn>操作</TableColumn>
           </TableHeader>
-          <TableBody items={rows} isLoading={loading} emptyContent="暂无媒体采集记录">
+          <TableBody items={rows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无媒体采集记录")}>
             {(row) => (
               <TableRow key={row.id}>
                 <TableCell>
@@ -253,14 +231,9 @@ export function MediaCapturePanel() {
                 </TableCell>
                 <TableCell>
                   <Button
-                    size="sm"
-                    color="primary"
-                    variant="flat"
-                    isDisabled={!canPlay(row)}
-                    title={row.playbackMessage ?? undefined}
-                    isLoading={ticketLoadingId === row.id}
+                    size="sm" variant="secondary" isDisabled={!canPlay(row) || ticketLoadingId === row.id}
                     onPress={() => void openPlayer(row)}
-                  >
+                  >{ticketLoadingId === row.id ? <Spinner size="sm" /> : null}
                     播放
                   </Button>
                 </TableCell>
@@ -273,7 +246,7 @@ export function MediaCapturePanel() {
       {totalPages > 1 ? (
         <div className="flex items-center justify-between gap-3">
           <span className="text-tiny text-default-400">共 {total} 条</span>
-          <Pagination showControls page={page + 1} total={totalPages} onChange={(value) => setPage(value - 1)} />
+          <Pager page={page + 1} total={totalPages} onChange={(value) => setPage(value - 1)}  />
         </div>
       ) : null}
 
@@ -302,36 +275,30 @@ function MediaPlayerModal({
   ticketUpdating: boolean;
 }) {
   return (
-    <Modal
-      isOpen={capture != null && ticket != null}
-      classNames={{
-        backdrop: "apple-tv-backdrop",
-        base: "apple-tv-modal",
-        wrapper: "apple-tv-modal-wrapper",
-      }}
-      hideCloseButton
-      placement="center"
-      size="5xl"
-      onOpenChange={(open) => {
+    <Modal.Root isOpen={capture != null && ticket != null} onOpenChange={(open) => {
         if (!open) {
           onClose();
         }
-      }}
-    >
-      <ModalContent>
-        {(close) => (
-          capture && ticket ? (
+      }}>
+      <Modal.Backdrop>
+        <Modal.Container placement="center" size="cover">
+          <Modal.Dialog>
+            {
+            capture && ticket ? (
             <MediaPlayer
-              capture={capture}
-              ticket={ticket}
-              ticketUpdating={ticketUpdating}
-              onBackfillChange={onBackfillChange}
-              onClose={close}
+            capture={capture}
+            ticket={ticket}
+            ticketUpdating={ticketUpdating}
+            onBackfillChange={onBackfillChange}
+            onClose={onClose}
             />
-          ) : null
-        )}
-      </ModalContent>
-    </Modal>
+            ) : null
+            }
+    
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -977,12 +944,10 @@ function MediaPlayer({
               {ticketUpdating ? <LoaderCircle className="animate-spin text-white/60" size={14} /> : null}
               <span className="apple-tv-backfill-label">补采缺口</span>
               <Switch
-                size="sm"
-                color="primary"
                 aria-label="缺失片段补采"
                 isDisabled={ticketUpdating}
                 isSelected={ticket.backfillMissing}
-                onValueChange={onBackfillChange}
+                onChange={onBackfillChange}
               />
             </div>
             <PlayerIconButton label="关闭播放器" onPress={onClose}>
@@ -1096,7 +1061,7 @@ function MediaPlayer({
                 />
               </div>
 
-              <Dropdown placement="top-end">
+              <Dropdown>
                 <DropdownTrigger>
                   <button
                     type="button"
@@ -1107,17 +1072,19 @@ function MediaPlayer({
                     <span>{playbackRate}×</span>
                   </button>
                 </DropdownTrigger>
-                <DropdownMenu
-                  aria-label="选择播放速度"
-                  disallowEmptySelection
-                  selectedKeys={new Set([String(playbackRate)])}
-                  selectionMode="single"
-                  onAction={(key) => changePlaybackRate(Number(key))}
-                >
-                  {PLAYER_RATES.map((rate) => (
-                    <DropdownItem key={String(rate)}>{rate}×</DropdownItem>
-                  ))}
-                </DropdownMenu>
+                <DropdownPopover placement="top end">
+                  <DropdownMenu
+                    aria-label="选择播放速度"
+                    disallowEmptySelection
+                    selectedKeys={new Set([String(playbackRate)])}
+                    selectionMode="single"
+                    onAction={(key) => changePlaybackRate(Number(key))}
+                  >
+                    {PLAYER_RATES.map((rate) => (
+                      <DropdownItem key={String(rate)}>{rate}×</DropdownItem>
+                    ))}
+                  </DropdownMenu>
+                </DropdownPopover>
               </Dropdown>
 
               {pictureInPictureSupported ? (
@@ -1167,8 +1134,8 @@ function PlayerIconButton({
   onPress: () => void;
 }) {
   return (
-    <Tooltip content={label} delay={450} placement="top">
-      <button
+    <Tooltip delay={450}>
+      <TooltipTrigger><button
         type="button"
         aria-label={label}
         className={`apple-tv-icon-button ${emphasized ? "is-emphasized" : ""}`}
@@ -1176,7 +1143,8 @@ function PlayerIconButton({
         onClick={onPress}
       >
         {children}
-      </button>
+      </button></TooltipTrigger>
+      <TooltipContent placement="top">{label}</TooltipContent>
     </Tooltip>
   );
 }
@@ -1228,12 +1196,12 @@ function MediaKindChip({ kind }: { kind: string }) {
   const label = kind === "HLS_MANIFEST" ? "HLS"
     : kind === "DASH_MANIFEST" ? "DASH"
       : kind === "MEDIA_SEGMENT" ? "分段" : "Range 媒体";
-  return <Chip size="sm" variant="flat">{label}</Chip>;
+  return <Chip size="sm" variant="soft">{label}</Chip>;
 }
 
 function MediaStateChip({ row }: { row: HttpMediaCapture }) {
   const color = row.state === "COMPLETE" && row.offlineReady ? "success"
-    : row.state === "COMPLETE" && row.playable ? "primary"
+    : row.state === "COMPLETE" && row.playable ? "accent"
       : row.state === "COMPLETE" ? "default"
         : row.state === "FAILED" || row.state === "INCOMPLETE" ? "danger"
       : "warning";
@@ -1242,7 +1210,7 @@ function MediaStateChip({ row }: { row: HttpMediaCapture }) {
       : row.state === "COMPLETE" ? "已采集"
         : row.state === "CAPTURING" || row.state === "STARTING" ? "采集中"
           : row.state === "INCOMPLETE" ? "不完整" : "失败";
-  return <Chip color={color} size="sm" variant="flat">{label}</Chip>;
+  return <Chip color={color} size="sm" variant="soft">{label}</Chip>;
 }
 
 function mediaRangeLabel(row: HttpMediaCapture): string {

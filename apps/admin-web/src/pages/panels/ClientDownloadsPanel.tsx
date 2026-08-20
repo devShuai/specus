@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Button, Card, CardBody, CardHeader, Chip, Spinner } from "@heroui/react";
+import { Button, Card, Chip, Spinner, buttonVariants } from "@heroui/react";
 import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
 import { MacosInstallGuide } from "../../components/MacosInstallGuide";
@@ -59,10 +59,10 @@ export function ClientDownloadsPanel() {
           <p className="text-small text-default-500">macOS 推荐 Homebrew；GitHub Releases 提供各平台手动下载包</p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button as="a" href="/download" rel="noopener noreferrer" size="sm" target="_blank" variant="bordered">
+          <a href="/download" rel="noopener noreferrer" target="_blank" className={buttonVariants({ variant: "outline", size: "sm" })}>
             打开公开下载页 ↗
-          </Button>
-          <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load(true)}>
+          </a>
+          <Button size="sm" variant="secondary" onPress={() => void load(true)} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
             刷新
           </Button>
         </div>
@@ -76,21 +76,21 @@ export function ClientDownloadsPanel() {
           role="alert"
         >
           <p className="text-small text-danger">下载链接加载失败：{error}</p>
-          <Button color="danger" size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+          <Button size="sm" variant="danger-soft" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
             重试
           </Button>
         </div>
       ) : loading && links.length === 0 ? (
-        <Spinner className="my-8" label="加载中…" />
+        <span className="inline-flex items-center gap-2 my-8"><Spinner /><span className="text-sm text-default-500">加载中…</span></span>
       ) : (
         <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
           {grouped.map(({ implementation, links: implLinks }) => (
-            <Card key={implementation} shadow="none" className="rounded-md border border-default-200">
-              <CardHeader className="flex flex-col items-start gap-1 px-5 pb-2 pt-4">
+            <Card key={implementation} className="rounded-md border border-default-200">
+              <Card.Header className="flex flex-col items-start gap-1 px-5 pb-2 pt-4">
                 <h3 className="text-base font-semibold">{IMPLEMENTATION_LABELS[implementation]}</h3>
                 <p className="text-tiny text-default-500">{IMPLEMENTATION_DESCRIPTIONS[implementation]}</p>
-              </CardHeader>
-              <CardBody className="gap-3 px-5 pb-5 pt-2">
+              </Card.Header>
+              <Card.Content className="gap-3 px-5 pb-5 pt-2">
                 {implLinks.length === 0 ? (
                   <p className="rounded-md border border-default-200 bg-default-50 p-3 text-tiny text-default-500">
                     当前未获取到对应产物，请稍后刷新
@@ -98,7 +98,7 @@ export function ClientDownloadsPanel() {
                 ) : (
                   implLinks.map((link) => <DownloadCard key={link.id} link={link} />)
                 )}
-              </CardBody>
+              </Card.Content>
             </Card>
           ))}
         </div>
@@ -125,13 +125,13 @@ function DownloadCard({ link }: { link: ClientDownloadLink }) {
         <span className="shrink-0 text-tiny text-default-400 group-hover:text-primary">↗</span>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1">
-        <Chip size="sm" variant="flat" color="primary">
+        <Chip size="sm" variant="soft" color="accent">
           {platformLabel(link.platform)}
         </Chip>
-        <Chip size="sm" variant="flat">
+        <Chip size="sm" variant="soft">
           {archLabel(link.arch)}
         </Chip>
-        {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="flat">v{link.version}</Chip> : null}
+        {link.version ? <Chip size="sm" color={link.isLatest ? "success" : "default"} variant="soft">v{link.version}</Chip> : null}
         {link.fileSize ? <span className="text-tiny text-default-400">{formatBytes(link.fileSize)}</span> : null}
         <span className="ml-auto text-tiny text-default-400">更新 {formatDateTime(link.updatedAt)}</span>
       </div>

@@ -8,9 +8,22 @@
   unicode-range: U+0000-00FF, U+2000-206F, U+2190-21FF, U+2200-22FF;
 }
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Tailwind 4 用单条 @import 取代了 base/components/utilities 三条指令。 */
+@import "tailwindcss";
+
+/* HeroUI 3 不再提供 Tailwind 插件（v2 的 heroui() 已移除），主题改为直接引入它的样式表，
+   语义色与组件变体由其中的 CSS 变量提供。 */
+@import "@heroui/react/styles";
+
+/* Tailwind 4 取消了 darkMode 配置项：dark: 默认跟随 prefers-color-scheme，
+   而本应用的深浅主题由 ThemeContext 写在 <html> 的 .dark class 上（E-14）。
+   不重新声明这个变体，系统偏好深色而应用主题为浅色时，dark:text-white 之类
+   仍会命中，浅底上就出现白字。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* 扫描范围：@source 需要 glob 而不是目录，写成目录会一条工具类都扫不出来。 */
+@source "./**/*.{ts,tsx}";
+@source "../index.html";
 
 html,
 body,

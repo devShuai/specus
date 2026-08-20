@@ -1,17 +1,7 @@
 import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ButtonHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
-import {
-  Button,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@heroui/react";
+import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Popover, PopoverContent, PopoverTrigger } from "@heroui/react";
 import {
   fitWhiteboardImageDataUrl,
 } from "../lib/whiteboardImageCompression";
@@ -1639,23 +1629,20 @@ export function SyncedWhiteboard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>
-            <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+            <Chip size="sm" variant="soft" color={isConnected ? "success" : "default"}>
               {isConnected ? "实时同步" : "本地绘制"}
             </Chip>
-            <Chip size="sm" radius="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {totalPeers} 台 · {boardCountLabel}
             </Chip>
-            {isReadOnly ? <Chip size="sm" radius="sm" variant="flat" color="warning">访客只读</Chip> : null}
+            {isReadOnly ? <Chip size="sm" variant="soft" color="warning">访客只读</Chip> : null}
           </div>
           <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
             可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
           </div>
         </div>
         <Button
-          size="sm"
-          radius="sm"
-          color={isExpanded ? "primary" : "default"}
-          variant="flat"
+          size="sm" variant="secondary"
           onPress={() => setIsExpanded((value) => !value)}
         >
           <span className="mr-1.5"><ToolGlyph name={isExpanded ? "collapse" : "fullscreen"} /></span>
@@ -1678,43 +1665,45 @@ export function SyncedWhiteboard({
             <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
-            <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+            <Dropdown>
               <DropdownTrigger>
                 <WhiteboardMenuTrigger icon="insert" label={insertMenuLabel} active={isInsertMenuActive} />
               </DropdownTrigger>
-              <DropdownMenu
-                aria-label="插入内容"
-                disabledKeys={isReadOnly
-                  ? ["text", "rectangle", "ellipse", "arrow", "flow", "image"]
-                  : isImportingImage
-                    ? ["image"]
-                    : []}
-                onAction={(key) => {
-                  const action = String(key);
-                  if (action === "flow") {
-                    setIsFlowchartOpen((value) => !value);
-                    return;
-                  }
-                  setIsFlowchartOpen(false);
-                  if (action === "image") {
-                    imageInputRef.current?.click();
-                    return;
-                  }
-                  selectTool(action as WhiteboardTool);
-                }}
-              >
-                <DropdownItem key="text" startContent={<ToolGlyph name="text" />}>文本</DropdownItem>
-                <DropdownItem key="rectangle" startContent={<ToolGlyph name="rectangle" />}>矩形</DropdownItem>
-                <DropdownItem key="ellipse" startContent={<ToolGlyph name="ellipse" />}>圆形</DropdownItem>
-                <DropdownItem key="arrow" startContent={<ToolGlyph name="arrow" />}>箭头</DropdownItem>
-                <DropdownItem key="flow" startContent={<ToolGlyph name="flow" />}>流程图组件</DropdownItem>
-                <DropdownItem key="image" startContent={<ToolGlyph name="image" />}>
-                  {isImportingImage ? "图片处理中" : "插入图片"}
-                </DropdownItem>
-              </DropdownMenu>
+              <DropdownPopover placement="bottom start">
+                <DropdownMenu
+                  aria-label="插入内容"
+                  disabledKeys={isReadOnly
+                    ? ["text", "rectangle", "ellipse", "arrow", "flow", "image"]
+                    : isImportingImage
+                      ? ["image"]
+                      : []}
+                  onAction={(key) => {
+                    const action = String(key);
+                    if (action === "flow") {
+                      setIsFlowchartOpen((value) => !value);
+                      return;
+                    }
+                    setIsFlowchartOpen(false);
+                    if (action === "image") {
+                      imageInputRef.current?.click();
+                      return;
+                    }
+                    selectTool(action as WhiteboardTool);
+                  }}
+                >
+                  <DropdownItem key="text">{<ToolGlyph name="text" />}文本</DropdownItem>
+                  <DropdownItem key="rectangle">{<ToolGlyph name="rectangle" />}矩形</DropdownItem>
+                  <DropdownItem key="ellipse">{<ToolGlyph name="ellipse" />}圆形</DropdownItem>
+                  <DropdownItem key="arrow">{<ToolGlyph name="arrow" />}箭头</DropdownItem>
+                  <DropdownItem key="flow">{<ToolGlyph name="flow" />}流程图组件</DropdownItem>
+                  <DropdownItem key="image">{<ToolGlyph name="image" />}
+                    {isImportingImage ? "图片处理中" : "插入图片"}
+                  </DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
 
-            <Popover placement="bottom-start" shouldBlockScroll={false}>
+            <Popover>
               <PopoverTrigger>
                 <button
                   type="button"
@@ -1737,7 +1726,7 @@ export function SyncedWhiteboard({
                   <MenuChevronGlyph />
                 </button>
               </PopoverTrigger>
-              <PopoverContent className="w-64 p-3">
+              <PopoverContent placement="bottom start" className="w-64 p-3">
                 <div className="w-full space-y-4">
                   <div>
                     <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
@@ -1860,63 +1849,67 @@ export function SyncedWhiteboard({
 
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
-            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+            <Dropdown>
               <DropdownTrigger>
                 <WhiteboardMenuTrigger icon="file" label="文件" />
               </DropdownTrigger>
-              <DropdownMenu
-                aria-label="白板文件"
-                disabledKeys={[
-                  ...(isReadOnly || isImportingDocument ? ["import"] : []),
-                  ...(strokes.length === 0 && objects.length === 0 ? ["export"] : []),
-                ]}
-                onAction={(key) => {
-                  if (String(key) === "import") {
-                    documentInputRef.current?.click();
-                  } else {
-                    void exportBoardDocument();
-                  }
-                }}
-              >
-                <DropdownItem key="import" startContent={<ToolGlyph name="import" />}>
-                  {isImportingDocument ? "正在导入" : "导入白板"}
-                </DropdownItem>
-                <DropdownItem key="export" startContent={<ToolGlyph name="export" />}>导出白板</DropdownItem>
-              </DropdownMenu>
+              <DropdownPopover placement="bottom end">
+                <DropdownMenu
+                  aria-label="白板文件"
+                  disabledKeys={[
+                    ...(isReadOnly || isImportingDocument ? ["import"] : []),
+                    ...(strokes.length === 0 && objects.length === 0 ? ["export"] : []),
+                  ]}
+                  onAction={(key) => {
+                    if (String(key) === "import") {
+                      documentInputRef.current?.click();
+                    } else {
+                      void exportBoardDocument();
+                    }
+                  }}
+                >
+                  <DropdownItem key="import">{<ToolGlyph name="import" />}
+                    {isImportingDocument ? "正在导入" : "导入白板"}
+                  </DropdownItem>
+                  <DropdownItem key="export">{<ToolGlyph name="export" />}导出白板</DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
 
-            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+            <Dropdown>
               <DropdownTrigger>
                 <WhiteboardMenuTrigger icon="edit" label="编辑" />
               </DropdownTrigger>
-              <DropdownMenu
-                aria-label="编辑白板"
-                disabledKeys={[
-                  ...(!localElementExists || isReadOnly ? ["undo"] : []),
-                  ...(!selectedObjectId || isReadOnly ? ["delete"] : []),
-                  ...((strokes.length === 0 && objects.length === 0) || isReadOnly ? ["clear"] : []),
-                ]}
-                onAction={(key) => {
-                  const action = String(key);
-                  if (action === "undo") {
-                    undoLastLocalElement();
-                  } else if (action === "delete") {
-                    if (selectedObjectId) removeObject(selectedObjectId);
-                  } else {
-                    clearBoard();
-                  }
-                }}
-              >
-                <DropdownItem key="undo" startContent={<ToolGlyph name="undo" />} endContent={<span className="text-[10px] text-zinc-400">Ctrl Z</span>}>
-                  撤销
-                </DropdownItem>
-                <DropdownItem key="delete" startContent={<ToolGlyph name="delete" />} endContent={<span className="text-[10px] text-zinc-400">Delete</span>}>
-                  删除所选
-                </DropdownItem>
-                <DropdownItem key="clear" color="danger" className="text-danger" startContent={<ToolGlyph name="clear" />}>
-                  清空白板
-                </DropdownItem>
-              </DropdownMenu>
+              <DropdownPopover placement="bottom end">
+                <DropdownMenu
+                  aria-label="编辑白板"
+                  disabledKeys={[
+                    ...(!localElementExists || isReadOnly ? ["undo"] : []),
+                    ...(!selectedObjectId || isReadOnly ? ["delete"] : []),
+                    ...((strokes.length === 0 && objects.length === 0) || isReadOnly ? ["clear"] : []),
+                  ]}
+                  onAction={(key) => {
+                    const action = String(key);
+                    if (action === "undo") {
+                      undoLastLocalElement();
+                    } else if (action === "delete") {
+                      if (selectedObjectId) removeObject(selectedObjectId);
+                    } else {
+                      clearBoard();
+                    }
+                  }}
+                >
+                  <DropdownItem key="undo">{<ToolGlyph name="undo" />}
+                    撤销
+                  {<span className="text-[10px] text-zinc-400">Ctrl Z</span>}</DropdownItem>
+                  <DropdownItem key="delete">{<ToolGlyph name="delete" />}
+                    删除所选
+                  {<span className="text-[10px] text-zinc-400">Delete</span>}</DropdownItem>
+                  <DropdownItem key="clear" className="text-danger">{<ToolGlyph name="clear" />}
+                    清空白板
+                  </DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
           </div>
 
@@ -2330,11 +2323,11 @@ export function SyncedWhiteboard({
                 </div>
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
-                <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+                <Chip size="sm" variant="soft" color={isConnected ? "success" : "default"}>
                   {isConnected ? "实时同步" : "本地绘制"}
                 </Chip>
-                <Chip size="sm" radius="sm" variant="flat">{totalPeers} 台</Chip>
-                <Chip size="sm" radius="sm" variant="flat">{boardCountLabel}</Chip>
+                <Chip size="sm" variant="soft">{totalPeers} 台</Chip>
+                <Chip size="sm" variant="soft">{boardCountLabel}</Chip>
               </div>
               <div className="mt-2 rounded-lg border border-cyan-500/15 bg-cyan-500/[0.08] px-2.5 py-2 text-[11px] leading-5 text-zinc-700 dark:text-zinc-200">
                 {boardMessage}
@@ -2344,13 +2337,11 @@ export function SyncedWhiteboard({
                 可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
               </div>
               <div className="mt-2 grid grid-cols-3 gap-1.5 border-t border-black/5 pt-2 dark:border-white/10">
-                <Button size="sm" radius="sm" variant="flat" className="min-w-0 px-1" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
+                <Button size="sm" variant="secondary" className="min-w-0 px-1" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
                   撤销
                 </Button>
                 <Button
-                  size="sm"
-                  radius="sm"
-                  variant="flat"
+                  size="sm" variant="secondary"
                   className="min-w-0 px-1"
                   isDisabled={!selectedObjectId}
                   onPress={() => selectedObjectId && removeObject(selectedObjectId)}
@@ -2358,10 +2349,7 @@ export function SyncedWhiteboard({
                   删除
                 </Button>
                 <Button
-                  size="sm"
-                  radius="sm"
-                  color="danger"
-                  variant="flat"
+                  size="sm" variant="danger-soft"
                   className="min-w-0 px-1"
                   onPress={clearBoard}
                   isDisabled={strokes.length === 0 && objects.length === 0}

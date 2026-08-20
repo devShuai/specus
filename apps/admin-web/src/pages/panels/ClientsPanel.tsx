@@ -1,24 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import {
-  Button,
-  Chip,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Pagination,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tooltip,
-  useDisclosure,
-} from "@heroui/react";
+import { Button, Chip, Description, FieldError, Input, Label, Modal, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField, Tooltip, TooltipContent, TooltipTrigger, useOverlayState } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { Client, ClientCredential } from "../../api/types";
 import { formatBytes, formatDateTime, formatSince } from "../../lib/format";
@@ -54,7 +36,7 @@ function useLocalPagination<T>(items: T[], pageSize = PAGE_SIZE) {
   const paged = items.slice((safePage - 1) * pageSize, safePage * pageSize);
   const pager = totalPages > 1 ? (
     <div className="flex justify-end">
-      <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+      <Pager page={safePage} total={totalPages} onChange={setPage}  />
     </div>
   ) : null;
   return { paged, pager };
@@ -72,9 +54,9 @@ export function ClientsPanel() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [editingCredential, setEditingCredential] = useState<ClientCredential | null>(null);
   const [revealedSecret, setRevealedSecret] = useState("");
-  const clientModal = useDisclosure();
-  const credentialModal = useDisclosure();
-  const secretModal = useDisclosure();
+  const clientModal = useOverlayState();
+  const credentialModal = useOverlayState();
+  const secretModal = useOverlayState();
   const [detailClient, setDetailClient] = useState<Client | null>(null);
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
@@ -113,7 +95,7 @@ export function ClientsPanel() {
       return;
     }
     setRevealedSecret(value);
-    secretModal.onOpen();
+    secretModal.open();
   };
 
   const maxOnlineNumber = Number(maxOnline);
@@ -152,12 +134,12 @@ export function ClientsPanel() {
 
   const openClientEdit = (client: Client) => {
     setEditingClient(client);
-    clientModal.onOpen();
+    clientModal.open();
   };
 
   const openCredentialEdit = (credential: ClientCredential) => {
     setEditingCredential(credential);
-    credentialModal.onOpen();
+    credentialModal.open();
   };
 
   const pushNat = async (client: Client) => {
@@ -219,20 +201,21 @@ export function ClientsPanel() {
         ) : null}
       </StatusChip>
     );
-    return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
+    return tooltip ? <Tooltip>
+      <TooltipTrigger>{chip}</TooltipTrigger>
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip> : chip;
   };
 
   const messageCapabilityChip = (client: Client) => (
     <Tooltip
-      content={
-        client.messageReceiveCapable
-          ? `附件 ${client.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${client.messageMediaPreviewCapable ? "支持" : "不支持"}`
-          : "该客户端未上报消息能力"
-      }
     >
-      <Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="flat">
+      <TooltipTrigger><Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="soft">
         {client.messageReceiveCapable ? "可聊天" : "不可聊天"}
-      </Chip>
+      </Chip></TooltipTrigger>
+      <TooltipContent>{client.messageReceiveCapable
+          ? `附件 ${client.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${client.messageMediaPreviewCapable ? "支持" : "不支持"}`
+          : "该客户端未上报消息能力"}</TooltipContent>
     </Tooltip>
   );
 
@@ -247,26 +230,27 @@ export function ClientsPanel() {
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
             <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。</p>
           </div>
-          <Button className="w-full sm:w-auto" variant="flat" isLoading={loadingClients || loadingCredentials} onPress={() => void load()}>
+          <Button className="w-full sm:w-auto" variant="secondary" onPress={() => void load()} isDisabled={loadingClients || loadingCredentials}>{loadingClients || loadingCredentials ? <Spinner size="sm" /> : null}
             刷新
           </Button>
         </div>
 
         <form className="flex flex-wrap items-end gap-3" onSubmit={createCredential}>
-          <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
-          <Input className="w-full sm:w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
-          <Input
-            className="w-full sm:w-44"
-            type="number"
-            label="在线实例上限"
-            min={1}
-            max={10000}
-            value={maxOnline}
-            onValueChange={setMaxOnline}
-            isInvalid={Boolean(maxOnlineError)}
-            errorMessage={maxOnlineError}
-          />
-          <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+          <TextField value={apiKey} onChange={setApiKey} className="w-full sm:w-64">
+            <Label>apiKey</Label>
+            <Input placeholder="留空自动生成" />
+          </TextField>
+          <TextField value={secret} onChange={setSecret} className="w-full sm:w-56">
+            <Label>secret</Label>
+            <Input placeholder="留空自动生成" />
+          </TextField>
+          <TextField value={maxOnline} onChange={setMaxOnline} isInvalid={Boolean(maxOnlineError)} type="number" className="w-full sm:w-44">
+            <Label>在线实例上限</Label>
+            <Input min={1}
+            max={10000}  />
+            <FieldError>{maxOnlineError}</FieldError>
+          </TextField>
+          <Button variant="primary" className="h-14 w-full sm:w-auto" type="submit" isDisabled={creating}>{creating ? <Spinner size="sm" /> : null}
             新建接入凭证
           </Button>
         </form>
@@ -295,10 +279,10 @@ export function ClientsPanel() {
                   ]}
                   actions={
                     <>
-                      <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
+                      <Button size="sm" variant="secondary" onPress={() => openCredentialEdit(credential)}>
                         编辑
                       </Button>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => void removeCredential(credential)}>
+                      <Button size="sm" variant="danger-soft" onPress={() => void removeCredential(credential)}>
                         删除
                       </Button>
                     </>
@@ -311,7 +295,7 @@ export function ClientsPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="接入凭证列表" isHeaderSticky removeWrapper>
+        <Table aria-label="接入凭证列表">
           <TableHeader>
             <TableColumn>ID</TableColumn>
             <TableColumn>apiKey</TableColumn>
@@ -321,7 +305,7 @@ export function ClientsPanel() {
             <TableColumn>创建时间</TableColumn>
             <TableColumn>操作</TableColumn>
           </TableHeader>
-          <TableBody items={credentialPagination.paged} isLoading={loadingCredentials} emptyContent={<EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />}>
+          <TableBody items={credentialPagination.paged} renderEmptyState={() => (loadingCredentials ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />)}>
             {(credential) => (
               <TableRow key={credential.id}>
                 <TableCell>{credential.id}</TableCell>
@@ -336,10 +320,10 @@ export function ClientsPanel() {
                 <TableCell>{formatDateTime(credential.createdAt)}</TableCell>
                 <TableCell>
                   <div className="flex gap-2">
-                    <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
+                    <Button size="sm" variant="secondary" onPress={() => openCredentialEdit(credential)}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => removeCredential(credential)}>
+                    <Button size="sm" variant="danger-soft" onPress={() => removeCredential(credential)}>
                       删除
                     </Button>
                   </div>
@@ -382,16 +366,16 @@ export function ClientsPanel() {
                   ]}
                   actions={
                     <>
-                      <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
+                      <Button size="sm" variant="secondary" onPress={() => setDetailClient(client)}>
                         详情
                       </Button>
-                      <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
+                      <Button size="sm" variant="secondary" onPress={() => openClientEdit(client)}>
                         编辑
                       </Button>
-                      <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
+                      <Button size="sm" variant="secondary" onPress={() => void pushNat(client)}>
                         下发映射
                       </Button>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
+                      <Button size="sm" variant="danger-soft" onPress={() => removeClient(client)}>
                         删除
                       </Button>
                     </>
@@ -404,7 +388,7 @@ export function ClientsPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="客户端实例列表" isHeaderSticky removeWrapper>
+        <Table aria-label="客户端实例列表">
           <TableHeader>
             <TableColumn>ID</TableColumn>
             <TableColumn>客户端</TableColumn>
@@ -418,7 +402,7 @@ export function ClientsPanel() {
             <TableColumn>创建时间</TableColumn>
             <TableColumn>操作</TableColumn>
           </TableHeader>
-          <TableBody items={clientPagination.paged} isLoading={loadingClients} emptyContent={<EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />}>
+          <TableBody items={clientPagination.paged} renderEmptyState={() => (loadingClients ? <Spinner size="sm" /> : <EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />)}>
             {(client) => (
               <TableRow key={client.id}>
                 <TableCell>{client.id}</TableCell>
@@ -433,16 +417,16 @@ export function ClientsPanel() {
                 <TableCell>{formatDateTime(client.createdAt)}</TableCell>
                 <TableCell>
                   <div className="flex gap-2">
-                    <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
+                    <Button size="sm" variant="secondary" onPress={() => setDetailClient(client)}>
                       详情
                     </Button>
-                    <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
+                    <Button size="sm" variant="secondary" onPress={() => openClientEdit(client)}>
                       编辑
                     </Button>
-                    <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
+                    <Button size="sm" variant="secondary" onPress={() => void pushNat(client)}>
                       下发映射
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
+                    <Button size="sm" variant="danger-soft" onPress={() => removeClient(client)}>
                       删除
                     </Button>
                   </div>
@@ -462,29 +446,33 @@ export function ClientsPanel() {
 
       <EditClientModal disclosure={clientModal} client={editingClient} onSaved={() => void loadClients()} />
 
-      <Modal isOpen={secretModal.isOpen} onOpenChange={secretModal.onOpenChange}>
-        <ModalContent>
-          {(onClose) => (
-            <>
-              <ModalHeader>客户端 secret（仅显示一次）</ModalHeader>
-              <ModalBody>
-                <Input value={revealedSecret} isReadOnly onFocus={(event) => event.target.select()} />
-              </ModalBody>
-              <ModalFooter>
-                <Button
-                  variant="flat"
+      <Modal.Root isOpen={secretModal.isOpen} onOpenChange={secretModal.setOpen}>
+        <Modal.Backdrop>
+          <Modal.Container>
+            <Modal.Dialog>
+              {({ close: onClose }) => (
+              <>
+              <Modal.Header>客户端 secret（仅显示一次）</Modal.Header>
+              <Modal.Body>
+                <Input value={revealedSecret} readOnly onFocus={(event) => event.target.select()} />
+              </Modal.Body>
+              <Modal.Footer>
+                <Button variant="secondary"
                   onPress={() => void copyTextWithFeedback(revealedSecret)}
                 >
                   复制
                 </Button>
-                <Button color="primary" onPress={onClose}>
+                <Button variant="primary" onPress={onClose}>
                   我已保存
                 </Button>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              </Modal.Footer>
+              </>
+              )}
+
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
       <ClientDetailDrawer client={detailClient} open={detailClient != null} onClose={() => setDetailClient(null)} />
       <ConfirmModal
         isOpen={confirm != null}
@@ -500,7 +488,7 @@ export function ClientsPanel() {
 }
 
 interface EditCredentialModalProps {
-  disclosure: ReturnType<typeof useDisclosure>;
+  disclosure: ReturnType<typeof useOverlayState>;
   credential: ClientCredential | null;
   onSaved: (secret?: string) => void;
 }
@@ -541,7 +529,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
         maxOnlineInstances: maxOnlineNumber,
       });
       notify("接入凭证已更新");
-      disclosure.onClose();
+      disclosure.close();
       onSaved(result.secret);
     } catch (error) {
       notifyError(error, "更新失败");
@@ -551,45 +539,52 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
   };
 
   return (
-    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange}>
-      <ModalContent>
-        {(onClose) => (
-          <>
-            <ModalHeader>编辑接入凭证「{credential?.apiKey}」</ModalHeader>
-            <ModalBody className="gap-3">
-              <Input label="apiKey" value={apiKey} onValueChange={setApiKey} isRequired />
-              <Input label="secret" placeholder="留空保留原 secret" value={secret} onValueChange={setSecret} />
-              <Input
-                type="number"
-                label="在线实例上限"
-                min={1}
-                max={10000}
-                value={maxOnline}
-                onValueChange={setMaxOnline}
-                isInvalid={Boolean(maxOnlineError)}
-                errorMessage={maxOnlineError}
-              />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+    <Modal.Root isOpen={disclosure.isOpen} onOpenChange={disclosure.setOpen}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog>
+            {({ close: onClose }) => (
+            <>
+            <Modal.Header>编辑接入凭证「{credential?.apiKey}」</Modal.Header>
+            <Modal.Body className="gap-3">
+              <TextField value={apiKey} onChange={setApiKey} isRequired>
+                <Label>apiKey</Label>
+                <Input />
+              </TextField>
+            <TextField value={secret} onChange={setSecret}>
+              <Label>secret</Label>
+              <Input placeholder="留空保留原 secret" />
+            </TextField>
+            <TextField value={maxOnline} onChange={setMaxOnline} isInvalid={Boolean(maxOnlineError)} type="number">
+              <Label>在线实例上限</Label>
+              <Input min={1}
+              max={10000}  />
+              <FieldError>{maxOnlineError}</FieldError>
+            </TextField>
+            <Switch isSelected={enabled} onChange={setEnabled}>
+              启用
+            </Switch>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isDisabled={Boolean(maxOnlineError)} isLoading={saving} onPress={() => void save()}>
+              <Button variant="primary" isDisabled={Boolean(maxOnlineError) || saving} onPress={() => void save()}>{saving ? <Spinner size="sm" /> : null}
                 保存
               </Button>
-            </ModalFooter>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+            </Modal.Footer>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
 interface EditClientModalProps {
-  disclosure: ReturnType<typeof useDisclosure>;
+  disclosure: ReturnType<typeof useOverlayState>;
   client: Client | null;
   onSaved: () => void;
 }
@@ -676,7 +671,7 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
         connectionRateLimitPerMinute: rateNumber,
       });
       notify(renamed ? "客户端名称已更新，在线实例将自动重连" : "客户端实例已更新");
-      disclosure.onClose();
+      disclosure.close();
       onSaved();
     } catch (error) {
       notifyError(error, "更新失败");
@@ -686,56 +681,50 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
   };
 
   return (
-    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange}>
-      <ModalContent>
-        {(onClose) => (
-          <>
-            <ModalHeader>编辑客户端实例「{client?.clientName}」</ModalHeader>
-            <ModalBody className="gap-3">
-              <Input
-                label="客户端名称"
-                value={clientName}
-                onValueChange={setClientName}
-                maxLength={120}
-                isRequired
-                isInvalid={Boolean(nameError)}
-                errorMessage={nameError}
-                description={nameStatus === "checking"
+    <Modal.Root isOpen={disclosure.isOpen} onOpenChange={disclosure.setOpen}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog>
+            {({ close: onClose }) => (
+            <>
+            <Modal.Header>编辑客户端实例「{client?.clientName}」</Modal.Header>
+            <Modal.Body className="gap-3">
+              <TextField value={clientName} onChange={setClientName} isRequired isInvalid={Boolean(nameError)}>
+                <Label>客户端名称</Label>
+                <Input maxLength={120}   />
+                <Description>{nameStatus === "checking"
                   ? "正在检查全局唯一性…"
                   : nameStatus === "available" && !localNameError
                     ? "名称可用；修改后在线实例会重新连接"
-                    : "所有租户和用户之间不可重名"}
-              />
-              <Input
-                type="number"
-                label="每分钟连接上限（0 = 不限）"
-                value={rate}
-                onValueChange={setRate}
-                min={0}
-                max={10000}
-                isInvalid={Boolean(rateError)}
-                errorMessage={rateError}
-              />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+                    : "所有租户和用户之间不可重名"}</Description>
+                <FieldError>{nameError}</FieldError>
+              </TextField>
+            <TextField value={rate} onChange={setRate} isInvalid={Boolean(rateError)} type="number">
+              <Label>每分钟连接上限（0 = 不限）</Label>
+              <Input min={0}
+              max={10000}  />
+              <FieldError>{rateError}</FieldError>
+            </TextField>
+            <Switch isSelected={enabled} onChange={setEnabled}>
+              启用
+            </Switch>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
                 取消
               </Button>
-              <Button
-                color="primary"
-                isDisabled={Boolean(localNameError) || Boolean(rateError) || nameStatus === "checking" || nameStatus === "unavailable"}
-                isLoading={saving}
+              <Button variant="primary" isDisabled={Boolean(localNameError) || Boolean(rateError) || nameStatus === "checking" || nameStatus === "unavailable" || saving}
                 onPress={() => void save()}
-              >
-                保存
-              </Button>
-            </ModalFooter>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+              >{saving ? <Spinner size="sm" /> : null}
+            保存
+            </Button>
+            </Modal.Footer>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }

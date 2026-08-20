@@ -5,21 +5,7 @@ import type {
   DragEvent as ReactDragEvent,
   ReactNode,
 } from "react";
-import {
-  Button,
-  Chip,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-  Progress,
-  Switch,
-} from "@heroui/react";
+import { Button, Chip, Description, FieldError, Input, InputGroup, InputGroupInput, InputGroupSuffix, Label, Modal, Popover, PopoverContent, PopoverTrigger, ProgressBar, Spinner, Switch, TextField } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { useAuth } from "../auth/AuthContext";
 import { UserMenuButton } from "../components/UserMenuButton";
@@ -2853,33 +2839,34 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         confirmLabel="撤销"
         danger
       />
-      <Modal isOpen={inviteLabelRole !== null} onClose={() => setInviteLabelRole(null)} size="sm" placement="center">
-        <ModalContent>
-          <ModalHeader className="text-base">邀请名称</ModalHeader>
-          <ModalBody>
-            <Input
-              autoFocus
-              label="名称"
-              radius="sm"
-              variant="bordered"
-              value={inviteLabelDraft}
-              onValueChange={setInviteLabelDraft}
-              maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && inviteLabelDraft.trim()) {
-                  void confirmCreateRoomAccess();
-                }
-              }}
-            />
-          </ModalBody>
-          <ModalFooter>
-            <Button variant="flat" onPress={() => setInviteLabelRole(null)}>取消</Button>
-            <Button color="primary" isDisabled={!inviteLabelDraft.trim()} onPress={() => void confirmCreateRoomAccess()}>
-              创建邀请
-            </Button>
-          </ModalFooter>
-        </ModalContent>
-      </Modal>
+      <Modal.Root isOpen={inviteLabelRole !== null} onOpenChange={(open) => { if (!open) (() => setInviteLabelRole(null))(); }}>
+        <Modal.Backdrop>
+          <Modal.Container size="sm" placement="center">
+            <Modal.Dialog>
+              <Modal.Header className="text-base">邀请名称</Modal.Header>
+              <Modal.Body>
+                <TextField value={inviteLabelDraft} onChange={setInviteLabelDraft}>
+                  <Label>名称</Label>
+                  <Input autoFocus
+                  maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && inviteLabelDraft.trim()) {
+                      void confirmCreateRoomAccess();
+                    }
+                  }} />
+                </TextField>
+              </Modal.Body>
+              <Modal.Footer>
+                <Button variant="secondary" onPress={() => setInviteLabelRole(null)}>取消</Button>
+                <Button variant="primary" isDisabled={!inviteLabelDraft.trim()} onPress={() => void confirmCreateRoomAccess()}>
+                  创建邀请
+                </Button>
+              </Modal.Footer>
+
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
     </>
   );
 
@@ -2925,38 +2912,24 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 onApply={() => void applyClientName()}
               />
             </div>
-            <Input
-              className="diagram-collaboration-input-root"
-              classNames={{ inputWrapper: "diagram-collaboration-input" }}
-              size="sm"
-              label="房间名"
-              radius="sm"
-              variant="bordered"
-              value={roomIdDraft}
-              onValueChange={updateRoomIdDraft}
-              maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
-              isInvalid={Boolean(roomSettingsErrors.roomId)}
-              errorMessage={roomSettingsErrors.roomId}
-            />
-            {sharedRoomActive ? (
+            <TextField value={roomIdDraft} onChange={updateRoomIdDraft} isInvalid={Boolean(roomSettingsErrors.roomId)} className="diagram-collaboration-input-root">
+              <Label>房间名</Label>
               <Input
-                className="diagram-collaboration-input-root"
-                classNames={{ inputWrapper: "diagram-collaboration-input" }}
-                size="sm"
-                label="房间 Token"
-                radius="sm"
-                variant="bordered"
-                value={roomTokenDraft}
-                onValueChange={updateRoomTokenDraft}
-                maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
-                isInvalid={Boolean(roomSettingsErrors.roomToken)}
-                errorMessage={roomSettingsErrors.roomToken}
-                endContent={
-                  <Button className="diagram-collaboration-inline-action" size="sm" variant="light" onPress={() => updateRoomTokenDraft(createRoomToken())}>
+              maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}  />
+              <FieldError>{roomSettingsErrors.roomId}</FieldError>
+            </TextField>
+            {sharedRoomActive ? (
+              <TextField value={roomTokenDraft} onChange={updateRoomTokenDraft} isInvalid={Boolean(roomSettingsErrors.roomToken)} className="diagram-collaboration-input-root">
+                <Label>房间 Token</Label>
+                <InputGroup>
+                  <InputGroupInput
+                maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH} />
+                  <InputGroupSuffix>{<Button className="diagram-collaboration-inline-action" variant="ghost" onPress={() => updateRoomTokenDraft(createRoomToken())}>
                     生成
-                  </Button>
-                }
-              />
+                  </Button>}</InputGroupSuffix>
+                </InputGroup>
+                <FieldError>{roomSettingsErrors.roomToken}</FieldError>
+              </TextField>
             ) : null}
             {sharedRoomActive ? (
               <div className="diagram-collaboration-permissions">
@@ -2974,8 +2947,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             ) : null}
           </div>
           <div className="mt-2.5 flex justify-end gap-1.5">
-            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>恢复</Button>
-            <Button className="diagram-collaboration-action is-primary" size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>应用设置</Button>
+            <Button className="diagram-collaboration-action" size="sm" variant="ghost" onPress={resetRoomSettingsDraft}>恢复</Button>
+            <Button className="diagram-collaboration-action is-primary" size="sm" variant="secondary" onPress={applyRoomSettings}>应用设置</Button>
           </div>
         </section>
 
@@ -2985,15 +2958,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <span>{sharedRoomActive ? "可跨网络加入" : "限同一网络"}</span>
           </div>
           <div className="mt-2 grid grid-cols-4 gap-1.5">
-            <Button className="diagram-collaboration-action is-primary" size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom(roomInviteRole)}>分享</Button>
-            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink(roomInviteRole)}>复制链接</Button>
-            <Button className={`diagram-collaboration-action ${qrVisible ? "is-active" : ""}`} size="sm" radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
+            <Button className="diagram-collaboration-action is-primary" size="sm" variant="secondary" onPress={() => void shareRoom(roomInviteRole)}>分享</Button>
+            <Button className="diagram-collaboration-action" size="sm" variant="secondary" onPress={() => void copyRoomLink(roomInviteRole)}>复制链接</Button>
+            <Button className={`diagram-collaboration-action ${qrVisible ? "is-active" : ""}`} size="sm" variant="secondary" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
               {qrVisible ? "收起二维码" : "二维码"}
             </Button>
-            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
+            <Button className="diagram-collaboration-action" size="sm" variant="secondary" onPress={createNewRoom}>新房间</Button>
           </div>
           {!sharedRoomActive ? (
-            <Button className="diagram-collaboration-action mt-1.5" size="sm" radius="sm" color="primary" variant="flat" onPress={enterSharedRoom}>
+            <Button className="diagram-collaboration-action mt-1.5" size="sm" variant="secondary" onPress={enterSharedRoom}>
               创建共享房间，邀请远程协作者
             </Button>
           ) : null}
@@ -3022,7 +2995,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             {createdRoomAccess ? (
               <div className="diagram-collaboration-created-access mt-2">
                 <span className="min-w-0 truncate">{createdRoomAccess.access.label} · Token 仅显示一次</span>
-                <Button className="diagram-collaboration-action shrink-0" size="sm" radius="sm" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制</Button>
+                <Button className="diagram-collaboration-action shrink-0" size="sm" variant="secondary" onPress={() => void copyCreatedRoomAccessLink()}>复制</Button>
               </div>
             ) : null}
             <div className="diagram-collaboration-access-list mt-1.5">
@@ -3034,7 +3007,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     <div className="truncate text-tiny font-medium">{access.label}</div>
                     <div className="mt-0.5 text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : isAccessTokenExpired(access) ? "已过期" : access.expiresAt ? formatInviteExpiry(access.expiresAt) : "长期有效"}</div>
                   </div>
-                  <Button className="diagram-collaboration-action shrink-0" size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>
+                  <Button className="diagram-collaboration-action shrink-0" size="sm" variant="danger" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>
                     {access.revokedAt ? "已撤销" : "撤销"}
                   </Button>
                 </div>
@@ -3120,7 +3093,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <div className="app-apple-tool-workspace min-w-0 p-1 sm:p-2">
           <div className="flex items-center justify-between gap-3">
             <h1 className="text-xl font-semibold text-zinc-950 dark:text-white sm:text-2xl">互传</h1>
-            <Button size="sm" radius="sm" variant="light" className="transfer-touch-action" onPress={() => setHelpOpen(true)}>使用帮助</Button>
+            <Button size="sm" variant="ghost" className="transfer-touch-action" onPress={() => setHelpOpen(true)}>使用帮助</Button>
           </div>
 
           <section className="app-apple-tool-surface transfer-room-hub mt-3 p-3">
@@ -3128,7 +3101,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                 <span className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">房间</span>
                 <strong className="max-w-44 truncate text-base text-zinc-950 dark:text-white">{transferRoomDisplayName(roomId)}</strong>
-                <Chip size="sm" radius="sm" variant="flat" color={effectiveRoomRole === "OWNER" ? "primary" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
+                <Chip size="sm" variant="soft" color={effectiveRoomRole === "OWNER" ? "accent" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
                   {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读"}
                 </Chip>
                 <button
@@ -3141,26 +3114,22 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </button>
                 <Chip
                   size="sm"
-                  radius="sm"
-                  variant="flat"
+                  variant="soft"
                   color={discoveryStatus === "online" ? "success" : discoveryStatus === "reconnecting" ? "warning" : discoveryStatus === "permission-denied" || discoveryStatus === "name-conflict" ? "danger" : "default"}
                 >
                   {discoveryStatusLabel(discoveryStatus)}
                 </Chip>
-                <Popover placement="bottom-start">
+                <Popover>
                   <PopoverTrigger>
                     <Button
-                      size="sm"
-                      radius="sm"
-                      variant="flat"
-                      color={ossFallbackEnabled ? "success" : "default"}
+                      size="sm" variant="secondary"
                       className="h-6 min-w-0 gap-1 px-2 text-tiny max-sm:min-h-11"
                       aria-label="传输兜底方式说明"
                     >
                       {!authReady ? "账号检测中" : ossFallbackEnabled ? "云端接力可用" : "仅设备连接"}
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent className="max-w-64 px-3 py-2">
+                  <PopoverContent placement="bottom start" className="max-w-64 px-3 py-2">
                     <div className="text-tiny font-semibold">
                       {ossFallbackEnabled ? "云端接力已启用" : "仅使用设备连接"}
                     </div>
@@ -3174,17 +3143,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               </div>
               <div className="transfer-room-controls flex shrink-0 items-center gap-2">
                 {!isDiagramWorkspace ? (
-                  <Button isIconOnly size="sm" radius="sm" variant="light" className="min-h-11 min-w-11 sm:min-h-8 sm:min-w-8" aria-label="打开帮助" title="帮助" onPress={() => setHelpOpen(true)}>
+                  <Button isIconOnly size="sm" variant="ghost" className="min-h-11 min-w-11 sm:min-h-8 sm:min-w-8" aria-label="打开帮助" onPress={() => setHelpOpen(true)}>
                     ?
                   </Button>
                 ) : null}
-                <Button size="sm" radius="sm" color="primary" variant="flat" className="min-h-11 sm:min-h-8" onPress={openInvitePanel}>
+                <Button size="sm" variant="secondary" className="min-h-11 sm:min-h-8" onPress={openInvitePanel}>
                   邀请 / 加入
                 </Button>
                 <Button
-                  size="sm"
-                  radius="sm"
-                  variant="light"
+                  size="sm" variant="ghost"
                   className="min-h-11 sm:min-h-8"
                   onPress={() => {
                     resetRoomSettingsDraft();
@@ -3209,14 +3176,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   {discoveryError || discoveryStatusDescription(discoveryStatus)}
                 </span>
                 <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                  <Button size="sm" radius="sm" variant="flat" className="transfer-touch-action" onPress={retryDiscoveryConnection}>重试连接</Button>
-                  <Button size="sm" radius="sm" variant="light" className="transfer-touch-action" onPress={() => setRoomSettingsOpen(true)}>检查设置</Button>
+                  <Button size="sm" variant="secondary" className="transfer-touch-action" onPress={retryDiscoveryConnection}>重试连接</Button>
+                  <Button size="sm" variant="ghost" className="transfer-touch-action" onPress={() => setRoomSettingsOpen(true)}>检查设置</Button>
                   {discoveryErrorDetail ? (
-                    <Popover placement="bottom-end">
+                    <Popover>
                       <PopoverTrigger>
-                        <Button size="sm" radius="sm" variant="light" className="transfer-touch-action">查看详情</Button>
+                        <Button size="sm" variant="ghost" className="transfer-touch-action">查看详情</Button>
                       </PopoverTrigger>
-                      <PopoverContent className="max-w-[min(88vw,420px)] px-3 py-2">
+                      <PopoverContent placement="bottom end" className="max-w-[min(88vw,420px)] px-3 py-2">
                         <div>
                           <div className="text-tiny font-semibold text-zinc-800 dark:text-zinc-100">连接诊断信息</div>
                           <code className="mt-1 block break-all text-[11px] leading-5 text-zinc-500 dark:text-zinc-400">{discoveryErrorDetail}</code>
@@ -3280,7 +3247,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               </span>
               {activeOutgoingActivity ? (
                 <span className="w-24 shrink-0 sm:w-36">
-                  <Progress size="sm" aria-label={`${activeOutgoingActivity.fileName} 发送进度`} value={activeOutgoingActivity.progress} />
+                  <ProgressBar size="sm" aria-label={`${activeOutgoingActivity.fileName} 发送进度`} value={activeOutgoingActivity.progress} />
                 </span>
               ) : null}
               <span className="shrink-0 text-tiny font-medium text-primary-700 dark:text-primary-300">查看</span>
@@ -3392,16 +3359,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             {coarsePointer ? (
               <div className="mt-2 grid grid-cols-2 gap-2">
                 <Button
-                  size="sm"
-                  variant="flat"
+                  size="sm" variant="secondary"
                   isDisabled={isRoomReadOnly}
                   onPress={openSystemFilePicker}
                 >
                   系统文件
                 </Button>
                 <Button
-                  size="sm"
-                  variant="flat"
+                  size="sm" variant="secondary"
                   isDisabled={isRoomReadOnly}
                   onPress={openMediaFilePicker}
                 >
@@ -3446,7 +3411,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <span className="min-w-0 [overflow-wrap:anywhere]">{error}</span>
               <span className="flex shrink-0 items-center gap-1">
                 {state === "failed" && selectedFiles.length > 0 ? (
-                  <Button size="sm" radius="sm" color="danger" variant="flat" onPress={retryFailedTransfer}>
+                  <Button size="sm" variant="danger-soft" onPress={retryFailedTransfer}>
                     重试
                   </Button>
                 ) : null}
@@ -3534,12 +3499,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     <div className="flex shrink-0 items-center gap-1.5">
                       <Button
                         isIconOnly
-                        size="sm"
-                        radius="sm"
-                        color="primary"
-                        variant="flat"
+                        size="sm" variant="secondary"
                         aria-label="分享"
-                        title="分享"
                         onPress={() => void shareRecordFile()}
                       >
                         <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -3551,19 +3512,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       </Button>
                       <Button
                         isIconOnly
-                        size="sm"
-                        radius="sm"
-                        color="success"
-                        variant="flat"
+                        size="sm" variant="secondary"
                         aria-label="保存到本机"
-                        title="保存到本机"
                         onPress={() => void downloadRecordFile()}
                       >
                         <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                           <path d="M12 4v11m0 0 4-4m-4 4-4-4M4.5 19.5h15" />
                         </svg>
                       </Button>
-                      <Chip size="sm" color="success" variant="flat">
+                      <Chip size="sm" color="success" variant="soft">
                         完成
                       </Chip>
                     </div>
@@ -3601,7 +3558,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
               </div>
             </div>
-            <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
+            <Chip size="sm" variant="soft" color={peers.length > 0 ? "accent" : "default"}>
               {peers.length} 台
             </Chip>
           </div>
@@ -3652,23 +3609,20 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         onRedeem={() => void redeemPairingCode()}
         onCreateSharedRoom={enterSharedRoom}
       />
-      <Modal
-        isOpen={roomSettingsOpen}
-        size="2xl"
-        scrollBehavior="inside"
-        onOpenChange={(open) => {
+      <Modal.Root isOpen={roomSettingsOpen} onOpenChange={(open) => {
           setRoomSettingsOpen(open);
           if (!open) resetRoomSettingsDraft();
-        }}
-      >
-        <ModalContent className="transfer-room-settings-modal">
-          {(onClose) => (
-            <>
-              <ModalHeader className="flex items-center justify-between gap-3">
+        }}>
+        <Modal.Backdrop>
+          <Modal.Container scroll="inside" size="cover">
+            <Modal.Dialog>
+              {({ close: onClose }) => (
+              <>
+              <Modal.Header className="flex items-center justify-between gap-3">
                 <span>房间设置</span>
-                <Chip size="sm" radius="sm" variant="flat">{sharedRoomActive ? "共享房间" : "附近设备"}</Chip>
-              </ModalHeader>
-              <ModalBody className="gap-5 pb-5">
+                <Chip size="sm" variant="soft">{sharedRoomActive ? "共享房间" : "附近设备"}</Chip>
+              </Modal.Header>
+              <Modal.Body className="gap-5 pb-5">
                 <section className="grid gap-3 sm:grid-cols-2">
                   <div className="sm:col-span-2">
                     <h3 className="mb-2 text-small font-semibold text-zinc-900 dark:text-white">设备与房间</h3>
@@ -3695,10 +3649,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     </p>
                   </div>
                   <Switch
-                    size="sm"
                     aria-label="切换允许被发现"
                     isSelected={discoverable}
-                    onValueChange={updateDiscoverable}
+                    onChange={updateDiscoverable}
                   />
                 </section>
 
@@ -3711,60 +3664,50 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       </p>
                     </div>
                     <Switch
-                      size="sm"
                       aria-label="切换接收前确认"
                       isSelected={receiveConfirmationRequired}
-                      onValueChange={updateReceiveConfirmationRequired}
+                      onChange={updateReceiveConfirmationRequired}
                     />
                   </section>
                 ) : null}
-              </ModalBody>
-              <ModalFooter className="justify-between">
+              </Modal.Body>
+              <Modal.Footer className="justify-between">
                 <div className="flex items-center gap-2">
                   {sharedRoomActive ? (
-                    <Button color="danger" variant="light" radius="sm" onPress={exitSharedRoom}>退出共享房间</Button>
+                    <Button variant="danger" onPress={exitSharedRoom}>退出共享房间</Button>
                   ) : null}
-                  <Button color="danger" variant="light" radius="sm" onPress={createNewRoom}>创建新房间</Button>
+                  <Button variant="danger" onPress={createNewRoom}>创建新房间</Button>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button variant="light" radius="sm" onPress={onClose}>取消</Button>
-                  <Button
-                    color="primary"
-                    radius="sm"
-                    isLoading={clientNameSaving}
-                    isDisabled={Boolean(clientNameLocalError) || clientNameStatus === "checking" || clientNameStatus === "unavailable"}
+                  <Button variant="ghost" onPress={onClose}>取消</Button>
+                  <Button variant="primary" isDisabled={Boolean(clientNameLocalError) || clientNameStatus === "checking" || clientNameStatus === "unavailable" || clientNameSaving}
                     onPress={() => void saveRoomSettings()}
-                  >
+                  >{clientNameSaving ? <Spinner size="sm" /> : null}
                     保存设置
                   </Button>
-                </div>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              </div>
+              </Modal.Footer>
+              </>
+              )}
+      
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
 
-      <Modal
-        isOpen={activityCenterOpen}
-        size="2xl"
-        scrollBehavior="inside"
-        onOpenChange={(open) => {
-          setActivityCenterOpen(open);
-          if (open) {
-            setOutgoingActivities((activities) => activities.map((activity) => ({ ...activity, unread: false })));
-          }
-        }}
-      >
-        <ModalContent>
-          {(onClose) => (
-            <>
-              <ModalHeader className="flex items-center justify-between gap-3">
+      <Modal.Root isOpen={activityCenterOpen}>
+        <Modal.Backdrop>
+          <Modal.Container scroll="inside" size="cover">
+            <Modal.Dialog>
+              {({ close: onClose }) => (
+              <>
+              <Modal.Header className="flex items-center justify-between gap-3">
                 <span>传输任务</span>
-                <Chip size="sm" radius="sm" variant="flat">
+                <Chip size="sm" variant="soft">
                   {activeOutgoingCount + receivingTransfers.length + pendingTransfers.length} 个进行中
                 </Chip>
-              </ModalHeader>
-              <ModalBody className="gap-5 pb-5">
+              </Modal.Header>
+              <Modal.Body className="gap-5 pb-5">
                 <TransferActivityList
                   outgoing={outgoingActivities}
                   pending={pendingTransfers}
@@ -3776,37 +3719,43 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   onReject={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
                   onCancelReceiving={(item) => cancelIncomingTransfer(item.sourcePeerId, item.transferId)}
                 />
-              </ModalBody>
-              <ModalFooter>
-                <Button
-                  variant="light"
-                  radius="sm"
+              </Modal.Body>
+              <Modal.Footer>
+                <Button variant="ghost"
                   onPress={() => setOutgoingActivities((activities) => activities.filter((activity) => (
                     activity.status === "queued" || activity.status === "connecting" || activity.status === "sending"
                   )))}
                 >
                   清理已完成
                 </Button>
-                <Button color="primary" radius="sm" onPress={onClose}>完成</Button>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              <Button variant="primary" onPress={onClose}>完成</Button>
+              </Modal.Footer>
+              </>
+              )}
+      
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
 
-      <Modal isOpen={helpOpen} size="2xl" scrollBehavior="inside" onOpenChange={setHelpOpen}>
-        <ModalContent>
-          {(onClose) => (
-            <>
-              <ModalHeader>互传帮助</ModalHeader>
-              <ModalBody className="pb-5">
+      <Modal.Root isOpen={helpOpen} onOpenChange={setHelpOpen}>
+        <Modal.Backdrop>
+          <Modal.Container size="cover" scroll="inside">
+            <Modal.Dialog>
+              {({ close: onClose }) => (
+              <>
+              <Modal.Header>互传帮助</Modal.Header>
+              <Modal.Body className="pb-5">
                 <TransferFaq iceConfig={iceConfig} sharedRoom={sharedRoomActive} ossFallbackEnabled={ossFallbackEnabled} />
-              </ModalBody>
-              <ModalFooter><Button color="primary" radius="sm" onPress={onClose}>知道了</Button></ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              </Modal.Body>
+              <Modal.Footer><Button variant="primary" onPress={onClose}>知道了</Button></Modal.Footer>
+              </>
+              )}
+
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal.Root>
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
       {sharedModals}
     </main>
@@ -3845,40 +3794,30 @@ function ClientNameSettings({
 
   return (
     <div className={`grid gap-1.5 ${hideAction ? "" : compact ? "grid-cols-[minmax(0,1fr)_auto] items-start" : "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start"}`}>
-      <Input
-        id={inputId}
-        size={compact ? "sm" : "md"}
-        label={compact ? "客户端名称" : "我的客户端名称"}
-        radius="sm"
-        variant="bordered"
-        value={value}
-        onValueChange={onValueChange}
+      <TextField value={value} onChange={onValueChange} isRequired isInvalid={Boolean(errorMessage)} className={`whitespace-nowrap text-[10px] ${status === "available" ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}>
+        <Label>{compact ? "客户端名称" : "我的客户端名称"}</Label>
+        <InputGroup>
+          <InputGroupInput id={inputId}
         maxLength={MAX_TRANSFER_CLIENT_NAME_LENGTH}
-        isRequired
-        isInvalid={Boolean(errorMessage)}
-        errorMessage={errorMessage}
-        description={compact ? undefined : description}
-        endContent={compact && !errorMessage ? (
-          <span className={`whitespace-nowrap text-[10px] ${status === "available" ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}>
-            {status === "checking" ? "校验中" : status === "available" ? "可用" : ""}
-          </span>
-        ) : undefined}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !localError && status !== "checking" && status !== "unavailable") {
             onApply();
           }
-        }}
-      />
+        }} />
+          <InputGroupSuffix>{compact && !errorMessage ? (
+          <span>
+            {status === "checking" ? "校验中" : status === "available" ? "可用" : ""}
+          </span>
+        ) : undefined}</InputGroupSuffix>
+        </InputGroup>
+        <Description>{compact ? undefined : description}</Description>
+        <FieldError>{errorMessage}</FieldError>
+      </TextField>
       {!hideAction ? <Button
         className={compact ? "mt-1" : "sm:mt-2"}
-        size={compact ? "sm" : "md"}
-        color="primary"
-        radius="sm"
-        variant="flat"
-        isDisabled={Boolean(localError) || status === "checking" || status === "unavailable"}
-        isLoading={isSaving}
+        size={compact ? "sm" : "md"} variant="secondary" isDisabled={Boolean(localError) || status === "checking" || status === "unavailable" || isSaving}
         onPress={onApply}
-      >
+      >{isSaving ? <Spinner size="sm" /> : null}
         {compact ? "保存" : "保存名称"}
       </Button> : null}
     </div>
@@ -3920,7 +3859,7 @@ function RoomPermissionSetting({
       >
         <div className="flex items-center gap-2">
           <span className="whitespace-nowrap text-tiny font-medium text-zinc-800 dark:text-zinc-200">邀请权限</span>
-          <Chip size="sm" radius="sm" variant="flat" color={currentRole === "VIEWER" ? "default" : "success"}>
+          <Chip size="sm" variant="soft" color={currentRole === "VIEWER" ? "default" : "success"}>
             {currentRoleLabel}
           </Chip>
         </div>
@@ -3946,13 +3885,8 @@ function RoomPermissionSetting({
         {canManage ? (
           <Button
             className="shrink-0"
-            size="sm"
-            radius="sm"
-            color="primary"
-            variant="flat"
-            isLoading={isLoading}
-            onPress={onCreateInvite}
-          >
+            size="sm" variant="secondary"
+            onPress={onCreateInvite} isDisabled={isLoading}>{isLoading ? <Spinner size="sm" /> : null}
             生成邀请
           </Button>
         ) : null}
@@ -3967,7 +3901,7 @@ function RoomPermissionSetting({
           <div className="text-small font-medium text-zinc-900 dark:text-white">房间权限</div>
           <div className="mt-0.5 text-tiny text-zinc-500 dark:text-zinc-400">设置新成员加入后可以执行的操作</div>
         </div>
-        <Chip size="sm" radius="sm" variant="flat" color={currentRole === "VIEWER" ? "default" : "success"}>
+        <Chip size="sm" variant="soft" color={currentRole === "VIEWER" ? "default" : "success"}>
           当前：{currentRoleLabel}
         </Chip>
       </div>
@@ -4004,13 +3938,8 @@ function RoomPermissionSetting({
         {canManage ? (
           <Button
             className="shrink-0"
-            size="sm"
-            radius="sm"
-            color="primary"
-            variant="flat"
-            isLoading={isLoading}
-            onPress={onCreateInvite}
-          >
+            size="sm" variant="secondary"
+            onPress={onCreateInvite} isDisabled={isLoading}>{isLoading ? <Spinner size="sm" /> : null}
             生成邀请链接
           </Button>
         ) : null}
@@ -4097,17 +4026,16 @@ function TransferActivityList({
                         {activity.transport ? ` · ${transferTransportLabel(activity.transport)}` : ""}
                       </div>
                     </div>
-                    <Chip size="sm" radius="sm" variant="flat" color={transferActivityStatusColor(activity.status)}>
+                    <Chip size="sm" variant="soft" color={transferActivityStatusColor(activity.status)}>
                       {transferActivityStatusLabel(activity.status)}
                     </Chip>
                   </div>
                   {(active || activity.progress > 0) ? (
                     <div className="mt-2">
-                      <Progress
+                      <ProgressBar
                         size="sm"
                         aria-label={`${activity.fileName} 传输进度`}
                         value={activity.progress}
-                        color={activity.status === "failed" || activity.status === "cancelled" ? "danger" : "primary"}
                       />
                       <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-zinc-400">
                         <span>{formatBytes(activity.transferredBytes)} / {formatBytes(activity.sizeBytes)}</span>
@@ -4121,9 +4049,9 @@ function TransferActivityList({
                   {activity.error ? <div className="mt-1.5 text-tiny text-rose-600 dark:text-rose-300">{activity.error}</div> : null}
                   {active || activity.status === "failed" || activity.status === "cancelled" ? (
                     <div className="mt-2 flex justify-end gap-1.5">
-                      {active ? <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onCancel(activity.id)}>取消</Button> : null}
+                      {active ? <Button size="sm" variant="danger" onPress={() => onCancel(activity.id)}>取消</Button> : null}
                       {activity.status === "failed" || activity.status === "cancelled" ? (
-                        <Button size="sm" radius="sm" color="primary" variant="flat" onPress={() => onRetry(activity)}>重试</Button>
+                        <Button size="sm" variant="secondary" onPress={() => onRetry(activity)}>重试</Button>
                       ) : null}
                     </div>
                   ) : null}
@@ -4145,8 +4073,8 @@ function TransferActivityList({
                   <div className="mt-0.5 truncate text-tiny opacity-75">来自 {peerDisplayNames[item.sourcePeerId] || "未命名设备"} · {formatBytes(item.sizeBytes)}</div>
                 </div>
                 <div className="flex shrink-0 gap-1.5">
-                  <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onReject(item)}>拒绝</Button>
-                  <Button size="sm" radius="sm" color="primary" onPress={() => onAccept(item)}>接收</Button>
+                  <Button size="sm" variant="danger" onPress={() => onReject(item)}>拒绝</Button>
+                  <Button variant="primary" size="sm" onPress={() => onAccept(item)}>接收</Button>
                 </div>
               </div>
             ))}
@@ -4159,9 +4087,9 @@ function TransferActivityList({
                       <div className="truncate text-small font-medium">{item.fileName}</div>
                       <div className="mt-0.5 truncate text-tiny text-zinc-500 dark:text-zinc-400">来自 {peerDisplayNames[item.sourcePeerId] || "未命名设备"}</div>
                     </div>
-                    <Button size="sm" radius="sm" variant="light" color="danger" onPress={() => onCancelReceiving(item)}>取消</Button>
+                    <Button size="sm" variant="danger" onPress={() => onCancelReceiving(item)}>取消</Button>
                   </div>
-                  <Progress className="mt-2" size="sm" aria-label={`${item.fileName} 接收进度`} value={progress} />
+                  <ProgressBar className="mt-2" size="sm" aria-label={`${item.fileName} 接收进度`} value={progress} />
                   <div className="mt-1 text-[11px] text-zinc-400">{formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}</div>
                 </div>
               );
@@ -4280,7 +4208,7 @@ function IncomingFilesPanel({
             接收进度、预览和保存入口会显示在这里。
           </div>
         </div>
-        <Chip size="sm" radius="sm" variant="flat" color={hasIncoming || hasReceiving || hasPending ? "primary" : "default"}>
+        <Chip size="sm" variant="soft" color={hasIncoming || hasReceiving || hasPending ? "accent" : "default"}>
           {incoming.length + receivingTransfers.length + pendingTransfers.length} 项
         </Chip>
       </div>
@@ -4296,15 +4224,15 @@ function IncomingFilesPanel({
                     来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.sizeBytes)}
                   </div>
                 </div>
-                <Chip size="sm" radius="sm" color="warning" variant="flat">
+                <Chip size="sm" color="warning" variant="soft">
                   待确认
                 </Chip>
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2">
-                <Button size="sm" radius="sm" color="primary" onPress={() => onAcceptDirect(item)}>
+                <Button variant="primary" size="sm" onPress={() => onAcceptDirect(item)}>
                   接收
                 </Button>
-                <Button size="sm" radius="sm" variant="flat" onPress={() => onRejectDirect(item)}>
+                <Button size="sm" variant="secondary" onPress={() => onRejectDirect(item)}>
                   拒绝
                 </Button>
               </div>
@@ -4325,8 +4253,8 @@ function IncomingFilesPanel({
                   来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
                 </div>
                 <div className="mt-2 flex items-center gap-2">
-                  <Progress className="flex-1" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
-                  <Button size="sm" radius="sm" variant="light" onPress={() => onCancelReceiving(item)}>
+                  <ProgressBar className="flex-1" aria-label={`${item.fileName} 接收进度`} size="sm" value={percent} />
+                  <Button size="sm" variant="ghost" onPress={() => onCancelReceiving(item)}>
                     取消
                   </Button>
                 </div>
@@ -4362,22 +4290,17 @@ function IncomingFilesPanel({
                 />
               )}
               <div className="mt-2 flex gap-2">
-                <Button size="sm" radius="sm" variant="flat" isDisabled={cloudLoginRequired} onPress={() => void onShare(item)}>
+                <Button size="sm" variant="secondary" isDisabled={cloudLoginRequired} onPress={() => void onShare(item)}>
                   分享
                 </Button>
                 <Button
                   size="sm"
-                  radius="sm"
-                  color="success"
-                  variant={item.downloadUrl || item.direct ? "solid" : "flat"}
-                  isLoading={item.downloading}
-                  onPress={() => cloudLoginRequired ? onLogin() : void onDownload(item)}
-                >
+                  onPress={() => cloudLoginRequired ? onLogin() : void onDownload(item)} isDisabled={item.downloading} variant={item.downloadUrl || item.direct ? "primary" : "secondary"}>{item.downloading ? <Spinner size="sm" /> : null}
                   {item.direct ? "保存" : cloudLoginRequired ? "登录下载" : "下载"}
                 </Button>
               </div>
               {item.downloading && (
-                <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
+                <ProgressBar className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} size="sm" value={item.downloadProgress ?? 0} />
               )}
               {item.downloadError && (
                 <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
@@ -4423,11 +4346,10 @@ function TransferProgress({
     || state === "completing";
   return (
     <>
-      <Progress
+      <ProgressBar
         aria-label="上传进度"
         isIndeterminate={indeterminate}
         value={indeterminate ? undefined : state === "done" ? 100 : progress}
-        color={state === "failed" ? "danger" : "primary"}
         size="sm"
       />
       <div className="mt-2 flex items-center gap-1.5 text-tiny text-zinc-500 dark:text-zinc-400">
@@ -4444,7 +4366,7 @@ function TransferProgress({
           </span>
         )}
         {busy ? (
-          <Button className="ml-auto" size="sm" radius="sm" color="danger" variant="light" onPress={onCancel}>
+          <Button className="ml-auto" size="sm" variant="danger" onPress={onCancel}>
             取消
           </Button>
         ) : null}
@@ -4520,156 +4442,134 @@ function TransferInviteModal({
   const pairingExpiry = pairingCode ? formatInviteExpiry(pairingCode.expiresAt) : null;
 
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      size="3xl"
-      scrollBehavior="inside"
-      backdrop="blur"
-      classNames={{
-        base: "border border-black/10 bg-white/95 shadow-2xl dark:border-white/10 dark:bg-zinc-950/95",
-        closeButton: "top-4 right-4",
-      }}
-    >
-      <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 py-4 pr-14 dark:border-white/[0.08] sm:px-7">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-lg font-semibold tracking-tight sm:text-xl">邀请对方加入</span>
-            <Chip size="sm" radius="sm" color={sharedRoomActive ? "primary" : "success"} variant="flat">
-              {sharedRoomActive ? "跨网络" : "同一网络"}
-            </Chip>
-          </div>
-          <p className="text-tiny font-normal leading-5 text-zinc-500 dark:text-zinc-400">
-            房间 {transferRoomDisplayName(roomId)} · {sharedRoomActive ? "邀请只包含限时权限，不包含房主凭证" : "同一网络的设备打开链接即加入"}
-          </p>
-        </ModalHeader>
-        <ModalBody className="gap-0 overflow-y-auto px-5 pb-6 pt-5 sm:px-7">
-          {canInvite ? (
-            <div className="grid items-stretch gap-5 md:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)] md:gap-7">
-              <div className="order-2 flex min-h-[292px] flex-col items-center justify-center overflow-hidden rounded-[28px] border border-cyan-500/15 bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_46%),linear-gradient(145deg,rgba(8,145,178,0.08),rgba(37,99,235,0.04))] px-5 py-6 dark:border-cyan-300/15 dark:bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_48%),linear-gradient(145deg,rgba(8,145,178,0.10),rgba(37,99,235,0.06))] md:order-1">
-                {qrUrl ? (
-                  <>
-                    <div className="relative">
-                      <span className="absolute -inset-4 -z-0 rounded-[30px] bg-cyan-400/10 blur-xl" aria-hidden="true" />
-                      <RoomQrCode value={qrUrl} large />
-                    </div>
-                    <div className="mt-4 text-center text-small font-semibold text-zinc-900 dark:text-white">
-                      {sharedRoomActive ? "扫码立即配对" : "扫码打开房间"}
-                    </div>
-                    <div className="mt-1 max-w-56 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                      {sharedRoomActive ? "二维码 5 分钟内单次有效，扫码后自动加入。" : "链接不携带口令，同一网络的设备打开即加入。"}
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex flex-col items-center text-center">
-                    <div className="relative h-24 w-24" aria-hidden="true">
-                      <span className="absolute inset-0 animate-ping rounded-full border border-cyan-400/40 motion-reduce:animate-none" />
-                      <span className="absolute inset-4 rounded-full border border-cyan-500/30" />
-                      <span className="absolute inset-[38px] rounded-full bg-cyan-500 shadow-[0_0_24px_rgba(6,182,212,0.65)]" />
-                    </div>
-                    <div className="mt-4 text-small font-semibold">{isPreparing ? "正在建立安全邀请" : "等待生成二维码"}</div>
-                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">不会使用房主 Token 作为兜底</div>
-                  </div>
-                )}
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+      <Modal.Backdrop>
+        <Modal.Container scroll="inside" size="cover">
+          <Modal.Dialog>
+            <Modal.Header className="flex flex-col gap-1 border-b border-black/[0.07] px-5 py-4 pr-14 dark:border-white/[0.08] sm:px-7">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-lg font-semibold tracking-tight sm:text-xl">邀请对方加入</span>
+                <Chip size="sm" variant="soft" color={sharedRoomActive ? "accent" : "success"}>
+                  {sharedRoomActive ? "跨网络" : "同一网络"}
+                </Chip>
               </div>
-
-              <div className="order-1 flex min-w-0 flex-col md:order-2">
-                <Button
-                  className="mt-4 h-11 w-full bg-cyan-600 font-semibold text-white shadow-[0_10px_30px_rgba(8,145,178,0.22)] md:mt-5"
-                  color="primary"
-                  radius="lg"
-                  isLoading={isPreparing && !inviteUrl}
-                  isDisabled={!inviteUrl}
-                  onPress={onShare}
-                >
-                  {systemShareAvailable ? "发送邀请" : "复制邀请链接"}
-                </Button>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <Button radius="lg" variant="flat" isDisabled={!inviteUrl} onPress={onCopy}>复制链接</Button>
-                  <Button radius="lg" variant="light" isLoading={isPreparing} onPress={onRegenerate}>
-                    重新生成
-                  </Button>
-                </div>
-
-                {!sharedRoomActive ? (
-                  <Button
-                    className="mt-3 w-full"
-                    radius="lg"
-                    variant="flat"
-                    color="primary"
-                    onPress={onCreateSharedRoom}
-                  >
-                    创建共享房间，邀请远程设备
-                  </Button>
-                ) : null}
-
-                {sharedRoomActive ? (
-                  <div className="mt-4 rounded-2xl border border-black/[0.07] bg-black/[0.025] px-4 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">口头告诉对方</div>
-                        <div className="mt-1 font-mono text-2xl font-semibold tracking-[0.18em] text-zinc-950 dark:text-white">
-                          {formattedPairingCode || "•••• ••••"}
+              <p className="text-tiny font-normal leading-5 text-zinc-500 dark:text-zinc-400">
+                房间 {transferRoomDisplayName(roomId)} · {sharedRoomActive ? "邀请只包含限时权限，不包含房主凭证" : "同一网络的设备打开链接即加入"}
+              </p>
+            </Modal.Header>
+            <Modal.Body className="gap-0 overflow-y-auto px-5 pb-6 pt-5 sm:px-7">
+              {canInvite ? (
+                <div className="grid items-stretch gap-5 md:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)] md:gap-7">
+                  <div className="order-2 flex min-h-[292px] flex-col items-center justify-center overflow-hidden rounded-[28px] border border-cyan-500/15 bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_46%),linear-gradient(145deg,rgba(8,145,178,0.08),rgba(37,99,235,0.04))] px-5 py-6 dark:border-cyan-300/15 dark:bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.18),transparent_48%),linear-gradient(145deg,rgba(8,145,178,0.10),rgba(37,99,235,0.06))] md:order-1">
+                    {qrUrl ? (
+                      <>
+                        <div className="relative">
+                          <span className="absolute -inset-4 -z-0 rounded-[30px] bg-cyan-400/10 blur-xl" aria-hidden="true" />
+                          <RoomQrCode value={qrUrl} large />
                         </div>
-                      </div>
-                      <Button size="sm" radius="lg" variant="light" isLoading={isPairingCodeLoading} onPress={onRegeneratePairing}>
-                        换一个
-                      </Button>
-                    </div>
-                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-zinc-500 dark:text-zinc-400">
-                      <span>{pairingExpiry ? `${pairingExpiry} · 单次有效` : "正在生成 5 分钟配对码"}</span>
-                      {inviteExpiry ? <span>链接 {inviteExpiry}</span> : null}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
+                        <div className="mt-4 text-center text-small font-semibold text-zinc-900 dark:text-white">
+                          {sharedRoomActive ? "扫码立即配对" : "扫码打开房间"}
+                        </div>
+                        <div className="mt-1 max-w-56 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                          {sharedRoomActive ? "二维码 5 分钟内单次有效，扫码后自动加入。" : "链接不携带口令，同一网络的设备打开即加入。"}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex flex-col items-center text-center">
+                        <div className="relative h-24 w-24" aria-hidden="true">
+                          <span className="absolute inset-0 animate-ping rounded-full border border-cyan-400/40 motion-reduce:animate-none" />
+                          <span className="absolute inset-4 rounded-full border border-cyan-500/30" />
+                          <span className="absolute inset-[38px] rounded-full bg-cyan-500 shadow-[0_0_24px_rgba(6,182,212,0.65)]" />
             </div>
-          ) : (
+            <div className="mt-4 text-small font-semibold">{isPreparing ? "正在建立安全邀请" : "等待生成二维码"}</div>
+            <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">不会使用房主 Token 作为兜底</div>
+            </div>
+            )}
+            </div>
+
+            <div className="order-1 flex min-w-0 flex-col md:order-2">
+              <Button variant="primary"
+                className="mt-4 h-11 w-full bg-cyan-600 font-semibold text-white shadow-[0_10px_30px_rgba(8,145,178,0.22)] md:mt-5" isDisabled={!inviteUrl || isPreparing && !inviteUrl}
+                onPress={onShare}
+              >{isPreparing && !inviteUrl ? <Spinner size="sm" /> : null}
+            {systemShareAvailable ? "发送邀请" : "复制邀请链接"}
+            </Button>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <Button variant="secondary" isDisabled={!inviteUrl} onPress={onCopy}>复制链接</Button>
+              <Button variant="ghost" onPress={onRegenerate} isDisabled={isPreparing}>{isPreparing ? <Spinner size="sm" /> : null}
+                重新生成
+              </Button>
+            </div>
+
+            {!sharedRoomActive ? (
+            <Button
+            className="mt-3 w-full" variant="secondary"
+            onPress={onCreateSharedRoom}
+            >
+            创建共享房间，邀请远程设备
+            </Button>
+            ) : null}
+
+            {sharedRoomActive ? (
+            <div className="mt-4 rounded-2xl border border-black/[0.07] bg-black/[0.025] px-4 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">口头告诉对方</div>
+                  <div className="mt-1 font-mono text-2xl font-semibold tracking-[0.18em] text-zinc-950 dark:text-white">
+                    {formattedPairingCode || "•••• ••••"}
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" onPress={onRegeneratePairing} isDisabled={isPairingCodeLoading}>{isPairingCodeLoading ? <Spinner size="sm" /> : null}
+                  换一个
+                </Button>
+              </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+              <span>{pairingExpiry ? `${pairingExpiry} · 单次有效` : "正在生成 5 分钟配对码"}</span>
+              {inviteExpiry ? <span>链接 {inviteExpiry}</span> : null}
+            </div>
+            </div>
+            ) : null}
+            </div>
+            </div>
+            ) : (
             <div className="rounded-2xl border border-amber-500/20 bg-amber-50/80 px-4 py-3 text-small text-amber-950 dark:border-amber-300/15 dark:bg-amber-300/10 dark:text-amber-100">
               {rolePending ? "正在确认当前房间权限，确认后即可生成邀请。" : "当前设备不是房主。为避免转发已有权限，只有房主可以生成新的邀请。"}
             </div>
-          )}
+            )}
 
-          <div className="mt-5 border-t border-black/[0.07] pt-5 dark:border-white/[0.08]">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-              <Input
-                className="min-w-0 flex-1"
-                label="已有配对码？"
-                description="输入对方告诉你的 8 位数字，不需要复制长链接。"
-                placeholder="1234 5678"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                maxLength={12}
-                radius="lg"
-                variant="bordered"
-                value={pairingCodeDraft}
-                onValueChange={(value) => onPairingCodeDraftChange(value.replace(/[^0-9 -]/g, "").slice(0, 12))}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && normalizeTransferPairingCode(pairingCodeDraft)) onRedeem();
-                }}
-              />
-              <Button
-                className="h-11 shrink-0 px-6"
-                color="primary"
-                radius="lg"
-                variant="flat"
-                isLoading={isRedeeming}
-                isDisabled={!normalizeTransferPairingCode(pairingCodeDraft)}
-                onPress={onRedeem}
-              >
-                加入房间
-              </Button>
+            <div className="mt-5 border-t border-black/[0.07] pt-5 dark:border-white/[0.08]">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                <TextField value={pairingCodeDraft} onChange={(value) => onPairingCodeDraftChange(value.replace(/[^0-9 -]/g, "").slice(0, 12))} className="min-w-0 flex-1" autoComplete="one-time-code">
+                  <Label>已有配对码？</Label>
+                  <Input
+                  placeholder="1234 5678"
+                  inputMode="numeric"
+                  maxLength={12}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && normalizeTransferPairingCode(pairingCodeDraft)) onRedeem();
+                  }}  />
+                  <Description>{"输入对方告诉你的 8 位数字，不需要复制长链接。"}</Description>
+                </TextField>
+                <Button
+                  className="h-11 shrink-0 px-6" variant="secondary" isDisabled={!normalizeTransferPairingCode(pairingCodeDraft) || isRedeeming}
+                  onPress={onRedeem}
+                >{isRedeeming ? <Spinner size="sm" /> : null}
+                  加入房间
+                </Button>
             </div>
-          </div>
+            </div>
 
-          {error ? (
+            {error ? (
             <div className="mt-4 rounded-xl border border-rose-500/20 bg-rose-50 px-3 py-2 text-tiny text-rose-700 dark:border-rose-300/15 dark:bg-rose-300/10 dark:text-rose-100">
               {error}
             </div>
-          ) : null}
-        </ModalBody>
-      </ModalContent>
-    </Modal>
+            ) : null}
+            </Modal.Body>
+    
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -4678,20 +4578,22 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
   const mimeType = target ? effectiveMimeType(target.fileName, target.mimeType) : "";
 
   return (
-    <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
-      <ModalContent className="max-w-[min(96vw,1480px)]">
-        {target && (
-          <>
-            <ModalHeader className="flex min-w-0 flex-row items-center gap-2 px-4 py-3 pr-12">
+    <Modal.Root isOpen={Boolean(target)} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+      <Modal.Backdrop>
+        <Modal.Container size="cover" scroll="inside">
+          <Modal.Dialog className="max-w-[min(96vw,1480px)]">
+            {target && (
+            <>
+            <Modal.Header className="flex min-w-0 flex-row items-center gap-2 px-4 py-3 pr-12">
               <span className="min-w-0 flex-1 truncate text-base font-semibold">{target.fileName}</span>
-              <Chip color="primary" size="sm" variant="flat" className="shrink-0">
+              <Chip color="accent" size="sm" variant="soft" className="shrink-0">
                 {previewKindLabel(kind)}
               </Chip>
               <span className="hidden shrink-0 font-mono text-tiny font-normal text-default-400 sm:inline">
                 {mimeType}
               </span>
-            </ModalHeader>
-            <ModalBody className="overflow-y-auto px-3 pb-3 pt-0">
+            </Modal.Header>
+            <Modal.Body className="overflow-y-auto px-3 pb-3 pt-0">
               <FilePreview
                 fileName={target.fileName}
                 mimeType={target.mimeType}
@@ -4700,11 +4602,14 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
                 sizeBytes={target.sizeBytes}
                 expanded
               />
-            </ModalBody>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+            </Modal.Body>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -5204,10 +5109,10 @@ function transferActivityStatusLabel(status: OutgoingTransferStatus) {
   return "已取消";
 }
 
-function transferActivityStatusColor(status: OutgoingTransferStatus): "default" | "primary" | "success" | "danger" {
+function transferActivityStatusColor(status: OutgoingTransferStatus): "default" | "accent" | "success" | "danger" {
   if (status === "completed") return "success";
   if (status === "failed" || status === "cancelled") return "danger";
-  if (status === "connecting" || status === "sending") return "primary";
+  if (status === "connecting" || status === "sending") return "accent";
   return "default";
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Button, Card, CardBody, CardHeader, Spinner } from "@heroui/react";
+import { Button, Card, Spinner } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { Client, Overview, TrafficUsage } from "../../api/types";
 import { formatBytes } from "../../lib/format";
@@ -61,7 +61,7 @@ export function OverviewPanel() {
   }, [load]);
 
   if (loading && !overview) {
-    return <Spinner className="mt-6" label="加载中…" />;
+    return <span className="inline-flex items-center gap-2 mt-6"><Spinner /><span className="text-sm text-default-500">加载中…</span></span>;
   }
 
   const trafficTrend = buildTrafficTrend(traffic).slice(-10);
@@ -109,19 +109,19 @@ export function OverviewPanel() {
           <h2 className="text-lg font-semibold">运行概览</h2>
           <p className="text-small text-default-500">客户端、连接质量和流量走势</p>
         </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button size="sm" variant="secondary" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {cards.map((card) => (
-          <Card key={card.label} radius="sm" shadow="sm">
-            <CardBody className="gap-1 p-4">
+          <Card key={card.label}>
+            <Card.Content className="gap-1 p-4">
               <span className="text-small text-default-500">{card.label}</span>
               <span className="text-2xl font-semibold">{card.value}</span>
               <span className="text-tiny text-default-400">{card.hint}</span>
-            </CardBody>
+            </Card.Content>
           </Card>
         ))}
       </div>
@@ -183,12 +183,12 @@ function ChartPanel({
   children: ReactNode;
 }) {
   return (
-    <Card radius="sm" shadow="sm">
-      <CardHeader className="flex flex-col items-start gap-0 px-4 pb-0 pt-4">
+    <Card>
+      <Card.Header className="flex flex-col items-start gap-0 px-4 pb-0 pt-4">
         <h3 className="text-small font-semibold">{title}</h3>
         <p className="text-tiny text-default-400">{subtitle}</p>
-      </CardHeader>
-      <CardBody className="p-4">{children}</CardBody>
+      </Card.Header>
+      <Card.Content className="p-4">{children}</Card.Content>
     </Card>
   );
 }

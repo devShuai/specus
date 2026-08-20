@@ -11,6 +11,21 @@ import type { ReactNode } from "react";
  */
 export type StatusTone = "success" | "warning" | "danger" | "default" | "primary" | "secondary";
 
+/**
+ * HeroUI 3 renamed the emphasis colours: the old `primary` is now `accent`, and
+ * there is no `secondary` slot any more. The app keeps its own tone vocabulary
+ * and maps it here, so call sites still say what they mean rather than what the
+ * component library currently calls it.
+ */
+const TONE_COLOR: Record<StatusTone, "accent" | "danger" | "default" | "success" | "warning"> = {
+  success: "success",
+  warning: "warning",
+  danger: "danger",
+  default: "default",
+  primary: "accent",
+  secondary: "default",
+};
+
 export interface StatusChipProps {
   tone?: StatusTone;
   children: ReactNode;
@@ -20,7 +35,7 @@ export interface StatusChipProps {
 /** 统一的状态徽章：固定 size/variant，颜色只能从语义 tone 进入。 */
 export function StatusChip({ tone = "default", children, className = "" }: StatusChipProps) {
   return (
-    <Chip size="sm" variant="flat" color={tone} className={className}>
+    <Chip size="sm" variant="soft" color={TONE_COLOR[tone]} className={className}>
       {children}
     </Chip>
   );

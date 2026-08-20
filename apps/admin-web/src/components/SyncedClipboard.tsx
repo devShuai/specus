@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ClipboardEvent as ReactClipboardEvent } from "react";
-import { Button, Chip } from "@heroui/react";
+import { Button, Chip, Spinner } from "@heroui/react";
 import {
   CLIPBOARD_TEXT_MAX_CHARS,
   CLIPBOARD_TEXT_MAX_UTF8_BYTES,
@@ -578,11 +578,11 @@ export function SyncedClipboard({
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.07]">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步剪贴板</h2>
-          <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
+          <Chip size="sm" variant="soft" color={canSend && targetPeerId ? "success" : "default"}>
             {canSend ? (targetPeerId ? "粘贴即发送" : "等待设备") : "只读"}
           </Chip>
           {blocks.length > 0 && (
-            <Chip size="sm" radius="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {blocks.length} 项
             </Chip>
           )}
@@ -631,17 +631,11 @@ export function SyncedClipboard({
             </span>
             <div className="flex items-center gap-1.5">
               <Button
-                radius="sm"
-                size="sm"
-                variant="flat"
-                isLoading={isSystemClipboardReading}
-                onPress={readSystemClipboard}
-              >
+                size="sm" variant="secondary"
+                onPress={readSystemClipboard} isDisabled={isSystemClipboardReading}>{isSystemClipboardReading ? <Spinner size="sm" /> : null}
                 读取剪贴板
               </Button>
-              <Button
-                color="primary"
-                radius="sm"
+              <Button variant="primary"
                 size="sm"
                 isDisabled={!composerDraft || !composerWithinLimits}
                 onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, ""))}
@@ -661,9 +655,7 @@ export function SyncedClipboard({
             <div className="flex items-center justify-between gap-2">
               <p className="text-tiny text-zinc-400 dark:text-zinc-500">最新在前 · 最多保留 80 条</p>
               <Button
-                radius="sm"
-                size="sm"
-                variant="light"
+                size="sm" variant="ghost"
                 isDisabled={isSending || isClipboardWritePending}
                 onPress={clearAllBlocks}
               >
@@ -678,10 +670,10 @@ export function SyncedClipboard({
               return (
                 <article key={block.id} className="min-w-0 rounded-lg border border-black/[0.07] bg-white/55 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
                   <div className="flex min-w-0 items-center gap-2">
-                    <Chip size="sm" radius="sm" variant="flat" color={block.origin === "remote" ? "success" : "primary"}>
+                    <Chip size="sm" variant="soft" color={block.origin === "remote" ? "success" : "accent"}>
                       {block.origin === "remote" ? "收到" : "本机"}
                     </Chip>
-                    <Chip size="sm" radius="sm" variant="flat">
+                    <Chip size="sm" variant="soft">
                       {clipboardKindLabel(block.kind)}
                     </Chip>
                     <span className="min-w-0 flex-1 truncate text-tiny font-medium text-zinc-600 dark:text-zinc-300">
@@ -747,31 +739,18 @@ export function SyncedClipboard({
                   )}
                   <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
                     <Button
-                      color="primary"
-                      radius="sm"
-                      size="sm"
-                      variant="flat"
-                      isLoading={sendingBlockId === block.id}
-                      isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending}
+                      size="sm" variant="secondary" isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending || sendingBlockId === block.id}
                       onPress={() => void submitText(block.text, block.id, block.kind, block.html)}
-                    >
+                    >{sendingBlockId === block.id ? <Spinner size="sm" /> : null}
                       同步到设备
                     </Button>
                     <Button
-                      radius="sm"
-                      size="sm"
-                      variant={needsCopy ? "solid" : "flat"}
-                      color={needsCopy ? "warning" : "default"}
-                      isLoading={clipboardWriteBlockId === block.id}
-                      isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id}
-                      onPress={() => handleManualCopy(block)}
-                    >
+                      size="sm" isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id || clipboardWriteBlockId === block.id}
+                      onPress={() => handleManualCopy(block)} variant={needsCopy ? "primary" : "secondary"}>{clipboardWriteBlockId === block.id ? <Spinner size="sm" /> : null}
                       复制到剪贴板
                     </Button>
                     <Button
-                      radius="sm"
-                      size="sm"
-                      variant="light"
+                      size="sm" variant="ghost"
                       isDisabled={sendingBlockId === block.id || clipboardWriteBlockId === block.id}
                       onPress={() => removeBlock(block)}
                     >

@@ -1,4 +1,4 @@
-import { Modal, ModalBody, ModalContent, ModalHeader } from "@heroui/react";
+import { Modal } from "@heroui/react";
 import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 
 /**
@@ -46,54 +46,53 @@ export function NearbyDeviceActions({
   onSelect,
 }: NearbyDeviceActionsProps) {
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      placement="center"
-      size="sm"
-      backdrop="blur"
-    >
-      <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 pb-2">
-          <span className="text-medium font-semibold">{deviceName}</span>
-          <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
-            {transportPath === "turn"
-              ? "经备用通道连接"
-              : transportPath === "direct"
-                ? "设备直连"
-                : sameLan
-                  ? "同一网络中的设备"
-                  : "远程设备"}
-          </span>
-        </ModalHeader>
-        <ModalBody className="gap-2 pb-5">
-          {ACTIONS.map((action) => {
-            const disabled = action.requiresSend && !canSend;
-            return (
-              <button
-                key={action.key}
-                type="button"
-                disabled={disabled}
-                onClick={() => onSelect(action.key)}
-                className="nearby-action flex min-h-14 items-center gap-3 rounded-xl border border-black/[0.07] px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/[0.08]"
-              >
-                <span
-                  aria-hidden="true"
-                  className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[var(--app-apple-blue-soft,rgba(0,102,204,0.12))] text-[15px] text-[var(--app-apple-blue,#0066cc)]"
-                >
-                  {action.icon}
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-small font-medium text-zinc-900 dark:text-white">{action.label}</span>
-                  <span className="mt-0.5 block text-tiny leading-4 text-zinc-500 dark:text-zinc-400">
-                    {disabled ? "当前房间为只读，无法发送" : action.detail}
-                  </span>
-                </span>
-              </button>
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open) (onClose)(); }}>
+      <Modal.Backdrop>
+        <Modal.Container placement="center" size="sm">
+          <Modal.Dialog>
+            <Modal.Header className="flex flex-col gap-1 pb-2">
+              <span className="text-medium font-semibold">{deviceName}</span>
+              <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
+                {transportPath === "turn"
+                  ? "经备用通道连接"
+                  : transportPath === "direct"
+                    ? "设备直连"
+                    : sameLan
+                      ? "同一网络中的设备"
+                      : "远程设备"}
+              </span>
+            </Modal.Header>
+            <Modal.Body className="gap-2 pb-5">
+              {ACTIONS.map((action) => {
+                const disabled = action.requiresSend && !canSend;
+                return (
+                  <button
+                    key={action.key}
+                    type="button"
+                    disabled={disabled}
+                    onClick={() => onSelect(action.key)}
+                    className="nearby-action flex min-h-14 items-center gap-3 rounded-xl border border-black/[0.07] px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/[0.08]"
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[var(--app-apple-blue-soft,rgba(0,102,204,0.12))] text-[15px] text-[var(--app-apple-blue,#0066cc)]"
+                    >
+                      {action.icon}
+                    </span>
+            <span className="min-w-0">
+              <span className="block text-small font-medium text-zinc-900 dark:text-white">{action.label}</span>
+              <span className="mt-0.5 block text-tiny leading-4 text-zinc-500 dark:text-zinc-400">
+                {disabled ? "当前房间为只读，无法发送" : action.detail}
+              </span>
+            </span>
+            </button>
             );
-          })}
-        </ModalBody>
-      </ModalContent>
-    </Modal>
+            })}
+            </Modal.Body>
+    
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }

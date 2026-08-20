@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
+import { Button, Card, Chip, Tab, TabList, TabPanel, Tabs, buttonVariants } from "@heroui/react";
 import { copyTextWithFeedback } from "../../lib/clipboard";
 import {
   MACOS_CLIENT_START_COMMAND,
@@ -32,7 +32,7 @@ const NAT_PATH_GUIDANCE = [
   {
     label: "EIM + ADF",
     path: "直连较友好",
-    tone: "primary",
+    tone: "accent",
     detail: "双方并行发包通常可以打洞，超时后自动切换 relay。",
   },
   {
@@ -117,28 +117,37 @@ export function HelpPanel() {
         <p className="text-small text-default-500">客户端启动方法、配置模板与常见问题</p>
       </div>
 
-      <Tabs aria-label="帮助文档" variant="underlined" selectedKey={activeTab} onSelectionChange={onTabChange}>
-        <Tab key="quickstart" title="快速开始">
+      <Tabs aria-label="帮助文档" variant="secondary" selectedKey={activeTab} onSelectionChange={onTabChange}>
+        <TabList>
+          <Tab id="quickstart">{"快速开始"}</Tab>
+          <Tab id="java">{"Java 客户端"}</Tab>
+          <Tab id="go">{"Go 客户端"}</Tab>
+          <Tab id="csharp">{".NET 客户端"}</Tab>
+          <Tab id="peer-mesh">{"私有组网"}</Tab>
+          <Tab id="protocol">{"协议与端口"}</Tab>
+          <Tab id="faq">{"常见问题"}</Tab>
+        </TabList>
+        <TabPanel id="quickstart">
           <QuickStartSection />
-        </Tab>
-        <Tab key="java" title="Java 客户端">
+        </TabPanel>
+        <TabPanel id="java">
           <JavaSection />
-        </Tab>
-        <Tab key="go" title="Go 客户端">
+        </TabPanel>
+        <TabPanel id="go">
           <GoSection />
-        </Tab>
-        <Tab key="csharp" title=".NET 客户端">
+        </TabPanel>
+        <TabPanel id="csharp">
           <CsharpSection />
-        </Tab>
-        <Tab key="peer-mesh" title="私有组网">
+        </TabPanel>
+        <TabPanel id="peer-mesh">
           <PeerMeshSection />
-        </Tab>
-        <Tab key="protocol" title="协议与端口">
+        </TabPanel>
+        <TabPanel id="protocol">
           <ProtocolSection />
-        </Tab>
-        <Tab key="faq" title="常见问题">
+        </TabPanel>
+        <TabPanel id="faq">
           <FaqSection />
-        </Tab>
+        </TabPanel>
       </Tabs>
     </div>
   );
@@ -384,7 +393,7 @@ sudo firewall-cmd --reload`} />
           {NAT_PATH_GUIDANCE.map((item) => (
             <div key={item.label} className="grid gap-2 py-2 sm:grid-cols-[150px_110px_minmax(0,1fr)] sm:items-center">
               <span className="font-mono text-small font-semibold text-foreground">{item.label}</span>
-              <Chip className="w-fit" size="sm" color={item.tone} variant="flat">
+              <Chip className="w-fit" size="sm" color={item.tone} variant="soft">
                 {item.path}
               </Chip>
               <span className="text-tiny text-default-500">{item.detail}</span>
@@ -399,16 +408,12 @@ sudo firewall-cmd --reload`} />
       <DocCard title="NAT 穿透说明">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <p className="text-small text-default-500">根据 Tailscale NAT traversal 文章做中文改写。</p>
-          <Button
-            as="a"
+          <a
             href={NAT_TRAVERSAL_REFERENCE.url}
             rel="noreferrer"
-            target="_blank"
-            size="sm"
-            variant="flat"
-          >
+            target="_blank" className={buttonVariants({ variant: "secondary", size: "sm" })}>
             阅读原文
-          </Button>
+          </a>
         </div>
         <div className="grid gap-2 md:grid-cols-2">
           {NAT_TRAVERSAL_REFERENCE.notes.map((note) => (
@@ -547,11 +552,11 @@ function FaqSection() {
 
 function DocCard({ title, children }: { title: React.ReactNode; children: React.ReactNode }) {
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardHeader className="px-5 pb-2 pt-4">
+    <Card className="rounded-md border border-default-200">
+      <Card.Header className="px-5 pb-2 pt-4">
         <h3 className="text-base font-semibold">{title}</h3>
-      </CardHeader>
-      <CardBody className="px-5 pb-4 pt-1 text-small leading-6">{children}</CardBody>
+      </Card.Header>
+      <Card.Content className="px-5 pb-4 pt-1 text-small leading-6">{children}</Card.Content>
     </Card>
   );
 }
@@ -573,7 +578,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
     <div className="overflow-hidden rounded-md border border-default-200 bg-default-50">
       <div className="flex items-center justify-between gap-2 border-b border-default-200 px-3 py-1.5">
         <span className="text-tiny text-default-400">{language}</span>
-        <Button size="sm" variant="flat" onPress={() => void onCopy()}>
+        <Button size="sm" variant="secondary" onPress={() => void onCopy()}>
           {copied ? "已复制" : "复制"}
         </Button>
       </div>

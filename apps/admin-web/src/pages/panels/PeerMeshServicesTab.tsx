@@ -1,18 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Button,
-  Chip,
-  Input,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from "@heroui/react";
+import { Button, Chip, Input, Label, ListBox, ListBoxItem, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type {
   PeerMeshDevice,
@@ -419,7 +406,7 @@ export function PeerMeshServicesTab({
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger-200 bg-danger-50 p-3 text-small text-danger-700">
           <span>Peer 服务状态未知：{loadError}</span>
-          <Button size="sm" color="danger" variant="flat" onPress={() => void load()}>
+          <Button size="sm" variant="danger-soft" onPress={() => void load()}>
             重新加载
           </Button>
         </div>
@@ -438,7 +425,7 @@ export function PeerMeshServicesTab({
             aria-busy={updatingShare}
             isSelected={sharingControl.selected}
             isDisabled={sharingControl.disabled}
-            onValueChange={(enabled) => setSharingEnabled(enabled)}
+            onChange={(enabled) => setSharingEnabled(enabled)}
           />
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-default-200 pt-2">
@@ -451,7 +438,7 @@ export function PeerMeshServicesTab({
             aria-busy={updatingShare}
             isSelected={Boolean(sharing?.mdnsImportEnabled)}
             isDisabled={sharingControl.disabled || !sharing?.configuredEnabled}
-            onValueChange={async (enabled) => {
+            onChange={async (enabled) => {
               if (!operationLocks.current.acquire("sharing")) {
                 return;
               }
@@ -475,88 +462,115 @@ export function PeerMeshServicesTab({
         <div className="grid grid-cols-1 gap-2 md:grid-cols-3 xl:grid-cols-7">
           <Select
             aria-label="发布设备"
-            label="设备"
-            selectedKeys={draft.clientId ? [draft.clientId] : []}
-            onSelectionChange={(keys) => setDraft((current) => ({ ...current, clientId: String([...keys][0] ?? "") }))}
-          >
-            {devices.map((device) => (
-              <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
+            onSelectionChange={(key) => setDraft((current) => ({ ...current, clientId: String(key ?? "") }))} selectedKey={draft.clientId || null}>
+            <Label>设备</Label>
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox>
+                {devices.map((device) => (
+              <ListBoxItem key={String(device.clientId)} id={String(device.clientId)}>{device.clientName}</ListBoxItem>
             ))}
+              </ListBox>
+            </SelectPopover>
           </Select>
-          <Input label="名称" value={draft.name} onValueChange={(name) => setDraft((current) => ({ ...current, name }))} />
+          <TextField value={draft.name} onChange={(name) => setDraft((current) => ({ ...current, name }))}>
+            <Label>名称</Label>
+            <Input />
+          </TextField>
           <Select
             aria-label="应用类型"
-            label="类型"
-            selectedKeys={[draft.application]}
-            onSelectionChange={(keys) =>
-              setDraft((current) => ({ ...current, application: String([...keys][0] ?? "tcp") }))
-            }
-          >
-            {applications.map((item) => (
-              <SelectItem key={item}>{item}</SelectItem>
+            onSelectionChange={(key) =>
+              setDraft((current) => ({ ...current, application: String(key ?? "tcp") }))
+            } selectedKey={draft.application}>
+            <Label>类型</Label>
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox>
+                {applications.map((item) => (
+              <ListBoxItem id={item}>{item}</ListBoxItem>
             ))}
+              </ListBox>
+            </SelectPopover>
           </Select>
-          <Input
-            label="本机目标"
-            value={draft.targetHost}
-            onValueChange={(targetHost) => setDraft((current) => ({ ...current, targetHost }))}
-          />
-          <Input
-            label="目标端口"
-            value={draft.targetPort}
-            onValueChange={(targetPort) => setDraft((current) => ({ ...current, targetPort }))}
-          />
-          <Input
-            label="发布端口"
-            value={draft.publishedPort}
-            onValueChange={(publishedPort) => setDraft((current) => ({ ...current, publishedPort }))}
-          />
+          <TextField value={draft.targetHost} onChange={(targetHost) => setDraft((current) => ({ ...current, targetHost }))}>
+            <Label>本机目标</Label>
+            <Input />
+          </TextField>
+          <TextField value={draft.targetPort} onChange={(targetPort) => setDraft((current) => ({ ...current, targetPort }))}>
+            <Label>目标端口</Label>
+            <Input />
+          </TextField>
+          <TextField value={draft.publishedPort} onChange={(publishedPort) => setDraft((current) => ({ ...current, publishedPort }))}>
+            <Label>发布端口</Label>
+            <Input />
+          </TextField>
           <Select
             aria-label="可见范围"
-            label="可见范围"
-            selectedKeys={[draft.visibility]}
-            onSelectionChange={(keys) =>
-              setDraft((current) => ({ ...current, visibility: String([...keys][0] ?? "OWNER") }))
-            }
-          >
-            <SelectItem key="OWNER">同归属</SelectItem>
-            <SelectItem key="ACL">ACL</SelectItem>
+            onSelectionChange={(key) =>
+              setDraft((current) => ({ ...current, visibility: String(key ?? "OWNER") }))
+            } selectedKey={draft.visibility}>
+            <Label>可见范围</Label>
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox>
+                <ListBoxItem id="OWNER">同归属</ListBoxItem>
+            <ListBoxItem id="ACL">ACL</ListBoxItem>
+              </ListBox>
+            </SelectPopover>
           </Select>
           {draft.visibility === "ACL" && (
             <Select
               aria-label="允许的客户端"
-              label="允许的客户端"
               selectionMode="multiple"
-              selectedKeys={new Set(draft.allowedClientIds)}
               onSelectionChange={(keys) =>
-                setDraft((current) => ({ ...current, allowedClientIds: [...keys].map(String) }))
-              }
-            >
-              {devices
+                // HeroUI 3 的 onSelectionChange 签名没跟着 selectionMode 走：多选时
+                // 运行时收到的是 Set<Key>，类型上却仍标成单个 key。
+                setDraft((current) => ({
+                  ...current,
+                  allowedClientIds: [...(keys as unknown as Iterable<string | number>)].map(String),
+                }))
+              } selectedKey={new Set(draft.allowedClientIds) as unknown as string | null}>
+              <Label>允许的客户端</Label>
+              <SelectTrigger>
+                <SelectValue />
+                <SelectIndicator />
+              </SelectTrigger>
+              <SelectPopover>
+                <ListBox>
+                  {devices
                 .filter((device) => String(device.clientId) !== draft.clientId)
                 .map((device) => (
-                  <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
+                  <ListBoxItem key={String(device.clientId)} id={String(device.clientId)}>{device.clientName}</ListBoxItem>
                 ))}
+                </ListBox>
+              </SelectPopover>
             </Select>
           )}
           <div className="flex items-end">
-            <Button color="primary" isLoading={savingService} isDisabled={savingService} onPress={() => void saveService()}>
+            <Button variant="primary" isDisabled={savingService || savingService} onPress={() => void saveService()}>{savingService ? <Spinner size="sm" /> : null}
               {editingId == null ? "新增（默认关闭）" : "保存更改"}
             </Button>
             {editingId != null && (
-              <Button variant="light" isDisabled={savingService} onPress={() => setEditingId(null)}>取消编辑</Button>
+              <Button variant="ghost" isDisabled={savingService} onPress={() => setEditingId(null)}>取消编辑</Button>
             )}
           </div>
           <div className="flex items-end gap-2">
-            <Button
-              variant="flat"
+            <Button variant="secondary"
               isDisabled={!draft.clientId || importing}
               onPress={() => void importCandidates()}
             >
               从 TCP/HTTP 导入候选
             </Button>
-            <Button
-              variant="flat"
+            <Button variant="secondary"
               isDisabled={!draft.clientId || importing || !sharing?.mdnsImportEnabled}
               onPress={() => void importMdns()}
             >
@@ -581,7 +595,7 @@ export function PeerMeshServicesTab({
                   : `会话 ${group.publisherSessionId}${group.instanceId ? ` · 实例 ${group.instanceId}` : ""}`}
               </span>
             </div>
-            <Table aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`} removeWrapper>
+            <Table aria-label={`${group.publisherClientName} 会话 ${group.publisherSessionId ?? "未上报"} 的 Peer 服务`}>
               <TableHeader>
                 <TableColumn>服务</TableColumn>
                 <TableColumn>类型</TableColumn>
@@ -617,7 +631,7 @@ export function PeerMeshServicesTab({
                         : "同归属"}
                     </TableCell>
                     <TableCell>
-                      <Chip size="sm" color={chip.color} variant="flat">
+                      <Chip size="sm" color={chip.color} variant="soft">
                         {chip.text}
                       </Chip>
                     </TableCell>
@@ -632,19 +646,17 @@ export function PeerMeshServicesTab({
                             aria-busy={updatingServices.has(service.id)}
                             isSelected={service.enabled}
                             isDisabled={rowBusy || updatingShare || loadError != null}
-                            onValueChange={(enabled) => void toggleService(service, enabled)}
+                            onChange={(enabled) => void toggleService(service, enabled)}
                           />
                         )}
                         {isAdmin && (
-                          <Button size="sm" variant="light" isDisabled={rowBusy} onPress={() => editService(service)}>
+                          <Button size="sm" variant="ghost" isDisabled={rowBusy} onPress={() => editService(service)}>
                             编辑
                           </Button>
                         )}
                         {isAdmin && service.enabled && (
                           <Button
-                            size="sm"
-                            color="warning"
-                            variant="light"
+                            size="sm" variant="ghost"
                             isDisabled={rowBusy || updatingShare || loadError != null}
                             onPress={() => void toggleService(service, false)}
                           >
@@ -652,33 +664,23 @@ export function PeerMeshServicesTab({
                           </Button>
                         )}
                         <Button
-                          size="sm"
-                          variant="flat"
-                          title={row.availability.available ? "复制当前发布地址" : row.availability.reason}
+                          size="sm" variant="secondary"
                           isDisabled={rowBusy || !row.availability.available}
                           onPress={() => void copyAddress(row)}
                         >
                           复制地址
                         </Button>
                         <Button
-                          size="sm"
-                          variant="flat"
-                          title={!sharing?.effectiveEnabled ? "全局服务共享已关闭" : "刷新并核对该运行实例的目录状态"}
-                          isLoading={testingInstances.has(row.key)}
-                          isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null}
+                          size="sm" variant="secondary" isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null || testingInstances.has(row.key)}
                           onPress={() => void testAvailability(row)}
-                        >
+                        >{testingInstances.has(row.key) ? <Spinner size="sm" /> : null}
                           测试可用性
                         </Button>
                         {isAdmin && (
                           <Button
-                            size="sm"
-                            color="danger"
-                            variant="light"
-                            isLoading={deletingServices.has(service.id)}
-                            isDisabled={rowBusy}
+                            size="sm" variant="danger" isDisabled={rowBusy || deletingServices.has(service.id)}
                             onPress={() => removeService(service)}
-                          >
+                          >{deletingServices.has(service.id) ? <Spinner size="sm" /> : null}
                             删除
                           </Button>
                         )}

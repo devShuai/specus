@@ -1,27 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Input,
-  Pagination,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-  Select,
-  SelectItem,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from "@heroui/react";
+import { Button, Card, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Input, Label, ListBox, ListBoxItem, Popover, PopoverContent, PopoverTrigger, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { ConnectionRecord, LiveConnectionEvent } from "../../api/types";
 import { formatDateTime, formatDuration } from "../../lib/format";
@@ -33,10 +12,6 @@ import { MobileListCard, MobileListCardList } from "../../components/MobileListC
 import { EmptyState } from "../../components/EmptyState";
 
 const PAGE_SIZE = 50;
-const FILTER_POPOVER_CLASS_NAMES = {
-  content: "border border-default-200 bg-content1 text-foreground shadow-large",
-} as const;
-
 export function ConnectionsPanel() {
   const { expireSession } = useAuth();
   const [clients, setClients] = useState<{ id: number; clientName: string }[]>([]);
@@ -250,20 +225,15 @@ export function ConnectionsPanel() {
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold text-foreground">连接记录</h2>
-            <Chip radius="sm" size="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {total} 条
             </Chip>
           </div>
           <p className="mt-1 text-small text-default-500">查看客户端连接结果、来源地址与在线时长。</p>
         </div>
         <Button
-          className="w-full shrink-0 sm:w-auto"
-          color="primary"
-          isLoading={loading}
-          radius="sm"
-          variant="flat"
-          onPress={() => void load()}
-        >
+          className="w-full shrink-0 sm:w-auto" variant="secondary"
+          onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新记录
         </Button>
       </div>
@@ -281,25 +251,47 @@ export function ConnectionsPanel() {
             <Button
               className="shrink-0"
               isDisabled={!hasActiveFilters}
-              radius="sm"
-              size="sm"
-              variant="light"
+              size="sm" variant="ghost"
               onPress={reset}
             >
               重置筛选
             </Button>
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <Select className="w-full" label="客户端" items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]} selectedKeys={clientId ? [clientId] : [""]} onChange={(event) => changeClientId(event.target.value)}>
-              {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
+            <Select className="w-full" selectedKey={clientId || ""} onSelectionChange={(event) => changeClientId(String(event ?? ""))}>
+              <Label>客户端</Label>
+              <SelectTrigger>
+                <SelectValue />
+                <SelectIndicator />
+              </SelectTrigger>
+              <SelectPopover>
+                <ListBox items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}>
+                  {(item) => <ListBoxItem id={item.id}>{item.clientName}</ListBoxItem>}
+                </ListBox>
+              </SelectPopover>
             </Select>
-            <Select className="w-full" label="结果" selectedKeys={result ? [result] : [""]} onChange={(event) => changeResult(event.target.value)}>
-              <SelectItem key="">全部</SelectItem>
-              <SelectItem key="true">成功</SelectItem>
-              <SelectItem key="false">失败</SelectItem>
+            <Select className="w-full" selectedKey={result || ""} onSelectionChange={(event) => changeResult(String(event ?? ""))}>
+              <Label>结果</Label>
+              <SelectTrigger>
+                <SelectValue />
+                <SelectIndicator />
+              </SelectTrigger>
+              <SelectPopover>
+                <ListBox>
+                  <ListBoxItem id="">全部</ListBoxItem>
+              <ListBoxItem id="true">成功</ListBoxItem>
+              <ListBoxItem id="false">失败</ListBoxItem>
+                </ListBox>
+              </SelectPopover>
             </Select>
-            <Input className="w-full" type="date" label="开始日期" value={fromDate} onValueChange={changeFromDate} />
-            <Input className="w-full" type="date" label="结束日期" value={toDate} onValueChange={changeToDate} />
+            <TextField value={fromDate} onChange={changeFromDate} type="date" className="w-full">
+              <Label>开始日期</Label>
+              <Input />
+            </TextField>
+            <TextField value={toDate} onChange={changeToDate} type="date" className="w-full">
+              <Label>结束日期</Label>
+              <Input />
+            </TextField>
           </div>
         </div>
         <MobileListCardList
@@ -321,7 +313,7 @@ export function ConnectionsPanel() {
                   </div>
                 }
                 badges={
-                  <Chip size="sm" variant="flat" color={record.success ? "success" : "danger"}>
+                  <Chip size="sm" variant="soft" color={record.success ? "success" : "danger"}>
                     {record.success ? "成功" : "失败"}
                   </Chip>
                 }
@@ -340,13 +332,13 @@ export function ConnectionsPanel() {
 
       {/* desktop: 表格 + 搜索条件在表头 */}
       <div className="hidden min-w-0 xl:block">
-      <Card shadow="none" className="overflow-visible rounded-lg border border-default-200 bg-content1">
-        <CardBody className="p-3">
+      <Card className="overflow-visible rounded-lg border border-default-200 bg-content1">
+        <Card.Content className="p-3">
         <div className="mb-3 flex min-h-9 items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2 text-tiny text-default-500">
             <span className="truncate">点击列标题旁的筛选图标缩小记录范围</span>
             {hasActiveFilters ? (
-              <Chip color="primary" radius="sm" size="sm" variant="flat">
+              <Chip color="accent" size="sm" variant="soft">
                 {activeFilterCount} 项筛选
               </Chip>
             ) : null}
@@ -354,9 +346,7 @@ export function ConnectionsPanel() {
           <Button
             className="h-9 shrink-0"
             isDisabled={!hasActiveFilters}
-            radius="sm"
-            size="sm"
-            variant="light"
+            size="sm" variant="ghost"
             onPress={reset}
           >
             重置筛选
@@ -365,13 +355,6 @@ export function ConnectionsPanel() {
         <Table
           key={tableCollectionKey}
           aria-label="连接记录"
-          classNames={{
-            table: "w-full table-fixed",
-            th: "h-10 bg-content2 px-2 text-tiny font-semibold text-default-600",
-            td: "border-b border-divider/70 px-2 py-2.5 align-middle text-small text-default-700",
-          }}
-          isHeaderSticky
-          removeWrapper
         >
         <TableHeader>
           <TableColumn className="w-[6%]">ID</TableColumn>
@@ -389,7 +372,7 @@ export function ConnectionsPanel() {
           <TableColumn className="w-[11%]">持续时长</TableColumn>
           <TableColumn>原因</TableColumn>
         </TableHeader>
-        <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />}>
+        <TableBody key={tableCollectionKey} items={tableRows} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />)}>
           {(record) => (
             <TableRow key={record.tableKey}>
               <TableCell>{record.id}</TableCell>
@@ -399,7 +382,7 @@ export function ConnectionsPanel() {
                 </span>
               </TableCell>
               <TableCell>
-                <Chip size="sm" variant="flat" color={record.success ? "success" : "danger"}>
+                <Chip size="sm" variant="soft" color={record.success ? "success" : "danger"}>
                   {record.success ? "成功" : "失败"}
                 </Chip>
               </TableCell>
@@ -432,7 +415,7 @@ export function ConnectionsPanel() {
           )}
         </TableBody>
       </Table>
-        </CardBody>
+        </Card.Content>
       </Card>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -440,12 +423,11 @@ export function ConnectionsPanel() {
           {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
         </span>
         {totalPages > 1 ? (
-          <Pagination
-            showControls
+          <Pager
             page={page + 1}
             total={totalPages}
             onChange={(value) => changePage(value - 1)}
-          />
+           />
         ) : null}
       </div>
     </div>
@@ -470,29 +452,27 @@ function ConnectionClientFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={Boolean(selectedClientId)} title="筛选客户端">
-      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
+      <Dropdown>
         <DropdownTrigger>
           <Button
             isIconOnly
             aria-label="筛选客户端"
             className="h-7 min-w-7 text-default-500"
-            color={selectedClientId ? "primary" : "default"}
-            size="sm"
-            title="筛选客户端"
-            variant={selectedClientId ? "flat" : "light"}
-          >
+            size="sm" variant={selectedClientId ? "secondary" : "ghost"}>
             <FilterIcon />
           </Button>
         </DropdownTrigger>
-        <DropdownMenu
-          aria-label="筛选连接记录客户端"
-          items={filterItems}
-          selectedKeys={[selectedClientId || ""]}
-          selectionMode="single"
-          onAction={(key) => onSelect(String(key))}
-        >
-          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
-        </DropdownMenu>
+        <DropdownPopover placement="bottom start">
+          <DropdownMenu
+            aria-label="筛选连接记录客户端"
+            items={filterItems}
+            selectedKeys={[selectedClientId || ""]}
+            selectionMode="single"
+            onAction={(key) => onSelect(String(key))}
+          >
+            {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+          </DropdownMenu>
+        </DropdownPopover>
       </Dropdown>
     </TableFilterHeader>
   );
@@ -514,29 +494,27 @@ function ConnectionResultFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={Boolean(selectedResult)} title="筛选结果">
-      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
+      <Dropdown>
         <DropdownTrigger>
           <Button
             isIconOnly
             aria-label="筛选结果"
             className="h-7 min-w-7 text-default-500"
-            color={selectedResult ? "primary" : "default"}
-            size="sm"
-            title="筛选结果"
-            variant={selectedResult ? "flat" : "light"}
-          >
+            size="sm" variant={selectedResult ? "secondary" : "ghost"}>
             <FilterIcon />
           </Button>
         </DropdownTrigger>
-        <DropdownMenu
-          aria-label="筛选连接记录结果"
-          items={filterItems}
-          selectedKeys={[selectedResult || ""]}
-          selectionMode="single"
-          onAction={(key) => onSelect(String(key))}
-        >
-          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
-        </DropdownMenu>
+        <DropdownPopover placement="bottom start">
+          <DropdownMenu
+            aria-label="筛选连接记录结果"
+            items={filterItems}
+            selectedKeys={[selectedResult || ""]}
+            selectionMode="single"
+            onAction={(key) => onSelect(String(key))}
+          >
+            {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+          </DropdownMenu>
+        </DropdownPopover>
       </Dropdown>
     </TableFilterHeader>
   );
@@ -558,26 +536,28 @@ function ConnectionDateFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={active} title="筛选连接时间">
-      <Popover classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
+      <Popover>
         <PopoverTrigger>
           <Button
             isIconOnly
             aria-label="筛选连接时间"
             className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="筛选连接时间"
-            variant={active ? "flat" : "light"}
-          >
+            size="sm" variant={active ? "secondary" : "ghost"}>
             <FilterIcon />
           </Button>
         </PopoverTrigger>
-        <PopoverContent className="w-64 p-3">
+        <PopoverContent placement="bottom start" className="w-64 p-3">
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold text-foreground">连接时间范围</div>
-            <Input label="开始日期" size="sm" type="date" value={fromDate} onValueChange={onFromChange} />
-            <Input label="结束日期" size="sm" type="date" value={toDate} onValueChange={onToChange} />
-            <Button size="sm" variant="flat" onPress={() => { onFromChange(""); onToChange(""); }}>
+            <TextField value={fromDate} onChange={onFromChange} type="date">
+              <Label>开始日期</Label>
+              <Input />
+            </TextField>
+            <TextField value={toDate} onChange={onToChange} type="date">
+              <Label>结束日期</Label>
+              <Input />
+            </TextField>
+            <Button size="sm" variant="secondary" onPress={() => { onFromChange(""); onToChange(""); }}>
               清空时间筛选
             </Button>
           </div>

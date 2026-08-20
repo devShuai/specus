@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
-import { Button, Card, CardBody, Chip, Progress, Textarea, Tooltip } from "@heroui/react";
+import { Button, Card, Chip, ProgressBar, Spinner, TextArea, TextField, Tooltip, TooltipContent, TooltipTrigger } from "@heroui/react";
 import { adminApi, tokenStore } from "../../api/client";
 import type { AttachmentPresignUploadResponse, Client, TransferAttachment } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
@@ -435,15 +435,15 @@ export function AdminMessagesPanel() {
 
   return (
     <div className="mt-4 grid min-h-[calc(100vh-120px)] min-w-0 gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="gap-3 p-3">
+      <Card className="rounded-md border border-default-200">
+        <Card.Content className="gap-3 p-3">
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-base font-semibold text-foreground">消息客户端</h2>
             <div className="flex items-center gap-2">
-              <Chip size="sm" color={connected ? "success" : "default"} variant="flat">
+              <Chip size="sm" color={connected ? "success" : "default"} variant="soft">
                 {connected ? "已连接" : "未连接"}
               </Chip>
-              <Button size="sm" variant="flat" onPress={() => void loadClients()}>
+              <Button size="sm" variant="secondary" onPress={() => void loadClients()}>
                 刷新
               </Button>
             </div>
@@ -473,11 +473,11 @@ export function AdminMessagesPanel() {
                     <span className="truncate text-small font-medium">{client.clientName}</span>
                     <span className="flex shrink-0 items-center gap-1">
                       {unread > 0 && (
-                        <Chip size="sm" color="danger" variant="solid" aria-label={`${unread} 条未读消息`}>
+                        <Chip size="sm" color="danger" variant="primary" aria-label={`${unread} 条未读消息`}>
                           {unread > 99 ? "99+" : unread}
                         </Chip>
                       )}
-                      <Chip size="sm" color="success" variant="flat">
+                      <Chip size="sm" color="success" variant="soft">
                         在线
                       </Chip>
                     </span>
@@ -490,11 +490,11 @@ export function AdminMessagesPanel() {
               );
             })}
           </div>
-        </CardBody>
+        </Card.Content>
       </Card>
 
-      <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-3 p-3">
+      <Card className="rounded-md border border-default-200">
+        <Card.Content className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-3 p-3">
           <div className="flex min-w-0 items-center justify-between gap-3 border-b border-default-200 pb-3">
             <div className="min-w-0">
               <h2 className="truncate text-base font-semibold text-foreground">{selectedClientInfo?.clientName ?? "未选择客户端"}</h2>
@@ -503,14 +503,15 @@ export function AdminMessagesPanel() {
               </div>
             </div>
             {selectedClient && (
-              <Tooltip content={`附件 ${selectedClient.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${selectedClient.messageMediaPreviewCapable ? "支持" : "不支持"}`}>
-                <Chip size="sm" color="primary" variant="flat">
+              <Tooltip>
+                <TooltipTrigger><Chip size="sm" color="accent" variant="soft">
                   可聊天
-                </Chip>
+                </Chip></TooltipTrigger>
+                <TooltipContent>{`附件 ${selectedClient.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${selectedClient.messageMediaPreviewCapable ? "支持" : "不支持"}`}</TooltipContent>
               </Tooltip>
             )}
             {selectedOffline && (
-              <Chip size="sm" color="default" variant="flat">
+              <Chip size="sm" color="default" variant="soft">
                 已离线
               </Chip>
             )}
@@ -543,9 +544,7 @@ export function AdminMessagesPanel() {
             {hasNewBelow && (
               <Button
                 className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-md"
-                color="primary"
-                size="sm"
-                variant="solid"
+                size="sm" variant="primary"
                 onPress={scrollToBottom}
               >
                 ↓ 有新消息
@@ -560,7 +559,7 @@ export function AdminMessagesPanel() {
               </div>
             )}
             {uploadProgress != null && (
-              <Progress aria-label="上传进度" size="sm" color="primary" value={uploadProgress} />
+              <ProgressBar aria-label="上传进度" size="sm" value={uploadProgress} />
             )}
             {file && (
               <div className="flex items-center justify-between gap-2 rounded-md border border-default-200 bg-content2 px-3 py-2 text-small">
@@ -569,36 +568,32 @@ export function AdminMessagesPanel() {
               </div>
             )}
             <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <Textarea
+              <TextField
                 aria-label="消息内容"
-                minRows={2}
-                maxRows={5}
-                radius="sm"
-                variant="bordered"
-                placeholder={selectedOffline ? "目标已离线" : "输入消息"}
                 value={body}
                 isDisabled={selectedOffline}
-                onValueChange={setBody}
-                onKeyDown={onComposerKeyDown}
-              />
+                onChange={setBody}
+              >
+                <TextArea
+                  placeholder={selectedOffline ? "目标已离线" : "输入消息"}
+                  onKeyDown={onComposerKeyDown}
+                />
+              </TextField>
               <div className="flex gap-2 sm:flex-col">
                 <input ref={fileInputRef} className="hidden" type="file" aria-label="选择附件" onChange={chooseFile} />
-                <Button className="flex-1 sm:flex-none" variant="flat" isDisabled={selectedOffline} onPress={() => fileInputRef.current?.click()}>
+                <Button className="flex-1 sm:flex-none" variant="secondary" isDisabled={selectedOffline} onPress={() => fileInputRef.current?.click()}>
                   附件
                 </Button>
-                <Button
-                  className="flex-1 sm:flex-none"
-                  color="primary"
-                  isLoading={sending}
-                  isDisabled={!selectedClient || !connected || (!body.trim() && !file)}
+                <Button variant="primary"
+                  className="flex-1 sm:flex-none" isDisabled={!selectedClient || !connected || (!body.trim() && !file) || sending}
                   onPress={() => void send()}
-                >
+                >{sending ? <Spinner size="sm" /> : null}
                   发送
                 </Button>
               </div>
             </div>
           </div>
-        </CardBody>
+        </Card.Content>
       </Card>
     </div>
   );
@@ -626,7 +621,7 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
           <span>{formatDateTime(message.createdAt)}</span>
           <span className={failed ? "font-medium text-danger" : undefined}>{statusText(message.status)}</span>
           {failed && mine && (
-            <Button className="h-5 min-w-0 px-1.5 text-tiny" size="sm" color="danger" variant="light" onPress={onResend}>
+            <Button className="h-5 min-w-0 px-1.5 text-tiny" size="sm" variant="danger" onPress={onResend}>
               重发
             </Button>
           )}
@@ -642,7 +637,7 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
                 </div>
               </div>
               {attachment.attachmentId && (
-                <Button size="sm" variant="flat" isLoading={downloading} onPress={onDownload}>
+                <Button size="sm" variant="secondary" onPress={onDownload} isDisabled={downloading}>{downloading ? <Spinner size="sm" /> : null}
                   {downloading ? "下载中…" : "下载"}
                 </Button>
               )}

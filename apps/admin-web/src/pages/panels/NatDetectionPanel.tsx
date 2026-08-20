@@ -1,13 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Input,
-  Textarea,
-  Tooltip,
-} from "@heroui/react";
+import { Button, Card, Chip, Description, FieldError, InputGroup, InputGroupInput, InputGroupSuffix, Label, TextArea, TextField, Tooltip, TooltipContent, TooltipTrigger, buttonVariants } from "@heroui/react";
 import { AppLogo } from "../../components/AppLogo";
 import { UserMenuButton } from "../../components/UserMenuButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
@@ -199,7 +191,7 @@ interface BrowserNatOutcome {
   title: string;
   description: string;
   reachability: string;
-  tone: "default" | "primary" | "success" | "warning" | "danger";
+  tone: "default" | "accent" | "success" | "warning" | "danger";
   frameClass: string;
   markerClass: string;
   textClass: string;
@@ -231,7 +223,7 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
     title: "端口保持型 NAT",
     description: "公网映射保持稳定，并保留了本机源端口。这通常有利于 UDP 打洞，但不能据此判断入站过滤是否宽松。",
     reachability: "直连友好",
-    tone: "primary",
+    tone: "accent",
     frameClass: "border-blue-500/35 bg-blue-500/[0.07] dark:border-blue-400/30 dark:bg-blue-400/[0.09]",
     markerClass: "bg-blue-600 text-white dark:bg-blue-400 dark:text-zinc-950",
     textClass: "text-blue-800 dark:text-blue-200",
@@ -741,11 +733,9 @@ function NatDetectStage({
       <div className="relative flex flex-col items-center gap-6 text-center">
         <div className="flex flex-wrap items-center justify-center gap-2">
           <Chip
-            radius="sm"
-            variant="flat"
-            startContent={<StatusGlyph color={profile.color} className="ml-1" />}
+            variant="soft"
             className={`${accent.chipBg} ${accent.chipText} border ${accent.chipBorder}`}
-          >
+          >{<StatusGlyph color={profile.color} className="ml-1" />}
             {checking ? "检测进行中" : result ? "检测完成" : "准备就绪"}
           </Chip>
           <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
@@ -792,31 +782,23 @@ function NatDetectStage({
             <span className="text-tiny text-zinc-500 dark:text-zinc-400">点击展开</span>
           </summary>
           <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
-            <Textarea
-              label="STUN 服务（每行一个，默认主备节点）"
-              size="sm"
-              variant="bordered"
-              radius="sm"
-              minRows={2}
-              value={serversText}
-              onValueChange={onServersTextChange}
-              description={probeActive
+            <TextField value={serversText} onChange={onServersTextChange}>
+              <Label>STUN 服务（每行一个，默认主备节点）</Label>
+              <TextArea  />
+              <Description>{probeActive
                 ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
-                : `默认使用 specus 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
-            />
-            <Input
-              label="单服务超时"
-              size="sm"
-              variant="bordered"
-              radius="sm"
-              value={timeoutMs}
-              onValueChange={onTimeoutChange}
-              isInvalid={!timeoutMsInputValid(timeoutMs)}
-              errorMessage="请输入 3000–15000 之间的数字"
-              endContent={<span className="text-tiny text-default-400">ms</span>}
-            />
+                : `默认使用 specus 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}</Description>
+            </TextField>
+            <TextField value={timeoutMs} onChange={onTimeoutChange} isInvalid={!timeoutMsInputValid(timeoutMs)} className="text-tiny text-default-400">
+              <Label>单服务超时</Label>
+              <InputGroup>
+                <InputGroupInput />
+                <InputGroupSuffix>{<span>ms</span>}</InputGroupSuffix>
+              </InputGroup>
+              <FieldError>{"请输入 3000–15000 之间的数字"}</FieldError>
+            </TextField>
             <div className="flex justify-end sm:col-span-2">
-              <Button size="sm" variant="light" onPress={onResetServers}>
+              <Button size="sm" variant="ghost" onPress={onResetServers}>
                 恢复默认
               </Button>
             </div>
@@ -919,7 +901,7 @@ const NAT_PHASE_ACCENTS: Record<NatCheckProgressPhase, string> = {
 /** 渠水染成结论色：直连顺畅是 emerald，受阻依次转 amber / rose。 */
 const NAT_CHANNEL_TONE_WATER: Record<BrowserNatOutcome["tone"], string> = {
   default: "#94a3b8",
-  primary: "var(--specus-accent)",
+  accent: "var(--specus-accent)",
   success: "#10b981",
   warning: "#f59e0b",
   danger: "#f43f5e",
@@ -928,7 +910,7 @@ const NAT_CHANNEL_TONE_WATER: Record<BrowserNatOutcome["tone"], string> = {
 /** 出结果后球内水位：直连越顺畅渠水越满，受阻则退到近涸。 */
 const NAT_ORB_WATER_BY_TONE: Record<BrowserNatOutcome["tone"], number> = {
   default: 30,
-  primary: 85,
+  accent: 85,
   success: 85,
   warning: 45,
   danger: 16,
@@ -1188,7 +1170,7 @@ function NatOutcomeCard({
   return (
     <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-sm sm:p-6 ${outcome.frameClass}`}>
       <span
-        className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}${outcome.tone === "success" || outcome.tone === "primary" ? " nat-outcome-bar-flow" : ""}`}
+        className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}${outcome.tone === "success" || outcome.tone === "accent" ? " nat-outcome-bar-flow" : ""}`}
         aria-hidden="true"
       />
       <div className="flex flex-wrap items-start gap-4 pt-1">
@@ -1202,7 +1184,7 @@ function NatOutcomeCard({
           <p className="text-tiny font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">检测结果</p>
           <div className="mt-1 flex flex-wrap items-center gap-2.5">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white sm:text-3xl">{outcome.title}</h2>
-            <Chip size="sm" radius="sm" variant="flat" className={`${outcome.textClass} bg-white/45 dark:bg-black/15`}>
+            <Chip size="sm" variant="soft" className={`${outcome.textClass} bg-white/45 dark:bg-black/15`}>
               {outcome.reachability}
             </Chip>
           </div>
@@ -1234,16 +1216,15 @@ function NatOutcomeCard({
 
       <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-tiny text-zinc-600 dark:text-zinc-400">
         <Tooltip
-          placement="bottom"
-          content={<div className="max-w-64 py-0.5 text-tiny">{technicalSummary}</div>}
         >
-          <a
+          <TooltipTrigger><a
             href="#/help/peer-mesh#nat-types"
             className="inline-flex items-center gap-1.5 font-medium text-zinc-700 underline decoration-black/20 underline-offset-4 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:decoration-white/25 dark:hover:text-white"
           >
             <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(outcome.tone)}`} />
             技术判断：{technicalLabel}
-          </a>
+          </a></TooltipTrigger>
+          <TooltipContent placement="bottom">{<div className="max-w-64 py-0.5 text-tiny">{technicalSummary}</div>}</TooltipContent>
         </Tooltip>
         <span aria-hidden="true">·</span>
         <span className="inline-flex items-center gap-1.5">
@@ -1484,10 +1465,8 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
       {items.map((item) => (
         <Tooltip
           key={item.label}
-          placement="bottom"
-          content={<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}
         >
-          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
+          <TooltipTrigger><div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
             <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
               <span>{item.label}</span>
               <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
@@ -1495,7 +1474,8 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
             <div className="mt-0.5 font-mono text-lg font-semibold text-zinc-950 dark:text-white">
               {item.value}
             </div>
-          </div>
+          </div></TooltipTrigger>
+          <TooltipContent placement="bottom">{<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}</TooltipContent>
         </Tooltip>
       ))}
     </div>
@@ -1590,8 +1570,8 @@ function MappedEndpointsCard({ result }: { result: BrowserNatResult }) {
   ].filter((group) => group.endpoints.length > 0);
 
   return (
-    <Card shadow="none" className="rounded-xl border glass glass-border">
-      <CardBody className="gap-4 p-5">
+    <Card className="rounded-xl border glass glass-border">
+      <Card.Content className="gap-4 p-5">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span className="flex items-center gap-2">
             <DotIcon className={result.mappedEndpoints.length ? "text-emerald-500" : "text-zinc-400"} />
@@ -1627,7 +1607,7 @@ function MappedEndpointsCard({ result }: { result: BrowserNatResult }) {
             ))}
           </div>
         )}
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1650,8 +1630,8 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
         : "text-emerald-500";
 
   return (
-    <Card shadow="none" className="rounded-xl border glass glass-border">
-      <CardBody className="gap-3 p-5">
+    <Card className="rounded-xl border glass glass-border">
+      <Card.Content className="gap-3 p-5">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span className="flex items-center gap-2">
             <DotIcon className={headDotClass} />
@@ -1688,7 +1668,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
                 key={probe.server}
                 className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border glass-chip glass-border px-3 py-2"
               >
-                <Chip size="sm" variant="flat" color={status.color} className="shrink-0">
+                <Chip size="sm" variant="soft" color={status.color} className="shrink-0">
                   {status.label}
                 </Chip>
                 <code className="break-all font-mono text-tiny text-zinc-800 dark:text-zinc-200">
@@ -1715,7 +1695,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
             );
           })}
         </div>
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1793,17 +1773,14 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                   <th className="px-2 py-1.5 text-left font-medium">地址</th>
                   <th className="px-2 py-1.5 text-left font-medium">
                     <Tooltip
-                      placement="top"
-                      content={
-                        <div className="max-w-60 py-0.5 text-tiny">
-                          raddr / rport：srflx 候选对应的本机源地址与源端口，用于对照公网端口是否被 NAT 改写。
-                        </div>
-                      }
                     >
-                      <span className="inline-flex cursor-help items-center gap-1">
+                      <TooltipTrigger><span className="inline-flex cursor-help items-center gap-1">
                         关联地址
                         <InfoIcon className="h-3 w-3 opacity-60" />
-                      </span>
+                      </span></TooltipTrigger>
+                      <TooltipContent placement="top">{<div className="max-w-60 py-0.5 text-tiny">
+                          raddr / rport：srflx 候选对应的本机源地址与源端口，用于对照公网端口是否被 NAT 改写。
+                        </div>}</TooltipContent>
                     </Tooltip>
                   </th>
                 </tr>
@@ -1822,12 +1799,11 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                     </td>
                     <td className="px-2 py-2 align-top">
                       <Tooltip
-                        placement="top"
-                        content={<div className="max-w-60 py-0.5 text-tiny">{candidateTypeHint(item.candidate.type)}</div>}
                       >
-                        <Chip size="sm" color={candidateColor(item.candidate.type)} variant="flat" className="cursor-help">
+                        <TooltipTrigger><Chip size="sm" color={candidateColor(item.candidate.type)} variant="soft" className="cursor-help">
                           {item.candidate.type}
-                        </Chip>
+                        </Chip></TooltipTrigger>
+                        <TooltipContent placement="top">{<div className="max-w-60 py-0.5 text-tiny">{candidateTypeHint(item.candidate.type)}</div>}</TooltipContent>
                       </Tooltip>
                     </td>
                     <td className="px-2 py-2 align-top text-tiny uppercase text-zinc-500 dark:text-zinc-400">
@@ -1959,7 +1935,7 @@ function NatTypeGuide({
             NAT1-4 是本页面为了直观展示而使用的分级，不是 IETF 标准类型。现代诊断应把映射行为和过滤行为分开记录。
           </p>
         </div>
-        <Chip size="sm" radius="sm" variant="flat" color={topologyAvailable ? "success" : "warning"}>
+        <Chip size="sm" variant="soft" color={topologyAvailable ? "success" : "warning"}>
           {topologyAvailable ? "RFC 5780 拓扑已下发" : "基础 STUN 兼容模式"}
         </Chip>
       </div>
@@ -2032,7 +2008,7 @@ function NatTypeGuide({
                 ["RESPONSE-PORT", capabilities?.responsePort],
                 ["PADDING", capabilities?.padding],
               ].map(([label, enabled]) => (
-                <Chip key={String(label)} size="sm" radius="sm" variant="flat" color={enabled ? "success" : "default"}>
+                <Chip key={String(label)} size="sm" variant="soft" color={enabled ? "success" : "default"}>
                   {label}
                 </Chip>
               ))}
@@ -2071,9 +2047,9 @@ function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | nu
           当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 5780</Button>
-          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 8489</Button>
-          <Button as="a" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">NAT traversal</Button>
+          <a href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" className={buttonVariants({ variant: "ghost", size: "sm" })}>RFC 5780</a>
+          <a href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" className={buttonVariants({ variant: "ghost", size: "sm" })}>RFC 8489</a>
+          <a href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" className={buttonVariants({ variant: "ghost", size: "sm" })}>NAT traversal</a>
         </div>
       </div>
     </footer>
@@ -2081,7 +2057,7 @@ function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | nu
 }
 
 const ACCENTS: Record<
-  "default" | "primary" | "success" | "warning" | "danger",
+  "default" | "accent" | "success" | "warning" | "danger",
   {
     border: string;
     bg: string;
@@ -2097,7 +2073,7 @@ const ACCENTS: Record<
     chipText: "text-zinc-700 dark:text-zinc-200",
     chipBorder: "border-zinc-300/60 dark:border-white/10",
   },
-  primary: {
+  accent: {
     border: "border-primary-500/25 dark:border-primary-300/25",
     bg: "bg-primary-500/[0.04] dark:bg-primary-400/[0.06]",
     chipBg: "bg-primary-500/15 dark:bg-primary-400/15",
@@ -2159,7 +2135,7 @@ function StatusGlyph({
   color,
   className = "",
 }: {
-  color: "default" | "primary" | "success" | "warning" | "danger";
+  color: "default" | "accent" | "success" | "warning" | "danger";
   className?: string;
 }) {
   const base = `h-3.5 w-3.5 shrink-0 ${className}`;
@@ -2187,7 +2163,7 @@ function StatusGlyph({
           <line x1="15" y1="9" x2="9" y2="15" />
         </svg>
       );
-    case "primary":
+    case "accent":
       return (
         <span className={`relative flex h-2.5 w-2.5 shrink-0 items-center justify-center ${className}`}>
           <span className="absolute h-full w-full animate-ping rounded-full bg-current opacity-50" />
@@ -2242,11 +2218,11 @@ function DotIcon({ className = "" }: { className?: string }) {
   );
 }
 
-function natToneBg(tone: "default" | "primary" | "success" | "warning" | "danger"): string {
+function natToneBg(tone: "default" | "accent" | "success" | "warning" | "danger"): string {
   switch (tone) {
     case "success":
       return "bg-emerald-500";
-    case "primary":
+    case "accent":
       return "bg-primary-500";
     case "warning":
       return "bg-amber-500";
@@ -2755,7 +2731,7 @@ function Rfc5780EndpointCard({ checks }: { checks: StunEndpointCheck[] }) {
             A1/A2 是两个公网地址，P1/P2 是两个 UDP 端口。预检只确认端点可达，不跨不同浏览器 socket 比较映射。
           </p>
         </div>
-        <Chip size="sm" variant="flat" color={checks.every((check) => check.reachable) ? "success" : "warning"}>
+        <Chip size="sm" variant="soft" color={checks.every((check) => check.reachable) ? "success" : "warning"}>
           {checks.filter((check) => check.reachable).length}/{checks.length} 可达
         </Chip>
       </div>
@@ -2985,7 +2961,7 @@ function relatedEndpointOf(candidate: BrowserIceCandidate) {
   return `${candidate.relatedAddress ?? "-"}:${candidate.relatedPort ?? "-"}`;
 }
 
-function candidateColor(type: string): "default" | "primary" | "success" | "warning" {
+function candidateColor(type: string): "default" | "accent" | "success" | "warning" {
   if (type === "srflx") {
     return "success";
   }
@@ -2993,7 +2969,7 @@ function candidateColor(type: string): "default" | "primary" | "success" | "warn
     return "warning";
   }
   if (type === "host") {
-    return "primary";
+    return "accent";
   }
   return "default";
 }
@@ -3001,7 +2977,7 @@ function candidateColor(type: string): "default" | "primary" | "success" | "warn
 function browserNatProfile(kind: BrowserNatKind): {
   title: string;
   badge: string;
-  color: "default" | "primary" | "success" | "warning" | "danger";
+  color: "default" | "accent" | "success" | "warning" | "danger";
   description: string;
 } {
   switch (kind) {
@@ -3009,7 +2985,7 @@ function browserNatProfile(kind: BrowserNatKind): {
       return {
         title: "正在检测",
         badge: "ICE gathering",
-        color: "primary",
+        color: "accent",
         description: "正在向 STUN 服务收集 ICE candidates，请稍候。",
       };
     case "not-supported":
@@ -3051,7 +3027,7 @@ function browserNatProfile(kind: BrowserNatKind): {
       return {
         title: "浏览器 NAT 检测",
         badge: "ready",
-        color: "primary",
+        color: "accent",
         description: "检测当前设备、当前浏览器、当前网络出口的 UDP/STUN 可达性，以及多个 STUN 看到的公网映射是否一致。",
       };
   }

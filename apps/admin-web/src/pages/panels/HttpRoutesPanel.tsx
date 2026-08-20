@@ -1,29 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import {
-  Button,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Pagination,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  useDisclosure,
-} from "@heroui/react";
+import { Button, Chip, Description, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, FieldError, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, TextField, useOverlayState } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { HttpRoute } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
@@ -67,7 +44,7 @@ export function HttpRoutesPanel() {
   const [pendingKeys, setPendingKeys] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
-  const editModal = useDisclosure();
+  const editModal = useOverlayState();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -204,29 +181,39 @@ export function HttpRoutesPanel() {
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
         <Select
           className="w-full sm:w-48"
-          label="客户端"
-          selectedKeys={createClientId ? [createClientId] : []}
-          onChange={(event) => setCreateClientId(event.target.value)}
-          isRequired
-        >
-          {clients.map((client) => (
-            <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
+          isRequired selectedKey={createClientId || null} onSelectionChange={(event) => setCreateClientId(String(event ?? ""))}>
+          <Label>客户端</Label>
+          <SelectTrigger>
+            <SelectValue />
+            <SelectIndicator />
+          </SelectTrigger>
+          <SelectPopover>
+            <ListBox>
+              {clients.map((client) => (
+            <ListBoxItem id={String(client.id)}>{client.clientName}</ListBoxItem>
           ))}
+            </ListBox>
+          </SelectPopover>
         </Select>
-        <Input className="w-full sm:w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
-        <Input className="w-full sm:w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
-        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+        <TextField value={route} onChange={setRoute} isRequired className="w-full sm:w-40">
+          <Label>路由名</Label>
+          <Input placeholder="web" maxLength={60} />
+        </TextField>
+        <TextField value={targetBaseUrl} onChange={setTargetBaseUrl} isRequired className="w-full sm:w-64">
+          <Label>目标地址</Label>
+          <Input placeholder="http://127.0.0.1:8080" maxLength={512} />
+        </TextField>
+        <Button variant="primary" className="h-14 w-full sm:w-auto" type="submit" isDisabled={creating}>{creating ? <Spinner size="sm" /> : null}
           新建路由
         </Button>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="secondary" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
         <div className="w-full rounded-medium border border-default-200 bg-default-50/70 p-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
             <Switch
-              size="sm"
               isSelected={authEnabled}
-              onValueChange={(enabled) => {
+              onChange={(enabled) => {
                 setAuthEnabled(enabled);
                 setAuthValidationVisible(false);
               }}
@@ -240,27 +227,16 @@ export function HttpRoutesPanel() {
           </div>
           {authEnabled ? (
             <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
-              <Input
-                autoComplete="off"
-                label="访问用户名"
-                maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}
-                value={authUsername}
-                onValueChange={setAuthUsername}
-                isInvalid={Boolean(createAuthError && createAuthError.includes("用户名"))}
-                errorMessage={createAuthError.includes("用户名") ? createAuthError : ""}
-                isRequired
-              />
-              <Input
-                autoComplete="new-password"
-                label="访问密码"
-                maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}
-                type="password"
-                value={authPassword}
-                onValueChange={setAuthPassword}
-                isInvalid={Boolean(createAuthError && createAuthError.includes("密码"))}
-                errorMessage={createAuthError.includes("密码") ? createAuthError : ""}
-                isRequired
-              />
+              <TextField value={authUsername} onChange={setAuthUsername} isRequired isInvalid={Boolean(createAuthError && createAuthError.includes("用户名"))} autoComplete="off">
+                <Label>访问用户名</Label>
+                <Input maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}  />
+                <FieldError>{createAuthError.includes("用户名") ? createAuthError : ""}</FieldError>
+              </TextField>
+              <TextField value={authPassword} onChange={setAuthPassword} isRequired isInvalid={Boolean(createAuthError && createAuthError.includes("密码"))} type="password" autoComplete="new-password">
+                <Label>访问密码</Label>
+                <Input maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}  />
+                <FieldError>{createAuthError.includes("密码") ? createAuthError : ""}</FieldError>
+              </TextField>
             </div>
           ) : null}
         </div>
@@ -277,15 +253,14 @@ export function HttpRoutesPanel() {
           >
             {lastCreatedAccessUrl}
           </a>
-          <Button size="sm" variant="flat" onPress={() => void copyAccessUrl(lastCreatedAccessUrl)}>
+          <Button size="sm" variant="secondary" onPress={() => void copyAccessUrl(lastCreatedAccessUrl)}>
             复制
           </Button>
           <Button
             isIconOnly
             aria-label="关闭提示"
             className="h-7 w-7 min-w-7"
-            size="sm"
-            variant="light"
+            size="sm" variant="ghost"
             onPress={() => setLastCreatedAccessUrl("")}
           >
             <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -297,15 +272,19 @@ export function HttpRoutesPanel() {
 
       <div className="flex flex-wrap items-end gap-3 xl:hidden">
         <Select
-          className="w-full sm:w-48"
-          label="筛选客户端"
-          items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}
-          selectedKeys={filterClientId ? [filterClientId] : [""]}
-          onChange={(event) => setFilterClientId(event.target.value)}
-        >
-          {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
+          className="w-full sm:w-48" selectedKey={filterClientId || ""} onSelectionChange={(event) => setFilterClientId(String(event ?? ""))}>
+          <Label>筛选客户端</Label>
+          <SelectTrigger>
+            <SelectValue />
+            <SelectIndicator />
+          </SelectTrigger>
+          <SelectPopover>
+            <ListBox items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}>
+              {(item) => <ListBoxItem id={item.id}>{item.clientName}</ListBoxItem>}
+            </ListBox>
+          </SelectPopover>
         </Select>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="secondary" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
       </div>
@@ -337,34 +316,30 @@ export function HttpRoutesPanel() {
                 badges={
                   <>
                     <Switch
-                      size="sm"
                       isSelected={item.enabled}
                       isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
-                      onValueChange={() => void toggle(item)}
+                      onChange={() => void toggle(item)}
                     >
                       启用
                     </Switch>
                     <Switch
-                      size="sm"
                       isSelected={Boolean(item.detailCaptureEnabled)}
                       isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
-                      onValueChange={() => void toggleDetailCapture(item)}
+                      onChange={() => void toggleDetailCapture(item)}
                     >
                       明细采集
                     </Switch>
                     <Switch
-                      size="sm"
                       isSelected={Boolean(item.pathRewriteEnabled)}
                       isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
-                      onValueChange={() => void togglePathRewrite(item)}
+                      onChange={() => void togglePathRewrite(item)}
                     >
                       路径改写
                     </Switch>
                     <Switch
-                      size="sm"
                       isSelected={Boolean(item.mediaCaptureEnabled)}
                       isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
-                      onValueChange={() => void toggleMediaCapture(item)}
+                      onChange={() => void toggleMediaCapture(item)}
                     >
                       媒体采集
                     </Switch>
@@ -386,8 +361,7 @@ export function HttpRoutesPanel() {
                         </a>
                         <Button
                           size="sm"
-                          className="w-fit"
-                          variant="light"
+                          className="w-fit" variant="ghost"
                           onPress={() => void copyAccessUrl(accessUrl)}
                         >
                           复制
@@ -399,10 +373,10 @@ export function HttpRoutesPanel() {
                 ]}
                 actions={
                   <>
-                    <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
+                    <Button size="sm" variant="secondary" onPress={() => { setEditing(item); editModal.open(); }}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
+                    <Button size="sm" variant="danger-soft" onPress={() => remove(item)}>
                       删除
                     </Button>
                   </>
@@ -417,9 +391,6 @@ export function HttpRoutesPanel() {
       <div className="hidden min-w-0 xl:block">
         <Table
           aria-label="HTTP 路由列表"
-          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
-          isHeaderSticky
-          removeWrapper
         >
         <TableHeader>
           <TableColumn className="w-[5%]">ID</TableColumn>
@@ -441,7 +412,7 @@ export function HttpRoutesPanel() {
           <TableColumn className="w-[10%]">更新时间</TableColumn>
           <TableColumn className="w-[10%]">操作</TableColumn>
         </TableHeader>
-        <TableBody items={pagedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
+        <TableBody items={pagedRoutes} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />)}>
           {(item) => {
             return (
             <TableRow key={item.id}>
@@ -474,37 +445,33 @@ export function HttpRoutesPanel() {
               <TableCell>
                 <Switch
                   aria-label="启用"
-                  size="sm"
                   isSelected={item.enabled}
                   isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
-                  onValueChange={() => void toggle(item)}
+                  onChange={() => void toggle(item)}
                 />
               </TableCell>
               <TableCell>
                 <Switch
                   aria-label="明细采集"
-                  size="sm"
                   isSelected={Boolean(item.detailCaptureEnabled)}
                   isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
-                  onValueChange={() => void toggleDetailCapture(item)}
+                  onChange={() => void toggleDetailCapture(item)}
                 />
               </TableCell>
               <TableCell>
                 <Switch
                   aria-label="媒体采集"
-                  size="sm"
                   isSelected={Boolean(item.mediaCaptureEnabled)}
                   isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
-                  onValueChange={() => void toggleMediaCapture(item)}
+                  onChange={() => void toggleMediaCapture(item)}
                 />
               </TableCell>
               <TableCell>
                 <Switch
                   aria-label="路径改写"
-                  size="sm"
                   isSelected={Boolean(item.pathRewriteEnabled)}
                   isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
-                  onValueChange={() => void togglePathRewrite(item)}
+                  onChange={() => void togglePathRewrite(item)}
                 />
               </TableCell>
               <TableCell>
@@ -514,10 +481,10 @@ export function HttpRoutesPanel() {
               </TableCell>
               <TableCell>
                 <div className="flex gap-1">
-                  <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
+                  <Button className="min-w-0 px-2" size="sm" variant="secondary" onPress={() => { setEditing(item); editModal.open(); }}>
                     编辑
                   </Button>
-                  <Button className="min-w-0 px-2" size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
+                  <Button className="min-w-0 px-2" size="sm" variant="danger-soft" onPress={() => remove(item)}>
                     删除
                   </Button>
                 </div>
@@ -531,7 +498,7 @@ export function HttpRoutesPanel() {
 
       {totalPages > 1 ? (
         <div className="flex justify-end">
-          <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+          <Pager page={safePage} total={totalPages} onChange={setPage}  />
         </div>
       ) : null}
 
@@ -564,7 +531,7 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
         {accessUrl}
       </a>
       <div>
-        <Button size="sm" variant="light" onPress={() => void copyAccessUrl(accessUrl)}>
+        <Button size="sm" variant="ghost" onPress={() => void copyAccessUrl(accessUrl)}>
           复制
         </Button>
       </div>
@@ -575,12 +542,9 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
 function HttpRouteAuthChip({ enabled }: { enabled: boolean }) {
   return (
     <Chip
-      color={enabled ? "primary" : "default"}
       size="sm"
-      startContent={<RouteAuthIcon locked={enabled} />}
       title={enabled ? "访问者需要通过 HTTP Basic 认证" : "无需认证即可访问"}
-      variant="flat"
-    >
+      variant="soft" color={enabled ? "accent" : "default"}>{<RouteAuthIcon locked={enabled} />}
       {enabled ? "Basic" : "公开"}
     </Chip>
   );
@@ -621,29 +585,27 @@ function ClientFilterHeader({
       <span className="truncate" title={label}>
         {label}
       </span>
-      <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+      <Dropdown>
         <DropdownTrigger>
           <Button
             isIconOnly
             aria-label="筛选客户端"
             className="h-7 min-w-7 text-default-500"
-            color={selectedClientId ? "primary" : "default"}
-            size="sm"
-            title="筛选客户端"
-            variant={selectedClientId ? "flat" : "light"}
-          >
+            size="sm" variant={selectedClientId ? "secondary" : "ghost"}>
             <FilterIcon />
           </Button>
         </DropdownTrigger>
-        <DropdownMenu
-          aria-label="筛选 HTTP 路由客户端"
-          items={filterItems}
-          selectedKeys={[selectedClientId || ""]}
-          selectionMode="single"
-          onAction={(key) => onSelect(String(key))}
-        >
-          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
-        </DropdownMenu>
+        <DropdownPopover placement="bottom start">
+          <DropdownMenu
+            aria-label="筛选 HTTP 路由客户端"
+            items={filterItems}
+            selectedKeys={[selectedClientId || ""]}
+            selectionMode="single"
+            onAction={(key) => onSelect(String(key))}
+          >
+            {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+          </DropdownMenu>
+        </DropdownPopover>
       </Dropdown>
     </div>
   );
@@ -671,7 +633,7 @@ async function copyAccessUrl(url: string): Promise<void> {
 }
 
 interface EditHttpRouteModalProps {
-  disclosure: ReturnType<typeof useDisclosure>;
+  disclosure: ReturnType<typeof useOverlayState>;
   route: HttpRoute | null;
   onSaved: () => void;
 }
@@ -736,7 +698,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         ...buildHttpRouteAuthMutation(authDraft),
       });
       notify("HTTP 路由已更新");
-      disclosure.onClose();
+      disclosure.close();
       onSaved();
     } catch (error) {
       notifyError(error, "更新失败");
@@ -746,86 +708,86 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   };
 
   return (
-    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange}>
-      <ModalContent>
-        {(onClose) => (
-          <>
-            <ModalHeader>编辑 HTTP 路由 #{route?.id}</ModalHeader>
-            <ModalBody className="gap-3">
-              <Input label="路由名" value={name} onValueChange={setName} maxLength={60} isRequired />
-              <Input label="目标地址" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
-              <div className="rounded-medium border border-default-200 bg-default-50/70 p-3">
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                  <Switch
-                    size="sm"
-                    isSelected={authEnabled}
-                    onValueChange={(nextEnabled) => {
-                      setAuthEnabled(nextEnabled);
-                      setAuthValidationVisible(false);
-                    }}
-                  >
-                    访问认证
-                  </Switch>
-                  <HttpRouteAuthChip enabled={authEnabled} />
-                </div>
-                <p className="mt-2 text-tiny text-default-500">
-                  {authEnabled
-                    ? "浏览器访问该路由时需要输入 HTTP Basic 用户名和密码。"
-                    : authPasswordConfigured
-                      ? "当前公开访问；已保存的凭据会保留，重新开启后可继续使用。"
-                      : "当前公开访问，拥有链接的访问者可直接打开。"}
-                </p>
-                {authEnabled ? (
-                  <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
-                    <Input
-                      autoComplete="off"
-                      label="访问用户名"
-                      maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}
-                      value={authUsername}
-                      onValueChange={setAuthUsername}
-                      isInvalid={Boolean(authError && authError.includes("用户名"))}
-                      errorMessage={authError.includes("用户名") ? authError : ""}
-                      isRequired
-                    />
-                    <Input
-                      autoComplete="new-password"
-                      description={authPasswordConfigured ? "留空表示保留当前密码" : "首次开启时必须设置密码"}
-                      label={authPasswordConfigured ? "更换访问密码" : "访问密码"}
-                      maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}
-                      type="password"
-                      value={authPassword}
-                      onValueChange={setAuthPassword}
-                      isInvalid={Boolean(authError && authError.includes("密码"))}
-                      errorMessage={authError.includes("密码") ? authError : ""}
-                      isRequired={!authPasswordConfigured}
-                    />
-                  </div>
-                ) : null}
-              </div>
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
-              <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
-                明细采集
-              </Switch>
-              <Switch isSelected={mediaCaptureEnabled} onValueChange={setMediaCaptureEnabled}>
-                媒体采集（RustFS）
-              </Switch>
-              <Switch isSelected={pathRewriteEnabled} onValueChange={setPathRewriteEnabled}>
-                路径改写
-              </Switch>
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+    <Modal.Root isOpen={disclosure.isOpen} onOpenChange={disclosure.setOpen}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog>
+            {({ close: onClose }) => (
+            <>
+            <Modal.Header>编辑 HTTP 路由 #{route?.id}</Modal.Header>
+            <Modal.Body className="gap-3">
+              <TextField value={name} onChange={setName} isRequired>
+                <Label>路由名</Label>
+                <Input maxLength={60} />
+              </TextField>
+            <TextField value={targetBaseUrl} onChange={setTargetBaseUrl} isRequired>
+              <Label>目标地址</Label>
+              <Input maxLength={512} />
+            </TextField>
+            <div className="rounded-medium border border-default-200 bg-default-50/70 p-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                <Switch
+                  isSelected={authEnabled}
+                  onChange={(nextEnabled) => {
+                    setAuthEnabled(nextEnabled);
+                    setAuthValidationVisible(false);
+                  }}
+                >
+                  访问认证
+                </Switch>
+                <HttpRouteAuthChip enabled={authEnabled} />
+            </div>
+            <p className="mt-2 text-tiny text-default-500">
+              {authEnabled
+                ? "浏览器访问该路由时需要输入 HTTP Basic 用户名和密码。"
+                : authPasswordConfigured
+                  ? "当前公开访问；已保存的凭据会保留，重新开启后可继续使用。"
+                  : "当前公开访问，拥有链接的访问者可直接打开。"}
+            </p>
+            {authEnabled ? (
+            <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
+              <TextField value={authUsername} onChange={setAuthUsername} isRequired isInvalid={Boolean(authError && authError.includes("用户名"))} autoComplete="off">
+                <Label>访问用户名</Label>
+                <Input maxLength={HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH}  />
+                <FieldError>{authError.includes("用户名") ? authError : ""}</FieldError>
+              </TextField>
+            <TextField value={authPassword} onChange={setAuthPassword} isRequired={!authPasswordConfigured} isInvalid={Boolean(authError && authError.includes("密码"))} type="password" autoComplete="new-password">
+              <Label>{authPasswordConfigured ? "更换访问密码" : "访问密码"}</Label>
+              <Input
+              maxLength={HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH}   />
+              <Description>{authPasswordConfigured ? "留空表示保留当前密码" : "首次开启时必须设置密码"}</Description>
+              <FieldError>{authError.includes("密码") ? authError : ""}</FieldError>
+            </TextField>
+            </div>
+            ) : null}
+            </div>
+            <Switch isSelected={enabled} onChange={setEnabled}>
+              启用
+            </Switch>
+            <Switch isSelected={detailCaptureEnabled} onChange={setDetailCaptureEnabled}>
+              明细采集
+            </Switch>
+            <Switch isSelected={mediaCaptureEnabled} onChange={setMediaCaptureEnabled}>
+              媒体采集（RustFS）
+            </Switch>
+            <Switch isSelected={pathRewriteEnabled} onChange={setPathRewriteEnabled}>
+              路径改写
+            </Switch>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isDisabled={Boolean(authError)} isLoading={saving} onPress={() => void save()}>
+              <Button variant="primary" isDisabled={Boolean(authError) || saving} onPress={() => void save()}>{saving ? <Spinner size="sm" /> : null}
                 保存
               </Button>
-            </ModalFooter>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+            </Modal.Footer>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }
