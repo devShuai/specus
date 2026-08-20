@@ -1084,7 +1084,7 @@ function MediaPlayer({
                     onAction={(key) => changePlaybackRate(Number(key))}
                   >
                     {PLAYER_RATES.map((rate) => (
-                      <DropdownItem key={String(rate)}>{rate}×</DropdownItem>
+                      <DropdownItem key={String(rate)} id={String(rate)}>{rate}×</DropdownItem>
                     ))}
                   </DropdownMenu>
                 </DropdownPopover>

@@ -1694,12 +1694,12 @@ export function SyncedWhiteboard({
                     selectTool(action as WhiteboardTool);
                   }}
                 >
-                  <DropdownItem key="text">{<ToolGlyph name="text" />}文本</DropdownItem>
-                  <DropdownItem key="rectangle">{<ToolGlyph name="rectangle" />}矩形</DropdownItem>
-                  <DropdownItem key="ellipse">{<ToolGlyph name="ellipse" />}圆形</DropdownItem>
-                  <DropdownItem key="arrow">{<ToolGlyph name="arrow" />}箭头</DropdownItem>
-                  <DropdownItem key="flow">{<ToolGlyph name="flow" />}流程图组件</DropdownItem>
-                  <DropdownItem key="image">{<ToolGlyph name="image" />}
+                  <DropdownItem id="text">{<ToolGlyph name="text" />}文本</DropdownItem>
+                  <DropdownItem id="rectangle">{<ToolGlyph name="rectangle" />}矩形</DropdownItem>
+                  <DropdownItem id="ellipse">{<ToolGlyph name="ellipse" />}圆形</DropdownItem>
+                  <DropdownItem id="arrow">{<ToolGlyph name="arrow" />}箭头</DropdownItem>
+                  <DropdownItem id="flow">{<ToolGlyph name="flow" />}流程图组件</DropdownItem>
+                  <DropdownItem id="image">{<ToolGlyph name="image" />}
                     {isImportingImage ? "图片处理中" : "插入图片"}
                   </DropdownItem>
                 </DropdownMenu>
@@ -1874,10 +1874,10 @@ export function SyncedWhiteboard({
                     }
                   }}
                 >
-                  <DropdownItem key="import">{<ToolGlyph name="import" />}
+                  <DropdownItem id="import">{<ToolGlyph name="import" />}
                     {isImportingDocument ? "正在导入" : "导入白板"}
                   </DropdownItem>
-                  <DropdownItem key="export">{<ToolGlyph name="export" />}导出白板</DropdownItem>
+                  <DropdownItem id="export">{<ToolGlyph name="export" />}导出白板</DropdownItem>
                 </DropdownMenu>
               </DropdownPopover>
             </Dropdown>
@@ -1908,13 +1908,13 @@ export function SyncedWhiteboard({
                     }
                   }}
                 >
-                  <DropdownItem key="undo">{<ToolGlyph name="undo" />}
+                  <DropdownItem id="undo">{<ToolGlyph name="undo" />}
                     撤销
                   {<span className="text-[10px] text-zinc-400">Ctrl Z</span>}</DropdownItem>
-                  <DropdownItem key="delete">{<ToolGlyph name="delete" />}
+                  <DropdownItem id="delete">{<ToolGlyph name="delete" />}
                     删除所选
                   {<span className="text-[10px] text-zinc-400">Delete</span>}</DropdownItem>
-                  <DropdownItem key="clear" className="text-danger">{<ToolGlyph name="clear" />}
+                  <DropdownItem className="text-danger" id="clear">{<ToolGlyph name="clear" />}
                     清空白板
                   </DropdownItem>
                 </DropdownMenu>

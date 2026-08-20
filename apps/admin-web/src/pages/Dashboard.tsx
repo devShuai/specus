@@ -252,22 +252,22 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
           else if (key === "docs") window.location.hash = "/help";
         }}>
           <DropdownSection aria-label="主题">
-            <DropdownItem key="theme-dark">{"\uD83C\uDF19"} 深色模式{mode === "dark" ? <CheckIcon /> : null}</DropdownItem>
-            <DropdownItem key="theme-light">{"\u2600\uFE0F"} 浅色模式{mode === "light" ? <CheckIcon /> : null}</DropdownItem>
-            <DropdownItem key="theme-system">{"\uD83D\uDDA5\uFE0F"} 跟随系统{mode === "system" ? <CheckIcon /> : null}</DropdownItem>
+            <DropdownItem id="theme-dark">{"\uD83C\uDF19"} 深色模式{mode === "dark" ? <CheckIcon /> : null}</DropdownItem>
+            <DropdownItem id="theme-light">{"\u2600\uFE0F"} 浅色模式{mode === "light" ? <CheckIcon /> : null}</DropdownItem>
+            <DropdownItem id="theme-system">{"\uD83D\uDDA5\uFE0F"} 跟随系统{mode === "system" ? <CheckIcon /> : null}</DropdownItem>
           </DropdownSection>
           <DropdownSection aria-label="快捷">
-            <DropdownItem key="docs">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
+            <DropdownItem id="docs">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
           </DropdownSection>
           <DropdownSection aria-label="账户">
-            <DropdownItem key="profile">
+            <DropdownItem id="profile">
               <div className="min-w-48 space-y-1 py-1">
                 <div className="text-small font-semibold text-foreground">{name}</div>
                 <div className="text-tiny text-default-500">租户: {profile?.tenantId || "-"}</div>
                 <div className="text-tiny text-default-500">角色: {profile?.admin ? "管理员" : "普通用户"}</div>
               </div>
             </DropdownItem>
-            <DropdownItem key="logout" className="text-danger">退出登录</DropdownItem>
+            <DropdownItem className="text-danger" id="logout">退出登录</DropdownItem>
           </DropdownSection>
         </DropdownMenu>
       </DropdownPopover>

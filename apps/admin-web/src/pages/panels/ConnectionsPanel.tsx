@@ -467,7 +467,7 @@ function ConnectionClientFilterHeader({
             selectionMode="single"
             onAction={(key) => onSelect(String(key))}
           >
-            {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+            {(item) => <DropdownItem id={item.key}>{item.label}</DropdownItem>}
           </DropdownMenu>
         </DropdownPopover>
       </Dropdown>
@@ -504,7 +504,7 @@ function ConnectionResultFilterHeader({
             selectionMode="single"
             onAction={(key) => onSelect(String(key))}
           >
-            {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+            {(item) => <DropdownItem id={item.key}>{item.label}</DropdownItem>}
           </DropdownMenu>
         </DropdownPopover>
       </Dropdown>

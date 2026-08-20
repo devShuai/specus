@@ -6085,9 +6085,7 @@ function DiagramToolbarMenu({
         >
           {(item) => (
             <DropdownItem
-              key={item.key}
-              className={`rounded-md px-2.5 py-2 text-[11px] data-[hover=true]:bg-[var(--diagram-apple-blue-soft)] data-[hover=true]:text-[var(--diagram-apple-blue)] ${item.danger ? "text-[var(--diagram-apple-danger)]" : "text-[var(--diagram-apple-ink)]"}`}
-            >
+              className={`rounded-md px-2.5 py-2 text-[11px] data-[hover=true]:bg-[var(--diagram-apple-blue-soft)] data-[hover=true]:text-[var(--diagram-apple-blue)] ${item.danger ? "text-[var(--diagram-apple-danger)]" : "text-[var(--diagram-apple-ink)]"}`} key={item.key} id={item.key}>
               <span className="min-w-0">
                 {item.section ? <span className="mb-1 block text-[11px] font-semibold uppercase text-zinc-400">{item.section}</span> : null}
                 <span className="block">{item.label}</span>
