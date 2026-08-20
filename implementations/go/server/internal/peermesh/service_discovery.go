@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,9 +17,9 @@ import (
 )
 
 type catalogKey struct {
-	tenantID            string
-	publisherClientID   int64
-	publisherSessionID  int64
+	tenantID           string
+	publisherClientID  int64
+	publisherSessionID int64
 }
 
 type catalogSnapshot struct {
@@ -187,6 +188,7 @@ func (s *Service) CreateSharedService(ctx context.Context, access AccessContext,
 	if err := s.db.InsertPeerMeshSharedService(ctx, row); err != nil {
 		return SharedServiceView{}, err
 	}
+	s.PushConfig(ctx, *account)
 	return s.sharedServiceView(ctx, row, true), nil
 }
 
@@ -201,7 +203,6 @@ func (s *Service) UpdateSharedService(ctx context.Context, access AccessContext,
 		}
 		return SharedServiceView{}, errors.New("service not found")
 	}
-	wasEnabled := row.Enabled
 	if err := applyServiceMutation(row, mutation, false); err != nil {
 		return SharedServiceView{}, err
 	}
@@ -212,9 +213,12 @@ func (s *Service) UpdateSharedService(ctx context.Context, access AccessContext,
 	if err := s.db.UpdatePeerMeshSharedService(ctx, *row); err != nil {
 		return SharedServiceView{}, err
 	}
-	if wasEnabled && !row.Enabled {
-		s.withdrawClient(ctx, row.TenantID, row.ClientID)
+	account, err := s.findTenantClient(ctx, row.TenantID, row.ClientID)
+	if err != nil {
+		return SharedServiceView{}, err
 	}
+	s.PushConfig(ctx, *account)
+	s.withdrawClient(ctx, row.TenantID, row.ClientID)
 	return s.sharedServiceView(ctx, *row, true), nil
 }
 
@@ -232,6 +236,11 @@ func (s *Service) DeleteSharedService(ctx context.Context, access AccessContext,
 	if err := s.db.DeletePeerMeshSharedService(ctx, access.TenantID, id); err != nil {
 		return err
 	}
+	account, err := s.findTenantClient(ctx, row.TenantID, row.ClientID)
+	if err != nil {
+		return err
+	}
+	s.PushConfig(ctx, *account)
 	s.withdrawClient(ctx, row.TenantID, row.ClientID)
 	return nil
 }
@@ -245,6 +254,11 @@ func (s *Service) OnClientDisconnected(ctx context.Context, clientName string, s
 		return
 	}
 	s.withdrawSession(ctx, *account, sessionID)
+	key := catalogKey{account.TenantID, account.ID, sessionID}
+	s.catalogMu.Lock()
+	delete(s.catalogRevisions, key)
+	delete(s.serviceReportRates, sessionID)
+	s.catalogMu.Unlock()
 }
 
 func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAccount, report ControlMessage, publisherSessionID int64) error {
@@ -258,6 +272,20 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 		}
 		publisherSessionID = online.ID
 	}
+	publisherSession, err := s.db.GetClientSession(ctx, publisherSessionID)
+	if err != nil {
+		return err
+	}
+	if publisherSession.TenantID != source.TenantID || publisherSession.ClientID != source.ID ||
+		publisherSession.Status != "NETTY_ONLINE" {
+		return errors.New("publisher session is not current")
+	}
+	if publisherSession.PeerServiceDiscoveryVersion < peerServiceDiscoveryVersion {
+		return errors.New("publisher does not support peer service discovery v2")
+	}
+	if err := s.enforceServiceReportRate(publisherSessionID, time.Now()); err != nil {
+		return err
+	}
 	revision := int64(0)
 	if report.Revision != nil {
 		revision = *report.Revision
@@ -266,15 +294,15 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 		return errors.New("revision must be >= 1")
 	}
 	key := catalogKey{source.TenantID, source.ID, publisherSessionID}
-	s.catalogMu.Lock()
-	previous, ok := s.catalogs[key]
-	s.catalogMu.Unlock()
-	if ok && revision <= previous.revision {
+	if !s.acceptCatalogRevision(key, revision) {
 		return nil
 	}
 	enabled := report.Enabled != nil && *report.Enabled
 	if !enabled || !s.effectiveSharing(ctx, source) {
-		s.withdrawSession(ctx, source, publisherSessionID)
+		s.catalogMu.Lock()
+		delete(s.catalogs, key)
+		s.catalogMu.Unlock()
+		s.fanoutCatalog(ctx, source, publisherSessionID, revision, nil, time.Now())
 		return nil
 	}
 	roster, err := s.AllowedRoster(ctx, source)
@@ -306,6 +334,32 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 	s.audit("service-report", source.TenantID, &source.ID, &publisherSessionID, "", "published")
 	s.catalogMu.Unlock()
 	s.fanoutCatalog(ctx, source, publisherSessionID, revision, advertised, expiresAt)
+	return nil
+}
+
+func (s *Service) enforceServiceReportRate(sessionID int64, now time.Time) error {
+	const maxWindows = 4096
+	const limit = 20
+	cutoff := now.Add(-time.Minute)
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+	stamps, exists := s.serviceReportRates[sessionID]
+	if !exists && len(s.serviceReportRates) >= maxWindows {
+		s.audit("service-report", "", nil, &sessionID, "", "rate-table-full")
+		return errors.New("service-report rate limited")
+	}
+	kept := stamps[:0]
+	for _, stamp := range stamps {
+		if !stamp.Before(cutoff) {
+			kept = append(kept, stamp)
+		}
+	}
+	if len(kept) >= limit {
+		s.serviceReportRates[sessionID] = kept
+		s.audit("service-report", "", nil, &sessionID, "", "rate-limited")
+		return errors.New("service-report rate limited")
+	}
+	s.serviceReportRates[sessionID] = append(kept, now)
 	return nil
 }
 
@@ -344,6 +398,11 @@ func (s *Service) advertisedFromReport(ctx context.Context, source store.ClientA
 }
 
 func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccount, publisherSessionID, revision int64, services []AdvertisedService, expiresAt time.Time) {
+	s.fanoutCatalogMode(ctx, publisher, publisherSessionID, revision, services, expiresAt, false)
+}
+
+func (s *Service) fanoutCatalogMode(ctx context.Context, publisher store.ClientAccount, publisherSessionID, revision int64,
+	services []AdvertisedService, expiresAt time.Time, includeDenied bool) {
 	clients, err := s.db.ListClients(ctx)
 	if err != nil {
 		return
@@ -353,7 +412,7 @@ func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccou
 			continue
 		}
 		ok, err := s.CanPeer(ctx, publisher, recipient)
-		if err != nil || !ok {
+		if err != nil || (!ok && !includeDenied) {
 			continue
 		}
 		bound, found := s.sessions.Find(recipient.ClientName)
@@ -362,7 +421,7 @@ func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccou
 		}
 		visible := make([]AdvertisedService, 0, len(services))
 		for _, service := range services {
-			if s.visibleTo(ctx, publisher, recipient, service) {
+			if ok && s.visibleTo(ctx, publisher, recipient, service) {
 				visible = append(visible, service)
 			}
 		}
@@ -371,6 +430,79 @@ func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccou
 			Type: TypeServiceCatalog, PublisherClientID: publisher.ID, PublisherClientName: publisher.ClientName,
 			PublisherSessionID: &sessionID, Revision: &revision, ExpiresAt: expiresAt.UTC().Format(time.RFC3339Nano),
 			Services: visible, CreatedAtMillis: time.Now().UnixMilli(),
+		})
+	}
+}
+
+func (s *Service) onAuthorizationChanged(ctx context.Context, tenantID string) {
+	type changed struct {
+		key      catalogKey
+		snapshot catalogSnapshot
+	}
+	var snapshots []changed
+	s.catalogMu.Lock()
+	for key, snapshot := range s.catalogs {
+		if key.tenantID != tenantID {
+			continue
+		}
+		snapshot.revision = s.nextCatalogRevisionLocked(key)
+		s.catalogs[key] = snapshot
+		snapshots = append(snapshots, changed{key: key, snapshot: snapshot})
+	}
+	s.catalogMu.Unlock()
+	for _, item := range snapshots {
+		publisher, err := s.findTenantClient(ctx, tenantID, item.key.publisherClientID)
+		if err == nil && publisher != nil {
+			s.fanoutCatalogMode(ctx, *publisher, item.key.publisherSessionID, item.snapshot.revision,
+				item.snapshot.services, item.snapshot.expiresAt, true)
+		}
+	}
+}
+
+func (s *Service) pushCurrentCatalogs(ctx context.Context, recipient store.ClientAccount) {
+	bound, found := s.sessions.Find(recipient.ClientName)
+	if !found || bound == nil {
+		return
+	}
+	type current struct {
+		key      catalogKey
+		snapshot catalogSnapshot
+	}
+	now := time.Now()
+	var snapshots []current
+	s.catalogMu.Lock()
+	for key, snapshot := range s.catalogs {
+		if key.tenantID == recipient.TenantID && key.publisherClientID != recipient.ID && snapshot.expiresAt.After(now) {
+			snapshot.services = append([]AdvertisedService(nil), snapshot.services...)
+			snapshots = append(snapshots, current{key: key, snapshot: snapshot})
+		}
+	}
+	s.catalogMu.Unlock()
+	for _, item := range snapshots {
+		publisher, err := s.findTenantClient(ctx, item.key.tenantID, item.key.publisherClientID)
+		if err != nil || publisher == nil {
+			continue
+		}
+		allowed, err := s.CanPeer(ctx, *publisher, recipient)
+		if err != nil || !allowed {
+			continue
+		}
+		visible := make([]AdvertisedService, 0, len(item.snapshot.services))
+		for _, service := range item.snapshot.services {
+			if s.visibleTo(ctx, *publisher, recipient, service) {
+				visible = append(visible, service)
+			}
+		}
+		if len(visible) == 0 {
+			continue
+		}
+		sessionID := item.key.publisherSessionID
+		revision := item.snapshot.revision
+		_ = s.sendSignal(bound, "server", recipient.ClientName, ControlMessage{
+			Type: TypeServiceCatalog, PublisherClientID: publisher.ID, PublisherClientName: publisher.ClientName,
+			PublisherSessionID: &sessionID, Revision: &revision,
+			ExpiresAt: item.snapshot.expiresAt.UTC().Format(time.RFC3339Nano), Services: visible,
+			CreatedAtMillis: time.Now().UnixMilli(),
 		})
 	}
 }
@@ -396,10 +528,61 @@ func (s *Service) visibleTo(ctx context.Context, publisher, recipient store.Clie
 }
 
 func (s *Service) withdrawSession(ctx context.Context, publisher store.ClientAccount, sessionID int64) {
+	key := catalogKey{publisher.TenantID, publisher.ID, sessionID}
 	s.catalogMu.Lock()
-	delete(s.catalogs, catalogKey{publisher.TenantID, publisher.ID, sessionID})
+	delete(s.catalogs, key)
+	delete(s.serviceReportRates, sessionID)
+	revision := s.nextCatalogRevisionLocked(key)
 	s.catalogMu.Unlock()
-	s.fanoutCatalog(ctx, publisher, sessionID, 0, nil, time.Now())
+	s.fanoutCatalog(ctx, publisher, sessionID, revision, nil, time.Now())
+}
+
+func (s *Service) acceptCatalogRevision(key catalogKey, revision int64) bool {
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
+		return false
+	}
+	if previous := s.catalogRevisions[key]; revision <= previous {
+		return false
+	}
+	s.catalogRevisions[key] = revision
+	return true
+}
+
+func (s *Service) nextCatalogRevisionLocked(key catalogKey) int64 {
+	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
+		return int64(^uint64(0) >> 1)
+	}
+	next := s.catalogRevisions[key] + 1
+	if next < 1 {
+		next = 1
+	}
+	s.catalogRevisions[key] = next
+	return next
+}
+
+func (s *Service) expireServiceCatalogs(ctx context.Context, now time.Time) {
+	type expiredCatalog struct {
+		key      catalogKey
+		revision int64
+	}
+	var expired []expiredCatalog
+	s.catalogMu.Lock()
+	for key, snapshot := range s.catalogs {
+		if snapshot.expiresAt.After(now) {
+			continue
+		}
+		delete(s.catalogs, key)
+		expired = append(expired, expiredCatalog{key: key, revision: s.nextCatalogRevisionLocked(key)})
+	}
+	s.catalogMu.Unlock()
+	for _, item := range expired {
+		publisher, err := s.findTenantClient(ctx, item.key.tenantID, item.key.publisherClientID)
+		if err == nil && publisher != nil {
+			s.fanoutCatalog(ctx, *publisher, item.key.publisherSessionID, item.revision, nil, now)
+		}
+	}
 }
 
 func (s *Service) withdrawClient(ctx context.Context, tenantID string, clientID int64) {
@@ -473,31 +656,67 @@ func (s *Service) effectiveSharing(ctx context.Context, account store.ClientAcco
 	return err == nil && device != nil && device.Enabled
 }
 
-func (s *Service) localServicesFor(account store.ClientAccount) []LocalPeerService {
+func (s *Service) localServicesFor(ctx context.Context, account store.ClientAccount, clientProtocolVersion int) []LocalPeerService {
 	out := []LocalPeerService{}
-	if s.db == nil {
+	if s.db == nil || clientProtocolVersion < 2 {
 		return out
 	}
-	rows, err := s.db.ListPeerMeshSharedServices(context.Background(), account.TenantID, []int64{account.ID})
+	rows, err := s.db.ListPeerMeshSharedServices(ctx, account.TenantID, []int64{account.ID})
 	if err != nil {
 		return out
 	}
 	for _, row := range rows {
+		allowedPeerVirtualIPs := s.allowedPeerVirtualIPs(ctx, account, row)
 		out = append(out, LocalPeerService{
-			ServiceID:     row.ServiceID,
-			Name:          row.Name,
-			Description:   row.Description,
-			Transport:     row.Transport,
-			Application:   row.Application,
-			TargetHost:    row.TargetHost,
-			TargetPort:    row.TargetPort,
-			PublishedPort: row.PublishedPort,
-			Path:          row.Path,
-			Enabled:       row.Enabled,
-			Visibility:    row.Visibility,
+			ServiceID:             row.ServiceID,
+			Name:                  row.Name,
+			Description:           row.Description,
+			Transport:             row.Transport,
+			Application:           row.Application,
+			TargetHost:            row.TargetHost,
+			TargetPort:            row.TargetPort,
+			PublishedPort:         row.PublishedPort,
+			Path:                  row.Path,
+			Enabled:               row.Enabled,
+			Visibility:            row.Visibility,
+			AllowedPeerVirtualIPs: allowedPeerVirtualIPs,
 		})
 	}
 	return out
+}
+
+func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.ClientAccount, definition store.PeerMeshSharedService) []string {
+	if !definition.Enabled {
+		return []string{}
+	}
+	clients, err := s.db.ListClients(ctx)
+	if err != nil {
+		return []string{}
+	}
+	explicit := decodeClientIDs(definition.AllowedClientIDs)
+	allowed := make([]string, 0)
+	for _, recipient := range clients {
+		if recipient.ID == publisher.ID || recipient.TenantID != publisher.TenantID {
+			continue
+		}
+		canPeer, err := s.CanPeer(ctx, publisher, recipient)
+		if err != nil || !canPeer {
+			continue
+		}
+		visible := normalizeOwner(publisher.OwnerUsername) == normalizeOwner(recipient.OwnerUsername)
+		if !strings.EqualFold(definition.Visibility, "OWNER") {
+			visible = len(explicit) == 0 || slices.Contains(explicit, recipient.ID)
+		}
+		if !visible {
+			continue
+		}
+		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, publisher.TenantID, recipient.ID)
+		if err == nil && device != nil && device.Enabled && strings.TrimSpace(device.VirtualIP) != "" {
+			allowed = append(allowed, strings.TrimSpace(device.VirtualIP))
+		}
+	}
+	slices.Sort(allowed)
+	return slices.Compact(allowed)
 }
 
 func (s *Service) sharingStatusFor(account store.ClientAccount, device *store.PeerMeshDevice) ServiceSharingStatus {
@@ -567,7 +786,7 @@ func (s *Service) sharedServiceView(ctx context.Context, row store.PeerMeshShare
 		Name: row.Name, Description: row.Description, Transport: row.Transport, Application: row.Application,
 		PublishedPort: row.PublishedPort, Path: row.Path, Enabled: row.Enabled, Visibility: row.Visibility,
 		AllowedClientIDs: decodeClientIDs(row.AllowedClientIDs),
-		CreatedAt: row.CreatedAt.UTC().Format(time.RFC3339Nano), UpdatedAt: row.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		CreatedAt:        row.CreatedAt.UTC().Format(time.RFC3339Nano), UpdatedAt: row.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if includeTarget {
 		host := row.TargetHost

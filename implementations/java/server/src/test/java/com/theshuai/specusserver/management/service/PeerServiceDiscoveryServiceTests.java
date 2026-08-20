@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshServiceSharing;
 import com.theshuai.specusserver.management.model.PeerMeshSharedService;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRepository;
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
@@ -34,11 +35,12 @@ class PeerServiceDiscoveryServiceTests {
     private final PeerMeshSharedServiceRepository serviceRepository = mock(PeerMeshSharedServiceRepository.class);
     private final PeerMeshDeviceRepository deviceRepository = mock(PeerMeshDeviceRepository.class);
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
+    private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
     private final SpecusMappingRepository specusMappingRepository = mock(SpecusMappingRepository.class);
     private final HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
     private final PeerServiceDiscoveryService service = new PeerServiceDiscoveryService(
             peerMeshService, sharingRepository, serviceRepository, deviceRepository, clientAccountRepository,
-            specusMappingRepository, httpRouteMappingRepository);
+            clientSessionRepository, specusMappingRepository, httpRouteMappingRepository);
 
     {
         when(specusMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(any(), any())).thenReturn(List.of());
@@ -140,6 +142,7 @@ class PeerServiceDiscoveryServiceTests {
         when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(new PeerMeshService.PeerRosterItem(
                 2L, "b", "100.96.0.2", "pk", true, false, false, false, false, 0, 1, List.of("ssh"))));
         when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
+        when(clientAccountRepository.findByIdAndTenantId(1L, "tenant-a")).thenReturn(Optional.of(publisher));
         when(peerMeshService.canPeer(publisher, peer)).thenReturn(true);
 
         PeerControlMessage first = reportMessage(definition.getServiceId());
@@ -155,6 +158,55 @@ class PeerServiceDiscoveryServiceTests {
                     assertThat(item.getName()).isEqualTo("local-ssh");
                     assertThat(item.getPublishedPort()).isEqualTo(2222);
                 });
+        assertThat(service.catalogsForRecipient(peer))
+                .singleElement()
+                .satisfies(delivery -> {
+                    assertThat(delivery.recipient()).isSameAs(peer);
+                    assertThat(delivery.catalog().getPublisherSessionId()).isEqualTo(99L);
+                    assertThat(delivery.catalog().getRevision()).isEqualTo(2L);
+                    assertThat(delivery.catalog().getServices()).hasSize(1);
+                });
+    }
+
+    @Test
+    void withdrawalKeepsRevisionTombstoneAndServerBoundsClientTtl() {
+        ClientAccount publisher = client(1, "alice", "a");
+        ClientAccount peer = client(2, "alice", "b");
+        PeerMeshSharedService definition = definition(publisher);
+        PeerMeshServiceSharing sharing = new PeerMeshServiceSharing();
+        sharing.setTenantId("tenant-a");
+        sharing.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.of(sharing));
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device(1, "a", true)));
+        when(serviceRepository.findByTenantIdAndClientIdOrderByNameAsc("tenant-a", 1L)).thenReturn(List.of(definition));
+        when(serviceRepository.findByTenantIdAndClientIdAndServiceId("tenant-a", 1L, definition.getServiceId()))
+                .thenReturn(Optional.of(definition));
+        when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(new PeerMeshService.PeerRosterItem(
+                2L, "b", "100.96.0.2", "pk", true, false, false, false, false, 0, 2, List.of("ssh"))));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
+        when(peerMeshService.canPeer(publisher, peer)).thenReturn(true);
+
+        PeerControlMessage published = reportMessage(definition.getServiceId());
+        published.setRevision(2L);
+        published.setGeneratedAt("2099-01-01T00:00:00Z");
+        published.setExpiresAt("2099-01-01T01:00:00Z");
+        service.acceptReport(publisher, published, 99L);
+        var snapshot = service.currentCatalog("tenant-a", 1L, 99L);
+        assertThat(snapshot.expiresAt()).isBefore(Instant.now().plusSeconds(301));
+
+        PeerControlMessage withdrawal = reportMessage(definition.getServiceId());
+        withdrawal.setRevision(3L);
+        withdrawal.setEnabled(false);
+        var deliveries = service.acceptReport(publisher, withdrawal, 99L);
+        assertThat(deliveries).allSatisfy(item -> assertThat(item.catalog().getRevision()).isEqualTo(3L));
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
+
+        assertThat(service.acceptReport(publisher, published, 99L)).isEmpty();
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
+
+        service.onClientDisconnected(publisher, 99L);
+        assertThat(service.trackedCatalogRevisionCount()).isZero();
     }
 
     private static ManagementContext admin() {

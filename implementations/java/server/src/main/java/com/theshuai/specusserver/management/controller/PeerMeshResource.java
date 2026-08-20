@@ -78,7 +78,7 @@ public class PeerMeshResource {
                                      @RequestBody PeerMeshService.AclMutation request) {
         var context = contextResolver.resolve(jwt);
         PeerMeshAclView created = peerMeshService.createAcl(context, request);
-        peerSignalService.pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
+        peerSignalService.refreshAuthorization(context);
         return created;
     }
 
@@ -86,7 +86,7 @@ public class PeerMeshResource {
     public void deleteAcl(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
         var context = contextResolver.resolve(jwt);
         peerMeshService.deleteAcl(context, id);
-        peerSignalService.pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
+        peerSignalService.refreshAuthorization(context);
     }
 
     /** 打洞/路径聚合统计：activeDirectRatio 即当前活跃会话的直连占比 */
@@ -151,21 +151,28 @@ public class PeerMeshResource {
     @PostMapping("/services")
     public PeerMeshSharedServiceView createService(@AuthenticationPrincipal Jwt jwt,
                                                    @RequestBody PeerServiceDiscoveryService.ServiceMutation request) {
-        return peerServiceDiscoveryService.createService(contextResolver.resolve(jwt), request);
+        var context = contextResolver.resolve(jwt);
+        var created = peerServiceDiscoveryService.createService(context, request);
+        peerSignalService.pushServiceConfig(context, created.clientId());
+        return created;
     }
 
     @PutMapping("/services/{id}")
     public PeerMeshSharedServiceView updateService(@AuthenticationPrincipal Jwt jwt,
                                                    @PathVariable long id,
                                                    @RequestBody PeerServiceDiscoveryService.ServiceMutation request) {
-        var result = peerServiceDiscoveryService.updateService(contextResolver.resolve(jwt), id, request);
+        var context = contextResolver.resolve(jwt);
+        var result = peerServiceDiscoveryService.updateService(context, id, request);
+        peerSignalService.pushServiceConfig(context, result.service().clientId());
         peerSignalService.pushCatalogs(result.catalogs());
         return result.service();
     }
 
     @DeleteMapping("/services/{id}")
     public void deleteService(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        var result = peerServiceDiscoveryService.deleteService(contextResolver.resolve(jwt), id);
+        var context = contextResolver.resolve(jwt);
+        var result = peerServiceDiscoveryService.deleteService(context, id);
+        peerSignalService.pushServiceConfig(context, result.service().clientId());
         peerSignalService.pushCatalogs(result.catalogs());
     }
 

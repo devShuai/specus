@@ -3,10 +3,106 @@ package peermesh
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
+
+func TestServiceReportWithdrawalKeepsRevisionTombstoneAndServerTTL(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{Enabled: true, CIDR: "100.96.0.0/11", SessionTTLSeconds: 3600}, db, registry, nil)
+	publisher := insertPeerClient(t, db, 3020, "tenant-a", "alice", "alice-laptop")
+	recipient := insertPeerClient(t, db, 3021, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, publisher, "100.96.0.20", "publisher-key")
+	insertPeerDevice(t, db, recipient, "100.96.0.21", "recipient-key")
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(ctx, store.ClientSession{
+		ID: sessionIDForTest, TenantID: publisher.TenantID, ClientID: publisher.ID,
+		ClientName: publisher.ClientName, TokenHash: "peer-service-test", Status: "NETTY_ONLINE",
+		MachineFingerprint: "machine", OSUser: "user", PeerServiceDiscoveryVersion: 2,
+		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recipientSession := &recordingSession{name: recipient.ClientName}
+	registry.Replace(recipientSession)
+	if _, err := service.SetSharing(ctx, AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}, true); err != nil {
+		t.Fatal(err)
+	}
+	name, app, host := "web", "http", "127.0.0.1"
+	targetPort, publishedPort, enabled := 8080, 18080, true
+	created, err := service.CreateSharedService(ctx, AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}, ServiceMutation{
+		ClientID: &publisher.ID, Name: &name, Application: &app, TargetHost: &host,
+		TargetPort: &targetPort, PublishedPort: &publishedPort,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpdateSharedService(ctx, AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}, created.ID, ServiceMutation{Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := int64(sessionIDForTest)
+	revision2 := int64(2)
+	report := ControlMessage{Type: TypeServiceReport, Enabled: boolPtr(true), Revision: &revision2,
+		Services: []AdvertisedService{{ServiceID: created.ServiceID}}}
+	if err := service.handleServiceReport(ctx, publisher, report, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	recipientSession.packets = nil
+	service.PushOnLogin(ctx, recipient)
+	loginMessages := recipientSession.peerMessages(t)
+	foundCurrentCatalog := false
+	for _, message := range loginMessages {
+		if message.Type == TypeServiceCatalog && message.PublisherClientID == publisher.ID &&
+			message.PublisherSessionID != nil && *message.PublisherSessionID == sessionID &&
+			message.Revision != nil && *message.Revision == revision2 && len(message.Services) == 1 {
+			foundCurrentCatalog = true
+			break
+		}
+	}
+	if !foundCurrentCatalog {
+		t.Fatalf("login did not receive current service catalog: %#v", loginMessages)
+	}
+	service.catalogMu.Lock()
+	snapshot := service.catalogs[catalogKey{publisher.TenantID, publisher.ID, sessionID}]
+	service.catalogMu.Unlock()
+	if snapshot.expiresAt.After(time.Now().Add(5*time.Minute + time.Second)) {
+		t.Fatalf("server accepted client-controlled TTL: %s", snapshot.expiresAt)
+	}
+	revision3 := int64(3)
+	report.Revision = &revision3
+	report.Enabled = boolPtr(false)
+	if err := service.handleServiceReport(ctx, publisher, report, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	report.Revision = &revision2
+	report.Enabled = boolPtr(true)
+	if err := service.handleServiceReport(ctx, publisher, report, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	service.catalogMu.Lock()
+	_, revived := service.catalogs[catalogKey{publisher.TenantID, publisher.ID, sessionID}]
+	service.catalogMu.Unlock()
+	if revived {
+		t.Fatal("stale report revived withdrawn catalog")
+	}
+	service.OnClientDisconnected(ctx, publisher.ClientName, sessionID)
+	service.catalogMu.Lock()
+	_, revisionTracked := service.catalogRevisions[catalogKey{publisher.TenantID, publisher.ID, sessionID}]
+	_, rateTracked := service.serviceReportRates[sessionID]
+	service.catalogMu.Unlock()
+	if revisionTracked || rateTracked {
+		t.Fatal("disconnect retained bounded service-report state")
+	}
+}
+
+const sessionIDForTest = 99
+
+func boolPtr(value bool) *bool { return &value }
 
 func TestSharingDefaultsOffAndRejectsPublicTarget(t *testing.T) {
 	ctx := context.Background()
@@ -76,7 +172,7 @@ func TestLoginConfigIncludesOwnerLocalServices(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := service.BuildLoginConfig(ctx, account, "", "")
+	cfg, err := service.BuildLoginConfig(ctx, account, "", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +181,45 @@ func TestLoginConfigIncludesOwnerLocalServices(t *testing.T) {
 	}
 	if cfg.LocalServices[0].TargetHost != "127.0.0.1" || cfg.LocalServices[0].TargetPort != 22 {
 		t.Fatalf("owner config must include target: %+v", cfg.LocalServices[0])
+	}
+	legacy, err := service.BuildLoginConfig(ctx, account, "", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.LocalServices) != 0 {
+		t.Fatalf("v1 client must not receive services without data-plane ACL: %#v", legacy.LocalServices)
+	}
+}
+
+func TestLoginConfigIncludesOnlyAuthorizedPeerVirtualIPs(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := New(config.PeerMeshConfig{Enabled: true, CIDR: "100.96.0.0/11", SessionTTLSeconds: 3600}, db, session.NewRegistry(), nil)
+	access := AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}
+	publisher := insertPeerClient(t, db, 3010, "tenant-a", "alice", "alice-laptop")
+	allowed := insertPeerClient(t, db, 3011, "tenant-a", "alice", "alice-nas")
+	denied := insertPeerClient(t, db, 3012, "tenant-a", "bob", "bob-pc")
+	insertPeerDevice(t, db, publisher, "100.96.0.10", "publisher-key")
+	insertPeerDevice(t, db, allowed, "100.96.0.11", "allowed-key")
+	insertPeerDevice(t, db, denied, "100.96.0.12", "denied-key")
+	name, app, host, visibility := "web", "http", "127.0.0.1", "OWNER"
+	targetPort, publishedPort, enabled := 8080, 18080, true
+	created, err := service.CreateSharedService(ctx, access, ServiceMutation{
+		ClientID: &publisher.ID, Name: &name, Application: &app, TargetHost: &host,
+		TargetPort: &targetPort, PublishedPort: &publishedPort, Visibility: &visibility,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpdateSharedService(ctx, access, created.ID, ServiceMutation{Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := service.BuildLoginConfig(ctx, publisher, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LocalServices) != 1 || len(cfg.LocalServices[0].AllowedPeerVirtualIPs) != 1 || cfg.LocalServices[0].AllowedPeerVirtualIPs[0] != "100.96.0.11" {
+		t.Fatalf("allowedPeerVirtualIps = %#v", cfg.LocalServices)
 	}
 }
 
