@@ -37,8 +37,10 @@ import java.util.function.Function;
  */
 @Slf4j
 public final class PeerServiceRuntime implements AutoCloseable {
+    private static final int MAX_CATALOG_REVISIONS = 4096;
     static final int PROBE_TIMEOUT_MILLIS = 400;
     private static final long PROBE_INTERVAL_SECONDS = 15;
+    static final Duration REPORT_REFRESH_INTERVAL = PeerServiceDiscovery.CATALOG_TTL.dividedBy(2);
 
     private final PeerMeshClient.ControlSender sender;
     private final ScheduledExecutorService scheduler;
@@ -47,6 +49,7 @@ public final class PeerServiceRuntime implements AutoCloseable {
     private final AtomicLong revision = new AtomicLong();
     private final AtomicBoolean hasAuthorizedOnlinePeer = new AtomicBoolean();
     private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
+    private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
     private final Map<String, PeerServiceForwarder> bridges = new ConcurrentHashMap<>();
     private final Object lock = new Object();
     private volatile ClientAuthLoginResponse.PeerMeshConfig config = new ClientAuthLoginResponse.PeerMeshConfig();
@@ -55,6 +58,7 @@ public final class PeerServiceRuntime implements AutoCloseable {
     private volatile List<String> lastReportedIds = List.of();
     private volatile List<PeerServiceStats> lastReportedStats = List.of();
     private volatile List<String> lastMdnsKeys = List.of();
+    volatile Instant lastReportAt = Instant.EPOCH;
     private final Set<String> locallyPaused = ConcurrentHashMap.newKeySet();
 
     public PeerServiceRuntime(PeerMeshClient.ControlSender sender) {
@@ -108,6 +112,8 @@ public final class PeerServiceRuntime implements AutoCloseable {
             if (!effectiveSharing() || !onlinePeer) {
                 stopProbeLocked();
                 closeBridges();
+                catalogs.clear();
+                catalogRevisions.clear();
                 return;
             }
             reconcileBridgesLocked();
@@ -117,10 +123,15 @@ public final class PeerServiceRuntime implements AutoCloseable {
     }
 
     public void applyCatalog(PeerControlMessage catalog) {
-        if (catalog == null || catalog.getPublisherClientId() == null || catalog.getPublisherSessionId() == null) {
+        if (!effectiveSharing() || catalog == null || catalog.getPublisherClientId() == null
+                || catalog.getPublisherSessionId() == null) {
             return;
         }
         CatalogKey key = new CatalogKey(catalog.getPublisherClientId(), catalog.getPublisherSessionId());
+        long incomingRevision = catalog.getRevision() == null ? 0L : catalog.getRevision();
+        if (incomingRevision < 1 || !acceptCatalogRevision(key, incomingRevision)) {
+            return;
+        }
         List<PeerAdvertisedService> services = catalog.getServices() == null
                 ? List.of()
                 : catalog.getServices().stream().map(PeerServiceDiscovery::copyAdvertised).toList();
@@ -135,7 +146,7 @@ public final class PeerServiceRuntime implements AutoCloseable {
                 catalog.getPublisherClientId(),
                 catalog.getPublisherClientName() == null ? "" : catalog.getPublisherClientName(),
                 catalog.getPublisherSessionId(),
-                catalog.getRevision() == null ? 0L : catalog.getRevision(),
+                incomingRevision,
                 expiresAt,
                 services));
         log.info("Peer 服务目录已更新: publisher={} session={} services={}",
@@ -143,6 +154,21 @@ public final class PeerServiceRuntime implements AutoCloseable {
         for (RemoteServiceView view : remoteServices()) {
             log.info("  {} {} {}", view.publisherClientName(), view.service().getApplication(), view.accessTarget());
         }
+    }
+
+    private boolean acceptCatalogRevision(CatalogKey key, long incomingRevision) {
+        if (!catalogRevisions.containsKey(key) && catalogRevisions.size() >= MAX_CATALOG_REVISIONS) {
+            return false;
+        }
+        AtomicBoolean accepted = new AtomicBoolean();
+        catalogRevisions.compute(key, (ignored, current) -> {
+            if (current != null && incomingRevision <= current) {
+                return current;
+            }
+            accepted.set(true);
+            return incomingRevision;
+        });
+        return accepted.get();
     }
 
     public List<RemoteServiceView> remoteServices() {
@@ -205,7 +231,9 @@ public final class PeerServiceRuntime implements AutoCloseable {
             List<String> mdnsKeys = mdns.stream()
                     .map(item -> item.getApplication() + ":" + item.getTargetHost() + ":" + item.getTargetPort())
                     .toList();
-            if (ids.equals(lastReportedIds) && revision.get() > 0 && statsUnchanged(stats) && mdnsKeys.equals(lastMdnsKeys)) {
+            boolean refreshDue = !lastReportAt.plus(REPORT_REFRESH_INTERVAL).isAfter(Instant.now());
+            if (!refreshDue && ids.equals(lastReportedIds) && revision.get() > 0
+                    && statsUnchanged(stats) && mdnsKeys.equals(lastMdnsKeys)) {
                 reconcileBridgesLocked();
                 return;
             }
@@ -292,6 +320,7 @@ public final class PeerServiceRuntime implements AutoCloseable {
         report.setMdnsCandidates(mdns);
         report.setCreatedAtMillis(System.currentTimeMillis());
         lastReportedStats = stats;
+        lastReportAt = Instant.now();
         sender.send("", JsonUtil.objectToString(report));
     }
 

@@ -54,11 +54,13 @@ func TestPeerServiceRuntimeReportsReachableServiceWithoutTargetHost(t *testing.T
 	}
 
 	sessionID := int64(9)
+	revision := int64(1)
 	runtime.applyCatalog(peerControlMessage{
 		Type:                peerControlTypeServiceCatalog,
 		PublisherClientID:   2,
 		PublisherClientName: "client-b",
 		PublisherSessionID:  &sessionID,
+		Revision:            &revision,
 		ExpiresAt:           time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
 		Services: []peerAdvertisedService{{
 			ServiceID: "svc-http01", Name: "web", Transport: "tcp", Application: "http",
@@ -79,13 +81,16 @@ func TestPeerServiceRuntimeReportsReachableServiceWithoutTargetHost(t *testing.T
 
 func TestPeerServiceRuntimeEmptyCatalogAndOfflinePublisher(t *testing.T) {
 	runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
+	runtime.applyConfig(testPeerMeshConfig(true, 1, false))
 	runtime.setRoster(map[int64]peerServiceRosterHint{2: {virtualIP: "100.96.0.2", online: false}})
 	sessionID := int64(9)
+	revision := int64(1)
 	catalog := peerControlMessage{
 		Type:                peerControlTypeServiceCatalog,
 		PublisherClientID:   2,
 		PublisherClientName: "client-b",
 		PublisherSessionID:  &sessionID,
+		Revision:            &revision,
 		ExpiresAt:           time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
 		Services: []peerAdvertisedService{{
 			ServiceID: "svc-http01", Name: "web", Transport: "tcp", Application: "http",
@@ -100,13 +105,88 @@ func TestPeerServiceRuntimeEmptyCatalogAndOfflinePublisher(t *testing.T) {
 		t.Fatalf("reason = %q", runtime.remoteServices()[0].UnavailableReason)
 	}
 	catalog.Services = nil
+	revision++
+	catalog.Revision = &revision
 	runtime.applyCatalog(catalog)
 	if len(runtime.remoteServices()) != 0 {
 		t.Fatal("empty catalog should withdraw")
 	}
 }
 
+func TestPeerServiceRuntimeRejectsStaleCatalogAfterWithdrawal(t *testing.T) {
+	runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
+	runtime.applyConfig(testPeerMeshConfig(true, 1, false))
+	sessionID := int64(9)
+	revision2 := int64(2)
+	catalog := peerControlMessage{
+		Type: peerControlTypeServiceCatalog, PublisherClientID: 2, PublisherClientName: "client-b",
+		PublisherSessionID: &sessionID, Revision: &revision2,
+		ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+		Services:  []peerAdvertisedService{{ServiceID: "svc-http01", Application: "http", PublishedPort: 8080}},
+	}
+	runtime.applyCatalog(catalog)
+	revision3 := int64(3)
+	catalog.Revision = &revision3
+	catalog.Services = nil
+	runtime.applyCatalog(catalog)
+	catalog.Revision = &revision2
+	catalog.Services = []peerAdvertisedService{{ServiceID: "svc-http01", Application: "http", PublishedPort: 8080}}
+	runtime.applyCatalog(catalog)
+	if len(runtime.remoteServices()) != 0 {
+		t.Fatal("stale catalog revived a withdrawn service")
+	}
+}
+
+func TestPeerServiceRuntimeReconnectAcceptsCurrentCatalogRevision(t *testing.T) {
+	runtime := newPeerServiceRuntime(nil, func(any) error { return nil })
+	runtime.applyConfig(testPeerMeshConfig(true, 1, false))
+	runtime.setRoster(map[int64]peerServiceRosterHint{2: {virtualIP: "100.96.0.2", online: true}})
+	runtime.setHasAuthorizedOnlinePeer(true)
+	sessionID := int64(9)
+	revision := int64(7)
+	catalog := peerControlMessage{
+		Type: peerControlTypeServiceCatalog, PublisherClientID: 2, PublisherClientName: "client-b",
+		PublisherSessionID: &sessionID, Revision: &revision,
+		ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+		Services:  []peerAdvertisedService{{ServiceID: "svc-http01", Application: "http", PublishedPort: 8080}},
+	}
+	runtime.applyCatalog(catalog)
+	if len(runtime.remoteServices()) != 1 {
+		t.Fatal("initial catalog was not accepted")
+	}
+	runtime.setHasAuthorizedOnlinePeer(false)
+	if len(runtime.remoteServices()) != 0 {
+		t.Fatal("disconnect must clear the catalog")
+	}
+	runtime.setHasAuthorizedOnlinePeer(true)
+	runtime.applyCatalog(catalog)
+	if len(runtime.remoteServices()) != 1 {
+		t.Fatal("current catalog revision was rejected after reconnect")
+	}
+}
+
+func TestPeerServiceRuntimeRenewsUnchangedCatalogBeforeTTL(t *testing.T) {
+	port, listener := mustListen(t)
+	defer listener.Close()
+	sent := &sentReports{}
+	runtime := newPeerServiceRuntime(nil, sent.append)
+	runtime.setHasAuthorizedOnlinePeer(true)
+	runtime.applyConfig(testPeerMeshConfig(true, port, true))
+	waitUntil(t, func() bool { return sent.len() > 0 })
+	sent.reset()
+	runtime.mu.Lock()
+	runtime.lastReportAt = time.Now().Add(-peerServiceReportRefresh - time.Second)
+	runtime.mu.Unlock()
+	runtime.probeAndReport()
+	if sent.len() != 1 {
+		t.Fatalf("renewal reports = %d", sent.len())
+	}
+}
+
 func TestProbeTCPDetectsOpenAndClosedPorts(t *testing.T) {
+	if isLocalServiceTarget("10.255.255.254") {
+		t.Fatal("unassigned private address must not be accepted as a local service target")
+	}
 	port, err := freePort()
 	if err != nil {
 		t.Fatal(err)
@@ -166,12 +246,69 @@ func TestPeerServiceRuntimeLocalPauseStopsReporting(t *testing.T) {
 
 func TestCollectEnvironmentAdvertisesPeerServiceCapabilities(t *testing.T) {
 	info := collectEnvironment()
-	if info.ClientPeerServiceCapabilities.Version != 1 {
+	if info.ClientPeerServiceCapabilities.Version != 2 {
 		t.Fatalf("version = %d", info.ClientPeerServiceCapabilities.Version)
 	}
 	if strings.Join(info.ClientPeerServiceCapabilities.Applications, ",") != "http,https,ssh,tcp,udp" {
 		t.Fatalf("apps = %#v", info.ClientPeerServiceCapabilities.Applications)
 	}
+}
+
+func TestPeerServiceTCPBridgeEnforcesServerAuthoredSourceACL(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetPort := target.Addr().(*net.TCPAddr).Port
+	publishedPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := LocalPeerService{
+		ServiceID: "svc-acl01", Transport: "tcp", Application: "tcp",
+		TargetHost: "127.0.0.1", TargetPort: targetPort, PublishedPort: publishedPort,
+		AllowedPeerVirtualIPs: []string{"127.0.0.2"},
+	}
+	bridge, err := bindPeerServiceBridge("127.0.0.1", service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.close()
+	unauthorized, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(publishedPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unauthorized.Close()
+	_ = target.(*net.TCPListener).SetDeadline(time.Now().Add(250 * time.Millisecond))
+	if forwarded, acceptErr := target.Accept(); acceptErr == nil {
+		forwarded.Close()
+		t.Fatal("unauthorized source reached local target")
+	}
+
+	bridge.close()
+	publishedPort, err = freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.PublishedPort = publishedPort
+	service.AllowedPeerVirtualIPs = []string{"127.0.0.1"}
+	bridge, err = bindPeerServiceBridge("127.0.0.1", service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.close()
+	authorized, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(publishedPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authorized.Close()
+	_ = target.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
+	forwarded, err := target.Accept()
+	if err != nil {
+		t.Fatalf("authorized source did not reach local target: %v", err)
+	}
+	forwarded.Close()
 }
 
 func testPeerMeshConfig(sharing bool, targetPort int, enabled bool) PeerMeshConfig {

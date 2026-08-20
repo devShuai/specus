@@ -72,6 +72,7 @@ public class PeerServiceRuntimeTests
     {
         using var runtime = new PeerServiceRuntime(_ => { });
         runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", false));
+        runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
         runtime.ApplyCatalog(2, "client-b", 9, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"),
         [
             new AdvertisedService
@@ -87,13 +88,76 @@ public class PeerServiceRuntimeTests
         Assert.False(runtime.RemoteServices()[0].Openable);
         Assert.Contains("离线", runtime.RemoteServices()[0].UnavailableReason);
 
-        runtime.ApplyCatalog(2, "client-b", 9, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), []);
+        runtime.ApplyCatalog(2, "client-b", 9, 2, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), []);
         Assert.Empty(runtime.RemoteServices());
+    }
+
+    [Fact]
+    public void CatalogRevisionTombstoneRejectsRollbackAndLateRevival()
+    {
+        using var runtime = new PeerServiceRuntime(_ => { });
+        runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+        runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
+        runtime.SetHasAuthorizedOnlinePeer(true);
+        var service = new AdvertisedService
+        {
+            ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http",
+            PublishedPort = 8080, Path = "/app",
+        };
+        runtime.ApplyCatalog(2, "client-b", 9, 2, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
+        runtime.ApplyCatalog(2, "client-b", 9, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), []);
+        Assert.Single(runtime.RemoteServices());
+
+        runtime.ApplyCatalog(2, "client-b", 9, 3, DateTimeOffset.UtcNow.ToString("O"), []);
+        runtime.ApplyCatalog(2, "client-b", 9, 2, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
+        Assert.Empty(runtime.RemoteServices());
+    }
+
+    [Fact]
+    public void ReconnectClearsCatalogRevisionHighWaterAndAcceptsCurrentSnapshot()
+    {
+        using var runtime = new PeerServiceRuntime(_ => { });
+        runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+        runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
+        runtime.SetHasAuthorizedOnlinePeer(true);
+        var service = new AdvertisedService
+        {
+            ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http",
+            PublishedPort = 8080, Path = "/app",
+        };
+        runtime.ApplyCatalog(2, "client-b", 9, 7, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
+        Assert.Single(runtime.RemoteServices());
+
+        runtime.SetHasAuthorizedOnlinePeer(false);
+        Assert.Empty(runtime.RemoteServices());
+        runtime.SetHasAuthorizedOnlinePeer(true);
+        runtime.ApplyCatalog(2, "client-b", 9, 7, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"), [service]);
+
+        Assert.Single(runtime.RemoteServices());
+    }
+
+    [Fact]
+    public void StableCatalogIsRenewedBeforeItsLeaseExpires()
+    {
+        var port = FreePort();
+        using var listener = Listen(port);
+        var sent = new List<string>();
+        using var runtime = new PeerServiceRuntime(sent.Add);
+        runtime.SetHasAuthorizedOnlinePeer(true);
+        runtime.ApplyConfig(Config(sharing: true, port, enabled: true));
+        WaitUntil(() => sent.Count > 0);
+        sent.Clear();
+        runtime.ProbeAndReport();
+        Assert.Empty(sent);
+        runtime.ForceReportRefreshForTest();
+        runtime.ProbeAndReport();
+        Assert.Single(sent);
     }
 
     [Fact]
     public void ProbeTcpDetectsOpenAndClosedPorts()
     {
+        Assert.False(PeerServiceDiscovery.IsLocalInterfaceTarget("10.255.255.254"));
         var port = FreePort();
         Assert.False(PeerServiceDiscovery.ProbeTcp("127.0.0.1", port, 200));
         using var listener = Listen(port);
@@ -136,8 +200,39 @@ public class PeerServiceRuntimeTests
     public void CollectedEnvironmentAdvertisesPeerServiceCapabilities()
     {
         var environment = ClientEnvironmentInfo.Collect(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
-        Assert.Equal(1, environment.ClientPeerServiceCapabilities.Version);
+        Assert.Equal(2, environment.ClientPeerServiceCapabilities.Version);
         Assert.Equal(new[] { "http", "https", "ssh", "tcp", "udp" }, environment.ClientPeerServiceCapabilities.Applications);
+    }
+
+    [Fact]
+    public async Task TcpBridgeEnforcesServerAuthoredSourceAcl()
+    {
+        using var target = Listen(0);
+        var targetPort = ((IPEndPoint)target.LocalEndpoint).Port;
+        var publishedPort = FreePort();
+        var service = new LocalPeerService
+        {
+            ServiceId = "svc-acl01", Transport = "tcp", Application = "tcp",
+            TargetHost = "127.0.0.1", TargetPort = targetPort, PublishedPort = publishedPort,
+            AllowedPeerVirtualIps = ["127.0.0.2"],
+        };
+        using (var bridge = PeerServiceBridge.Bind("127.0.0.1", service, null))
+        using (var caller = new TcpClient())
+        {
+            await caller.ConnectAsync(IPAddress.Loopback, publishedPort);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await target.AcceptTcpClientAsync(timeout.Token));
+        }
+
+        publishedPort = FreePort();
+        service.PublishedPort = publishedPort;
+        service.AllowedPeerVirtualIps = ["127.0.0.1"];
+        using var allowedBridge = PeerServiceBridge.Bind("127.0.0.1", service, null);
+        using var allowedCaller = new TcpClient();
+        await allowedCaller.ConnectAsync(IPAddress.Loopback, publishedPort);
+        using var forwarded = await target.AcceptTcpClientAsync();
+        Assert.True(forwarded.Connected);
     }
 
     private static PeerMeshConfig Config(bool sharing, int targetPort, bool enabled) => new()

@@ -10,6 +10,7 @@ internal sealed class PeerServiceRuntime : IDisposable
 {
     internal const int ProbeTimeoutMillis = 400;
     private static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan ReportRefreshInterval = TimeSpan.FromTicks(PeerServiceDiscovery.CatalogTtl.Ticks / 2);
     private static readonly JsonSerializerOptions ReportJson = new(JsonSerializerDefaults.Web);
 
     private readonly Action<string> _send;
@@ -17,6 +18,7 @@ internal sealed class PeerServiceRuntime : IDisposable
     private readonly string _instanceId = Guid.NewGuid().ToString("N");
     private readonly object _sync = new();
     private readonly ConcurrentDictionary<CatalogKey, CatalogSnapshot> _catalogs = new();
+    private readonly ConcurrentDictionary<CatalogKey, long> _catalogRevisions = new();
     private readonly Dictionary<string, IPeerServiceForwarder> _bridges = new(StringComparer.Ordinal);
     private long _revision;
     private bool _hasAuthorizedOnlinePeer;
@@ -25,6 +27,7 @@ internal sealed class PeerServiceRuntime : IDisposable
     private volatile Dictionary<long, RosterHint> _roster = new();
     private Timer? _probeTimer;
     private List<string> _lastReportedIds = [];
+    private DateTimeOffset _lastReportAt = DateTimeOffset.MinValue;
     private readonly HashSet<string> _locallyPaused = new(StringComparer.Ordinal);
 
     public PeerServiceRuntime(Action<string> send, ILogger? logger = null)
@@ -92,6 +95,8 @@ internal sealed class PeerServiceRuntime : IDisposable
             {
                 StopProbeLocked();
                 CloseBridgesLocked();
+                _catalogs.Clear();
+                _catalogRevisions.Clear();
                 return;
             }
             ReconcileBridgesLocked();
@@ -103,11 +108,15 @@ internal sealed class PeerServiceRuntime : IDisposable
     public void ApplyCatalog(long publisherClientId, string? publisherClientName, long publisherSessionId,
         long revision, string? expiresAt, IReadOnlyList<AdvertisedService>? services)
     {
-        if (publisherClientId <= 0 || publisherSessionId <= 0)
+        if (!EffectiveSharing || publisherClientId <= 0 || publisherSessionId <= 0 || revision < 1)
         {
             return;
         }
         var key = new CatalogKey(publisherClientId, publisherSessionId);
+        if (!AcceptCatalogRevision(key, revision))
+        {
+            return;
+        }
         var copy = (services ?? []).Select(CopyAdvertised).ToList();
         if (copy.Count == 0)
         {
@@ -149,6 +158,19 @@ internal sealed class PeerServiceRuntime : IDisposable
             }
         }
         return views;
+    }
+
+    internal bool PruneExpiredCatalogs(DateTimeOffset now)
+    {
+        var removed = false;
+        foreach (var entry in _catalogs)
+        {
+            if (entry.Value.ExpiresAt <= now && _catalogs.TryRemove(entry.Key, out _))
+            {
+                removed = true;
+            }
+        }
+        return removed;
     }
 
     public IReadOnlyList<LocalPeerService> LocalServices =>
@@ -198,7 +220,8 @@ internal sealed class PeerServiceRuntime : IDisposable
                 reachable.Add(AdvertisedFrom(local));
             }
             var ids = reachable.Select(item => item.ServiceId).ToList();
-            if (ids.SequenceEqual(_lastReportedIds) && _revision > 0)
+            if (ids.SequenceEqual(_lastReportedIds) && _revision > 0
+                && DateTimeOffset.UtcNow - _lastReportAt < ReportRefreshInterval)
             {
                 ReconcileBridgesLocked();
                 return;
@@ -216,6 +239,41 @@ internal sealed class PeerServiceRuntime : IDisposable
             StopProbeLocked();
             CloseBridgesLocked();
             _catalogs.Clear();
+        }
+    }
+
+    internal void ForceReportRefreshForTest()
+    {
+        lock (_sync)
+        {
+            _lastReportAt = DateTimeOffset.MinValue;
+        }
+    }
+
+    private bool AcceptCatalogRevision(CatalogKey key, long revision)
+    {
+        if (!_catalogRevisions.ContainsKey(key) && _catalogRevisions.Count >= 4096)
+        {
+            return false;
+        }
+        while (true)
+        {
+            if (!_catalogRevisions.TryGetValue(key, out var current))
+            {
+                if (_catalogRevisions.TryAdd(key, revision))
+                {
+                    return true;
+                }
+                continue;
+            }
+            if (revision <= current)
+            {
+                return false;
+            }
+            if (_catalogRevisions.TryUpdate(key, revision, current))
+            {
+                return true;
+            }
         }
     }
 
@@ -303,6 +361,7 @@ internal sealed class PeerServiceRuntime : IDisposable
 
     private void SendReportLocked(bool enabled, List<AdvertisedService> services)
     {
+        _lastReportAt = DateTimeOffset.UtcNow;
         var report = new ServiceReportMessage
         {
             Type = "service-report",

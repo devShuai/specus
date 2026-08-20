@@ -5,6 +5,8 @@ import org.junit.After;
 import org.junit.Test;
 
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -79,22 +81,151 @@ public class PeerServiceRuntimeTest {
     public void emptyCatalogWithdrawsAndOfflinePublisherDisablesOpen() throws Exception {
         runtime = newRuntime();
         runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", false)));
+        runtime.applyConfig(config(true, freePort(), false));
         runtime.applyCatalog(catalogJson());
         assertFalse(runtime.remoteServices().get(0).openable);
         assertTrue(runtime.remoteServices().get(0).unavailableReason.contains("离线"));
 
         JSONObject empty = catalogJson();
+        empty.put("revision", 2L);
         empty.put("services", new org.json.JSONArray());
         runtime.applyCatalog(empty);
         assertTrue(runtime.remoteServices().isEmpty());
     }
 
     @Test
+    public void catalogRevisionTombstoneRejectsRollbackAndLateRevival() throws Exception {
+        runtime = newRuntime();
+        runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
+        runtime.applyConfig(config(true, freePort(), false));
+        runtime.setHasAuthorizedOnlinePeer(true);
+        JSONObject current = catalogJson();
+        current.put("revision", 2L);
+        runtime.applyCatalog(current);
+
+        JSONObject staleWithdrawal = catalogJson();
+        staleWithdrawal.put("revision", 1L);
+        staleWithdrawal.put("services", new org.json.JSONArray());
+        runtime.applyCatalog(staleWithdrawal);
+        assertEquals(1, runtime.remoteServices().size());
+
+        JSONObject withdrawal = catalogJson();
+        withdrawal.put("revision", 3L);
+        withdrawal.put("services", new org.json.JSONArray());
+        runtime.applyCatalog(withdrawal);
+        runtime.applyCatalog(current);
+        assertTrue(runtime.remoteServices().isEmpty());
+    }
+
+    @Test
+    public void reconnectClearsCatalogRevisionHighWaterAndAcceptsCurrentSnapshot() throws Exception {
+        runtime = newRuntime();
+        runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
+        runtime.applyConfig(config(true, freePort(), false));
+        runtime.setHasAuthorizedOnlinePeer(true);
+        JSONObject current = catalogJson();
+        current.put("revision", 7L);
+        runtime.applyCatalog(current);
+        assertEquals(1, runtime.remoteServices().size());
+
+        runtime.setHasAuthorizedOnlinePeer(false);
+        assertTrue(runtime.remoteServices().isEmpty());
+        runtime.setHasAuthorizedOnlinePeer(true);
+        runtime.applyCatalog(current);
+
+        assertEquals(1, runtime.remoteServices().size());
+    }
+
+    @Test
+    public void stableCatalogIsRenewedBeforeItsLeaseExpires() throws Exception {
+        int port = freePort();
+        try (ServerSocket ignored = listen(port)) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            runtime.applyConfig(config(true, port, true));
+            waitUntil(() -> !sent.isEmpty());
+            sent.clear();
+            runtime.probeAndReport();
+            assertTrue(sent.isEmpty());
+            runtime.forceReportRefreshForTest();
+            runtime.probeAndReport();
+            assertEquals(1, sent.size());
+        }
+    }
+
+    @Test
+    public void snapshotIncludesServiceIdentityAndDisablesLocalToggleWhenSharingIsOff() throws Exception {
+        runtime = newRuntime();
+        runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
+        runtime.applyConfig(config(true, freePort(), false));
+        runtime.applyCatalog(catalogJson());
+
+        JSONObject enabled = new JSONObject(PeerServiceRuntime.lastSnapshotJson());
+        JSONObject remote = enabled.getJSONArray("remotes").getJSONObject(0);
+        assertEquals("svc-http01", remote.getString("serviceId"));
+        assertEquals("web", remote.getString("name"));
+
+        runtime.applyConfig(config(false, freePort(), true));
+        JSONObject disabled = new JSONObject(PeerServiceRuntime.lastSnapshotJson());
+        JSONObject local = disabled.getJSONArray("locals").getJSONObject(0);
+        assertFalse(local.getBoolean("canToggle"));
+        assertFalse(local.getBoolean("locallyPublished"));
+        assertEquals(0, disabled.getJSONArray("remotes").length());
+    }
+
+    @Test
+    public void expiredCatalogIsPrunedAndSnapshotUpdated() throws Exception {
+        runtime = newRuntime();
+        runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
+        runtime.applyConfig(config(true, freePort(), false));
+        JSONObject catalog = catalogJson();
+        catalog.put("expiresAt", Instant.now().minusSeconds(1).toString());
+        runtime.applyCatalog(catalog);
+
+        assertTrue(runtime.pruneExpiredCatalogs(Instant.now()));
+        assertTrue(runtime.remoteServices().isEmpty());
+    }
+
+    @Test
     public void probeTcpDetectsOpenAndClosedPorts() throws Exception {
+        assertFalse(PeerServiceRuntime.isLocalServiceTarget("10.255.255.254"));
         int port = freePort();
         assertFalse(PeerServiceRuntime.probeTcp("127.0.0.1", port, 200));
         try (ServerSocket ignored = listen(port)) {
             assertTrue(PeerServiceRuntime.probeTcp("127.0.0.1", port, 400));
+        }
+    }
+
+    @Test
+    public void tcpBridgeEnforcesServerAuthoredSourceAcl() throws Exception {
+        int targetPort = freePort();
+        int publishedPort = freePort();
+        SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
+        local.serviceId = "svc-acl01";
+        local.targetHost = "127.0.0.1";
+        local.targetPort = targetPort;
+        local.publishedPort = publishedPort;
+        local.allowedPeerVirtualIps = List.of("127.0.0.2");
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket ignored = new Socket("127.0.0.1", publishedPort)) {
+            target.setSoTimeout(250);
+            try {
+                target.accept().close();
+                throw new AssertionError("unauthorized source reached local target");
+            } catch (SocketTimeoutException expected) {
+                // expected
+            }
+        }
+
+        publishedPort = freePort();
+        local.publishedPort = publishedPort;
+        local.allowedPeerVirtualIps = List.of("127.0.0.1");
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket ignored = new Socket("127.0.0.1", publishedPort);
+             Socket forwarded = target.accept()) {
+            assertTrue(forwarded.isConnected());
         }
     }
 

@@ -10,6 +10,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -115,15 +117,71 @@ class PeerServiceRuntimeTests {
     @Test
     void emptyCatalogWithdrawsAndOfflinePublisherDisablesOpen() {
         runtime = newRuntime();
+        runtime.applyConfig(config(true, localService(1, false)));
         runtime.setRosterLookup(id -> new PeerServiceRuntime.RosterHint("100.96.0.2", false));
         runtime.applyCatalog(catalogMessage());
         assertThat(runtime.remoteServices().getFirst().openable()).isFalse();
         assertThat(runtime.remoteServices().getFirst().unavailableReason()).contains("离线");
 
         PeerControlMessage empty = catalogMessage();
+        empty.setRevision(2L);
         empty.setServices(List.of());
         runtime.applyCatalog(empty);
         assertThat(runtime.remoteServices()).isEmpty();
+    }
+
+    @Test
+    void staleCatalogCannotRollBackOrReviveWithdrawnServices() {
+        runtime = newRuntime();
+        runtime.applyConfig(config(true, localService(1, false)));
+        PeerControlMessage newest = catalogMessage();
+        newest.setRevision(2L);
+        runtime.applyCatalog(newest);
+        PeerControlMessage stale = catalogMessage();
+        stale.setRevision(1L);
+        runtime.applyCatalog(stale);
+        assertThat(runtime.remoteServices()).hasSize(1);
+
+        PeerControlMessage withdrawn = catalogMessage();
+        withdrawn.setRevision(3L);
+        withdrawn.setServices(List.of());
+        runtime.applyCatalog(withdrawn);
+        runtime.applyCatalog(newest);
+        assertThat(runtime.remoteServices()).isEmpty();
+    }
+
+    @Test
+    void reconnectClearsCatalogRevisionHighWaterAndAcceptsCurrentSnapshot() {
+        runtime = newRuntime();
+        runtime.applyConfig(config(true, localService(1, false)));
+        runtime.setRosterLookup(id -> new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+        runtime.setHasAuthorizedOnlinePeer(true);
+        PeerControlMessage current = catalogMessage();
+        current.setRevision(7L);
+        runtime.applyCatalog(current);
+        assertThat(runtime.remoteServices()).hasSize(1);
+
+        runtime.setHasAuthorizedOnlinePeer(false);
+        assertThat(runtime.remoteServices()).isEmpty();
+        runtime.setHasAuthorizedOnlinePeer(true);
+        runtime.applyCatalog(current);
+
+        assertThat(runtime.remoteServices()).hasSize(1);
+    }
+
+    @Test
+    void unchangedServicesAreRenewedBeforeCatalogTtl() throws Exception {
+        int port = freePort();
+        try (ServerSocket ignored = listen(port)) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            runtime.applyConfig(config(true, localService(port, true)));
+            waitUntil(() -> !sent.isEmpty());
+            sent.clear();
+            runtime.lastReportAt = Instant.now().minus(PeerServiceRuntime.REPORT_REFRESH_INTERVAL).minusSeconds(1);
+            runtime.probeAndReport();
+            assertThat(sent).hasSize(1);
+        }
     }
 
     @Test
@@ -132,6 +190,38 @@ class PeerServiceRuntimeTests {
         assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", port, 200)).isFalse();
         try (ServerSocket ignored = listen(port)) {
             assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", port, 400)).isTrue();
+        }
+    }
+
+    @Test
+    void tcpBridgeRejectsSourceOutsideServerAuthoredAcl() throws Exception {
+        int targetPort = freePort();
+        int publishedPort = freePort();
+        LocalPeerService local = localService(targetPort, true);
+        local.setPublishedPort(publishedPort);
+        local.setAllowedPeerVirtualIps(List.of("127.0.0.2"));
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket caller = new Socket("127.0.0.1", publishedPort)) {
+            target.setSoTimeout(250);
+            assertThat(org.assertj.core.api.Assertions.catchThrowable(target::accept))
+                    .isInstanceOf(SocketTimeoutException.class);
+            assertThat(caller.getInputStream().read()).isEqualTo(-1);
+        }
+    }
+
+    @Test
+    void tcpBridgeAllowsServerAuthorizedSource() throws Exception {
+        int targetPort = freePort();
+        int publishedPort = freePort();
+        LocalPeerService local = localService(targetPort, true);
+        local.setPublishedPort(publishedPort);
+        local.setAllowedPeerVirtualIps(List.of("127.0.0.1"));
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket caller = new Socket("127.0.0.1", publishedPort);
+             Socket forwarded = target.accept()) {
+            assertThat(forwarded.isConnected()).isTrue();
         }
     }
 
