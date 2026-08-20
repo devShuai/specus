@@ -75,6 +75,31 @@
   --color-content3: #f5f5f7;
 }
 
+/* 控件形态：HeroUI 3 的默认标定比这套界面圆润、松散，直接用会和原设计对不上。
+   下面几条按迁移前的实测值校准（胶囊按钮、无边框输入行、紧凑表格）。 */
+.button {
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+/* 表单字段在旧设计里是贴着背景的一行，不是带白底的圆角盒子。 */
+.textfield input,
+.input,
+.field {
+  border-radius: 0;
+  background-color: transparent;
+}
+
+/* 表头与单元格的密度：v3 默认每行高 9px，一屏少看两行。 */
+.table__column {
+  font-weight: 600;
+  padding: 1px 12px;
+}
+
+.table__cell {
+  padding: 8px 12px;
+}
+
 /* HeroUI 3 的语义 token。hover 与 soft 档由根色 color-mix 派生，
    所以只需覆盖根色，整条链跟着走。 */
 :root,
