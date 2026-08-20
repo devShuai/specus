@@ -21,6 +21,73 @@ namespace Specus.IntegrationTests;
 public sealed class PeerMeshServiceTests
 {
     [Fact]
+    public async Task PeerServiceCatalogAndAuditSurviveAcrossScopedServiceInstances()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var publisher = fixture.AddClient(1001, "tenant-a", "alice", "alice-laptop");
+        fixture.AddDevice(publisher, "100.96.0.10", "public-key");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
+        {
+            Id = 9001, TenantId = "tenant-a", ClientId = publisher.Id, ClientName = publisher.ClientName,
+            ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http",
+            TargetHost = "127.0.0.1", TargetPort = 8080, PublishedPort = 18080, Path = "/",
+            Enabled = true, Visibility = "OWNER", CreatedAt = now, UpdatedAt = now,
+        });
+        await fixture.SaveChangesAsync();
+        fixture.State.ServiceCatalogs[("tenant-a", publisher.Id, 77)] = new PeerMeshServiceCatalogSnapshot(
+            4, "instance-a", now, now.AddMinutes(5),
+            [new AdvertisedService { ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http", PublishedPort = 18080, Path = "/" }],
+            publisher.ClientName, [], []);
+        fixture.State.ServiceCatalogRevisions[("tenant-a", publisher.Id, 77)] = 4;
+        fixture.State.Audits.Enqueue(new PeerMeshAuditEvent(now.ToString("O"), "service-report", "tenant-a",
+            publisher.Id, 77, null, "published"));
+
+        var sibling = fixture.CreateSiblingService();
+        var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, true);
+        var services = await sibling.ListSharedServicesAsync(admin, CancellationToken.None);
+
+        Assert.Single(services);
+        Assert.Single(services[0].Instances);
+        Assert.Equal(4, services[0].Instances[0].Revision);
+        Assert.Contains(sibling.RecentAudits(admin), item => item.Action == "service-report");
+    }
+
+    [Fact]
+    public async Task ClientDisconnectWithdrawsCatalogAndReleasesBoundedSessionState()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var publisher = fixture.AddClient(1002, "tenant-a", "alice", "alice-laptop");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.ClientSessions.Add(new ClientSession
+        {
+            Id = 78,
+            TenantId = publisher.TenantId,
+            ClientId = publisher.Id,
+            ClientName = publisher.ClientName,
+            Status = ClientAccountService.StatusDisconnected,
+            TokenHash = "disconnected-token",
+            MachineFingerprint = "machine-a",
+            OsUser = "alice",
+            HttpLoginAt = now.AddMinutes(-1),
+            DisconnectedAt = now,
+            ExpiresAt = now.AddHours(1),
+        });
+        await fixture.SaveChangesAsync();
+        fixture.State.ServiceCatalogs[(publisher.TenantId, publisher.Id, 78)] =
+            new PeerMeshServiceCatalogSnapshot(4, "instance-a", now, now.AddMinutes(5), [],
+                publisher.ClientName, [], []);
+        fixture.State.ServiceCatalogRevisions[(publisher.TenantId, publisher.Id, 78)] = 4;
+        fixture.State.ServiceReportWindows[78] = new System.Collections.Concurrent.ConcurrentQueue<long>([1]);
+
+        await fixture.CreateSiblingService().OnClientDisconnectedAsync(78, CancellationToken.None);
+
+        Assert.DoesNotContain((publisher.TenantId, publisher.Id, 78), fixture.State.ServiceCatalogs.Keys);
+        Assert.DoesNotContain((publisher.TenantId, publisher.Id, 78), fixture.State.ServiceCatalogRevisions.Keys);
+        Assert.DoesNotContain(78, fixture.State.ServiceReportWindows.Keys);
+    }
+
+    [Fact]
     public async Task PublicStunConfigNormalizesJavaStyleHostsAndIpv6()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync(
@@ -350,6 +417,33 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(source, "100.96.0.22", "source-key");
         fixture.AddDevice(target, "100.96.0.23", "target-key");
         var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
+        {
+            Id = 92101,
+            TenantId = "tenant-a",
+            ClientId = target.Id,
+            ClientName = target.ClientName,
+            ServiceId = "svc-login01",
+            Name = "login-service",
+            Transport = "tcp",
+            Application = "http",
+            TargetHost = "127.0.0.1",
+            TargetPort = 8080,
+            PublishedPort = 18080,
+            Path = "/",
+            Enabled = true,
+            Visibility = "OWNER",
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+        fixture.State.ServiceCatalogs[("tenant-a", target.Id, 21021)] = new PeerMeshServiceCatalogSnapshot(
+            7, "target-instance", now, now.AddMinutes(5),
+            [new AdvertisedService
+            {
+                ServiceId = "svc-login01", Name = "login-service", Transport = "tcp",
+                Application = "http", PublishedPort = 18080, Path = "/",
+            }], target.ClientName, [], []);
+        fixture.State.ServiceCatalogRevisions[("tenant-a", target.Id, 21021)] = 7;
         fixture.Db.ClientSessions.AddRange(
             new ClientSession
             {
@@ -396,6 +490,12 @@ public sealed class PeerMeshServiceTests
             && message.Peers.Any(peer => peer.ClientId == target.Id
                 && peer.Online
                 && peer.MessageReceiveCapable));
+        Assert.Contains(sourceMessages, message => message.Type == "service-catalog"
+            && message.PublisherClientId == target.Id
+            && message.PublisherSessionId == 21021
+            && message.Revision == 7
+            && message.Services is { Count: 1 }
+            && message.Services[0].ServiceId == "svc-login01");
 
         var targetRoster = Assert.Single(targetWriter.PeerMessages(), message => message.Type == "roster");
         Assert.Contains(targetRoster.Peers ?? [], peer => peer.ClientId == source.Id && peer.Online);
@@ -755,14 +855,17 @@ public sealed class PeerMeshServiceTests
     private sealed class PeerMeshFixture : IAsyncDisposable
     {
         private readonly SqliteConnection _connection;
+        private readonly IOptions<PeerMeshOptions> _options;
 
         private PeerMeshFixture(SqliteConnection connection, SpecusDbContext db, SessionRegistry registry,
-            PeerMeshService service)
+            PeerMeshService service, IOptions<PeerMeshOptions> options, PeerMeshServiceState state)
         {
             _connection = connection;
             Db = db;
             Registry = registry;
             Service = service;
+            _options = options;
+            State = state;
         }
 
         public SpecusDbContext Db { get; }
@@ -770,6 +873,11 @@ public sealed class PeerMeshServiceTests
         public SessionRegistry Registry { get; }
 
         public PeerMeshService Service { get; }
+
+        public PeerMeshServiceState State { get; }
+
+        public PeerMeshService CreateSiblingService() => new(Db, Registry, _options,
+            NullLogger<PeerMeshService>.Instance, null, State);
 
         public static async Task<PeerMeshFixture> CreateAsync(
             string publicAddress = "203.0.113.10",
@@ -791,7 +899,7 @@ public sealed class PeerMeshServiceTests
             var db = new SpecusDbContext(options);
             await db.Database.EnsureCreatedAsync();
             var registry = new SessionRegistry(NullLogger<SessionRegistry>.Instance);
-            var service = new PeerMeshService(db, registry, Options.Create(new PeerMeshOptions
+            var peerOptions = Options.Create(new PeerMeshOptions
             {
                 Enabled = enabled,
                 Cidr = "100.96.0.0/11",
@@ -805,8 +913,11 @@ public sealed class PeerMeshServiceTests
                 NatProbeAlternatePort = natProbeAlternatePort,
                 PublicStunServers = publicStunServers?.ToList() ?? [],
                 SessionTtlSeconds = 3600,
-            }), NullLogger<PeerMeshService>.Instance);
-            return new PeerMeshFixture(connection, db, registry, service);
+            });
+            var state = new PeerMeshServiceState();
+            var service = new PeerMeshService(db, registry, peerOptions,
+                NullLogger<PeerMeshService>.Instance, null, state);
+            return new PeerMeshFixture(connection, db, registry, service, peerOptions, state);
         }
 
         public ClientAccount AddClient(long id, string tenantId, string owner, string clientName)

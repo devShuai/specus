@@ -246,6 +246,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             await using var scope = _services.CreateAsyncScope();
             var clientService = scope.ServiceProvider.GetRequiredService<ClientAccountService>();
             clientService.MarkNettyDisconnected(context.ClientSessionId);
+            if (context.ClientSessionId is { } disconnectedSessionId)
+            {
+                var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
+                await peerMesh.OnClientDisconnectedAsync(disconnectedSessionId, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
             if (context.ConnectionRecordId is not { } recordId)
             {
                 return;

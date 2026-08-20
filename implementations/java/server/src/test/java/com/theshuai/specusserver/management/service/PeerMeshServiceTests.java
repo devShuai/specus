@@ -9,6 +9,7 @@ import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.PeerMeshAcl;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshSession;
+import com.theshuai.specusserver.management.model.PeerMeshSharedService;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
@@ -119,7 +120,51 @@ class PeerMeshServiceTests {
         assertThat(config.getServiceSharing().isDeploymentEnabled()).isTrue();
         assertThat(config.getServiceSharing().isConfiguredEnabled()).isFalse();
         assertThat(config.getServiceSharing().isEffectiveEnabled()).isFalse();
-        assertThat(config.getPeerServiceDiscoveryVersion()).isEqualTo(1);
+        assertThat(config.getPeerServiceDiscoveryVersion()).isEqualTo(2);
+    }
+
+    @Test
+    void loginConfigOnlyPublishesServicesToAclCapableClientAndIncludesAuthorizedPeerIps() {
+        properties.setEnabled(true);
+        ClientAccount publisher = client(1, "alice", "a");
+        ClientAccount allowed = client(2, "alice", "b");
+        ClientAccount denied = client(3, "bob", "c");
+        PeerMeshDevice publisherDevice = device(1L, "100.96.0.1", true);
+        PeerMeshDevice allowedDevice = device(2L, "100.96.0.2", true);
+        PeerMeshDevice deniedDevice = device(3L, "100.96.0.3", true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(publisherDevice));
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 2L)).thenReturn(Optional.of(allowedDevice));
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 3L)).thenReturn(Optional.of(deniedDevice));
+        when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a"))
+                .thenReturn(List.of(publisher, allowed, denied));
+        when(aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId("tenant-a", 1L, 3L))
+                .thenReturn(Optional.empty());
+        PeerMeshSharedService definition = new PeerMeshSharedService();
+        definition.setServiceId("svc-http01");
+        definition.setName("web");
+        definition.setTransport("tcp");
+        definition.setApplication("http");
+        definition.setTargetHost("127.0.0.1");
+        definition.setTargetPort(8080);
+        definition.setPublishedPort(18080);
+        definition.setEnabled(true);
+        definition.setVisibility("OWNER");
+        when(sharedServiceRepository.findByTenantIdAndClientIdOrderByNameAsc("tenant-a", 1L))
+                .thenReturn(List.of(definition));
+        when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
+                "ice-user", "ice-cred", "specus", "nonce", Instant.now().plusSeconds(3600)));
+
+        ClientEnvironmentInfo v2 = new ClientEnvironmentInfo();
+        v2.getClientPeerServiceCapabilities().setVersion(2);
+        var secure = service.buildLoginConfig(publisher, v2, "127.0.0.1");
+        assertThat(secure.getLocalServices()).hasSize(1);
+        assertThat(secure.getLocalServices().getFirst().getAllowedPeerVirtualIps())
+                .containsExactly("100.96.0.2");
+
+        ClientEnvironmentInfo v1 = new ClientEnvironmentInfo();
+        v1.getClientPeerServiceCapabilities().setVersion(1);
+        assertThat(service.buildLoginConfig(publisher, v1, "127.0.0.1").getLocalServices()).isEmpty();
     }
 
     @Test
@@ -537,6 +582,14 @@ class PeerMeshServiceTests {
         device.setClientId(clientId);
         device.setEnabled(true);
         when(deviceRepository.findByTenantIdAndClientId("tenant-a", clientId)).thenReturn(Optional.of(device));
+    }
+
+    private PeerMeshDevice device(long clientId, String virtualIp, boolean enabled) {
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setClientId(clientId);
+        device.setVirtualIp(virtualIp);
+        device.setEnabled(enabled);
+        return device;
     }
 
     private PeerMeshSession activeSession() {

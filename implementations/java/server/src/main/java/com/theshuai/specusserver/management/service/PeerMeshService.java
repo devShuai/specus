@@ -57,6 +57,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -128,18 +129,18 @@ public class PeerMeshService {
         return properties.isEnabled();
     }
 
-    private List<LocalPeerService> localServices(ClientAccount account) {
-        if (account == null || sharedServiceRepository == null) {
+    private List<LocalPeerService> localServices(ClientAccount account, int clientProtocolVersion) {
+        if (account == null || sharedServiceRepository == null || clientProtocolVersion < 2) {
             return List.of();
         }
         return sharedServiceRepository
                 .findByTenantIdAndClientIdOrderByNameAsc(account.getTenantId(), account.getId())
                 .stream()
-                .map(this::toLocalService)
+                .map(row -> toLocalService(account, row))
                 .toList();
     }
 
-    private LocalPeerService toLocalService(PeerMeshSharedService row) {
+    private LocalPeerService toLocalService(ClientAccount publisher, PeerMeshSharedService row) {
         LocalPeerService service = new LocalPeerService();
         service.setServiceId(row.getServiceId());
         service.setName(row.getName());
@@ -152,7 +153,30 @@ public class PeerMeshService {
         service.setPath(row.getPath());
         service.setEnabled(row.isEnabled());
         service.setVisibility(row.getVisibility());
+        service.setAllowedPeerVirtualIps(allowedPeerVirtualIps(publisher, row));
         return service;
+    }
+
+    private List<String> allowedPeerVirtualIps(ClientAccount publisher, PeerMeshSharedService definition) {
+        if (publisher == null || definition == null || !definition.isEnabled()) {
+            return List.of();
+        }
+        List<Long> explicit = PeerServiceDiscovery.decodeClientIds(definition.getAllowedClientIds());
+        return clientAccountRepository.findByTenantIdOrderByIdDesc(publisher.getTenantId()).stream()
+                .filter(recipient -> !Objects.equals(recipient.getId(), publisher.getId()))
+                .filter(recipient -> canPeer(publisher, recipient))
+                .filter(recipient -> PeerServiceDiscovery.VISIBILITY_OWNER.equals(definition.getVisibility())
+                        ? normalizeOwner(publisher.getOwnerUsername()).equals(normalizeOwner(recipient.getOwnerUsername()))
+                        : explicit.isEmpty() || explicit.contains(recipient.getId()))
+                .map(recipient -> deviceRepository
+                        .findByTenantIdAndClientId(publisher.getTenantId(), recipient.getId())
+                        .filter(PeerMeshDevice::isEnabled)
+                        .map(PeerMeshDevice::getVirtualIp)
+                        .filter(StringUtils::hasText)
+                        .orElse(null))
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
     }
 
     @Transactional
@@ -163,7 +187,10 @@ public class PeerMeshService {
         if (properties.isEnabled()) {
             device = ensureDevice(account, environment);
         }
-        return buildConfig(account, device, requestServerName);
+        int clientProtocolVersion = environment == null || environment.getClientPeerServiceCapabilities() == null
+                ? 0
+                : PeerServiceDiscovery.normalizeVersion(environment.getClientPeerServiceCapabilities().getVersion());
+        return buildConfig(account, device, requestServerName, clientProtocolVersion);
     }
 
     @Transactional
@@ -173,12 +200,13 @@ public class PeerMeshService {
             device = deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
                     .orElseGet(() -> deviceRepository.save(createDevice(account)));
         }
-        return buildConfig(account, device, null);
+        return buildConfig(account, device, null, currentPeerServiceProtocolVersion(account));
     }
 
     private ClientAuthLoginResponse.PeerMeshConfig buildConfig(ClientAccount account,
                                                                PeerMeshDevice device,
-                                                               String requestServerName) {
+                                                               String requestServerName,
+                                                               int clientProtocolVersion) {
         ClientAuthLoginResponse.PeerMeshConfig config = new ClientAuthLoginResponse.PeerMeshConfig();
         config.setEnabled(false);
         config.setClientId(account.getId());
@@ -196,7 +224,7 @@ public class PeerMeshService {
         config.setPeerServiceDiscoveryVersion(PeerServiceDiscovery.PROTOCOL_VERSION);
         config.setServiceSharing(PeerServiceSharingStatus.of(
                 properties.isEnabled(), configuredSharing, deviceEnabled, mdnsImport));
-        config.setLocalServices(localServices(account));
+        config.setLocalServices(localServices(account, clientProtocolVersion));
         if (!properties.isEnabled() || device == null) {
             return config;
         }
@@ -215,6 +243,18 @@ public class PeerMeshService {
         config.setServerPublicKey(serverPublicKey());
         config.setClientPublicKey(device.getPublicKey());
         return config;
+    }
+
+    private int currentPeerServiceProtocolVersion(ClientAccount account) {
+        if (account == null) {
+            return 0;
+        }
+        return clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                        account.getTenantId(), List.of(account.getId()), ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .mapToInt(ClientSession::getPeerServiceDiscoveryVersion)
+                .max()
+                .orElse(0);
     }
 
     @Transactional
@@ -742,6 +782,28 @@ public class PeerMeshService {
             sessionRepository.saveAll(sessions);
         }
         return sessions.stream().map(this::toSessionView).toList();
+    }
+
+    @Transactional
+    public List<PeerMeshSessionView> closeUnauthorizedSessions(ManagementContext context) {
+        List<PeerMeshSession> sessions = sessionRepository.findByTenantIdAndStatusNotOrderByUpdatedAtDesc(
+                context.tenant().tenantId(), STATUS_CLOSED);
+        List<PeerMeshSession> closed = new ArrayList<>();
+        Instant now = Instant.now();
+        for (PeerMeshSession session : sessions) {
+            ClientAccount source = clientAccountRepository.findByIdAndTenantId(
+                    session.getSourceClientId(), context.tenant().tenantId()).orElse(null);
+            ClientAccount target = clientAccountRepository.findByIdAndTenantId(
+                    session.getTargetClientId(), context.tenant().tenantId()).orElse(null);
+            if (source == null || target == null || !canPeer(source, target)) {
+                markClosed(session, now);
+                closed.add(session);
+            }
+        }
+        if (!closed.isEmpty()) {
+            sessionRepository.saveAll(closed);
+        }
+        return closed.stream().map(this::toSessionView).toList();
     }
 
     @Transactional
