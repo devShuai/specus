@@ -18,6 +18,8 @@ public sealed partial class PeerMeshService
     private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), long> _serviceCatalogRevisions;
     private readonly ConcurrentQueue<PeerMeshAuditEvent> _audits;
     private readonly ConcurrentDictionary<long, ConcurrentQueue<long>> _serviceReportWindows;
+    private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), SemaphoreSlim>
+        _serviceCatalogMutationGates;
 
     public async Task<PeerMeshServiceSharingView> SharingStatusAsync(ManagementContext context,
         CancellationToken cancellationToken)
@@ -192,52 +194,63 @@ public sealed partial class PeerMeshService
         var sessionId = publisherSessionId is > 0
             ? publisherSessionId.Value
             : throw new ArgumentException("publisher session is required");
-        var publisherSession = await _db.ClientSessions.AsNoTracking()
-                .FirstOrDefaultAsync(session => session.Id == sessionId, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ArgumentException("publisher session is not current");
-        if (!ManagementContext.SameTenant(publisherSession.TenantId, source.TenantId)
-            || publisherSession.ClientId != source.Id
-            || !string.Equals(publisherSession.Status, ClientAccountService.StatusNettyOnline,
-                StringComparison.Ordinal))
-        {
-            throw new ArgumentException("publisher session is not current");
-        }
-        if (publisherSession.PeerServiceDiscoveryVersion < PeerServiceDiscoveryVersion)
-        {
-            throw new ArgumentException("publisher does not support peer service discovery v2");
-        }
-        EnforceServiceReportRate(sessionId);
-        var revision = report.Revision ?? 0;
-        if (revision < 1)
-        {
-            throw new ArgumentException("revision must be >= 1");
-        }
         var key = (source.TenantId, source.Id, sessionId);
-        if (!AcceptCatalogRevision(key, revision))
+        var gate = CatalogMutationGate(key);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            return;
-        }
-        if (report.Enabled != true || !await EffectiveSharingAsync(source, cancellationToken).ConfigureAwait(false))
-        {
-            _serviceCatalogs.TryRemove(key, out _);
-            await FanoutAsync(source, sessionId, revision, [], DateTimeOffset.UtcNow, cancellationToken)
+            var publisherSession = await _db.ClientSessions.AsNoTracking()
+                    .FirstOrDefaultAsync(session => session.Id == sessionId, cancellationToken)
+                    .ConfigureAwait(false)
+                ?? throw new ArgumentException("publisher session is not current");
+            if (!ManagementContext.SameTenant(publisherSession.TenantId, source.TenantId)
+                || publisherSession.ClientId != source.Id
+                || !string.Equals(publisherSession.Status, ClientAccountService.StatusNettyOnline,
+                    StringComparison.Ordinal))
+            {
+                throw new ArgumentException("publisher session is not current");
+            }
+            if (publisherSession.PeerServiceDiscoveryVersion < PeerServiceDiscoveryVersion)
+            {
+                throw new ArgumentException("publisher does not support peer service discovery v2");
+            }
+            EnforceServiceReportRate(sessionId);
+            var revision = report.Revision ?? 0;
+            if (revision < 1)
+            {
+                throw new ArgumentException("revision must be >= 1");
+            }
+            if (!AcceptCatalogRevision(key, revision))
+            {
+                return;
+            }
+            if (report.Enabled != true || !await EffectiveSharingAsync(source, cancellationToken).ConfigureAwait(false))
+            {
+                _serviceCatalogs.TryRemove(key, out _);
+                await FanoutAsync(source, sessionId, revision, [], DateTimeOffset.UtcNow, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
+            var roster = await AllowedRosterAsync(source, cancellationToken).ConfigureAwait(false);
+            if (roster.All(item => !item.Online))
+            {
+                return;
+            }
+            var advertised = await AdvertisedFromReportAsync(source, report.Services, cancellationToken)
                 .ConfigureAwait(false);
-            return;
+            var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
+            _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(revision, report.InstanceId ?? "", DateTimeOffset.UtcNow,
+                expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
+                SanitizeMdns(report.MdnsCandidates));
+            Audit("service-report", source.TenantId, source.Id, sessionId, null,
+                advertised.Count == 0 ? "empty" : "published");
+            await FanoutAsync(source, sessionId, revision, advertised, expiresAt, cancellationToken)
+                .ConfigureAwait(false);
         }
-        var roster = await AllowedRosterAsync(source, cancellationToken).ConfigureAwait(false);
-        if (roster.All(item => !item.Online))
+        finally
         {
-            return;
+            gate.Release();
         }
-        var advertised = await AdvertisedFromReportAsync(source, report.Services, cancellationToken)
-            .ConfigureAwait(false);
-        var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
-        _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(revision, report.InstanceId ?? "", DateTimeOffset.UtcNow,
-            expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
-            SanitizeMdns(report.MdnsCandidates));
-        Audit("service-report", source.TenantId, source.Id, sessionId, null, advertised.Count == 0 ? "empty" : "published");
-        await FanoutAsync(source, sessionId, revision, advertised, expiresAt, cancellationToken).ConfigureAwait(false);
     }
 
     internal static IReadOnlyList<string> DecodeApplications(string? raw)
@@ -342,19 +355,32 @@ public sealed partial class PeerMeshService
         foreach (var entry in _serviceCatalogs.Where(item =>
                      ManagementContext.SameTenant(item.Key.TenantId, tenantId)).ToArray())
         {
-            var publisher = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(account =>
-                    account.TenantId == tenantId && account.Id == entry.Key.ClientId, cancellationToken)
-                .ConfigureAwait(false);
-            if (publisher is null)
+            var gate = CatalogMutationGate(entry.Key);
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                _serviceCatalogs.TryRemove(entry.Key, out _);
-                continue;
+                if (!_serviceCatalogs.TryGetValue(entry.Key, out var current))
+                {
+                    continue;
+                }
+                var publisher = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(account =>
+                        account.TenantId == tenantId && account.Id == entry.Key.ClientId, cancellationToken)
+                    .ConfigureAwait(false);
+                if (publisher is null)
+                {
+                    _serviceCatalogs.TryRemove(entry.Key, out _);
+                    continue;
+                }
+                var revision = NextCatalogRevision(entry.Key);
+                var snapshot = current with { Revision = revision };
+                _serviceCatalogs[entry.Key] = snapshot;
+                await FanoutAsync(publisher, entry.Key.SessionId, revision, snapshot.Services, snapshot.ExpiresAt,
+                    includeDenied: true, cancellationToken).ConfigureAwait(false);
             }
-            var revision = NextCatalogRevision(entry.Key);
-            var snapshot = entry.Value with { Revision = revision };
-            _serviceCatalogs[entry.Key] = snapshot;
-            await FanoutAsync(publisher, entry.Key.SessionId, revision, snapshot.Services, snapshot.ExpiresAt,
-                includeDenied: true, cancellationToken).ConfigureAwait(false);
+            finally
+            {
+                gate.Release();
+            }
         }
     }
 
@@ -431,10 +457,19 @@ public sealed partial class PeerMeshService
         CancellationToken cancellationToken)
     {
         var key = (publisher.TenantId, publisher.Id, sessionId);
-        _serviceCatalogs.TryRemove(key, out _);
-        _serviceReportWindows.TryRemove(sessionId, out _);
-        await FanoutAsync(publisher, sessionId, NextCatalogRevision(key), [], DateTimeOffset.UtcNow,
-            cancellationToken).ConfigureAwait(false);
+        var gate = CatalogMutationGate(key);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _serviceCatalogs.TryRemove(key, out _);
+            _serviceReportWindows.TryRemove(sessionId, out _);
+            await FanoutAsync(publisher, sessionId, NextCatalogRevision(key), [], DateTimeOffset.UtcNow,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     public async Task OnClientDisconnectedAsync(long sessionId, CancellationToken cancellationToken)
@@ -464,7 +499,16 @@ public sealed partial class PeerMeshService
             }
             else
             {
-                _serviceCatalogs.TryRemove(key, out _);
+                var gate = CatalogMutationGate(key);
+                await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    _serviceCatalogs.TryRemove(key, out _);
+                }
+                finally
+                {
+                    gate.Release();
+                }
             }
         }
         finally
@@ -473,8 +517,12 @@ public sealed partial class PeerMeshService
             // AcceptServiceReportAsync. Release process-wide bounded state even if fanout fails.
             _serviceCatalogRevisions.TryRemove(key, out _);
             _serviceReportWindows.TryRemove(sessionId, out _);
+            _serviceCatalogMutationGates.TryRemove(key, out _);
         }
     }
+
+    private SemaphoreSlim CatalogMutationGate((string TenantId, long ClientId, long SessionId) key) =>
+        _serviceCatalogMutationGates.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
 
     private void EnforceServiceReportRate(long sessionId)
     {

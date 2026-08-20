@@ -65,6 +65,7 @@ public sealed partial class PeerMeshService
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
         _audits = state.Audits;
         _serviceReportWindows = state.ServiceReportWindows;
+        _serviceCatalogMutationGates = state.ServiceCatalogMutationGates;
     }
 
     public bool Enabled => _options.Enabled;

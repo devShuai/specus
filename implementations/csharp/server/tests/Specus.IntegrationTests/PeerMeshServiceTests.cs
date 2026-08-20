@@ -21,12 +21,18 @@ namespace Specus.IntegrationTests;
 public sealed class PeerMeshServiceTests
 {
     [Fact]
-    public async Task PeerServiceCatalogAndAuditSurviveAcrossScopedServiceInstances()
+    public async Task PeerServiceReportCatalogAndAuditSurviveAcrossScopedServiceInstances()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();
         var publisher = fixture.AddClient(1001, "tenant-a", "alice", "alice-laptop");
+        var recipient = fixture.AddClient(1002, "tenant-a", "alice", "alice-phone");
         fixture.AddDevice(publisher, "100.96.0.10", "public-key");
+        fixture.AddDevice(recipient, "100.96.0.11", "recipient-key");
         var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshServiceSharings.Add(new PeerMeshServiceSharing
+        {
+            TenantId = "tenant-a", Enabled = true, UpdatedBy = "admin", UpdatedAt = now,
+        });
         fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
         {
             Id = 9001, TenantId = "tenant-a", ClientId = publisher.Id, ClientName = publisher.ClientName,
@@ -34,16 +40,16 @@ public sealed class PeerMeshServiceTests
             TargetHost = "127.0.0.1", TargetPort = 8080, PublishedPort = 18080, Path = "/",
             Enabled = true, Visibility = "OWNER", CreatedAt = now, UpdatedAt = now,
         });
+        fixture.Db.ClientSessions.Add(CurrentPublisherSession(77, publisher, now));
         await fixture.SaveChangesAsync();
-        fixture.State.ServiceCatalogs[("tenant-a", publisher.Id, 77)] = new PeerMeshServiceCatalogSnapshot(
-            4, "instance-a", now, now.AddMinutes(5),
-            [new AdvertisedService { ServiceId = "svc-http01", Name = "web", Transport = "tcp", Application = "http", PublishedPort = 18080, Path = "/" }],
-            publisher.ClientName, [], []);
-        fixture.State.ServiceCatalogRevisions[("tenant-a", publisher.Id, 77)] = 4;
-        fixture.State.Audits.Enqueue(new PeerMeshAuditEvent(now.ToString("O"), "service-report", "tenant-a",
-            publisher.Id, 77, null, "published"));
+        fixture.Bind(recipient);
+
+        await fixture.Service.HandleServiceReportAsync(publisher,
+            ServiceReport(4, "instance-a", "svc-http01"), 77, CancellationToken.None);
 
         var sibling = fixture.CreateSiblingService();
+        await sibling.HandleServiceReportAsync(publisher,
+            ServiceReport(3, "stale-instance", "svc-http01"), 77, CancellationToken.None);
         var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, true);
         var services = await sibling.ListSharedServicesAsync(admin, CancellationToken.None);
 
@@ -51,6 +57,122 @@ public sealed class PeerMeshServiceTests
         Assert.Single(services[0].Instances);
         Assert.Equal(4, services[0].Instances[0].Revision);
         Assert.Contains(sibling.RecentAudits(admin), item => item.Action == "service-report");
+    }
+
+    [Fact]
+    public async Task ConcurrentScopedReportsKeepHighestRevisionAndWithdrawalsCannotBeRevived()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var publisher = fixture.AddClient(1011, "tenant-a", "alice", "alice-workstation");
+        var recipient = fixture.AddClient(1012, "tenant-a", "alice", "alice-tablet");
+        fixture.AddDevice(publisher, "100.96.0.12", "publisher-key");
+        fixture.AddDevice(recipient, "100.96.0.13", "recipient-key");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshServiceSharings.Add(new PeerMeshServiceSharing
+        {
+            TenantId = publisher.TenantId, Enabled = true, UpdatedBy = "admin", UpdatedAt = now,
+        });
+        fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
+        {
+            Id = 9011, TenantId = publisher.TenantId, ClientId = publisher.Id,
+            ClientName = publisher.ClientName, ServiceId = "svc-race001", Name = "race-service",
+            Transport = "tcp", Application = "http", TargetHost = "127.0.0.1", TargetPort = 8081,
+            PublishedPort = 18081, Path = "/", Enabled = true, Visibility = "OWNER",
+            CreatedAt = now, UpdatedAt = now,
+        });
+        fixture.Db.ClientSessions.Add(CurrentPublisherSession(79, publisher, now));
+        await fixture.SaveChangesAsync();
+        fixture.Bind(recipient);
+
+        var scopeA = fixture.CreateSiblingService();
+        var scopeB = fixture.CreateSiblingService();
+        await Task.WhenAll(
+            scopeA.HandleServiceReportAsync(publisher,
+                ServiceReport(2, "instance-2", "svc-race001"), 79, CancellationToken.None),
+            scopeB.HandleServiceReportAsync(publisher,
+                ServiceReport(3, "instance-3", "svc-race001"), 79, CancellationToken.None));
+
+        var key = (publisher.TenantId, publisher.Id, SessionId: 79L);
+        Assert.Equal(3, fixture.State.ServiceCatalogRevisions[key]);
+        Assert.Equal(3, fixture.State.ServiceCatalogs[key].Revision);
+        Assert.Equal("instance-3", fixture.State.ServiceCatalogs[key].InstanceId);
+
+        await scopeA.HandleServiceReportAsync(publisher, ServiceReport(4, "instance-4", "svc-race001", false),
+            79, CancellationToken.None);
+        await scopeB.HandleServiceReportAsync(publisher, ServiceReport(3, "late-instance", "svc-race001"),
+            79, CancellationToken.None);
+
+        Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
+        Assert.Equal(4, fixture.State.ServiceCatalogRevisions[key]);
+
+        await scopeA.HandleServiceReportAsync(publisher, ServiceReport(5, "instance-5", "svc-race001"),
+            79, CancellationToken.None);
+        var admin = new ManagementContext(publisher.TenantId, "admin", ManagementRole.Admin, true);
+        await scopeB.UpdateSharedServiceAsync(admin, 9011,
+            new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null,
+                false, null), CancellationToken.None);
+
+        Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
+        Assert.True(fixture.State.ServiceCatalogRevisions[key] > 5);
+
+        await scopeB.UpdateSharedServiceAsync(admin, 9011,
+            new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null,
+                true, null), CancellationToken.None);
+        await scopeA.HandleServiceReportAsync(publisher, ServiceReport(10, "instance-10", "svc-race001"),
+            79, CancellationToken.None);
+        Assert.True(fixture.State.ServiceCatalogs.ContainsKey(key));
+
+        await scopeB.DeleteSharedServiceAsync(admin, 9011, CancellationToken.None);
+
+        Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
+        Assert.True(fixture.State.ServiceCatalogRevisions[key] > 10);
+    }
+
+    [Fact]
+    public void ProcessRestartStateStartsEmptyInsteadOfLeakingPreviousSessionCatalogs()
+    {
+        var previous = new PeerMeshServiceState();
+        var now = DateTimeOffset.UtcNow;
+        previous.ServiceCatalogs[("tenant-a", 1, 2)] = new PeerMeshServiceCatalogSnapshot(
+            3, "old-instance", now, now.AddMinutes(5), [], "old-client", [], []);
+        previous.ServiceCatalogRevisions[("tenant-a", 1, 2)] = 3;
+
+        var restarted = new PeerMeshServiceState();
+
+        Assert.Empty(restarted.ServiceCatalogs);
+        Assert.Empty(restarted.ServiceCatalogRevisions);
+        Assert.Empty(restarted.Audits);
+    }
+
+    [Fact]
+    public async Task CatalogProjectionIsStrictlyIsolatedByTenantClientAndSession()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var publisher = fixture.AddClient(1021, "tenant-a", "alice", "alice-server");
+        var otherClient = fixture.AddClient(1022, "tenant-a", "alice", "alice-other");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
+        {
+            Id = 9021, TenantId = publisher.TenantId, ClientId = publisher.Id,
+            ClientName = publisher.ClientName, ServiceId = "svc-scope01", Name = "scope-service",
+            Transport = "tcp", Application = "http", TargetHost = "127.0.0.1", TargetPort = 8082,
+            PublishedPort = 18082, Path = "/", Enabled = true, Visibility = "OWNER",
+            CreatedAt = now, UpdatedAt = now,
+        });
+        await fixture.SaveChangesAsync();
+        var service = new AdvertisedService { ServiceId = "svc-scope01" };
+        fixture.State.ServiceCatalogs[(publisher.TenantId, publisher.Id, 81)] = Catalog(1, "session-81", service, now);
+        fixture.State.ServiceCatalogs[(publisher.TenantId, publisher.Id, 82)] = Catalog(2, "session-82", service, now);
+        fixture.State.ServiceCatalogs[(publisher.TenantId, otherClient.Id, 81)] = Catalog(3, "other-client", service, now);
+        fixture.State.ServiceCatalogs[("tenant-b", publisher.Id, 81)] = Catalog(4, "other-tenant", service, now);
+
+        var views = await fixture.CreateSiblingService().ListSharedServicesAsync(
+            new ManagementContext(publisher.TenantId, "admin", ManagementRole.Admin, true),
+            CancellationToken.None);
+
+        var view = Assert.Single(views);
+        Assert.Equal([81L, 82L], view.Instances.Select(item => item.PublisherSessionId).Order().ToArray());
+        Assert.DoesNotContain(view.Instances, item => item.InstanceId is "other-client" or "other-tenant");
     }
 
     [Fact]
@@ -820,6 +942,41 @@ public sealed class PeerMeshServiceTests
 
     private static System.Net.IPEndPoint Endpoint(string host, int port) =>
         new(System.Net.IPAddress.Parse(host), port);
+
+    private static ClientSession CurrentPublisherSession(long id, ClientAccount publisher, DateTimeOffset now) =>
+        new()
+        {
+            Id = id,
+            TenantId = publisher.TenantId,
+            ClientId = publisher.Id,
+            ClientName = publisher.ClientName,
+            Status = ClientAccountService.StatusNettyOnline,
+            TokenHash = $"publisher-token-{id}",
+            MachineFingerprint = $"publisher-machine-{id}",
+            OsUser = publisher.OwnerUsername ?? "user",
+            PeerServiceDiscoveryVersion = 2,
+            PeerServiceApplications = "http,https,ssh,tcp,udp",
+            HttpLoginAt = now.AddMinutes(-1),
+            NettyConnectedAt = now,
+            ExpiresAt = now.AddHours(1),
+        };
+
+    private static PeerControlMessage ServiceReport(long revision, string instanceId, string serviceId,
+        bool enabled = true) =>
+        new()
+        {
+            Type = "service-report",
+            Enabled = enabled,
+            Revision = revision,
+            InstanceId = instanceId,
+            Services = enabled
+                ? [new AdvertisedService { ServiceId = serviceId }]
+                : [],
+        };
+
+    private static PeerMeshServiceCatalogSnapshot Catalog(long revision, string instanceId,
+        AdvertisedService service, DateTimeOffset now) =>
+        new(revision, instanceId, now, now.AddMinutes(5), [service], "publisher", [], []);
 
     private static async Task<bool> AuthorizeRelayFrameAsync(PeerMeshService service, long sessionId, long fromClientId,
         long toClientId, long sequence, long bytes)
