@@ -25,6 +25,8 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 
 - `peer-mesh-spm2.json`：固定 session key、方向 traffic key、nonce、明文和完整 SPM2 帧。
 - `peer-path-mtu-v2.json`：固定 SPMTU2 nonce、inner MTU、probe header、padding 和 ack。
+- `peer-service-discovery-v2.json`：Java、Go、.NET、Android 真实客户端序列化路径对应的
+  `service-report` 与登录 capability wire fixture，以及旧客户端忽略未知消息/字段的兼容样例。
 
 Java、Go、.NET、Android 使用相同字段和字节序；Java、Go、.NET 服务端同时用 SPM2 向量验证无需解密
 的 relay 授权头解析。

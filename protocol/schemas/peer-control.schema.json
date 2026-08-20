@@ -855,6 +855,24 @@
                 "$ref": "#/$defs/PeerMdnsCandidate"
               }
             }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["sourceClientId"] },
+              { "required": ["sourceClientName"] },
+              { "required": ["sourceVirtualIp"] },
+              { "required": ["sourcePublicKey"] },
+              { "required": ["sourceKeyEpoch"] },
+              { "required": ["targetClientId"] },
+              { "required": ["targetClientName"] },
+              { "required": ["targetVirtualIp"] },
+              { "required": ["targetPublicKey"] },
+              { "required": ["sessionId"] },
+              { "required": ["token"] },
+              { "required": ["publisherClientId"] },
+              { "required": ["publisherClientName"] },
+              { "required": ["publisherSessionId"] }
+            ]
           }
         }
       ]

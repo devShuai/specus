@@ -141,6 +141,9 @@ jobs:
       - name: Test
         working-directory: apps/admin-web
         run: npm test
+      - name: Validate Peer Service wire fixtures against shared schemas
+        working-directory: apps/admin-web
+        run: npm run verify:peer-service-wire
       - name: Build
         working-directory: apps/admin-web
         run: npm run build

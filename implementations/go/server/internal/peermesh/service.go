@@ -912,6 +912,12 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	if err := json.Unmarshal([]byte(request.Message), &signal); err != nil || strings.TrimSpace(signal.Type) == "" {
 		return errors.New("invalid peer signal")
 	}
+	if signal.Type == TypeServiceReport {
+		if err := validateServiceReportEnvelope(request); err != nil {
+			return err
+		}
+		return s.handleServiceReport(ctx, *source, signal, publisherSessionID)
+	}
 	if err := s.fillSource(ctx, &signal, *source); err != nil {
 		return err
 	}
@@ -931,17 +937,6 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		if err != nil || strings.TrimSpace(request.ToClientName) == "" {
 			return err
 		}
-	case TypeServiceReport:
-		if len([]byte(request.Message)) > 16*1024 {
-			return errors.New("service-report exceeds 16384 bytes")
-		}
-		if strings.TrimSpace(request.ToClientName) != "" {
-			return errors.New("service-report toClientName must be empty")
-		}
-		if signal.PublisherSessionID != nil {
-			return errors.New("service-report publisherSessionId is server-bound")
-		}
-		return s.handleServiceReport(ctx, *source, signal, publisherSessionID)
 	case TypeServiceCatalog:
 		return errors.New("service-catalog is server-only")
 	}
@@ -979,6 +974,29 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		s.sendSessionGrant(*source, *target, grant)
 	}
 	return s.sendSignal(targetSession, source.ClientName, target.ClientName, signal)
+}
+
+func validateServiceReportEnvelope(request protocol.MessageRequest) error {
+	if len([]byte(request.Message)) > 16*1024 {
+		return errors.New("service-report exceeds 16384 bytes")
+	}
+	if strings.TrimSpace(request.ToClientName) != "" {
+		return errors.New("service-report toClientName must be empty")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(request.Message), &fields); err != nil {
+		return errors.New("invalid service-report")
+	}
+	for _, field := range []string{
+		"sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+		"targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+		"sessionId", "token", "publisherClientId", "publisherClientName", "publisherSessionId",
+	} {
+		if _, present := fields[field]; present {
+			return fmt.Errorf("service-report %s is server-bound", field)
+		}
+	}
+	return nil
 }
 
 func (s *Service) PushRoster(ctx context.Context, account store.ClientAccount) {

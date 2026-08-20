@@ -21,6 +21,36 @@ namespace Specus.IntegrationTests;
 public sealed class PeerMeshServiceTests
 {
     [Fact]
+    public void ServiceReportEnvelopeRejectsClientControlledRoutingAndIdentity()
+    {
+        var valid = new MessageRequestPacket
+        {
+            ToClientName = "",
+            Message = "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[]}",
+        };
+        PeerMeshService.ValidateServiceReportEnvelope(valid);
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateServiceReportEnvelope(new MessageRequestPacket
+        {
+            ToClientName = "peer-b", Message = valid.Message,
+        }));
+        string[] fields =
+        [
+            "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+            "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+            "sessionId", "token", "publisherClientId", "publisherClientName", "publisherSessionId",
+        ];
+        foreach (var field in fields)
+        {
+            Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateServiceReportEnvelope(
+                new MessageRequestPacket
+                {
+                    ToClientName = "",
+                    Message = $"{{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[],\"{field}\":null}}",
+                }));
+        }
+    }
+
+    [Fact]
     public async Task PeerServiceReportCatalogAndAuditSurviveAcrossScopedServiceInstances()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();

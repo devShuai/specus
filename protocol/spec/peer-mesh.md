@@ -160,8 +160,9 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 `peerServiceDiscoveryVersion` 和 `peerServiceApplications` 来自
 `environment.clientPeerServiceCapabilities`。版本 `0` 或缺省表示该 peer 不支持服务发现；正式 v2
 支持 TCP/UDP 桥及默认关闭的 mDNS 候选导入，并要求服务端下发的数据面来源 ACL；版本 `2`
-增加发布端数据面 ACL，服务端不得向版本低于 `2` 的客户端下发 `localServices`；
-一期应用类型仅允许 `http`、`https`、`ssh`、`tcp`。
+增加发布端数据面 ACL，服务端不得向版本低于 `2` 的客户端下发 `localServices`。正式 v2 的
+应用类型固定为 `http`、`https`、`ssh`、`tcp`、`udp`；mDNS 只产生待管理员确认导入的候选，
+不会自动发布服务。
 
 ### `candidates`
 
@@ -366,7 +367,6 @@ Peer Mesh 设备互联不等于本机服务目录。一期发布用户在控制�
   "type": "service-report",
   "enabled": true,
   "revision": 3,
-  "publisherSessionId": 1868708022931423400,
   "instanceId": "runtime-1",
   "generatedAt": "2026-08-19T09:00:00Z",
   "expiresAt": "2026-08-19T09:05:00Z",
@@ -382,6 +382,11 @@ Peer Mesh 设备互联不等于本机服务目录。一期发布用户在控制�
   ]
 }
 ```
+
+客户端 `service-report` 还必须省略 `sourceClient*`、`sourceVirtualIp`、`sourcePublicKey`、
+`sourceKeyEpoch`、`targetClient*`、`targetVirtualIp`、`targetPublicKey`、`sessionId`、`token` 与全部
+`publisherClient*` 字段；即使显式发送 `null` 也属于协议违规。服务端先校验原始 JSON，再绑定认证
+控制连接的发布者身份和 session，不能通过“覆盖客户端自报值”代替拒绝非法载荷。
 
 可选 `stats[]` 仅出现在 `service-report`，携带每个已发布服务的本机桥接计数（`bytesIn` /
 `bytesOut` / `activeConnections` / `totalConnections`）。服务端只用于管理端健康与流量展示，

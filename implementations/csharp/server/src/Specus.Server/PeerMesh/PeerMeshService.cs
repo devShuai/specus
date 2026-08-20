@@ -366,6 +366,13 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("invalid peer signal");
         }
+        if (string.Equals(signal.Type, TypeServiceReport, StringComparison.Ordinal))
+        {
+            ValidateServiceReportEnvelope(request);
+            await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
         await FillSourceAsync(signal, source, cancellationToken).ConfigureAwait(false);
 
         switch (signal.Type)
@@ -386,22 +393,6 @@ public sealed partial class PeerMeshService
                     return;
                 }
                 break;
-            case TypeServiceReport:
-                if (System.Text.Encoding.UTF8.GetByteCount(request.Message) > 16 * 1024)
-                {
-                    throw new ArgumentException("service-report exceeds 16384 bytes");
-                }
-                if (!string.IsNullOrWhiteSpace(request.ToClientName))
-                {
-                    throw new ArgumentException("service-report toClientName must be empty");
-                }
-                if (signal.PublisherSessionId is not null)
-                {
-                    throw new ArgumentException("service-report publisherSessionId is server-bound");
-                }
-                await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
-                    .ConfigureAwait(false);
-                return;
             case TypeServiceCatalog:
                 throw new ArgumentException("service-catalog is server-only");
         }
@@ -606,6 +597,36 @@ public sealed partial class PeerMeshService
         _db.PeerMeshAcls.Remove(acl);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static void ValidateServiceReportEnvelope(MessageRequestPacket request)
+    {
+        if (Encoding.UTF8.GetByteCount(request.Message ?? "") > 16 * 1024)
+        {
+            throw new ArgumentException("service-report exceeds 16384 bytes");
+        }
+        if (!string.IsNullOrWhiteSpace(request.ToClientName))
+        {
+            throw new ArgumentException("service-report toClientName must be empty");
+        }
+        using var document = JsonDocument.Parse(request.Message ?? "{}");
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new ArgumentException("invalid service-report");
+        }
+        string[] serverBoundFields =
+        [
+            "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+            "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+            "sessionId", "token", "publisherClientId", "publisherClientName", "publisherSessionId",
+        ];
+        foreach (var field in serverBoundFields)
+        {
+            if (document.RootElement.TryGetProperty(field, out _))
+            {
+                throw new ArgumentException($"service-report {field} is server-bound");
+            }
+        }
     }
 
     private async Task RefreshAuthorizationAsync(ManagementContext context, CancellationToken cancellationToken)

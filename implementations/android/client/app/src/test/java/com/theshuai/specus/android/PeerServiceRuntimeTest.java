@@ -15,6 +15,8 @@ import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -67,11 +69,24 @@ public class PeerServiceRuntimeTest {
             runtime = newRuntime();
             runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
             runtime.setHasAuthorizedOnlinePeer(true);
-            runtime.applyConfig(config(true, port, true));
+            SpecusCore.PeerMeshConfig config = config(true, port, true);
+            config.localServices.get(0).serviceId = "svc-wire01";
+            config.localServices.get(0).name = "fixture-http";
+            config.localServices.get(0).description = "wire fixture";
+            config.localServices.get(0).path = "/health";
+            runtime.applyConfig(config);
             waitUntil(() -> !sent.isEmpty());
             assertTrue(sent.get(0).contains("service-report"));
-            assertTrue(sent.get(0).contains("svc-http01"));
+            assertTrue(sent.get(0).contains("svc-wire01"));
             assertFalse(sent.get(0).contains("targetHost"));
+            JSONObject vectors = ProtocolVectorTestSupport.read("peer-service-discovery-v2.json");
+            JSONObject actualReport = new JSONObject(sent.get(0));
+            JSONObject expectedReport = vectors.getJSONObject("serviceReports").getJSONObject("android");
+            for (String dynamic : List.of(
+                    "revision", "instanceId", "generatedAt", "expiresAt", "createdAtMillis")) {
+                expectedReport.put(dynamic, actualReport.get(dynamic));
+            }
+            assertEquals(canonical(expectedReport), canonical(actualReport));
 
             runtime.applyCatalog(catalogJson());
             List<PeerServiceRuntime.RemoteServiceView> views = runtime.remoteServices();
@@ -178,6 +193,33 @@ public class PeerServiceRuntimeTest {
         assertFalse(local.getBoolean("canToggle"));
         assertFalse(local.getBoolean("locallyPublished"));
         assertEquals(0, disabled.getJSONArray("remotes").length());
+    }
+
+    @Test
+    public void clientCapabilitiesMatchTheSharedWireFixture() throws Exception {
+        JSONObject vectors = ProtocolVectorTestSupport.read("peer-service-discovery-v2.json");
+        SpecusCore.ClientPeerServiceCapabilities capabilities =
+                SpecusCore.ClientPeerServiceCapabilities.androidDefault();
+        assertEquals(vectors.getInt("protocolVersion"), capabilities.version);
+        org.json.JSONArray applications = vectors.getJSONArray("applications");
+        assertEquals(applications.length(), capabilities.applications.size());
+        for (int index = 0; index < applications.length(); index++) {
+            assertEquals(applications.getString(index), capabilities.applications.get(index));
+        }
+    }
+
+    @Test
+    public void catalogWithFutureFieldRemainsCompatible() throws Exception {
+        runtime = newRuntime();
+        runtime.setRoster(Map.of(10L, new PeerServiceRuntime.RosterHint("100.96.0.10", true)));
+        runtime.applyConfig(config(true, freePort(), false));
+        runtime.setHasAuthorizedOnlinePeer(true);
+        JSONObject vectors = ProtocolVectorTestSupport.read("peer-service-discovery-v2.json");
+
+        runtime.applyCatalog(vectors.getJSONObject("legacyCompatibility")
+                .getJSONObject("catalogWithFutureField"));
+
+        assertTrue(runtime.remoteServices().isEmpty());
     }
 
     @Test
@@ -455,6 +497,44 @@ public class PeerServiceRuntimeTest {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
         }
+    }
+
+    private static Set<String> jsonKeys(JSONObject object) {
+        Set<String> keys = new TreeSet<>();
+        object.keys().forEachRemaining(keys::add);
+        return keys;
+    }
+
+    private static String canonical(Object value) throws Exception {
+        if (value instanceof JSONObject object) {
+            StringBuilder result = new StringBuilder("{");
+            boolean first = true;
+            for (String key : jsonKeys(object)) {
+                if (!first) {
+                    result.append(',');
+                }
+                first = false;
+                result.append(JSONObject.quote(key)).append(':').append(canonical(object.get(key)));
+            }
+            return result.append('}').toString();
+        }
+        if (value instanceof org.json.JSONArray array) {
+            StringBuilder result = new StringBuilder("[");
+            for (int index = 0; index < array.length(); index++) {
+                if (index > 0) {
+                    result.append(',');
+                }
+                result.append(canonical(array.get(index)));
+            }
+            return result.append(']').toString();
+        }
+        if (value == null || value == JSONObject.NULL) {
+            return "null";
+        }
+        if (value instanceof String text) {
+            return JSONObject.quote(text);
+        }
+        return String.valueOf(value);
     }
 
     private static ServerSocket listen(int port) throws Exception {

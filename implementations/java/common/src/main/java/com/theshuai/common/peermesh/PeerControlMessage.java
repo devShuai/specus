@@ -7,6 +7,7 @@ import lombok.Data;
 import java.util.List;
 
 @Data
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class PeerControlMessage {
     public static final String TYPE_CONFIG = "peer-config";
     public static final String TYPE_ROSTER = "roster";
@@ -62,7 +63,6 @@ public class PeerControlMessage {
     private Long revision;
     private Long publisherClientId;
     private String publisherClientName;
-    @JsonInclude(JsonInclude.Include.NON_NULL)
     private Long publisherSessionId;
     private String instanceId;
     private String generatedAt;

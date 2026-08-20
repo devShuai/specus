@@ -2,13 +2,38 @@ package peermesh
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
+
+func TestValidateServiceReportEnvelopeRejectsClientControlledRoutingAndIdentity(t *testing.T) {
+	valid := protocol.MessageRequest{Message: `{"type":"service-report","enabled":true,"revision":1,"services":[]}`}
+	if err := validateServiceReportEnvelope(valid); err != nil {
+		t.Fatalf("valid envelope: %v", err)
+	}
+	targeted := valid
+	targeted.ToClientName = "peer-b"
+	if err := validateServiceReportEnvelope(targeted); err == nil {
+		t.Fatal("targeted service-report was accepted")
+	}
+	for _, field := range []string{
+		"sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+		"targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+		"sessionId", "token", "publisherClientId", "publisherClientName", "publisherSessionId",
+	} {
+		request := valid
+		request.Message = fmt.Sprintf(`{"type":"service-report","enabled":true,"revision":1,"services":[],%q:null}`, field)
+		if err := validateServiceReportEnvelope(request); err == nil {
+			t.Errorf("field %s was accepted", field)
+		}
+	}
+}
 
 func TestServiceReportWithdrawalKeepsRevisionTombstoneAndServerTTL(t *testing.T) {
 	ctx := context.Background()

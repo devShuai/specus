@@ -1,6 +1,9 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Specus.Client.Configuration;
+using Specus.Client.Control;
 using Specus.Client.PeerMesh;
 
 namespace Specus.Client.Tests;
@@ -42,11 +45,26 @@ public class PeerServiceRuntimeTests
         using var runtime = new PeerServiceRuntime(sent.Add);
         runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
         runtime.SetHasAuthorizedOnlinePeer(true);
-        runtime.ApplyConfig(Config(sharing: true, port, enabled: true));
+        var config = Config(sharing: true, port, enabled: true);
+        config.LocalServices![0].ServiceId = "svc-wire01";
+        config.LocalServices[0].Name = "fixture-http";
+        config.LocalServices[0].Description = "wire fixture";
+        config.LocalServices[0].Path = "/health";
+        runtime.ApplyConfig(config);
         WaitUntil(() => sent.Count > 0);
         Assert.Contains("service-report", sent[0]);
-        Assert.Contains("svc-http01", sent[0]);
+        Assert.Contains("svc-wire01", sent[0]);
         Assert.DoesNotContain("targetHost", sent[0]);
+        var actualReport = JsonNode.Parse(sent[0])!.AsObject();
+        var vectors = ProtocolVectorTestHelper.Read<PeerServiceWireVectors>(
+            "protocol/test-vectors/peer-service-discovery-v2.json");
+        var expectedReport = JsonNode.Parse(vectors.ServiceReports["dotnet"].GetRawText())!.AsObject();
+        foreach (var field in new[] { "revision", "instanceId", "generatedAt", "expiresAt", "createdAtMillis" })
+        {
+            expectedReport[field] = actualReport[field]?.DeepClone();
+        }
+        Assert.True(JsonNode.DeepEquals(expectedReport, actualReport),
+            $"real .NET service-report differs from shared fixture: {actualReport}");
 
         runtime.ApplyCatalog(2, "client-b", 9, 1, DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"),
         [
@@ -249,8 +267,27 @@ public class PeerServiceRuntimeTests
     public void CollectedEnvironmentAdvertisesPeerServiceCapabilities()
     {
         var environment = ClientEnvironmentInfo.Collect(Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
-        Assert.Equal(2, environment.ClientPeerServiceCapabilities.Version);
-        Assert.Equal(new[] { "http", "https", "ssh", "tcp", "udp" }, environment.ClientPeerServiceCapabilities.Applications);
+        var vectors = ProtocolVectorTestHelper.Read<PeerServiceWireVectors>(
+            "protocol/test-vectors/peer-service-discovery-v2.json");
+        Assert.Equal(vectors.ProtocolVersion, environment.ClientPeerServiceCapabilities.Version);
+        Assert.Equal(vectors.Applications, environment.ClientPeerServiceCapabilities.Applications);
+    }
+
+    [Fact]
+    public async Task PeerMeshClientIgnoresUnknownFutureControlMessage()
+    {
+        var vectors = ProtocolVectorTestHelper.Read<PeerServiceWireVectors>(
+            "protocol/test-vectors/peer-service-discovery-v2.json");
+        await using var client = new PeerMeshClient(
+            new SpecusClientConfig(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<PeerMeshClient>.Instance);
+        await using var writer = new FrameWriter(new MemoryStream());
+
+        await client.HandleControlAsync(
+            vectors.LegacyCompatibility.UnknownMessage.GetRawText(),
+            new SpecusRuntimeState(),
+            writer,
+            CancellationToken.None);
     }
 
     [Fact]
@@ -448,5 +485,18 @@ public class PeerServiceRuntimeTests
             Thread.Sleep(20);
         }
         throw new InvalidOperationException("condition not met");
+    }
+
+    private sealed class PeerServiceWireVectors
+    {
+        public int ProtocolVersion { get; set; }
+        public string[] Applications { get; set; } = [];
+        public Dictionary<string, JsonElement> ServiceReports { get; set; } = [];
+        public LegacyCompatibilityVector LegacyCompatibility { get; set; } = new();
+    }
+
+    private sealed class LegacyCompatibilityVector
+    {
+        public JsonElement UnknownMessage { get; set; }
     }
 }

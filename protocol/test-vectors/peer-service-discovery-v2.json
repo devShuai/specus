@@ -1,0 +1,186 @@
+{
+  "protocolVersion": 2,
+  "applications": ["http", "https", "ssh", "tcp", "udp"],
+  "serviceReports": {
+    "java": {
+      "type": "service-report",
+      "directBytes": 0,
+      "relayBytes": 0,
+      "createdAtMillis": 1787191200000,
+      "dataFrameVersion": 2,
+      "candidates": [],
+      "peers": [],
+      "enabled": true,
+      "revision": 1,
+      "instanceId": "fixture-java",
+      "generatedAt": "2026-08-20T02:00:00Z",
+      "expiresAt": "2026-08-20T02:05:00Z",
+      "services": [
+        {
+          "serviceId": "svc-wire01",
+          "name": "fixture-http",
+          "description": "wire fixture",
+          "transport": "tcp",
+          "application": "http",
+          "publishedPort": 18080,
+          "path": "/health"
+        }
+      ],
+      "stats": [],
+      "mdnsCandidates": []
+    },
+    "go": {
+      "type": "service-report",
+      "enabled": true,
+      "revision": 1,
+      "instanceId": "fixture-go",
+      "generatedAt": "2026-08-20T02:00:00Z",
+      "expiresAt": "2026-08-20T02:05:00Z",
+      "services": [
+        {
+          "serviceId": "svc-wire01",
+          "name": "fixture-http",
+          "description": "wire fixture",
+          "transport": "tcp",
+          "application": "http",
+          "publishedPort": 18080,
+          "path": "/health"
+        }
+      ],
+      "stats": [
+        {
+          "serviceId": "svc-wire01",
+          "bytesIn": 0,
+          "bytesOut": 0,
+          "activeConnections": 0,
+          "totalConnections": 0
+        }
+      ],
+      "createdAtMillis": 1787191200000
+    },
+    "dotnet": {
+      "type": "service-report",
+      "enabled": true,
+      "revision": 1,
+      "instanceId": "fixture-dotnet",
+      "generatedAt": "2026-08-20T02:00:00.0000000+00:00",
+      "expiresAt": "2026-08-20T02:05:00.0000000+00:00",
+      "services": [
+        {
+          "serviceId": "svc-wire01",
+          "name": "fixture-http",
+          "description": "wire fixture",
+          "transport": "tcp",
+          "application": "http",
+          "publishedPort": 18080,
+          "path": "/health"
+        }
+      ],
+      "createdAtMillis": 1787191200000,
+      "stats": [
+        {
+          "serviceId": "svc-wire01",
+          "bytesIn": 0,
+          "bytesOut": 0,
+          "activeConnections": 0,
+          "totalConnections": 0
+        }
+      ],
+      "mdnsCandidates": []
+    },
+    "android": {
+      "type": "service-report",
+      "enabled": true,
+      "revision": 1,
+      "instanceId": "fixture-android",
+      "generatedAt": "2026-08-20T02:00:00Z",
+      "expiresAt": "2026-08-20T02:05:00Z",
+      "createdAtMillis": 1787191200000,
+      "services": [
+        {
+          "serviceId": "svc-wire01",
+          "name": "fixture-http",
+          "description": "wire fixture",
+          "transport": "tcp",
+          "application": "http",
+          "publishedPort": 18080,
+          "path": "/health"
+        }
+      ]
+    }
+  },
+  "clientAuthRequests": {
+    "java": {
+      "apiKey": "fixture-key",
+      "timestamp": "1787191200000",
+      "nonce": "fixture-nonce-java",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+      "environment": {
+        "machineFingerprint": "fixture-machine-java",
+        "osUser": "fixture-user",
+        "clientPeerServiceCapabilities": {
+          "version": 2,
+          "applications": ["http", "https", "ssh", "tcp", "udp"]
+        }
+      }
+    },
+    "go": {
+      "apiKey": "fixture-key",
+      "timestamp": "1787191200000",
+      "nonce": "fixture-nonce-go",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+      "environment": {
+        "machineFingerprint": "fixture-machine-go",
+        "osUser": "fixture-user",
+        "clientPeerServiceCapabilities": {
+          "version": 2,
+          "applications": ["http", "https", "ssh", "tcp", "udp"]
+        }
+      }
+    },
+    "dotnet": {
+      "apiKey": "fixture-key",
+      "timestamp": "1787191200000",
+      "nonce": "fixture-nonce-dotnet",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+      "environment": {
+        "machineFingerprint": "fixture-machine-dotnet",
+        "osUser": "fixture-user",
+        "clientPeerServiceCapabilities": {
+          "version": 2,
+          "applications": ["http", "https", "ssh", "tcp", "udp"]
+        }
+      }
+    },
+    "android": {
+      "apiKey": "fixture-key",
+      "timestamp": "1787191200000",
+      "nonce": "fixture-nonce-android",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+      "environment": {
+        "machineFingerprint": "fixture-machine-android",
+        "osUser": "fixture-user",
+        "clientPeerServiceCapabilities": {
+          "version": 2,
+          "applications": ["http", "https", "ssh", "tcp", "udp"]
+        }
+      }
+    }
+  },
+  "legacyCompatibility": {
+    "unknownMessage": {
+      "type": "future-peer-service-v3",
+      "futureField": true
+    },
+    "catalogWithFutureField": {
+      "type": "service-catalog",
+      "publisherClientId": 10,
+      "publisherClientName": "fixture-publisher",
+      "publisherSessionId": 20,
+      "revision": 1,
+      "expiresAt": "2026-08-20T02:05:00Z",
+      "services": [],
+      "futureField": "ignored"
+    }
+  }
+}

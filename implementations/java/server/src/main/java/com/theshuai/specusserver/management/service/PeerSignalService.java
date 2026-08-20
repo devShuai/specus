@@ -1,5 +1,6 @@
 package com.theshuai.specusserver.management.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
@@ -55,6 +56,11 @@ public class PeerSignalService {
         ClientAccount source = clientAccountService.findClientByName(session.getClientName())
                 .orElseThrow(() -> new IllegalArgumentException("source client not found: " + session.getClientName()));
         PeerControlMessage signal = parseSignal(request.getMessage());
+        if (PeerControlMessage.TYPE_SERVICE_REPORT.equals(signal.getType())) {
+            validateServiceReportEnvelope(request);
+            pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
+            return;
+        }
         fillSource(signal, source);
 
         if (PeerControlMessage.TYPE_PATH_REPORT.equals(signal.getType())) {
@@ -74,20 +80,6 @@ public class PeerSignalService {
             if (!StringUtils.hasText(request.getToClientName())) {
                 return;
             }
-        }
-        if (PeerControlMessage.TYPE_SERVICE_REPORT.equals(signal.getType())) {
-            if (request.getMessage().getBytes(StandardCharsets.UTF_8).length
-                    > PeerServiceDiscovery.MAX_SNAPSHOT_BYTES) {
-                throw new IllegalArgumentException("service-report exceeds 16384 bytes");
-            }
-            if (StringUtils.hasText(request.getToClientName())) {
-                throw new IllegalArgumentException("service-report toClientName must be empty");
-            }
-            if (signal.getPublisherSessionId() != null) {
-                throw new IllegalArgumentException("service-report publisherSessionId is server-bound");
-            }
-            pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
-            return;
         }
         if (PeerControlMessage.TYPE_SERVICE_CATALOG.equals(signal.getType())) {
             throw new IllegalArgumentException("service-catalog is server-only");
@@ -116,6 +108,28 @@ public class PeerSignalService {
             sendSessionGrant(source, target, grant);
         }
         sendSignal(targetChannel, source.getClientName(), target.getClientName(), signal);
+    }
+
+    static void validateServiceReportEnvelope(MessageRequestPacket request) {
+        if (request.getMessage().getBytes(StandardCharsets.UTF_8).length
+                > PeerServiceDiscovery.MAX_SNAPSHOT_BYTES) {
+            throw new IllegalArgumentException("service-report exceeds 16384 bytes");
+        }
+        if (StringUtils.hasText(request.getToClientName())) {
+            throw new IllegalArgumentException("service-report toClientName must be empty");
+        }
+        JsonNode root = JsonUtil.readString(request.getMessage());
+        if (root == null || !root.isObject()) {
+            throw new IllegalArgumentException("invalid service-report");
+        }
+        for (String field : List.of(
+                "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+                "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+                "sessionId", "token", "publisherClientId", "publisherClientName", "publisherSessionId")) {
+            if (root.has(field)) {
+                throw new IllegalArgumentException("service-report " + field + " is server-bound");
+            }
+        }
     }
 
     public void pushRoster(ClientAccount account) {

@@ -2,7 +2,10 @@ package client
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,14 +46,36 @@ func TestPeerServiceRuntimeReportsReachableServiceWithoutTargetHost(t *testing.T
 	runtime := newPeerServiceRuntime(nil, sent.append)
 	runtime.setRoster(map[int64]peerServiceRosterHint{2: {virtualIP: "100.96.0.2", online: true}})
 	runtime.setHasAuthorizedOnlinePeer(true)
-	runtime.applyConfig(testPeerMeshConfig(true, port, true))
+	config := testPeerMeshConfig(true, port, true)
+	config.LocalServices[0].ServiceID = "svc-wire01"
+	config.LocalServices[0].Name = "fixture-http"
+	config.LocalServices[0].Description = "wire fixture"
+	config.LocalServices[0].Path = "/health"
+	runtime.applyConfig(config)
 	waitUntil(t, func() bool { return sent.len() > 0 })
 	body := sent.snapshot()[0]
-	if !strings.Contains(body, "service-report") || !strings.Contains(body, "svc-http01") {
+	if !strings.Contains(body, "service-report") || !strings.Contains(body, "svc-wire01") {
 		t.Fatalf("report = %s", body)
 	}
 	if strings.Contains(body, "targetHost") {
 		t.Fatalf("catalog payload must not include targetHost: %s", body)
+	}
+	var vectors struct {
+		ServiceReports map[string]json.RawMessage `json:"serviceReports"`
+	}
+	readRepositoryJSON(t, "protocol/test-vectors/peer-service-discovery-v2.json", &vectors)
+	var actual, expected map[string]any
+	if err := json.Unmarshal([]byte(body), &actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(vectors.ServiceReports["go"], &expected); err != nil {
+		t.Fatal(err)
+	}
+	for _, dynamic := range []string{"revision", "instanceId", "generatedAt", "expiresAt", "createdAtMillis"} {
+		expected[dynamic] = actual[dynamic]
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("real Go service-report differs from the shared fixture: actual=%v expected=%v", actual, expected)
 	}
 
 	sessionID := int64(9)
@@ -321,12 +346,28 @@ func TestPeerServiceRuntimeLocalPauseStopsReporting(t *testing.T) {
 
 func TestCollectEnvironmentAdvertisesPeerServiceCapabilities(t *testing.T) {
 	info := collectEnvironment()
-	if info.ClientPeerServiceCapabilities.Version != 2 {
+	var vectors struct {
+		ProtocolVersion int      `json:"protocolVersion"`
+		Applications    []string `json:"applications"`
+	}
+	readRepositoryJSON(t, "protocol/test-vectors/peer-service-discovery-v2.json", &vectors)
+	if info.ClientPeerServiceCapabilities.Version != vectors.ProtocolVersion {
 		t.Fatalf("version = %d", info.ClientPeerServiceCapabilities.Version)
 	}
-	if strings.Join(info.ClientPeerServiceCapabilities.Applications, ",") != "http,https,ssh,tcp,udp" {
+	if !reflect.DeepEqual(info.ClientPeerServiceCapabilities.Applications, vectors.Applications) {
 		t.Fatalf("apps = %#v", info.ClientPeerServiceCapabilities.Applications)
 	}
+}
+
+func TestPeerMeshClientIgnoresUnknownFutureControlMessage(t *testing.T) {
+	var vectors struct {
+		LegacyCompatibility struct {
+			UnknownMessage json.RawMessage `json:"unknownMessage"`
+		} `json:"legacyCompatibility"`
+	}
+	readRepositoryJSON(t, "protocol/test-vectors/peer-service-discovery-v2.json", &vectors)
+	mesh := &peerMeshClient{logger: log.New(io.Discard, "", 0)}
+	mesh.handleControl(nil, string(vectors.LegacyCompatibility.UnknownMessage), RuntimeConfig{}, nil)
 }
 
 func TestPeerServiceTCPBridgeEnforcesServerAuthoredSourceACL(t *testing.T) {
