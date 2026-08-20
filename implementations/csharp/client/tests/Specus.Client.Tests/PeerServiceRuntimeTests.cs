@@ -137,7 +137,7 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
-    public void StableCatalogIsRenewedBeforeItsLeaseExpires()
+    public void StableCatalogIsRenewedAcrossMultipleLeaseTtls()
     {
         var port = FreePort();
         using var listener = Listen(port);
@@ -149,9 +149,12 @@ public class PeerServiceRuntimeTests
         sent.Clear();
         runtime.ProbeAndReport();
         Assert.Empty(sent);
-        runtime.ForceReportRefreshForTest();
-        runtime.ProbeAndReport();
-        Assert.Single(sent);
+        for (var elapsedTtls = 1; elapsedTtls <= 3; elapsedTtls++)
+        {
+            runtime.ForceReportRefreshForTest();
+            runtime.ProbeAndReport();
+            Assert.Equal(elapsedTtls, sent.Count);
+        }
     }
 
     [Fact]

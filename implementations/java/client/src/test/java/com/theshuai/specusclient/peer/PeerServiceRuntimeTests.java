@@ -170,7 +170,7 @@ class PeerServiceRuntimeTests {
     }
 
     @Test
-    void unchangedServicesAreRenewedBeforeCatalogTtl() throws Exception {
+    void unchangedServicesAreRenewedAcrossMultipleCatalogTtls() throws Exception {
         int port = freePort();
         try (ServerSocket ignored = listen(port)) {
             runtime = newRuntime();
@@ -178,9 +178,13 @@ class PeerServiceRuntimeTests {
             runtime.applyConfig(config(true, localService(port, true)));
             waitUntil(() -> !sent.isEmpty());
             sent.clear();
-            runtime.lastReportAt = Instant.now().minus(PeerServiceRuntime.REPORT_REFRESH_INTERVAL).minusSeconds(1);
-            runtime.probeAndReport();
-            assertThat(sent).hasSize(1);
+            for (int elapsedTtls = 1; elapsedTtls <= 3; elapsedTtls++) {
+                runtime.lastReportAt = Instant.now()
+                        .minus(PeerServiceRuntime.REPORT_REFRESH_INTERVAL)
+                        .minusSeconds(1);
+                runtime.probeAndReport();
+                assertThat(sent).hasSize(elapsedTtls);
+            }
         }
     }
 

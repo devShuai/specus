@@ -165,7 +165,7 @@ func TestPeerServiceRuntimeReconnectAcceptsCurrentCatalogRevision(t *testing.T) 
 	}
 }
 
-func TestPeerServiceRuntimeRenewsUnchangedCatalogBeforeTTL(t *testing.T) {
+func TestPeerServiceRuntimeRenewsUnchangedCatalogAcrossMultipleTTLs(t *testing.T) {
 	port, listener := mustListen(t)
 	defer listener.Close()
 	sent := &sentReports{}
@@ -174,12 +174,14 @@ func TestPeerServiceRuntimeRenewsUnchangedCatalogBeforeTTL(t *testing.T) {
 	runtime.applyConfig(testPeerMeshConfig(true, port, true))
 	waitUntil(t, func() bool { return sent.len() > 0 })
 	sent.reset()
-	runtime.mu.Lock()
-	runtime.lastReportAt = time.Now().Add(-peerServiceReportRefresh - time.Second)
-	runtime.mu.Unlock()
-	runtime.probeAndReport()
-	if sent.len() != 1 {
-		t.Fatalf("renewal reports = %d", sent.len())
+	for elapsedTTLs := 1; elapsedTTLs <= 3; elapsedTTLs++ {
+		runtime.mu.Lock()
+		runtime.lastReportAt = time.Now().Add(-peerServiceReportRefresh - time.Second)
+		runtime.mu.Unlock()
+		runtime.probeAndReport()
+		if sent.len() != elapsedTTLs {
+			t.Fatalf("renewal reports after %d TTLs = %d", elapsedTTLs, sent.len())
+		}
 	}
 }
 

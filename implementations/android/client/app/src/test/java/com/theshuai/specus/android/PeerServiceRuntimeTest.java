@@ -137,7 +137,7 @@ public class PeerServiceRuntimeTest {
     }
 
     @Test
-    public void stableCatalogIsRenewedBeforeItsLeaseExpires() throws Exception {
+    public void stableCatalogIsRenewedAcrossMultipleLeaseTtls() throws Exception {
         int port = freePort();
         try (ServerSocket ignored = listen(port)) {
             runtime = newRuntime();
@@ -147,9 +147,11 @@ public class PeerServiceRuntimeTest {
             sent.clear();
             runtime.probeAndReport();
             assertTrue(sent.isEmpty());
-            runtime.forceReportRefreshForTest();
-            runtime.probeAndReport();
-            assertEquals(1, sent.size());
+            for (int elapsedTtls = 1; elapsedTtls <= 3; elapsedTtls++) {
+                runtime.forceReportRefreshForTest();
+                runtime.probeAndReport();
+                assertEquals(elapsedTtls, sent.size());
+            }
         }
     }
 
