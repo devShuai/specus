@@ -121,6 +121,7 @@ builder.Services.AddSingleton<ClientPackageStore>();
 builder.Services.AddSingleton<ClientPackagePublicRateLimiter>();
 builder.Services.AddHostedService<RegistrationChallengeCleanupService>();
 builder.Services.AddSingleton<TurnCredentialService>();
+builder.Services.AddSingleton<PeerMeshServiceState>();
 builder.Services.AddScoped<PeerMeshService>();
 builder.Services.AddHostedService<StunTurnServer>();
 builder.Services.AddHostedService<PeerMeshRelayTrafficFlushService>();
