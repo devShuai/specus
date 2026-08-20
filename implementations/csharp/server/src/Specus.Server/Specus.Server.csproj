@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -21,7 +21,7 @@
 
   <ItemGroup>
     <PackageReference Include="MailKit" Version="4.17.0" />
-    <PackageReference Include="StackExchange.Redis" Version="3.0.17" />
+    <PackageReference Include="StackExchange.Redis" Version="3.1.13" />
     <ProjectReference Include="..\..\..\protocol\src\Specus.Protocol\Specus.Protocol.csproj" />
     <ProjectReference Include="..\Specus.Server.Data\Specus.Server.Data.csproj" />
     <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load
