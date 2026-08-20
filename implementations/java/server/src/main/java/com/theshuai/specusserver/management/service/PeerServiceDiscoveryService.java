@@ -57,6 +57,7 @@ public class PeerServiceDiscoveryService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
     private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
+    private final Map<CatalogKey, Long> reportRevisions = new ConcurrentHashMap<>();
     private final Map<CatalogKey, List<com.theshuai.common.peermesh.PeerMdnsCandidate>> mdnsCandidates = new ConcurrentHashMap<>();
     private final Map<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
     private final Map<String, Long> auditLogTimestamps = new ConcurrentHashMap<>();
@@ -186,13 +187,15 @@ public class PeerServiceDiscoveryService {
         requireAdmin(context);
         PeerMeshSharedService row = serviceRepository.findByIdAndTenantId(id, context.tenant().tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("service not found: " + id));
+        ServiceRuntimeDefinition previousRuntime = ServiceRuntimeDefinition.from(row);
         applyDefinition(row, mutation, false);
         row.setUpdatedAt(Instant.now().toString());
         PeerMeshSharedService saved = serviceRepository.save(row);
         audit("service-update", saved.getTenantId(), saved.getClientId(), null, saved.getServiceId(),
                 saved.isEnabled() ? "enabled" : "updated");
-        List<CatalogDelivery> catalogsToPush = republishClient(
-                saved.getTenantId(), saved.getClientId(), "service-updated");
+        List<CatalogDelivery> catalogsToPush = previousRuntime.equals(ServiceRuntimeDefinition.from(saved))
+                ? onClientAuthorizationChanged(saved.getTenantId(), saved.getClientId())
+                : republishClient(saved.getTenantId(), saved.getClientId(), "service-updated");
         return new ServiceMutationResult(toView(saved, true), catalogsToPush);
     }
 
@@ -225,7 +228,8 @@ public class PeerServiceDiscoveryService {
             throw new IllegalArgumentException("revision must be >= 1");
         }
         CatalogKey key = new CatalogKey(source.getTenantId(), source.getId(), publisherSessionId);
-        if (!acceptRevision(key, revision)) {
+        Long catalogRevision = acceptReportAndAdvanceCatalogRevision(key, revision);
+        if (catalogRevision == null) {
             audit("service-report", source.getTenantId(), source.getId(), publisherSessionId, null, "ignored-revision");
             return List.of();
         }
@@ -233,19 +237,21 @@ public class PeerServiceDiscoveryService {
             catalogs.remove(key);
             mdnsCandidates.remove(key);
             audit("service-report", source.getTenantId(), source.getId(), publisherSessionId, null, "withdrawn");
-            return fanout(source, publisherSessionId, revision, List.of(), Instant.now().plus(PeerServiceDiscovery.CATALOG_TTL));
+            return fanoutAuthorizationChange(source, publisherSessionId, catalogRevision, List.of(),
+                    Instant.now().plus(PeerServiceDiscovery.CATALOG_TTL));
         }
         if (!hasAuthorizedOnlinePeer(source)) {
             catalogs.remove(key);
             mdnsCandidates.remove(key);
             audit("service-report", source.getTenantId(), source.getId(), publisherSessionId, null, "no-authorized-peer");
-            return List.of();
+            return fanoutAuthorizationChange(source, publisherSessionId, catalogRevision, List.of(),
+                    Instant.now().plus(PeerServiceDiscovery.CATALOG_TTL));
         }
         List<PeerAdvertisedService> advertised = advertisedFromReport(source, report.getServices());
         Instant generatedAt = Instant.now();
         Instant expiresAt = generatedAt.plus(PeerServiceDiscovery.CATALOG_TTL);
         catalogs.put(key, new CatalogSnapshot(
-                revision,
+                catalogRevision,
                 PeerServiceDiscovery.normalizeInstanceId(report.getInstanceId()),
                 generatedAt,
                 expiresAt,
@@ -255,7 +261,7 @@ public class PeerServiceDiscoveryService {
         storeMdns(key, source, report);
         audit("service-report", source.getTenantId(), source.getId(), publisherSessionId, null,
                 advertised.isEmpty() ? "empty" : "published");
-        return fanout(source, publisherSessionId, revision, advertised, expiresAt);
+        return fanout(source, publisherSessionId, catalogRevision, advertised, expiresAt);
     }
 
     public List<CatalogDelivery> onClientDisconnected(ClientAccount account, Long sessionId) {
@@ -268,21 +274,31 @@ public class PeerServiceDiscoveryService {
         reportTimestamps.remove(sessionId);
         audit("publisher-offline", account.getTenantId(), account.getId(), sessionId, null, "disconnected");
         try {
-            return fanout(account, sessionId, nextRevision(key), List.of(), Instant.now());
+            return fanoutAuthorizationChange(account, sessionId, nextRevision(key), List.of(), Instant.now());
         } finally {
             // The authenticated session is already offline, so late reports cannot be accepted. Keep the
             // withdrawal revision only long enough to fan it out, then release the bounded high-water slot.
             catalogRevisions.remove(key);
+            reportRevisions.remove(key);
         }
     }
 
     public List<CatalogDelivery> onAuthorizationChanged(String tenantId) {
+        return onAuthorizationChanged(tenantId, null);
+    }
+
+    public List<CatalogDelivery> onClientAuthorizationChanged(String tenantId, long clientId) {
+        return onAuthorizationChanged(tenantId, clientId);
+    }
+
+    private List<CatalogDelivery> onAuthorizationChanged(String tenantId, Long publisherClientId) {
         if (!StringUtils.hasText(tenantId)) {
             return List.of();
         }
         List<CatalogDelivery> deliveries = new ArrayList<>();
         for (Map.Entry<CatalogKey, CatalogSnapshot> entry : catalogs.entrySet()) {
-            if (!tenantId.equals(entry.getKey().tenantId())) {
+            if (!tenantId.equals(entry.getKey().tenantId())
+                    || (publisherClientId != null && entry.getKey().publisherClientId() != publisherClientId)) {
                 continue;
             }
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
@@ -322,17 +338,17 @@ public class PeerServiceDiscoveryService {
             }
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     key.publisherClientId(), key.tenantId()).orElse(null);
-            if (publisher == null || !peerMeshService.canPeer(publisher, recipient)) {
+            if (publisher == null) {
                 continue;
             }
-            List<PeerAdvertisedService> visible = snapshot.services().stream()
+            List<PeerAdvertisedService> visible = peerMeshService.canPeer(publisher, recipient)
+                    ? snapshot.services().stream()
                     .filter(service -> visibleTo(publisher, recipient, service))
                     .map(PeerServiceDiscovery::copyAdvertised)
-                    .toList();
-            if (!visible.isEmpty()) {
-                deliveries.add(new CatalogDelivery(recipient, catalogMessage(publisher,
-                        key.publisherSessionId(), snapshot.revision(), visible, snapshot.expiresAt())));
-            }
+                    .toList()
+                    : List.of();
+            deliveries.add(new CatalogDelivery(recipient, catalogMessage(publisher,
+                    key.publisherSessionId(), snapshot.revision(), visible, snapshot.expiresAt())));
         }
         return deliveries;
     }
@@ -346,7 +362,7 @@ public class PeerServiceDiscoveryService {
     }
 
     int trackedCatalogRevisionCount() {
-        return catalogRevisions.size();
+        return catalogRevisions.size() + reportRevisions.size();
     }
 
     public List<CatalogDelivery> expireStale() {
@@ -359,7 +375,7 @@ public class PeerServiceDiscoveryService {
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     entry.getKey().publisherClientId(), entry.getKey().tenantId()).orElse(null);
             if (publisher != null) {
-                deliveries.addAll(fanout(publisher, entry.getKey().publisherSessionId(),
+                deliveries.addAll(fanoutAuthorizationChange(publisher, entry.getKey().publisherSessionId(),
                         nextRevision(entry.getKey()), List.of(), now));
             }
             audit("catalog-expire", entry.getKey().tenantId(), entry.getKey().publisherClientId(),
@@ -377,7 +393,7 @@ public class PeerServiceDiscoveryService {
                 return false;
             }
             if (publisher != null) {
-                deliveries.addAll(fanout(publisher, entry.getKey().publisherSessionId(),
+                deliveries.addAll(fanoutAuthorizationChange(publisher, entry.getKey().publisherSessionId(),
                         nextRevision(entry.getKey()), List.of(), Instant.now()));
             }
             audit("catalog-withdraw", tenantId, clientId, entry.getKey().publisherSessionId(), null, reason);
@@ -396,7 +412,7 @@ public class PeerServiceDiscoveryService {
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     entry.getKey().publisherClientId(), tenantId).orElse(null);
             if (publisher != null) {
-                deliveries.addAll(fanout(publisher, entry.getKey().publisherSessionId(),
+                deliveries.addAll(fanoutAuthorizationChange(publisher, entry.getKey().publisherSessionId(),
                         nextRevision(entry.getKey()), List.of(), Instant.now()));
             }
             audit("catalog-withdraw", tenantId, entry.getKey().publisherClientId(),
@@ -407,19 +423,34 @@ public class PeerServiceDiscoveryService {
         return deliveries;
     }
 
-    private boolean acceptRevision(CatalogKey key, long revision) {
-        synchronized (catalogRevisions) {
-            Long previous = catalogRevisions.get(key);
-            if (previous == null && catalogRevisions.size() >= 4096) {
+    private Long acceptReportAndAdvanceCatalogRevision(CatalogKey key, long revision) {
+        synchronized (reportRevisions) {
+            Long previous = reportRevisions.get(key);
+            if (previous == null && reportRevisions.size() >= 4096) {
                 audit("service-report", key.tenantId(), key.publisherClientId(),
                         key.publisherSessionId(), null, "revision-table-full");
-                return false;
+                return null;
             }
             if (previous != null && revision <= previous) {
-                return false;
+                return null;
             }
-            catalogRevisions.put(key, revision);
-            return true;
+            synchronized (catalogRevisions) {
+                Long delivered = catalogRevisions.get(key);
+                if (delivered == null && catalogRevisions.size() >= 4096) {
+                    audit("service-report", key.tenantId(), key.publisherClientId(),
+                            key.publisherSessionId(), null, "catalog-revision-table-full");
+                    return null;
+                }
+                if (delivered != null && delivered == Long.MAX_VALUE) {
+                    return null;
+                }
+                long catalogRevision = delivered == null || revision > delivered
+                        ? revision
+                        : delivered + 1L;
+                reportRevisions.put(key, revision);
+                catalogRevisions.put(key, catalogRevision);
+                return catalogRevision;
+            }
         }
     }
 
@@ -1026,6 +1057,22 @@ public class PeerServiceDiscoveryService {
                                   List<PeerAdvertisedService> services,
                                   String publisherClientName,
                                   List<PeerServiceStats> stats) {
+    }
+
+    private record ServiceRuntimeDefinition(String name,
+                                            String description,
+                                            String transport,
+                                            String application,
+                                            String targetHost,
+                                            int targetPort,
+                                            int publishedPort,
+                                            String path,
+                                            boolean enabled) {
+        private static ServiceRuntimeDefinition from(PeerMeshSharedService service) {
+            return new ServiceRuntimeDefinition(service.getName(), service.getDescription(), service.getTransport(),
+                    service.getApplication(), service.getTargetHost(), service.getTargetPort(),
+                    service.getPublishedPort(), service.getPath(), service.isEnabled());
+        }
     }
 
     public record AuditEvent(String at, String action, String tenantId, Long clientId, Long sessionId,

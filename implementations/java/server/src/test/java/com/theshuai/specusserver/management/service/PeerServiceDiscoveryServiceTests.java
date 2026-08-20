@@ -16,7 +16,10 @@ import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepo
 import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
 import com.theshuai.specusserver.management.model.SpecusMapping;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.session.SessionUtil;
 import com.theshuai.specusserver.management.tenant.TenantContext;
+import com.theshuai.common.session.Session;
+import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -227,6 +230,95 @@ class PeerServiceDiscoveryServiceTests {
 
         service.onClientDisconnected(publisher, 99L);
         assertThat(service.trackedCatalogRevisionCount()).isZero();
+    }
+
+    @Test
+    void authorizationChangesLoginAndDisconnectSynchronizeThreePeersAndPublisherSessions() {
+        ClientAccount publisher = client(1, "alice", "publisher-sync");
+        ClientAccount peerB = client(2, "bob", "peer-b-sync");
+        ClientAccount peerC = client(3, "carol", "peer-c-sync");
+        PeerMeshSharedService definition = definition(publisher);
+        definition.setVisibility("ACL");
+        definition.setAllowedClientIds("[2,3]");
+        PeerMeshServiceSharing sharing = new PeerMeshServiceSharing();
+        sharing.setTenantId("tenant-a");
+        sharing.setEnabled(true);
+
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.of(sharing));
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", publisher.getId()))
+                .thenReturn(Optional.of(device(publisher.getId(), publisher.getClientName(), true)));
+        when(serviceRepository.findByTenantIdAndClientIdOrderByNameAsc("tenant-a", publisher.getId()))
+                .thenReturn(List.of(definition));
+        when(serviceRepository.findByTenantIdAndClientIdAndServiceId(
+                "tenant-a", publisher.getId(), definition.getServiceId())).thenReturn(Optional.of(definition));
+        when(serviceRepository.findByIdAndTenantId(definition.getId(), "tenant-a")).thenReturn(Optional.of(definition));
+        when(serviceRepository.save(any(PeerMeshSharedService.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a"))
+                .thenReturn(List.of(publisher, peerB, peerC));
+        when(clientAccountRepository.findByIdAndTenantId(publisher.getId(), "tenant-a"))
+                .thenReturn(Optional.of(publisher));
+        when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(
+                new PeerMeshService.PeerRosterItem(peerB.getId(), peerB.getClientName(), "100.96.0.2", "pk-b",
+                        true, false, false, false, false, 0, 2, List.of("http")),
+                new PeerMeshService.PeerRosterItem(peerC.getId(), peerC.getClientName(), "100.96.0.3", "pk-c",
+                        true, false, false, false, false, 0, 2, List.of("http"))));
+        when(peerMeshService.canPeer(publisher, peerB)).thenReturn(true);
+        when(peerMeshService.canPeer(publisher, peerC)).thenReturn(true);
+
+        EmbeddedChannel channelB = new EmbeddedChannel();
+        EmbeddedChannel channelC = new EmbeddedChannel();
+        SessionUtil.bindControlSession(new Session(peerB.getClientName()), channelB);
+        SessionUtil.bindControlSession(new Session(peerC.getClientName()), channelC);
+        try {
+            PeerControlMessage report = reportMessage(definition.getServiceId());
+            report.setRevision(1L);
+            service.acceptReport(publisher, report, 101L);
+            report.setRevision(1L);
+            service.acceptReport(publisher, report, 102L);
+
+            var visibilityUpdate = new PeerServiceDiscoveryService.ServiceMutation(
+                    null, null, null, null, null, null, null, null, null, null, null, "ACL", List.of(2L));
+            var filtered = service.updateService(admin(), definition.getId(), visibilityUpdate).catalogs();
+            assertThat(filtered).filteredOn(delivery -> delivery.recipient() == peerB).hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).hasSize(1));
+            assertThat(filtered).filteredOn(delivery -> delivery.recipient() == peerC).hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).isEmpty());
+            service.updateService(admin(), definition.getId(), new PeerServiceDiscoveryService.ServiceMutation(
+                    null, null, null, null, null, null, null, null, null, null, null, "ACL", List.of(2L, 3L)));
+
+            when(peerMeshService.canPeer(publisher, peerB)).thenReturn(false);
+            var revoked = service.onAuthorizationChanged("tenant-a");
+            assertThat(revoked).filteredOn(delivery -> delivery.recipient() == peerB)
+                    .hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).isEmpty());
+            assertThat(revoked).filteredOn(delivery -> delivery.recipient() == peerC)
+                    .hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).hasSize(1));
+            assertThat(service.catalogsForRecipient(peerB)).hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).isEmpty());
+
+            when(peerMeshService.canPeer(publisher, peerB)).thenReturn(true);
+            assertThat(service.catalogsForRecipient(peerB)).hasSize(2)
+                    .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).hasSize(1));
+
+            long authorizationRevision = service.currentCatalog("tenant-a", publisher.getId(), 101L).revision();
+            report.setRevision(2L);
+            assertThat(service.acceptReport(publisher, report, 101L)).isNotEmpty();
+            assertThat(service.currentCatalog("tenant-a", publisher.getId(), 101L).revision())
+                    .isGreaterThan(authorizationRevision);
+
+            var disconnected = service.onClientDisconnected(publisher, 101L);
+            assertThat(disconnected).allSatisfy(delivery -> {
+                assertThat(delivery.catalog().getPublisherSessionId()).isEqualTo(101L);
+                assertThat(delivery.catalog().getServices()).isEmpty();
+            });
+            assertThat(service.currentCatalog("tenant-a", publisher.getId(), 101L)).isNull();
+            assertThat(service.currentCatalog("tenant-a", publisher.getId(), 102L)).isNotNull();
+        } finally {
+            channelB.close();
+            channelC.close();
+        }
     }
 
     private static ManagementContext admin() {

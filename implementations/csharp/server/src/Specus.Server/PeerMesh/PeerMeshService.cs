@@ -63,6 +63,7 @@ public sealed partial class PeerMeshService
         state ??= new PeerMeshServiceState();
         _serviceCatalogs = state.ServiceCatalogs;
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
+        _serviceReportRevisions = state.ServiceReportRevisions;
         _audits = state.Audits;
         _serviceReportWindows = state.ServiceReportWindows;
         _serviceCatalogMutationGates = state.ServiceCatalogMutationGates;
@@ -1347,6 +1348,11 @@ public sealed partial class PeerMeshService
         {
             await PushRosterAsync(target, cancellationToken).ConfigureAwait(false);
         }
+        if (!enabled)
+        {
+            await WithdrawClientAsync(account.TenantId, account.Id, cancellationToken).ConfigureAwait(false);
+        }
+        await OnAuthorizationChangedAsync(account.TenantId, cancellationToken).ConfigureAwait(false);
     }
 
     private Task<List<ClientAccount>> RosterRefreshTargetsAsync(ClientAccount account, CancellationToken cancellationToken) =>

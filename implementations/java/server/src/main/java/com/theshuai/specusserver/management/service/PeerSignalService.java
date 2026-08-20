@@ -179,12 +179,15 @@ public class PeerSignalService {
         for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
             pushRoster(target);
         }
+        List<PeerServiceDiscoveryService.CatalogDelivery> catalogs = new java.util.ArrayList<>();
         if (enabled) {
-            pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(account.getTenantId()));
+            catalogs.addAll(peerServiceDiscoveryService.onAuthorizationChanged(account.getTenantId()));
         } else {
-            pushCatalogs(peerServiceDiscoveryService.withdrawClient(
+            catalogs.addAll(peerServiceDiscoveryService.withdrawClient(
                     account.getTenantId(), account.getId(), "device-disabled"));
+            catalogs.addAll(peerServiceDiscoveryService.onAuthorizationChanged(account.getTenantId()));
         }
+        pushCatalogs(catalogs);
         return closedSessions;
     }
 

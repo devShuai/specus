@@ -204,6 +204,7 @@ func (s *Service) UpdateSharedService(ctx context.Context, access AccessContext,
 		}
 		return SharedServiceView{}, errors.New("service not found")
 	}
+	previousRuntime := serviceRuntimeDefinitionOf(*row)
 	if err := applyServiceMutation(row, mutation, false); err != nil {
 		return SharedServiceView{}, err
 	}
@@ -219,8 +220,26 @@ func (s *Service) UpdateSharedService(ctx context.Context, access AccessContext,
 		return SharedServiceView{}, err
 	}
 	s.PushConfig(ctx, *account)
-	s.withdrawClient(ctx, row.TenantID, row.ClientID)
+	if previousRuntime == serviceRuntimeDefinitionOf(*row) {
+		s.onAuthorizationChanged(ctx, row.TenantID)
+	} else {
+		s.withdrawClient(ctx, row.TenantID, row.ClientID)
+	}
 	return s.sharedServiceView(ctx, *row, true), nil
+}
+
+type serviceRuntimeDefinition struct {
+	name, description, transport, application, targetHost, path string
+	targetPort, publishedPort                                   int
+	enabled                                                     bool
+}
+
+func serviceRuntimeDefinitionOf(row store.PeerMeshSharedService) serviceRuntimeDefinition {
+	return serviceRuntimeDefinition{
+		name: row.Name, description: row.Description, transport: row.Transport,
+		application: row.Application, targetHost: row.TargetHost, path: row.Path,
+		targetPort: row.TargetPort, publishedPort: row.PublishedPort, enabled: row.Enabled,
+	}
 }
 
 func (s *Service) DeleteSharedService(ctx context.Context, access AccessContext, id int64) error {
@@ -258,6 +277,7 @@ func (s *Service) OnClientDisconnected(ctx context.Context, clientName string, s
 	key := catalogKey{account.TenantID, account.ID, sessionID}
 	s.catalogMu.Lock()
 	delete(s.catalogRevisions, key)
+	delete(s.reportRevisions, key)
 	delete(s.serviceReportRates, sessionID)
 	s.catalogMu.Unlock()
 }
@@ -298,7 +318,8 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 		return errors.New("revision must be >= 1")
 	}
 	key := catalogKey{source.TenantID, source.ID, publisherSessionID}
-	if !s.acceptCatalogRevision(key, revision) {
+	catalogRevision, accepted := s.acceptReportRevision(key, revision)
+	if !accepted {
 		return nil
 	}
 	enabled := report.Enabled != nil && *report.Enabled
@@ -306,7 +327,7 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 		s.catalogMu.Lock()
 		delete(s.catalogs, key)
 		s.catalogMu.Unlock()
-		s.fanoutCatalog(ctx, source, publisherSessionID, revision, nil, time.Now())
+		s.fanoutCatalogMode(ctx, source, publisherSessionID, catalogRevision, nil, time.Now(), true)
 		return nil
 	}
 	roster, err := s.AllowedRoster(ctx, source)
@@ -321,6 +342,10 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 		}
 	}
 	if !hasPeer {
+		s.catalogMu.Lock()
+		delete(s.catalogs, key)
+		s.catalogMu.Unlock()
+		s.fanoutCatalogMode(ctx, source, publisherSessionID, catalogRevision, nil, time.Now(), true)
 		return nil
 	}
 	advertised, err := s.advertisedFromReport(ctx, source, report.Services)
@@ -331,13 +356,13 @@ func (s *Service) handleServiceReport(ctx context.Context, source store.ClientAc
 	expiresAt := now.Add(5 * time.Minute)
 	s.catalogMu.Lock()
 	s.catalogs[key] = catalogSnapshot{
-		revision: revision, instanceID: strings.TrimSpace(report.InstanceID), generatedAt: now, expiresAt: expiresAt,
+		revision: catalogRevision, instanceID: strings.TrimSpace(report.InstanceID), generatedAt: now, expiresAt: expiresAt,
 		services: advertised, publisherClientName: source.ClientName, stats: copyServiceStats(report.Stats, advertised),
 		mdns: sanitizeMdnsCandidates(report.MdnsCandidates),
 	}
 	s.audit("service-report", source.TenantID, &source.ID, &publisherSessionID, "", "published")
 	s.catalogMu.Unlock()
-	s.fanoutCatalog(ctx, source, publisherSessionID, revision, advertised, expiresAt)
+	s.fanoutCatalog(ctx, source, publisherSessionID, catalogRevision, advertised, expiresAt)
 	return nil
 }
 
@@ -516,17 +541,16 @@ func (s *Service) pushCurrentCatalogs(ctx context.Context, recipient store.Clien
 			continue
 		}
 		allowed, err := s.CanPeer(ctx, *publisher, recipient)
-		if err != nil || !allowed {
+		if err != nil {
 			continue
 		}
 		visible := make([]AdvertisedService, 0, len(item.snapshot.services))
-		for _, service := range item.snapshot.services {
-			if s.visibleTo(ctx, *publisher, recipient, service) {
-				visible = append(visible, service)
+		if allowed {
+			for _, service := range item.snapshot.services {
+				if s.visibleTo(ctx, *publisher, recipient, service) {
+					visible = append(visible, service)
+				}
 			}
-		}
-		if len(visible) == 0 {
-			continue
 		}
 		sessionID := item.key.publisherSessionID
 		revision := item.snapshot.revision
@@ -566,20 +590,31 @@ func (s *Service) withdrawSession(ctx context.Context, publisher store.ClientAcc
 	delete(s.serviceReportRates, sessionID)
 	revision := s.nextCatalogRevisionLocked(key)
 	s.catalogMu.Unlock()
-	s.fanoutCatalog(ctx, publisher, sessionID, revision, nil, time.Now())
+	s.fanoutCatalogMode(ctx, publisher, sessionID, revision, nil, time.Now(), true)
 }
 
-func (s *Service) acceptCatalogRevision(key catalogKey, revision int64) bool {
+func (s *Service) acceptReportRevision(key catalogKey, revision int64) (int64, bool) {
 	s.catalogMu.Lock()
 	defer s.catalogMu.Unlock()
+	if _, exists := s.reportRevisions[key]; !exists && len(s.reportRevisions) >= 4096 {
+		return 0, false
+	}
+	if previous := s.reportRevisions[key]; revision <= previous {
+		return 0, false
+	}
 	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
-		return false
+		return 0, false
 	}
-	if previous := s.catalogRevisions[key]; revision <= previous {
-		return false
+	catalogRevision := revision
+	if previous := s.catalogRevisions[key]; catalogRevision <= previous {
+		if previous == int64(^uint64(0)>>1) {
+			return 0, false
+		}
+		catalogRevision = previous + 1
 	}
-	s.catalogRevisions[key] = revision
-	return true
+	s.reportRevisions[key] = revision
+	s.catalogRevisions[key] = catalogRevision
+	return catalogRevision, true
 }
 
 func (s *Service) nextCatalogRevisionLocked(key catalogKey) int64 {
@@ -612,7 +647,7 @@ func (s *Service) expireServiceCatalogs(ctx context.Context, now time.Time) {
 	for _, item := range expired {
 		publisher, err := s.findTenantClient(ctx, item.key.tenantID, item.key.publisherClientID)
 		if err == nil && publisher != nil {
-			s.fanoutCatalog(ctx, *publisher, item.key.publisherSessionID, item.revision, nil, now)
+			s.fanoutCatalogMode(ctx, *publisher, item.key.publisherSessionID, item.revision, nil, now, true)
 		}
 	}
 }

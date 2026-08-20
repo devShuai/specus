@@ -168,10 +168,165 @@ func TestServiceReportWithdrawalKeepsRevisionTombstoneAndServerTTL(t *testing.T)
 	service.OnClientDisconnected(ctx, publisher.ClientName, sessionID)
 	service.catalogMu.Lock()
 	_, revisionTracked := service.catalogRevisions[catalogKey{publisher.TenantID, publisher.ID, sessionID}]
+	_, reportRevisionTracked := service.reportRevisions[catalogKey{publisher.TenantID, publisher.ID, sessionID}]
 	_, rateTracked := service.serviceReportRates[sessionID]
 	service.catalogMu.Unlock()
-	if revisionTracked || rateTracked {
+	if revisionTracked || reportRevisionTracked || rateTracked {
 		t.Fatal("disconnect retained bounded service-report state")
+	}
+}
+
+func TestAuthorizationChangesLoginAndDisconnectSynchronizeThreePeersAndPublisherSessions(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{Enabled: true, CIDR: "100.96.0.0/11", SessionTTLSeconds: 3600}, db, registry, nil)
+	access := AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}
+	publisher := insertPeerClient(t, db, 3050, "tenant-a", "alice", "publisher-sync")
+	peerB := insertPeerClient(t, db, 3051, "tenant-a", "bob", "peer-b-sync")
+	peerC := insertPeerClient(t, db, 3052, "tenant-a", "carol", "peer-c-sync")
+	insertPeerDevice(t, db, publisher, "100.96.0.50", "publisher-key")
+	insertPeerDevice(t, db, peerB, "100.96.0.51", "peer-b-key")
+	insertPeerDevice(t, db, peerC, "100.96.0.52", "peer-c-key")
+	if _, err := service.SetSharing(ctx, access, true); err != nil {
+		t.Fatal(err)
+	}
+	name, app, host := "sync-web", "http", "127.0.0.1"
+	targetPort, publishedPort := 8080, 18080
+	created, err := service.CreateSharedService(ctx, access, ServiceMutation{
+		ClientID: &publisher.ID, Name: &name, Application: &app, TargetHost: &host,
+		TargetPort: &targetPort, PublishedPort: &publishedPort,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled, visibility := true, "ACL"
+	if _, err := service.UpdateSharedService(ctx, access, created.ID, ServiceMutation{
+		Enabled: &enabled, Visibility: &visibility, AllowedClientIDs: []int64{peerB.ID, peerC.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	both := "BOTH"
+	allowed := true
+	aclB, err := service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &publisher.ID, TargetClientID: &peerB.ID, Allowed: &allowed, Direction: &both,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &publisher.ID, TargetClientID: &peerC.ID, Allowed: &allowed, Direction: &both,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writerB := &recordingSession{name: peerB.ClientName}
+	writerC := &recordingSession{name: peerC.ClientName}
+	registry.Replace(writerB)
+	registry.Replace(writerC)
+	now := time.Now()
+	if err := db.InsertClientSession(ctx, store.ClientSession{
+		ID: 501, TenantID: publisher.TenantID, ClientID: publisher.ID,
+		ClientName: publisher.ClientName, TokenHash: "publisher-sync-session", Status: "NETTY_ONLINE",
+		MachineFingerprint: "publisher-sync-machine", OSUser: "alice", PeerServiceDiscoveryVersion: 2,
+		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service.catalogMu.Lock()
+	for _, sessionID := range []int64{501, 502} {
+		key := catalogKey{publisher.TenantID, publisher.ID, sessionID}
+		service.catalogs[key] = catalogSnapshot{revision: 4, instanceID: fmt.Sprintf("instance-%d", sessionID),
+			generatedAt: now, expiresAt: now.Add(5 * time.Minute), publisherClientName: publisher.ClientName,
+			services: []AdvertisedService{{ServiceID: created.ServiceID, Name: name, Transport: "tcp",
+				Application: app, PublishedPort: publishedPort}}}
+		service.catalogRevisions[key] = 4
+		service.reportRevisions[key] = 4
+	}
+	service.catalogMu.Unlock()
+
+	if _, err := service.UpdateSharedService(ctx, access, created.ID, ServiceMutation{
+		Visibility: &visibility, AllowedClientIDs: []int64{peerB.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 1)
+	assertCatalogsForPublisher(t, writerC.peerMessages(t), publisher.ID, 2, 0)
+	writerB.packets, writerC.packets = nil, nil
+	if _, err := service.UpdateSharedService(ctx, access, created.ID, ServiceMutation{
+		Visibility: &visibility, AllowedClientIDs: []int64{peerB.ID, peerC.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 1)
+	assertCatalogsForPublisher(t, writerC.peerMessages(t), publisher.ID, 2, 1)
+
+	writerB.packets, writerC.packets = nil, nil
+	if err := service.DeleteACL(ctx, access, aclB.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 0)
+	assertCatalogsForPublisher(t, writerC.peerMessages(t), publisher.ID, 2, 1)
+	writerB.packets = nil
+	service.PushOnLogin(ctx, peerB)
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 0)
+
+	writerB.packets = nil
+	if _, err := service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &publisher.ID, TargetClientID: &peerB.ID, Allowed: &allowed, Direction: &both,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 1)
+
+	writerB.packets = nil
+	service.PushOnLogin(ctx, peerB)
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 2, 1)
+
+	key501 := catalogKey{publisher.TenantID, publisher.ID, 501}
+	service.catalogMu.Lock()
+	authorizationRevision := service.catalogs[key501].revision
+	service.catalogMu.Unlock()
+	reportRevision := int64(5)
+	if err := service.handleServiceReport(ctx, publisher, ControlMessage{
+		Type: TypeServiceReport, Enabled: boolPtr(true), Revision: &reportRevision,
+		Services: []AdvertisedService{{ServiceID: created.ServiceID}},
+	}, 501); err != nil {
+		t.Fatal(err)
+	}
+	service.catalogMu.Lock()
+	acceptedRevision := service.catalogs[key501].revision
+	service.catalogMu.Unlock()
+	if acceptedRevision <= authorizationRevision {
+		t.Fatalf("client report was suppressed by authorization revision: got=%d prior=%d",
+			acceptedRevision, authorizationRevision)
+	}
+
+	writerB.packets = nil
+	service.OnClientDisconnected(ctx, publisher.ClientName, 501)
+	service.catalogMu.Lock()
+	_, firstPresent := service.catalogs[catalogKey{publisher.TenantID, publisher.ID, 501}]
+	_, secondPresent := service.catalogs[catalogKey{publisher.TenantID, publisher.ID, 502}]
+	service.catalogMu.Unlock()
+	if firstPresent || !secondPresent {
+		t.Fatalf("disconnect must withdraw one publisher session only: first=%v second=%v", firstPresent, secondPresent)
+	}
+	assertCatalogsForPublisher(t, writerB.peerMessages(t), publisher.ID, 1, 0)
+}
+
+func assertCatalogsForPublisher(t *testing.T, messages []ControlMessage, publisherID int64, wantCount, wantServices int) {
+	t.Helper()
+	count := 0
+	for _, message := range messages {
+		if message.Type != TypeServiceCatalog || message.PublisherClientID != publisherID {
+			continue
+		}
+		count++
+		if len(message.Services) != wantServices {
+			t.Fatalf("catalog services=%d want=%d: %#v", len(message.Services), wantServices, message)
+		}
+	}
+	if count != wantCount {
+		t.Fatalf("catalog count=%d want=%d: %#v", count, wantCount, messages)
 	}
 }
 

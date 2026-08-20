@@ -17,6 +17,9 @@ public sealed class PeerMeshServiceState
     internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), long>
         ServiceCatalogRevisions { get; } = new();
 
+    internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), long>
+        ServiceReportRevisions { get; } = new();
+
     internal ConcurrentQueue<PeerMeshAuditEvent> Audits { get; } = new();
 
     internal ConcurrentDictionary<long, ConcurrentQueue<long>> ServiceReportWindows { get; } = new();

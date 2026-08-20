@@ -452,6 +452,7 @@ type Service struct {
 	catalogMu           sync.Mutex
 	catalogs            map[catalogKey]catalogSnapshot
 	catalogRevisions    map[catalogKey]int64
+	reportRevisions     map[catalogKey]int64
 	serviceReportRates  map[int64][]time.Time
 	auditMu             sync.Mutex
 	audits              []AuditEvent
@@ -499,6 +500,7 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 		sessionTokenCache:   make(map[int64]string),
 		catalogs:            make(map[catalogKey]catalogSnapshot),
 		catalogRevisions:    make(map[catalogKey]int64),
+		reportRevisions:     make(map[catalogKey]int64),
 		serviceReportRates:  make(map[int64][]time.Time),
 		audits:              []AuditEvent{},
 	}
@@ -1066,6 +1068,7 @@ func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clien
 	for _, target := range s.rosterRefreshTargets(ctx, *account) {
 		s.PushRoster(ctx, target)
 	}
+	s.onAuthorizationChanged(ctx, account.TenantID)
 	return closed, nil
 }
 

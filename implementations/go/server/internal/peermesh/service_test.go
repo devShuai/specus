@@ -487,6 +487,14 @@ func TestRefreshDeviceDisableClosesOpenSessionsAndNotifiesBothPeers(t *testing.T
 	}); err != nil {
 		t.Fatalf("insert peer session: %v", err)
 	}
+	service.catalogMu.Lock()
+	service.catalogs[catalogKey{"tenant-a", source.ID, 9002}] = catalogSnapshot{
+		revision: 3, instanceID: "source-instance", generatedAt: now, expiresAt: now.Add(5 * time.Minute),
+		publisherClientName: source.ClientName,
+		services:            []AdvertisedService{{ServiceID: "svc-device01", PublishedPort: 18080}},
+	}
+	service.catalogRevisions[catalogKey{"tenant-a", source.ID, 9002}] = 3
+	service.catalogMu.Unlock()
 
 	closed, err := service.RefreshDevice(ctx, AccessContext{Username: "alice", TenantID: "tenant-a"}, source.ID, false)
 	if err != nil {
@@ -502,6 +510,7 @@ func TestRefreshDeviceDisableClosesOpenSessionsAndNotifiesBothPeers(t *testing.T
 	assertHasCloseMessage(t, targetMessages, 9001)
 	assertHasMessageType(t, sourceMessages, TypeConfig)
 	assertHasMessageType(t, targetMessages, TypeRoster)
+	assertCatalogsForPublisher(t, targetMessages, source.ID, 1, 0)
 }
 
 func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T) {

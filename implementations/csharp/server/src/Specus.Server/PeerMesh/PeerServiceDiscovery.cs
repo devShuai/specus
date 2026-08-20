@@ -17,6 +17,7 @@ public sealed partial class PeerMeshService
     private static readonly string[] PeerServiceApps = ["http", "https", "ssh", "tcp", "udp"];
     private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), PeerMeshServiceCatalogSnapshot> _serviceCatalogs;
     private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), long> _serviceCatalogRevisions;
+    private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), long> _serviceReportRevisions;
     private readonly ConcurrentQueue<PeerMeshAuditEvent> _audits;
     private readonly ConcurrentDictionary<long, ConcurrentQueue<long>> _serviceReportWindows;
     private readonly ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), SemaphoreSlim>
@@ -161,6 +162,7 @@ public sealed partial class PeerMeshService
                 .FirstOrDefaultAsync(item => item.TenantId == context.TenantId && item.Id == id, cancellationToken)
                 .ConfigureAwait(false)
             ?? throw new ArgumentException("service not found");
+        var previousRuntime = ServiceRuntimeDefinition.From(row);
         ApplyMutation(row, mutation, creating: false);
         await RejectPortConflictAsync(row, cancellationToken).ConfigureAwait(false);
         row.UpdatedAt = DateTimeOffset.UtcNow;
@@ -169,7 +171,14 @@ public sealed partial class PeerMeshService
                 .FirstAsync(item => item.TenantId == row.TenantId && item.Id == row.ClientId, cancellationToken)
                 .ConfigureAwait(false);
         await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
-        await WithdrawClientAsync(row.TenantId, row.ClientId, cancellationToken).ConfigureAwait(false);
+        if (previousRuntime == ServiceRuntimeDefinition.From(row))
+        {
+            await OnAuthorizationChangedAsync(row.TenantId, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await WithdrawClientAsync(row.TenantId, row.ClientId, cancellationToken).ConfigureAwait(false);
+        }
         return await ToViewAsync(row, true, cancellationToken).ConfigureAwait(false);
     }
 
@@ -222,31 +231,36 @@ public sealed partial class PeerMeshService
             {
                 throw new ArgumentException("revision must be >= 1");
             }
-            if (!AcceptCatalogRevision(key, revision))
+            if (!AcceptReportRevision(key, revision, out var catalogRevision))
             {
                 return;
             }
             if (report.Enabled != true || !await EffectiveSharingAsync(source, cancellationToken).ConfigureAwait(false))
             {
                 _serviceCatalogs.TryRemove(key, out _);
-                await FanoutAsync(source, sessionId, revision, [], DateTimeOffset.UtcNow, cancellationToken)
+                await FanoutAsync(source, sessionId, catalogRevision, [], DateTimeOffset.UtcNow,
+                        includeDenied: true, cancellationToken)
                     .ConfigureAwait(false);
                 return;
             }
             var roster = await AllowedRosterAsync(source, cancellationToken).ConfigureAwait(false);
             if (roster.All(item => !item.Online))
             {
+                _serviceCatalogs.TryRemove(key, out _);
+                await FanoutAsync(source, sessionId, catalogRevision, [], DateTimeOffset.UtcNow,
+                        includeDenied: true, cancellationToken)
+                    .ConfigureAwait(false);
                 return;
             }
             var advertised = await AdvertisedFromReportAsync(source, report.Services, cancellationToken)
                 .ConfigureAwait(false);
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
-            _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(revision, NormalizeInstanceId(report.InstanceId), DateTimeOffset.UtcNow,
+            _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(catalogRevision, NormalizeInstanceId(report.InstanceId), DateTimeOffset.UtcNow,
                 expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
                 SanitizeMdns(report.MdnsCandidates));
             Audit("service-report", source.TenantId, source.Id, sessionId, null,
                 advertised.Count == 0 ? "empty" : "published");
-            await FanoutAsync(source, sessionId, revision, advertised, expiresAt, cancellationToken)
+            await FanoutAsync(source, sessionId, catalogRevision, advertised, expiresAt, cancellationToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -432,21 +446,20 @@ public sealed partial class PeerMeshService
             var publisher = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(account =>
                     account.TenantId == key.TenantId && account.Id == key.ClientId, cancellationToken)
                 .ConfigureAwait(false);
-            if (publisher is null || !await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false))
+            if (publisher is null)
             {
                 continue;
             }
             var visible = new List<AdvertisedService>();
-            foreach (var service in snapshot.Services)
+            if (await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false))
             {
-                if (await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
+                foreach (var service in snapshot.Services)
                 {
-                    visible.Add(service);
+                    if (await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
+                    {
+                        visible.Add(service);
+                    }
                 }
-            }
-            if (visible.Count == 0)
-            {
-                continue;
             }
             await SendSignalAsync(session, "server", recipient.ClientName, new PeerControlMessage
             {
@@ -492,7 +505,7 @@ public sealed partial class PeerMeshService
             _serviceCatalogs.TryRemove(key, out _);
             _serviceReportWindows.TryRemove(sessionId, out _);
             await FanoutAsync(publisher, sessionId, NextCatalogRevision(key), [], DateTimeOffset.UtcNow,
-                cancellationToken).ConfigureAwait(false);
+                includeDenied: true, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -544,6 +557,7 @@ public sealed partial class PeerMeshService
             // The persisted session is offline before this hook runs, so a late report is rejected by
             // AcceptServiceReportAsync. Release process-wide bounded state even if fanout fails.
             _serviceCatalogRevisions.TryRemove(key, out _);
+            _serviceReportRevisions.TryRemove(key, out _);
             _serviceReportWindows.TryRemove(sessionId, out _);
             _serviceCatalogMutationGates.TryRemove(key, out _);
         }
@@ -579,32 +593,34 @@ public sealed partial class PeerMeshService
         }
     }
 
-    private bool AcceptCatalogRevision((string TenantId, long ClientId, long SessionId) key, long revision)
+    private bool AcceptReportRevision((string TenantId, long ClientId, long SessionId) key, long revision,
+        out long catalogRevision)
     {
-        if (!_serviceCatalogRevisions.ContainsKey(key) && _serviceCatalogRevisions.Count >= 4096)
+        catalogRevision = 0;
+        if (!_serviceReportRevisions.ContainsKey(key) && _serviceReportRevisions.Count >= 4096)
         {
             Audit("service-report", key.TenantId, key.ClientId, key.SessionId, null, "revision-table-full");
             return false;
         }
-        while (true)
+        if (_serviceReportRevisions.TryGetValue(key, out var reportRevision) && revision <= reportRevision)
         {
-            if (!_serviceCatalogRevisions.TryGetValue(key, out var current))
-            {
-                if (_serviceCatalogRevisions.TryAdd(key, revision))
-                {
-                    return true;
-                }
-                continue;
-            }
-            if (revision <= current)
-            {
-                return false;
-            }
-            if (_serviceCatalogRevisions.TryUpdate(key, revision, current))
-            {
-                return true;
-            }
+            return false;
         }
+        if (!_serviceCatalogRevisions.ContainsKey(key) && _serviceCatalogRevisions.Count >= 4096)
+        {
+            Audit("service-report", key.TenantId, key.ClientId, key.SessionId, null,
+                "catalog-revision-table-full");
+            return false;
+        }
+        var deliveredRevision = _serviceCatalogRevisions.GetValueOrDefault(key);
+        if (revision <= deliveredRevision && deliveredRevision == long.MaxValue)
+        {
+            return false;
+        }
+        catalogRevision = revision > deliveredRevision ? revision : checked(deliveredRevision + 1);
+        _serviceReportRevisions[key] = revision;
+        _serviceCatalogRevisions[key] = catalogRevision;
+        return true;
     }
 
     private long NextCatalogRevision((string TenantId, long ClientId, long SessionId) key)
@@ -675,6 +691,22 @@ public sealed partial class PeerMeshService
                 cancellationToken)
             .ConfigureAwait(false);
         return device?.Enabled == true;
+    }
+
+    private sealed record ServiceRuntimeDefinition(
+        string Name,
+        string Description,
+        string Transport,
+        string Application,
+        string TargetHost,
+        int TargetPort,
+        int PublishedPort,
+        string Path,
+        bool Enabled)
+    {
+        internal static ServiceRuntimeDefinition From(PeerMeshSharedService service) => new(
+            service.Name, service.Description, service.Transport, service.Application, service.TargetHost,
+            service.TargetPort, service.PublishedPort, service.Path, service.Enabled);
     }
 
     private async Task RejectPortConflictAsync(PeerMeshSharedService row, CancellationToken cancellationToken)
