@@ -9,6 +9,11 @@ import com.theshuai.common.peermesh.PeerServiceSharingStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -226,6 +231,97 @@ class PeerServiceRuntimeTests {
              Socket caller = new Socket("127.0.0.1", publishedPort);
              Socket forwarded = target.accept()) {
             assertThat(forwarded.isConnected()).isTrue();
+        }
+    }
+
+    @Test
+    void tcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow() throws Exception {
+        int targetPort = freePort();
+        int publishedPort = freePort();
+        LocalPeerService local = localService(targetPort, true);
+        local.setPublishedPort(publishedPort);
+        local.setAllowedPeerVirtualIps(List.of("127.0.0.2"));
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket denied = connectFrom("127.0.0.3", publishedPort)) {
+            target.setSoTimeout(250);
+            assertThat(org.assertj.core.api.Assertions.catchThrowable(target::accept))
+                    .isInstanceOf(SocketTimeoutException.class);
+
+            try (Socket allowed = connectFrom("127.0.0.2", publishedPort)) {
+                target.setSoTimeout(1_000);
+                try (Socket forwarded = target.accept()) {
+                    assertThat(forwarded.isConnected()).isTrue();
+                    allowed.setSoTimeout(1_000);
+                    bridge.close();
+                    int result;
+                    try {
+                        result = allowed.getInputStream().read();
+                    } catch (IOException closed) {
+                        result = -1;
+                    }
+                    assertThat(result).isEqualTo(-1);
+                }
+            }
+            assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                    () -> connectFrom("127.0.0.2", publishedPort)))
+                    .isInstanceOf(IOException.class);
+        }
+    }
+
+    @Test
+    void udpBridgeAppliesTheSameAclAndRevocationBoundary() throws Exception {
+        byte[] payload = {1, 2, 3};
+        try (DatagramSocket target = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+             DatagramSocket denied = new DatagramSocket(new InetSocketAddress("127.0.0.3", 0));
+             DatagramSocket allowed = new DatagramSocket(new InetSocketAddress("127.0.0.2", 0))) {
+            int publishedPort = freeUdpPort();
+            LocalPeerService local = localService(target.getLocalPort(), true);
+            local.setTransport("udp");
+            local.setApplication("udp");
+            local.setPublishedPort(publishedPort);
+            local.setAllowedPeerVirtualIps(List.of("127.0.0.2"));
+            try (PeerServiceUdpBridge bridge = PeerServiceUdpBridge.bind("127.0.0.1", local)) {
+                denied.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(250);
+                assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> target.receive(new DatagramPacket(new byte[8], 8))))
+                        .isInstanceOf(SocketTimeoutException.class);
+
+                allowed.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(1_000);
+                DatagramPacket forwarded = new DatagramPacket(new byte[8], 8);
+                target.receive(forwarded);
+                assertThat(forwarded.getLength()).isEqualTo(payload.length);
+
+                bridge.close();
+                allowed.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(250);
+                assertThat(org.assertj.core.api.Assertions.catchThrowable(
+                        () -> target.receive(new DatagramPacket(new byte[8], 8))))
+                        .isInstanceOf(SocketTimeoutException.class);
+            }
+        }
+    }
+
+    private static Socket connectFrom(String sourceIp, int targetPort) throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.bind(new InetSocketAddress(InetAddress.getByName(sourceIp), 0));
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), targetPort));
+            return socket;
+        } catch (IOException failure) {
+            socket.close();
+            throw failure;
+        }
+    }
+
+    private static int freeUdpPort() throws IOException {
+        try (DatagramSocket socket = new DatagramSocket(0)) {
+            return socket.getLocalPort();
         }
     }
 

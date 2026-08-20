@@ -11,15 +11,18 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 final class PeerServiceUdpBridge implements AutoCloseable {
     private static final int MAX_PEERS = 64;
     private static final int PEER_IDLE_TIMEOUT_MILLIS = 60_000;
+    private static final Logger LOG = Logger.getLogger(PeerServiceUdpBridge.class.getName());
     private final String virtualIp;
     private final SpecusCore.LocalPeerService service;
     private final DatagramSocket inbound;
     private final InetSocketAddress target;
     private final Set<InetAddress> allowedPeerAddresses;
+    private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<SocketAddress, DatagramSocket> peers = new ConcurrentHashMap<>();
@@ -64,6 +67,7 @@ final class PeerServiceUdpBridge implements AutoCloseable {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 inbound.receive(packet);
                 if (!allowedPeerAddresses.contains(packet.getAddress())) {
+                    auditAccessOnce("deny", packet.getSocketAddress(), "source-not-allowed");
                     continue;
                 }
                 if (!peers.containsKey(packet.getSocketAddress()) && peers.size() >= MAX_PEERS) {
@@ -79,6 +83,7 @@ final class PeerServiceUdpBridge implements AutoCloseable {
 
     private DatagramSocket openPeer(SocketAddress peer) {
         try {
+            auditAccessOnce("allow", peer, "acl-authorized");
             DatagramSocket socket = new DatagramSocket();
             socket.connect(target);
             socket.setSoTimeout(PEER_IDLE_TIMEOUT_MILLIS);
@@ -86,6 +91,17 @@ final class PeerServiceUdpBridge implements AutoCloseable {
             return socket;
         } catch (Exception e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    private void auditAccessOnce(String action, Object source, String reason) {
+        String sourceAddress = String.valueOf(source);
+        String key = action + '|' + sourceAddress;
+        if (auditedAccessEvents.size() < 128 && auditedAccessEvents.add(key)) {
+            LOG.info("[peer-service-access-audit] action=" + action
+                    + " serviceId=" + service.serviceId
+                    + " source=" + sourceAddress
+                    + " reason=" + reason);
         }
     }
 
@@ -107,7 +123,12 @@ final class PeerServiceUdpBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        open.set(false);
+        if (!open.compareAndSet(true, false)) {
+            return;
+        }
+        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                + " activePeers=" + peers.size()
+                + " reason=config-withdrawn-or-shutdown");
         inbound.close();
         peers.values().forEach(DatagramSocket::close);
         peers.clear();

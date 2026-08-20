@@ -127,6 +127,9 @@ type peerServiceBridge struct {
 	conns     map[net.Conn]struct{}
 	tcpSlots  chan struct{}
 	udpPeers  sync.Map
+	logger    *log.Logger
+	auditSeen sync.Map
+	auditSize atomic.Int64
 }
 
 func newPeerServiceRuntime(logger *log.Logger, send func(any) error) *peerServiceRuntime {
@@ -586,7 +589,7 @@ func bindPeerServiceBridge(virtualIP string, service LocalPeerService, logger *l
 		return nil, err
 	}
 	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, listener: listener,
-		conns: make(map[net.Conn]struct{}), tcpSlots: make(chan struct{}, 64)}
+		conns: make(map[net.Conn]struct{}), tcpSlots: make(chan struct{}, 64), logger: logger}
 	go bridge.acceptLoop(logger)
 	return bridge, nil
 }
@@ -601,7 +604,7 @@ func bindPeerServiceUDP(virtualIP string, service LocalPeerService, logger *log.
 		return nil, err
 	}
 	bridge := &peerServiceBridge{virtualIP: virtualIP, service: service, udp: conn,
-		tcpSlots: make(chan struct{}, 64)}
+		tcpSlots: make(chan struct{}, 64), logger: logger}
 	go bridge.udpLoop(logger)
 	return bridge, nil
 }
@@ -622,9 +625,11 @@ func (b *peerServiceBridge) acceptLoop(logger *log.Logger) {
 			return
 		}
 		if !peerServiceSourceAllowed(inbound.RemoteAddr(), b.service.AllowedPeerVirtualIPs) {
+			b.auditAccessOnce("deny", inbound.RemoteAddr(), "source-not-allowed")
 			_ = inbound.Close()
 			continue
 		}
+		b.auditAccessOnce("allow", inbound.RemoteAddr(), "acl-authorized")
 		select {
 		case b.tcpSlots <- struct{}{}:
 		default:
@@ -658,6 +663,7 @@ func (b *peerServiceBridge) udpLoop(_ *log.Logger) {
 		}
 		peerAddr, ok := netip.AddrFromSlice(peer.IP)
 		if !ok || !peerServiceIPAllowed(peerAddr.Unmap(), b.service.AllowedPeerVirtualIPs) {
+			b.auditAccessOnce("deny", peer, "source-not-allowed")
 			continue
 		}
 		b.bytesIn.Add(int64(n))
@@ -674,6 +680,7 @@ func (b *peerServiceBridge) udpLoop(_ *log.Logger) {
 			}
 			_ = outbound.SetReadDeadline(time.Now().Add(time.Minute))
 			b.udpPeers.Store(key, outbound)
+			b.auditAccessOnce("allow", peer, "acl-authorized")
 			b.total.Add(1)
 			b.active.Add(1)
 			go b.udpReply(key, outbound, peer)
@@ -687,6 +694,19 @@ func (b *peerServiceBridge) udpLoop(_ *log.Logger) {
 		_ = value.(*net.UDPConn).Close()
 		return true
 	})
+}
+
+func (b *peerServiceBridge) auditAccessOnce(action string, source net.Addr, reason string) {
+	if b.logger == nil || source == nil || b.auditSize.Load() >= 128 {
+		return
+	}
+	key := action + "|" + source.String()
+	if _, loaded := b.auditSeen.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	b.auditSize.Add(1)
+	b.logger.Printf("[peer-service-access-audit] action=%s serviceId=%s source=%s reason=%s",
+		action, b.service.ServiceID, source.String(), reason)
 }
 
 func peerServiceSourceAllowed(remote net.Addr, allowed []string) bool {
@@ -806,7 +826,13 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 }
 
 func (b *peerServiceBridge) close() {
-	b.closed.Store(true)
+	if !b.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if b.logger != nil {
+		b.logger.Printf("[peer-service-access-audit] action=revoke serviceId=%s activeConnections=%d reason=config-withdrawn-or-shutdown",
+			b.service.ServiceID, b.active.Load())
+	}
 	if b.listener != nil {
 		_ = b.listener.Close()
 	}

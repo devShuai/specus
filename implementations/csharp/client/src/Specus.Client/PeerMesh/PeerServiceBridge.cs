@@ -22,9 +22,11 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     private readonly ILogger? _logger;
     private readonly ConcurrentDictionary<TcpClient, TcpClient> _splices = new();
     private readonly SemaphoreSlim _slots = new(64, 64);
+    private readonly ConcurrentDictionary<string, byte> _auditedAccessEvents = new(StringComparer.Ordinal);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
+    private int _disposed;
 
     private PeerServiceBridge(string virtualIp, LocalPeerService service, TcpListener listener, ILogger? logger)
     {
@@ -81,15 +83,29 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
             if (inbound.Client.RemoteEndPoint is not IPEndPoint remote
                 || !PeerServiceDiscovery.IsSourceAllowed(remote.Address, _service))
             {
+                AuditAccessOnce("deny", inbound.Client.RemoteEndPoint, "source-not-allowed");
                 inbound.Dispose();
                 continue;
             }
+            AuditAccessOnce("allow", remote, "acl-authorized");
             if (!_slots.Wait(0))
             {
                 inbound.Dispose();
                 continue;
             }
             _ = SpliceAsync(inbound);
+        }
+    }
+
+    private void AuditAccessOnce(string action, EndPoint? source, string reason)
+    {
+        var sourceAddress = source?.ToString() ?? "unknown";
+        var key = $"{action}|{sourceAddress}";
+        if (_auditedAccessEvents.Count < 128 && _auditedAccessEvents.TryAdd(key, 0))
+        {
+            _logger?.LogInformation(
+                "[peer-service-access-audit] action={Action} serviceId={ServiceId} source={Source} reason={Reason}",
+                action, _service.ServiceId, sourceAddress, reason);
         }
     }
 
@@ -149,6 +165,13 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+        _logger?.LogInformation(
+            "[peer-service-access-audit] action=revoke serviceId={ServiceId} activeConnections={ActiveConnections} reason=config-withdrawn-or-shutdown",
+            _service.ServiceId, _splices.Count);
         _cts.Cancel();
         try
         {

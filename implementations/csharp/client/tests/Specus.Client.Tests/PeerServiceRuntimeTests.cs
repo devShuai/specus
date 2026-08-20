@@ -238,6 +238,107 @@ public class PeerServiceRuntimeTests
         Assert.True(forwarded.Connected);
     }
 
+    [Fact]
+    public async Task TcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow()
+    {
+        using var target = Listen(0);
+        var targetPort = ((IPEndPoint)target.LocalEndpoint).Port;
+        var publishedPort = FreePort();
+        var service = new LocalPeerService
+        {
+            ServiceId = "svc-acl-three", Transport = "tcp", Application = "tcp",
+            TargetHost = "127.0.0.1", TargetPort = targetPort, PublishedPort = publishedPort,
+            AllowedPeerVirtualIps = ["127.0.0.2"],
+        };
+        using var bridge = PeerServiceBridge.Bind("127.0.0.1", service, null);
+
+        using var denied = await ConnectFromAsync("127.0.0.3", publishedPort);
+        using (var deniedTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250)))
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await target.AcceptTcpClientAsync(deniedTimeout.Token));
+        }
+
+        using var allowed = await ConnectFromAsync("127.0.0.2", publishedPort);
+        using var forwarded = await target.AcceptTcpClientAsync();
+        Assert.True(forwarded.Connected);
+
+        bridge.Dispose();
+        var activeFlowClosed = false;
+        try
+        {
+            using var readTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            activeFlowClosed = await allowed.GetStream().ReadAsync(new byte[1], readTimeout.Token) == 0;
+        }
+        catch (Exception exception) when (exception is IOException or SocketException)
+        {
+            activeFlowClosed = true;
+        }
+        Assert.True(activeFlowClosed);
+        await Assert.ThrowsAnyAsync<SocketException>(async () =>
+        {
+            using var retry = await ConnectFromAsync("127.0.0.2", publishedPort);
+        });
+    }
+
+    [Fact]
+    public async Task UdpBridgeAppliesTheSameAclAndRevocationBoundary()
+    {
+        using var target = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var portProbe = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var publishedPort = ((IPEndPoint)portProbe.Client.LocalEndPoint!).Port;
+        portProbe.Dispose();
+        var service = new LocalPeerService
+        {
+            ServiceId = "svc-udp-acl", Transport = "udp", Application = "udp",
+            TargetHost = "127.0.0.1",
+            TargetPort = ((IPEndPoint)target.Client.LocalEndPoint!).Port,
+            PublishedPort = publishedPort,
+            AllowedPeerVirtualIps = ["127.0.0.2"],
+        };
+        using var bridge = PeerServiceUdpBridge.Bind("127.0.0.1", service, null);
+        using var denied = new UdpClient(new IPEndPoint(IPAddress.Parse("127.0.0.3"), 0));
+        using var allowed = new UdpClient(new IPEndPoint(IPAddress.Parse("127.0.0.2"), 0));
+        var destination = new IPEndPoint(IPAddress.Loopback, publishedPort);
+        var payload = new byte[] { 1, 2, 3 };
+
+        await denied.SendAsync(payload, destination);
+        using (var deniedTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250)))
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await target.ReceiveAsync(deniedTimeout.Token));
+        }
+
+        await allowed.SendAsync(payload, destination);
+        using (var allowedTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
+        {
+            var forwarded = await target.ReceiveAsync(allowedTimeout.Token);
+            Assert.Equal(payload, forwarded.Buffer);
+        }
+
+        bridge.Dispose();
+        await allowed.SendAsync(payload, destination);
+        using var revokedTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await target.ReceiveAsync(revokedTimeout.Token));
+    }
+
+    private static async Task<TcpClient> ConnectFromAsync(string sourceIp, int targetPort)
+    {
+        var client = new TcpClient(AddressFamily.InterNetwork);
+        try
+        {
+            client.Client.Bind(new IPEndPoint(IPAddress.Parse(sourceIp), 0));
+            await client.ConnectAsync(IPAddress.Loopback, targetPort);
+            return client;
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
+    }
+
     private static PeerMeshConfig Config(bool sharing, int targetPort, bool enabled) => new()
     {
         Enabled = true,

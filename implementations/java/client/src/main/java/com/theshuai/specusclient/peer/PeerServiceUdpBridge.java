@@ -28,6 +28,7 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
     private final DatagramSocket inbound;
     private final InetSocketAddress target;
     private final Set<InetAddress> allowedPeerAddresses;
+    private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<SocketAddress, DatagramSocket> peers = new ConcurrentHashMap<>();
@@ -87,6 +88,7 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 inbound.receive(packet);
                 if (!allowedPeerAddresses.contains(packet.getAddress())) {
+                    auditAccessOnce("deny", packet.getSocketAddress(), "source-not-allowed");
                     continue;
                 }
                 if (!peers.containsKey(packet.getSocketAddress()) && peers.size() >= MAX_PEERS) {
@@ -123,6 +125,7 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
 
     private DatagramSocket openPeerSocket(SocketAddress peer) {
         try {
+            auditAccessOnce("allow", peer, "acl-authorized");
             DatagramSocket socket = new DatagramSocket();
             socket.setReuseAddress(true);
             socket.setSoTimeout(PEER_IDLE_TIMEOUT_MILLIS);
@@ -132,6 +135,15 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
             return socket;
         } catch (Exception e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    private void auditAccessOnce(String action, SocketAddress source, String reason) {
+        String sourceAddress = String.valueOf(source);
+        String key = action + '|' + sourceAddress;
+        if (auditedAccessEvents.size() < 128 && auditedAccessEvents.add(key)) {
+            log.info("[peer-service-access-audit] action={} serviceId={} source={} reason={}",
+                    action, service.getServiceId(), sourceAddress, reason);
         }
     }
 
@@ -154,7 +166,11 @@ final class PeerServiceUdpBridge implements PeerServiceForwarder {
 
     @Override
     public void close() {
-        open.set(false);
+        if (!open.compareAndSet(true, false)) {
+            return;
+        }
+        log.info("[peer-service-access-audit] action=revoke serviceId={} activePeers={} reason=config-withdrawn-or-shutdown",
+                service.getServiceId(), peers.size());
         inbound.close();
         peers.values().forEach(DatagramSocket::close);
         peers.clear();

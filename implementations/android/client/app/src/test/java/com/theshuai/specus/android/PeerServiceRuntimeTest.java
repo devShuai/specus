@@ -4,6 +4,11 @@ import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Test;
 
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -228,6 +233,117 @@ public class PeerServiceRuntimeTest {
              Socket ignored = new Socket("127.0.0.1", publishedPort);
              Socket forwarded = target.accept()) {
             assertTrue(forwarded.isConnected());
+        }
+    }
+
+    @Test
+    public void tcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow() throws Exception {
+        int targetPort = freePort();
+        int publishedPort = freePort();
+        SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
+        local.serviceId = "svc-acl-three";
+        local.targetHost = "127.0.0.1";
+        local.targetPort = targetPort;
+        local.publishedPort = publishedPort;
+        local.allowedPeerVirtualIps = List.of("127.0.0.2");
+        try (ServerSocket target = listen(targetPort);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+             Socket denied = connectFrom("127.0.0.3", publishedPort)) {
+            target.setSoTimeout(250);
+            try {
+                target.accept().close();
+                throw new AssertionError("peer C bypassed the service ACL");
+            } catch (SocketTimeoutException expected) {
+                // expected
+            }
+
+            try (Socket allowed = connectFrom("127.0.0.2", publishedPort)) {
+                target.setSoTimeout(1_000);
+                try (Socket forwarded = target.accept()) {
+                    assertTrue(forwarded.isConnected());
+                    allowed.setSoTimeout(1_000);
+                    bridge.close();
+                    int result;
+                    try {
+                        result = allowed.getInputStream().read();
+                    } catch (IOException closed) {
+                        result = -1;
+                    }
+                    assertEquals(-1, result);
+                }
+            }
+            boolean reconnectRejected = false;
+            try (Socket ignored = connectFrom("127.0.0.2", publishedPort)) {
+                // unexpected
+            } catch (IOException expected) {
+                reconnectRejected = true;
+            }
+            assertTrue(reconnectRejected);
+        }
+    }
+
+    @Test
+    public void udpBridgeAppliesTheSameAclAndRevocationBoundary() throws Exception {
+        byte[] payload = {1, 2, 3};
+        try (DatagramSocket target = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+             DatagramSocket denied = new DatagramSocket(new InetSocketAddress("127.0.0.3", 0));
+             DatagramSocket allowed = new DatagramSocket(new InetSocketAddress("127.0.0.2", 0))) {
+            int publishedPort = freeUdpPort();
+            SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
+            local.serviceId = "svc-udp-acl";
+            local.transport = "udp";
+            local.application = "udp";
+            local.targetHost = "127.0.0.1";
+            local.targetPort = target.getLocalPort();
+            local.publishedPort = publishedPort;
+            local.allowedPeerVirtualIps = List.of("127.0.0.2");
+            try (PeerServiceUdpBridge bridge = PeerServiceUdpBridge.bind("127.0.0.1", local)) {
+                denied.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(250);
+                try {
+                    target.receive(new DatagramPacket(new byte[8], 8));
+                    throw new AssertionError("unauthorized UDP peer reached the local target");
+                } catch (SocketTimeoutException expected) {
+                    // expected
+                }
+
+                allowed.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(1_000);
+                DatagramPacket forwarded = new DatagramPacket(new byte[8], 8);
+                target.receive(forwarded);
+                assertEquals(payload.length, forwarded.getLength());
+
+                bridge.close();
+                allowed.send(new DatagramPacket(payload, payload.length,
+                        new InetSocketAddress("127.0.0.1", publishedPort)));
+                target.setSoTimeout(250);
+                try {
+                    target.receive(new DatagramPacket(new byte[8], 8));
+                    throw new AssertionError("revoked UDP peer remained forwarded");
+                } catch (SocketTimeoutException expected) {
+                    // expected
+                }
+            }
+        }
+    }
+
+    private static Socket connectFrom(String sourceIp, int targetPort) throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.bind(new InetSocketAddress(InetAddress.getByName(sourceIp), 0));
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), targetPort));
+            return socket;
+        } catch (IOException failure) {
+            socket.close();
+            throw failure;
+        }
+    }
+
+    private static int freeUdpPort() throws IOException {
+        try (DatagramSocket socket = new DatagramSocket(0)) {
+            return socket.getLocalPort();
         }
     }
 

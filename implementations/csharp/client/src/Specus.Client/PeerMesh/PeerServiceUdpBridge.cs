@@ -14,10 +14,12 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger? _logger;
     private readonly ConcurrentDictionary<string, UdpPeer> _peers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _auditedAccessEvents = new(StringComparer.Ordinal);
     private long _bytesIn;
     private long _bytesOut;
     private long _totalConnections;
     private int _active;
+    private int _disposed;
 
     private PeerServiceUdpBridge(string virtualIp, LocalPeerService service, UdpClient inbound, ILogger? logger)
     {
@@ -73,6 +75,7 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
             }
             if (!PeerServiceDiscovery.IsSourceAllowed(packet.RemoteEndPoint.Address, _service))
             {
+                AuditAccessOnce("deny", packet.RemoteEndPoint, "source-not-allowed");
                 continue;
             }
             Interlocked.Add(ref _bytesIn, packet.Buffer.Length);
@@ -93,6 +96,7 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
                 }
                 else
                 {
+                    AuditAccessOnce("allow", packet.RemoteEndPoint, "acl-authorized");
                     Interlocked.Increment(ref _totalConnections);
                     Interlocked.Increment(ref _active);
                     _ = ReplyLoopAsync(key, binding, packet.RemoteEndPoint);
@@ -107,6 +111,18 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
             {
                 // next packet retries
             }
+        }
+    }
+
+    private void AuditAccessOnce(string action, EndPoint source, string reason)
+    {
+        var sourceAddress = source.ToString() ?? "unknown";
+        var key = $"{action}|{sourceAddress}";
+        if (_auditedAccessEvents.Count < 128 && _auditedAccessEvents.TryAdd(key, 0))
+        {
+            _logger?.LogInformation(
+                "[peer-service-access-audit] action={Action} serviceId={ServiceId} source={Source} reason={Reason}",
+                action, _service.ServiceId, sourceAddress, reason);
         }
     }
 
@@ -145,6 +161,13 @@ internal sealed class PeerServiceUdpBridge : IPeerServiceForwarder
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+        _logger?.LogInformation(
+            "[peer-service-access-audit] action=revoke serviceId={ServiceId} activePeers={ActivePeers} reason=config-withdrawn-or-shutdown",
+            _service.ServiceId, _peers.Count);
         _cts.Cancel();
         _inbound.Dispose();
         foreach (var peer in _peers.Values)

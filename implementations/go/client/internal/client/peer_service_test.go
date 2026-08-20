@@ -313,6 +313,121 @@ func TestPeerServiceTCPBridgeEnforcesServerAuthoredSourceACL(t *testing.T) {
 	forwarded.Close()
 }
 
+func TestPeerServiceTCPBridgeSeparatesThreePeersAndRevokesActiveFlow(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetPort := target.Addr().(*net.TCPAddr).Port
+	publishedPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := LocalPeerService{
+		ServiceID: "svc-acl-three", Transport: "tcp", Application: "tcp",
+		TargetHost: "127.0.0.1", TargetPort: targetPort, PublishedPort: publishedPort,
+		AllowedPeerVirtualIPs: []string{"127.0.0.2"},
+	}
+	bridge, err := bindPeerServiceBridge("127.0.0.1", service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.close()
+
+	denied, err := dialPeerServiceFrom("127.0.0.3", publishedPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer denied.Close()
+	_ = target.(*net.TCPListener).SetDeadline(time.Now().Add(250 * time.Millisecond))
+	if forwarded, acceptErr := target.Accept(); acceptErr == nil {
+		forwarded.Close()
+		t.Fatal("peer C bypassed the service ACL")
+	}
+
+	allowed, err := dialPeerServiceFrom("127.0.0.2", publishedPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer allowed.Close()
+	_ = target.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
+	forwarded, err := target.Accept()
+	if err != nil {
+		t.Fatalf("peer B did not reach the service: %v", err)
+	}
+	defer forwarded.Close()
+
+	bridge.close()
+	_ = allowed.SetReadDeadline(time.Now().Add(time.Second))
+	if _, readErr := allowed.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("revoked peer B flow remained active")
+	}
+	if retry, retryErr := dialPeerServiceFrom("127.0.0.2", publishedPort); retryErr == nil {
+		retry.Close()
+		t.Fatal("revoked peer B established a new flow")
+	}
+}
+
+func TestPeerServiceUDPBridgeAppliesTheSameACLAndRevocationBoundary(t *testing.T) {
+	target, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	portProbe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedPort := portProbe.LocalAddr().(*net.UDPAddr).Port
+	_ = portProbe.Close()
+	service := LocalPeerService{
+		ServiceID: "svc-udp-acl", Transport: "udp", Application: "udp",
+		TargetHost: "127.0.0.1", TargetPort: target.LocalAddr().(*net.UDPAddr).Port,
+		PublishedPort: publishedPort, AllowedPeerVirtualIPs: []string{"127.0.0.2"},
+	}
+	bridge, err := bindPeerServiceBridge("127.0.0.1", service, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.close()
+
+	denied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.3"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer denied.Close()
+	allowed, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer allowed.Close()
+	destination := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: publishedPort}
+	_, _ = denied.WriteToUDP([]byte{1, 2, 3}, destination)
+	_ = target.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	if _, _, readErr := target.ReadFromUDP(make([]byte, 8)); readErr == nil {
+		t.Fatal("unauthorized UDP peer reached the local target")
+	}
+
+	_, _ = allowed.WriteToUDP([]byte{1, 2, 3}, destination)
+	_ = target.SetReadDeadline(time.Now().Add(time.Second))
+	if n, _, readErr := target.ReadFromUDP(make([]byte, 8)); readErr != nil || n != 3 {
+		t.Fatalf("authorized UDP peer was not forwarded: n=%d err=%v", n, readErr)
+	}
+
+	bridge.close()
+	_, _ = allowed.WriteToUDP([]byte{1, 2, 3}, destination)
+	_ = target.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	if _, _, readErr := target.ReadFromUDP(make([]byte, 8)); readErr == nil {
+		t.Fatal("revoked UDP peer remained forwarded")
+	}
+}
+
+func dialPeerServiceFrom(sourceIP string, targetPort int) (net.Conn, error) {
+	dialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(sourceIP)}}
+	return dialer.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort)))
+}
+
 func testPeerMeshConfig(sharing bool, targetPort int, enabled bool) PeerMeshConfig {
 	return PeerMeshConfig{
 		Enabled:   true,

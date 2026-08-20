@@ -15,13 +15,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 final class PeerServiceBridge implements AutoCloseable {
     private static final int MAX_ACTIVE_CONNECTIONS = 64;
+    private static final Logger LOG = Logger.getLogger(PeerServiceBridge.class.getName());
     private final String virtualIp;
     private final SpecusCore.LocalPeerService service;
     private final ServerSocket serverSocket;
     private final Set<InetAddress> allowedPeerAddresses;
+    private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
@@ -64,9 +67,11 @@ final class PeerServiceBridge implements AutoCloseable {
             try {
                 Socket inbound = serverSocket.accept();
                 if (!allowedPeerAddresses.contains(inbound.getInetAddress())) {
+                    auditAccessOnce("deny", inbound.getRemoteSocketAddress(), "source-not-allowed");
                     closeQuietly(inbound);
                     continue;
                 }
+                auditAccessOnce("allow", inbound.getRemoteSocketAddress(), "acl-authorized");
                 if (!slots.tryAcquire()) {
                     closeQuietly(inbound);
                     continue;
@@ -98,6 +103,17 @@ final class PeerServiceBridge implements AutoCloseable {
             }
         }
         return Set.copyOf(addresses);
+    }
+
+    private void auditAccessOnce(String action, Object source, String reason) {
+        String sourceAddress = String.valueOf(source);
+        String key = action + '|' + sourceAddress;
+        if (auditedAccessEvents.size() < 128 && auditedAccessEvents.add(key)) {
+            LOG.info("[peer-service-access-audit] action=" + action
+                    + " serviceId=" + service.serviceId
+                    + " source=" + sourceAddress
+                    + " reason=" + reason);
+        }
     }
 
     private void splice(Socket inbound) {
@@ -146,7 +162,12 @@ final class PeerServiceBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        open.set(false);
+        if (!open.compareAndSet(true, false)) {
+            return;
+        }
+        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                + " activeConnections=" + splices.size()
+                + " reason=config-withdrawn-or-shutdown");
         try {
             serverSocket.close();
         } catch (IOException ignored) {

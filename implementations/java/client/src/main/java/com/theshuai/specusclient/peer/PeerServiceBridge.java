@@ -39,6 +39,7 @@ final class PeerServiceBridge implements PeerServiceForwarder {
     private final LocalPeerService service;
     private final ServerSocket serverSocket;
     private final Set<InetAddress> allowedPeerAddresses;
+    private final Set<String> auditedAccessEvents = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final ConcurrentHashMap<Socket, Socket> splices = new ConcurrentHashMap<>();
@@ -96,9 +97,11 @@ final class PeerServiceBridge implements PeerServiceForwarder {
             try {
                 Socket inbound = serverSocket.accept();
                 if (!isAllowed(inbound.getRemoteSocketAddress())) {
+                    auditAccessOnce("deny", inbound.getRemoteSocketAddress(), "source-not-allowed");
                     closeQuietly(inbound);
                     continue;
                 }
+                auditAccessOnce("allow", inbound.getRemoteSocketAddress(), "acl-authorized");
                 if (!slots.tryAcquire()) {
                     closeQuietly(inbound);
                     continue;
@@ -122,6 +125,15 @@ final class PeerServiceBridge implements PeerServiceForwarder {
         return remoteAddress instanceof InetSocketAddress inet
                 && inet.getAddress() != null
                 && allowedPeerAddresses.contains(inet.getAddress());
+    }
+
+    private void auditAccessOnce(String action, SocketAddress source, String reason) {
+        String sourceAddress = String.valueOf(source);
+        String key = action + '|' + sourceAddress;
+        if (auditedAccessEvents.size() < 128 && auditedAccessEvents.add(key)) {
+            log.info("[peer-service-access-audit] action={} serviceId={} source={} reason={}",
+                    action, service.getServiceId(), sourceAddress, reason);
+        }
     }
 
     private static Set<InetAddress> allowedPeerAddresses(LocalPeerService service) {
@@ -189,7 +201,11 @@ final class PeerServiceBridge implements PeerServiceForwarder {
 
     @Override
     public void close() {
-        open.set(false);
+        if (!open.compareAndSet(true, false)) {
+            return;
+        }
+        log.info("[peer-service-access-audit] action=revoke serviceId={} activeConnections={} reason=config-withdrawn-or-shutdown",
+                service.getServiceId(), splices.size());
         try {
             serverSocket.close();
         } catch (IOException ignored) {
