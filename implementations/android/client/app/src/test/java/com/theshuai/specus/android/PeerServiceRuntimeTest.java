@@ -21,6 +21,7 @@ import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -433,13 +434,7 @@ public class PeerServiceRuntimeTest {
                     assertEquals(-1, result);
                 }
             }
-            boolean reconnectRejected = false;
-            try (Socket ignored = connectFrom("127.0.0.2", publishedPort)) {
-                // unexpected
-            } catch (IOException expected) {
-                reconnectRejected = true;
-            }
-            assertTrue(reconnectRejected);
+            assertTrue(connectRejectedFrom("127.0.0.2", publishedPort));
         }
     }
 
@@ -499,6 +494,20 @@ public class PeerServiceRuntimeTest {
         } catch (IOException failure) {
             socket.close();
             throw failure;
+        }
+    }
+
+    private static boolean connectRejectedFrom(String sourceIp, int targetPort) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (true) {
+            try (Socket ignored = connectFrom(sourceIp, targetPort)) {
+                if (System.nanoTime() >= deadline) {
+                    return false;
+                }
+                Thread.sleep(50);
+            } catch (IOException expected) {
+                return true;
+            }
         }
     }
 

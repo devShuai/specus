@@ -43,11 +43,20 @@ func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
 		t.Fatalf("new app: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = app.Run(ctx)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		app.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("app.Run did not return after cancel")
+		}
+		_ = app.Close()
 	})
-	go func() { _ = app.Run(ctx) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for app.ControlPort() == 0 && time.Now().Before(deadline) {

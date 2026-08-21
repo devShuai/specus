@@ -1024,7 +1024,10 @@ public sealed class ClientUpdateService : IClientUpdateService, IDisposable
                 if ($skipUpdate) { $info.EnvironmentVariables['SPECUS_SKIP_UPDATE_ONCE'] = '1' }
                 $process = [Diagnostics.Process]::Start($info)
                 if ($null -eq $process) { return $false }
-                Start-Sleep -Milliseconds 1000
+                $deadline = [datetime]::UtcNow.AddSeconds(3)
+                while (-not $process.HasExited -and [datetime]::UtcNow -lt $deadline) {
+                  Start-Sleep -Milliseconds 100
+                }
                 return -not $process.HasExited
               }
               catch { return $false }
@@ -1161,7 +1164,14 @@ public sealed class ClientUpdateService : IClientUpdateService, IDisposable
                 nohup {{restart}} >/dev/null 2>&1 &
               fi
               restart_pid=$!
-              sleep 1
+              wait_health=0
+              while [ "$wait_health" -lt 3 ]; do
+                sleep 1
+                if ! kill -0 "$restart_pid" 2>/dev/null; then
+                  return 1
+                fi
+                wait_health=$((wait_health + 1))
+              done
               kill -0 "$restart_pid" 2>/dev/null
             }
             restore_old() {
