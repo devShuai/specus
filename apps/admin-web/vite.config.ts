@@ -43,6 +43,11 @@ function staticChunkGraphBytes(entry: OutputChunk, chunks: Map<string, OutputChu
   return bytes;
 }
 
+/** Matches a package directory under node_modules, on either path separator. */
+function NM(pkg: string): RegExp {
+  return new RegExp(`[\\/]node_modules[\\/]${pkg}[\\/]`);
+}
+
 function enforceChunkBudgets(): Plugin {
   return {
     name: "specus-chunk-budgets",
@@ -117,73 +122,45 @@ export default defineConfig(({ mode }) => {
       },
       rollupOptions: {
         output: {
-          manualChunks(id) {
-            const normalized = id.replace(/\\/g, "/");
-            if (normalized.includes("vite/preload-helper")) {
-              return "vite-runtime";
-            }
-            if (!normalized.includes("/node_modules/")) {
-              return undefined;
-            }
+          // Vite 8 bundles with rolldown, which duplicates a small module into any
+          // chunk that imports it instead of leaving it in the chunk it was
+          // assigned. React's jsx-runtime and react-dom shims got copied into
+          // heroui-vendor that way, and the public download route — which renders
+          // no HeroUI component — ended up importing two of those copies, dragging
+          // the whole component library into its static graph.
+          //
+          // codeSplitting groups are a hard assignment, so the shims stay put.
+          // Groups match in order, mirroring the if-chain this replaces. Anything
+          // unmatched stays with its route or dynamic importer; a catch-all vendor
+          // bucket would couple unrelated, rarely used features.
+          codeSplitting: {
+            groups: [
+              { name: "vite-runtime", test: /vite[\/]preload-helper/ },
 
-            if (normalized.includes("/node_modules/@maxgraph/core/")) {
-              return "diagram-engine";
-            }
-            if (
-              normalized.includes("/node_modules/yjs/")
-              || normalized.includes("/node_modules/lib0/")
-              || normalized.includes("/node_modules/isomorphic.js/")
-            ) {
-              return "diagram-collaboration";
-            }
-            if (normalized.includes("/node_modules/pako/")) {
-              return "diagram-compression";
-            }
-            if (normalized.includes("/node_modules/fflate/")) {
-              return "diagram-archive";
-            }
-            if (normalized.includes("/node_modules/hls.js/")) {
-              return "media-hls";
-            }
-            if (normalized.includes("/node_modules/dashjs/")) {
-              return "media-dash";
-            }
-            if (normalized.includes("/node_modules/mp4box/")) {
-              return "media-mp4";
-            }
+              { name: "react-vendor", test: NM("(react|react-dom|scheduler|use-sync-external-store)") },
 
-            if (
-              normalized.includes("/node_modules/react/") ||
-              normalized.includes("/node_modules/react-dom/") ||
-              normalized.includes("/node_modules/scheduler/") ||
-              normalized.includes("/node_modules/use-sync-external-store/")
-            ) {
-              return "react-vendor";
-            }
-            if (normalized.includes("/node_modules/framer-motion/")) {
-              return "motion-vendor";
-            }
-            if (normalized.includes("/node_modules/@heroui/")) {
-              return "heroui-vendor";
-            }
-            if (normalized.includes("/node_modules/@react-aria/")) {
-              return "react-aria";
-            }
-            if (normalized.includes("/node_modules/@react-stately/")) {
-              return "react-stately";
-            }
-            if (normalized.includes("/node_modules/@react-types/")) {
-              return "react-types";
-            }
-            if (normalized.includes("/node_modules/@internationalized/")) {
-              return "intl-vendor";
-            }
-            if (normalized.includes("/node_modules/@floating-ui/")) {
-              return "floating-ui";
-            }
-            // Let Rollup keep remaining dependencies with their actual route or dynamic
-            // importer. A generic vendor bucket couples unrelated, rarely used features.
-            return undefined;
+              { name: "diagram-engine", test: NM("@maxgraph[\/]core") },
+              { name: "diagram-collaboration", test: NM("(yjs|lib0|isomorphic\.js)") },
+              { name: "diagram-compression", test: NM("pako") },
+              { name: "diagram-archive", test: NM("fflate") },
+              { name: "media-hls", test: NM("hls\.js") },
+              { name: "media-dash", test: NM("dashjs") },
+              { name: "media-mp4", test: NM("mp4box") },
+
+              { name: "motion-vendor", test: NM("framer-motion") },
+
+              // npm nests these under @heroui/*/node_modules, so their paths contain
+              // both scopes. Groups match in order — putting @heroui first would
+              // swallow all of react-aria/react-stately/@internationalized into
+              // heroui-vendor, which is exactly what it did: 226 KiB that belongs
+              // in three separately cacheable chunks.
+              { name: "react-aria", test: NM("@react-aria") },
+              { name: "react-stately", test: NM("@react-stately") },
+              { name: "react-types", test: NM("@react-types") },
+              { name: "intl-vendor", test: NM("@internationalized") },
+              { name: "floating-ui", test: NM("@floating-ui") },
+              { name: "heroui-vendor", test: NM("@heroui") },
+            ],
           },
         },
       },

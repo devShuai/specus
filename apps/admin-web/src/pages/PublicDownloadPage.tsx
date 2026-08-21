@@ -478,7 +478,7 @@ function DeviceChooser({
   onChoose,
   onReset,
 }: {
-  containerRef: RefObject<HTMLDivElement>;
+  containerRef: RefObject<HTMLDivElement | null>;
   current: VisitorDevice;
   detected: VisitorDevice;
   manual: boolean;
