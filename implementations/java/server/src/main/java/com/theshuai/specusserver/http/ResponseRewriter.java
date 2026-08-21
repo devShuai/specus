@@ -122,9 +122,10 @@ public class ResponseRewriter {
             rewritten = HTML_PATH_SINGLE_PATTERN.matcher(rewritten).replaceAll("$1$2'" + prefix + "$3'");
             rewritten = rewriteSrcset(rewritten, prefix, HTML_SRCSET_PATTERN, '"');
             rewritten = rewriteSrcset(rewritten, prefix, HTML_SRCSET_SINGLE_PATTERN, '\'');
-            // 注入运行时 polyfill：拦截 fetch / XMLHttpRequest / new URL / 节点的 src/href 赋值，
-            // 给绝对路径动态加前缀。这是处理 SPA / webpack chunk 拼接 URL 的唯一可靠方式
-            // ——JS 文件做正则改写会误伤字符串拼接（如 "/api"+"/v2"+"/x" 三段会变成三份前缀）。
+            // 注入运行时 polyfill：拦截 fetch / XHR / history / setAttribute / IDL src·href
+            // setter。DSH 一类插件壳用 createElement('script'); el.src = '/plugins/...'，
+            // 只补 setAttribute 会把请求打到站点根路径。JS 文件不做正则改写，避免
+            // "/api"+"/v2"+"/x" 被加三次前缀。
             rewritten = injectRuntimePolyfill(rewritten, prefix);
         }
         if (contentType.equals("text/css")) {
@@ -170,12 +171,11 @@ public class ResponseRewriter {
     /**
      * 在 HTML 的 {@code <head>} 后注入一段运行时 polyfill。脚本在浏览器执行时拦截：
      * <ul>
-     *   <li>{@code fetch(url, ...)}：url 是绝对路径就加前缀</li>
+     *   <li>{@code fetch(url, ...)} / {@code Request}：path-absolute 与同源绝对 URL 加前缀</li>
      *   <li>{@code XMLHttpRequest.prototype.open(method, url, ...)}：同上</li>
-     *   <li>{@code new URL(input, base)} / {@code new Request(url, ...)}：同上</li>
      *   <li>{@code window.history.pushState/replaceState}：第三个参数 url 改写</li>
-     *   <li>{@code <img>}、{@code <script>}、{@code <link>}、{@code <a>}、{@code <iframe>} 等元素的
-     *       {@code src} / {@code href} setter：动态创建/赋值时改写</li>
+     *   <li>{@code Element.setAttribute} 以及 {@code HTMLScriptElement.src} 等 IDL setter：
+     *       {@code el.src = '/plugins/...'} 不会走 setAttribute，必须单独包一层</li>
      * </ul>
      *
      * <p>这是处理 SPA / webpack 拼接 URL 的唯一可靠方式——服务端正则改写无法识别
@@ -211,15 +211,26 @@ public class ResponseRewriter {
         String jsPrefix = "'" + prefix.replace("\\", "\\\\").replace("'", "\\'") + "'";
         return "<script>(function(){try{"
                 + "var P=" + jsPrefix + ";"
-                // 判断函数：是否应该加前缀（绝对路径且未带前缀，非协议相对，非完整 URL，非 data:）
+                // path-absolute（/foo）或同源绝对 URL（https://host/foo）；已带前缀或协议相对跳过
                 + "function need(u){"
-                + "if(typeof u!=='string')return false;"
-                + "if(u.length===0||u.charAt(0)!=='/')return false;"
-                + "if(u.length>1&&u.charAt(1)==='/')return false;"
-                + "if(u.indexOf(P+'/')===0||u===P)return false;"
+                + "if(typeof u!=='string'||!u)return false;"
+                + "var path=u;"
+                + "if(u.charAt(0)!=='/'){"
+                + "if(typeof location==='undefined')return false;"
+                + "var o=location.origin;"
+                + "if(!o||u.indexOf(o)!==0)return false;"
+                + "path=u.slice(o.length);"
+                + "if(!path||path.charAt(0)!=='/')return false;"
+                + "}"
+                + "if(path.length>1&&path.charAt(1)==='/')return false;"
+                + "if(path.indexOf(P+'/')===0||path===P||path.indexOf(P+'?')===0||path.indexOf(P+'#')===0)return false;"
                 + "return true;"
                 + "}"
-                + "function fix(u){return need(u)?P+u:u;}"
+                + "function fix(u){"
+                + "if(!need(u))return u;"
+                + "if(u.charAt(0)==='/')return P+u;"
+                + "return location.origin+P+u.slice(location.origin.length);"
+                + "}"
                 // fetch
                 + "if(typeof fetch==='function'){"
                 + "var of=fetch;"
@@ -256,6 +267,27 @@ public class ResponseRewriter {
                 + "return osa.call(this,n,v);"
                 + "};"
                 + "}"
+                // IDL setter：createElement('script'); el.src = '/plugins/...' 走这里而不是 setAttribute
+                + "function wrapAttr(N,p){"
+                + "var C=window[N];"
+                + "if(typeof C!=='function'||!C.prototype)return;"
+                + "var proto=C.prototype,from=proto,d;"
+                + "while(from&&!(d=Object.getOwnPropertyDescriptor(from,p)))from=Object.getPrototypeOf(from);"
+                + "if(!d||typeof d.set!=='function')return;"
+                + "var desc={configurable:true,enumerable:d.enumerable,set:function(v){"
+                + "try{if(typeof v==='string')v=fix(v);}catch(e){}"
+                + "d.set.call(this,v);"
+                + "}};"
+                + "if(d.get)desc.get=function(){return d.get.call(this);};"
+                + "Object.defineProperty(proto,p,desc);"
+                + "}"
+                + "var S=['HTMLScriptElement','HTMLImageElement','HTMLIFrameElement','HTMLSourceElement',"
+                + "'HTMLVideoElement','HTMLAudioElement','HTMLEmbedElement','HTMLInputElement','HTMLMediaElement'];"
+                + "for(var si=0;si<S.length;si++){wrapAttr(S[si],'src');wrapAttr(S[si],'srcset');wrapAttr(S[si],'poster');}"
+                + "var H=['HTMLLinkElement','HTMLAnchorElement','HTMLBaseElement','SVGAElement','SVGImageElement'];"
+                + "for(var hi=0;hi<H.length;hi++)wrapAttr(H[hi],'href');"
+                + "wrapAttr('HTMLFormElement','action');"
+                + "wrapAttr('HTMLObjectElement','data');"
                 // EventSource
                 + "if(typeof EventSource==='function'){"
                 + "var OE=EventSource;"

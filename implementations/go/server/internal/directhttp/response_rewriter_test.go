@@ -31,6 +31,9 @@ func TestResponseRewriterRewritesHTMLPaths(t *testing.T) {
 		"wrapHistory('replaceState')",
 		"window.EventSource=function",
 		"window.WebSocket=function",
+		"function wrapAttr(",
+		"HTMLScriptElement",
+		"location.origin",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("runtime polyfill missing %q: %s", expected, text)

@@ -18,6 +18,9 @@ public sealed class ResponseRewriterTests
         Assert.Contains("wrapHistory('replaceState')", text);
         Assert.Contains("window.EventSource=function", text);
         Assert.Contains("window.WebSocket=function", text);
+        Assert.Contains("function wrapAttr(", text);
+        Assert.Contains("HTMLScriptElement", text);
+        Assert.Contains("location.origin", text);
     }
 
     private static byte[] Rewrite(byte[] body, string clientName, string route, IReadOnlyList<string> headers)
