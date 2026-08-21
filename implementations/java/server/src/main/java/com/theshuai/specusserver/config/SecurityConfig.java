@@ -24,7 +24,13 @@ import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
 import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriter;
+import org.springframework.security.web.header.writers.CompositeHeaderWriter;
+import org.springframework.security.web.header.writers.DelegatingRequestMatcherHeaderWriter;
 import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import org.springframework.security.web.header.writers.StaticHeadersWriter;
+import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
+import org.springframework.security.web.util.matcher.RequestMatcher;
 import org.springframework.util.StringUtils;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -92,24 +98,46 @@ public class SecurityConfig {
                  *
                  * 同时加 Referrer-Policy: strict-origin-when-cross-origin（同源带完整 referrer
                  * 让 GA 能识别站内跳转，跨域只发 origin 不泄露路径）与 X-Frame-Options: DENY。
+                 *
+                 * {@code /http/**} 是被映射应用的入口，不能套管理站 CSP / nosniff / DENY：
+                 * 路径改写会注入内联 polyfill，目标页也常有自己的 script-src；套上管理站策略后
+                 * 浏览器会拦内联脚本，502 的 text/plain 错误页还会被 nosniff 当成非法 JS/CSS。
                  */
                 .headers(headers -> headers
-                        .contentSecurityPolicy(csp -> csp.policyDirectives(
-                                "default-src 'self'; "
-                                + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
-                                + "style-src 'self' 'unsafe-inline'; "
-                                + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
-                                + "media-src 'self' blob: data:" + ossSuffix + "; "
-                                + "object-src 'self' blob:; "
-                                + "frame-src 'self' blob: https://challenges.cloudflare.com; "
-                                + "font-src 'self' data:; "
-                                + "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
-                                + "form-action 'self'; "
-                                + "frame-ancestors 'none'; "
-                                + "base-uri 'self'"))
-                        .referrerPolicy(rp -> rp.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
-                        .frameOptions(frame -> frame.deny()));
+                        .defaultsDisabled()
+                        .addHeaderWriter(portalOnlySecurityHeaders(ossSuffix)));
         return http.build();
+    }
+
+    private static HeaderWriter portalOnlySecurityHeaders(String ossSuffix) {
+        String policy = "default-src 'self'; "
+                + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                + "style-src 'self' 'unsafe-inline'; "
+                + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
+                + "media-src 'self' blob: data:" + ossSuffix + "; "
+                + "object-src 'self' blob:; "
+                + "frame-src 'self' blob: https://challenges.cloudflare.com; "
+                + "font-src 'self' data:; "
+                + "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
+                + "form-action 'self'; "
+                + "frame-ancestors 'none'; "
+                + "base-uri 'self'";
+        RequestMatcher httpSpecus = request -> {
+            String path = request.getRequestURI().substring(request.getContextPath().length());
+            return "/http".equals(path) || path.startsWith("/http/");
+        };
+        return new DelegatingRequestMatcherHeaderWriter(
+                new NegatedRequestMatcher(httpSpecus),
+                new CompositeHeaderWriter(List.of(
+                        new StaticHeadersWriter("Content-Security-Policy", policy),
+                        new StaticHeadersWriter("X-Content-Type-Options", "nosniff"),
+                        new StaticHeadersWriter("X-Frame-Options", "DENY"),
+                        new ReferrerPolicyHeaderWriter(
+                                ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN),
+                        new StaticHeadersWriter("Cache-Control",
+                                "no-cache, no-store, max-age=0, must-revalidate"),
+                        new StaticHeadersWriter("Pragma", "no-cache"),
+                        new StaticHeadersWriter("Expires", "0"))));
     }
 
     private BearerTokenResolver adminApiBearerTokenResolver() {

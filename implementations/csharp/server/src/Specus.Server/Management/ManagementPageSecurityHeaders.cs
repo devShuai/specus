@@ -30,6 +30,10 @@ public static class ManagementPageSecurityHeaders
     {
         app.Use(static (context, next) =>
         {
+            if (IsHttpSpecusIngress(context.Request.Path))
+            {
+                return next();
+            }
             var headers = context.Response.Headers;
             headers["Content-Security-Policy"] = ContentSecurityPolicy;
             headers["X-Frame-Options"] = "DENY";
@@ -39,4 +43,7 @@ public static class ManagementPageSecurityHeaders
         });
         return app;
     }
+
+    private static bool IsHttpSpecusIngress(PathString path) =>
+        path.StartsWithSegments("/http");
 }

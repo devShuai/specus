@@ -57,6 +57,18 @@ public sealed class ManagementPageTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task HttpSpecusIngressDoesNotInheritManagementContentSecurityPolicy()
+    {
+        using var client = _server!.CreateClient();
+
+        var specus = await client.GetAsync("/http/missing-client/nacos/");
+        Assert.False(specus.IsSuccessStatusCode);
+        Assert.False(specus.Headers.Contains("Content-Security-Policy"));
+        Assert.False(specus.Headers.Contains("X-Frame-Options"));
+        Assert.False(specus.Headers.Contains("X-Content-Type-Options"));
+    }
+
+    [Fact]
     public async Task DatabaseInitializeEndpointIsProtectedAndIdempotent()
     {
         using var anonymous = _server!.CreateClient();

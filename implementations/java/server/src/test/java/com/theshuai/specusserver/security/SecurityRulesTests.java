@@ -229,6 +229,19 @@ class SecurityRulesTests {
     }
 
     @Test
+    void httpSpecusIngressDoesNotInheritManagementContentSecurityPolicy() throws Exception {
+        HttpResponse<String> portal = get("/", null);
+        assertThat(portal.headers().firstValue("Content-Security-Policy"))
+                .hasValueSatisfying(policy -> assertThat(policy).contains("frame-ancestors 'none'"));
+
+        HttpResponse<String> specus = get("/http/missing-client/nacos/", null);
+        assertThat(specus.statusCode()).isEqualTo(502);
+        assertThat(specus.headers().firstValue("Content-Security-Policy")).isEmpty();
+        assertThat(specus.headers().firstValue("X-Frame-Options")).isEmpty();
+        assertThat(specus.headers().firstValue("X-Content-Type-Options")).isEmpty();
+    }
+
+    @Test
     void oidcConfigIsPublic() throws Exception {
         assertThat(get("/oidc-config", null).statusCode()).isEqualTo(200);
     }
