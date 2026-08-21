@@ -106,7 +106,13 @@ func (state *natFlowState) add(credit uint32) bool {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closed || state.credit+uint64(credit) > natMaximumWindowBytes {
+	// WINDOW_UPDATE can already be in flight when the owning stream closes.
+	// Treat valid late credit as consumed instead of escalating a stream race
+	// into a connection-level protocol failure.
+	if state.closed {
+		return true
+	}
+	if state.credit+uint64(credit) > natMaximumWindowBytes {
 		return false
 	}
 	state.credit += uint64(credit)
@@ -670,7 +676,12 @@ func (client *Client) addNatCredit(streamID uint32, credit uint32) bool {
 	client.natFlowsMu.Lock()
 	flow := client.natFlows[streamID]
 	client.natFlowsMu.Unlock()
-	return flow != nil && flow.add(credit)
+	if flow == nil {
+		// WINDOW_UPDATE can race a terminal frame. Credit for a recently
+		// closed stream is consumed without resurrecting that stream.
+		return true
+	}
+	return flow.add(credit)
 }
 
 func (client *Client) hasNatFlow(streamID uint32) bool {

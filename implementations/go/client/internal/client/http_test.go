@@ -113,6 +113,65 @@ func TestHTTPStreamForwardsRequestAndStreamsResponse(t *testing.T) {
 	}
 }
 
+func TestHTTPWindowUpdateAfterCompleteDoesNotCloseDataConnection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	defer upstream.Close()
+
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{{Route: "dsh", TargetBaseURL: upstream.URL}})
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	specusClient.openNatFlow(12)
+	specusClient.openHTTPStream(clientConn, 12, map[string]any{
+		"source": "http", "phase": "request", "method": "GET", "route": "dsh",
+		"relativePath": "/",
+	})
+	if handled, accepted := specusClient.finishHTTPRequest(12, nil); !handled || !accepted {
+		t.Fatal("HTTP request stream was not registered")
+	}
+
+	_ = serverConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	seenFin := false
+	for !seenFin {
+		packet, err := protocol.ReadPacket(serverConn)
+		if err != nil {
+			t.Fatalf("read response frame: %v", err)
+		}
+		if packet.Command != protocol.CommandNatMessage {
+			continue
+		}
+		message, err := protocol.DecodeNatMessage(packet.Body)
+		if err != nil {
+			t.Fatalf("decode NAT frame: %v", err)
+		}
+		if message.Type == protocol.NatRST {
+			t.Fatalf("HTTP stream reset: %+v", message.Metadata)
+		}
+		if message.Type == protocol.NatFin {
+			seenFin = true
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for specusClient.hasNatFlow(12) {
+		if time.Now().After(deadline) {
+			t.Fatal("HTTP stream did not release its NAT flow after FIN")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := handleNatForTest(specusClient, clientConn, protocol.NatMessage{
+		Type: protocol.NatWindowUpdate, StreamID: 12, Value: uint32(len("<html>ok</html>")),
+	}); err != nil {
+		t.Fatalf("WINDOW_UPDATE after HTTP complete closed the data connection: %v", err)
+	}
+}
+
 func TestRequestBodyReturnsCreditAfterChunkConsumption(t *testing.T) {
 	credits := make(chan int, 1)
 	body := newHTTPRequestBody(func(bytes int) { credits <- bytes })

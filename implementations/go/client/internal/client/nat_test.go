@@ -131,6 +131,53 @@ func TestTCPNatFlowIgnoresLateRSTForRecentlyClosedStream(t *testing.T) {
 	}
 }
 
+func TestNatFlowIgnoresLateWindowUpdate(t *testing.T) {
+	client := New(Config{}, log.New(io.Discard, "", 0))
+	control := &captureConn{}
+
+	client.openNatFlow(93)
+	client.closeNatFlow(93)
+	if err := handleNatForTest(client, control, protocol.NatMessage{
+		Type: protocol.NatWindowUpdate, StreamID: 93, Value: 1024,
+	}); err != nil {
+		t.Fatalf("late WINDOW_UPDATE closed the data connection: %v", err)
+	}
+
+	if err := handleNatForTest(client, control, protocol.NatMessage{
+		Type: protocol.NatWindowUpdate, StreamID: 94, Value: 1024,
+	}); err != nil {
+		t.Fatalf("WINDOW_UPDATE for an unknown stream closed the data connection: %v", err)
+	}
+	if control.Len() != 0 {
+		t.Fatal("late WINDOW_UPDATE must not emit a frame")
+	}
+}
+
+func TestNatFlowRejectsOverflowWindowUpdateOnLiveStream(t *testing.T) {
+	client := New(Config{}, log.New(io.Discard, "", 0))
+	control := &captureConn{}
+	if !client.openNatFlow(95) {
+		t.Fatal("openNatFlow() = false, want true")
+	}
+
+	if err := handleNatForTest(client, control, protocol.NatMessage{
+		Type: protocol.NatWindowUpdate, StreamID: 95, Value: natMaximumWindowBytes,
+	}); err == nil {
+		t.Fatal("overflow WINDOW_UPDATE on a live stream must close the data connection")
+	}
+}
+
+func TestNatFlowAddConsumesCreditAfterClose(t *testing.T) {
+	state := newNatFlowState()
+	state.close()
+	if !state.add(1024) {
+		t.Fatal("late credit on a closed flow must be consumed")
+	}
+	if state.add(0) || state.add(natMaximumWindowBytes+1) {
+		t.Fatal("malformed credit must still be rejected after close")
+	}
+}
+
 func TestDuplicateOpenResetsStreamWithoutClosingDataConnection(t *testing.T) {
 	client := New(Config{}, log.New(io.Discard, "", 0))
 	control := &captureConn{}
