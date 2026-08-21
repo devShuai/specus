@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Security;
@@ -200,6 +201,109 @@ public sealed class DirectHttpForwarder
                 message.Content?.Headers.TryAddWithoutValidation(name, value);
             }
         }
+    }
+
+    internal static void BindUpstreamAuthority(HttpRequestMessage message, Uri target)
+    {
+        var origin = HttpOriginOf(target);
+        if (origin is null)
+        {
+            return;
+        }
+        ReplaceHeader(message, "Origin", origin);
+        if (message.Headers.TryGetValues("Referer", out var referers))
+        {
+            var referer = referers.FirstOrDefault();
+            if (!string.IsNullOrEmpty(referer))
+            {
+                ReplaceHeader(message, "Referer", RewriteRefererOrigin(referer, origin));
+            }
+        }
+        if (message.Headers.TryGetValues("Sec-Fetch-Site", out var sites)
+            && sites.Any(value => string.Equals(value, "cross-site", StringComparison.OrdinalIgnoreCase)))
+        {
+            ReplaceHeader(message, "Sec-Fetch-Site", "same-origin");
+        }
+    }
+
+    internal static List<KeyValuePair<string, string>> RewriteHandshakeAuthority(
+        IReadOnlyList<KeyValuePair<string, string>> headers, Uri target)
+    {
+        var origin = HttpOriginOf(target);
+        if (origin is null)
+        {
+            return headers.ToList();
+        }
+        var rewritten = new List<KeyValuePair<string, string>>(headers.Count);
+        foreach (var header in headers)
+        {
+            if (header.Key.Equals("Origin", StringComparison.OrdinalIgnoreCase))
+            {
+                rewritten.Add(new KeyValuePair<string, string>(header.Key, origin));
+            }
+            else if (header.Key.Equals("Referer", StringComparison.OrdinalIgnoreCase))
+            {
+                rewritten.Add(new KeyValuePair<string, string>(
+                    header.Key, RewriteRefererOrigin(header.Value, origin)));
+            }
+            else if (header.Key.Equals("Sec-Fetch-Site", StringComparison.OrdinalIgnoreCase)
+                     && header.Value.Trim().Equals("cross-site", StringComparison.OrdinalIgnoreCase))
+            {
+                rewritten.Add(new KeyValuePair<string, string>(header.Key, "same-origin"));
+            }
+            else
+            {
+                rewritten.Add(header);
+            }
+        }
+        return rewritten;
+    }
+
+    private static void ReplaceHeader(HttpRequestMessage message, string name, string value)
+    {
+        message.Headers.Remove(name);
+        message.Headers.TryAddWithoutValidation(name, value);
+    }
+
+    private static string? HttpOriginOf(Uri target)
+    {
+        if (target is null || string.IsNullOrEmpty(target.Host))
+        {
+            return null;
+        }
+        var scheme = target.Scheme;
+        if (scheme.Equals("ws", StringComparison.OrdinalIgnoreCase))
+        {
+            scheme = "http";
+        }
+        else if (scheme.Equals("wss", StringComparison.OrdinalIgnoreCase))
+        {
+            scheme = "https";
+        }
+        else if (!scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+                 && !scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return target.IsDefaultPort
+            ? $"{scheme}://{target.Host}"
+            : $"{scheme}://{target.Host}:{target.Port}";
+    }
+
+    private static string RewriteRefererOrigin(string referer, string origin)
+    {
+        if (!Uri.TryCreate(referer.Trim(), UriKind.Absolute, out var parsed)
+            || !Uri.TryCreate(origin, UriKind.Absolute, out var baseOrigin))
+        {
+            return origin + "/";
+        }
+        var builder = new UriBuilder(parsed)
+        {
+            Scheme = baseOrigin.Scheme,
+            Host = baseOrigin.Host,
+            Port = baseOrigin.Port,
+        };
+        return builder.Uri.OriginalString;
     }
 
     internal static string? FirstHeader(IReadOnlyList<string>? headers, string headerName)

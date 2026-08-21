@@ -1,5 +1,7 @@
 package com.theshuai.specusserver.http;
 
+import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
+import com.theshuai.specusserver.management.service.ClientAccountService;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -20,7 +22,8 @@ import static org.mockito.Mockito.when;
 class WebSocketSpecusHandshakeInterceptorAuthenticationTests {
     private final HttpRouteAuthenticationService authenticationService = mock(HttpRouteAuthenticationService.class);
     private final WebSocketSpecusHandshakeInterceptor interceptor =
-            new WebSocketSpecusHandshakeInterceptor(authenticationService);
+            new WebSocketSpecusHandshakeInterceptor(
+                    authenticationService, mock(ClientAccountService.class), mock(HttpRouteMappingRepository.class));
     private final WebSocketHandler handler = mock(WebSocketHandler.class);
 
     @Test

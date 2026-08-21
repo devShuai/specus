@@ -1,5 +1,8 @@
 package com.theshuai.specusserver.http;
 
+import com.theshuai.specusserver.management.model.HttpRouteMapping;
+import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
+import com.theshuai.specusserver.management.service.ClientAccountService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -46,9 +49,15 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
     );
 
     private final HttpRouteAuthenticationService routeAuthenticationService;
+    private final ClientAccountService clientAccountService;
+    private final HttpRouteMappingRepository httpRouteMappingRepository;
 
-    public WebSocketSpecusHandshakeInterceptor(HttpRouteAuthenticationService routeAuthenticationService) {
+    public WebSocketSpecusHandshakeInterceptor(HttpRouteAuthenticationService routeAuthenticationService,
+                                               ClientAccountService clientAccountService,
+                                               HttpRouteMappingRepository httpRouteMappingRepository) {
         this.routeAuthenticationService = routeAuthenticationService;
+        this.clientAccountService = clientAccountService;
+        this.httpRouteMappingRepository = httpRouteMappingRepository;
     }
 
     @Override
@@ -96,7 +105,9 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         attributes.put(WebSocketSpecusHandler.ATTR_RELATIVE_PATH, parts.relativePath);
         attributes.put(WebSocketSpecusHandler.ATTR_RAW_QUERY, http.getQueryString());
         attributes.put(WebSocketSpecusHandler.ATTR_HEADERS,
-                collectHeaders(http, access.credentialsConsumed()));
+                UpstreamBrowserHeaders.rewrite(
+                        collectHeaders(http, access.credentialsConsumed()),
+                        targetBaseUrl(parts.clientName, parts.route)));
         // WS 升级是 GET，无 body；保留空数组占位，保持 CONNECTED metaData 结构一致
         attributes.put(WebSocketSpecusHandler.ATTR_BODY, new byte[0]);
         return true;
@@ -108,6 +119,17 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
                                WebSocketHandler wsHandler,
                                Exception exception) {
         // no-op
+    }
+
+    private String targetBaseUrl(String clientName, String route) {
+        try {
+            return clientAccountService.findClientByName(clientName)
+                    .flatMap(account -> httpRouteMappingRepository.findByClientIdAndRoute(account.getId(), route))
+                    .map(HttpRouteMapping::getTargetBaseUrl)
+                    .orElse(null);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     static PathParts parsePath(String requestUri, String contextPath) {

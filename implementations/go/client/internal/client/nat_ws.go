@@ -89,7 +89,8 @@ func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint3
 		client.sendNatReset(connection, streamID, 4, "invalid websocket target")
 		return
 	}
-	localConnection, err := dialLocalWebSocket(target, webSocketHandshakeHeaders(metadata),
+	localConnection, err := dialLocalWebSocket(target,
+		rewriteHeaderLines(webSocketHandshakeHeaders(metadata), target),
 		client.upstreamTLSFactory())
 	if err != nil {
 		client.logger.Printf("[ws-specus][client] connect local ws failed channelId=%q route=%q target=%s: %v",

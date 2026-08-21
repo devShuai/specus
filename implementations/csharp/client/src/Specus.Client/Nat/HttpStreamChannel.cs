@@ -112,6 +112,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
         var boundedRange = DirectHttpForwarder.BoundedRange(
             DirectHttpForwarder.FirstHeader(headers, "range"));
         DirectHttpForwarder.CopyRequestHeaders(headers, request, boundedRange is not null);
+        DirectHttpForwarder.BindUpstreamAuthority(request, target);
         if (boundedRange is not null)
         {
             request.Headers.TryAddWithoutValidation("Range", boundedRange);

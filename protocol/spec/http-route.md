@@ -132,7 +132,10 @@ Connection, Content-Length, Host, Keep-Alive, Proxy-Authenticate,
 Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade
 ```
 
-其他 header 按 `name:value` 数组保留重复值。受保护 route 的入口 `Authorization: Basic ...` 在校验成功后必须
+其他 header 按 `name:value` 数组保留重复值。客户端把请求发到 `targetBaseUrl` 时，必须把 `Origin` / `Referer`
+改写为该目标的 origin（`ws`/`wss` 目标使用对应的 `http`/`https` origin），并把 `Sec-Fetch-Site: cross-site`
+改成 `same-origin`。否则本地应用若按 Host 与 Origin 对齐做 CSRF / DNS-rebinding 围栏，会把公网入口当成跨站
+请求并返回 403。受保护 route 的入口 `Authorization: Basic ...` 在校验成功后必须
 从转发 metadata 和流量明细中移除，防止公网凭据泄露给 upstream 或持久化；公开 route 的 Authorization 仍原样
 透传，以支持 upstream 自身的 Bearer/Basic 认证。公网响应的 Content-Length 由实际输出决定；经过路径改写或
 解压后必须移除旧 Content-Length/Content-Encoding。可解析的单范围 `Range` 会裁剪到最多 8 MiB；multi-range、

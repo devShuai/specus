@@ -441,6 +441,8 @@ public class NatClientHandler extends NatCommonHandler {
             return;
         }
         log.info("[ws-specus][client] CONNECTED channelId={} route={} target={}", channelId, route, withoutQuery(target));
+        io.netty.handler.codec.http.HttpHeaders handshakeHeaders = buildWsHandshakeHeaders(natMessagePacket);
+        HttpStreamForwarder.bindUpstreamAuthority(handshakeHeaders, target);
 
         EventLoopGroup group = ensureWsWorkerGroup();
         Bootstrap b = new Bootstrap();
@@ -456,7 +458,7 @@ public class NatClientHandler extends NatCommonHandler {
                     protected void initChannel(SocketChannel ch) throws Exception {
                         WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
                                 target, WebSocketVersion.V13, null, true,
-                                buildWsHandshakeHeaders(natMessagePacket), LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES);
+                                handshakeHeaders, LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES);
                         if ("wss".equalsIgnoreCase(target.getScheme())) {
                             io.netty.handler.ssl.SslHandler sslHandler = LOCAL_WS_SSL_CONTEXT.newHandler(
                                     ch.alloc(), target.getHost(),

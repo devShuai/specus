@@ -112,6 +112,7 @@ final class NettyWebSocketTransport {
         HttpHeaders headers;
         try {
             headers = buildHeaders(handshakeHeaders);
+            NettyHttpTransport.bindUpstreamAuthority(headers, target);
         } catch (RuntimeException error) {
             fail(error);
             return;

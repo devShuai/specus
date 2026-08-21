@@ -282,6 +282,7 @@ final class NettyHttpTransport {
                 hasAcceptEncoding |= "accept-encoding".equalsIgnoreCase(name);
             }
         }
+        bindUpstreamAuthority(request.headers(), target);
         if (boundedRange != null) {
             request.headers().set(HttpHeaderNames.RANGE, boundedRange);
         }
@@ -454,6 +455,52 @@ final class NettyHttpTransport {
             }
         });
         return result;
+    }
+
+    static void bindUpstreamAuthority(HttpHeaders headers, URI target) {
+        String origin = httpOriginOf(target);
+        if (origin == null) {
+            return;
+        }
+        if (headers.contains("Origin")) {
+            headers.set("Origin", origin);
+        }
+        if (headers.contains("Referer")) {
+            headers.set("Referer", rewriteRefererOrigin(headers.get("Referer"), origin));
+        }
+        if ("cross-site".equalsIgnoreCase(headers.get("Sec-Fetch-Site"))) {
+            headers.set("Sec-Fetch-Site", "same-origin");
+        }
+    }
+
+    static String httpOriginOf(URI target) {
+        if (target == null || target.getHost() == null || target.getHost().isBlank()) {
+            return null;
+        }
+        String scheme = target.getScheme() == null ? "" : target.getScheme().toLowerCase(Locale.ROOT);
+        if ("ws".equals(scheme)) {
+            scheme = "http";
+        } else if ("wss".equals(scheme)) {
+            scheme = "https";
+        } else if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            return null;
+        }
+        int port = target.getPort();
+        return port > 0 ? scheme + "://" + target.getHost() + ":" + port : scheme + "://" + target.getHost();
+    }
+
+    private static String rewriteRefererOrigin(String referer, String origin) {
+        try {
+            URI parsed = URI.create(referer == null ? "" : referer.trim());
+            URI base = URI.create(origin);
+            if (parsed.getScheme() == null || parsed.getHost() == null) {
+                return origin + "/";
+            }
+            return new URI(base.getScheme(), parsed.getUserInfo(), base.getHost(), base.getPort(),
+                    parsed.getRawPath(), parsed.getRawQuery(), parsed.getRawFragment()).toString();
+        } catch (Exception ignored) {
+            return origin + "/";
+        }
     }
 
     private static boolean shouldForward(String name) {

@@ -125,7 +125,9 @@ public class HttpSpecusController {
                     // PUBLIC and AUTHENTICATED continue into the data plane.
                 }
             }
-            forwardedHeaders = requestHeaders(request, access.credentialsConsumed());
+            forwardedHeaders = UpstreamBrowserHeaders.rewrite(
+                    requestHeaders(request, access.credentialsConsumed()),
+                    targetBaseUrl(clientName, route));
             boolean detailCaptureEnabled = trafficInspectionService.shouldCaptureHttpExchange(clientName, route);
             requestCapture = new FullCapture(detailCaptureEnabled);
             responseCapture = new FullCapture(detailCaptureEnabled);
@@ -517,6 +519,20 @@ public class HttpSpecusController {
             rewriteDecisionCache.put(cacheKey, new RewriteDecision(enabled, now + routeCacheTtlMillis));
         }
         return enabled;
+    }
+
+    private String targetBaseUrl(String clientName, String route) {
+        try {
+            Optional<ClientAccount> account = clientAccountService.findClientByName(clientName);
+            if (account.isEmpty()) {
+                return null;
+            }
+            return httpRouteMappingRepository.findByClientIdAndRoute(account.get().getId(), route)
+                    .map(HttpRouteMapping::getTargetBaseUrl)
+                    .orElse(null);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     private boolean loadPathRewriteEnabled(String clientName, String route) {

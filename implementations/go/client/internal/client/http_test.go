@@ -7,12 +7,34 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
+
+func TestRewriteUpstreamAuthorityHeadersMapsPublicOriginToLoopbackTarget(t *testing.T) {
+	target, err := url.Parse("http://127.0.0.1:3210/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := make(http.Header)
+	headers.Set("Origin", "https://specus.devshuai.com")
+	headers.Set("Referer", "https://specus.devshuai.com/http/client/dsh/")
+	headers.Set("Sec-Fetch-Site", "cross-site")
+	rewriteUpstreamAuthorityHeaders(headers, target)
+	if got := headers.Get("Origin"); got != "http://127.0.0.1:3210" {
+		t.Fatalf("Origin = %q", got)
+	}
+	if got := headers.Get("Referer"); got != "http://127.0.0.1:3210/http/client/dsh/" {
+		t.Fatalf("Referer = %q", got)
+	}
+	if got := headers.Get("Sec-Fetch-Site"); got != "same-origin" {
+		t.Fatalf("Sec-Fetch-Site = %q", got)
+	}
+}
 
 func TestBuildTargetRejectsEscapesAndUnsupportedSchemes(t *testing.T) {
 	target, err := buildTarget("http://127.0.0.1:8080/base", "/items", "x=1")

@@ -98,6 +98,7 @@ sudo ADMIN_WEB_ROOT=/data/specus/admin-web \
 `/http/` 是透明代理的第三方应用入口。该 location 不继承管理站点的 CSP、Permissions-Policy、
 X-Frame-Options 或 Cache-Control，而是保留隧道上游返回的响应头；否则 DSM 等依赖 WebAssembly、
 动态脚本、摄像头或内嵌页面的应用会在浏览器中初始化失败。HTTPS location 仍由 OpenResty 补充 HSTS。
+`/http/` 还必须按 `$http_upgrade` 传递 `Upgrade`/`Connection`，否则浏览器 WebSocket 无法升级到被映射应用。
 
 ## HTTPS
 

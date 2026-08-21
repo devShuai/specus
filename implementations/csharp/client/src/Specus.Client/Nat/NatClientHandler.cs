@@ -459,7 +459,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
         try
         {
             socket = await ConnectLocalWebSocketAsync(target,
-                WebSocketHandshakeHeaders(packet.MetaData), pending.Token).ConfigureAwait(false);
+                DirectHttpForwarder.RewriteHandshakeAuthority(
+                    WebSocketHandshakeHeaders(packet.MetaData), target), pending.Token).ConfigureAwait(false);
             var channel = new WebSocketSpecusChannel(
                 packet.StreamId,
                 channelId,

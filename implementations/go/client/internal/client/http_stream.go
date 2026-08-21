@@ -195,6 +195,7 @@ func (stream *httpRequestStream) forward() {
 	if rangeHeader != "" {
 		request.Header.Set("Range", rangeHeader)
 	}
+	rewriteUpstreamAuthorityHeaders(request.Header, target)
 
 	upstream, err := stream.client.forwardingHTTPClient().Do(request)
 	if err != nil {

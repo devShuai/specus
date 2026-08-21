@@ -85,6 +85,82 @@ func buildTarget(targetBaseURL, relativePath, rawQuery string) (*url.URL, error)
 	return target, nil
 }
 
+func rewriteUpstreamAuthorityHeaders(headers http.Header, target *url.URL) {
+	origin := httpOriginOf(target)
+	if origin == "" {
+		return
+	}
+	if headers.Get("Origin") != "" {
+		headers.Set("Origin", origin)
+	}
+	if referer := headers.Get("Referer"); referer != "" {
+		headers.Set("Referer", rewriteRefererOrigin(referer, origin))
+	}
+	if strings.EqualFold(headers.Get("Sec-Fetch-Site"), "cross-site") {
+		headers.Set("Sec-Fetch-Site", "same-origin")
+	}
+}
+
+func rewriteHeaderLines(lines []string, target *url.URL) []string {
+	origin := httpOriginOf(target)
+	if origin == "" || len(lines) == 0 {
+		return lines
+	}
+	rewritten := make([]string, 0, len(lines))
+	for _, line := range lines {
+		separator := strings.IndexByte(line, ':')
+		if separator <= 0 {
+			rewritten = append(rewritten, line)
+			continue
+		}
+		name := line[:separator]
+		value := line[separator+1:]
+		switch {
+		case strings.EqualFold(name, "Origin"):
+			rewritten = append(rewritten, name+":"+origin)
+		case strings.EqualFold(name, "Referer"):
+			rewritten = append(rewritten, name+":"+rewriteRefererOrigin(value, origin))
+		case strings.EqualFold(name, "Sec-Fetch-Site") && strings.EqualFold(strings.TrimSpace(value), "cross-site"):
+			rewritten = append(rewritten, name+":same-origin")
+		default:
+			rewritten = append(rewritten, line)
+		}
+	}
+	return rewritten
+}
+
+func httpOriginOf(target *url.URL) string {
+	if target == nil || target.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(target.Scheme)
+	switch scheme {
+	case "ws":
+		scheme = "http"
+	case "wss":
+		scheme = "https"
+	case "http", "https":
+	default:
+		return ""
+	}
+	return scheme + "://" + target.Host
+}
+
+func rewriteRefererOrigin(referer, origin string) string {
+	parsed, err := url.Parse(strings.TrimSpace(referer))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return origin + "/"
+	}
+	base, err := url.Parse(origin)
+	if err != nil {
+		return origin + "/"
+	}
+	parsed.Scheme = base.Scheme
+	parsed.Host = base.Host
+	parsed.User = nil
+	return parsed.String()
+}
+
 func copyListHeaders(headers []string, target http.Header, skipRange bool) {
 	for _, header := range headers {
 		separator := strings.IndexByte(header, ':')
