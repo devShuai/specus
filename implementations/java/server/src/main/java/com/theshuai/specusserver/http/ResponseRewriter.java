@@ -171,8 +171,9 @@ public class ResponseRewriter {
     /**
      * 在 HTML 的 {@code <head>} 后注入一段运行时 polyfill。脚本在浏览器执行时拦截：
      * <ul>
-     *   <li>{@code fetch(url, ...)} / {@code Request}：path-absolute 与同源绝对 URL 加前缀</li>
-     *   <li>{@code XMLHttpRequest.prototype.open(method, url, ...)}：同上</li>
+     *   <li>{@code fetch}：string、{@code URL}（DSH 用 {@code new URL('/api/...', origin)}）和 {@code Request}</li>
+     *   <li>{@code XMLHttpRequest.prototype.open}、{@code EventSource}、{@code WebSocket}：含同源
+     *       {@code ws}/{@code wss} URL 对象</li>
      *   <li>{@code window.history.pushState/replaceState}：第三个参数 url 改写</li>
      *   <li>{@code Element.setAttribute} 以及 {@code HTMLScriptElement.src} 等 IDL setter：
      *       {@code el.src = '/plugins/...'} 不会走 setAttribute，必须单独包一层</li>
@@ -211,15 +212,27 @@ public class ResponseRewriter {
         String jsPrefix = "'" + prefix.replace("\\", "\\\\").replace("'", "\\'") + "'";
         return "<script>(function(){try{"
                 + "var P=" + jsPrefix + ";"
-                // path-absolute（/foo）或同源绝对 URL（https://host/foo）；已带前缀或协议相对跳过
+                // string / URL.href / Request.url
+                + "function hrefOf(u){"
+                + "if(typeof u==='string')return u;"
+                + "if(u&&typeof u.href==='string')return u.href;"
+                + "if(u&&typeof u.url==='string')return u.url;"
+                + "return '';"
+                + "}"
+                + "function locParts(){"
+                + "if(typeof location==='undefined')return null;"
+                + "return {http:location.origin,ws:(location.protocol==='https:'?'wss://':'ws://')+location.host};"
+                + "}"
+                // path-absolute、同源 https、同源 ws/wss；已带前缀或协议相对跳过
                 + "function need(u){"
                 + "if(typeof u!=='string'||!u)return false;"
-                + "var path=u;"
+                + "var path=u,loc=locParts(),base=null;"
                 + "if(u.charAt(0)!=='/'){"
-                + "if(typeof location==='undefined')return false;"
-                + "var o=location.origin;"
-                + "if(!o||u.indexOf(o)!==0)return false;"
-                + "path=u.slice(o.length);"
+                + "if(!loc)return false;"
+                + "if(u.indexOf(loc.http)===0)base=loc.http;"
+                + "else if(u.indexOf(loc.ws)===0)base=loc.ws;"
+                + "else return false;"
+                + "path=u.slice(base.length);"
                 + "if(!path||path.charAt(0)!=='/')return false;"
                 + "}"
                 + "if(path.length>1&&path.charAt(1)==='/')return false;"
@@ -229,15 +242,22 @@ public class ResponseRewriter {
                 + "function fix(u){"
                 + "if(!need(u))return u;"
                 + "if(u.charAt(0)==='/')return P+u;"
-                + "return location.origin+P+u.slice(location.origin.length);"
+                + "var loc=locParts();"
+                + "var base=u.indexOf(loc.http)===0?loc.http:loc.ws;"
+                + "return base+P+u.slice(base.length);"
                 + "}"
-                // fetch
+                + "function rewriteInput(input){"
+                + "var h=hrefOf(input);"
+                + "if(!h||!need(h))return input;"
+                + "var rewritten=fix(h);"
+                + "if(typeof Request==='function'&&input instanceof Request)return new Request(rewritten,input);"
+                + "return rewritten;"
+                + "}"
+                // fetch：DSH 传 URL 对象（只有 href，没有 url）
                 + "if(typeof fetch==='function'){"
                 + "var of=fetch;"
                 + "window.fetch=function(input,init){"
-                + "try{if(typeof input==='string'){input=fix(input);}"
-                + "else if(input&&typeof input.url==='string'&&need(input.url)){input=new Request(fix(input.url),input);}}"
-                + "catch(e){}"
+                + "try{input=rewriteInput(input);}catch(e){}"
                 + "return of.call(this,input,init);"
                 + "};"
                 + "}"
@@ -245,7 +265,7 @@ public class ResponseRewriter {
                 + "if(typeof XMLHttpRequest!=='undefined'){"
                 + "var oo=XMLHttpRequest.prototype.open;"
                 + "XMLHttpRequest.prototype.open=function(m,u){"
-                + "try{u=fix(u);}catch(e){}"
+                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
                 + "arguments[1]=u;"
                 + "return oo.apply(this,arguments);"
                 + "};"
@@ -291,14 +311,17 @@ public class ResponseRewriter {
                 // EventSource
                 + "if(typeof EventSource==='function'){"
                 + "var OE=EventSource;"
-                + "window.EventSource=function(u,c){return new OE(fix(u),c);};"
+                + "window.EventSource=function(u,c){"
+                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
+                + "return new OE(u,c);"
+                + "};"
                 + "window.EventSource.prototype=OE.prototype;"
                 + "}"
-                // WebSocket：补 / 开头的相对 ws URL（ws://host/path 不变）
+                // WebSocket：DSH 传 URL 对象，且把 https origin 改成 wss://host/api/...
                 + "if(typeof WebSocket==='function'){"
                 + "var OW=WebSocket;"
                 + "window.WebSocket=function(u,p){"
-                + "try{if(typeof u==='string'&&u.indexOf('ws://')!==0&&u.indexOf('wss://')!==0&&need(u))u=fix(u);}catch(e){}"
+                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
                 + "return p===undefined?new OW(u):new OW(u,p);"
                 + "};"
                 + "window.WebSocket.prototype=OW.prototype;"

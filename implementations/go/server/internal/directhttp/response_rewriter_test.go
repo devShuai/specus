@@ -33,6 +33,9 @@ func TestResponseRewriterRewritesHTMLPaths(t *testing.T) {
 		"window.WebSocket=function",
 		"function wrapAttr(",
 		"HTMLScriptElement",
+		"function hrefOf(",
+		"function rewriteInput(",
+		"loc.ws",
 		"location.origin",
 	} {
 		if !strings.Contains(text, expected) {

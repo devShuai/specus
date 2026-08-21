@@ -20,6 +20,9 @@ public sealed class ResponseRewriterTests
         Assert.Contains("window.WebSocket=function", text);
         Assert.Contains("function wrapAttr(", text);
         Assert.Contains("HTMLScriptElement", text);
+        Assert.Contains("function hrefOf(", text);
+        Assert.Contains("function rewriteInput(", text);
+        Assert.Contains("loc.ws", text);
         Assert.Contains("location.origin", text);
     }
 

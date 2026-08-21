@@ -26,6 +26,9 @@ class ResponseRewriterTests {
         assertTrue(text.contains("src=\"/http/Demo client/dsh/img/logo.png\""));
         assertTrue(text.contains("function wrapAttr("));
         assertTrue(text.contains("HTMLScriptElement"));
+        assertTrue(text.contains("function hrefOf("));
+        assertTrue(text.contains("function rewriteInput("));
+        assertTrue(text.contains("loc.ws"));
         assertTrue(text.contains("location.origin"));
         assertTrue(text.contains("wrapHistory('pushState')"));
         assertTrue(text.contains("window.EventSource=function"));
