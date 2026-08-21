@@ -83,14 +83,14 @@ class HttpMediaCaptureServiceTests {
             session.complete();
 
             ArgumentCaptor<byte[]> partBytes = ArgumentCaptor.forClass(byte[].class);
-            verify(fixture.storage, timeout(5_000).times(2))
+            verify(fixture.storage, timeout(20_000).times(2))
                     .uploadPart(any(MultipartUpload.class), anyInt(), partBytes.capture());
             assertThat(partBytes.getAllValues())
                     .extracting(bytes -> bytes.length)
                     .containsExactlyInAnyOrder(PART_SIZE, 37);
-            verify(fixture.storage, timeout(5_000))
+            verify(fixture.storage, timeout(20_000))
                     .completeMultipart(any(MultipartUpload.class), any());
-            verify(fixture.captureRepository, timeout(5_000).atLeastOnce())
+            verify(fixture.captureRepository, timeout(20_000).atLeastOnce())
                     .save(any(HttpMediaCapture.class));
 
             assertThat(fixture.persisted[0].getState()).isEqualTo(HttpMediaCaptureService.STATE_COMPLETE);

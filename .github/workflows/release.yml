@@ -462,7 +462,7 @@ jobs:
             --out "$target" "$source_apk"
           verify_output="$("$apksigner" verify --verbose --print-certs "$target")"
           printf '%s\n' "$verify_output"
-          actual_cert="$(printf '%s\n' "$verify_output" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
+          actual_cert="$(printf '%s\n' "$verify_output" | grep -i 'certificate SHA-256 digest:' | head -n 1 | sed 's/.*SHA-256 digest:[[:space:]]*//' | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
           expected_cert="$(printf '%s' "$SPECUS_ANDROID_CERT_SHA256" | tr '[:upper:]' '[:lower:]' | tr -d ':[:space:]')"
           [[ "$actual_cert" =~ ^[0-9a-f]{64}$ && "$actual_cert" = "$expected_cert" ]] || {
             echo "Android release certificate fingerprint does not match the protected value" >&2
