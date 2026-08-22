@@ -28,7 +28,8 @@ const (
 // disabled, which meant anything able to answer on the target address was accepted and the tunnel
 // carried the result to a remote user who could not tell. A self-signed target is still supported
 // through the upstreamTls section: a private CA, a certificate pin, or an explicit opt-out.
-func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory) *http.Client {
+func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory,
+	routeInsecureSkipVerify bool) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -41,7 +42,7 @@ func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory) *http.Client {
 		if err != nil {
 			host = address
 		}
-		tlsConfig, err := tlsFactory.forHost(host)
+		tlsConfig, err := tlsFactory.forHostWithRoutePolicy(host, routeInsecureSkipVerify)
 		if err != nil {
 			return nil, err
 		}
@@ -163,7 +164,12 @@ func (stream *httpRequestStream) forward() {
 	}
 	relativePath, _ := metadataStringOptional(stream.metadata, "relativePath")
 	rawQuery, _ := metadataStringOptional(stream.metadata, "rawQuery")
-	target, err := buildTarget(stream.client.routeTarget(route), relativePath, rawQuery)
+	routeConfig, found := stream.client.routeConfig(route)
+	if !found {
+		stream.fail(24, "未配置 HTTP route")
+		return
+	}
+	target, err := buildTarget(routeConfig.TargetBaseURL, relativePath, rawQuery)
 	if err != nil {
 		stream.fail(24, err.Error())
 		return
@@ -197,7 +203,8 @@ func (stream *httpRequestStream) forward() {
 	}
 	rewriteUpstreamAuthorityHeaders(request.Header, target)
 
-	upstream, err := stream.client.forwardingHTTPClient().Do(request)
+	upstream, err := stream.client.forwardingHTTPClient(
+		routeConfig.InsecureSkipVerify).Do(request)
 	if err != nil {
 		if stream.ctx.Err() == nil {
 			stream.fail(26, err.Error())

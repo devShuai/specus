@@ -46,7 +46,7 @@ class NatControlHotReloadTests {
                       "specusConfigList":[{"port":9000,"specusAddress":"127.0.0.1","specusPort":8080}],
                       "httpSpecusConfigList":[
                         {"route":"web","targetBaseUrl":"http://127.0.0.1:8080"},
-                        {"route":"api","targetBaseUrl":"https://api.example.com"}
+                        {"route":"api","targetBaseUrl":"https://api.example.com","insecureSkipVerify":true}
                       ]
                     }
                     """;
@@ -57,6 +57,8 @@ class NatControlHotReloadTests {
             assertEquals(2, snapshot.size());
             assertEquals("http://127.0.0.1:8080", snapshot.get("web"));
             assertEquals("https://api.example.com", snapshot.get("api"));
+            assertFalse(nat.isCurrentHttpRouteInsecureSkipVerify("web"));
+            assertTrue(nat.isCurrentHttpRouteInsecureSkipVerify("api"));
 
             // NatClientHandler 由 NAT_CONTROL 路径动态加入 pipeline，并发送 TCP REGISTER。
             NatMessagePacket register = readNatMessage(channel);

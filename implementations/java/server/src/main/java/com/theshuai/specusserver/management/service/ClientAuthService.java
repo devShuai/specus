@@ -495,6 +495,7 @@ public class ClientAuthService {
         ClientAuthLoginResponse.HttpRouteEndpoint endpoint = new ClientAuthLoginResponse.HttpRouteEndpoint();
         endpoint.setRoute(route.getRoute());
         endpoint.setTargetBaseUrl(route.getTargetBaseUrl());
+        endpoint.setInsecureSkipVerify(Boolean.TRUE.equals(route.getInsecureSkipVerify()));
         return endpoint;
     }
 

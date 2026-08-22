@@ -215,6 +215,18 @@ public sealed class SpecusClientConfigLoaderTests
     }
 
     [Fact]
+    public void NatControlSnapshotReadsPerRouteTlsPolicy()
+    {
+        var snapshot = JsonSerializer.Deserialize<SpecusConfigSnapshot>(
+            """{"specusConfigList":[],"httpSpecusConfigList":[{"route":"secure","targetBaseUrl":"https://localhost:8443","insecureSkipVerify":true}]}""",
+            SpecusClientConfigLoader.JsonOptions);
+
+        var route = Assert.Single(Assert.IsType<List<HttpSpecusConfigEntry>>(
+            snapshot!.HttpSpecusConfigList));
+        Assert.True(route.InsecureSkipVerify);
+    }
+
+    [Fact]
     public void RuntimeControlTlsSignalIsBackwardCompatible()
     {
         var secured = JsonSerializer.Deserialize<SpecusRuntimeState>(

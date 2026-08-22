@@ -113,6 +113,7 @@ public class HttpRouteService {
         row.setDetailCaptureEnabled(Boolean.TRUE.equals(request.detailCaptureEnabled()));
         row.setMediaCaptureEnabled(Boolean.TRUE.equals(request.mediaCaptureEnabled()));
         row.setPathRewriteEnabled(Boolean.TRUE.equals(request.pathRewriteEnabled()));
+        row.setInsecureSkipVerify(Boolean.TRUE.equals(request.insecureSkipVerify()));
         applyAuthentication(row, request, true);
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
@@ -146,7 +147,9 @@ public class HttpRouteService {
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
         boolean dataPlaneChanged = !Objects.equals(route, row.getRoute())
                 || !Objects.equals(targetBaseUrl, row.getTargetBaseUrl())
-                || (request.enabled() != null && request.enabled() != row.isEnabled());
+                || (request.enabled() != null && request.enabled() != row.isEnabled())
+                || (request.insecureSkipVerify() != null
+                && request.insecureSkipVerify() != Boolean.TRUE.equals(row.getInsecureSkipVerify()));
 
         if (!route.equals(row.getRoute())) {
             httpRouteMappingRepository.findByTenantIdAndClientIdAndRoute(tenant.tenantId(), row.getClientId(), route).ifPresent(existing -> {
@@ -169,6 +172,9 @@ public class HttpRouteService {
         }
         if (request.pathRewriteEnabled() != null) {
             row.setPathRewriteEnabled(request.pathRewriteEnabled());
+        }
+        if (request.insecureSkipVerify() != null) {
+            row.setInsecureSkipVerify(request.insecureSkipVerify());
         }
         applyAuthentication(row, request, false);
         row.setUpdatedAt(Instant.now().toString());
@@ -356,6 +362,7 @@ public class HttpRouteService {
                 Boolean.TRUE.equals(row.getDetailCaptureEnabled()),
                 Boolean.TRUE.equals(row.getMediaCaptureEnabled()),
                 Boolean.TRUE.equals(row.getPathRewriteEnabled()),
+                Boolean.TRUE.equals(row.getInsecureSkipVerify()),
                 Boolean.TRUE.equals(row.getAuthEnabled()),
                 StringUtils.hasText(row.getAuthUsername()) ? row.getAuthUsername() : "",
                 StringUtils.hasText(row.getAuthPasswordHash()),
@@ -371,12 +378,13 @@ public class HttpRouteService {
             Boolean detailCaptureEnabled,
             Boolean mediaCaptureEnabled,
             Boolean pathRewriteEnabled,
+            Boolean insecureSkipVerify,
             Boolean authEnabled,
             String authUsername,
             String authPassword
     ) {
         public RouteMutation(String route, String targetBaseUrl, Boolean enabled) {
-            this(route, targetBaseUrl, enabled, null, null, null, null, null, null);
+            this(route, targetBaseUrl, enabled, null, null, null, null, null, null, null);
         }
 
         public RouteMutation(String route,
@@ -386,7 +394,20 @@ public class HttpRouteService {
                              Boolean mediaCaptureEnabled,
                              Boolean pathRewriteEnabled) {
             this(route, targetBaseUrl, enabled, detailCaptureEnabled, mediaCaptureEnabled,
-                    pathRewriteEnabled, null, null, null);
+                    pathRewriteEnabled, null, null, null, null);
+        }
+
+        public RouteMutation(String route,
+                             String targetBaseUrl,
+                             Boolean enabled,
+                             Boolean detailCaptureEnabled,
+                             Boolean mediaCaptureEnabled,
+                             Boolean pathRewriteEnabled,
+                             Boolean authEnabled,
+                             String authUsername,
+                             String authPassword) {
+            this(route, targetBaseUrl, enabled, detailCaptureEnabled, mediaCaptureEnabled,
+                    pathRewriteEnabled, null, authEnabled, authUsername, authPassword);
         }
     }
 }

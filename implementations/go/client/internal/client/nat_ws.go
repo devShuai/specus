@@ -75,15 +75,15 @@ func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint3
 		client.sendNatReset(connection, streamID, 2, "websocket route missing")
 		return
 	}
-	targetBaseURL := client.routeTarget(route)
-	if strings.TrimSpace(targetBaseURL) == "" {
+	routeConfig, found := client.routeConfig(route)
+	if !found || strings.TrimSpace(routeConfig.TargetBaseURL) == "" {
 		client.logger.Printf("[ws-specus][client] CONNECTED for unknown route %q", route)
 		client.sendNatReset(connection, streamID, 3, "unknown websocket route")
 		return
 	}
 	relativePath, _ := metadataStringOptional(metadata, "relativePath")
 	rawQuery, _ := metadataStringOptional(metadata, "rawQuery")
-	target, err := buildWebSocketTarget(targetBaseURL, relativePath, rawQuery)
+	target, err := buildWebSocketTarget(routeConfig.TargetBaseURL, relativePath, rawQuery)
 	if err != nil {
 		client.logger.Printf("[ws-specus][client] CONNECTED route=%q build-target-failed: %v", route, err)
 		client.sendNatReset(connection, streamID, 4, "invalid websocket target")
@@ -91,7 +91,7 @@ func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint3
 	}
 	localConnection, err := dialLocalWebSocket(target,
 		rewriteHeaderLines(webSocketHandshakeHeaders(metadata), target),
-		client.upstreamTLSFactory())
+		client.upstreamTLSFactory(), routeConfig.InsecureSkipVerify)
 	if err != nil {
 		client.logger.Printf("[ws-specus][client] connect local ws failed channelId=%q route=%q target=%s: %v",
 			channelID, route, targetWithoutRawQuery(target), err)
@@ -183,7 +183,7 @@ func webSocketHandshakeHeaders(metadata map[string]any) []string {
 }
 
 func dialLocalWebSocket(target *url.URL, headers []string,
-	upstreamTLS *upstreamTLSFactory) (*webSocketLocalConnection, error) {
+	upstreamTLS *upstreamTLSFactory, routeInsecureSkipVerify bool) (*webSocketLocalConnection, error) {
 	address := target.Host
 	if _, _, err := net.SplitHostPort(address); err != nil {
 		switch strings.ToLower(target.Scheme) {
@@ -200,7 +200,8 @@ func dialLocalWebSocket(target *url.URL, headers []string,
 	if strings.EqualFold(target.Scheme, "wss") {
 		// Verified like any other upstream connection; see upstream_tls.go for why this is not
 		// simply skipped and how a self-signed target is configured.
-		tlsConfig, configErr := upstreamTLS.forHost(target.Hostname())
+		tlsConfig, configErr := upstreamTLS.forHostWithRoutePolicy(
+			target.Hostname(), routeInsecureSkipVerify)
 		if configErr != nil {
 			return nil, configErr
 		}

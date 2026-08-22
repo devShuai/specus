@@ -91,6 +91,11 @@
           "format": "uri",
           "pattern": "^https?://",
           "description": "客户端侧目标基础地址。"
+        },
+        "insecureSkipVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否跳过该目标的 HTTPS/WSS 证书链与主机名校验；缺省为 false。"
         }
       }
     }

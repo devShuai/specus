@@ -358,4 +358,7 @@ public sealed class HttpSpecusConfigEntry
 
     [JsonPropertyName("targetBaseUrl")]
     public string TargetBaseUrl { get; set; } = "";
+
+    [JsonPropertyName("insecureSkipVerify")]
+    public bool InsecureSkipVerify { get; set; }
 }

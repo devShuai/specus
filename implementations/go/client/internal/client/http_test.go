@@ -51,6 +51,30 @@ func TestBuildTargetRejectsEscapesAndUnsupportedSchemes(t *testing.T) {
 	}
 }
 
+func TestHTTPRouteSnapshotPreservesAndUpdatesPerRouteTLSPolicy(t *testing.T) {
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{
+		{
+			Route:              " secure ",
+			TargetBaseURL:      "https://localhost:8443",
+			InsecureSkipVerify: true,
+		},
+	})
+
+	route, found := specusClient.routeConfig("secure")
+	if !found || !route.InsecureSkipVerify {
+		t.Fatalf("route TLS policy was not preserved: %#v, found=%v", route, found)
+	}
+
+	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{
+		{Route: "secure", TargetBaseURL: "https://localhost:8443"},
+	})
+	route, found = specusClient.routeConfig("secure")
+	if !found || route.InsecureSkipVerify {
+		t.Fatalf("route TLS policy was not updated: %#v, found=%v", route, found)
+	}
+}
+
 func TestBoundedRange(t *testing.T) {
 	cases := map[string]string{
 		"bytes=0-999999999": "bytes=0-8388607",

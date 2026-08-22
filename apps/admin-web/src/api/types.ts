@@ -125,6 +125,7 @@ export interface HttpRoute {
   detailCaptureEnabled: boolean;
   mediaCaptureEnabled: boolean;
   pathRewriteEnabled: boolean;
+  insecureSkipVerify: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -807,6 +808,7 @@ export interface HttpRouteMutation {
   detailCaptureEnabled?: boolean;
   mediaCaptureEnabled?: boolean;
   pathRewriteEnabled?: boolean;
+  insecureSkipVerify?: boolean;
 }
 
 // 客户端版本编目 —— GitHub Release 外链为默认；服务端托管包用于内网/离线分发。

@@ -291,6 +291,7 @@ public class SpecusClientApplication {
             HttpSpecusConfig config = new HttpSpecusConfig();
             config.setRoute(endpoint.getRoute());
             config.setTargetBaseUrl(endpoint.getTargetBaseUrl());
+            config.setInsecureSkipVerify(endpoint.isInsecureSkipVerify());
             configs.add(config);
         }
         return configs;

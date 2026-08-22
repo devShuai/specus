@@ -48,13 +48,15 @@ type Client struct {
 	logger *log.Logger
 
 	// Trust policy for connections to the forwarding target, built once from the configuration.
-	upstreamTLSOnce sync.Once
-	upstreamTLS     *upstreamTLSFactory
-	forwardHTTPOnce sync.Once
-	forwardHTTP     *http.Client
+	upstreamTLSOnce         sync.Once
+	upstreamTLS             *upstreamTLSFactory
+	forwardHTTPOnce         sync.Once
+	forwardHTTP             *http.Client
+	insecureForwardHTTPOnce sync.Once
+	insecureForwardHTTP     *http.Client
 
 	routesMu sync.RWMutex
-	routes   map[string]string
+	routes   map[string]HTTPSpecusConfig
 
 	controlWriteMu        sync.Mutex
 	dataWriteMu           sync.Mutex
@@ -154,7 +156,7 @@ func New(config Config, logger *log.Logger) *Client {
 	return &Client{
 		config:                config,
 		logger:                logger,
-		routes:                make(map[string]string),
+		routes:                make(map[string]HTTPSpecusConfig),
 		specusMappings:        make(map[int]SpecusConfig),
 		registered:            make(map[int]struct{}),
 		locals:                make(map[uint32]net.Conn),

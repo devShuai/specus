@@ -90,6 +90,17 @@ public class DirectHttpForwarderTests
         Assert.Null(handler.SslOptions.RemoteCertificateValidationCallback);
     }
 
+    [Fact]
+    public void BuildDefaultHandler_CanSkipVerificationForOneRoute()
+    {
+        using var handler = DirectHttpForwarder.BuildDefaultHandler(
+            routeInsecureSkipVerify: true);
+
+        Assert.NotNull(handler.SslOptions.RemoteCertificateValidationCallback);
+        Assert.True(handler.SslOptions.RemoteCertificateValidationCallback!(
+            this, null, null, SslPolicyErrors.RemoteCertificateChainErrors));
+    }
+
     [Theory]
     [InlineData("bytes=0-", "bytes=0-8388607")]
     [InlineData("bytes=10-20", "bytes=10-20")]
@@ -122,6 +133,43 @@ public class DirectHttpForwarderTests
         handler.ApplyRoutes(Array.Empty<HttpSpecusConfigEntry>());
 
         Assert.Empty(handler.SnapshotRoutes());
+    }
+
+    [Fact]
+    public async Task ApplyRoutes_PreservesPerRouteTlsPolicy()
+    {
+        await using var stream = new MemoryStream();
+        await using var writer = new FrameWriter(stream);
+        using var http = new HttpClient();
+        using var forwarder = new DirectHttpForwarder(http);
+        var handler = new DirectHttpHandler(
+            new[]
+            {
+                new HttpSpecusConfigEntry
+                {
+                    Route = "secure",
+                    TargetBaseUrl = "https://localhost:8443",
+                    InsecureSkipVerify = true,
+                },
+            },
+            writer,
+            forwarder,
+            NullLogger<DirectHttpHandler>.Instance);
+
+        Assert.True(handler.TryResolveRouteConfig("secure", out var route));
+        Assert.True(route.InsecureSkipVerify);
+
+        handler.ApplyRoutes(new[]
+        {
+            new HttpSpecusConfigEntry
+            {
+                Route = "secure",
+                TargetBaseUrl = "https://localhost:8443",
+            },
+        });
+
+        Assert.True(handler.TryResolveRouteConfig("secure", out route));
+        Assert.False(route.InsecureSkipVerify);
     }
 
 }

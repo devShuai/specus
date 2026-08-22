@@ -35,6 +35,7 @@ ANY /http/{clientName}/{route}/**
 | `targetBaseUrl` | 客户端实际访问的绝对 `http/https` 基础地址；WebSocket Upgrade 时客户端按 scheme 映射为 `ws/wss` |
 | `enabled` | 是否允许公网访问 |
 | `pathRewriteEnabled` | 是否对可安全缓冲的小型 HTML/CSS 响应执行路径改写 |
+| `insecureSkipVerify` | 是否跳过该 route 的 HTTPS/WSS 证书链与主机名校验；默认 `false` |
 | `authEnabled` | 是否要求公网调用方通过 HTTP Basic 认证；默认 `false` |
 | `authUsername` | Basic 用户名，trim 后最多 120 字符且不得含 `:`、CR 或 LF |
 
@@ -48,6 +49,10 @@ ANY /http/{clientName}/{route}/**
 
 目标 URI 由 `targetBaseUrl + relativePath + ?rawQuery` 构造。base URL 不能包含 query/fragment，相对路径不能
 含控制字符。HTTP 客户端不自动跟随 redirect，响应原样返回给公网调用方。
+
+`insecureSkipVerify` 会随登录快照和 `NAT_CONTROL.httpSpecusConfigList` 热更新到客户端。字段缺省或为
+`false` 时，Java 客户端使用已配置的 upstream TLS 策略并校验证书；为 `true` 时接受任意证书并关闭主机名
+校验，只应用于可信内网中的自签名目标。
 
 ## 3. 请求流
 

@@ -79,16 +79,51 @@ public final class UpstreamTlsPolicy {
     }
 
     /**
+     * Builds the configured context unless a route explicitly opts out of verification.
+     * The route override is deliberately one-way: it can relax the global policy for a single
+     * self-signed target, while the existing global insecure setting still applies to all routes.
+     */
+    public SslContext buildContext(boolean routeInsecureSkipVerify) {
+        if (!routeInsecureSkipVerify) {
+            return buildContext();
+        }
+        try {
+            return SslContextBuilder.forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (Exception error) {
+            throw new IllegalStateException("failed to build insecure upstream TLS context", error);
+        }
+    }
+
+    /**
      * Turns on hostname verification. A trust manager checks that the certificate is trusted, not
      * that it belongs to the host being dialled, so without this a valid certificate for any host
      * would be accepted for every host. Pinning identifies the peer directly and does not need it.
      */
     public void applyHostnameVerification(SSLEngine engine) {
         if (!verifies() || pins()) {
+            disableHostnameVerification(engine);
             return;
         }
         SSLParameters parameters = engine.getSSLParameters();
         parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        engine.setSSLParameters(parameters);
+    }
+
+    public void applyHostnameVerification(SSLEngine engine, boolean routeInsecureSkipVerify) {
+        if (routeInsecureSkipVerify) {
+            disableHostnameVerification(engine);
+            return;
+        }
+        applyHostnameVerification(engine);
+    }
+
+    private static void disableHostnameVerification(SSLEngine engine) {
+        SSLParameters parameters = engine.getSSLParameters();
+        // Netty's OpenSSL engine keeps its default when given null; an empty algorithm is the
+        // portable way to turn endpoint identification off (also used by NettyClient).
+        parameters.setEndpointIdentificationAlgorithm("");
         engine.setSSLParameters(parameters);
     }
 

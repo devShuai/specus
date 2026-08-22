@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.handler;
 
 import com.theshuai.specusclient.bean.SpecusBean;
+import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
@@ -38,7 +39,8 @@ class HttpStreamForwarderTrailersTests {
                         "trailerNames", List.of("X-Request-Trailer"),
                         "headers", List.of("Content-Type:text/plain"));
                 HttpStreamForwarder forwarder = new HttpStreamForwarder(owner, 7, metadata,
-                        Map.of("api", "http://127.0.0.1:" + upstream.getLocalPort()), group);
+                        Map.of("api", routeConfig("api",
+                                "http://127.0.0.1:" + upstream.getLocalPort())), group);
 
                 assertTrue(forwarder.onData("ping".getBytes(StandardCharsets.US_ASCII)));
                 assertTrue(forwarder.onRequestFin(Map.of("trailers", List.of(
@@ -74,7 +76,8 @@ class HttpStreamForwarderTrailersTests {
                         "relativePath", "/fixed",
                         "contentLength", 4L);
                 HttpStreamForwarder forwarder = new HttpStreamForwarder(owner, 7, metadata,
-                        Map.of("api", "http://127.0.0.1:" + upstream.getLocalPort()), group);
+                        Map.of("api", routeConfig("api",
+                                "http://127.0.0.1:" + upstream.getLocalPort())), group);
 
                 assertTrue(forwarder.onData("ping".getBytes(StandardCharsets.US_ASCII)));
                 assertTrue(forwarder.onRequestFin(Map.of()));
@@ -90,6 +93,13 @@ class HttpStreamForwarderTrailersTests {
                         .awaitUninterruptibly(10, TimeUnit.SECONDS);
             }
         }
+    }
+
+    private static HttpSpecusConfig routeConfig(String route, String targetBaseUrl) {
+        HttpSpecusConfig config = new HttpSpecusConfig();
+        config.setRoute(route);
+        config.setTargetBaseUrl(targetBaseUrl);
+        return config;
     }
 
     private static String serveOnce(ServerSocket server) {

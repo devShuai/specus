@@ -50,6 +50,20 @@ public sealed class UpstreamTlsPolicyTests : IDisposable
     }
 
     [Fact]
+    public void RouteOptOutDoesNotWeakenOtherRoutes()
+    {
+        var policy = new UpstreamTlsPolicy(false, null, []);
+
+        var insecure = policy.CreateOptions("self-signed.test", routeInsecureSkipVerify: true);
+        Assert.NotNull(insecure.RemoteCertificateValidationCallback);
+        Assert.True(insecure.RemoteCertificateValidationCallback!(
+            this, null, null, SslPolicyErrors.RemoteCertificateChainErrors));
+
+        Assert.Null(policy.CreateOptions(
+            "verified.test", routeInsecureSkipVerify: false).RemoteCertificateValidationCallback);
+    }
+
+    [Fact]
     public void PinnedPolicyAcceptsOnlyTheMatchingCertificate()
     {
         using var certificate = SelfSigned("pinned.test");

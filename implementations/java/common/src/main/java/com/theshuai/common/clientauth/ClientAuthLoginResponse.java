@@ -43,6 +43,7 @@ public class ClientAuthLoginResponse {
     public static class HttpRouteEndpoint {
         private String route;
         private String targetBaseUrl;
+        private boolean insecureSkipVerify;
     }
 
     @Data

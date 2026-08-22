@@ -88,6 +88,13 @@ public class HttpRouteMapping {
     private Boolean pathRewriteEnabled = false;
 
     /**
+     * Whether the tunnel client may accept an untrusted certificate from this route's HTTPS/WSS
+     * target. Nullable for upgrades of existing databases; {@code null} is treated as false.
+     */
+    @Column(name = "insecure_skip_verify")
+    private Boolean insecureSkipVerify = false;
+
+    /**
      * Whether the public HTTP/WebSocket ingress requires route-scoped HTTP Basic authentication.
      * Kept nullable for safe upgrades of existing databases; {@code null} is treated as disabled.
      */

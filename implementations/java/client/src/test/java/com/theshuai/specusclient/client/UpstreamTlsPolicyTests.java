@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.client;
 
 import com.theshuai.specusclient.bean.UpstreamTlsConfig;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -41,6 +42,19 @@ class UpstreamTlsPolicyTests {
 
         assertFalse(policy.verifies());
         assertNotNull(policy.buildContext());
+    }
+
+    @Test
+    void routeOptOutBuildsPermissiveContextAndSkipsHostnameVerification() {
+        UpstreamTlsPolicy policy = new UpstreamTlsPolicy(new UpstreamTlsConfig());
+        var engine = policy.buildContext(true).newEngine(
+                UnpooledByteBufAllocator.DEFAULT, "self-signed.local", 443);
+
+        policy.applyHostnameVerification(engine, true);
+
+        assertNotNull(engine);
+        assertTrue(engine.getSSLParameters().getEndpointIdentificationAlgorithm() == null
+                || engine.getSSLParameters().getEndpointIdentificationAlgorithm().isEmpty());
     }
 
     @Test

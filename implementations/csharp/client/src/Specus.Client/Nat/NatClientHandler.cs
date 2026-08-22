@@ -388,8 +388,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
         {
             return RejectNewHttpStreamAsync(packet.StreamId, 20, "invalid HTTP OPEN");
         }
-        if (!_directHttp.TryResolveRoute(route, out var targetBaseUrl)
-            || string.IsNullOrWhiteSpace(targetBaseUrl))
+        if (!_directHttp.TryResolveRouteConfig(route, out var routeConfig)
+            || string.IsNullOrWhiteSpace(routeConfig.TargetBaseUrl))
         {
             _logger.LogWarning(
                 "HTTP stream {StreamId} requested unknown route {Route}; available routes=[{Routes}]",
@@ -399,7 +399,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
             return RejectNewHttpStreamAsync(packet.StreamId, 22, "unknown HTTP route");
         }
         var channel = new HttpStreamChannel(packet.StreamId, packet.MetaData, _directHttp,
-            targetBaseUrl, _writer, _logger, _cancellationToken,
+            routeConfig.TargetBaseUrl, _writer, _logger, _cancellationToken,
             closed =>
             {
                 if (_httpChannels.TryRemove(
@@ -407,7 +407,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 {
                     MarkStreamClosed(closed.StreamId);
                 }
-            });
+            }, routeConfig.InsecureSkipVerify);
         if (!_httpChannels.TryAdd(packet.StreamId, channel))
         {
             channel.Abort("duplicate HTTP stream");
@@ -432,8 +432,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
             return;
         }
 
-        var routes = _directHttp.SnapshotRoutes();
-        if (!routes.TryGetValue(route, out var targetBaseUrl) || string.IsNullOrWhiteSpace(targetBaseUrl))
+        if (!_directHttp.TryResolveRouteConfig(route, out var routeConfig)
+            || string.IsNullOrWhiteSpace(routeConfig.TargetBaseUrl))
         {
             _logger.LogWarning("[ws-specus][client] CONNECTED for unknown route {route}", route);
             if (FailPendingStream(packet.StreamId, pending))
@@ -445,7 +445,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
 
         var relativePath = AsString(packet.MetaData, "relativePath");
         var rawQuery = AsString(packet.MetaData, "rawQuery");
-        if (!TryBuildWebSocketTarget(targetBaseUrl, relativePath, rawQuery, out var target, out var error))
+        if (!TryBuildWebSocketTarget(
+                routeConfig.TargetBaseUrl, relativePath, rawQuery, out var target, out var error))
         {
             _logger.LogWarning("[ws-specus][client] CONNECTED route={route} build-target-failed error={error}", route, error);
             if (FailPendingStream(packet.StreamId, pending))
@@ -460,7 +461,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
         {
             socket = await ConnectLocalWebSocketAsync(target,
                 DirectHttpForwarder.RewriteHandshakeAuthority(
-                    WebSocketHandshakeHeaders(packet.MetaData), target), pending.Token).ConfigureAwait(false);
+                    WebSocketHandshakeHeaders(packet.MetaData), target),
+                routeConfig.InsecureSkipVerify, pending.Token).ConfigureAwait(false);
             var channel = new WebSocketSpecusChannel(
                 packet.StreamId,
                 channelId,
@@ -1072,8 +1074,15 @@ internal sealed class NatClientHandler : IAsyncDisposable
     }
 
     internal static Task<RawWebSocketConnection> ConnectLocalWebSocketAsync(Uri target,
-        IReadOnlyList<KeyValuePair<string, string>> headers, CancellationToken cancellationToken) =>
-        RawWebSocketConnection.ConnectAsync(target, headers, cancellationToken);
+        IReadOnlyList<KeyValuePair<string, string>> headers,
+        CancellationToken cancellationToken) =>
+        ConnectLocalWebSocketAsync(target, headers, insecureSkipVerify: false, cancellationToken);
+
+    internal static Task<RawWebSocketConnection> ConnectLocalWebSocketAsync(Uri target,
+        IReadOnlyList<KeyValuePair<string, string>> headers, bool insecureSkipVerify,
+        CancellationToken cancellationToken) =>
+        RawWebSocketConnection.ConnectAsync(
+            target, headers, cancellationToken, insecureSkipVerify);
 
     internal static List<KeyValuePair<string, string>> WebSocketHandshakeHeaders(Dictionary<string, object?>? meta)
     {

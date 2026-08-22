@@ -93,13 +93,21 @@ func (f *upstreamTLSFactory) load() {
 
 // forHost returns the TLS configuration to use when dialling serverName.
 func (f *upstreamTLSFactory) forHost(serverName string) (*tls.Config, error) {
+	return f.forHostWithRoutePolicy(serverName, false)
+}
+
+// forHostWithRoutePolicy applies the operator's global policy, with an optional per-route
+// opt-out received from the server. A route can relax verification, but cannot make a globally
+// insecure client verify only that route.
+func (f *upstreamTLSFactory) forHostWithRoutePolicy(serverName string,
+	routeInsecureSkipVerify bool) (*tls.Config, error) {
 	f.load()
 	if f.loadErr != nil {
 		return nil, f.loadErr
 	}
 
 	config := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
-	if f.insecure {
+	if f.insecure || routeInsecureSkipVerify {
 		config.InsecureSkipVerify = true
 		return config, nil
 	}
@@ -148,10 +156,18 @@ func (c *Client) upstreamTLSFactory() *upstreamTLSFactory {
 }
 
 // forwardingHTTPClient returns the shared HTTP client used to reach forwarding targets.
-func (c *Client) forwardingHTTPClient() *http.Client {
+func (c *Client) forwardingHTTPClient(routeInsecureSkipVerify bool) *http.Client {
+	if routeInsecureSkipVerify {
+		c.insecureForwardHTTPOnce.Do(func() {
+			if c.insecureForwardHTTP == nil {
+				c.insecureForwardHTTP = newForwardingHTTPClient(c.upstreamTLSFactory(), true)
+			}
+		})
+		return c.insecureForwardHTTP
+	}
 	c.forwardHTTPOnce.Do(func() {
 		if c.forwardHTTP == nil {
-			c.forwardHTTP = newForwardingHTTPClient(c.upstreamTLSFactory())
+			c.forwardHTTP = newForwardingHTTPClient(c.upstreamTLSFactory(), false)
 		}
 	})
 	return c.forwardHTTP

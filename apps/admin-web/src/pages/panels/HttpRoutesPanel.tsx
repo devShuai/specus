@@ -56,6 +56,7 @@ export function HttpRoutesPanel() {
   const [createClientId, setCreateClientId] = useState("");
   const [route, setRoute] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
+  const [verifyTlsCertificate, setVerifyTlsCertificate] = useState(true);
   const [authEnabled, setAuthEnabled] = useState(false);
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -111,10 +112,12 @@ export function HttpRoutesPanel() {
         detailCaptureEnabled: false,
         mediaCaptureEnabled: false,
         pathRewriteEnabled: false,
+        insecureSkipVerify: !verifyTlsCertificate,
         ...buildHttpRouteAuthMutation(authDraft),
       });
       setRoute("");
       setTargetBaseUrl("");
+      setVerifyTlsCertificate(true);
       setAuthEnabled(false);
       setAuthUsername("");
       setAuthPassword("");
@@ -215,6 +218,13 @@ export function HttpRoutesPanel() {
         </Select>
         <Input className="w-full sm:w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
         <Input className="w-full sm:w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
+        <Switch
+          className="h-14"
+          isSelected={verifyTlsCertificate}
+          onValueChange={setVerifyTlsCertificate}
+        >
+          验证 HTTPS 证书
+        </Switch>
         <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建路由
         </Button>
@@ -369,6 +379,11 @@ export function HttpRoutesPanel() {
                       媒体采集
                     </Switch>
                     <HttpRouteAuthChip enabled={Boolean(item.authEnabled)} />
+                    {item.targetBaseUrl?.toLowerCase().startsWith("https://") ? (
+                      <Chip color={item.insecureSkipVerify ? "warning" : "success"} size="sm" variant="flat">
+                        {item.insecureSkipVerify ? "跳过证书校验" : "证书校验"}
+                      </Chip>
+                    ) : null}
                   </>
                 }
                 fields={[
@@ -461,9 +476,21 @@ export function HttpRoutesPanel() {
                 </code>
               </TableCell>
               <TableCell>
-                <code className="block truncate" title={item.targetBaseUrl || "-"}>
-                  {item.targetBaseUrl || "-"}
-                </code>
+                <div className="flex min-w-0 flex-col gap-1">
+                  <code className="block truncate" title={item.targetBaseUrl || "-"}>
+                    {item.targetBaseUrl || "-"}
+                  </code>
+                  {item.targetBaseUrl?.toLowerCase().startsWith("https://") ? (
+                    <Chip
+                      className="w-fit"
+                      color={item.insecureSkipVerify ? "warning" : "success"}
+                      size="sm"
+                      variant="flat"
+                    >
+                      {item.insecureSkipVerify ? "跳过证书校验" : "证书校验"}
+                    </Chip>
+                  ) : null}
+                </div>
               </TableCell>
               <TableCell>
                 <HttpRouteAccessLink route={item} />
@@ -688,6 +715,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
   const [mediaCaptureEnabled, setMediaCaptureEnabled] = useState(false);
   const [pathRewriteEnabled, setPathRewriteEnabled] = useState(false);
+  const [verifyTlsCertificate, setVerifyTlsCertificate] = useState(true);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -703,6 +731,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
       setDetailCaptureEnabled(Boolean(route.detailCaptureEnabled));
       setMediaCaptureEnabled(Boolean(route.mediaCaptureEnabled));
       setPathRewriteEnabled(Boolean(route.pathRewriteEnabled));
+      setVerifyTlsCertificate(!Boolean(route.insecureSkipVerify));
     }
   }, [route]);
 
@@ -733,6 +762,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         detailCaptureEnabled,
         mediaCaptureEnabled,
         pathRewriteEnabled,
+        insecureSkipVerify: !verifyTlsCertificate,
         ...buildHttpRouteAuthMutation(authDraft),
       });
       notify("HTTP 路由已更新");
@@ -814,6 +844,14 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               <Switch isSelected={pathRewriteEnabled} onValueChange={setPathRewriteEnabled}>
                 路径改写
               </Switch>
+              <Switch isSelected={verifyTlsCertificate} onValueChange={setVerifyTlsCertificate}>
+                验证 HTTPS/WSS 证书
+              </Switch>
+              {!verifyTlsCertificate ? (
+                <p className="text-tiny text-warning">
+                  已关闭证书和主机名校验，仅应对可信内网中的自签名服务使用。
+                </p>
+              ) : null}
             </ModalBody>
             <ModalFooter>
               <Button variant="flat" onPress={onClose}>

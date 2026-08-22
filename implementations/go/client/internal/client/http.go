@@ -17,11 +17,13 @@ var skippedHTTPHeaders = map[string]struct{}{
 	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
 }
 
-func buildHTTPRouteMap(configs []HTTPSpecusConfig) map[string]string {
-	routes := make(map[string]string, len(configs))
+func buildHTTPRouteMap(configs []HTTPSpecusConfig) map[string]HTTPSpecusConfig {
+	routes := make(map[string]HTTPSpecusConfig, len(configs))
 	for _, config := range configs {
-		if strings.TrimSpace(config.Route) != "" {
-			routes[config.Route] = config.TargetBaseURL
+		route := strings.TrimSpace(config.Route)
+		if route != "" {
+			config.Route = route
+			routes[route] = config
 		}
 	}
 	return routes
@@ -36,10 +38,11 @@ func (client *Client) syncHTTPSpecusConfigs(configs []HTTPSpecusConfig) {
 	client.logger.Printf("[http-stream] routes updated: %d -> %d entries", previous, len(next))
 }
 
-func (client *Client) routeTarget(route string) string {
+func (client *Client) routeConfig(route string) (HTTPSpecusConfig, bool) {
 	client.routesMu.RLock()
 	defer client.routesMu.RUnlock()
-	return client.routes[route]
+	config, ok := client.routes[route]
+	return config, ok
 }
 
 func buildTarget(targetBaseURL, relativePath, rawQuery string) (*url.URL, error) {

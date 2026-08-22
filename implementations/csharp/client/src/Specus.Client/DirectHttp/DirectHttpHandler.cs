@@ -9,7 +9,7 @@ namespace Specus.Client.DirectHttp;
 /// </summary>
 internal sealed class DirectHttpHandler
 {
-    private volatile IReadOnlyDictionary<string, string> _routes;
+    private volatile IReadOnlyDictionary<string, HttpSpecusConfigEntry> _routes;
     private readonly ILogger _logger;
 
     public DirectHttpHandler(
@@ -27,10 +27,23 @@ internal sealed class DirectHttpHandler
 
     public DirectHttpForwarder Forwarder { get; }
 
-    public IReadOnlyDictionary<string, string> SnapshotRoutes() => _routes;
+    public IReadOnlyDictionary<string, string> SnapshotRoutes() =>
+        _routes.ToDictionary(static pair => pair.Key, static pair => pair.Value.TargetBaseUrl,
+            StringComparer.Ordinal);
 
-    public bool TryResolveRoute(string route, out string targetBaseUrl) =>
-        _routes.TryGetValue(route, out targetBaseUrl!);
+    public bool TryResolveRoute(string route, out string targetBaseUrl)
+    {
+        if (TryResolveRouteConfig(route, out var config))
+        {
+            targetBaseUrl = config.TargetBaseUrl;
+            return true;
+        }
+        targetBaseUrl = string.Empty;
+        return false;
+    }
+
+    public bool TryResolveRouteConfig(string route, out HttpSpecusConfigEntry config) =>
+        _routes.TryGetValue(route, out config!);
 
     public string DescribeRoutes() =>
         string.Join(", ", _routes.Keys.Order(StringComparer.Ordinal));
@@ -50,25 +63,33 @@ internal sealed class DirectHttpHandler
         LogSnapshot("applied", routes);
     }
 
-    private static IReadOnlyDictionary<string, string> BuildMap(IEnumerable<HttpSpecusConfigEntry>? source)
+    private static IReadOnlyDictionary<string, HttpSpecusConfigEntry> BuildMap(
+        IEnumerable<HttpSpecusConfigEntry>? source)
     {
         if (source is null)
         {
-            return new Dictionary<string, string>(StringComparer.Ordinal);
+            return new Dictionary<string, HttpSpecusConfigEntry>(StringComparer.Ordinal);
         }
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var map = new Dictionary<string, HttpSpecusConfigEntry>(StringComparer.Ordinal);
         foreach (var entry in source)
         {
             if (string.IsNullOrWhiteSpace(entry.Route))
             {
                 continue;
             }
-            map[entry.Route.Trim()] = entry.TargetBaseUrl;
+            var route = entry.Route.Trim();
+            map[route] = new HttpSpecusConfigEntry
+            {
+                Route = route,
+                TargetBaseUrl = entry.TargetBaseUrl,
+                InsecureSkipVerify = entry.InsecureSkipVerify,
+            };
         }
         return map;
     }
 
-    private void LogSnapshot(string action, IReadOnlyDictionary<string, string> routes)
+    private void LogSnapshot(
+        string action, IReadOnlyDictionary<string, HttpSpecusConfigEntry> routes)
     {
         _logger.LogInformation(
             "HTTP route snapshot {Action}: count={Count}, routes=[{Routes}]",

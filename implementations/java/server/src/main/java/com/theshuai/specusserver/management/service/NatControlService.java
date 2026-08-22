@@ -326,6 +326,7 @@ public class NatControlService {
                 Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("route", route.getRoute());
                 entry.put("targetBaseUrl", route.getTargetBaseUrl());
+                entry.put("insecureSkipVerify", Boolean.TRUE.equals(route.getInsecureSkipVerify()));
                 httpSpecusConfigList.add(entry);
             }
             specusBean.put("httpSpecusConfigList", httpSpecusConfigList);

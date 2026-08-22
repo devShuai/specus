@@ -8,7 +8,7 @@ namespace Specus.Client.DirectHttp;
 /// <summary>
 /// Shared HTTP stream transport and route-containment/header utilities.
 /// </summary>
-public sealed class DirectHttpForwarder
+public sealed class DirectHttpForwarder : IDisposable
 {
     public const int MaxRequestBodySize = 16 * 1024 * 1024;
     public const int MaxResponseBodySize = 64 * 1024 * 1024;
@@ -25,19 +25,28 @@ public sealed class DirectHttpForwarder
         };
 
     private readonly HttpClient _httpClient;
+    private readonly Lazy<HttpClient> _routeInsecureHttpClient;
+    private readonly bool _ownsRouteInsecureHttpClient;
 
-    public DirectHttpForwarder(HttpClient httpClient)
+    public DirectHttpForwarder(HttpClient httpClient, HttpClient? routeInsecureHttpClient = null)
     {
         _httpClient = httpClient;
+        _ownsRouteInsecureHttpClient = routeInsecureHttpClient is null;
+        _routeInsecureHttpClient = routeInsecureHttpClient is null
+            ? new Lazy<HttpClient>(() => BuildDefaultClient(routeInsecureSkipVerify: true))
+            : new Lazy<HttpClient>(() => routeInsecureHttpClient);
     }
 
     /// <summary>Builds a default <see cref="HttpClient"/> matching the Java client's timeouts.</summary>
-    public static HttpClient BuildDefaultClient()
+    public static HttpClient BuildDefaultClient(bool routeInsecureSkipVerify = false)
     {
-        return new HttpClient(BuildDefaultHandler()) { Timeout = Timeout.InfiniteTimeSpan };
+        return new HttpClient(BuildDefaultHandler(routeInsecureSkipVerify))
+        {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
     }
 
-    public static SocketsHttpHandler BuildDefaultHandler()
+    public static SocketsHttpHandler BuildDefaultHandler(bool routeInsecureSkipVerify = false)
     {
         var handler = new SocketsHttpHandler
         {
@@ -48,14 +57,24 @@ public sealed class DirectHttpForwarder
             UseProxy = false,
             // Verified by default; see UpstreamTlsPolicy for why, and for how a self-signed
             // target is described. This used to accept every certificate unconditionally.
-            SslOptions = UpstreamTlsPolicy.Current.CreateOptions(string.Empty),
+            SslOptions = UpstreamTlsPolicy.Current.CreateOptions(
+                string.Empty, routeInsecureSkipVerify),
         };
         return handler;
     }
 
     internal Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
-        CancellationToken cancellationToken) =>
-        _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        bool routeInsecureSkipVerify, CancellationToken cancellationToken) =>
+        (routeInsecureSkipVerify ? _routeInsecureHttpClient.Value : _httpClient)
+            .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+    public void Dispose()
+    {
+        if (_ownsRouteInsecureHttpClient && _routeInsecureHttpClient.IsValueCreated)
+        {
+            _routeInsecureHttpClient.Value.Dispose();
+        }
+    }
 
     /// <summary>
     /// Builds the upstream target URL with the same containment rules as the Java forwarder:

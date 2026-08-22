@@ -249,6 +249,11 @@
           "type": "string",
           "format": "uri",
           "pattern": "^https?://"
+        },
+        "insecureSkipVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否跳过该目标的 HTTPS/WSS 证书链与主机名校验；缺省为 false。"
         }
       }
     },

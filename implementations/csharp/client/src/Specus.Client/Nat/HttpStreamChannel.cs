@@ -20,6 +20,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     private readonly Dictionary<string, object?> _metadata;
     private readonly DirectHttpHandler _routes;
     private readonly string _targetBaseUrl;
+    private readonly bool _insecureSkipVerify;
     private readonly FrameWriter _writer;
     private readonly ILogger _logger;
     private readonly Action<HttpStreamChannel> _onClose;
@@ -31,12 +32,14 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
 
     public HttpStreamChannel(uint streamId, Dictionary<string, object?> metadata,
         DirectHttpHandler routes, string targetBaseUrl, FrameWriter writer, ILogger logger,
-        CancellationToken session, Action<HttpStreamChannel> onClose)
+        CancellationToken session, Action<HttpStreamChannel> onClose,
+        bool insecureSkipVerify = false)
     {
         _streamId = streamId;
         _metadata = new Dictionary<string, object?>(metadata);
         _routes = routes;
         _targetBaseUrl = targetBaseUrl;
+        _insecureSkipVerify = insecureSkipVerify;
         _writer = writer;
         _logger = logger;
         _onClose = onClose;
@@ -106,7 +109,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
             request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
             request.Headers.TransferEncodingChunked = true;
             request.Headers.TryAddWithoutValidation("Trailer", _requestTrailers.Names);
-            trailerTransport = new TrailerHttpTransport(_requestTrailers);
+            trailerTransport = new TrailerHttpTransport(_requestTrailers, _insecureSkipVerify);
         }
         var headers = AsStrings(_metadata, "headers");
         var boundedRange = DirectHttpForwarder.BoundedRange(
@@ -120,7 +123,8 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
 
         using var requestTrailerTransport = trailerTransport;
         using var response = trailerTransport is null
-            ? await _routes.Forwarder.SendAsync(request, cancellationToken).ConfigureAwait(false)
+            ? await _routes.Forwarder.SendAsync(
+                request, _insecureSkipVerify, cancellationToken).ConfigureAwait(false)
             : await trailerTransport.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var trailerNames = DeclaredResponseTrailers(response);
         await _writer.WriteAsync(new NatMessagePacket
@@ -447,9 +451,9 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     {
         private readonly HttpClient _client;
 
-        public TrailerHttpTransport(RequestTrailerState trailers)
+        public TrailerHttpTransport(RequestTrailerState trailers, bool insecureSkipVerify)
         {
-            var handler = DirectHttpForwarder.BuildDefaultHandler();
+            var handler = DirectHttpForwarder.BuildDefaultHandler(insecureSkipVerify);
             handler.PooledConnectionLifetime = TimeSpan.Zero;
             handler.PlaintextStreamFilter = (context, _) =>
                 ValueTask.FromResult<Stream>(new TrailerInjectingStream(

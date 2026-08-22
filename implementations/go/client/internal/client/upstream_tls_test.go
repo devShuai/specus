@@ -35,7 +35,7 @@ func selfSignedServer(t *testing.T) *httptest.Server {
 // accepted, and the tunnel would carry the result to a remote user who cannot tell.
 func TestUpstreamTLSRejectsAnUntrustedCertificateByDefault(t *testing.T) {
 	server := selfSignedServer(t)
-	client := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{}))
+	client := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{}), false)
 
 	response, err := client.Get(server.URL)
 	if err == nil {
@@ -53,7 +53,7 @@ func TestUpstreamTLSAcceptsAnUntrustedCertificateWhenExplicitlyAllowed(t *testin
 	server := selfSignedServer(t)
 	client := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{
 		InsecureSkipVerify: true,
-	}))
+	}), false)
 
 	response, err := client.Get(server.URL)
 	if err != nil {
@@ -62,6 +62,26 @@ func TestUpstreamTLSAcceptsAnUntrustedCertificateWhenExplicitlyAllowed(t *testin
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+}
+
+func TestUpstreamTLSAcceptsAnUntrustedCertificateForOneRoute(t *testing.T) {
+	server := selfSignedServer(t)
+	factory := newUpstreamTLSFactory(UpstreamTLSConfig{})
+	client := newForwardingHTTPClient(factory, true)
+
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("a route-level opt-out must connect: %v", err)
+	}
+	response.Body.Close()
+
+	verified, err := factory.forHostWithRoutePolicy("example.test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.InsecureSkipVerify {
+		t.Fatal("the route-level opt-out must not weaken other routes")
 	}
 }
 
@@ -75,7 +95,7 @@ func TestUpstreamTLSTrustsAConfiguredCertificateAuthority(t *testing.T) {
 
 	client := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{
 		CACertificatePath: pemPath,
-	}))
+	}), false)
 	response, err := client.Get(server.URL)
 	if err != nil {
 		t.Fatalf("a configured CA must be trusted: %v", err)
@@ -91,7 +111,7 @@ func TestUpstreamTLSPinningAcceptsOnlyThePinnedCertificate(t *testing.T) {
 
 	matching := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{
 		PinnedCertificateSHA256: []string{hex.EncodeToString(digest[:])},
-	}))
+	}), false)
 	response, err := matching.Get(server.URL)
 	if err != nil {
 		t.Fatalf("the pinned certificate must be accepted: %v", err)
@@ -128,7 +148,7 @@ func TestUpstreamTLSAcceptsFingerprintsInTheFormToolsPrint(t *testing.T) {
 
 	client := newForwardingHTTPClient(newUpstreamTLSFactory(UpstreamTLSConfig{
 		PinnedCertificateSHA256: []string{colonised.String()},
-	}))
+	}), false)
 	response, err := client.Get(server.URL)
 	if err != nil {
 		t.Fatalf("a colon-separated uppercase fingerprint must work: %v", err)

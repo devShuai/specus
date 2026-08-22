@@ -184,3 +184,16 @@ func TestNatControlConfigDistinguishesMissingAndEmptyHTTPRoutesLikeJava(t *testi
 		t.Fatalf("empty httpSpecusConfigList length = %d", len(*empty.HTTPSpecusConfigList))
 	}
 }
+
+func TestNatControlConfigReadsPerRouteTLSPolicy(t *testing.T) {
+	var snapshot natControlConfig
+	if err := json.Unmarshal([]byte(`{"specusConfigList":[],"httpSpecusConfigList":[{"route":"secure","targetBaseUrl":"https://localhost:8443","insecureSkipVerify":true}]}`), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.HTTPSpecusConfigList == nil || len(*snapshot.HTTPSpecusConfigList) != 1 {
+		t.Fatalf("unexpected HTTP route snapshot: %#v", snapshot.HTTPSpecusConfigList)
+	}
+	if !(*snapshot.HTTPSpecusConfigList)[0].InsecureSkipVerify {
+		t.Fatal("route-level insecureSkipVerify was not preserved")
+	}
+}

@@ -75,6 +75,7 @@ class HttpRouteServiceTests {
         assertThat(view.targetBaseUrl()).isEqualTo("http://127.0.0.1:8080");
         assertThat(view.enabled()).isTrue();
         assertThat(view.mediaCaptureEnabled()).isFalse();
+        assertThat(view.insecureSkipVerify()).isFalse();
         assertThat(view.createdAt()).isNotBlank();
         assertThat(view.updatedAt()).isNotBlank();
 
@@ -200,6 +201,20 @@ class HttpRouteServiceTests {
         assertThat(updated.detailCaptureEnabled()).isTrue();
         assertThat(updated.mediaCaptureEnabled()).isTrue();
         assertThat(updated.pathRewriteEnabled()).isTrue();
+    }
+
+    @Test
+    void routeCanSkipTlsVerificationAndPartialUpdatePreservesIt() {
+        HttpRouteView created = httpRouteService.createRoute(clientIdA,
+                new RouteMutation("secure", "https://127.0.0.1:8443", true,
+                        false, false, false, true, null, null, null));
+
+        assertThat(created.insecureSkipVerify()).isTrue();
+
+        HttpRouteView updated = httpRouteService.updateRoute(created.id(),
+                new RouteMutation("secure", "https://127.0.0.1:9443", true));
+
+        assertThat(updated.insecureSkipVerify()).isTrue();
     }
 
     @Test

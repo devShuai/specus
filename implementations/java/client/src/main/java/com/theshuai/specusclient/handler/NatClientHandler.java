@@ -30,7 +30,6 @@ import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
 import com.theshuai.specusclient.client.UpstreamTlsPolicyHolder;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.bytes.ByteArrayDecoder;
@@ -58,16 +57,18 @@ public class NatClientHandler extends NatCommonHandler {
     static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
     static final int PENDING_STREAM_LIMIT = 1024;
     private static final SslContext LOCAL_WS_SSL_CONTEXT = buildLocalWsSslContext();
+    private static final SslContext INSECURE_LOCAL_WS_SSL_CONTEXT =
+            UpstreamTlsPolicyHolder.current().buildContext(true);
 
     private String remoteHost;
 
     private Map<Integer, SpecusConfig> specusConfigMap = new HashMap<>();
 
     /**
-     * HTTP 路由快照（route → targetBaseUrl）。WS 隧道 CONNECTED 帧到达时按 route 查本地
+     * HTTP 路由快照（route → target + TLS policy）。WS 隧道 CONNECTED 帧到达时按 route 查本地
      * {@code ws://} 或 HTTP 目标。volatile 整体替换，供强制 NAT stream v2 转发使用。
      */
-    private volatile Map<String, String> httpRoutes = Map.of();
+    private volatile Map<String, HttpSpecusConfig> httpRoutes = Map.of();
 
     private final ConcurrentHashMap<Integer, LocalSpecusHandler> channelHandlerMap = new ConcurrentHashMap<>();
     /** WS 隧道流的本地 Channel，key = 服务端分配的 streamId。 */
@@ -100,14 +101,18 @@ public class NatClientHandler extends NatCommonHandler {
         this.httpRoutes = toHttpRouteMap(specusBean.getHttpSpecusConfigList());
     }
 
-    private static Map<String, String> toHttpRouteMap(List<HttpSpecusConfig> configs) {
+    private static Map<String, HttpSpecusConfig> toHttpRouteMap(List<HttpSpecusConfig> configs) {
         if (configs == null || configs.isEmpty()) {
             return Map.of();
         }
-        Map<String, String> map = new HashMap<>();
+        Map<String, HttpSpecusConfig> map = new HashMap<>();
         for (HttpSpecusConfig c : configs) {
             if (c != null && c.getRoute() != null && !c.getRoute().isBlank()) {
-                map.put(c.getRoute(), c.getTargetBaseUrl() == null ? "" : c.getTargetBaseUrl());
+                HttpSpecusConfig copy = new HttpSpecusConfig();
+                copy.setRoute(c.getRoute());
+                copy.setTargetBaseUrl(c.getTargetBaseUrl() == null ? "" : c.getTargetBaseUrl());
+                copy.setInsecureSkipVerify(c.isInsecureSkipVerify());
+                map.put(copy.getRoute(), copy);
             }
         }
         return Map.copyOf(map);
@@ -123,7 +128,14 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     Map<String, String> getCurrentHttpRoutes() {
-        return httpRoutes;
+        Map<String, String> targets = new HashMap<>();
+        httpRoutes.forEach((route, config) -> targets.put(route, config.getTargetBaseUrl()));
+        return Map.copyOf(targets);
+    }
+
+    boolean isCurrentHttpRouteInsecureSkipVerify(String route) {
+        HttpSpecusConfig config = httpRoutes.get(route);
+        return config != null && config.isInsecureSkipVerify();
     }
 
     @Override
@@ -423,8 +435,9 @@ public class NatClientHandler extends NatCommonHandler {
             sendReset(streamId, 2, "invalid websocket open");
             return;
         }
-        Map<String, String> routes = httpRoutes;
-        String targetBaseUrl = routes.get(route);
+        Map<String, HttpSpecusConfig> routes = httpRoutes;
+        HttpSpecusConfig routeConfig = routes.get(route);
+        String targetBaseUrl = routeConfig == null ? null : routeConfig.getTargetBaseUrl();
         if (targetBaseUrl == null || targetBaseUrl.isBlank()) {
             log.warn("[ws-specus][client] CONNECTED for unknown route {} from {}", route, clientName);
             sendReset(streamId, 3, "unknown websocket route");
@@ -460,13 +473,16 @@ public class NatClientHandler extends NatCommonHandler {
                                 target, WebSocketVersion.V13, null, true,
                                 handshakeHeaders, LOCAL_WS_MAX_FRAME_PAYLOAD_BYTES);
                         if ("wss".equalsIgnoreCase(target.getScheme())) {
-                            io.netty.handler.ssl.SslHandler sslHandler = LOCAL_WS_SSL_CONTEXT.newHandler(
+                            boolean insecureSkipVerify = routeConfig.isInsecureSkipVerify();
+                            SslContext sslContext = insecureSkipVerify
+                                    ? INSECURE_LOCAL_WS_SSL_CONTEXT : LOCAL_WS_SSL_CONTEXT;
+                            io.netty.handler.ssl.SslHandler sslHandler = sslContext.newHandler(
                                     ch.alloc(), target.getHost(),
                                     target.getPort() == -1 ? defaultPort(target.getScheme()) : target.getPort());
                             // See HttpStreamForwarder: the trust manager alone does not check that
                             // the certificate belongs to the host being dialled.
                             UpstreamTlsPolicyHolder.current()
-                                    .applyHostnameVerification(sslHandler.engine());
+                                    .applyHostnameVerification(sslHandler.engine(), insecureSkipVerify);
                             ch.pipeline().addLast(sslHandler);
                         }
                         ch.pipeline().addLast(new HttpClientCodec());

@@ -73,8 +73,9 @@ type SpecusConfig struct {
 }
 
 type HTTPSpecusConfig struct {
-	Route         string `json:"route"`
-	TargetBaseURL string `json:"targetBaseUrl"`
+	Route              string `json:"route"`
+	TargetBaseURL      string `json:"targetBaseUrl"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify"`
 }
 
 type RuntimeConfig struct {

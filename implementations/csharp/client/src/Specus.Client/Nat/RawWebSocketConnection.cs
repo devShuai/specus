@@ -46,7 +46,7 @@ internal sealed class RawWebSocketConnection : IAsyncDisposable
 
     public static async Task<RawWebSocketConnection> ConnectAsync(Uri target,
         IReadOnlyList<KeyValuePair<string, string>> headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool insecureSkipVerify = false)
     {
         if (!target.IsAbsoluteUri || target.Scheme is not ("ws" or "wss"))
         {
@@ -66,7 +66,8 @@ internal sealed class RawWebSocketConnection : IAsyncDisposable
             {
                 // Verified like any other upstream connection, and through the same policy as the
                 // HTTP path, so a target configured once behaves the same on either protocol.
-                var options = UpstreamTlsPolicy.Current.CreateOptions(target.IdnHost);
+                var options = UpstreamTlsPolicy.Current.CreateOptions(
+                    target.IdnHost, insecureSkipVerify);
                 var tls = new SslStream(stream, leaveInnerStreamOpen: false,
                     options.RemoteCertificateValidationCallback is null
                         ? null

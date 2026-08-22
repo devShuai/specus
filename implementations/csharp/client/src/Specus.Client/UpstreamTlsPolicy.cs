@@ -73,7 +73,15 @@ public sealed class UpstreamTlsPolicy
     public bool Pins => _pinned.Count > 0;
 
     /// <summary>Builds the options used to authenticate one upstream connection.</summary>
-    public SslClientAuthenticationOptions CreateOptions(string targetHost)
+    public SslClientAuthenticationOptions CreateOptions(string targetHost) =>
+        CreateOptions(targetHost, routeInsecureSkipVerify: false);
+
+    /// <summary>
+    /// Builds the options for one upstream route. A route may explicitly relax verification;
+    /// it cannot make a globally insecure client verify only that route.
+    /// </summary>
+    public SslClientAuthenticationOptions CreateOptions(
+        string targetHost, bool routeInsecureSkipVerify)
     {
         var options = new SslClientAuthenticationOptions
         {
@@ -82,7 +90,7 @@ public sealed class UpstreamTlsPolicy
             CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
         };
 
-        if (_insecureSkipVerify)
+        if (_insecureSkipVerify || routeInsecureSkipVerify)
         {
             options.RemoteCertificateValidationCallback = static (_, _, _, _) => true;
             return options;

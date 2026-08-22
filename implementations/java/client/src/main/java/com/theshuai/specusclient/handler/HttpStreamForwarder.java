@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.handler;
 
 import com.theshuai.common.service.ExecuteService;
+import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
@@ -28,7 +29,6 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import com.theshuai.specusclient.client.UpstreamTlsPolicyHolder;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -54,18 +54,20 @@ final class HttpStreamForwarder implements Runnable {
             "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade");
     private static final SslContext LOCAL_HTTP_SSL_CONTEXT = buildLocalHttpSslContext();
+    private static final SslContext INSECURE_LOCAL_HTTP_SSL_CONTEXT =
+            UpstreamTlsPolicyHolder.current().buildContext(true);
 
     private final NatClientHandler owner;
     private final int streamId;
     private final Map<String, Object> metadata;
-    private final Map<String, String> routes;
+    private final Map<String, HttpSpecusConfig> routes;
     private final EventLoopGroup workerGroup;
     private final StreamingBodyInput requestBody;
     private final AtomicBoolean remoteReset = new AtomicBoolean();
     private volatile Channel upstreamChannel;
 
     HttpStreamForwarder(NatClientHandler owner, int streamId, Map<String, Object> metadata,
-                        Map<String, String> routes, EventLoopGroup workerGroup) {
+                        Map<String, HttpSpecusConfig> routes, EventLoopGroup workerGroup) {
         this.owner = owner;
         this.streamId = streamId;
         this.metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
@@ -103,7 +105,9 @@ final class HttpStreamForwarder implements Runnable {
             String route = requiredText("route");
             String relativePath = text(metadata.get("relativePath"));
             String rawQuery = text(metadata.get("rawQuery"));
-            URI target = HttpRouteTargetResolver.buildTarget(routes.get(route), relativePath, rawQuery);
+            HttpSpecusConfig routeConfig = routes.get(route);
+            URI target = HttpRouteTargetResolver.buildTarget(
+                    routeConfig == null ? null : routeConfig.getTargetBaseUrl(), relativePath, rawQuery);
             long contentLength = number(metadata.get("contentLength"), -1L);
             if (contentLength > MAX_REQUEST_BYTES) {
                 throw new IOException("HTTP 请求体超过限制");
@@ -111,7 +115,7 @@ final class HttpStreamForwarder implements Runnable {
             List<String> headers = stringList(metadata.get("headers"));
             List<String> trailerNames = validTrailerNames(stringList(metadata.get("trailerNames")));
             String range = HttpRouteTargetResolver.boundedRange(firstHeader(headers, "range"));
-            exchange = connect(target);
+            exchange = connect(target, routeConfig.isInsecureSkipVerify());
             upstreamChannel = exchange.channel();
             UpstreamExchange requestExchange = exchange;
             ExecuteService.submit(() -> pumpRequest(requestExchange, target, method, contentLength,
@@ -170,7 +174,7 @@ final class HttpStreamForwarder implements Runnable {
         return value;
     }
 
-    private UpstreamExchange connect(URI target) throws Exception {
+    private UpstreamExchange connect(URI target, boolean insecureSkipVerify) throws Exception {
         UpstreamExchange exchange = new UpstreamExchange();
         int port = target.getPort() >= 0 ? target.getPort()
                 : "https".equalsIgnoreCase(target.getScheme()) ? 443 : 80;
@@ -185,13 +189,15 @@ final class HttpStreamForwarder implements Runnable {
                     @Override
                     protected void initChannel(SocketChannel channel) {
                         if ("https".equalsIgnoreCase(target.getScheme())) {
-                            io.netty.handler.ssl.SslHandler sslHandler = LOCAL_HTTP_SSL_CONTEXT
+                            SslContext sslContext = insecureSkipVerify
+                                    ? INSECURE_LOCAL_HTTP_SSL_CONTEXT : LOCAL_HTTP_SSL_CONTEXT;
+                            io.netty.handler.ssl.SslHandler sslHandler = sslContext
                                     .newHandler(channel.alloc(), target.getHost(), port);
                             // A trust manager proves the certificate is trusted, not that it
                             // belongs to this host. Without this a valid certificate for any host
                             // would be accepted for every host.
                             UpstreamTlsPolicyHolder.current()
-                                    .applyHostnameVerification(sslHandler.engine());
+                                    .applyHostnameVerification(sslHandler.engine(), insecureSkipVerify);
                             channel.pipeline().addLast(sslHandler);
                         }
                         channel.pipeline().addLast(new HttpClientCodec());
