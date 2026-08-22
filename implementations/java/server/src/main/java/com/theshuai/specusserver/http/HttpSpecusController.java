@@ -83,9 +83,9 @@ public class HttpSpecusController {
         this.routeCacheTtlMillis = Math.max(0, routeCacheTtlMillis);
     }
 
-    // RequestMappingHandlerMapping runs before Spring's WebSocketHandlerMapping.
-    // Excluding Upgrade requests here lets /http/** WebSockets reach the tunnel handler.
-    @RequestMapping(value = "/{clientName}/{route}/**", headers = "!Upgrade")
+    // WebSocket upgrades on this path are claimed by WebSocketHandlerMapping
+    // (upgrade-only, order -1). See WebSocketSpecusConfig.
+    @RequestMapping("/{clientName}/{route}/**")
     public void forward(@PathVariable String clientName,
                         @PathVariable String route,
                         HttpServletRequest request,

@@ -8,6 +8,10 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -49,5 +53,18 @@ class HttpWebSocketRoutingTests {
                     socket.getInputStream(), StandardCharsets.US_ASCII));
             assertThat(response.readLine()).startsWith("HTTP/1.1 101");
         }
+    }
+
+    @Test
+    void plainHttpGetIsNotCapturedByWebSocketHandshake() throws Exception {
+        HttpResponse<String> response = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/http/offline-client/route/")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode())
+                .as("plain GET must reach HttpSpecusController, not the WebSocket handshake: %s",
+                        response.body())
+                .isEqualTo(502);
+        assertThat(response.body()).contains("客户端不在线");
     }
 }
