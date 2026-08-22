@@ -237,7 +237,6 @@ if [[ "$ENABLE_AGENT" == "true" ]]; then
   write_env_file "ELASTIC_APM_RECORDING" "true" "replace"
   write_env_file "ELASTIC_APM_SERVER_URL" "$APM_SERVER_URL" "default"
   write_env_file "ELASTIC_APM_SERVICE_NAME" "specus-server" "default"
-  write_env_file "ELASTIC_APM_SERVICE_VERSION" "1.0-SNAPSHOT" "default"
   write_env_file "ELASTIC_APM_ENVIRONMENT" "$APM_ENVIRONMENT" "default"
   write_env_file "ELASTIC_APM_APPLICATION_PACKAGES" "com.theshuai.specusserver" "default"
   write_env_file "ELASTIC_APM_TRANSACTION_SAMPLE_RATE" "$APM_SAMPLE_RATE" "default"

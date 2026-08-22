@@ -675,7 +675,7 @@ Java codec 提供可重复的 JMH 基准，覆盖 SPM2 的 64/512/1200 字节 en
 
 ```powershell
 mvn -f implementations/java/client/pom.xml -Ppeer-mesh-benchmark package -DskipTests
-java -jar implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-benchmarks.jar `
+java -jar implementations/java/client/target/specus-client-benchmarks.jar `
   PeerDataFrameCodecBenchmark -prof gc -wi 3 -i 5 -f 1
 ```
 

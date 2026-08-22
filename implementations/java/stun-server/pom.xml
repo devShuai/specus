@@ -6,7 +6,7 @@
     <parent>
         <groupId>com.theshuai</groupId>
         <artifactId>specus</artifactId>
-        <version>1.0-SNAPSHOT</version>
+        <version>${revision}${changelist}</version>
         <relativePath>../../../pom.xml</relativePath>
     </parent>
 
@@ -18,7 +18,7 @@
         <dependency>
             <groupId>com.theshuai</groupId>
             <artifactId>specus-common</artifactId>
-            <version>1.0-SNAPSHOT</version>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -46,7 +46,7 @@
                                 <artifactItem>
                                     <groupId>com.theshuai</groupId>
                                     <artifactId>specus-common</artifactId>
-                                    <version>1.0-SNAPSHOT</version>
+                                    <version>${project.version}</version>
                                     <outputDirectory>${project.build.outputDirectory}</outputDirectory>
                                     <includes>com/theshuai/common/stun/**</includes>
                                     <overWrite>true</overWrite>

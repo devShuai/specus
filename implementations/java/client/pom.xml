@@ -5,12 +5,10 @@
     <parent>
         <artifactId>specus</artifactId>
         <groupId>com.theshuai</groupId>
-        <version>1.0-SNAPSHOT</version>
+        <version>${revision}${changelist}</version>
         <relativePath>../../../pom.xml</relativePath>
     </parent>
     <artifactId>specus-client</artifactId>
-    <!-- Inherited from the root pom; release packaging may override it with -Drevision. -->
-    <version>${revision}</version>
     <name>specus-client</name>
     <description>specus-client</description>
     <properties>
@@ -20,7 +18,7 @@
         <dependency>
             <groupId>com.theshuai</groupId>
             <artifactId>specus-common</artifactId>
-            <version>1.0-SNAPSHOT</version>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -60,6 +58,7 @@
     </dependencies>
 
     <build>
+        <finalName>specus-client</finalName>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -68,7 +67,7 @@
                     <archive>
                         <manifestEntries>
                             <!-- SpecusClientApplication reports this in login and version checks. -->
-                            <Implementation-Version>${revision}</Implementation-Version>
+                            <Implementation-Version>${project.version}</Implementation-Version>
                         </manifestEntries>
                     </archive>
                 </configuration>
@@ -78,6 +77,8 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
+                    <!-- 开发运行时保留 DevTools，但任何可发布的 exec JAR 都显式排除它。 -->
+                    <excludeDevtools>true</excludeDevtools>
                     <!--
                         repackage 默认会把 thin-jar 替换为 fat-jar，导致下游 test-scope 依赖
                         （如 specus-server 的 EndToEndSpecusIT）拿到 fat-jar，类路径污染、
@@ -140,7 +141,7 @@
                                 <path>
                                     <groupId>org.projectlombok</groupId>
                                     <artifactId>lombok</artifactId>
-                                    <version>1.18.46</version>
+                                    <version>${lombok.version}</version>
                                 </path>
                                 <path>
                                     <groupId>org.openjdk.jmh</groupId>

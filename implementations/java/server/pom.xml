@@ -5,7 +5,7 @@
     <parent>
         <artifactId>specus</artifactId>
         <groupId>com.theshuai</groupId>
-        <version>1.0-SNAPSHOT</version>
+        <version>${revision}${changelist}</version>
         <relativePath>../../../pom.xml</relativePath>
     </parent>
     <artifactId>specus-server</artifactId>
@@ -17,6 +17,7 @@
         <specus.server.web.skip>false</specus.server.web.skip>
     </properties>
     <build>
+        <finalName>specus-server</finalName>
         <plugins>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
@@ -48,15 +49,26 @@
                     <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
                     <!-- 显式指定 main class，repackage 不再依赖类路径自动探测 -->
                     <mainClass>com.theshuai.specusserver.SpecusServerApplication</mainClass>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
                 </configuration>
             </plugin>
         </plugins>
     </build>
     <dependencies>
         <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
             <groupId>com.theshuai</groupId>
             <artifactId>specus-common</artifactId>
-            <version>1.0-SNAPSHOT</version>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -106,7 +118,7 @@
         <dependency>
             <groupId>com.theshuai</groupId>
             <artifactId>specus-client</artifactId>
-            <version>${revision}</version>
+            <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>

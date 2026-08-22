@@ -10,6 +10,7 @@ import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.serialize.Serializer;
 import com.theshuai.common.serialize.SerializerAlgorithm;
+import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
@@ -28,7 +29,7 @@ class CompactBinarySerializerTests {
         LoginRequestPacket packet = createLoginPacket();
 
         byte[] compactBytes = Serializer.COMPACT_BINARY.serialize(packet);
-        byte[] jsonBytes = Serializer.FASTJSON.serialize(packet);
+        byte[] jsonBytes = JsonUtil.objectToBytesStrict(packet);
         LoginRequestPacket result = Serializer.COMPACT_BINARY.deserialize(LoginRequestPacket.class, compactBytes);
 
         assertEquals(packet, result);

@@ -252,7 +252,7 @@ try {
         }
     }
 
-    $jarPath = Join-Path $RepoRoot "implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar"
+    $jarPath = Join-Path $RepoRoot "implementations/java/server/target/specus-server.jar"
     $assetName = "index-dry-run.js"
 
     if ($deployServer) {

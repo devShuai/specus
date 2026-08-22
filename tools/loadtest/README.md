@@ -52,7 +52,7 @@ The SPM2 codec baselines use the same `64/512/1200` byte payload sizes in each d
 
 ```powershell
 mvn -pl implementations/java/client -Ppeer-mesh-benchmark -DskipTests package
-java -jar implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-benchmarks.jar PeerDataFrameCodecBenchmark
+java -jar implementations/java/client/target/specus-client-benchmarks.jar PeerDataFrameCodecBenchmark
 
 Set-Location implementations/go/client
 go test ./internal/client -run '^$' -bench BenchmarkPeerDataFrameCodec -benchmem

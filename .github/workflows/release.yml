@@ -236,22 +236,42 @@ jobs:
       - name: Test Java modules
         run: >-
           mvn -pl implementations/java/server,implementations/java/client,implementations/java/stun-server -am
-          -Dspecus.server.web.skip=true -Drevision="$BUILD_VERSION" test
+          -Dspecus.server.web.skip=true -Drevision="$BUILD_VERSION" -Dchangelist= test
 
       - name: Package Java modules
-        # -Drevision feeds the client pom's ${revision}; the jar manifest then reports the release
-        # version, which is what the login handshake sends.
+        # revision + an empty changelist turn the shared development snapshot into the release
+        # version for every Java module and manifest.
         run: >-
           mvn -pl implementations/java/server,implementations/java/client,implementations/java/stun-server -am
-          -DskipTests -Dspecus.server.web.skip=true -Drevision="$BUILD_VERSION" clean package
+          -DskipTests -Dspecus.server.web.skip=true -Drevision="$BUILD_VERSION" -Dchangelist= clean package
+
+      - name: Verify Java artifact versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_manifest_version() {
+            local jar_path="$1"
+            local actual
+            actual="$(unzip -p "$jar_path" META-INF/MANIFEST.MF \
+              | tr -d '\r' \
+              | sed -n 's/^Implementation-Version: //p' \
+              | head -n 1)"
+            if [[ "$actual" != "$BUILD_VERSION" ]]; then
+              echo "$jar_path reports Implementation-Version=$actual, expected $BUILD_VERSION" >&2
+              exit 1
+            fi
+          }
+          verify_manifest_version implementations/java/client/target/specus-client-exec.jar
+          verify_manifest_version implementations/java/server/target/specus-server.jar
+          verify_manifest_version implementations/java/stun-server/target/stun-server.jar
 
       - name: Rename and checksum
         run: |
           set -euo pipefail
           dist="release-dist/java"
           mkdir -p "$dist"
-          cp implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar "$dist/specus-server-java-$RELEASE_VERSION.jar"
-          cp "implementations/java/client/target/specus-client-$BUILD_VERSION-exec.jar" "$dist/specus-client-java-$RELEASE_VERSION.jar"
+          cp implementations/java/server/target/specus-server.jar "$dist/specus-server-java-$RELEASE_VERSION.jar"
+          cp implementations/java/client/target/specus-client-exec.jar "$dist/specus-client-java-$RELEASE_VERSION.jar"
           cp implementations/java/stun-server/target/stun-server.jar "$dist/specus-stun-server-java-$RELEASE_VERSION.jar"
           (cd "$dist" && sha256sum -- *.jar > SHA256SUMS-java.txt)
 

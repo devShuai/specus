@@ -8,7 +8,7 @@ CONTROL_PORT="${CONTROL_PORT:-17010}"
 ADMIN_PORT="${ADMIN_PORT:-17011}"
 PUBLIC_PORT="${PUBLIC_PORT:-18080}"
 ECHO_PORT="${ECHO_PORT:-19090}"
-JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-exec.jar"
+JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-exec.jar"
 ACCESS_TOKEN="${ACCESS_TOKEN:-c-smoke-access-token}"
 
 cleanup() {

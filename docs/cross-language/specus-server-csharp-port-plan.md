@@ -47,7 +47,7 @@ Java 参考实现已收拢到 `implementations/java/server`、`implementations/j
   - 参考: [CompactBinarySerializer.java](../../implementations/java/common/src/main/java/com/theshuai/common/serialize/impl/CompactBinarySerializer.java)
   - .NET: `System.IO.Compression.DeflateStream` (raw deflate, 与 Java `Deflater(nowrap=true)` 可互解；压缩器输出字节不作为跨运行时稳定契约)
 - 13 种 packet record(11 个普通命令 + NAT_MESSAGE + DIRECT_HTTP)
-- NAT_MESSAGE 特殊 body 布局:`int32 type | int32 metaLen | utf8 fastjson meta | bytes payload`,metadata 用 `System.Text.Json` (camelCase)
+- NAT_MESSAGE 特殊 body 使用 v2 固定头、UTF-8 JSON metadata 与原始 payload；Java 使用 Jackson，.NET 使用 `System.Text.Json`
 - 启动 HTTP 登录 HMAC-SHA256 签名：`message = apiKey \n timestamp \n nonce \n machineFingerprint \n osUser`，key 为 `SHA256(plaintext secret)` 的 32 raw bytes
   - 参考: [HmacSigner.java](../../implementations/java/common/src/main/java/com/theshuai/common/security/HmacSigner.java)
 - `IDuplexPipe` 上的帧读取器:在 `PipeReader` 之上做长度切分 → 解码 → 派发

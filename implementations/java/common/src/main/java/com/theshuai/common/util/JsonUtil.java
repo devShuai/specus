@@ -7,7 +7,6 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.apache.commons.lang3.StringUtils;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -47,6 +46,17 @@ public class JsonUtil {
             log.error("处理失败", e);
         }
         return null;
+    }
+
+    public static byte[] objectToBytesStrict(Object object) {
+        if (object == null) {
+            throw new IllegalArgumentException("object is required");
+        }
+        try {
+            return objectMapper.writeValueAsBytes(object);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalArgumentException("cannot serialize JSON payload", exception);
+        }
     }
 
     public static <T> T bytesToObjectStrict(byte[] bytes, TypeReference<T> typeReference) {
@@ -103,7 +113,7 @@ public class JsonUtil {
     }
 
     public static <T> T parseObject(String result, Class<T> clazz) {
-        if (StringUtils.isEmpty(result)) {
+        if (result == null || result.isEmpty()) {
             return null;
         }
         try {

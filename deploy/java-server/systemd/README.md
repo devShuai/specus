@@ -22,7 +22,7 @@
 
   ```bash
   mvn -pl :specus-server -am -DskipTests clean package
-  # 产物：implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar
+  # 产物：implementations/java/server/target/specus-server.jar
   ```
 
 把 jar 上传到目标 Linux 机器（任意临时目录皆可）。
@@ -45,7 +45,7 @@ FLUSH PRIVILEGES;
 
 ```bash
 # 把整个 deploy/java-server/systemd 目录拷到目标机器，例如 /tmp/systemd
-sudo bash /tmp/systemd/install.sh /tmp/specus-server-1.0-SNAPSHOT.jar
+sudo bash /tmp/systemd/install.sh /tmp/specus-server.jar
 ```
 
 脚本会做以下事情：

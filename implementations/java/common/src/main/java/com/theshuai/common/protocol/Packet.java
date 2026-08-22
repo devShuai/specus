@@ -1,14 +1,14 @@
 package com.theshuai.common.protocol;
 
-import com.alibaba.fastjson2.annotation.JSONField;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Data;
 
 @Data
 public abstract class Packet {
 
-    @JSONField(deserialize = false, serialize = false)
+    @JsonIgnore
     private Byte version = PacketCodec.PROTOCOL_VERSION;
 
-    @JSONField(serialize = false)
+    @JsonIgnore
     public abstract Byte getCommand();
 }

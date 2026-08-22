@@ -311,7 +311,7 @@ if [[ "$DRY_RUN" != "true" ]]; then
   fi
 fi
 
-JAR_PATH="${REPO_ROOT}/implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar"
+JAR_PATH="${REPO_ROOT}/implementations/java/server/target/specus-server.jar"
 ASSET_NAME="index-dry-run.js"
 
 if [[ "$DEPLOY_SERVER" == "true" ]]; then

@@ -14,7 +14,6 @@ import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.specusclient.peer.PeerKeyStore;
 import com.theshuai.specusclient.update.ClientUpdateChecker;
 import com.theshuai.specusclient.update.DesktopUpdateNotifier;
-import org.apache.commons.io.IOUtils;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -22,7 +21,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.util.StringUtils;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -260,11 +258,7 @@ public class SpecusClientApplication {
     }
 
     private static String readFile(File file) throws IOException {
-        try (FileInputStream fileInputStream = new FileInputStream(file)) {
-            byte[] bytes = new byte[fileInputStream.available()];
-            IOUtils.readFully(fileInputStream, bytes);
-            return new String(bytes, StandardCharsets.UTF_8);
-        }
+        return Files.readString(file.toPath(), StandardCharsets.UTF_8);
     }
 
     private static List<SpecusConfig> toSpecusConfigs(List<ClientAuthLoginResponse.SpecusEndpoint> endpoints) {

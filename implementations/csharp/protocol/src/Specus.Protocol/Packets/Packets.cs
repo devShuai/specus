@@ -83,7 +83,7 @@ public sealed class NatMessagePacket : Packet
 
     /// <summary>
     /// JSON metadata. <see cref="object"/> values mirror Java's <c>Map&lt;String, Object&gt;</c>:
-    /// the Jackson/FastJson roundtrip will produce <see cref="string"/>, boxed numerics, etc.
+    /// the JSON roundtrip will produce <see cref="string"/>, boxed numerics, etc.
     /// On the C# side we deserialize from JSON via <see cref="System.Text.Json"/>.
     /// </summary>
     public Dictionary<string, object?>? MetaData { get; set; }

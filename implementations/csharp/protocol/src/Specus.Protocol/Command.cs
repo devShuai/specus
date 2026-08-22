@@ -15,7 +15,6 @@ public static class Command
 
 public static class SerializerAlgorithm
 {
-    public const byte FastJson = 1;
     public const byte Jackson = 2;
     public const byte Xml = 3;
     public const byte CompactBinary = 4;

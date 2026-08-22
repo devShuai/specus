@@ -3,7 +3,7 @@
 # specus-server systemd 一键安装脚本
 #
 # 用法（root 或 sudo 执行）：
-#   sudo ./install.sh /path/to/specus-server-1.0-SNAPSHOT.jar
+#   sudo ./install.sh /path/to/specus-server.jar
 #
 # 流程：
 #   1) 校验 Java 21+ 与 root 权限

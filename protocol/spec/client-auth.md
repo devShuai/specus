@@ -62,7 +62,7 @@ Content-Type: application/json
     "osName": "Windows 11",
     "osVersion": "10.0",
     "osArch": "amd64",
-    "clientVersion": "1.0-SNAPSHOT",
+    "clientVersion": "1.2.4-SNAPSHOT",
     "javaVersion": "21.0.11",
     "peerPublicKey": "base64-x25519-public-key",
     "clientMessageCapabilities": {

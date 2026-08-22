@@ -1,5 +1,6 @@
 HELP.md
 target/
+.flattened-pom.xml
 .mvn
 !**/src/main/**/target/
 !**/src/test/**/target/
