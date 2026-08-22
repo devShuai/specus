@@ -326,7 +326,7 @@ if [[ "$DEPLOY_SERVER" == "true" ]]; then
 
   if [[ "$DRY_RUN" != "true" ]]; then
     JAR_PATH=""
-    for candidate in "${REPO_ROOT}"/implementations/java/server/target/specus-server-*.jar; do
+    for candidate in "${REPO_ROOT}"/implementations/java/server/target/specus-server*.jar; do
       [[ -f "$candidate" ]] || continue
       [[ "$candidate" == *.jar.original ]] && continue
       if [[ -z "$JAR_PATH" || "$candidate" -nt "$JAR_PATH" ]]; then

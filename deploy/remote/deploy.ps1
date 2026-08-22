@@ -266,7 +266,8 @@ try {
         Invoke-DeployCommand $maven $mavenArguments
 
         if (-not $DryRun) {
-            $jar = Get-ChildItem (Join-Path $RepoRoot "implementations/java/server/target/specus-server-*.jar") |
+            $jarPattern = Join-Path $RepoRoot "implementations/java/server/target/specus-server*.jar"
+            $jar = Get-ChildItem $jarPattern |
                 Where-Object { $_.Name -notlike "*.jar.original" } |
                 Sort-Object LastWriteTimeUtc -Descending |
                 Select-Object -First 1
