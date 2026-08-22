@@ -35,7 +35,9 @@ import java.io.InputStream;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -70,7 +72,8 @@ final class HttpStreamForwarder implements Runnable {
                         Map<String, HttpSpecusConfig> routes, EventLoopGroup workerGroup) {
         this.owner = owner;
         this.streamId = streamId;
-        this.metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+        this.metadata = metadata == null || metadata.isEmpty()
+                ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(metadata));
         this.routes = routes;
         this.workerGroup = workerGroup;
         this.requestBody = new StreamingBodyInput(bytes -> owner.sendHttpWindowUpdate(streamId, bytes));

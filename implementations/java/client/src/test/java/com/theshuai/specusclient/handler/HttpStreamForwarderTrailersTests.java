@@ -12,6 +12,7 @@ import java.io.InputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -64,17 +65,18 @@ class HttpStreamForwarderTrailersTests {
     }
 
     @Test
-    void preservesKnownContentLengthWhenRequestHasNoTrailers() throws Exception {
+    void preservesKnownContentLengthWhenRequestHasNoTrailersOrQuery() throws Exception {
         try (ServerSocket upstream = new ServerSocket(0)) {
             CompletableFuture<String> captured = CompletableFuture.supplyAsync(() -> serveFixedLength(upstream));
             EventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
             try {
                 RecordingNatClientHandler owner = new RecordingNatClientHandler(List.of());
-                Map<String, Object> metadata = Map.of(
-                        "method", "POST",
-                        "route", "api",
-                        "relativePath", "/fixed",
-                        "contentLength", 4L);
+                Map<String, Object> metadata = new LinkedHashMap<>();
+                metadata.put("method", "POST");
+                metadata.put("route", "api");
+                metadata.put("relativePath", "/fixed");
+                metadata.put("rawQuery", null);
+                metadata.put("contentLength", 4L);
                 HttpStreamForwarder forwarder = new HttpStreamForwarder(owner, 7, metadata,
                         Map.of("api", routeConfig("api",
                                 "http://127.0.0.1:" + upstream.getLocalPort())), group);

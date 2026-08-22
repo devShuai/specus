@@ -8,7 +8,11 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class PacketCodecV2Tests {
@@ -70,6 +74,28 @@ class PacketCodecV2Tests {
                     ProtocolException.class,
                     () -> PacketCodec.INSTANCE.encode(encoded, packet));
             assertEquals(ProtocolException.Reason.INVALID_LENGTH, exception.getReason());
+        } finally {
+            encoded.release();
+        }
+    }
+
+    @Test
+    void shouldOmitNullNatMetadataEntries() throws Exception {
+        NatMessagePacket packet = new NatMessagePacket();
+        packet.setNatMessageType(NatMessageType.OPEN);
+        packet.setStreamId(1);
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("phase", "request");
+        metadata.put("rawQuery", null);
+        packet.setMetaData(metadata);
+
+        ByteBuf encoded = Unpooled.buffer();
+        try {
+            PacketCodec.INSTANCE.encode(encoded, packet);
+            NatMessagePacket decoded = assertInstanceOf(
+                    NatMessagePacket.class, PacketCodec.INSTANCE.decode(encoded));
+
+            assertEquals(Map.of("phase", "request"), decoded.getMetaData());
         } finally {
             encoded.release();
         }

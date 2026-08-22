@@ -16,6 +16,7 @@ import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -229,9 +230,18 @@ public final class PacketCodec {
         if (metadata == null || metadata.isEmpty()) {
             return new byte[0];
         }
+        Map<String, Object> normalizedMetadata = new LinkedHashMap<>();
+        metadata.forEach((key, value) -> {
+            if (key != null && value != null) {
+                normalizedMetadata.put(key, value);
+            }
+        });
+        if (normalizedMetadata.isEmpty()) {
+            return new byte[0];
+        }
         byte[] encoded;
         try {
-            encoded = JsonUtil.objectToBytesStrict(metadata);
+            encoded = JsonUtil.objectToBytesStrict(normalizedMetadata);
         } catch (RuntimeException exception) {
             throw new ProtocolException(
                     ProtocolException.Reason.MALFORMED_BODY,
