@@ -19,4 +19,13 @@ public class ClientPackageProperties {
     private int publicRateLimitPerIp = 120;
 
     private long publicRateLimitWindowSeconds = 60;
+
+    /** Use the official GitHub latest Release when no local catalogue entry owns a target. */
+    private boolean githubReleaseFallbackEnabled = true;
+
+    /** Successful Release metadata is cached to stay well below GitHub's anonymous API limit. */
+    private long githubReleaseCacheSeconds = 1_800;
+
+    /** End-to-end timeout for one GitHub Release metadata request. */
+    private int githubReleaseRequestTimeoutSeconds = 8;
 }

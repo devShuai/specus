@@ -10,12 +10,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class ClientDownloadLinkServiceTests {
@@ -132,6 +134,68 @@ class ClientDownloadLinkServiceTests {
         assertThat(result.sha256()).isNull();
         assertThat(result.changelogUrl()).isNull();
         assertThat(result.packageId()).isNull();
+    }
+
+    @Test
+    void versionCheckFallsBackToGithubReleaseAndNormalizesTagVersion() {
+        GitHubReleaseCatalog releaseCatalog = mock(GitHubReleaseCatalog.class);
+        when(releaseCatalog.findLatest("go", "windows", "x64"))
+                .thenReturn(Optional.of(releasePackage(
+                        71, "go", "windows", "x64", "1.2.3", "client.zip")));
+        ClientDownloadLinkService fallbackService = new ClientDownloadLinkService(
+                repository, storage, mock(PlatformTransactionManager.class), releaseCatalog);
+        when(repository.findByImplementationAndPlatformInAndArchInAndEnabledTrue(
+                "go", List.of("windows", "any"), List.of("x64", "any")))
+                .thenReturn(List.of());
+
+        ClientDownloadLinkService.VersionCheckView update =
+                fallbackService.checkVersion("go", "windows", "x64", "1.2.2");
+        ClientDownloadLinkService.VersionCheckView current =
+                fallbackService.checkVersion("go", "windows", "x64", "v1.2.3");
+
+        assertThat(update.updateAvailable()).isTrue();
+        assertThat(update.latestVersion()).isEqualTo("1.2.3");
+        assertThat(update.downloadUrl()).contains("/releases/download/v1.2.3/");
+        assertThat(current.updateAvailable()).isFalse();
+        assertThat(current.latestVersion()).isEqualTo("1.2.3");
+    }
+
+    @Test
+    void configuredTargetSuppressesGithubFallbackEvenWhenItHasNoEnabledLatest() {
+        GitHubReleaseCatalog releaseCatalog = mock(GitHubReleaseCatalog.class);
+        ClientDownloadLinkService fallbackService = new ClientDownloadLinkService(
+                repository, storage, mock(PlatformTransactionManager.class), releaseCatalog);
+        when(repository.findByImplementationAndPlatformInAndArchInAndEnabledTrue(
+                "go", List.of("linux", "any"), List.of("arm64", "any")))
+                .thenReturn(List.of());
+        when(repository.existsByImplementationAndPlatformInAndArchIn(
+                "go", List.of("linux", "any"), List.of("arm64", "any")))
+                .thenReturn(true);
+
+        ClientDownloadLinkService.VersionCheckView result =
+                fallbackService.checkVersion("go", "linux", "arm64", "1.0.0");
+
+        assertThat(result.latestVersion()).isNull();
+        verifyNoInteractions(releaseCatalog);
+    }
+
+    @Test
+    void publicListUsesReleaseAssetsOnlyForUnconfiguredTargets() {
+        GitHubReleaseCatalog releaseCatalog = mock(GitHubReleaseCatalog.class);
+        ClientDownloadLinkService fallbackService = new ClientDownloadLinkService(
+                repository, storage, mock(PlatformTransactionManager.class), releaseCatalog);
+        ClientDownloadLink configuredJava = row(
+                72, "java", "any", "any", "9.0.0", true, true, false);
+        when(repository.findAllByOrderByImplementationAscDisplayOrderAscIdAsc())
+                .thenReturn(List.of(configuredJava));
+        when(releaseCatalog.maySupplyMissingTarget(Set.of("java|any|any"))).thenReturn(true);
+        when(releaseCatalog.latestPackages()).thenReturn(List.of(
+                releasePackage(73, "java", "any", "any", "1.2.3", "client.jar"),
+                releasePackage(74, "go", "windows", "x64", "1.2.3", "client.zip")));
+
+        List<ClientDownloadLinkView> result = fallbackService.listEnabled();
+
+        assertThat(result).extracting(ClientDownloadLinkView::id).containsExactly(72L, 74L);
     }
 
     @Test
@@ -276,5 +340,25 @@ class ClientDownloadLinkServiceTests {
         row.setCreatedAt("2026-08-18T00:00:00Z");
         row.setUpdatedAt("2026-08-18T00:00:00Z");
         return row;
+    }
+
+    private GitHubReleaseCatalog.ReleasePackage releasePackage(
+            long id, String implementation, String platform, String arch,
+            String version, String fileName) {
+        return new GitHubReleaseCatalog.ReleasePackage(
+                id,
+                implementation,
+                platform,
+                arch,
+                "release-" + id,
+                "https://github.com/devShuai/specus/releases/download/v" + version + "/" + fileName,
+                null,
+                (int) id,
+                version,
+                "b".repeat(64),
+                1024L,
+                "https://github.com/devShuai/specus/releases/tag/v" + version,
+                "2026-08-22T00:00:00Z",
+                "2026-08-22T00:00:00Z");
     }
 }

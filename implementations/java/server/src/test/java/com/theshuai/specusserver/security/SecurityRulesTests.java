@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
                 "spring.jpa.hibernate.ddl-auto=create-drop",
                 "specus.netty.port=0",
                 "specus.database.seed-demo-client=false",
+                // Keep this authorization test deterministic and independent from GitHub.
+                "specus.client-packages.github-release-fallback-enabled=false",
                 // Exercises the weak built-in credential on purpose; prod would refuse to start.
                 "specus.env=dev",
                 "specus.auth.username=admin",

@@ -9,12 +9,11 @@
         <relativePath>../../../pom.xml</relativePath>
     </parent>
     <artifactId>specus-client</artifactId>
-    <!-- Release packaging passes -Drevision=<tag without v>; the default only applies locally. -->
+    <!-- Inherited from the root pom; release packaging may override it with -Drevision. -->
     <version>${revision}</version>
     <name>specus-client</name>
     <description>specus-client</description>
     <properties>
-        <revision>1.0.0-SNAPSHOT</revision>
         <java.version>21</java.version>
     </properties>
     <dependencies>

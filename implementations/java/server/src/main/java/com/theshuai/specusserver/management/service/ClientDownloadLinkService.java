@@ -4,6 +4,7 @@ import com.theshuai.specusserver.management.model.ClientDownloadLink;
 import com.theshuai.specusserver.management.model.ClientDownloadLinkView;
 import com.theshuai.specusserver.management.repository.ClientDownloadLinkRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -19,6 +20,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -50,13 +52,23 @@ public class ClientDownloadLinkService {
     private final ClientDownloadLinkRepository repository;
     private final ClientPackageStorage storage;
     private final TransactionTemplate transactions;
+    private final GitHubReleaseCatalog githubReleaseCatalog;
 
     public ClientDownloadLinkService(ClientDownloadLinkRepository repository,
                                      ClientPackageStorage storage,
                                      PlatformTransactionManager transactionManager) {
+        this(repository, storage, transactionManager, GitHubReleaseCatalog.disabled());
+    }
+
+    @Autowired
+    public ClientDownloadLinkService(ClientDownloadLinkRepository repository,
+                                     ClientPackageStorage storage,
+                                     PlatformTransactionManager transactionManager,
+                                     GitHubReleaseCatalog githubReleaseCatalog) {
         this.repository = repository;
         this.storage = storage;
         this.transactions = new TransactionTemplate(transactionManager);
+        this.githubReleaseCatalog = githubReleaseCatalog;
     }
 
     @Transactional(readOnly = true)
@@ -64,21 +76,35 @@ public class ClientDownloadLinkService {
         return repository.findAllByOrderByDisplayOrderAscIdAsc().stream().map(this::toView).toList();
     }
 
-    @Transactional(readOnly = true)
     public List<ClientDownloadLinkView> listEnabled() {
         List<ClientDownloadLink> catalogue = repository
                 .findAllByOrderByImplementationAscDisplayOrderAscIdAsc();
+        Set<String> configuredTargets = catalogue.stream()
+                .map(this::targetKey)
+                .collect(java.util.stream.Collectors.toSet());
         Set<String> versionedTargets = catalogue.stream()
                 .filter(row -> StringUtils.hasText(row.getVersion()))
                 .map(this::targetKey)
                 .collect(java.util.stream.Collectors.toSet());
-        return catalogue.stream()
+        List<ClientDownloadLinkView> configured = catalogue.stream()
                 .filter(ClientDownloadLink::isEnabled)
                 .filter(row -> versionedTargets.contains(targetKey(row))
                         ? Boolean.TRUE.equals(row.getLatest())
                         : !StringUtils.hasText(row.getVersion()))
                 .map(this::toView)
                 .toList();
+        if (!githubReleaseCatalog.maySupplyMissingTarget(configuredTargets)) {
+            return configured;
+        }
+        List<ClientDownloadLinkView> merged = new ArrayList<>(configured);
+        githubReleaseCatalog.latestPackages().stream()
+                .filter(item -> !configuredTargets.contains(item.targetKey()))
+                .map(GitHubReleaseCatalog.ReleasePackage::toView)
+                .forEach(merged::add);
+        merged.sort(Comparator
+                .comparingInt(ClientDownloadLinkView::displayOrder)
+                .thenComparing(ClientDownloadLinkView::id));
+        return List.copyOf(merged);
     }
 
     @Transactional
@@ -166,7 +192,6 @@ public class ClientDownloadLinkService {
      * 版本比较收敛在服务端。没有可用编目、或编目版本无法解析时一律返回“无更新”，
      * 而不是把一个不可比较的版本号丢给客户端自己判断。
      */
-    @Transactional(readOnly = true)
     public VersionCheckView checkVersion(String implementation, String platform, String arch,
                                                String currentVersion) {
         String normalizedImplementation = requireImplementation(implementation);
@@ -194,7 +219,17 @@ public class ClientDownloadLinkService {
                         .thenComparing(row -> safeVersion(row).orElseThrow()))
                 .orElse(null);
         if (latest == null) {
-            return VersionCheckView.none();
+            boolean configuredTarget = repository.existsByImplementationAndPlatformInAndArchIn(
+                    normalizedImplementation,
+                    fallbackValues(normalizedPlatform),
+                    fallbackValues(normalizedArch));
+            if (configuredTarget) {
+                return VersionCheckView.none();
+            }
+            return githubReleaseCatalog
+                    .findLatest(normalizedImplementation, normalizedPlatform, normalizedArch)
+                    .map(item -> releaseVersionCheck(current, item))
+                    .orElseGet(VersionCheckView::none);
         }
         SemanticVersion latestVersion;
         try {
@@ -224,6 +259,20 @@ public class ClientDownloadLinkService {
                 latest.getFileSize() == null ? 0L : latest.getFileSize(),
                 latest.getChangelogUrl(),
                 Boolean.TRUE.equals(latest.getHosted()) ? latest.getId() : null);
+    }
+
+    private VersionCheckView releaseVersionCheck(SemanticVersion current,
+                                                  GitHubReleaseCatalog.ReleasePackage latest) {
+        SemanticVersion release = SemanticVersion.parse(latest.version(), "release version");
+        return new VersionCheckView(
+                release.compareTo(current) > 0,
+                false,
+                latest.version(),
+                latest.downloadUrl(),
+                latest.sha256(),
+                latest.fileSize(),
+                latest.changelogUrl(),
+                null);
     }
 
     private List<String> fallbackValues(String requested) {

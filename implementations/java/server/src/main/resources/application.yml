@@ -87,6 +87,11 @@ specus:
     max-package-bytes: ${SPECUS_CLIENT_PACKAGE_MAX_BYTES:536870912}
     public-rate-limit-per-ip: ${SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_PER_IP:120}
     public-rate-limit-window-seconds: ${SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_WINDOW_SECONDS:60}
+    # Keep client self-update aligned with published GitHub Releases even before an administrator
+    # imports the assets into the local catalogue. Any local row (including disabled) wins per target.
+    github-release-fallback-enabled: ${SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED:true}
+    github-release-cache-seconds: ${SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_CACHE_SECONDS:1800}
+    github-release-request-timeout-seconds: ${SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_REQUEST_TIMEOUT_SECONDS:8}
   netty:
     port: ${SPECUS_NETTY_PORT:7010}
     bind-address: ${SPECUS_NETTY_BIND_ADDRESS:0.0.0.0}

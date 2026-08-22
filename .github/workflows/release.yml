@@ -216,6 +216,18 @@ jobs:
           cache: npm
           cache-dependency-path: apps/admin-web/package-lock.json
 
+      - name: Verify Java local version matches release tag
+        if: startsWith(needs.prep.outputs.version, 'v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_version="$(mvn -q help:evaluate -Dexpression=revision -DforceStdout)"
+          if [[ "$local_version" != "$BUILD_VERSION" ]]; then
+            echo "Java revision $local_version does not match release version $BUILD_VERSION" >&2
+            echo "Update the root pom.xml revision before creating the release tag." >&2
+            exit 1
+          fi
+
       - name: Build admin web into Java server resources
         run: |
           npm --prefix apps/admin-web ci

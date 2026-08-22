@@ -28,6 +28,12 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <!--
+            Single source for the Java client artifact and manifest version. Release builds still
+            override it with -Drevision=<tag without v>; the default keeps ordinary local packages
+            aligned with the current published client instead of reporting a stale 1.0.0-SNAPSHOT.
+        -->
+        <revision>1.2.3</revision>
+        <!--
             Overrides of the Spring Boot managed versions, each raising a dependency past a high
             severity advisory that the managed version still carries. They live in the root pom
             because every module inherits the same Boot BOM, and a fix applied to one module would

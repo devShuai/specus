@@ -19,6 +19,10 @@ public interface ClientDownloadLinkRepository extends JpaRepository<ClientDownlo
     List<ClientDownloadLink> findByImplementationAndPlatformInAndArchInAndEnabledTrue(
             String implementation, List<String> platforms, List<String> arches);
 
+    /** Includes disabled rows: any configured target suppresses automatic GitHub fallback. */
+    boolean existsByImplementationAndPlatformInAndArchIn(
+            String implementation, List<String> platforms, List<String> arches);
+
     Optional<ClientDownloadLink> findByIdAndEnabledTrueAndHostedTrue(Long id);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)

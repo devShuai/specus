@@ -8,7 +8,7 @@
 - 唯一发布坐标是 `implementation / platform / arch / version`。同一 `implementation / platform / arch` 只允许一个 `isLatest=true` 版本，且停用的版本不能标记为最新。升级检查只采用管理员显式标记的 latest；删除或停用 latest 后不会自动把历史版本晋级为新 latest。
 - `android / android / any` 表示 Android 通用 APK；Java 和 .NET CLI 可使用 `any / any`；Go 与 Windows 桌面版使用精确平台和架构。
 - 删除托管记录时同步删除本记录拥有的包文件；外部 HTTPS 链接记录不触碰文件系统。路径始终由服务端记录生成，不接受用户提供的磁盘路径。
-- 旧 `client_download_link` 数据保留并回填兼容字段，原 JSON CRUD 仍可维护外链。公开仓库默认把带摘要和大小的 GitHub Release 资产登记为外链；服务端托管包是内网、离线或自建分发的可选方式。公开下载页统一读取版本编目，GitHub API 仅用于补齐尚未登记的目标或短时故障回退。
+- 旧 `client_download_link` 数据保留并回填兼容字段，原 JSON CRUD 仍可维护外链。公开仓库默认把带摘要和大小的 GitHub Release 资产登记为外链；服务端托管包是内网、离线或自建分发的可选方式。公开下载列表和版本检查在目标完全未配置时，会从官方 GitHub latest Release 补齐严格校验过的资产；任何本地记录（包括禁用记录）都优先并抑制同目标自动回退。
 
 ## 公共接口
 
@@ -46,6 +46,8 @@
 
 无匹配版本时仍返回 `200`，两个布尔值为 `false`、`fileSize=0`，其余版本/包字段为 `null`。版本比较忽略可选前导 `v`，按数字语义比较稳定版本；无法安全解释的版本不能静默覆盖已有最新版本。`mandatory` 只表示当前版本低于最新记录的 `minSupportedVersion`，不授权客户端绕过用户确认。
 
+官方 GitHub Release 回退默认开启，成功结果缓存 30 分钟，请求超时 8 秒，失败时继续使用上一次可信缓存且不影响客户端连接。可分别通过 `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED`、`SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_CACHE_SECONDS` 与 `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_REQUEST_TIMEOUT_SECONDS` 调整；回退只接受 `devShuai/specus` 固定命名的资产、精确 GitHub 下载路径、GitHub 提供的 SHA-256 与正数文件大小。
+
 版本检查可返回两种下载位置：托管包携带正数 `packageId` 并使用同源精确路径；外部 Release 资产的 `packageId=null`，使用绝对 HTTPS URL。自更新客户端对外链最多跟随 5 次 HTTPS 重定向，禁止降级，最后仍按编目中的大小与 SHA-256 校验内容。
 
 包下载支持 `GET` 与 `HEAD`，匿名只读，应用可信代理后的客户端 IP 限速；响应禁止 MIME sniffing，并使用附件下载及 `no-store`。生产环境由 HTTPS 入口提供传输保护。
@@ -68,4 +70,4 @@
 
 ## 发布流水线
 
-tag 构建统一注入版本到 Go `-ldflags`、Java Maven revision、.NET `Version` 与 Android `versionName`，并在打包前执行对应测试；手动 workflow 以 commit 试跑时映射为合法的 `0.0.0-commit.<hash>` 构建版本，归档名仍保留原 commit。Android `versionCode` 使用单调递增的 workflow run number。APK 先在不接触密钥的构建任务中测试并产出 unsigned 内部 artifact，再由独立的 `release-signing` 受保护环境签名；签名任务必须同时匹配固定的 `SPECUS_ANDROID_CERT_SHA256`，unsigned artifact 不进入 GitHub Release。缺少签名 secrets 或证书指纹不匹配时流水线直接失败。所有归档与 APK 同时生成名称不冲突的 SHA-256 sidecar/清单，GitHub Release 继续作为默认外链分发和灾备来源。
+tag 构建统一注入版本到 Go `-ldflags`、Java Maven revision、.NET `Version` 与 Android `versionName`，并在打包前执行对应测试；Java 本地构建从根 POM 继承同一个 `revision`，客户端 artifact、Manifest 和服务端测试依赖保持一致，Release 流水线再用 `-Drevision=<tag without v>` 覆盖。正式 Tag 发布还会先校验根 POM 的默认 `revision` 与 Tag 一致，避免 Release 正确而后续本地包仍报告旧版本；手动 workflow 以 commit 试跑时则映射为合法的 `0.0.0-commit.<hash>` 构建版本，归档名仍保留原 commit。Android `versionCode` 使用单调递增的 workflow run number。APK 先在不接触密钥的构建任务中测试并产出 unsigned 内部 artifact，再由独立的 `release-signing` 受保护环境签名；签名任务必须同时匹配固定的 `SPECUS_ANDROID_CERT_SHA256`，unsigned artifact 不进入 GitHub Release。缺少签名 secrets 或证书指纹不匹配时流水线直接失败。所有归档与 APK 同时生成名称不冲突的 SHA-256 sidecar/清单，GitHub Release 继续作为默认外链分发和灾备来源。
