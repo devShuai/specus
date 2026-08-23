@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Button,
   Chip,
@@ -25,7 +25,7 @@ import {
   useDisclosure,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
-import type { HttpRoute } from "../../api/types";
+import type { Client, HttpRoute } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { copyTextWithFeedback } from "../../lib/clipboard";
 import { notify, notifyError } from "../../components/toast";
@@ -33,6 +33,7 @@ import { useClients } from "../../hooks/useClients";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
+import { StatusChip, onlineTone } from "../../components/StatusChip";
 import {
   buildHttpRouteAuthMutation,
   HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH,
@@ -49,7 +50,7 @@ function pendingKey(id: number, field: RouteToggleField): string {
 }
 
 export function HttpRoutesPanel() {
-  const { clients } = useClients();
+  const { clients, reload: reloadClients } = useClients();
   const [routes, setRoutes] = useState<HttpRoute[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterClientId, setFilterClientId] = useState("");
@@ -84,6 +85,10 @@ export function HttpRoutesPanel() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([load(), reloadClients()]);
+  }, [load, reloadClients]);
 
   const onCreate = async (event: FormEvent) => {
     event.preventDefault();
@@ -194,6 +199,10 @@ export function HttpRoutesPanel() {
   const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pagedRoutes = routes.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const clientById = useMemo(
+    () => new Map(clients.map((client) => [client.id, client])),
+    [clients],
+  );
   const createAuthDraft: HttpRouteAuthDraft = {
     enabled: authEnabled,
     username: authUsername,
@@ -228,7 +237,7 @@ export function HttpRoutesPanel() {
         <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建路由
         </Button>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
           刷新
         </Button>
         <div className="w-full rounded-medium border border-default-200 bg-default-50/70 p-3">
@@ -315,7 +324,7 @@ export function HttpRoutesPanel() {
         >
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
           刷新
         </Button>
       </div>
@@ -340,7 +349,10 @@ export function HttpRoutesPanel() {
                 }
                 subtitle={
                   <div className="flex flex-col gap-0.5">
-                    <span>{item.clientName}</span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>{item.clientName}</span>
+                      <ClientOnlineStatus client={clientById.get(item.clientId)} />
+                    </div>
                     <code className="break-all">{item.targetBaseUrl || "-"}</code>
                   </div>
                 }
@@ -466,9 +478,12 @@ export function HttpRoutesPanel() {
                 </span>
               </TableCell>
               <TableCell>
-                <span className="block truncate" title={item.clientName}>
-                  {item.clientName}
-                </span>
+                <div className="flex min-w-0 flex-col items-start gap-1">
+                  <span className="block max-w-full truncate" title={item.clientName}>
+                    {item.clientName}
+                  </span>
+                  <ClientOnlineStatus client={clientById.get(item.clientId)} />
+                </div>
               </TableCell>
               <TableCell>
                 <code className="block truncate" title={item.route}>
@@ -573,6 +588,18 @@ export function HttpRoutesPanel() {
         danger
       />
     </div>
+  );
+}
+
+function ClientOnlineStatus({ client }: { client?: Client }) {
+  if (!client) {
+    return <StatusChip>状态未知</StatusChip>;
+  }
+
+  return (
+    <StatusChip tone={onlineTone(client.online, !client.enabled)}>
+      {client.online ? "在线" : "离线"}
+    </StatusChip>
   );
 }
 
