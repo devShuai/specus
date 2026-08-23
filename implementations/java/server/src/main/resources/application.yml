@@ -1,5 +1,11 @@
 server:
   port: 8088
+  tomcat:
+    # DSM emits icon template placeholders such as {0} without percent-encoding them.
+    # Keep the relaxation limited to braces; the tunnel encodes them before forwarding.
+    relaxed-query-chars:
+      - "{"
+      - "}"
 
 spring:
   servlet:

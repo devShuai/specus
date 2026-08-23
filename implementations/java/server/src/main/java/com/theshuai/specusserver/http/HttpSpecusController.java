@@ -148,7 +148,7 @@ public class HttpSpecusController {
             metadata.put("method", request.getMethod());
             metadata.put("route", route);
             metadata.put("relativePath", relativePath);
-            metadata.put("rawQuery", request.getQueryString());
+            metadata.put("rawQuery", HttpQueryStringCodec.encodeForForwarding(request.getQueryString()));
             metadata.put("headers", forwardedHeaders);
             List<String> requestTrailerNames = declaredTrailerNames(
                     request.getHeaders("Trailer"), access.credentialsConsumed());

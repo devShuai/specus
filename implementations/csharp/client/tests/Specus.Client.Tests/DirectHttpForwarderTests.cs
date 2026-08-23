@@ -19,6 +19,18 @@ public class DirectHttpForwarderTests
     }
 
     [Fact]
+    public void BuildTarget_PreservesEncodedQueryBracesFromServer()
+    {
+        var ok = DirectHttpForwarder.TryBuildTarget(
+            "http://upstream.local", "/webapi/entry.cgi", "path=icon_%7B0%7D.png",
+            out var target, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal("/webapi/entry.cgi?path=icon_%7B0%7D.png",
+            target.GetComponents(UriComponents.PathAndQuery, UriFormat.UriEscaped));
+    }
+
+    [Fact]
     public void BuildTarget_AcceptsDoubleSlashPathLikeJava()
     {
         var ok = DirectHttpForwarder.TryBuildTarget(

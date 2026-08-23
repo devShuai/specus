@@ -43,6 +43,7 @@ public class ResponseRewriter {
 
     /** 隧道前缀模版：/http/{clientName}/{route} */
     private static final String PREFIX_TEMPLATE = "/http/%s/%s";
+    private static final String RUNTIME_POLYFILL_SRC = "/specus-http-route-runtime.js?v=4";
 
     /**
      * HTML 属性改写：href / src / action / data-href / data-src / poster / background 等以单个 / 开头的值
@@ -76,7 +77,7 @@ public class ResponseRewriter {
             Pattern.CASE_INSENSITIVE);
 
     /**
-     * 在 HTML 中定位 {@code <head>} 开标签的结束位置，用于注入运行时 polyfill。
+     * 在 HTML 中定位 {@code <head>} 开标签的结束位置，用于注入同源外部 runtime polyfill。
      * 不区分大小写，允许 {@code <head>}、{@code <head lang="en">} 等带属性形式。
      */
     private static final Pattern HEAD_TAG_PATTERN = Pattern.compile(
@@ -122,10 +123,10 @@ public class ResponseRewriter {
             rewritten = HTML_PATH_SINGLE_PATTERN.matcher(rewritten).replaceAll("$1$2'" + prefix + "$3'");
             rewritten = rewriteSrcset(rewritten, prefix, HTML_SRCSET_PATTERN, '"');
             rewritten = rewriteSrcset(rewritten, prefix, HTML_SRCSET_SINGLE_PATTERN, '\'');
-            // 注入运行时 polyfill：拦截 fetch / XHR / history / setAttribute / IDL src·href
-            // setter。DSH 一类插件壳用 createElement('script'); el.src = '/plugins/...'，
-            // 只补 setAttribute 会把请求打到站点根路径。JS 文件不做正则改写，避免
-            // "/api"+"/v2"+"/x" 被加三次前缀。
+            // 注入运行时 polyfill：拦截 fetch / XHR / history、DOM URL 属性，以及
+            // innerHTML / insertAdjacentHTML / 动态 CSS URL。DSH 一类插件壳会动态创建
+            // script 和应用图标；只补静态 HTML 会把这些请求打到站点根路径。JS 文件
+            // 不做正则改写，避免 "/api"+"/v2"+"/x" 被加三次前缀。
             rewritten = injectRuntimePolyfill(rewritten, prefix);
         }
         if (contentType.equals("text/css")) {
@@ -169,7 +170,7 @@ public class ResponseRewriter {
     }
 
     /**
-     * 在 HTML 的 {@code <head>} 后注入一段运行时 polyfill。脚本在浏览器执行时拦截：
+     * 在 HTML 的 {@code <head>} 后注入同源外部 runtime polyfill。脚本在浏览器执行时拦截：
      * <ul>
      *   <li>{@code fetch}：string、{@code URL}（DSH 用 {@code new URL('/api/...', origin)}）和 {@code Request}</li>
      *   <li>{@code XMLHttpRequest.prototype.open}、{@code EventSource}、{@code WebSocket}：含同源
@@ -177,6 +178,8 @@ public class ResponseRewriter {
      *   <li>{@code window.history.pushState/replaceState}：第三个参数 url 改写</li>
      *   <li>{@code Element.setAttribute} 以及 {@code HTMLScriptElement.src} 等 IDL setter：
      *       {@code el.src = '/plugins/...'} 不会走 setAttribute，必须单独包一层</li>
+     *   <li>{@code innerHTML / outerHTML / insertAdjacentHTML} 以及动态 CSS {@code url(...)}：
+     *       ExtJS 一类旧应用会用 HTML 字符串或 {@code backgroundImage} 创建应用图标</li>
      * </ul>
      *
      * <p>这是处理 SPA / webpack 拼接 URL 的唯一可靠方式——服务端正则改写无法识别
@@ -184,11 +187,13 @@ public class ResponseRewriter {
      * {@code "/http/c/r/api" + "/http/c/r/v2.0" + "/http/c/r/x"}，多次拼接后路径里出现多个
      * 重复前缀。
      *
-     * <p>注入策略：若 HTML 中找到 {@code <head>}，则在其后注入；否则在文档开头注入。两次访问
-     * 同一页面不会重复注入——因为脚本本身被解析后变成 DOM 节点，不会再被服务端看见。
+     * <p>外部脚本由 {@code script-src 'self'} 放行，不要求上游应用降低 CSP 到
+     * {@code 'unsafe-inline'}。隧道前缀通过 data attribute 传递，不生成任何可执行内联代码。
+     * 若 HTML 中找到 {@code <head>}，则在其后注入；否则在 {@code <html>} 后或文档开头注入。
      */
     private static String injectRuntimePolyfill(String html, String prefix) {
-        String script = buildPolyfillScript(prefix);
+        String script = "<script src=\"" + RUNTIME_POLYFILL_SRC
+                + "\" data-specus-prefix=\"" + escapeHtmlAttribute(prefix) + "\"></script>";
         java.util.regex.Matcher matcher = HEAD_TAG_PATTERN.matcher(html);
         if (matcher.find()) {
             return html.substring(0, matcher.end()) + script + html.substring(matcher.end());
@@ -203,140 +208,13 @@ public class ResponseRewriter {
         return script + html;
     }
 
-    /**
-     * 构造注入到 HTML 的 JavaScript 字符串。模板字面量用单引号包裹避免和 HTML 双引号属性冲突；
-     * 内部使用 IIFE 避免污染全局命名空间，且 try/catch 保证任意 monkey-patch 失败都不影响主页面。
-     */
-    private static String buildPolyfillScript(String prefix) {
-        // 安全转义 prefix（不会含特殊字符，但仍走 JSON 字符串编码防御）
-        String jsPrefix = "'" + prefix.replace("\\", "\\\\").replace("'", "\\'") + "'";
-        return "<script>(function(){try{"
-                + "var P=" + jsPrefix + ";"
-                // string / URL.href / Request.url
-                + "function hrefOf(u){"
-                + "if(typeof u==='string')return u;"
-                + "if(u&&typeof u.href==='string')return u.href;"
-                + "if(u&&typeof u.url==='string')return u.url;"
-                + "return '';"
-                + "}"
-                + "function locParts(){"
-                + "if(typeof location==='undefined')return null;"
-                + "return {http:location.origin,ws:(location.protocol==='https:'?'wss://':'ws://')+location.host};"
-                + "}"
-                // 同源完整 URL 可能由 origin + '/' + '/path' 拼出双斜杠；裸 //host 仍是协议相对 URL
-                + "function normalizePath(path,base){"
-                + "if(path.length>1&&path.charAt(1)==='/'){"
-                + "if(!base)return null;"
-                + "while(path.length>1&&path.charAt(1)==='/')path=path.slice(1);"
-                + "}"
-                + "return path;"
-                + "}"
-                // path-absolute、同源 https、同源 ws/wss；已带前缀或真正的协议相对 URL 跳过
-                + "function need(u){"
-                + "if(typeof u!=='string'||!u)return false;"
-                + "var path=u,loc=locParts(),base=null;"
-                + "if(u.charAt(0)!=='/'){"
-                + "if(!loc)return false;"
-                + "if(u.indexOf(loc.http)===0)base=loc.http;"
-                + "else if(u.indexOf(loc.ws)===0)base=loc.ws;"
-                + "else return false;"
-                + "path=u.slice(base.length);"
-                + "if(!path||path.charAt(0)!=='/')return false;"
-                + "}"
-                + "path=normalizePath(path,base);"
-                + "if(!path)return false;"
-                + "if(path.indexOf(P+'/')===0||path===P||path.indexOf(P+'?')===0||path.indexOf(P+'#')===0)return false;"
-                + "return true;"
-                + "}"
-                + "function fix(u){"
-                + "if(!need(u))return u;"
-                + "if(u.charAt(0)==='/')return P+u;"
-                + "var loc=locParts();"
-                + "var base=u.indexOf(loc.http)===0?loc.http:loc.ws;"
-                + "var path=normalizePath(u.slice(base.length),base);"
-                + "return base+P+path;"
-                + "}"
-                + "function rewriteInput(input){"
-                + "var h=hrefOf(input);"
-                + "if(!h||!need(h))return input;"
-                + "var rewritten=fix(h);"
-                + "if(typeof Request==='function'&&input instanceof Request)return new Request(rewritten,input);"
-                + "return rewritten;"
-                + "}"
-                // fetch：DSH 传 URL 对象（只有 href，没有 url）
-                + "if(typeof fetch==='function'){"
-                + "var of=fetch;"
-                + "window.fetch=function(input,init){"
-                + "try{input=rewriteInput(input);}catch(e){}"
-                + "return of.call(this,input,init);"
-                + "};"
-                + "}"
-                // XMLHttpRequest.open
-                + "if(typeof XMLHttpRequest!=='undefined'){"
-                + "var oo=XMLHttpRequest.prototype.open;"
-                + "XMLHttpRequest.prototype.open=function(m,u){"
-                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
-                + "arguments[1]=u;"
-                + "return oo.apply(this,arguments);"
-                + "};"
-                + "}"
-                // history.pushState / replaceState
-                + "function wrapHistory(name){"
-                + "var orig=history[name];"
-                + "if(typeof orig==='function'){"
-                + "history[name]=function(s,t,u){try{if(typeof u==='string')u=fix(u);}catch(e){}return orig.call(this,s,t,u);};"
-                + "}"
-                + "}"
-                + "if(typeof history!=='undefined'){wrapHistory('pushState');wrapHistory('replaceState');}"
-                // 元素 setAttribute 拦截
-                + "if(typeof Element!=='undefined'){"
-                + "var osa=Element.prototype.setAttribute;"
-                + "var URL_ATTRS={src:1,href:1,action:1,formaction:1,poster:1,background:1,'data-src':1,'data-href':1};"
-                + "Element.prototype.setAttribute=function(n,v){"
-                + "try{if(n&&URL_ATTRS[String(n).toLowerCase()]&&typeof v==='string')v=fix(v);}catch(e){}"
-                + "return osa.call(this,n,v);"
-                + "};"
-                + "}"
-                // IDL setter：createElement('script'); el.src = '/plugins/...' 走这里而不是 setAttribute
-                + "function wrapAttr(N,p){"
-                + "var C=window[N];"
-                + "if(typeof C!=='function'||!C.prototype)return;"
-                + "var proto=C.prototype,from=proto,d;"
-                + "while(from&&!(d=Object.getOwnPropertyDescriptor(from,p)))from=Object.getPrototypeOf(from);"
-                + "if(!d||typeof d.set!=='function')return;"
-                + "var desc={configurable:true,enumerable:d.enumerable,set:function(v){"
-                + "try{if(typeof v==='string')v=fix(v);}catch(e){}"
-                + "d.set.call(this,v);"
-                + "}};"
-                + "if(d.get)desc.get=function(){return d.get.call(this);};"
-                + "Object.defineProperty(proto,p,desc);"
-                + "}"
-                + "var S=['HTMLScriptElement','HTMLImageElement','HTMLIFrameElement','HTMLSourceElement',"
-                + "'HTMLVideoElement','HTMLAudioElement','HTMLEmbedElement','HTMLInputElement','HTMLMediaElement'];"
-                + "for(var si=0;si<S.length;si++){wrapAttr(S[si],'src');wrapAttr(S[si],'srcset');wrapAttr(S[si],'poster');}"
-                + "var H=['HTMLLinkElement','HTMLAnchorElement','HTMLBaseElement','SVGAElement','SVGImageElement'];"
-                + "for(var hi=0;hi<H.length;hi++)wrapAttr(H[hi],'href');"
-                + "wrapAttr('HTMLFormElement','action');"
-                + "wrapAttr('HTMLObjectElement','data');"
-                // EventSource
-                + "if(typeof EventSource==='function'){"
-                + "var OE=EventSource;"
-                + "window.EventSource=function(u,c){"
-                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
-                + "return new OE(u,c);"
-                + "};"
-                + "window.EventSource.prototype=OE.prototype;"
-                + "}"
-                // WebSocket：DSH 传 URL 对象，且把 https origin 改成 wss://host/api/...
-                + "if(typeof WebSocket==='function'){"
-                + "var OW=WebSocket;"
-                + "window.WebSocket=function(u,p){"
-                + "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}"
-                + "return p===undefined?new OW(u):new OW(u,p);"
-                + "};"
-                + "window.WebSocket.prototype=OW.prototype;"
-                + "}"
-                + "}catch(e){console&&console.warn&&console.warn('specus polyfill failed',e);}})();</script>";
+    private static String escapeHtmlAttribute(String value) {
+        return value.replace("&", "&amp;")
+                .replace("\"", "&quot;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\r", "&#13;")
+                .replace("\n", "&#10;");
     }
 
     /**

@@ -51,6 +51,17 @@ func TestBuildTargetRejectsEscapesAndUnsupportedSchemes(t *testing.T) {
 	}
 }
 
+func TestBuildTargetPreservesEncodedQueryBracesFromServer(t *testing.T) {
+	target, err := buildTarget(
+		"http://127.0.0.1:5000", "/webapi/entry.cgi", "path=icon_%7B0%7D.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := target.RequestURI(); got != "/webapi/entry.cgi?path=icon_%7B0%7D.png" {
+		t.Fatalf("RequestURI() = %q", got)
+	}
+}
+
 func TestHTTPRouteSnapshotPreservesAndUpdatesPerRouteTLSPolicy(t *testing.T) {
 	specusClient := New(Config{}, log.New(io.Discard, "", 0))
 	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{

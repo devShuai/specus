@@ -103,7 +103,8 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         attributes.put(WebSocketSpecusHandler.ATTR_CLIENT_NAME, parts.clientName);
         attributes.put(WebSocketSpecusHandler.ATTR_ROUTE, parts.route);
         attributes.put(WebSocketSpecusHandler.ATTR_RELATIVE_PATH, parts.relativePath);
-        attributes.put(WebSocketSpecusHandler.ATTR_RAW_QUERY, http.getQueryString());
+        attributes.put(WebSocketSpecusHandler.ATTR_RAW_QUERY,
+                HttpQueryStringCodec.encodeForForwarding(http.getQueryString()));
         attributes.put(WebSocketSpecusHandler.ATTR_HEADERS,
                 UpstreamBrowserHeaders.rewrite(
                         collectHeaders(http, access.credentialsConsumed()),

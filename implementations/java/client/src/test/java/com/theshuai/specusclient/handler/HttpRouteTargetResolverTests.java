@@ -18,6 +18,14 @@ class HttpRouteTargetResolverTests {
     }
 
     @Test
+    void shouldPreserveEncodedQueryBracesFromServer() {
+        URI target = HttpRouteTargetResolver.buildTarget(
+                "http://127.0.0.1:5000", "/webapi/entry.cgi", "path=icon_%7B0%7D.png");
+
+        assertEquals("path=icon_%7B0%7D.png", target.getRawQuery());
+    }
+
+    @Test
     void shouldRejectUnknownOrEscapingRoute() {
         assertThrows(IllegalArgumentException.class,
                 () -> HttpRouteTargetResolver.buildTarget(null, "/", null));
