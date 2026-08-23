@@ -3742,16 +3742,50 @@ body {
 }
 
 @media (max-width: 639px) {
+  /* 这块原本在窄屏是单列 grid：信息一行、按钮一行，按钮再右对齐，于是房间名、
+     连接状态、邀请入口摊成三四行，中间留大片空白。
+
+     375px 装不下「信息 + 三个 44px 触控按钮」，所以第一行只放房间身份和按钮，
+     其余连接状态在第二行通栏铺开 —— 行数不变，但每行都填满，不再有空列。 */
   .transfer-room-compact {
-    display: grid;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
     gap: 8px;
   }
 
+  /* 信息组占满整行，内部元素紧凑地流动换行。基线对齐，否则徽章和文字
+     各自居中，看起来比实际行数更散。 */
+  .transfer-room-compact > div:first-child {
+    width: 100%;
+    align-items: center;
+    gap: 6px 8px;
+  }
+
+  /* 「房间」这个前缀标签在窄屏是冗余的：紧跟着的就是房间名，旁边还有角色徽章。
+     去掉它能省下 32px，正好让身份和状态并成一行。 */
+  .transfer-room-compact > div:first-child > span:first-child {
+    display: none;
+  }
+
+  /* 设备名（可点击复制）在窄屏截断成 1247 这类片段，既读不出完整名字也占地方。
+     它在设置面板里有完整展示，这里让出空间给连接状态。 */
+  .transfer-room-compact > div:first-child > button[title="点击复制设备名称"] {
+    display: none;
+  }
+
+  /* 按钮独占一行时右对齐会在左边留一条空带。让「邀请 / 加入」吃掉剩余宽度：
+     它是这一行的主操作，放大触控目标正好，另外两个保持自身尺寸。 */
   .transfer-room-controls {
     width: 100%;
-    justify-content: flex-end;
+    flex-wrap: nowrap;
+    gap: 6px;
     border-top: 1px solid var(--app-apple-line);
     padding-top: 8px;
+  }
+
+  .transfer-room-controls > button:nth-last-child(2) {
+    flex: 1 1 auto;
   }
 
   .transfer-room-tools .app-apple-tool-tab {
