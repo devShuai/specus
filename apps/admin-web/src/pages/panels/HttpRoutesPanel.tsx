@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Button,
   Chip,
@@ -41,6 +41,7 @@ import {
   validateHttpRouteAuth,
   type HttpRouteAuthDraft,
 } from "./httpRouteAuth";
+import { findHttpRouteClient } from "./httpRouteClient";
 
 const PAGE_SIZE = 10;
 type RouteToggleField = "enabled" | "detailCaptureEnabled" | "mediaCaptureEnabled" | "pathRewriteEnabled";
@@ -50,9 +51,9 @@ function pendingKey(id: number, field: RouteToggleField): string {
 }
 
 export function HttpRoutesPanel() {
-  const { clients, reload: reloadClients } = useClients();
+  const { clients, loading: clientsLoading, reload: reloadClients } = useClients();
   const [routes, setRoutes] = useState<HttpRoute[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [routesLoading, setRoutesLoading] = useState(true);
   const [filterClientId, setFilterClientId] = useState("");
   const [createClientId, setCreateClientId] = useState("");
   const [route, setRoute] = useState("");
@@ -72,13 +73,13 @@ export function HttpRoutesPanel() {
   const editModal = useDisclosure();
 
   const load = useCallback(async () => {
-    setLoading(true);
+    setRoutesLoading(true);
     try {
       setRoutes(await adminApi.listHttpRoutes(filterClientId ? Number(filterClientId) : undefined));
     } catch (error) {
       notifyError(error, "加载 HTTP 路由失败");
     } finally {
-      setLoading(false);
+      setRoutesLoading(false);
     }
   }, [filterClientId]);
 
@@ -199,10 +200,11 @@ export function HttpRoutesPanel() {
   const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pagedRoutes = routes.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
-  const clientById = useMemo(
-    () => new Map(clients.map((client) => [client.id, client])),
-    [clients],
-  );
+  const loading = routesLoading || clientsLoading;
+  // Both list renderers keep rendering non-empty items while isLoading=true.
+  // Hide route rows until the client lookup is ready so a fast route response
+  // cannot briefly turn every association into "状态未知".
+  const displayedRoutes = loading ? [] : pagedRoutes;
   const createAuthDraft: HttpRouteAuthDraft = {
     enabled: authEnabled,
     username: authUsername,
@@ -332,7 +334,7 @@ export function HttpRoutesPanel() {
       {/* mobile: 卡片堆叠 */}
       <div className="xl:hidden">
         <MobileListCardList
-          items={pagedRoutes}
+          items={displayedRoutes}
           isLoading={loading}
           emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}
           renderCard={(raw) => {
@@ -351,7 +353,7 @@ export function HttpRoutesPanel() {
                   <div className="flex flex-col gap-0.5">
                     <div className="flex flex-wrap items-center gap-2">
                       <span>{item.clientName}</span>
-                      <ClientOnlineStatus client={clientById.get(item.clientId)} />
+                      <ClientOnlineStatus client={findHttpRouteClient(item, clients)} />
                     </div>
                     <code className="break-all">{item.targetBaseUrl || "-"}</code>
                   </div>
@@ -468,7 +470,7 @@ export function HttpRoutesPanel() {
           <TableColumn className="w-[10%]">更新时间</TableColumn>
           <TableColumn className="w-[10%]">操作</TableColumn>
         </TableHeader>
-        <TableBody items={pagedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
+        <TableBody items={displayedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
           {(item) => {
             return (
             <TableRow key={item.id}>
@@ -482,7 +484,7 @@ export function HttpRoutesPanel() {
                   <span className="block max-w-full truncate" title={item.clientName}>
                     {item.clientName}
                   </span>
-                  <ClientOnlineStatus client={clientById.get(item.clientId)} />
+                  <ClientOnlineStatus client={findHttpRouteClient(item, clients)} />
                 </div>
               </TableCell>
               <TableCell>
