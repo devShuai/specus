@@ -47,12 +47,10 @@ export function validateTransferRoomSettings(
 
 export function resolveTransferPeerSelection(
   currentPeerId: string,
-  visiblePeerIds: readonly string[],
+  _visiblePeerIds: readonly string[],
 ): string {
-  if (currentPeerId && visiblePeerIds.includes(currentPeerId)) {
-    return currentPeerId;
-  }
-  return visiblePeerIds[0] ?? "";
+  // Preserve an explicit, possibly offline target. Discovery must never choose a recipient.
+  return currentPeerId;
 }
 
 export function localizeTransferDiscoveryError(message: string): string {

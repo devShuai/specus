@@ -41,11 +41,11 @@ describe("transfer room settings", () => {
     });
   });
 
-  it("defaults to the first peer while retaining an available explicit target", () => {
+  it("never selects a recipient or replaces an offline explicit target", () => {
     expect(resolveTransferPeerSelection("peer-b", ["peer-a", "peer-b"])).toBe("peer-b");
-    expect(resolveTransferPeerSelection("peer-a", ["peer-b"])).toBe("peer-b");
-    expect(resolveTransferPeerSelection("", ["peer-b"])).toBe("peer-b");
-    expect(resolveTransferPeerSelection("peer-a", [])).toBe("");
+    expect(resolveTransferPeerSelection("peer-a", ["peer-b"])).toBe("peer-a");
+    expect(resolveTransferPeerSelection("", ["peer-b"])).toBe("");
+    expect(resolveTransferPeerSelection("peer-a", [])).toBe("peer-a");
   });
 
   it("keeps raw server diagnostics out of the primary discovery message", () => {

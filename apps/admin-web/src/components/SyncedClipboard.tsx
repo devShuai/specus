@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ClipboardEvent as ReactClipboardEvent } from "react";
-import { Button, Chip } from "@heroui/react";
+import { Button, Chip, Switch } from "@heroui/react";
+import { clipboardQuickSendAllowed } from "../lib/transferExperience";
 import {
   CLIPBOARD_TEXT_MAX_CHARS,
   CLIPBOARD_TEXT_MAX_UTF8_BYTES,
@@ -39,7 +40,7 @@ interface SyncedClipboardProps {
   targetPeerLabel: string;
   events: ClipboardInboundEvent[];
   onSend: (payload: ClipboardSyncPayload) => Promise<void>;
-  onFiles: (files: File[]) => void;
+  onFiles: (files: File[]) => boolean;
   onDraftStateChange?: (hasDraft: boolean) => void;
 }
 
@@ -80,10 +81,13 @@ export function SyncedClipboard({
   const draftStorageKeyRef = useRef("");
   const skipDraftPersistRef = useRef(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [composerHtml, setComposerHtml] = useState("");
+  const [quickSend, setQuickSend] = useState(false);
+  const [draftFiles, setDraftFiles] = useState<File[]>([]);
   const [blocks, setBlocks] = useState<ClipboardTextBlock[]>([]);
   const [latestInbound, setLatestInbound] = useState<ClipboardInboundEvent | null>(null);
   const [viewState, setViewState] = useState<ClipboardViewState>("idle");
-  const [statusMessage, setStatusMessage] = useState("粘贴文本、富文本、链接或文件，将直接发送给选中的设备。");
+  const [statusMessage, setStatusMessage] = useState("先粘贴或读取内容，检查接收方后点击发送。");
   const [isSending, setSending] = useState(false);
   const [sendingBlockId, setSendingBlockId] = useState("");
   const [isClipboardWritePending, setClipboardWritePending] = useState(false);
@@ -107,8 +111,14 @@ export function SyncedClipboard({
       setStatusMessage("剪贴板中包含文件，请先从“发送给谁”选择一台设备。");
       return false;
     }
-    onFiles(files);
-    return true;
+    return onFiles(files);
+  };
+
+  const stageClipboardFiles = (files: File[]) => {
+    if (clipboardQuickSendAllowed(quickSend, canSend, targetPeerId) && sendClipboardFiles(files)) return true;
+    setDraftFiles((current) => [...current, ...files]);
+    setStatusMessage(`已添加 ${files.length} 个文件到草稿，尚未发送。`);
+    return false;
   };
 
   const writeClipboardWithTimeout = useCallback(async (text: string, html = "") => {
@@ -177,6 +187,9 @@ export function SyncedClipboard({
     skipDraftPersistRef.current = true;
     draftStorageKeyRef.current = syncKey;
     setComposerDraft(persisted.composerDraft);
+    setComposerHtml("");
+    setDraftFiles([]);
+    setQuickSend(false);
     setBlocks(persisted.blocks);
     onDraftStateChange?.(Boolean(persisted.composerDraft || persisted.blocks.length > 0));
     setLatestInbound(null);
@@ -186,7 +199,7 @@ export function SyncedClipboard({
     setViewState(clipboardWritePendingRef.current ? "writing" : "idle");
     setStatusMessage(clipboardWritePendingRef.current
       ? "正在等待浏览器完成上一条剪贴板写入；完成前不会发起新的本机写入。"
-      : "粘贴文本、富文本、链接或文件，将直接发送给选中的设备。");
+      : "先粘贴或读取内容，检查接收方后点击发送。");
   }, [onDraftStateChange, syncKey]);
 
   useEffect(() => {
@@ -196,8 +209,8 @@ export function SyncedClipboard({
       return;
     }
     writeClipboardDraft(syncKey, composerDraft, blocks);
-    onDraftStateChange?.(Boolean(composerDraft || blocks.length > 0));
-  }, [blocks, composerDraft, onDraftStateChange, syncKey]);
+    onDraftStateChange?.(Boolean(composerDraft || blocks.length > 0 || draftFiles.length > 0));
+  }, [blocks, composerDraft, draftFiles.length, onDraftStateChange, syncKey]);
 
   useEffect(() => {
     if (!isActive
@@ -371,6 +384,7 @@ export function SyncedClipboard({
     const block = createLocalClipboardTextBlock(text, Date.now(), undefined, content);
     setBlocks((current) => prependClipboardTextBlocks(current, [block]));
     setComposerDraft("");
+    setComposerHtml("");
     window.requestAnimationFrame(() => textareaRef.current?.focus());
 
     if (!canSend) {
@@ -404,18 +418,19 @@ export function SyncedClipboard({
         if (generation !== syncGenerationRef.current) {
           return;
         }
-        const filesAccepted = files.length > 0 ? sendClipboardFiles(files) : false;
+        // Reading is always a draft operation, even when paste quick-send is enabled.
+        if (files.length > 0) setDraftFiles((current) => [...current, ...files]);
         if (!text && files.length === 0) {
           setViewState("idle");
           setStatusMessage("系统剪贴板中没有浏览器可读取的内容。");
           return;
         }
         if (text) {
-          addLocalBlock(text, classifyClipboardContent(text, html));
-        } else if (filesAccepted) {
-          setViewState("ready");
-          setStatusMessage(`已读取 ${files.length} 个文件，正在通过文件通道发送。`);
+          setComposerDraft(text);
+          setComposerHtml(html);
         }
+        setViewState("ready");
+        setStatusMessage("已读取到草稿，尚未发送。检查内容后点击发送。");
       })
       .catch((error) => {
         if (generation !== syncGenerationRef.current) {
@@ -448,9 +463,9 @@ export function SyncedClipboard({
       return;
     }
     event.preventDefault();
-    let filesBlockedByMissingTarget = false;
+    let filesStaged = false;
     if (files.length > 0) {
-      if (sendClipboardFiles(files)) {
+      if (stageClipboardFiles(files)) {
         if (!text) {
           setViewState("ready");
           setStatusMessage(`已粘贴 ${files.length} 个文件，正在通过文件通道发送。`);
@@ -459,7 +474,7 @@ export function SyncedClipboard({
       } else if (!text) {
         return;
       } else {
-        filesBlockedByMissingTarget = true;
+        filesStaged = true;
       }
     } else if (!text) {
       return;
@@ -470,11 +485,19 @@ export function SyncedClipboard({
       setStatusMessage(`剪贴板内容超过 ${CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 个字符或 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，未发送。`);
       return;
     }
-    addLocalBlock(text, content);
-    if (filesBlockedByMissingTarget) {
-      // 混合粘贴：文件因未选目标被跳过，与文本结果合并成一条提示，避免文件静默丢弃。
-      setViewState("failed");
-      setStatusMessage("剪贴板中的文件未发送：请先从“发送给谁”选择一台设备；文本已保存，选择设备后可同步。");
+    if (clipboardQuickSendAllowed(quickSend, canSend, targetPeerId)) {
+      addLocalBlock(text, content);
+    } else {
+      setComposerDraft(text);
+      setComposerHtml(content.html ?? "");
+      setViewState("ready");
+      setStatusMessage("内容已放入草稿，尚未发送。");
+    }
+    if (filesStaged) {
+      setViewState("ready");
+      setStatusMessage(clipboardQuickSendAllowed(quickSend, canSend, targetPeerId)
+        ? "文件尚未发送，已保留为草稿；请检查连接后点击“发送这些文件”。"
+        : "文字和文件已保留为草稿，检查接收方后分别点击发送。");
     }
   };
 
@@ -577,9 +600,9 @@ export function SyncedClipboard({
     >
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.07]">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步剪贴板</h2>
+          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">文字与链接</h2>
           <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
-            {canSend ? (targetPeerId ? "粘贴即发送" : "等待设备") : "只读"}
+            {canSend ? (targetPeerId ? quickSend ? "粘贴即发送" : "确认后发送" : "等待选择设备") : "只读"}
           </Chip>
           {blocks.length > 0 && (
             <Chip size="sm" radius="sm" variant="flat">
@@ -597,6 +620,7 @@ export function SyncedClipboard({
       </div>
 
       <div className="flex flex-col gap-3 px-4 py-3">
+        <Switch size="sm" isSelected={quickSend} onValueChange={setQuickSend} isDisabled={!canSend || !targetPeerId}>粘贴即发送（仅本次页面，读取剪贴板仍需确认）</Switch>
         <div className="rounded-xl border border-black/[0.06] bg-gradient-to-b from-white/90 to-white/50 p-3 shadow-sm dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
           <textarea
             ref={textareaRef}
@@ -609,6 +633,7 @@ export function SyncedClipboard({
             onChange={(event) => {
               const value = event.currentTarget.value;
               setComposerDraft(value);
+              setComposerHtml("");
               if (!isClipboardContentWithinLimits(value, "")) {
                 setViewState("failed");
                 setStatusMessage(`文本的 UTF-8 大小超过 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，请删减后再创建文本块。`);
@@ -617,10 +642,10 @@ export function SyncedClipboard({
             onKeyDown={(event) => {
               if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                 event.preventDefault();
-                addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, ""));
+                if (canSend && targetPeerId && !isSending) addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml));
               }
             }}
-            placeholder="粘贴或输入内容，Ctrl/⌘ + Enter 添加"
+            placeholder="粘贴或输入内容，检查后点击发送；Ctrl/⌘ + Enter 发送"
             className="min-h-24 w-full resize-y rounded-lg border border-transparent bg-black/[0.035] px-3.5 py-2.5 font-mono text-small leading-6 text-zinc-950 outline-none transition placeholder:text-zinc-400 hover:bg-black/[0.05] focus:border-primary-500/50 focus:bg-white focus:shadow-[0_0_0_4px_rgba(0,102,204,0.08)] dark:bg-white/[0.05] dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:hover:bg-white/[0.07] dark:focus:border-primary-400/50 dark:focus:bg-black/30"
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
@@ -643,14 +668,24 @@ export function SyncedClipboard({
                 color="primary"
                 radius="sm"
                 size="sm"
-                isDisabled={!composerDraft || !composerWithinLimits}
-                onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, ""))}
+                isDisabled={!composerDraft || !composerWithinLimits || !canSend || !targetPeerId || isSending}
+                onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml))}
               >
-                {canSend && targetPeerId && !isSending ? "添加并同步" : "添加内容"}
+                发送文字
               </Button>
             </div>
           </div>
         </div>
+
+        {draftFiles.length > 0 ? <div className="rounded-lg border border-default-200 p-3 text-small">
+          <p className="break-words">待发送文件：{draftFiles.map((file) => file.name).join("、")}</p>
+          <div className="mt-2 flex gap-2">
+            <Button size="sm" color="primary" isDisabled={!canSend || (fileTargetRequired && !targetPeerId)} onPress={() => {
+              if (sendClipboardFiles(draftFiles)) setDraftFiles([]);
+            }}>发送这些文件</Button>
+            <Button size="sm" variant="light" onPress={() => setDraftFiles([])}>移除文件</Button>
+          </div>
+        </div> : null}
 
         {blocks.length === 0 ? (
           <div className="rounded-lg border border-dashed border-black/15 px-4 py-6 text-center text-small text-zinc-500 dark:border-white/15 dark:text-zinc-400">
@@ -667,7 +702,7 @@ export function SyncedClipboard({
                 isDisabled={isSending || isClipboardWritePending}
                 onPress={clearAllBlocks}
               >
-                清空全部
+                清空记录
               </Button>
             </div>
             {blocks.map((block) => {
@@ -755,7 +790,7 @@ export function SyncedClipboard({
                       isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending}
                       onPress={() => void submitText(block.text, block.id, block.kind, block.html)}
                     >
-                      同步到设备
+                      发送到设备
                     </Button>
                     <Button
                       radius="sm"
@@ -795,7 +830,7 @@ export function SyncedClipboard({
         </div>
 
         <p className="text-tiny leading-5 text-zinc-400 dark:text-zinc-500">
-          内容仅保留在当前页面。不要同步密码、令牌等敏感信息。
+          文字草稿临时保存在当前浏览器标签页，刷新后可恢复；未发送文件刷新后需重新选择。不会持续读取系统剪贴板，请勿发送密码或令牌。
         </p>
       </div>
     </section>

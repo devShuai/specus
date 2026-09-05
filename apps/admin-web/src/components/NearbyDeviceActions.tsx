@@ -4,20 +4,18 @@ import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 /**
  * 设备列表的操作面板。
  *
- * 信息架构以「设备」为主体：先选人，再选做什么——这与 AirDrop 一致，也贴合互传的
- * 真实心智（"发给客厅那台电脑"，而不是"打开文件工具再挑设备"）。三项能力共用一个面板，
- * 避免用户在顶部页签和设备列表之间来回切换。
+ * 这里只提供发送到单台设备的动作。多人白板拥有独立、显式的成员范围，不能混入设备菜单。
  */
 
-export type NearbyDeviceAction = "files" | "clipboard" | "whiteboard";
+export type NearbyDeviceAction = "files" | "clipboard";
 
 interface NearbyDeviceActionsProps {
   isOpen: boolean;
   deviceName: string;
   transportPath?: PeerTransportPath;
-  /** 与本机同一网络时按仅直连策略提示 */
+  /** 与本机同一公网出口时展示自动发现提示 */
   sameLan?: boolean;
-  /** 只读房间等场景下禁止发起写操作，但仍允许查看白板 */
+  /** 只读房间等场景下禁止发起发送操作 */
   canSend: boolean;
   onClose: () => void;
   onSelect: (action: NearbyDeviceAction) => void;
@@ -32,8 +30,7 @@ const ACTIONS: Array<{
   requiresSend: boolean;
 }> = [
   { key: "files", label: "传文件", detail: "选择文件直接发送到这台设备", icon: "↑", requiresSend: true },
-  { key: "clipboard", label: "同步剪贴板", detail: "粘贴文字或图片即时同步", icon: "⧉", requiresSend: true },
-  { key: "whiteboard", label: "同步白板", detail: "一起画图，实时同步", icon: "✎", requiresSend: false },
+  { key: "clipboard", label: "发文字与链接", detail: "先编辑内容，再发送给这台设备", icon: "⧉", requiresSend: true },
 ];
 
 export function NearbyDeviceActions({
@@ -58,11 +55,11 @@ export function NearbyDeviceActions({
           <span className="text-medium font-semibold">{deviceName}</span>
           <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
             {transportPath === "turn"
-              ? "经备用通道连接"
+              ? "中继传输"
               : transportPath === "direct"
                 ? "设备直连"
                 : sameLan
-                  ? "同一网络中的设备"
+                  ? "自动发现的设备（同一公网出口）"
                   : "远程设备"}
           </span>
         </ModalHeader>

@@ -2,6 +2,11 @@ import type { PublicTransferIceConfig } from "../api/types";
 
 export type PeerTransportMode = "auto" | "direct" | "relay";
 
+// Sharing a public address does not guarantee that browser peers can connect
+// directly: client isolation and host firewalls can still block LAN candidates.
+// Keep TURN as the second file-transfer attempt for every peer.
+export const FILE_TRANSFER_TRANSPORT_MODES = ["direct", "relay"] as const;
+
 const TURN_CREDENTIAL_REFRESH_DEFAULT_MS = 30 * 60 * 1000;
 const TURN_CREDENTIAL_REFRESH_MAX_MS = 12 * 60 * 60 * 1000;
 const TURN_CREDENTIAL_REFRESH_RETRY_MS = 30 * 1000;

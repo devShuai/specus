@@ -3762,16 +3762,17 @@ body {
     gap: 6px 8px;
   }
 
-  /* 「房间」这个前缀标签在窄屏是冗余的：紧跟着的就是房间名，旁边还有角色徽章。
-     去掉它能省下 32px，正好让身份和状态并成一行。 */
+  /* 手机也必须显示本机身份，方便另一台设备核对接收方。 */
   .transfer-room-compact > div:first-child > span:first-child {
-    display: none;
+    display: inline;
   }
 
-  /* 设备名（可点击复制）在窄屏截断成 1247 这类片段，既读不出完整名字也占地方。
-     它在设置面板里有完整展示，这里让出空间给连接状态。 */
   .transfer-room-compact > div:first-child > button[title="点击复制设备名称"] {
-    display: none;
+    display: block;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
   }
 
   /* 按钮独占一行时右对齐会在左边留一条空带。让「邀请 / 加入」吃掉剩余宽度：
@@ -3794,6 +3795,16 @@ body {
 
   .transfer-room-settings-modal button {
     min-height: 44px !important;
+  }
+}
+
+@media (max-width: 360px) {
+  .transfer-room-tools .app-apple-tool-tab {
+    padding-inline: 5px;
+  }
+
+  .transfer-room-tools .app-apple-tool-tab .text-small {
+    font-size: 12px;
   }
 }
 

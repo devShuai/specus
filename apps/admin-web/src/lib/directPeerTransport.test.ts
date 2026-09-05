@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PublicTransferIceConfig } from "../api/types";
 import {
   buildPeerRtcConfiguration,
+  FILE_TRANSFER_TRANSPORT_MODES,
   hasTurnIceServer,
   normalizePeerTransportMode,
   turnCredentialRefreshDelayMs,
@@ -19,6 +20,10 @@ const config: PublicTransferIceConfig = {
 };
 
 describe("direct peer transport configuration", () => {
+  it("keeps TURN fallback enabled after the direct file-transfer attempt", () => {
+    expect(FILE_TRANSFER_TRANSPORT_MODES).toEqual(["direct", "relay"]);
+  });
+
   it("keeps TURN candidates out of the Direct connection", () => {
     const rtc = buildPeerRtcConfiguration(config, "direct");
 

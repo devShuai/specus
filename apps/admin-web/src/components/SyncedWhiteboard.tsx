@@ -1638,7 +1638,7 @@ export function SyncedWhiteboard({
       {!isExpanded ? <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>
+            <h2 className="text-base font-semibold text-zinc-950 dark:text-white">多人白板</h2>
             <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
               {isConnected ? "实时同步" : "本地绘制"}
             </Chip>
@@ -1968,7 +1968,7 @@ export function SyncedWhiteboard({
               className={"block h-full w-full bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 "
                 + (isReadOnly ? "pointer-events-none " : selectedTool === "select" ? "touch-pan-x touch-pan-y " : "touch-none ")
                 + cursorClass}
-              aria-label="同步白板画布"
+              aria-label="多人白板画布"
               aria-readonly={isReadOnly}
               tabIndex={0}
               onKeyDown={handleCanvasKeyDown}
@@ -2306,7 +2306,7 @@ export function SyncedWhiteboard({
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
-                  <div className="text-small font-semibold text-zinc-950 dark:text-white">同步白板</div>
+                  <div className="text-small font-semibold text-zinc-950 dark:text-white">多人白板</div>
                   <div className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">当前状态与操作提示</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
