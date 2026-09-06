@@ -1,6 +1,11 @@
 export const HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH = 120;
 export const HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH = 256;
 
+/** New public routes and removal of existing protection require explicit acknowledgement. */
+export function requiresPublicAccessConfirmation(previouslyProtected: boolean | null, nextProtected: boolean): boolean {
+  return !nextProtected && previouslyProtected !== false;
+}
+
 export interface HttpRouteAuthDraft {
   enabled: boolean;
   username: string;

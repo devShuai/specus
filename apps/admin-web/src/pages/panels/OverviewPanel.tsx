@@ -114,6 +114,14 @@ export function OverviewPanel() {
         </Button>
       </div>
 
+      <section className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-primary-200 bg-primary-50/40 p-4" aria-label="接入与发布入口">
+        <div>
+          <h3 className="font-semibold">接入设备，发布第一个服务</h3>
+          <p className="mt-1 text-small text-default-500">下载 → 保存接入配置 → 等待实例上线 → 发布与验证访问</p>
+        </div>
+        <Button as="a" href="#/clients" color="primary" variant="flat">开始接入 / 查看设备</Button>
+      </section>
+
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {cards.map((card) => (
           <Card key={card.label} radius="sm" shadow="sm">

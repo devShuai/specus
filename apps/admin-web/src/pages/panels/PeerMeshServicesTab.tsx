@@ -25,11 +25,13 @@ import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
 import { notify, notifyError } from "../../components/toast";
 import { copyTextWithFeedback } from "../../lib/clipboard";
+import { formatDateTime } from "../../lib/format";
 import {
   groupPeerMeshServices,
   PeerMeshOperationLocks,
   peerServiceAvailability,
   peerServiceSharingControl,
+  peerDirectoryCheckGuidance,
   type PeerMeshServiceInstanceRow,
 } from "./peerMeshServicesModel";
 
@@ -82,6 +84,7 @@ export function PeerMeshServicesTab({
   const [updatingShare, setUpdatingShare] = useState(false);
   const [updatingServices, setUpdatingServices] = useState<Set<number>>(new Set());
   const [testingInstances, setTestingInstances] = useState<Set<string>>(new Set());
+  const [directoryChecks, setDirectoryChecks] = useState<Record<string, { checkedAt: string; result: string; detail: string }>>({});
   const [deletingServices, setDeletingServices] = useState<Set<number>>(new Set());
   const [savingService, setSavingService] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -374,27 +377,32 @@ export function PeerMeshServicesTab({
     await copyTextWithFeedback(row.service.publishedAddress, "已复制虚拟地址");
   };
 
-  const testAvailability = async (row: PeerMeshServiceInstanceRow) => {
+  const checkDirectoryStatus = async (row: PeerMeshServiceInstanceRow) => {
     const lockKey = `test:${row.key}`;
     if (!operationLocks.current.acquire(lockKey)) {
       return;
     }
     setTestingInstances((current) => new Set(current).add(row.key));
     try {
-      const latest = await adminApi.listPeerMeshServices();
+      const [latest, latestSharing] = await Promise.all([adminApi.listPeerMeshServices(), adminApi.peerMeshServiceSharing()]);
       setServices(latest);
+      setSharing(latestSharing);
+      setLoadError(null);
       const service = latest.find((item) => item.id === row.service.id);
       const instance = service?.instances?.find((item) =>
         item.publisherSessionId === row.instance?.publisherSessionId) ?? null;
       const availability = service
-        ? peerServiceAvailability(service, instance, Boolean(sharing?.effectiveEnabled))
-        : { available: false, reason: "服务已撤回或删除" };
-      if (!availability.available) {
-        throw new Error(availability.reason);
-      }
-      notify(`目录可用：${service?.name} · 实例 ${instance?.publisherSessionId}`);
+        ? peerServiceAvailability(service, instance, latestSharing.effectiveEnabled)
+        : { available: false, state: "disabled" as const, reason: "服务已撤回或删除" };
+      setDirectoryChecks((current) => ({ ...current, [row.key]: {
+        checkedAt: new Date().toISOString(), result: availability.available ? "目录有效" : availability.reason,
+        detail: peerDirectoryCheckGuidance(availability),
+      } }));
+      notify(`目录检查：${availability.available ? "目录有效，目标连通性未检测" : availability.reason}`, availability.available ? undefined : "error");
     } catch (error) {
-      notifyError(error, "可用性检查失败");
+      setLoadError(error instanceof Error ? error.message : "无法读取 Peer 服务状态");
+      setDirectoryChecks((current) => ({ ...current, [row.key]: { checkedAt: new Date().toISOString(), result: "检查失败，状态未知", detail: "请检查后台连接后重试；本次没有验证目标连通性。" } }));
+      notifyError(error, "目录检查失败");
     } finally {
       setTestingInstances((current) => {
         const next = new Set(current);
@@ -416,6 +424,7 @@ export function PeerMeshServicesTab({
 
   return (
     <section className="space-y-4" aria-busy={loading || updatingShare}>
+      <p className="rounded-md border border-default-200 bg-default-50 p-3 text-small text-default-600">目录状态仅说明设备上报是否在线、服务记录是否有效，不代表目标应用可连接。请在已加入私有组网的设备上打开或连接发布地址，验证实际访问。</p>
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger-200 bg-danger-50 p-3 text-small text-danger-700">
           <span>Peer 服务状态未知：{loadError}</span>
@@ -594,7 +603,7 @@ export function PeerMeshServicesTab({
               <TableBody>
                 {group.rows.map((row) => {
                   const service = row.service;
-                  const chip = statusChip(row);
+                  const chip = loadError ? { color: "default" as const, text: "状态未知" } : statusChip(row);
                   const rowBusy = updatingServices.has(service.id)
                     || deletingServices.has(service.id)
                     || testingInstances.has(row.key);
@@ -620,6 +629,9 @@ export function PeerMeshServicesTab({
                       <Chip size="sm" color={chip.color} variant="flat">
                         {chip.text}
                       </Chip>
+                      {directoryChecks[row.key] ? <p role="status" className="mt-2 max-w-64 text-tiny leading-5 text-default-500">
+                        上次检查：{formatDateTime(directoryChecks[row.key].checkedAt)} · {directoryChecks[row.key].result}<br />{directoryChecks[row.key].detail}
+                      </p> : <p className="mt-1 text-tiny text-default-500">目标连通性未检测</p>}
                     </TableCell>
                     <TableCell>
                       <span className="text-tiny text-default-500">{instanceSummary(row)}</span>
@@ -663,12 +675,12 @@ export function PeerMeshServicesTab({
                         <Button
                           size="sm"
                           variant="flat"
-                          title={!sharing?.effectiveEnabled ? "全局服务共享已关闭" : "刷新并核对该运行实例的目录状态"}
+                          title="刷新共享开关与实例上报状态，不检测目标连通性"
                           isLoading={testingInstances.has(row.key)}
-                          isDisabled={rowBusy || !sharing?.effectiveEnabled || !service.enabled || loadError != null}
-                          onPress={() => void testAvailability(row)}
+                          isDisabled={rowBusy || updatingShare}
+                          onPress={() => void checkDirectoryStatus(row)}
                         >
-                          测试可用性
+                          检查目录状态
                         </Button>
                         {isAdmin && (
                           <Button

@@ -10,6 +10,7 @@ import {
   ModalHeader,
   Pagination,
   Switch,
+  Textarea,
   Table,
   TableBody,
   TableCell,
@@ -30,6 +31,8 @@ import { ClientDetailDrawer } from "../../components/ClientDetailDrawer";
 import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
 import { StatusChip, enabledTone, onlineTone } from "../../components/StatusChip";
+import { ClientOnboardingGuide } from "../../components/ClientOnboardingGuide";
+import { buildClientStartupConfig } from "../../lib/clientOnboarding";
 
 const PAGE_SIZE = 10;
 
@@ -72,6 +75,10 @@ export function ClientsPanel() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [editingCredential, setEditingCredential] = useState<ClientCredential | null>(null);
   const [revealedSecret, setRevealedSecret] = useState("");
+  const [revealedApiKey, setRevealedApiKey] = useState("");
+  const [serverBaseUrl, setServerBaseUrl] = useState(window.location.origin);
+  const [clientsLoadError, setClientsLoadError] = useState(false);
+  const [credentialsLoadError, setCredentialsLoadError] = useState(false);
   const clientModal = useDisclosure();
   const credentialModal = useDisclosure();
   const secretModal = useDisclosure();
@@ -82,7 +89,9 @@ export function ClientsPanel() {
     setLoadingClients(true);
     try {
       setClients(await adminApi.listClients());
+      setClientsLoadError(false);
     } catch (error) {
+      setClientsLoadError(true);
       notifyError(error, "加载客户端失败");
     } finally {
       setLoadingClients(false);
@@ -93,7 +102,9 @@ export function ClientsPanel() {
     setLoadingCredentials(true);
     try {
       setCredentials(await adminApi.listClientCredentials());
+      setCredentialsLoadError(false);
     } catch (error) {
+      setCredentialsLoadError(true);
       notifyError(error, "加载接入凭证失败");
     } finally {
       setLoadingCredentials(false);
@@ -108,12 +119,35 @@ export function ClientsPanel() {
     void load();
   }, [load]);
 
-  const showSecret = (value?: string) => {
+  const showSecret = (value?: string, credentialApiKey = "") => {
     if (!value) {
       return;
     }
     setRevealedSecret(value);
+    setRevealedApiKey(credentialApiKey);
+    setServerBaseUrl(window.location.origin);
     secretModal.onOpen();
+  };
+
+  const closeSecret = () => {
+    secretModal.onClose();
+    setRevealedSecret("");
+    setRevealedApiKey("");
+  };
+  let startupConfig = "";
+  let startupConfigError = "";
+  if (revealedSecret) {
+    try { startupConfig = buildClientStartupConfig(serverBaseUrl, revealedApiKey, revealedSecret); }
+    catch (error) { startupConfigError = error instanceof Error ? error.message : "请检查服务端地址"; }
+  }
+  const downloadStartupConfig = () => {
+    if (!startupConfig) return;
+    const url = URL.createObjectURL(new Blob([startupConfig], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = "client.jsonc";
+    document.body.appendChild(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notify("已开始下载 client.jsonc；文件含凭证，请妥善保管");
   };
 
   const maxOnlineNumber = Number(maxOnline);
@@ -140,7 +174,7 @@ export function ClientsPanel() {
       setApiKey("");
       setSecret("");
       setMaxOnline("2");
-      showSecret(result.secret);
+      showSecret(result.secret, result.credential.apiKey);
       notify("接入凭证已创建");
       await loadCredentials();
     } catch (error) {
@@ -241,6 +275,9 @@ export function ClientsPanel() {
 
   return (
     <div className="mt-3 flex min-w-0 flex-col gap-5">
+      <ClientOnboardingGuide loading={loadingClients || loadingCredentials} error={clientsLoadError || credentialsLoadError}
+        online={clients.filter((client) => client.enabled && client.online).length} registered={clients.length} credentials={credentials.length}
+        onRefresh={() => void load()} />
       <section className="min-w-0 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -254,7 +291,7 @@ export function ClientsPanel() {
 
         <form className="flex flex-wrap items-end gap-3" onSubmit={createCredential}>
           <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
-          <Input className="w-full sm:w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
+          <Input className="w-full sm:w-56" label="secret" type="password" autoComplete="new-password" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
           <Input
             className="w-full sm:w-44"
             type="number"
@@ -455,30 +492,36 @@ export function ClientsPanel() {
         {clientPagination.pager}
       </section>
 
-      <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value) => {
-        showSecret(value);
+      <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value, currentApiKey) => {
+        showSecret(value, currentApiKey);
         void loadCredentials();
       }} />
 
       <EditClientModal disclosure={clientModal} client={editingClient} onSaved={() => void loadClients()} />
 
-      <Modal isOpen={secretModal.isOpen} onOpenChange={secretModal.onOpenChange}>
+      <Modal isOpen={secretModal.isOpen} onClose={closeSecret} size="2xl" scrollBehavior="inside">
         <ModalContent>
-          {(onClose) => (
+          {() => (
             <>
-              <ModalHeader>客户端 secret（仅显示一次）</ModalHeader>
-              <ModalBody>
-                <Input value={revealedSecret} isReadOnly onFocus={(event) => event.target.select()} />
+              <ModalHeader>保存接入配置（凭证仅显示一次）</ModalHeader>
+              <ModalBody className="gap-3">
+                <p className="text-small text-warning">配置包含接入凭证，请只交给要接入的设备。关闭后本页不再保留；不要上传到仓库或发送给他人。</p>
+                <Input label="服务端地址" description="需能从客户端设备访问；前端与服务端分开部署时，请改为实际服务端地址。" value={serverBaseUrl} onValueChange={setServerBaseUrl} isInvalid={Boolean(startupConfigError)} errorMessage={startupConfigError} />
+                <Input label="apiKey" value={revealedApiKey} isReadOnly />
+                <Textarea label="client.jsonc（含敏感凭证）" value={startupConfig} isReadOnly minRows={5} classNames={{ input: "font-mono text-tiny" }} />
+                <p className="text-small text-default-500">保存为 client.jsonc 后，按所选客户端的启动说明运行。实例首次登录后才会出现在列表中。</p>
               </ModalBody>
-              <ModalFooter>
+              <ModalFooter className="flex-wrap">
                 <Button
                   variant="flat"
-                  onPress={() => void copyTextWithFeedback(revealedSecret)}
+                  isDisabled={!startupConfig}
+                  onPress={() => void copyTextWithFeedback(startupConfig, "接入配置已复制，请妥善保存")}
                 >
-                  复制
+                  复制配置
                 </Button>
-                <Button color="primary" onPress={onClose}>
-                  我已保存
+                <Button variant="flat" isDisabled={!startupConfig} onPress={downloadStartupConfig}>下载配置</Button>
+                <Button color="primary" onPress={closeSecret}>
+                  关闭配置
                 </Button>
               </ModalFooter>
             </>
@@ -502,7 +545,7 @@ export function ClientsPanel() {
 interface EditCredentialModalProps {
   disclosure: ReturnType<typeof useDisclosure>;
   credential: ClientCredential | null;
-  onSaved: (secret?: string) => void;
+  onSaved: (secret?: string, apiKey?: string) => void;
 }
 
 function EditCredentialModal({ disclosure, credential, onSaved }: EditCredentialModalProps) {
@@ -519,7 +562,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
       setEnabled(credential.enabled);
       setMaxOnline(String(credential.maxOnlineInstances));
     }
-  }, [credential]);
+  }, [credential, disclosure.isOpen]);
 
   const maxOnlineNumber = Number(maxOnline);
   const maxOnlineError = !maxOnline.trim()
@@ -542,7 +585,8 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
       });
       notify("接入凭证已更新");
       disclosure.onClose();
-      onSaved(result.secret);
+      setSecret("");
+      onSaved(result.secret, result.credential.apiKey);
     } catch (error) {
       notifyError(error, "更新失败");
     } finally {
@@ -558,7 +602,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
             <ModalHeader>编辑接入凭证「{credential?.apiKey}」</ModalHeader>
             <ModalBody className="gap-3">
               <Input label="apiKey" value={apiKey} onValueChange={setApiKey} isRequired />
-              <Input label="secret" placeholder="留空保留原 secret" value={secret} onValueChange={setSecret} />
+              <Input label="secret" type="password" autoComplete="new-password" placeholder="留空保留原 secret" value={secret} onValueChange={setSecret} />
               <Input
                 type="number"
                 label="在线实例上限"

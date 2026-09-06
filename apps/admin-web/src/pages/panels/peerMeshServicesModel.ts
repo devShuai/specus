@@ -10,6 +10,14 @@ export interface PeerMeshServiceAvailability {
   state: "available" | "disabled" | "offline" | "expired" | "unreported";
 }
 
+export function peerDirectoryCheckGuidance(availability: PeerMeshServiceAvailability): string {
+  if (availability.available) return "目标连通性未检测；请在已加入私有组网的设备上实际访问发布地址。";
+  if (availability.state === "disabled") return "请检查全局共享开关和服务配置是否启用。";
+  if (availability.state === "offline") return "请启动发布端客户端，恢复网络后再次检查。";
+  if (availability.state === "expired") return "请检查发布端连接与服务上报，等待目录更新后重试。";
+  return "请确认客户端已收到服务配置并上报运行实例。";
+}
+
 export interface PeerMeshServiceInstanceRow {
   key: string;
   service: PeerMeshSharedService;

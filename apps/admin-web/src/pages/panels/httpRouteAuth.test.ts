@@ -4,6 +4,7 @@ import {
   HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH,
   HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH,
   validateHttpRouteAuth,
+  requiresPublicAccessConfirmation,
   type HttpRouteAuthDraft,
 } from "./httpRouteAuth";
 
@@ -18,6 +19,13 @@ function draft(overrides: Partial<HttpRouteAuthDraft> = {}): HttpRouteAuthDraft 
 }
 
 describe("HTTP route Basic authentication", () => {
+  it("requires explicit confirmation for public creation or removal of protection", () => {
+    expect(requiresPublicAccessConfirmation(null, false)).toBe(true);
+    expect(requiresPublicAccessConfirmation(true, false)).toBe(true);
+    expect(requiresPublicAccessConfirmation(false, false)).toBe(false);
+    expect(requiresPublicAccessConfirmation(null, true)).toBe(false);
+    expect(requiresPublicAccessConfirmation(true, true)).toBe(false);
+  });
   it("does not require credentials for a public route", () => {
     expect(validateHttpRouteAuth(draft({ enabled: false, username: "", password: "" }))).toBe("");
     expect(buildHttpRouteAuthMutation(draft({ enabled: false }))).toEqual({ authEnabled: false });

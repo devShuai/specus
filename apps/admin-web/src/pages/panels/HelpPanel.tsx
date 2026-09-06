@@ -7,6 +7,7 @@ import {
   MACOS_HOMEBREW_UPGRADE_COMMAND,
 } from "../../lib/macosInstall";
 import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
+import { CLIENT_ONBOARDING_STEPS } from "../../lib/clientOnboarding";
 
 const HELP_TABS = [
   "quickstart",
@@ -154,31 +155,11 @@ function QuickStartSection() {
         </p>
       </DocCard>
 
-      <DocCard title="2. 创建客户端账号">
-        <p>
-          进入「客户端」面板「新建客户端」，系统会自动生成客户端和启动凭证。API Key + Secret 用于客户端启动时
-          调用 HTTP 登录接口。Secret 仅展示一次，复制保存到客户端配置文件。
-        </p>
-      </DocCard>
-
-      <DocCard title="3. 配置端口映射 / HTTP 路由">
-        <ul className="ml-5 list-disc space-y-1">
-          <li>
-            <b>端口映射</b>：把公网 TCP 端口（如 9000）转发到客户端内网的目标地址端口（如 127.0.0.1:8080）。
-          </li>
-          <li>
-            <b>HTTP 路由</b>：通过 <Inline>https://server/http/&#123;clientName&#125;/&#123;route&#125;/...</Inline> 转发到客户端内网的 HTTP 服务，
-            支持路径改写（让内网应用绝对路径可以正常工作）。
-          </li>
-        </ul>
-      </DocCard>
-
-      <DocCard title="4. 下载并启动客户端">
-        <p>
-          打开「客户端下载」面板获取对应实现的客户端，按下面各 Tab 的说明启动。所有实现共享同一份 JSONC 配置格式。
-          端口映射、HTTP 路由和私有组网配置都由服务端登录响应下发。
-        </p>
-      </DocCard>
+      {CLIENT_ONBOARDING_STEPS.map((step, index) => <DocCard key={step.title} title={`${index + 2}. ${step.title}`}>
+        <p>{step.detail}</p>
+        <Button as="a" href={step.href} size="sm" variant="flat" className="mt-3">{step.action}</Button>
+        {index === 3 ? <p className="mt-3 text-small text-default-500">端口映射会开放公网 TCP 端口；HTTP 路由可设置访问用户名和密码。创建配置和设备在线都不等于目标应用已经验证成功。</p> : null}
+      </DocCard>)}
     </div>
   );
 }

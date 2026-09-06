@@ -69,6 +69,9 @@ export function ClientDownloadsPanel() {
       </div>
 
       <MacosInstallGuide />
+      <div className="rounded-md border border-primary-200 bg-primary-50/40 p-3 text-small">
+        下载完成后，先 <a className="font-medium text-primary underline" href="#/clients">创建接入凭证并保存配置</a>，再按 <a className="font-medium text-primary underline" href="#/help/quickstart">启动说明</a> 运行客户端。首次登录生成实例后即可选择它发布服务，建议先确认设备在线。
+      </div>
 
       {error ? (
         <div

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Button,
+  Checkbox,
   Chip,
   Dropdown,
   DropdownItem,
@@ -13,6 +14,8 @@ import {
   ModalFooter,
   ModalHeader,
   Pagination,
+  Radio,
+  RadioGroup,
   Select,
   SelectItem,
   Switch,
@@ -39,6 +42,7 @@ import {
   HTTP_ROUTE_AUTH_PASSWORD_MAX_LENGTH,
   HTTP_ROUTE_AUTH_USERNAME_MAX_LENGTH,
   validateHttpRouteAuth,
+  requiresPublicAccessConfirmation,
   type HttpRouteAuthDraft,
 } from "./httpRouteAuth";
 import { findHttpRouteClient } from "./httpRouteClient";
@@ -51,7 +55,7 @@ function pendingKey(id: number, field: RouteToggleField): string {
 }
 
 export function HttpRoutesPanel() {
-  const { clients, loading: clientsLoading, reload: reloadClients } = useClients();
+  const { clients, loading: clientsLoading, error: clientsError, reload: reloadClients } = useClients();
   const [routes, setRoutes] = useState<HttpRoute[]>([]);
   const [routesLoading, setRoutesLoading] = useState(true);
   const [filterClientId, setFilterClientId] = useState("");
@@ -59,7 +63,7 @@ export function HttpRoutesPanel() {
   const [route, setRoute] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
   const [verifyTlsCertificate, setVerifyTlsCertificate] = useState(true);
-  const [authEnabled, setAuthEnabled] = useState(false);
+  const [authEnabled, setAuthEnabled] = useState(true);
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authValidationVisible, setAuthValidationVisible] = useState(false);
@@ -68,7 +72,7 @@ export function HttpRoutesPanel() {
   const [editing, setEditing] = useState<HttpRoute | null>(null);
   const pendingKeysRef = useRef<Set<string>>(new Set());
   const [pendingKeys, setPendingKeys] = useState<Set<string>>(new Set());
-  const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
+  const [confirm, setConfirm] = useState<{ title: string; description: string; confirmLabel?: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
   const editModal = useDisclosure();
 
@@ -93,7 +97,8 @@ export function HttpRoutesPanel() {
 
   const onCreate = async (event: FormEvent) => {
     event.preventDefault();
-    if (!createClientId) {
+    if (creating || clientsLoading) return;
+    if (clientsError || !clients.some((client) => String(client.id) === createClientId)) {
       notify("请先选择客户端", "error");
       return;
     }
@@ -109,32 +114,44 @@ export function HttpRoutesPanel() {
       notify(authError, "error");
       return;
     }
-    setCreating(true);
-    try {
-      const created = await adminApi.createHttpRoute(Number(createClientId), {
-        route: route.trim(),
-        targetBaseUrl: targetBaseUrl.trim(),
-        enabled: true,
-        detailCaptureEnabled: false,
-        mediaCaptureEnabled: false,
-        pathRewriteEnabled: false,
-        insecureSkipVerify: !verifyTlsCertificate,
-        ...buildHttpRouteAuthMutation(authDraft),
+    const publish = async () => {
+      setCreating(true);
+      try {
+        const created = await adminApi.createHttpRoute(Number(createClientId), {
+          route: route.trim(),
+          targetBaseUrl: targetBaseUrl.trim(),
+          enabled: true,
+          detailCaptureEnabled: false,
+          mediaCaptureEnabled: false,
+          pathRewriteEnabled: false,
+          insecureSkipVerify: !verifyTlsCertificate,
+          ...buildHttpRouteAuthMutation(authDraft),
+        });
+        setRoute("");
+        setTargetBaseUrl("");
+        setVerifyTlsCertificate(true);
+        setAuthEnabled(true);
+        setAuthUsername("");
+        setAuthPassword("");
+        setAuthValidationVisible(false);
+        setLastCreatedAccessUrl(httpRouteAccessUrl(created));
+        notify("HTTP 路由已创建，请打开访问链接验证目标应用");
+        await load();
+      } catch (error) {
+        notifyError(error, "创建失败");
+      } finally {
+        setCreating(false);
+      }
+    };
+    if (requiresPublicAccessConfirmation(null, authEnabled)) {
+      setConfirm({
+        title: "确认公开发布 HTTP 服务？",
+        description: `将 ${clients.find((client) => String(client.id) === createClientId)?.clientName} 的 ${targetBaseUrl.trim()} 发布为路由“${route.trim()}”。任何可访问此服务器的人都可能访问该应用，无需登录管理后台；链接不是访问口令。可在路由中开启认证或停用以撤销访问。`,
+        confirmLabel: "确认公开发布",
+        action: publish,
       });
-      setRoute("");
-      setTargetBaseUrl("");
-      setVerifyTlsCertificate(true);
-      setAuthEnabled(false);
-      setAuthUsername("");
-      setAuthPassword("");
-      setAuthValidationVisible(false);
-      setLastCreatedAccessUrl(httpRouteAccessUrl(created));
-      notify("HTTP 路由已创建");
-      await load();
-    } catch (error) {
-      notifyError(error, "创建失败");
-    } finally {
-      setCreating(false);
+    } else {
+      await publish();
     }
   };
 
@@ -215,6 +232,8 @@ export function HttpRoutesPanel() {
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
+      {!clientsLoading && clientsError ? <div role="alert" className="rounded-md border border-danger-200 p-3 text-small text-danger">客户端状态读取失败，暂时不能发布。<Button className="ml-2" size="sm" variant="flat" onPress={() => void reloadClients()}>重新加载客户端</Button></div>
+        : !clientsLoading && clients.length === 0 ? <div className="rounded-md border border-primary-200 bg-primary-50/40 p-3 text-small">尚无客户端实例。请先创建接入凭证并启动客户端，首次登录后才能选择它。<Button as="a" href="#/clients" className="ml-2" size="sm" variant="flat">去接入设备</Button></div> : null}
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
         <Select
           className="w-full sm:w-48"
@@ -222,6 +241,7 @@ export function HttpRoutesPanel() {
           selectedKeys={createClientId ? [createClientId] : []}
           onChange={(event) => setCreateClientId(event.target.value)}
           isRequired
+          isDisabled={clientsLoading || Boolean(clientsError) || clients.length === 0}
         >
           {clients.map((client) => (
             <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
@@ -236,27 +256,20 @@ export function HttpRoutesPanel() {
         >
           验证 HTTPS 证书
         </Switch>
-        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
-          新建路由
-        </Button>
         <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void refresh()}>
           刷新
         </Button>
         <div className="w-full rounded-medium border border-default-200 bg-default-50/70 p-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <Switch
-              size="sm"
-              isSelected={authEnabled}
-              onValueChange={(enabled) => {
+            <HttpRouteAccessChoice
+              enabled={authEnabled}
+              onChange={(enabled) => {
                 setAuthEnabled(enabled);
                 setAuthValidationVisible(false);
               }}
-            >
-              访问认证
-            </Switch>
-            <HttpRouteAuthChip enabled={authEnabled} />
+            />
             <span className="text-tiny text-default-500">
-              {authEnabled ? "访问链接时由浏览器验证用户名和密码" : "拥有链接的访问者可直接打开"}
+              {authEnabled ? "访问链接时验证独立的用户名和密码，不使用后台登录账号。请通过 HTTPS 分享。" : "无需登录后台或输入访问密码，知道或猜到地址的人都可能访问。"}
             </span>
           </div>
           {authEnabled ? (
@@ -285,11 +298,20 @@ export function HttpRoutesPanel() {
             </div>
           ) : null}
         </div>
+        <div className="w-full rounded-md border border-default-200 p-3 text-small [overflow-wrap:anywhere]" role="status" aria-label="发布范围摘要">
+          <strong>{authEnabled ? "受保护访问" : "公开访问"}</strong> · {clients.find((client) => String(client.id) === createClientId)?.clientName || "尚未选择设备"} · {route.trim() || "尚未填写路由名"}
+          <p className="mt-1 break-all text-default-500">目标：{targetBaseUrl.trim() || "尚未填写目标地址"}</p>
+          {createClientId && !clients.find((client) => String(client.id) === createClientId)?.online ? <p className="mt-1 text-warning">所选设备当前离线；配置创建后需等待设备上线，再验证访问。</p> : null}
+          {!verifyTlsCertificate ? <p className="mt-1 text-warning">已关闭目标 HTTPS 证书校验，仅用于可信内网自签名服务。</p> : null}
+        </div>
+        <Button className="min-h-11 w-full sm:w-auto" type="submit" color="primary" isLoading={creating} isDisabled={clientsLoading || Boolean(clientsError) || !createClientId}>
+          {authEnabled ? "发布受保护的服务" : "检查并公开发布"}
+        </Button>
       </form>
 
       {lastCreatedAccessUrl && (
         <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-small border border-success-200 bg-success-50 p-3 text-small">
-          <span className="shrink-0 font-semibold text-success">访问链接</span>
+          <span className="w-full shrink-0 font-semibold text-success sm:w-auto">已创建 · 待验证访问</span>
           <a
             className="min-w-0 flex-1 break-all font-mono text-primary underline-offset-2 hover:underline"
             href={lastCreatedAccessUrl}
@@ -585,8 +607,8 @@ export function HttpRoutesPanel() {
         onClose={() => setConfirm(null)}
         onConfirm={() => confirm?.action()}
         title={confirm?.title ?? ""}
-        description={confirm?.description}
-        confirmLabel="删除"
+        description={<span className="[overflow-wrap:anywhere]">{confirm?.description}</span>}
+        confirmLabel={confirm?.confirmLabel ?? "删除"}
         danger
       />
     </div>
@@ -640,6 +662,13 @@ function HttpRouteAuthChip({ enabled }: { enabled: boolean }) {
       {enabled ? "Basic" : "公开"}
     </Chip>
   );
+}
+
+function HttpRouteAccessChoice({ enabled, onChange }: { enabled: boolean; onChange: (enabled: boolean) => void }) {
+  return <RadioGroup label="访问范围" orientation="horizontal" value={enabled ? "protected" : "public"} onValueChange={(value) => onChange(value === "protected")}>
+    <Radio value="protected">受保护访问（用户名与密码）</Radio>
+    <Radio value="public">公开访问（无需认证）</Radio>
+  </RadioGroup>;
 }
 
 function RouteAuthIcon({ locked }: { locked: boolean }) {
@@ -746,6 +775,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   const [pathRewriteEnabled, setPathRewriteEnabled] = useState(false);
   const [verifyTlsCertificate, setVerifyTlsCertificate] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [publicAccessConfirmed, setPublicAccessConfirmed] = useState(false);
 
   useEffect(() => {
     if (route) {
@@ -761,8 +791,9 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
       setMediaCaptureEnabled(Boolean(route.mediaCaptureEnabled));
       setPathRewriteEnabled(Boolean(route.pathRewriteEnabled));
       setVerifyTlsCertificate(!Boolean(route.insecureSkipVerify));
+      setPublicAccessConfirmed(false);
     }
-  }, [route]);
+  }, [route, disclosure.isOpen]);
 
   const authDraft: HttpRouteAuthDraft = {
     enabled: authEnabled,
@@ -771,9 +802,14 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
     passwordConfigured: authPasswordConfigured,
   };
   const authError = authValidationVisible ? validateHttpRouteAuth(authDraft) : "";
+  const publicConfirmationRequired = requiresPublicAccessConfirmation(Boolean(route?.authEnabled), authEnabled);
 
   const save = async () => {
     if (!route) {
+      return;
+    }
+    if (publicConfirmationRequired && !publicAccessConfirmed) {
+      notify("请先确认公开访问范围，或保持受保护访问", "error");
       return;
     }
     const nextAuthError = validateHttpRouteAuth(authDraft);
@@ -815,16 +851,14 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               <Input label="目标地址" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
               <div className="rounded-medium border border-default-200 bg-default-50/70 p-3">
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                  <Switch
-                    size="sm"
-                    isSelected={authEnabled}
-                    onValueChange={(nextEnabled) => {
+                  <HttpRouteAccessChoice
+                    enabled={authEnabled}
+                    onChange={(nextEnabled) => {
                       setAuthEnabled(nextEnabled);
                       setAuthValidationVisible(false);
+                      setPublicAccessConfirmed(false);
                     }}
-                  >
-                    访问认证
-                  </Switch>
+                  />
                   <HttpRouteAuthChip enabled={authEnabled} />
                 </div>
                 <p className="mt-2 text-tiny text-default-500">
@@ -832,8 +866,9 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
                     ? "浏览器访问该路由时需要输入 HTTP Basic 用户名和密码。"
                     : authPasswordConfigured
                       ? "当前公开访问；已保存的凭据会保留，重新开启后可继续使用。"
-                      : "当前公开访问，拥有链接的访问者可直接打开。"}
+                      : "当前公开访问，无需登录后台或输入访问密码；链接不是访问口令。"}
                 </p>
+                {publicConfirmationRequired ? <Checkbox className="mt-3" isSelected={publicAccessConfirmed} onValueChange={setPublicAccessConfirmed}>我确认关闭访问认证，允许公开访问此内网应用</Checkbox> : null}
                 {authEnabled ? (
                   <div className="mt-3 grid gap-3 border-t border-default-200 pt-3 sm:grid-cols-2">
                     <Input
@@ -886,7 +921,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               <Button variant="flat" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isDisabled={Boolean(authError)} isLoading={saving} onPress={() => void save()}>
+              <Button color="primary" isDisabled={Boolean(authError) || (publicConfirmationRequired && !publicAccessConfirmed)} isLoading={saving} onPress={() => void save()}>
                 保存
               </Button>
             </ModalFooter>

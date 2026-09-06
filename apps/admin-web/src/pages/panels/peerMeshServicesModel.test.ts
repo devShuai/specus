@@ -5,7 +5,14 @@ import {
   PeerMeshOperationLocks,
   peerServiceAvailability,
   peerServiceSharingControl,
+  peerDirectoryCheckGuidance,
 } from "./peerMeshServicesModel";
+
+it("does not claim target connectivity after a directory check", () => {
+  expect(peerDirectoryCheckGuidance({ available: true, state: "available", reason: "目录可用" })).toContain("目标连通性未检测");
+  expect(peerDirectoryCheckGuidance({ available: false, state: "offline", reason: "发布实例已离线" })).toContain("启动发布端客户端");
+  expect(peerDirectoryCheckGuidance({ available: false, state: "expired", reason: "服务目录已过期" })).toContain("目录更新");
+});
 
 function instance(
   publisherSessionId: number,
