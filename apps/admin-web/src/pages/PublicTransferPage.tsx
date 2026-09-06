@@ -29,6 +29,8 @@ import { NearbyDeviceActions } from "../components/NearbyDeviceActions";
 import type { NearbyDeviceAction } from "../components/NearbyDeviceActions";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { TransferFilePreflight } from "../components/TransferFilePreflight";
+import { useFileLeaveWarning } from "../hooks/useFileLeaveWarning";
 import { SyncedClipboard } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
@@ -55,6 +57,7 @@ import type {
   TransferAttachment,
 } from "../api/types";
 import { usePageSeo } from "../lib/seo";
+import { formatDateTime } from "../lib/format";
 import { createQrMatrix } from "../lib/qr";
 import {
   buildTransferInviteUrl,
@@ -76,6 +79,7 @@ import {
 import { sendWhiteboardWithFallback } from "../lib/whiteboardTransport";
 import { decodeLegacyPeerDisplayName } from "../lib/peerDisplayName";
 import { collaborationPeers, keepUncompletedTransfers, transferCompletionLabel } from "../lib/transferExperience";
+import { checkFilePreflight, cloudFallbackPermitted, hasVolatileFileWork, retainVisibleFileActivities, type FilePreflightInput, type FileDeliveryMode } from "../lib/transferPreflight";
 import {
   clipboardSyncEventKey,
   isClipboardSyncPayload,
@@ -184,6 +188,12 @@ interface QueuedFileTransfer {
   ossFallbackAllowed: boolean;
 }
 
+interface DraftFileTransfer extends Pick<QueuedFileTransfer, "roomEpoch" | "roomGeneration" | "roomId" | "roomToken" | "targetPeerId" | "targetPeerLabel" | "targetSameLan"> {
+  files: File[];
+  mode: FileDeliveryMode;
+  allowCloudFallback: boolean;
+}
+
 interface OutgoingTransferActivity {
   id: string;
   file: File;
@@ -191,6 +201,7 @@ interface OutgoingTransferActivity {
   sizeBytes: number;
   targetPeerId: string;
   targetPeerLabel: string;
+  ossFallbackAllowed: boolean;
   status: OutgoingTransferStatus;
   progress: number;
   transferredBytes: number;
@@ -379,6 +390,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [pairingCodeRedeeming, setPairingCodeRedeeming] = useState(false);
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [fileDraft, setFileDraft] = useState<DraftFileTransfer | null>(null);
+  const fileDraftRef = useRef<DraftFileTransfer | null>(null);
+  fileDraftRef.current = fileDraft;
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [selectedPeerName, setSelectedPeerName] = useState("");
   const [fileDeliveryMode, setFileDeliveryMode] = useState<"device" | "link">("device");
@@ -1308,18 +1322,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   };
   const fileTargetRequired = fileDeliveryMode === "device";
   const fileDropzoneTitle = isFileDragActive
-    ? "松开即可发送"
+    ? "松开查看发送前确认"
     : fileTargetRequired && !selectedPeer
       ? peers.length === 0 ? "先邀请接收设备" : "先选择接收设备"
       : isTransferBusy
         ? "继续添加文件"
         : "选择或拖入文件";
   const fileDropzoneDetail = selectedFiles.length > 0
-    ? `${selectedFileTitle} · ${selectedFileDetail}`
+    ? `上次选择：${selectedFileTitle} · ${selectedFileDetail}；再次选择后先确认再发送`
     : fileDeliveryMode === "link"
-      ? "选择后上传文件，生成临时文件链接；不会直接发送给某台设备"
+      ? "先选择文件并查看存储说明，确认后才上传并生成链接"
     : selectedPeer
-      ? `选择后立即发送给 ${discoveryPeerDisplayName(selectedPeer)}`
+      ? `选择后先检查文件和接收方，确认后发送给 ${discoveryPeerDisplayName(selectedPeer)}`
       : selectedPeerId
         ? `${selectedPeerName || "原接收设备"} 已离线，请重新选择接收方`
         : peers.length === 0
@@ -1348,7 +1362,29 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     : 0;
   const unreadFileActivityCount = outgoingActivities.filter((activity) => activity.unread).length
     + unreadIncomingFileCount;
+  const volatileFileWork = hasVolatileFileWork({
+    draftCount: fileDraft?.files.length ?? 0,
+    outgoingCount: activeOutgoingCount + outgoingActivities.filter((activity) => activity.status === "failed").length,
+    receivingCount: receivingTransfers.length + incoming.filter((item) => item.downloading).length,
+    pendingCount: pendingTransfers.length,
+    unsavedIncomingCount: incoming.filter((item) => item.direct && item.downloadProgress !== 100).length,
+  });
+  useFileLeaveWarning(!isDiagramWorkspace && volatileFileWork);
+
+  const preflightInput = (draft: DraftFileTransfer): FilePreflightInput => ({
+    files: draft.files,
+    mode: draft.mode,
+    memoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
+    queuedCount: queuedFileTransfersRef.current.length + (uploadInFlightRef.current ? 1 : 0),
+    signedIn: ossFallbackEnabled,
+    rtcSupported: typeof RTCPeerConnection !== "undefined",
+    recipientOnline: peers.some((peer) => peer.peerId === draft.targetPeerId),
+    discoveryOnline: discoveryStatus === "online",
+    writable: !isRoomReadOnly,
+    scopeCurrent: draft.roomEpoch === roomEpochRef.current && draft.roomGeneration === roomGenerationRef.current,
+  });
   const hasRecoverableRoomContent = isTransferBusy
+    || fileDraft != null
     || activeOutgoingCount > 0
     || selectedFiles.length > 0
     || incoming.length > 0
@@ -1423,6 +1459,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setSelectedPeerName("");
     setFileDeliveryMode("device");
     setSelectedFiles([]);
+    fileDraftRef.current = null;
+    setFileDraft(null);
     fileDragDepthRef.current = 0;
     setFileDragActive(false);
     setProgress(0);
@@ -2139,7 +2177,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         if (!task.targetSameLan) {
           if (!task.ossFallbackAllowed) {
             setState("failed");
-            const message = "设备连接未建立；登录后可使用文件临时存储";
+            const message = "设备连接未建立；本次未允许云端存储。请检查网络后重试，或重新选择文件生成链接。";
             setError(message);
             failOutgoingActivity(task.activityId, message);
             continue;
@@ -2195,12 +2233,16 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (failed) retryOutgoingActivity(failed);
   };
 
-  const acceptFiles = (files: File[], deliveryMode: "device" | "link" = fileDeliveryMode) => {
+  const acceptFiles = (files: File[], deliveryMode: FileDeliveryMode = fileDeliveryMode) => {
     if (isRoomReadOnly) {
       setError("当前为只读访客，不能向房间发送文件");
       return false;
     }
     if (files.length === 0) {
+      return false;
+    }
+    if (fileDraftRef.current) {
+      setError("请先确认或取消当前待发送文件，再添加新文件");
       return false;
     }
     const targetRequired = deliveryMode === "device";
@@ -2218,8 +2260,45 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return false;
     }
 
-    const now = Date.now();
     const targetPeerLabel = targetRequired && selectedPeer ? discoveryPeerDisplayName(selectedPeer) : "文件链接";
+    const draft: DraftFileTransfer = {
+      files, mode: deliveryMode, allowCloudFallback: false,
+      roomEpoch: roomEpochRef.current, roomGeneration: roomGenerationRef.current,
+      roomId, roomToken, targetPeerId: targetRequired ? selectedPeerId : "", targetPeerLabel,
+      targetSameLan: targetRequired && Boolean(selectedPeerId && peerLanMap[selectedPeerId]),
+    };
+    fileDraftRef.current = draft;
+    setFileDraft(draft);
+    setError(null);
+    return true;
+  };
+
+  const cancelFileDraft = () => {
+    fileDraftRef.current = null;
+    setFileDraft(null);
+  };
+
+  const updateFileDraft = (patch: Partial<DraftFileTransfer>) => {
+    const current = fileDraftRef.current;
+    if (!current) return;
+    const next = { ...current, ...patch };
+    fileDraftRef.current = next;
+    setFileDraft(next);
+  };
+
+  const confirmFileDraft = () => {
+    const draft = fileDraftRef.current;
+    if (!draft) return;
+    const preflight = checkFilePreflight(preflightInput(draft));
+    if (!preflight.canSend) {
+      setError(preflight.errors[0]);
+      return;
+    }
+    const files = draft.files;
+    const now = Date.now();
+    const ossFallbackAllowed = draft.mode === "link" || cloudFallbackPermitted(draft.allowCloudFallback, ossFallbackEnabled, draft.targetSameLan);
+    // Consume the draft synchronously so rapid confirmation cannot enqueue it twice.
+    cancelFileDraft();
     const queueItems = files.map((file) => {
       const activityId = `outgoing-${peerId}-${now}-${transferActivitySequenceRef.current += 1}`;
       return {
@@ -2228,8 +2307,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           file,
           fileName: file.name || "attachment",
           sizeBytes: file.size,
-          targetPeerId: targetRequired ? selectedPeerId : "",
-          targetPeerLabel,
+          targetPeerId: draft.targetPeerId,
+          targetPeerLabel: draft.targetPeerLabel,
+          ossFallbackAllowed,
           status: "queued" as const,
           progress: 0,
           transferredBytes: 0,
@@ -2241,27 +2321,26 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         queued: {
           activityId,
           file,
-          roomEpoch: roomEpochRef.current,
-          roomGeneration: roomGenerationRef.current,
-          targetSameLan: targetRequired && Boolean(selectedPeerId && peerLanMap[selectedPeerId]),
-          roomId,
-          roomToken,
-          targetPeerId: targetRequired ? selectedPeerId : "",
-          targetPeerLabel,
-          ossFallbackAllowed: ossFallbackEnabled,
+          roomEpoch: draft.roomEpoch,
+          roomGeneration: draft.roomGeneration,
+          targetSameLan: draft.targetSameLan,
+          roomId: draft.roomId,
+          roomToken: draft.roomToken,
+          targetPeerId: draft.targetPeerId,
+          targetPeerLabel: draft.targetPeerLabel,
+          ossFallbackAllowed,
         } satisfies QueuedFileTransfer,
       };
     });
     queuedFileTransfersRef.current.push(...queueItems.map((item) => item.queued));
-    setOutgoingActivities((activities) => (
-      [...queueItems.map((item) => item.activity), ...activities].slice(0, TRANSFER_ACTIVITY_LIMIT)
+    setOutgoingActivities((activities) => retainVisibleFileActivities(
+      [...queueItems.map((item) => item.activity), ...activities], TRANSFER_ACTIVITY_LIMIT,
     ));
     setSelectedFiles(files);
     setError(null);
     setNotice(files.length > 1 ? `已加入 ${files.length} 个发送任务` : null);
     if (files.length > 1) setActivityCenterOpen(true);
     runQueuedTransfersRef.current();
-    return true;
   };
 
   const canOpenFilePicker = () => {
@@ -2389,6 +2468,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       assertFileTransferTaskCurrent(task);
 
       setState("uploading");
+      setNotice(`服务端已允许本次上传；文件有效期：${presign.attachment.expiresAt ? formatDateTime(presign.attachment.expiresAt) : "未提供"}。正在上传文件内容。`);
       await putObject(
         presign.uploadUrl,
         file,
@@ -2493,9 +2573,20 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   const retryOutgoingActivity = (activity: OutgoingTransferActivity) => {
     if (activity.status !== "failed" && activity.status !== "cancelled") return;
+    if (uploadInFlightRef.current?.activityId === activity.id || queuedFileTransfersRef.current.some((item) => item.activityId === activity.id)) return;
     const peerStillAvailable = !activity.targetPeerId || peers.some((peer) => peer.peerId === activity.targetPeerId);
     if (activity.targetPeerId && !peerStillAvailable) {
       setError("原接收设备已离线。任务目标不会自动更换，请等待对方上线或重新选择文件发送");
+      return;
+    }
+    const preflight = checkFilePreflight(preflightInput({
+      files: [activity.file], mode: activity.targetPeerId ? "device" : "link", allowCloudFallback: activity.ossFallbackAllowed,
+      roomEpoch: roomEpochRef.current, roomGeneration: roomGenerationRef.current, roomId, roomToken,
+      targetPeerId: activity.targetPeerId, targetPeerLabel: activity.targetPeerLabel,
+      targetSameLan: Boolean(activity.targetPeerId && peerLanMap[activity.targetPeerId]),
+    }));
+    if (!preflight.canSend) {
+      setError(preflight.errors[0]);
       return;
     }
     cancelledActivityIdsRef.current.delete(activity.id);
@@ -2520,7 +2611,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       roomToken,
       targetPeerId: activity.targetPeerId,
       targetPeerLabel: activity.targetPeerLabel,
-      ossFallbackAllowed: ossFallbackEnabled,
+      ossFallbackAllowed: cloudFallbackPermitted(activity.ossFallbackAllowed, ossFallbackEnabled, Boolean(activity.targetPeerId && peerLanMap[activity.targetPeerId])),
     });
     setError(null);
     setActivityCenterOpen(true);
@@ -2868,6 +2959,21 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   const sharedModals = (
     <>
+      {fileDraft ? <TransferFilePreflight
+        input={preflightInput(fileDraft)}
+        recipientLabel={fileDraft.targetPeerLabel}
+        allowCloud={fileDraft.allowCloudFallback}
+        canOfferCloudFallback={ossFallbackEnabled && !fileDraft.targetSameLan}
+        onAllowCloud={(allowCloudFallback) => updateFileDraft({ allowCloudFallback })}
+        onModeChange={() => {
+          updateFileDraft({ mode: "link", targetPeerId: "", targetPeerLabel: "文件链接", targetSameLan: false, allowCloudFallback: false });
+          setFileDeliveryMode("link");
+        }}
+        onRemove={(index) => updateFileDraft({ files: fileDraft.files.filter((_, fileIndex) => fileIndex !== index) })}
+        onCancel={cancelFileDraft}
+        onConfirm={confirmFileDraft}
+        onLogin={openLogin}
+      /> : null}
       <NearbyDeviceActions
         isOpen={deviceActionPeerId !== ""}
         deviceName={(() => {
@@ -3214,7 +3320,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     </div>
                     <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
                       {ossFallbackEnabled
-                        ? "生成链接会临时存储文件，需要服务端配置存储且账号额度充足。远程设备连接失败时也可能使用此方式。"
+                        ? "生成链接会临时存储文件，需要服务端配置存储且账号额度充足。设备传输只有在发送前单独允许时，才会在失败后改用临时存储。"
                         : "文件可直接传输或经中继转发，不会创建云端文件副本。"}
                     </p>
                   </PopoverContent>
@@ -3427,7 +3533,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             >
               <span className="transfer-file-add" aria-hidden="true">+</span>
               <span className="app-apple-tool-kicker px-2.5 py-1 text-[10px] font-semibold">
-                {isFileDragActive ? "松开发送" : "点击 · 拖入 · 粘贴"}
+                {isFileDragActive ? "松开检查" : "点击 · 拖入 · 粘贴"}
               </span>
               <span className="mt-4 text-xl font-semibold text-zinc-950 dark:text-white">
                 {fileDropzoneTitle}
@@ -3460,6 +3566,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </Button>
               </div>
             ) : null}
+            {volatileFileWork ? <p role="status" data-testid="transfer-leave-warning" className="mt-3 rounded-md border border-warning-200 bg-warning-50/30 p-3 text-tiny leading-5">
+              当前有待处理文件。离开或刷新会中断传输，文件草稿和未保存的接收文件不会恢复；浏览器可能无法弹出提醒，请先完成传输并保存收到的文件。
+            </p> : null}
           </div>
 
           {state !== "idle" && (
@@ -3569,6 +3678,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
                         {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "持有链接与访问口令的登录用户可下载"}
                       </div>
+                      {!record.direct ? <p className="mt-1 text-tiny text-default-500">文件有效期：{record.attachment.expiresAt ? formatDateTime(record.attachment.expiresAt) : "服务端未提供"}；与房间邀请有效期分别计算。</p> : null}
                     </div>
                     <div className="flex max-w-full flex-wrap items-center gap-1.5">
                       <Button
@@ -5045,7 +5155,7 @@ function TransferFaq({
             : "不可以。未登录时不会上传云端，需要先选择一台在线设备。"}
         </FaqItem>
         <FaqItem title="文件会怎么传？">
-          {`优先直连，连接不通时会尝试中继服务器转发，同一公网出口的设备也可能需要中继。中继不会生成文件存储副本。远程设备仍无法连接时，${ossFallbackEnabled ? "可能使用账号的临时文件存储，接收方需要登录下载。" : "不会上传云端。"}`}
+          {`选择、拖入或粘贴文件后先查看发送前确认。设备文件优先直连，连接不通时尝试 TURN 中继；两者的单文件内存上限均为 128 MiB。中继不会生成云端副本。${ossFallbackEnabled ? "只有在发送前明确允许云端回退时，远程设备连接失败才会改用临时存储；接收方需要登录下载。" : "未登录时不会上传云端。"}`}
         </FaqItem>
         <FaqItem title="为什么有时需要手动写入系统剪贴板？">
           浏览器可能阻止网页改写系统剪贴板。收到的文字仍在页面里，点击“复制到剪贴板”即可重试。本页不会持续读取你在其他应用中复制的内容。
@@ -5054,7 +5164,10 @@ function TransferFaq({
           通过直连或中继转发的文件只到点选设备，不创建云端副本。生成文件链接需要登录并启用临时存储，下载方也需要登录并持有访问口令与文件链接。
         </FaqItem>
         <FaqItem title="云端额度是多少？">
-          登录账号最多占用 1 GiB 有效附件存储，每个 UTC 自然月可使用 1 GiB 下载流量。生成链接不扣额度；首次打开并成功跳转时按文件完整大小计入，链接只能打开一次。
+          存储额度、下载额度、单文件上限和文件保存时长由服务端配置，当前页面无法读取实时剩余额度。申请上传可能预占存储额度；下载授权首次打开并成功跳转时，按文件完整大小计入下载额度。临时下载地址只能使用一次，重新下载需重新申请；这不代表文件分享链接只能用一次。文件有效期以生成结果为准。
+        </FaqItem>
+        <FaqItem title="关闭页面后能继续传吗？">
+          不能。当前传输和文件草稿只存在于页面中，失败重试会从头开始，不支持断点续传。接收完成也不等于已保存到设备，请点击“保存到设备”并检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。
         </FaqItem>
         <FaqItem title="更多说明">
           {sharedRoom

@@ -31,8 +31,9 @@ function roster() {
   for (const recipient of members.values()) {
     recipient.ws.send(JSON.stringify({ type: "roster", rosterRevision: revision, peers: [...members.values()]
       .filter((peer) => peer.peerId !== recipient.peerId && peer.discoverable !== false)
-      .map((peer) => ({ peerId: peer.peerId, displayName: peer.displayName, publicAddress: "198.51.100.10",
-        connectedAt: new Date().toISOString(), roomRole: "EDITOR", sameRoom: peer.roomId === recipient.roomId && peer.roomToken === recipient.roomToken })) }));
+      .map((peer) => ({ peerId: peer.peerId, displayName: peer.displayName,
+        connectedAt: new Date().toISOString(), roomRole: "EDITOR", sameRoom: peer.roomId === recipient.roomId && peer.roomToken === recipient.roomToken,
+        publicAddress: peer.publicAddress })) }));
   }
 }
 function relayFrame(target, source, app) {
@@ -41,11 +42,12 @@ function relayFrame(target, source, app) {
   header.writeUInt16BE(t.length, 6); header.writeUInt16BE(s.length, 8); header.writeUInt32BE(app.length, 10);
   return Buffer.concat([header, t, s, app]);
 }
-async function setup(name, shared = false, mobile = false, noRtc = false, authenticated = false) {
+async function setup(name, shared = false, mobile = false, noRtc = false, authenticated = false, remote = false, brokenRtc = false) {
   const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 },
     isMobile: mobile, hasTouch: mobile, acceptDownloads: true });
-  await context.addInitScript(({ name, noRtc, authenticated }) => {
+  await context.addInitScript(({ name, noRtc, authenticated, brokenRtc }) => {
     if (noRtc) window.RTCPeerConnection = undefined;
+    if (brokenRtc) window.RTCPeerConnection = class { constructor() { throw new Error("isolated RTC failure"); } };
     if (authenticated) sessionStorage.setItem("access_token", "isolated-test-session");
     localStorage.setItem("public-transfer-client-name", name);
     window.__clipboardWrites = [];
@@ -57,7 +59,7 @@ async function setup(name, shared = false, mobile = false, noRtc = false, authen
     } });
     Object.defineProperty(navigator, "canShare", { configurable: true, value: () => false });
     Object.defineProperty(navigator, "share", { configurable: true, value: undefined });
-  }, { name, noRtc, authenticated });
+  }, { name, noRtc, authenticated, brokenRtc });
   let storedAttachment;
   await context.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -89,7 +91,7 @@ async function setup(name, shared = false, mobile = false, noRtc = false, authen
   await context.routeWebSocket("**/ws/public-transfer/discovery?*", (ws) => {
     const body = tickets.get(new URL(ws.url()).searchParams.get("ticket"));
     assert.ok(body, "ticket must be issued before connecting");
-    const peer = { ...body, ws }; members.set(body.peerId, peer);
+    const peer = { ...body, ws, publicAddress: remote ? "203.0.113.20" : "198.51.100.10" }; members.set(body.peerId, peer);
     ws.onMessage((message) => {
       if (typeof message === "string") {
         const value = JSON.parse(message);
@@ -106,7 +108,7 @@ async function setup(name, shared = false, mobile = false, noRtc = false, authen
     ws.onClose(() => { if (members.get(peer.peerId)?.ws === ws) { members.delete(peer.peerId); roster(); } });
     // Let the page attach its handlers before delivering the initial snapshot.
     setTimeout(() => { if (members.get(peer.peerId)?.ws !== ws) return;
-      ws.send(JSON.stringify({ type: "hello", publicAddress: "198.51.100.10", roomRole: body.roomToken ? "OWNER" : "EDITOR" })); roster();
+      ws.send(JSON.stringify({ type: "hello", publicAddress: peer.publicAddress, roomRole: body.roomToken ? "OWNER" : "EDITOR" })); roster();
     }, 60);
   });
   const page = await context.newPage();
@@ -123,6 +125,16 @@ async function paste(page, text) {
     const data = new DataTransfer(); data.setData("text/plain", text);
     el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: data }));
   }, text);
+}
+async function confirmFiles(page, cloud = false) {
+  await page.getByRole("button", { name: cloud ? "确认上传并生成链接" : "确认发送", exact: true }).click();
+}
+async function leaveWarningEnabled(page) {
+  return page.evaluate(() => {
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
 }
 async function boardCount(page) {
   return page.evaluate(() => Object.keys(sessionStorage).filter((key) => key.startsWith("public-transfer-whiteboard-draft:"))
@@ -165,6 +177,17 @@ try {
   await a.page.getByRole("tab", { name: /文件传输/ }).click();
   await b.page.getByRole("tab", { name: /文件传输/ }).click();
   await a.page.locator("#public-transfer-file-input").setInputFiles({ name: "ux-check.txt", mimeType: "text/plain", buffer: Buffer.from("real WebRTC file regression") });
+  const preflight = a.page.getByRole("dialog");
+  await preflight.waitFor();
+  assert.match(await preflight.innerText(), /发送前确认/);
+  assert.match(await preflight.innerText(), /128 MiB/);
+  assert.match(await preflight.innerText(), /不会上传临时存储/);
+  assert.equal(await leaveWarningEnabled(a.page), true);
+  await delay(200);
+  assert.ok(!(await b.page.locator("body").innerText()).includes("ux-check.txt"));
+  await a.page.screenshot({ path: `${output}/file-preflight-desktop.png`, fullPage: true });
+  pass("file selection checks recipient, memory limit and transport before any send");
+  await confirmFiles(a.page);
   await until(async () => await b.page.getByRole("button", { name: "保存到设备", exact: true }).count() > 0, "WebRTC file received", 25000);
   assert.match(await a.page.locator("body").innerText(), /对方已接收/);
   const incomingBox = await b.page.getByRole("heading", { name: "收到的文件" }).boundingBox();
@@ -175,6 +198,9 @@ try {
   const download = await downloadWait;
   assert.equal(download.suggestedFilename(), "ux-check.txt");
   assert.match(await b.page.locator("body").innerText(), /已开始下载/);
+  assert.equal(await leaveWarningEnabled(a.page), false);
+  assert.equal(await leaveWarningEnabled(b.page), false);
+  pass("completed sends and received files with downloads started do not retain the leave guard");
   const inviteCallsBefore = apiCalls.filter((call) => call.path.endsWith("access-tokens")).length;
   const clipboardWritesBefore = (await b.page.evaluate(() => window.__clipboardWrites)).length;
   await b.page.getByRole("button", { name: "系统分享文件", exact: true }).click();
@@ -183,6 +209,21 @@ try {
   assert.equal((await b.page.evaluate(() => window.__clipboardWrites)).length, clipboardWritesBefore);
   await b.page.screenshot({ path: `${output}/mobile-received.png`, fullPage: true });
   pass("real WebRTC file, receiver-first layout, truthful download and no invite fallback");
+  await a.page.locator("#public-transfer-file-input").evaluate((input) => {
+    // Metadata-only oversize fixture: no 129 MiB buffer or real file is read.
+    const file = new File(["fixture"], "oversize.bin");
+    Object.defineProperty(file, "size", { value: 128 * 1024 * 1024 + 1 });
+    const files = new DataTransfer(); files.items.add(file);
+    input.files = files.files; input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await a.page.getByRole("dialog").waitFor();
+  assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
+  assert.match(await a.page.getByRole("dialog").innerText(), /超过设备传输的单文件内存上限/);
+  await a.page.getByRole("button", { name: "移除 oversize.bin", exact: true }).click();
+  assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
+  await a.page.getByRole("button", { name: "取消发送", exact: true }).click();
+  assert.equal(await leaveWarningEnabled(a.page), false);
+  pass("oversize files are rejected before sending; remove and cancel release the draft guard");
   await b.page.getByRole("button", { name: "设置", exact: true }).click();
   const settings = b.page.getByRole("dialog");
   await settings.getByRole("switch", { name: "切换允许被发现" }).click();
@@ -205,6 +246,7 @@ try {
   await delay(250);
   assert.ok(!(await b.page.locator("body").innerText()).includes("staged-file.txt"));
   await a.page.getByRole("button", { name: "发送这些文件", exact: true }).click();
+  await confirmFiles(a.page);
   await b.page.getByRole("button", { name: "拒绝", exact: true }).click();
   await until(async () => (await a.page.locator("body").innerText()).includes("对方拒绝接收"), "rejection remains a failed task");
   pass("pasted files stay staged until an explicit send; receiving confirmation works");
@@ -228,8 +270,14 @@ try {
   await invite.waitFor({ state: "hidden" });
   pass("add-device dialog exposes a distinct pairing-code path");
   const c = await setup("Gamma");
+  await a.page.getByRole("tab", { name: /文件传输/ }).click();
+  await a.page.locator("#public-transfer-file-input").setInputFiles({ name: "offline-draft.txt", mimeType: "text/plain", buffer: Buffer.from("never retarget") });
+  await a.page.getByRole("dialog").waitFor();
   await b.context.close();
   await until(async () => (await a.page.getByTestId("transfer-recipient-bar").innerText()).includes("已离线"), "offline target retained");
+  assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
+  assert.match(await a.page.getByRole("dialog").innerText(), /原接收设备已离线/);
+  await a.page.getByRole("button", { name: "取消发送", exact: true }).click();
   assert.ok(!(await a.page.getByTestId("transfer-recipient-bar").innerText()).includes(`发送给：${c.peer.displayName}`));
   pass("offline recipient is never replaced by another discovered peer");
   await a.page.getByRole("tab", { name: /多人白板/ }).click();
@@ -279,7 +327,24 @@ try {
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
   await logged.page.getByRole("button", { name: "改为生成文件链接", exact: true }).click();
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
+  await logged.page.getByRole("dialog").waitFor();
+  assert.match(await logged.page.getByRole("dialog").innerText(), /存储与额度尚未核验/);
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  assert.equal(await leaveWarningEnabled(logged.page), true);
+  await logged.page.setViewportSize({ width: 320, height: 720 });
+  await delay(350);
+  const fileListBox = await logged.page.getByRole("list", { name: "待确认文件", exact: true }).boundingBox();
+  assert.ok(fileListBox.height > 40, "file list must not collapse out of the mobile preflight");
+  assert.ok(await logged.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+  await logged.page.screenshot({ path: `${output}/file-preflight-mobile.png`, fullPage: true });
+  await logged.page.getByRole("button", { name: "取消发送", exact: true }).click();
+  assert.equal(await leaveWarningEnabled(logged.page), false);
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  pass("cloud preflight is metadata-only, fits mobile and cancels without reserving quota");
+  await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
+  await confirmFiles(logged.page, true);
   await logged.page.getByText("文件链接已生成", { exact: true }).waitFor();
+  assert.match(await logged.page.locator("body").innerText(), /文件有效期：/);
   assert.ok(!(await logged.page.locator("body").innerText()).includes("对方已接收"));
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore + 1);
   pass("signed-in users explicitly choose file links; upload completion is not recipient receipt");
@@ -292,6 +357,29 @@ try {
   await logged.page.screenshot({ path: `${output}/mobile-320-file-link.png`, fullPage: true });
   await logged.context.close();
   pass("file result and recipient controls fit a 320px viewport");
+  const recipient = await setup("Remote-receiver", false, false, false, false, true);
+  const sender = await setup("Fallback-sender", false, false, false, true, false, true);
+  await sender.page.getByRole("radio", { name: recipient.peer.displayName, exact: true }).first().click();
+  const beforeFallback = apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length;
+  await sender.page.locator("#public-transfer-file-input").setInputFiles({ name: "consent.txt", mimeType: "text/plain", buffer: Buffer.from("explicit cloud consent") });
+  const consent = sender.page.getByRole("checkbox", { name: /允许将这些文件上传临时存储/ });
+  await consent.waitFor();
+  assert.equal(await consent.isChecked(), false);
+  await confirmFiles(sender.page);
+  await until(async () => (await sender.page.locator("body").innerText()).includes("本次未允许云端存储"), "failed without consent");
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, beforeFallback);
+  await sender.page.getByRole("button", { name: "传输任务", exact: true }).click();
+  await sender.page.getByRole("dialog").getByRole("button", { name: "重试", exact: true }).click();
+  await until(async () => (await sender.page.getByRole("dialog").innerText()).includes("本次未允许云端存储"), "retry keeps no-cloud consent");
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, beforeFallback);
+  await sender.page.getByRole("dialog").getByRole("button", { name: "完成", exact: true }).click();
+  await sender.page.locator("#public-transfer-file-input").setInputFiles({ name: "consent.txt", mimeType: "text/plain", buffer: Buffer.from("explicit cloud consent") });
+  await consent.check();
+  await confirmFiles(sender.page);
+  await sender.page.getByText("文件链接已生成", { exact: true }).waitFor();
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, beforeFallback + 1);
+  pass("failed device transport and retries never upload without consent; explicit fallback uploads once");
+  await sender.context.close(); await recipient.context.close();
   failTickets = true;
   const fContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
   await fContext.route("**/oidc-config", (route) => route.fulfill({ json: { configured: false, passwordLoginEnabled: true } }));
