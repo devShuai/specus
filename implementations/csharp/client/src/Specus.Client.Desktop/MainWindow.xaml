@@ -191,7 +191,7 @@
                     <StackPanel>
                         <TextBlock Text="当前状态"
                                    FontSize="12"
-                                   FontWeight="SemiBold"
+                                   FontWeight="Bold"
                                    Foreground="{DynamicResource MutedBrush}" />
                         <Grid Margin="0,7,0,4">
                             <Grid.ColumnDefinitions>
@@ -274,7 +274,7 @@
                                            Grid.Column="1"
                                            Text="Peer Mesh 未启动"
                                            FontSize="12"
-                                           FontWeight="SemiBold"
+                                           FontWeight="Bold"
                                            TextTrimming="CharacterEllipsis"
                                            Foreground="{DynamicResource PrimaryHoverBrush}" />
                             </Grid>
@@ -392,7 +392,7 @@
                             <TextBlock Grid.Row="1"
                                        Text="活跃会话"
                                        FontSize="12"
-                                       FontWeight="SemiBold"
+                                       FontWeight="Bold"
                                        Foreground="{DynamicResource TextSecondaryBrush}"
                                        Margin="0,8,0,6" />
                             <Border Grid.Row="2"
@@ -526,7 +526,7 @@
                         <TextBlock Grid.Row="1"
                                    Text="本机发布（本实例开关，不改服务端配置）"
                                    FontSize="12"
-                                   FontWeight="SemiBold"
+                                   FontWeight="Bold"
                                    Foreground="{DynamicResource TextSecondaryBrush}"
                                    Margin="0,8,0,6" />
                         <Border Grid.Row="2" Style="{StaticResource TableShellStyle}">
@@ -801,7 +801,7 @@
                             <TextBlock Text="运行日志"
                                        FontSize="12"
                                        Foreground="{DynamicResource TextSecondaryBrush}"
-                                       FontWeight="SemiBold"
+                                       FontWeight="Bold"
                                        VerticalAlignment="Center" />
                         </StackPanel>
                         <Button x:Name="LogExpandButton"

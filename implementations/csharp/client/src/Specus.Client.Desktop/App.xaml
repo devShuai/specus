@@ -4,6 +4,15 @@
              xmlns:desktop="clr-namespace:Specus.Client.Desktop"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
+        <!-- Window-level defaults. MainWindow sets these on itself, but any additional window,
+             dialog or adorner would otherwise start from WPF's Ideal formatting, which is tuned
+             for large display text and renders UI-sized text softly. -->
+        <Style TargetType="Window">
+            <Setter Property="UseLayoutRounding" Value="True" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+            <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+        </Style>
+
         <SolidColorBrush x:Key="AppBackgroundBrush" Color="#071018" />
         <SolidColorBrush x:Key="SidebarBrush" Color="#09141E" />
         <SolidColorBrush x:Key="SurfaceBrush" Color="#0D1824" />
@@ -45,7 +54,7 @@
         <SolidColorBrush x:Key="MutedBrush" Color="#7E8EA3" />
 
         <Style TargetType="TextBlock">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="LineStackingStrategy" Value="BlockLineHeight" />
         </Style>
@@ -105,7 +114,7 @@
         </Style>
 
         <Style x:Key="GridCellSelectableTextBoxStyle" TargetType="TextBox">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="FontSize" Value="13" />
             <Setter Property="MinHeight" Value="0" />
             <Setter Property="Padding" Value="0" />
@@ -201,7 +210,7 @@
         </Style>
 
         <Style x:Key="LogTextBoxStyle" TargetType="TextBox">
-            <Setter Property="FontFamily" Value="Consolas" />
+            <Setter Property="FontFamily" Value="Consolas, Cascadia Mono, Courier New" />
             <Setter Property="FontSize" Value="12" />
             <Setter Property="Padding" Value="0" />
             <Setter Property="Background" Value="Transparent" />
@@ -229,7 +238,7 @@
         </Style>
 
         <Style TargetType="TextBox">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Padding" Value="10,5" />
             <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
@@ -269,7 +278,7 @@
         </Style>
 
         <Style TargetType="PasswordBox">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Padding" Value="10,5" />
             <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
@@ -333,7 +342,7 @@
         </Style>
 
         <Style TargetType="ComboBox">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Padding" Value="10,5" />
             <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
@@ -405,12 +414,18 @@
                                   Stretch="Uniform"
                                   Data="M 0 0 L 10 0 L 5 6 Z" />
 
+                            <!-- A Popup renders in its own window, so it does not inherit the
+                                 window's TextOptions and falls back to Ideal formatting, which
+                                 blurs UI-sized text. Restate them here. -->
                             <Popup x:Name="PART_Popup"
                                    Placement="Bottom"
                                    AllowsTransparency="True"
                                    Focusable="False"
                                    IsOpen="{TemplateBinding IsDropDownOpen}"
-                                   PopupAnimation="Fade">
+                                   PopupAnimation="Fade"
+                                   UseLayoutRounding="True"
+                                   TextOptions.TextFormattingMode="Display"
+                                   TextOptions.TextRenderingMode="ClearType">
                                 <Border Background="{DynamicResource SurfaceRaisedBrush}"
                                         BorderBrush="{DynamicResource PanelStrokeStrongBrush}"
                                         BorderThickness="1"
@@ -446,7 +461,7 @@
         </Style>
 
         <Style TargetType="ComboBoxItem">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="Padding" Value="8,5" />
             <Setter Property="Margin" Value="0,1" />
@@ -479,7 +494,7 @@
         </Style>
 
         <Style TargetType="Button">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="Padding" Value="12,5" />
             <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource SecondaryBrush}" />
@@ -591,7 +606,7 @@
         </Style>
 
         <Style x:Key="ModernTabItemStyle" TargetType="TabItem">
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="FontSize" Value="13" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
@@ -632,7 +647,7 @@
 
         <Style TargetType="DataGrid">
             <Setter Property="MinColumnWidth" Value="80" />
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Microsoft YaHei, Segoe UI, Simsun" />
             <Setter Property="AutoGenerateColumns" Value="False" />
             <Setter Property="CanUserAddRows" Value="False" />
             <Setter Property="CanUserDeleteRows" Value="False" />
