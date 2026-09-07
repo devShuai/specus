@@ -66,6 +66,13 @@
         <log4j2.version>2.25.5</log4j2.version>
         <httpclient5.version>5.6.4</httpclient5.version>
         <!--
+            GHSA-9xv2-5v5q-p794, GHSA-gcx9-497g-6cp6 and GHSA-h3x4-894j-xpx5 are all fixed in
+            11.0.25: a DIGEST authenticator replay bypass and two authorization defects in
+            FORM authentication. The server terminates browser-facing HTTP on this connector,
+            so authentication bypasses land squarely in its threat model.
+        -->
+        <tomcat.version>11.0.25</tomcat.version>
+        <!--
             Not a security fix. MySQL switched to a year-based scheme, so 26.7.0 follows 9.7.0
             rather than preceding it; the jump in the number is calendar, not eighteen majors of
             breaking change.
