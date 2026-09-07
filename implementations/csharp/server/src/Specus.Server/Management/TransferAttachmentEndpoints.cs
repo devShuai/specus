@@ -79,6 +79,15 @@ public static class TransferAttachmentEndpoints
                 return Results.Redirect(directUrl);
             });
 
+        app.MapGet("/api/public/transfer/attachments/capabilities",
+            async (HttpContext context, IOptions<AuthOptions> auth, TransferAttachmentService service,
+                CancellationToken cancellationToken) =>
+            {
+                context.Response.Headers.CacheControl = "private, no-store";
+                return Results.Ok(await service.CapabilitiesAsync(ManagementContext.From(context, auth.Value),
+                    cancellationToken).ConfigureAwait(false));
+            });
+
         app.MapPost("/api/public/transfer/attachments/presign-upload",
             async (HttpContext context, PresignUploadRequest request,
                 IOptions<AuthOptions> auth, PublicTransferRateLimiter rateLimiter,

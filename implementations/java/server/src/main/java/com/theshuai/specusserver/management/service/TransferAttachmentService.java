@@ -84,6 +84,35 @@ public class TransferAttachmentService {
         }
     }
 
+    /** Advisory account snapshot only: no object-store requests, reservations or room mutations. */
+    public TransferCapabilities capabilities(ManagementContext context) {
+        String tenant = requireAccountText(context.tenant().tenantId(), "tenantId");
+        String username = requireAccountText(context.username(), "username");
+        synchronized (quotaLock(tenant, username)) {
+            Instant now = Instant.now();
+            YearMonth month = YearMonth.from(now.atOffset(ZoneOffset.UTC));
+            long used = Math.max(0L, repository.sumActiveStorageBytes(tenant, username, Long.MIN_VALUE,
+                    STATUS_PENDING, STATUS_UPLOADED, now.toString()));
+            long downloaded = Math.max(0L, downloadUsageRepository.sumBytesByAccountAndMonth(
+                    tenant, username, month.toString()));
+            long storageLimit = properties.getPerUserStorageQuotaBytes() > 0
+                    ? properties.getPerUserStorageQuotaBytes() : DEFAULT_PER_USER_QUOTA_BYTES;
+            long downloadLimit = properties.getPerUserMonthlyDownloadQuotaBytes() > 0
+                    ? properties.getPerUserMonthlyDownloadQuotaBytes() : DEFAULT_PER_USER_QUOTA_BYTES;
+            return new TransferCapabilities(1, now.toString(), objectStorageService.isEnabled(),
+                    Math.max(0L, properties.getMaxAttachmentBytes()), Math.max(1L, properties.getRetentionHours()),
+                    storageLimit, used, Math.max(0L, storageLimit - used),
+                    downloadLimit, downloaded, Math.max(0L, downloadLimit - downloaded), month.toString(),
+                    month.plusMonths(1).atDay(1).atStartOfDay().toInstant(ZoneOffset.UTC).toString(), true);
+        }
+    }
+
+    public record TransferCapabilities(int schemaVersion, String checkedAt, boolean storageEnabled,
+            long maxAttachmentBytes, long retentionHours, long storageQuotaBytes, long storageUsedBytes,
+            long storageRemainingBytes, long monthlyDownloadQuotaBytes, long monthlyDownloadUsedBytes,
+            long monthlyDownloadRemainingBytes, String downloadUsageMonth, String downloadResetsAt,
+            boolean downloadGrantSingleUse) {}
+
     public PresignUploadResponse createPublicUpload(ManagementContext context, PresignUploadRequest request) {
         String roomId = normalizeRoomId(request.roomId());
         RoomAccess access = publicTransferRoomService.resolve(roomId, request.roomToken(), "attachment-upload");

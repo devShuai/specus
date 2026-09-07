@@ -56,6 +56,22 @@ public sealed class AdminApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task TransferCapabilitiesRequireAuthenticationAndAreNotCached()
+    {
+        using var client = _server!.CreateClient();
+        const string path = "/api/public/transfer/attachments/capabilities";
+        using var anonymous = await client.GetAsync(path);
+        Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
+        var token = await LoginAsync(client);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.AccessToken);
+        using var response = await client.GetAsync(path + "?tenantId=other&username=other");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True(response.Headers.CacheControl!.NoStore); Assert.True(response.Headers.CacheControl.Private);
+        var v = await response.Content.ReadFromJsonAsync<Specus.Server.Management.TransferCapabilities>(JsonOptions);
+        Assert.NotNull(v); Assert.Equal(1, v.SchemaVersion); Assert.False(v.StorageEnabled); Assert.Equal(0, v.StorageUsedBytes);
+    }
+
+    [Fact]
     public async Task LoginRejectsBadCredentials()
     {
         using var client = _server!.CreateClient();

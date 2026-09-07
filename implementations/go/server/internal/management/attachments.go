@@ -50,6 +50,21 @@ func (a *API) handlePublicAttachmentDownload(w http.ResponseWriter, r *http.Requ
 	http.Redirect(w, r, directURL, http.StatusFound)
 }
 
+func (a *API) handleTransferCapabilities(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	response, err := a.attachments.Capabilities(r.Context(), principal.TenantID, principal.Username)
+	if err != nil {
+		a.failAttachment(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {

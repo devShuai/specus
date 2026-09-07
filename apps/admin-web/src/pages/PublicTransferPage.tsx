@@ -31,6 +31,7 @@ import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { TransferFilePreflight } from "../components/TransferFilePreflight";
 import { useFileLeaveWarning } from "../hooks/useFileLeaveWarning";
+import { useTransferCapabilities } from "../hooks/useTransferCapabilities";
 import { SyncedClipboard } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
@@ -506,6 +507,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     canonical: `https://specus.devshuai.com/#/${workspace}`,
   });
   const ossFallbackEnabled = authReady && authed;
+  const cloudCapabilities = useTransferCapabilities(Boolean(ossFallbackEnabled && fileDraft
+    && (fileDraft.mode === "link" || cloudFallbackPermitted(fileDraft.allowCloudFallback, ossFallbackEnabled, fileDraft.targetSameLan))));
   const effectiveRoomRole: PublicTransferRoomRole = sharedRoomActive ? roomRole ?? "VIEWER" : "EDITOR";
   const isRoomReadOnly = sharedRoomActive && effectiveRoomRole === "VIEWER";
   const collaborationMembers = useMemo(() => collaborationPeers(peers, sharedRoomActive), [peers, sharedRoomActive]);
@@ -1382,6 +1385,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     discoveryOnline: discoveryStatus === "online",
     writable: !isRoomReadOnly,
     scopeCurrent: draft.roomEpoch === roomEpochRef.current && draft.roomGeneration === roomGenerationRef.current,
+    cloudRequested: cloudFallbackPermitted(draft.allowCloudFallback, ossFallbackEnabled, draft.targetSameLan),
+    cloudLoading: fileDraftRef.current === draft && cloudCapabilities.loading,
+    cloudSnapshot: fileDraftRef.current === draft ? cloudCapabilities.snapshot : null,
   });
   const hasRecoverableRoomContent = isTransferBusy
     || fileDraft != null
@@ -2960,6 +2966,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const sharedModals = (
     <>
       {fileDraft ? <TransferFilePreflight
+        capabilities={cloudCapabilities}
         input={preflightInput(fileDraft)}
         recipientLabel={fileDraft.targetPeerLabel}
         allowCloud={fileDraft.allowCloudFallback}
@@ -5164,7 +5171,7 @@ function TransferFaq({
           通过直连或中继转发的文件只到点选设备，不创建云端副本。生成文件链接需要登录并启用临时存储，下载方也需要登录并持有访问口令与文件链接。
         </FaqItem>
         <FaqItem title="云端额度是多少？">
-          存储额度、下载额度、单文件上限和文件保存时长由服务端配置，当前页面无法读取实时剩余额度。申请上传可能预占存储额度；下载授权首次打开并成功跳转时，按文件完整大小计入下载额度。临时下载地址只能使用一次，重新下载需重新申请；这不代表文件分享链接只能用一次。文件有效期以生成结果为准。
+          存储额度、下载额度、单文件上限和文件保存时长由服务端配置。选择云端方式后，发送前确认会读取当前账号的额度快照；旧服务端不支持或查询失败时会明确提示未核验。查询不预占额度，实际上传仍可能失败；申请上传可能预占存储额度。下载授权首次打开并成功跳转时，按文件完整大小计入下载额度。临时下载地址只能使用一次，重新下载需重新申请；这不代表文件分享链接只能用一次。文件有效期以生成结果为准。
         </FaqItem>
         <FaqItem title="关闭页面后能继续传吗？">
           不能。当前传输和文件草稿只存在于页面中，失败重试会从头开始，不支持断点续传。接收完成也不等于已保存到设备，请点击“保存到设备”并检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。

@@ -127,7 +127,7 @@ async function paste(page, text) {
   }, text);
 }
 async function confirmFiles(page, cloud = false) {
-  await page.getByRole("button", { name: cloud ? "确认上传并生成链接" : "确认发送", exact: true }).click();
+  await page.getByRole("button", { name: cloud ? /^确认上传/ : "确认发送", exact: !cloud }).click();
 }
 async function leaveWarningEnabled(page) {
   return page.evaluate(() => {
@@ -328,7 +328,7 @@ try {
   await logged.page.getByRole("button", { name: "改为生成文件链接", exact: true }).click();
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
   await logged.page.getByRole("dialog").waitFor();
-  assert.match(await logged.page.getByRole("dialog").innerText(), /存储与额度尚未核验/);
+  await logged.page.getByText("存储与额度尚未核验", { exact: true }).waitFor();
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
   assert.equal(await leaveWarningEnabled(logged.page), true);
   await logged.page.setViewportSize({ width: 320, height: 720 });
@@ -341,6 +341,86 @@ try {
   assert.equal(await leaveWarningEnabled(logged.page), false);
   assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
   pass("cloud preflight is metadata-only, fits mobile and cancels without reserving quota");
+  let quotaMode = "limited", quotaRequests = 0, releaseQuota;
+  const snapshot = () => {
+    const now = new Date();
+    return { schemaVersion: 1, checkedAt: now.toISOString(), storageEnabled: quotaMode !== "disabled",
+      maxAttachmentBytes: quotaMode === "oversized" ? 1 : 1000, retentionHours: 48,
+      storageQuotaBytes: 1000, storageUsedBytes: quotaMode === "limited" ? 999 : 0,
+      storageRemainingBytes: quotaMode === "limited" ? 1 : 1000, monthlyDownloadQuotaBytes: 1000,
+      monthlyDownloadUsedBytes: 1000, monthlyDownloadRemainingBytes: 0,
+      downloadUsageMonth: now.toISOString().slice(0, 7),
+      downloadResetsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString(), downloadGrantSingleUse: true };
+  };
+  await logged.context.route("**/attachments/capabilities", async (route) => {
+    quotaRequests += 1;
+    assert.equal(route.request().method(), "GET");
+    assert.equal(route.request().postData(), null);
+    assert.equal(route.request().headers().authorization, "Bearer isolated-test-session");
+    if (quotaMode === "delayed") {
+      const oldBody = { ...snapshot(), storageEnabled: false };
+      await new Promise((resolve) => { releaseQuota = resolve; });
+      await route.fulfill({ json: oldBody }).catch(() => {}); // The browser may already have aborted this request.
+      return;
+    }
+    if (quotaMode === "failure") return route.fulfill({ status: 503, json: { error: "isolated quota unavailable" } });
+    if (quotaMode === "malformed") return route.fulfill({ json: { storageRemainingBytes: 999999 } });
+    return route.fulfill({ json: snapshot() });
+  });
+  await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "quota-test.txt", mimeType: "text/plain", buffer: Buffer.from("quota test contents") });
+  const quotaBox = logged.page.getByTestId("transfer-cloud-quota");
+  const uploadConfirm = logged.page.getByRole("button", { name: /^确认上传/ });
+  await until(async () => (await quotaBox.innerText()).includes("本批需要 / 剩余存储"), "fresh account snapshot");
+  assert.equal(await uploadConfirm.isDisabled(), true);
+  assert.match(await logged.page.getByRole("alert").innerText(), /超过账号剩余存储额度/);
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  pass("authenticated GET shows quota and blocks a batch without creating upload reservations");
+  quotaMode = "oversized";
+  await logged.page.getByRole("button", { name: "刷新额度", exact: true }).click();
+  await until(async () => (await logged.page.getByRole("alert").innerText()).includes("单文件上传上限"), "server file limit");
+  assert.equal(await uploadConfirm.isDisabled(), true);
+  quotaMode = "disabled";
+  await logged.page.getByRole("button", { name: "刷新额度", exact: true }).click();
+  await until(async () => (await logged.page.getByRole("alert").innerText()).includes("未启用临时存储"), "disabled storage");
+  assert.equal(await uploadConfirm.isDisabled(), true);
+  pass("server upload limit and disabled storage fail before file upload");
+  quotaMode = "ready";
+  await logged.page.getByRole("button", { name: "刷新额度", exact: true }).click();
+  await until(async () => !(await uploadConfirm.isDisabled()), "quota refresh enables upload");
+  assert.match(await quotaBox.innerText(), /48 小时/);
+  assert.match(await quotaBox.innerText(), /未预占额度/);
+  assert.ok(await logged.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+  await quotaBox.scrollIntoViewIfNeeded();
+  await logged.page.screenshot({ path: `${output}/cloud-quota-mobile.png`, fullPage: true });
+  await logged.page.setViewportSize({ width: 1440, height: 1000 });
+  await logged.page.screenshot({ path: `${output}/cloud-quota-desktop.png`, fullPage: true });
+  pass("fresh quota fits mobile and zero sender download quota does not block uploading");
+  for (const mode of ["failure", "malformed"]) {
+    quotaMode = mode;
+    await logged.page.getByRole("button", { name: "刷新额度", exact: true }).click();
+    await logged.page.getByText("存储与额度尚未核验", { exact: true }).waitFor();
+    assert.ok(!(await quotaBox.innerText()).includes("本批需要 / 剩余存储"), "failed refresh must clear old account values");
+    assert.equal(await logged.page.getByRole("button", { name: "确认上传（额度未核验）", exact: true }).isDisabled(), false);
+  }
+  assert.ok(quotaRequests >= 6);
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  await logged.page.getByRole("button", { name: "取消发送", exact: true }).click();
+  quotaMode = "ready";
+  pass("failed and malformed quota refreshes clear stale data and retain explicit unverified fallback");
+  quotaMode = "delayed"; releaseQuota = undefined;
+  await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "old-query.txt", mimeType: "text/plain", buffer: Buffer.from("old query") });
+  await until(() => Boolean(releaseQuota), "pending quota query");
+  assert.equal(await logged.page.getByRole("button", { name: /^确认上传/ }).isDisabled(), true);
+  await logged.page.getByRole("button", { name: "取消发送", exact: true }).click();
+  quotaMode = "ready";
+  await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "new-query.txt", mimeType: "text/plain", buffer: Buffer.from("new query") });
+  await until(async () => !(await logged.page.getByRole("button", { name: /^确认上传/ }).isDisabled()), "new confirmation has fresh quota");
+  releaseQuota(); await delay(200);
+  assert.match(await quotaBox.innerText(), /临时存储已配置/);
+  assert.equal(await logged.page.getByRole("button", { name: /^确认上传/ }).isDisabled(), false);
+  await logged.page.getByRole("button", { name: "取消发送", exact: true }).click();
+  assert.equal(apiCalls.filter((call) => call.path.endsWith("attachments/presign-upload")).length, presignsBefore);
+  pass("cancelled quota requests cannot overwrite a new confirmation or authorize an upload");
   await logged.page.locator("#public-transfer-file-input").setInputFiles({ name: "cloud-test.txt", mimeType: "text/plain", buffer: Buffer.from("isolated cloud upload") });
   await confirmFiles(logged.page, true);
   await logged.page.getByText("文件链接已生成", { exact: true }).waitFor();

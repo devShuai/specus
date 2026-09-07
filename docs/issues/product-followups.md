@@ -2,7 +2,7 @@
 
 来源：2026-09-05 产品审阅。互传操作易用性由 #36 修复；首次接入、目录状态准确命名及 HTTP 发布权限确认由本轮修复 issue 处理。
 
-状态：实施中。2026-09-06 已完成第一批前端修复及本地验收，尚未部署；本 issue 未全量完成。用户已授权提交与推送产品修复，代码交付进度以关联提交及远端分支为准。首次接入及发布体验的修复与验证见 [issue #37](https://github.com/devShuai/specus/issues/37)。
+状态：实施中，未全量完成。2026-09-06 首批前端修复已通过 [268b5ea](https://github.com/devShuai/specus/commit/268b5ea) 推送到 `origin/main`，尚未部署。2026-09-07 只读额度接口（Java/Go/.NET）及前端接入已完成本地实现与验收，尚未部署；本批提交与推送进度以关联提交及远端分支为准。首次接入及发布体验见 [issue #37](https://github.com/devShuai/specus/issues/37)。
 
 跟踪：[GitHub issue #38](https://github.com/devShuai/specus/issues/38)。
 
@@ -33,14 +33,22 @@
 - [x] 对待确认、排队、发送、失败待重试、接收待确认及未开始保存的直传文件显示页面离开提醒，并按需注册浏览器离开事件；不把完成的发送记录当成待传内容。明确浏览器可能抑制提示，刷新或关闭后不能恢复文件传输。
 - [x] 桌面及 320px 手机布局可用；手机确认弹窗内容滚动，文件列表不会被压缩消失，操作按钮保持可达。
 
-### 尚未完成的能力边界
+### 只读额度接口进展（2026-09-07）
 
-- [ ] 设计并实现跨语言一致的只读额度/能力接口，提供实时剩余额度、上传限制及保留规则，再接入发送前确认。当前 API 不提供这些数据，前端显示“尚未确认”，实际上传仍可能被服务端拒绝；不得用上传授权接口冒充只读预检或偷偷预占额度。
-- [ ] 完成上述接口对应的多 server 契约及集成验收后，再勾选“大文件预检与离开提醒”整体能力。
+- [x] 定义 `GET /api/public/transfer/attachments/capabilities` v1 契约，见 `protocol/spec/transfer-capabilities.md`；不传文件名、房间口令或账号选择参数，身份只取已鉴权账号及租户。
+- [x] Java、Go、.NET 实现当前账号额度快照：已启用存储、单文件上限、保存时长、有效附件/待上传预留占用、剩余存储、本月已用/剩余下载额度及 UTC 月初重置时间。账号额度跨附件用途合计，排除过期记录，不混入其他账号或租户；剩余值最低为零。
+- [x] 查询仅鉴权并读库，返回 `private, no-store`；不创建房间、附件或下载授权，不申请对象存储 URL，不消耗上传限流、不预占额度，也不探测存储连接。读库失败不冒充零用量。
+- [x] 前端仅在已登录且明确选择云端方式时读取快照；展示本批需要/剩余存储、单文件上限、保存时长和下载额度。已知存储关闭、文件超限或批次超额时拦截；发送者下载额度为零不阻止上传，对方仍受其自身下载额度限制。
+- [x] 正在查询时暂缓确认；8 秒超时、旧版 404/405、异常响应或刷新失败均明确显示未核验并清除旧数值。可刷新或显式确认后交由服务端校验，不自动改成上传预检。快照在页面内保存，60 秒后标为过时；关闭确认或切换登录会话后不接受迟到结果。
+- [x] 保留已有界面风格，桌面两列/手机单列展示额度信息，确认区滚动且按钮保持可达；完成原互传与接入/发布浏览器回归。
+- [ ] C server 接入同一契约并验证：其对象存储实现属于独立的对齐工作，本轮未叠加修改。
+- [ ] 完成 C 端及全量跨语言契约验收后，再勾选“大文件预检与离开提醒”整体能力。快照始终只是提示，上传、完成和下载接口仍为最终校验，查询成功不保证后续上传成功。
 
 真实端到端连通性检查、临时 HTTP 分享、分块续传、服务工作台和产品指标仍未实现。本轮未修改既有 C server 对齐工作。
 
 ### 验证记录
+
+以下为 2026-09-06 首批前端验收记录；当时尚无额度接口。
 
 - `npm.cmd test`：42 个测试文件、288 项测试通过。
 - `npm.cmd run build`：TypeScript、生产构建及源码/产物 CSP 检查通过。
@@ -48,3 +56,12 @@
 - 首次接入与发布体验浏览器回归：12 组通过；合计 34 组，无页面错误或意外业务请求。
 - 桌面及手机截图人工检查通过；`git diff --check -- apps/admin-web docs/issues` 通过。
 - 浏览器业务 API 使用 mock，外部请求被阻断；真实 WebRTC 收发仅覆盖本地小文件，不等于生产后端、真实云端额度或跨 NAT 全矩阵验收。离开提醒验证事件注册/撤销，不承诺浏览器一定弹出原生对话框。
+
+### 本批验证记录（2026-09-07）
+
+- 前端 `npm.cmd test`：44 个测试文件、311 项测试通过；`npm.cmd run build`（类型、Vite、源码/产物 CSP）通过。
+- 隔离 Chrome 回归：互传 27 组、接入/发布 12 组，合计 39 组通过，无页面错误；新增读取额度、批次超额、单文件限制、存储关闭、错误与畸形响应、取消后的迟到请求及手机截图检查。
+- Java：`mvn.cmd -pl implementations/java/server -am '-Dspecus.server.web.skip=true' '-Dtest=TransferAttachmentServiceTests,SecurityRulesTests' '-Dsurefire.failIfNoSpecifiedTests=false' test`，38 项通过，包含真实 HTTP 鉴权和防缓存断言。
+- Go：`go test ./internal/transfer ./internal/management ./internal/server -count=1`，三个受影响包全部通过；包含 SQLite 账号/租户/期限隔离、只读快照及真实 HTTP 鉴权测试。
+- .NET：`dotnet test tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj -p:SpecusServerWebSkip=true --filter 'FullyQualifiedName~TransferAttachmentServiceTests|FullyQualifiedName~TransferCapabilitiesRequireAuthentication' --verbosity minimal`，23 项通过；包含 SQLite、配额默认值、无写入及鉴权测试。
+- 本批范围 `git diff --check` 通过。Java/.NET 是相关测试集而非整仓全量；浏览器使用模拟 API，后端使用隔离数据库/测试服务，未验收生产对象存储或 C 端，不宣称已经上线。

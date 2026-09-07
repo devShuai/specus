@@ -15,6 +15,64 @@ public sealed class TransferAttachmentServiceTests
     private static readonly ManagementContext Account = new("default", "alice", ManagementRole.User, false);
 
     [Fact]
+    public async Task CapabilitiesAreReadOnlyAndIsolateAccountAndExpiry()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100, storageQuotaBytes: 20, monthlyDownloadQuotaBytes: 10);
+        var now = DateTimeOffset.UtcNow;
+        var rows = new[] {
+            ("default", "alice", "PENDING", 10L, false), ("default", "alice", "UPLOADED", 20L, false),
+            ("default", "alice", "PENDING", 100L, true), ("default", "alice", "UPLOADED", 100L, true),
+            ("other", "alice", "PENDING", 100L, false), ("default", "bob", "UPLOADED", 100L, false),
+        };
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var (tenant, user, status, size, expired) = rows[i];
+            fixture.Db.TransferAttachments.Add(new TransferAttachment { Id = i + 1, TenantId = tenant, OwnerUsername = user,
+                Scope = TransferAttachmentService.ScopeAdminClientMessage, ObjectKey = $"test-{i}", FileName = "test.bin",
+                Status = status, SizeBytes = size, CreatedAt = now, UpdatedAt = now,
+                UploadExpiresAt = now.AddHours(expired ? -1 : 1), ExpiresAt = now.AddHours(expired ? -1 : 1) });
+        }
+        var usageRows = new[] { ("default", "alice", now, 14L), ("other", "alice", now, 100L),
+            ("default", "bob", now, 100L), ("default", "alice", now.AddMonths(-1), 100L) };
+        for (var i = 0; i < usageRows.Length; i++)
+        {
+            var (tenant, user, at, size) = usageRows[i];
+            fixture.Db.TransferAttachmentDownloadUsages.Add(new TransferAttachmentDownloadUsage { Id = i + 1, TenantId = tenant,
+                Username = user, SizeBytes = size, AttachmentId = 1, CreatedAt = at, UsageMonth = at.ToString("yyyy-MM", System.Globalization.CultureInfo.InvariantCulture) });
+        }
+        await fixture.Db.SaveChangesAsync();
+        for (var i = 0; i < 2; i++)
+        {
+            var v = await fixture.Service.CapabilitiesAsync(Account, CancellationToken.None);
+            Assert.True(v.StorageEnabled); Assert.Equal(30, v.StorageUsedBytes); Assert.Equal(0, v.StorageRemainingBytes);
+            Assert.Equal(14, v.MonthlyDownloadUsedBytes); Assert.Equal(0, v.MonthlyDownloadRemainingBytes);
+            Assert.Equal(100, v.MaxAttachmentBytes); Assert.True(v.DownloadGrantSingleUse);
+            Assert.Equal(v.CheckedAt.ToString("yyyy-MM", System.Globalization.CultureInfo.InvariantCulture), v.DownloadUsageMonth);
+            Assert.Equal(new DateTimeOffset(v.CheckedAt.Year, v.CheckedAt.Month, 1, 0, 0, 0, TimeSpan.Zero).AddMonths(1), v.DownloadResetsAt);
+        }
+        Assert.Equal(6, await fixture.Db.TransferAttachments.CountAsync());
+        Assert.Equal(4, await fixture.Db.TransferAttachmentDownloadUsages.CountAsync());
+        Assert.Empty(fixture.Db.TransferAttachmentDownloadGrants);
+        Assert.Null(fixture.Storage.LastUploadTtl); Assert.Null(fixture.Storage.LastDownloadTtl);
+        Assert.Equal(0, fixture.Storage.StatCalls); Assert.Empty(fixture.Storage.DeletedKeys);
+        var other = await fixture.Service.CapabilitiesAsync(new ManagementContext("other", "alice", ManagementRole.User, false), CancellationToken.None);
+        Assert.Equal(100, other.StorageUsedBytes);
+    }
+
+    [Fact]
+    public async Task CapabilitiesUseEnforcementDefaultsAndReportDisabledStorage()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 0, storageQuotaBytes: 0, monthlyDownloadQuotaBytes: -1);
+        fixture.Storage.Enabled = false;
+        var v = await fixture.Service.CapabilitiesAsync(Account, CancellationToken.None);
+        Assert.False(v.StorageEnabled); Assert.Equal(1024L * 1024 * 1024, v.StorageQuotaBytes);
+        Assert.Equal(v.StorageQuotaBytes, v.MonthlyDownloadQuotaBytes); Assert.Equal(0, v.MaxAttachmentBytes);
+        Assert.Null(fixture.Storage.LastUploadTtl); Assert.Equal(0, fixture.Storage.StatCalls);
+        await fixture.Db.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => fixture.Service.CapabilitiesAsync(Account, CancellationToken.None));
+    }
+
+    [Fact]
     public void PublicPresignLimiterPurgesExpiredIpWindowsEveryTenMinutes()
     {
         var limiter = new PublicTransferRateLimiter(Options.Create(new PublicTransferOptions
@@ -329,7 +387,7 @@ public sealed class TransferAttachmentServiceTests
 
     private sealed class FakeObjectStorage : IObjectStorageService
     {
-        public bool Enabled => true;
+        public bool Enabled { get; set; } = true;
         public ObjectStat Stat { get; set; } = new(true, 10);
         public List<string> DeletedKeys { get; } = [];
         public TimeSpan? LastUploadTtl { get; private set; }

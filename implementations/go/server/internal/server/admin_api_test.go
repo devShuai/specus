@@ -40,6 +40,36 @@ func newHTTPTestServer(t *testing.T, app *App) (*App, *httptest.Server) {
 	return app, ts
 }
 
+func TestTransferCapabilitiesAuthenticatedAndNoStore(t *testing.T) {
+	_, ts := newAPIServer(t)
+	path := ts.URL + "/api/public/transfer/attachments/capabilities"
+	response, err := http.Get(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 401 {
+		t.Fatalf("anonymous status %d", response.StatusCode)
+	}
+	request, _ := http.NewRequest(http.MethodGet, path+"?tenantId=other&username=other", nil)
+	request.Header.Set("Authorization", "Bearer "+adminToken(t, ts))
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 || response.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("snapshot status/cache: %d %v", response.StatusCode, response.Header)
+	}
+	var v transfer.Capabilities
+	if err := json.NewDecoder(response.Body).Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v.SchemaVersion != 1 || v.StorageEnabled || v.StorageUsedBytes != 0 {
+		t.Fatalf("unexpected snapshot: %+v", v)
+	}
+}
+
 func TestOneTimeDownloadGrantRejectsHeadWithoutConsumingIt(t *testing.T) {
 	_, ts := newAPIServer(t)
 	request, err := http.NewRequest(http.MethodHead,

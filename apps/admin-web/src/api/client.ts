@@ -746,32 +746,46 @@ async function publicJsonRequest<T>(path: string, body?: unknown): Promise<T> {
   return parsed as T;
 }
 
-async function authenticatedPublicJsonRequest<T>(path: string, body?: unknown): Promise<T> {
+async function authenticatedPublicJsonRequest<T>(path: string, body?: unknown, options?: { method: "GET"; signal?: AbortSignal }): Promise<T> {
   const token = tokenStore.get();
   if (!token || !tokenStore.valid()) {
     throw new ApiError("登录后才可使用云端中转");
   }
   const response = await fetch(path, {
-    method: "POST",
+    method: options?.method ?? "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify(body ?? {}),
+    body: options?.method === "GET" ? undefined : JSON.stringify(body ?? {}),
+    ...(options ? { cache: "no-store" as const, signal: options.signal } : {}),
   });
   if (response.status === 401) {
-    if (!unauthorizedHandled) {
+    if (tokenStore.get() === token && !unauthorizedHandled) {
       unauthorizedHandled = true;
       unauthorizedHandler?.();
     }
     throw new ApiError("登录已过期，请重新登录");
   }
+  if (options && (response.status === 404 || response.status === 405)) {
+    throw new ApiError("当前服务端尚未支持额度查询，额度未核验。");
+  }
+  if (options && !response.ok) throw new ApiError("额度读取失败，请刷新重试；当前额度未核验。");
   const text = await response.text();
-  const parsed = text ? JSON.parse(text) : null;
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : null; }
+  catch (error) {
+    if (options) throw new ApiError("服务端未返回可识别的额度信息，额度未核验。");
+    throw error;
+  }
   if (!response.ok) {
     throw new ApiError(parsed?.detail || parsed?.message || parsed?.error || response.statusText);
   }
   return parsed as T;
+}
+
+export function fetchTransferCapabilities(signal?: AbortSignal): Promise<unknown> {
+  return authenticatedPublicJsonRequest("/api/public/transfer/attachments/capabilities", undefined, { method: "GET", signal });
 }
 
 export async function fetchPublicTransferIceConfig(): Promise<PublicTransferIceConfig | null> {

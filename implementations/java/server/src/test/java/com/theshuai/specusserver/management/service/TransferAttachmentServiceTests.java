@@ -83,6 +83,54 @@ class TransferAttachmentServiceTests {
     }
 
     @Test
+    void capabilitiesReadOnlyAccountSnapshotUsesEnforcedDefaultsAndClampsRemaining() {
+        storageProperties.setPerUserStorageQuotaBytes(0);
+        storageProperties.setPerUserMonthlyDownloadQuotaBytes(10);
+        storageProperties.setRetentionHours(0);
+        when(repository.sumActiveStorageBytes(eq("default"), eq("alice"), eq(Long.MIN_VALUE),
+                eq("PENDING"), eq("UPLOADED"), any())).thenReturn(12L);
+        when(downloadUsageRepository.sumBytesByAccountAndMonth(eq("default"), eq("alice"), any())).thenReturn(14L);
+        when(objectStorageService.isEnabled()).thenReturn(true);
+        var snapshot = service.capabilities(ACCOUNT);
+        assertThat(snapshot.storageQuotaBytes()).isEqualTo(1024L * 1024 * 1024);
+        assertThat(snapshot.storageUsedBytes()).isEqualTo(12);
+        assertThat(snapshot.storageRemainingBytes()).isEqualTo(snapshot.storageQuotaBytes() - 12);
+        assertThat(snapshot.monthlyDownloadRemainingBytes()).isZero();
+        assertThat(snapshot.monthlyDownloadUsedBytes()).isEqualTo(14);
+        assertThat(snapshot.retentionHours()).isEqualTo(1);
+        assertThat(snapshot.maxAttachmentBytes()).isEqualTo(1024);
+        assertThat(snapshot.downloadGrantSingleUse()).isTrue();
+        var month = java.time.YearMonth.from(Instant.parse(snapshot.checkedAt()).atOffset(java.time.ZoneOffset.UTC));
+        assertThat(snapshot.downloadUsageMonth()).isEqualTo(month.toString());
+        assertThat(snapshot.downloadResetsAt()).isEqualTo(month.plusMonths(1).atDay(1).atStartOfDay().toInstant(java.time.ZoneOffset.UTC).toString());
+        verify(repository).sumActiveStorageBytes("default", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED", snapshot.checkedAt());
+        verify(downloadUsageRepository).sumBytesByAccountAndMonth("default", "alice", snapshot.downloadUsageMonth());
+        verify(objectStorageService).isEnabled();
+        org.mockito.Mockito.verifyNoMoreInteractions(repository, downloadUsageRepository, objectStorageService);
+        verifyNoInteractions(downloadGrantRepository, publicTransferRoomService, clientAccountService);
+    }
+
+    @Test
+    void capabilitiesDisabledStorageStillReportsQuotaWithoutObjectRequests() {
+        var other = new ManagementContext(new TenantContext("other-tenant"), "alice", true);
+        var result = service.capabilities(other);
+        assertThat(result.storageEnabled()).isFalse();
+        verify(repository).sumActiveStorageBytes("other-tenant", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED", result.checkedAt());
+        verify(downloadUsageRepository).sumBytesByAccountAndMonth("other-tenant", "alice", result.downloadUsageMonth());
+        verify(objectStorageService).isEnabled();
+        org.mockito.Mockito.verifyNoMoreInteractions(objectStorageService);
+        verifyNoInteractions(downloadGrantRepository, publicTransferRoomService);
+    }
+
+    @Test
+    void capabilitiesReadFailureDoesNotPretendUsageIsZero() {
+        when(repository.sumActiveStorageBytes(any(), any(), anyLong(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("database unavailable"));
+        assertThatThrownBy(() -> service.capabilities(ACCOUNT)).hasMessage("database unavailable");
+        verifyNoInteractions(objectStorageService, downloadGrantRepository, downloadUsageRepository, publicTransferRoomService);
+    }
+
+    @Test
     void createPublicUploadRejectsWhenRoomPendingQuotaIsFull() {
         when(repository.countByScopeAndPublicTransferRoomIdAndStatus(
                 eq(TransferAttachmentService.SCOPE_PUBLIC_TRANSFER),

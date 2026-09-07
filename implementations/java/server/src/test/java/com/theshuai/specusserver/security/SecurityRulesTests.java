@@ -106,6 +106,23 @@ class SecurityRulesTests {
     }
 
     @Test
+    void transferCapabilitiesRequiresAuthenticationAndIsNotCached() throws Exception {
+        String path = "/api/public/transfer/attachments/capabilities";
+        assertThat(get(path, null).statusCode()).isEqualTo(401);
+        var login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        String token = JsonUtil.readString(login.body()).path("accessToken").asText();
+        var response = get(path + "?username=someone-else&tenantId=someone-else", token);
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        assertThat(response.headers().firstValue("Cache-Control")).hasValue("private, no-store");
+        var body = JsonUtil.readString(response.body());
+        assertThat(body.path("schemaVersion").asInt()).isEqualTo(1);
+        assertThat(body.path("storageEnabled").asBoolean()).isFalse();
+        assertThat(body.path("storageUsedBytes").asLong()).isZero();
+        assertThat(body.has("accessKeySecret")).isFalse();
+        assertThat(body.has("bucket")).isFalse();
+    }
+
+    @Test
     void publicTransferObjectStorageRequiresAuthentication() throws Exception {
         HttpResponse<String> response = sendJson(
                 "POST",

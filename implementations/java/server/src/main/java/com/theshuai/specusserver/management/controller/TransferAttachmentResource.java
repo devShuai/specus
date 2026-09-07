@@ -45,6 +45,12 @@ public class TransferAttachmentResource {
         this.addressResolver = addressResolver;
     }
 
+    @GetMapping("/api/public/transfer/attachments/capabilities")
+    public ResponseEntity<TransferAttachmentService.TransferCapabilities> capabilities(@AuthenticationPrincipal Jwt jwt) {
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "private, no-store")
+                .body(service.capabilities(contextResolver.resolve(jwt)));
+    }
+
     @PostMapping("/api/public/transfer/attachments/presign-upload")
     public PresignUploadResponse publicPresignUpload(HttpServletRequest httpRequest,
                                                      @AuthenticationPrincipal Jwt jwt,

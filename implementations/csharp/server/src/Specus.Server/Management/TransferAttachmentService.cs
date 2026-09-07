@@ -231,6 +231,35 @@ public sealed class TransferAttachmentService
         _rooms = rooms;
     }
 
+    // Advisory snapshot: no rooms, object-store requests, grants or quota reservations.
+    public async Task<TransferCapabilities> CapabilitiesAsync(ManagementContext context, CancellationToken cancellationToken)
+    {
+        var tenant = RequireAccountText(context.TenantId, "tenantId");
+        var username = RequireAccountText(context.Username, "username");
+        var quotaLock = QuotaLock(tenant, username);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var month = now.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            var used = Math.Max(0L, await _db.TransferAttachments.AsNoTracking()
+                .Where(a => a.TenantId == tenant && a.OwnerUsername == username
+                    && ((a.Status == StatusPending && a.UploadExpiresAt > now)
+                        || (a.Status == StatusUploaded && a.ExpiresAt > now)))
+                .SumAsync(a => (long?)a.SizeBytes, cancellationToken).ConfigureAwait(false) ?? 0L);
+            var downloaded = Math.Max(0L, await _db.TransferAttachmentDownloadUsages.AsNoTracking()
+                .Where(u => u.TenantId == tenant && u.Username == username && u.UsageMonth == month)
+                .SumAsync(u => (long?)u.SizeBytes, cancellationToken).ConfigureAwait(false) ?? 0L);
+            var storageLimit = _options.PerUserStorageQuotaBytes > 0 ? _options.PerUserStorageQuotaBytes : DefaultPerUserQuotaBytes;
+            var downloadLimit = _options.PerUserMonthlyDownloadQuotaBytes > 0 ? _options.PerUserMonthlyDownloadQuotaBytes : DefaultPerUserQuotaBytes;
+            return new TransferCapabilities(1, now, _storage.Enabled, Math.Max(0L, _options.MaxAttachmentBytes),
+                Math.Max(1L, _options.RetentionHours), storageLimit, used, Math.Max(0L, storageLimit - used),
+                downloadLimit, downloaded, Math.Max(0L, downloadLimit - downloaded), month,
+                new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, TimeSpan.Zero).AddMonths(1), true);
+        }
+        finally { quotaLock.Release(); }
+    }
+
     public async Task<PresignUploadResponse> CreatePublicUploadAsync(ManagementContext context,
         PresignUploadRequest request, CancellationToken cancellationToken)
     {

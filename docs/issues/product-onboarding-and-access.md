@@ -2,7 +2,7 @@
 
 来源：2026-09-05 产品审阅；互传易用性专项已由 #36 处理，不重复计入本 issue。
 
-状态：本地修复和验证完成；尚未部署，本 issue 保持开放以跟踪后续交付。代码交付进度以关联提交及远端分支为准。
+状态：修复已于 2026-09-06 提交并推送到 `origin/main`：[79dbb80](https://github.com/devShuai/specus/commit/79dbb80)。2026-09-07 核验时本 issue 已关闭；尚未部署，issue 关闭不等于线上验收完成。
 
 跟踪：[GitHub issue #37](https://github.com/devShuai/specus/issues/37)。
 

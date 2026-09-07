@@ -1,3 +1,5 @@
+import { cloudPreflightErrors, type TransferCapabilities } from "./transferCapabilities";
+
 export const MAX_QUEUED_FILE_TRANSFERS = 40;
 export type FileDeliveryMode = "device" | "link";
 
@@ -12,6 +14,9 @@ export interface FilePreflightInput {
   discoveryOnline: boolean;
   writable: boolean;
   scopeCurrent: boolean;
+  cloudRequested?: boolean;
+  cloudLoading?: boolean;
+  cloudSnapshot?: TransferCapabilities | null;
 }
 
 /** Metadata-only check: never hash, read file bytes, reserve quota or start a transfer here. */
@@ -35,6 +40,10 @@ export function checkFilePreflight(input: FilePreflightInput) {
     if (oversized.length > 0) errors.push(`${oversized.length} 个文件超过设备传输的单文件内存上限，请移除，或明确改为生成文件链接。`);
   } else if (!input.signedIn) {
     errors.push("生成文件链接需要登录；登录后仍需重新确认上传。");
+  }
+  if (input.mode === "link" || input.cloudRequested) {
+    if (input.cloudLoading) errors.push("正在读取额度，请稍候；尚未申请上传。");
+    errors.push(...cloudPreflightErrors(input.files, input.cloudSnapshot));
   }
   return { totalBytes, oversized, errors, canSend: errors.length === 0 };
 }

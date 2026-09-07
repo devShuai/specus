@@ -106,6 +106,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/transfer/ice-config", a.handlePublicTransferIceConfig)
 	mux.HandleFunc("GET /api/public/transfer/downloads/{token}", a.handlePublicAttachmentDownload)
 	mux.HandleFunc("POST /api/public/transfer/oss-callback", a.handlePublicAttachmentUploadCallback)
+	mux.HandleFunc("GET /api/public/transfer/attachments/capabilities", a.requireAuth(a.handleTransferCapabilities))
 	mux.HandleFunc("POST /api/public/transfer/attachments/presign-upload", a.requireAuth(a.handlePublicAttachmentPresignUpload))
 	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/complete", a.requireAuth(a.handlePublicAttachmentComplete))
 	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/presign-download", a.requireAuth(a.handlePublicAttachmentPresignDownload))
