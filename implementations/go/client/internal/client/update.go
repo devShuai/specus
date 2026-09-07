@@ -107,6 +107,9 @@ func (updater *Updater) CheckAndApply(ctx context.Context) (UpdateResult, error)
 	if !updater.config.UpdatesEnabled() || !validUpdateVersion(updater.currentVersion) {
 		return result, nil
 	}
+	if isDevelopmentVersion(updater.currentVersion) {
+		return result, nil
+	}
 	info, err := updater.check(ctx)
 	result.Checked = true
 	if err != nil {
@@ -1295,6 +1298,17 @@ func updateTarget(goos, goarch string) (string, string) {
 		arch = "x64"
 	}
 	return platform, arch
+}
+
+// isDevelopmentVersion reports whether the running build carries a placeholder version rather
+// than one injected by release packaging. validUpdateVersion only checks that a version is
+// well formed, and the placeholders are: package-release.sh builds 0.0.0-commit.<hash> when it
+// has no tag, and the other implementations default to 0.0.0-dev. Such a version parses fine and
+// compares as older than every release, so the check would report an update for a build that is
+// newer than anything published.
+func isDevelopmentVersion(value string) bool {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(value), "v")
+	return trimmed == "" || strings.HasPrefix(trimmed, "0.0.0")
 }
 
 func validUpdateVersion(value string) bool {

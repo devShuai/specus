@@ -81,8 +81,22 @@ public final class ClientUpdateChecker implements AutoCloseable {
         if (!config.isUpdateCheckEnabled() || !started.compareAndSet(false, true)) {
             return;
         }
+        if (isDevelopmentBuild(currentVersion)) {
+            log.debug("update check skipped: development build {}", currentVersion);
+            return;
+        }
         long intervalHours = normalizedIntervalHours(config.getUpdateCheckIntervalHours());
         executor.scheduleWithFixedDelay(this::checkSafely, 0L, intervalHours, TimeUnit.HOURS);
+    }
+
+    /**
+     * A build without a manifest version falls back to {@code 0.0.0-dev}, which parses as a real
+     * semantic version and compares as older than every release. Left alone, the check reports an
+     * update for a build that is newer than anything published. Release packaging always injects a
+     * real version, so only placeholders start at 0.0.0.
+     */
+    static boolean isDevelopmentBuild(String version) {
+        return version == null || version.isBlank() || version.trim().startsWith("0.0.0");
     }
 
     static long normalizedIntervalHours(long configured) {

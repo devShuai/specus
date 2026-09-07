@@ -11,6 +11,28 @@ public static class ClientVersion
 
     public static string Current => Resolved.Value;
 
+    /// <summary>
+    /// True when the running build carries a placeholder version rather than one injected by
+    /// release packaging. A local <c>dotnet build</c> leaves the csproj default of
+    /// <c>0.0.0-dev</c>, which parses as a real semantic version and therefore compares as older
+    /// than every published release — the update check would report an update on a build that is
+    /// by definition newer than what is published.
+    /// </summary>
+    public static bool IsDevelopmentBuild => IsPlaceholder(Current);
+
+    internal static bool IsPlaceholder(string? version)
+    {
+        var trimmed = version?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return true;
+        }
+        // Release packaging always injects a real version; every placeholder this repository
+        // produces starts at 0.0.0 (csproj default, and the Go packaging script's
+        // 0.0.0-commit.<hash>).
+        return trimmed.StartsWith("0.0.0", StringComparison.Ordinal);
+    }
+
     internal static string Resolve(Assembly assembly)
     {
         var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()

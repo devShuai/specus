@@ -15,12 +15,35 @@ public sealed class ClientUpdateHostedServiceTests
         using var service = new ClientUpdateHostedService(new SpecusClientConfig
         {
             ServerBaseUrl = "https://specus.example", UpdateEnabled = true, AutoUpdate = false,
-        }, updates, lifetime, NullLogger<ClientUpdateHostedService>.Instance);
+        }, updates, lifetime, NullLogger<ClientUpdateHostedService>.Instance,
+            currentVersion: "1.0.0");
         await service.StartAsync(CancellationToken.None);
         await updates.Called.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.False(updates.DownloadCalled);
         Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Theory]
+    [InlineData("0.0.0-dev")]
+    [InlineData("0.0.0-commit.abc123def456")]
+    [InlineData("0.0.0")]
+    public async Task DevelopmentBuildDoesNotQueryTheVersionCatalogue(string version)
+    {
+        // A placeholder version compares as older than every release, so without this guard the
+        // check reports an update for a build that is newer than anything published.
+        var updates = new AvailableUpdateService();
+        using var service = new ClientUpdateHostedService(new SpecusClientConfig
+        {
+            ServerBaseUrl = "https://specus.example", UpdateEnabled = true, AutoUpdate = false,
+        }, updates, new TestLifetime(), NullLogger<ClientUpdateHostedService>.Instance,
+            currentVersion: version);
+
+        await service.StartAsync(CancellationToken.None);
+        await Task.Delay(200);
+        await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(updates.Called.Task.IsCompleted);
     }
 
     private sealed class AvailableUpdateService : IClientUpdateService
@@ -53,7 +76,7 @@ public sealed class ClientUpdateHostedServiceTests
             UpdateCheckIntervalHours = 1,
         };
         var service = new ClientUpdateHostedService(config, updates, new TestLifetime(),
-            NullLogger<ClientUpdateHostedService>.Instance);
+            NullLogger<ClientUpdateHostedService>.Instance, currentVersion: "1.0.0");
 
         await service.StartAsync(CancellationToken.None);
         await updates.Called.Task.WaitAsync(TimeSpan.FromSeconds(5));

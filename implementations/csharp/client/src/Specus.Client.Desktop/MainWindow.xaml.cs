@@ -500,6 +500,21 @@ public partial class MainWindow : Window
         CheckUpdateButton.Content = "检查中…";
         try
         {
+            // A local build reports 0.0.0-dev, which compares as older than every release, so the
+            // check would always claim an update for a build that is newer than any of them. The
+            // background loop stays silent; an explicit click still gets an answer, because
+            // silently doing nothing on a button press reads as a broken button.
+            if (ClientVersion.IsDevelopmentBuild)
+            {
+                if (showUpToDate)
+                {
+                    MessageBox.Show(this,
+                        $"当前是开发构建（{ClientVersion.Current}），不检查更新。\n\n" +
+                        "发布版本由打包流程注入版本号后才会参与版本比较。",
+                        "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                return;
+            }
             var serverText = ServerBaseUrlBox.Text.Trim();
             if (!Uri.TryCreate(serverText, UriKind.Absolute, out var serverUri))
             {
