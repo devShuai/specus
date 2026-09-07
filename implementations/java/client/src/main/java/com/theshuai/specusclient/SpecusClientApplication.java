@@ -14,13 +14,19 @@ import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.specusclient.peer.PeerKeyStore;
 import com.theshuai.specusclient.update.ClientUpdateChecker;
 import com.theshuai.specusclient.update.DesktopUpdateNotifier;
+import com.theshuai.specusclient.cli.ClientCli;
+import com.theshuai.specusclient.cli.ClientExitStatus;
+import com.theshuai.specusclient.cli.CliOutput;
+import com.theshuai.specusclient.cli.CliState;
+import com.theshuai.specusclient.auth.FirstLoginRetry;
+import com.theshuai.specusclient.auth.HttpLoginFailure;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.util.StringUtils;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -47,31 +53,81 @@ public class SpecusClientApplication {
     private static final String CONFIG_FILE = "client.jsonc";
 
     public static void main(String[] args) {
+        ClientCli.Options options;
+        try {
+            options = ClientCli.parse(args);
+        } catch (IllegalArgumentException error) {
+            System.exit(CliOutput.result(java.util.Arrays.asList(args).contains("--json"),"arguments",2,null,"specus-client: " + error.getMessage()));
+            return;
+        }
+        if (options.help()) { CliOutput.result(options.json(),"help",0,java.util.Map.of("help",ClientCli.HELP),ClientCli.HELP); return; }
+        if (options.version()) { CliOutput.result(options.json(),"version",0,java.util.Map.of("version",currentVersion()),currentVersion()); return; }
+        if (java.util.Set.of("status","peers","services").contains(options.command())) { System.exit(CliState.query(options)); return; }
+        ClientStartupConfig loaded;
+        try {
+            loaded = ClientCli.load(options.config(), warning -> System.err.println("Warning: " + warning));
+        } catch (Exception error) {
+            System.exit(CliOutput.result(options.json(),options.command(),2,null,"specus-client: invalid config " + options.config() + ": " + error.getMessage()
+                    + "\nCheck the configuration or run --help for usage."));
+            return;
+        }
+        if ("validate".equals(options.command())) {
+            CliOutput.result(options.json(),"config validate",0,java.util.Map.of("configPath",options.config().toString(),"offline",true),"Configuration valid: " + options.config() + " (offline; connectivity not tested)");
+            return;
+        }
+        if (options.noUpdate()) loaded.setUpdateCheckEnabled(false);
+        if ("show".equals(options.command())) {
+            var effective = CliOutput.redactedConfig(loaded);
+            CliOutput.result(options.json(),"config show",0,java.util.Map.of("configPath",options.config().toString(),"config",effective),options.config()+"\n"+effective.toPrettyString()); return;
+        }
+        if ("doctor".equals(options.command())) { System.exit(doctor(options,loaded)); return; }
         SpringApplication application = new SpringApplication(SpecusClientApplication.class);
         application.setWebApplicationType(WebApplicationType.NONE);
-        application.run(args);
+        application.setBannerMode(org.springframework.boot.Banner.Mode.OFF);
+        // Explicit CLI options take precedence over environment/application properties.
+        application.addInitializers(context -> context.getEnvironment().getPropertySources().addFirst(
+                new org.springframework.core.env.MapPropertySource("specus-cli", java.util.Map.of(
+                        "specus.cli.config", options.config().toString(),
+                        "specus.cli.no-update", options.noUpdate(),
+                        "specus.cli.login-timeout", options.loginTimeoutSeconds(),
+                        "logging.level.root", options.debug() ? "DEBUG" : "INFO"))));
+        application.setDefaultProperties(java.util.Map.of("logging.level.root", options.debug() ? "DEBUG" : "INFO"));
+        // DevTools replays the arguments supplied to run when restarting main. Retain
+        // our validated arguments, and let its special silent-exit exception reach its
+        // handler rather than catching it and terminating the restarted process.
+        org.springframework.context.ConfigurableApplicationContext context;
+        try {
+            context = application.run(args);
+        } catch (org.springframework.beans.BeansException error) {
+            // DevTools' uncaught-exception handler otherwise reports bean startup
+            // failures as a successful process exit. Do not catch its restart signal.
+            System.err.println("specus-client: startup failed; check the preceding configuration/login error.");
+            Throwable cause = error;
+            while (cause.getCause()!=null) cause=cause.getCause();
+            System.exit(cause instanceof HttpLoginFailure failure ? failure.exitCode() : cause instanceof IOException ? 2 : 1);
+            return;
+        }
+        int exitCode = context.getBean(ClientExitStatus.class).await();
+        SpringApplication.exit(context, () -> exitCode);
+        System.exit(exitCode);
     }
 
     @Bean
-    public ClientStartupConfig clientStartupConfig() {
-        String configString = loadConfigString();
-        if (!StringUtils.hasLength(configString)) {
-            throw new IllegalStateException("未找到 " + CONFIG_FILE + " 配置，无法启动 specus client");
-        }
-        ClientStartupConfig startupConfig = JsonUtil.stringToObject(configString, ClientStartupConfig.class);
-        if (startupConfig == null || !StringUtils.hasText(startupConfig.getServerBaseUrl())) {
-            throw new IllegalStateException(CONFIG_FILE + " 必须使用 HTTP 登录配置，至少包含 serverBaseUrl");
-        }
-        if (startupConfig.getControlTls() == null) {
-            startupConfig.setControlTls(new com.theshuai.specusclient.bean.ControlTlsConfig());
-        }
-        startupConfig.getControlTls().validate(startupConfig.getServerBaseUrl());
+    public ClientStartupConfig clientStartupConfig(
+            @Value("${specus.cli.config:client.jsonc}") String configPath,
+            @Value("${specus.cli.no-update:false}") boolean noUpdate) throws IOException {
+        Path path = Path.of(configPath).toAbsolutePath().normalize();
+        log.info("加载 specus client 配置: {}", path);
+        ClientStartupConfig startupConfig = ClientCli.load(path);
+        if (noUpdate) startupConfig.setUpdateCheckEnabled(false);
         return startupConfig;
     }
 
     @Bean
-    public SpecusBean specusBean(ClientStartupConfig startupConfig) {
-        return loginAndBuildSpecus(startupConfig);
+    public SpecusBean specusBean(ClientStartupConfig startupConfig,
+            @Value("${specus.cli.login-timeout:60}") int loginTimeoutSeconds, CliState cliState) {
+        return FirstLoginRetry.login(Duration.ofSeconds(loginTimeoutSeconds),
+                remaining -> loginAndBuildSpecus(startupConfig, remaining), message -> log.warn("{}", message));
     }
 
     @Bean(destroyMethod = "close")
@@ -85,6 +141,34 @@ public class SpecusClientApplication {
     }
 
     private static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig) {
+        return loginAndBuildSpecus(startupConfig, Duration.ofSeconds(20));
+    }
+
+    @Bean(destroyMethod="close")
+    public CliState cliState(@Value("${specus.cli.config:client.jsonc}") String configPath) throws IOException {
+        return new CliState(Path.of(configPath));
+    }
+
+    private static int doctor(ClientCli.Options options, ClientStartupConfig config) {
+        String scope = options.probe() ? "server-tcp" : "offline";
+        var data = java.util.Map.of("configPath",options.config().toString(),"scope",scope,"authenticationTested",false,"businessTested",false);
+        if (options.probe()) {
+            var executor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> { var thread=new Thread(r,"cli-doctor"); thread.setDaemon(true); return thread; });
+            try (var socket = new java.net.Socket()) {
+                var future = executor.submit(() -> {
+                    URI uri = URI.create(config.getServerBaseUrl());
+                    socket.connect(new java.net.InetSocketAddress(uri.getHost(),uri.getPort()>0 ? uri.getPort() : "https".equals(uri.getScheme()) ? 443 : 80),5000); return true;
+                });
+                future.get(5,TimeUnit.SECONDS);
+            } catch (Exception error) {
+                return CliOutput.result(options.json(),"doctor",4,data,"Server TCP probe failed or timed out. Check DNS, proxy, firewall and server availability; authentication was not attempted.");
+            } finally { executor.shutdownNow(); }
+        }
+        return CliOutput.result(options.json(),"doctor",0,data,"Doctor passed ("+scope+"); authentication, TLS and business readiness not tested.");
+    }
+
+    private static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig, Duration timeout) {
+        long attemptStarted = System.nanoTime();
         ClientEnvironmentInfo environment = collectEnvironment();
         ClientAuthLoginRequest loginRequest = new ClientAuthLoginRequest();
         loginRequest.setEnvironment(environment);
@@ -106,7 +190,10 @@ public class SpecusClientApplication {
                 MachineCredential.resolve(startupConfig.getSecret())
         ));
 
-        ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest);
+        Duration remaining = timeout.minusNanos(System.nanoTime() - attemptStarted);
+        if (remaining.isNegative() || remaining.isZero())
+            throw new HttpLoginFailure("HTTP login preparation exceeded the request budget.", true);
+        ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest, remaining);
         SpecusBean specusBean = new SpecusBean();
         specusBean.setClientName(response.getClientName());
         specusBean.setClientSessionId(response.getClientSessionId());
@@ -140,35 +227,57 @@ public class SpecusClientApplication {
         return specusBean;
     }
 
-    private static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest) {
+    static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest, Duration timeout) {
+        long requestStarted = System.nanoTime();
         String url = trimTrailingSlash(startupConfig.getServerBaseUrl()) + "/api/client/auth/login";
         String body = JsonUtil.objectToString(loginRequest);
         HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
+                .connectTimeout(timeout.compareTo(Duration.ofSeconds(10)) < 0 ? timeout : Duration.ofSeconds(10))
                 .build();
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(20))
+                .timeout(timeout.compareTo(Duration.ofSeconds(20)) < 0 ? timeout : Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
+        var pending = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            // HttpRequest.timeout alone does not bound a stalled response body on JDK 21.
+            long remainingNanos = request.timeout().orElseThrow().toNanos() - (System.nanoTime() - requestStarted);
+            if (remainingNanos <= 0) throw new java.util.concurrent.TimeoutException();
+            HttpResponse<String> response = pending.get(remainingNanos, TimeUnit.NANOSECONDS);
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new IllegalStateException("客户端 HTTP 登录失败 HTTP " + response.statusCode() + ": " + response.body());
+                throw HttpLoginFailure.forStatus(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null));
             }
-            ClientAuthLoginResponse loginResponse = JsonUtil.stringToObject(response.body(), ClientAuthLoginResponse.class);
+            ClientAuthLoginResponse loginResponse;
+            try {
+                // JsonUtil logs invalid input verbatim, which may contain access tokens.
+                loginResponse = new com.fasterxml.jackson.databind.ObjectMapper()
+                        .disable(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                        .readValue(response.body(), ClientAuthLoginResponse.class);
+            } catch (com.fasterxml.jackson.core.JsonProcessingException error) {
+                throw new HttpLoginFailure("Invalid HTTP login response. Check serverBaseUrl and server/client compatibility.", false);
+            }
             if (loginResponse == null || !StringUtils.hasText(loginResponse.getAccessToken())
                     || !StringUtils.hasText(loginResponse.getClientName())
                     || !StringUtils.hasText(loginResponse.getNettyHost())
-                    || loginResponse.getNettyPort() <= 0) {
-                throw new IllegalStateException("客户端 HTTP 登录返回无效");
+                    || loginResponse.getClientSessionId() <= 0
+                    || loginResponse.getNettyPort() <= 0 || loginResponse.getNettyPort() > 65535) {
+                throw new HttpLoginFailure("Invalid HTTP login response: missing client/session/token/netty endpoint.", false);
             }
             return loginResponse;
-        } catch (IOException e) {
-            throw new IllegalStateException("客户端 HTTP 登录请求失败: " + e.getMessage(), e);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new HttpLoginFailure("HTTP login request timeout. Check network/server availability.", true);
+        } catch (java.util.concurrent.ExecutionException e) {
+            if (e.getCause() instanceof javax.net.ssl.SSLException)
+                throw new HttpLoginFailure("HTTP login TLS failure. Check the server certificate, hostname and system trust store; do not disable verification.", false);
+            throw new HttpLoginFailure("HTTP login network failure. Check DNS, proxy and server availability.", e.getCause() instanceof IOException);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("客户端 HTTP 登录请求被中断", e);
+            throw new HttpLoginFailure("HTTP login cancelled.", false);
+        } finally {
+            pending.cancel(true);
+            // close() waits for unfinished exchanges and can undo the deadline guarantee.
+            httpClient.shutdownNow();
         }
     }
 
@@ -239,26 +348,6 @@ public class SpecusClientApplication {
             log.debug("采集本地 IP 失败: {}", e.getMessage());
         }
         return addresses;
-    }
-
-    private static String loadConfigString() {
-        File configFile = new File(System.getProperty("user.dir") + File.separator + CONFIG_FILE);
-
-        try {
-            if (configFile.exists()) {
-                log.info("加载 specus client 配置: {}", configFile.getAbsolutePath());
-                return readFile(configFile);
-            }
-            log.warn("未找到 {}。已检查路径: [{}]", CONFIG_FILE, configFile.getAbsolutePath());
-            return "";
-        } catch (Exception e) {
-            log.error("处理 specus client 配置失败", e);
-            return "";
-        }
-    }
-
-    private static String readFile(File file) throws IOException {
-        return Files.readString(file.toPath(), StandardCharsets.UTF_8);
     }
 
     private static List<SpecusConfig> toSpecusConfigs(List<ClientAuthLoginResponse.SpecusEndpoint> endpoints) {

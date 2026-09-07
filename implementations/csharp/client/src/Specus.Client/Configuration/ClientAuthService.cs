@@ -27,6 +27,8 @@ public sealed class ClientAuthService
     private readonly HttpClient _http;
     private readonly ILogger<ClientAuthService> _logger;
     private readonly ClientMessageCapabilities _messageCapabilities;
+    private bool _authenticated;
+    public TimeSpan InitialLoginTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
     public ClientAuthService(
         SpecusClientConfig config,
@@ -65,6 +67,54 @@ public sealed class ClientAuthService
 
     public async Task<SpecusRuntimeState> LoginAsync(CancellationToken cancellationToken)
     {
+        if (_authenticated) return await LoginOnceAsync(cancellationToken).ConfigureAwait(false);
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(InitialLoginTimeout);
+        var delay = TimeSpan.FromSeconds(1);
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    var result = await LoginOnceAsync(budget.Token).ConfigureAwait(false);
+                    _authenticated = true;
+                    return result;
+                }
+                catch (HttpLoginFailure error) when (error.Retryable)
+                {
+                    var wait = error.RetryAfter > delay ? error.RetryAfter : delay;
+                    _logger.LogWarning("{Reason} Retrying in {Seconds}s within the initial login budget.", error.Message, wait.TotalSeconds);
+                    await Task.Delay(wait, budget.Token).ConfigureAwait(false);
+                    delay = TimeSpan.FromSeconds(Math.Min(5, delay.TotalSeconds * 2));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new HttpLoginFailure("Initial HTTP login timeout. Check network/server availability or increase --login-timeout (seconds).", false, 4);
+        }
+    }
+
+    private async Task<SpecusRuntimeState> LoginOnceAsync(CancellationToken cancellationToken)
+    {
+        try { return await SendLoginAsync(cancellationToken).ConfigureAwait(false); }
+        catch (HttpRequestException error)
+        {
+            bool tls = error.HttpRequestError == HttpRequestError.SecureConnectionError;
+            throw new HttpLoginFailure(tls ? "HTTP login TLS failure. Check the certificate, hostname and system trust store; do not disable verification."
+                : "HTTP login network failure. Check DNS, proxy and server availability.", !tls);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        { throw new HttpLoginFailure("HTTP login request timeout. Check network/server availability.", true); }
+        catch (JsonException)
+        { throw new HttpLoginFailure("Invalid HTTP login response. Check serverBaseUrl and server/client compatibility.", false); }
+        catch (InvalidDataException)
+        { throw new HttpLoginFailure("Cannot resolve secret. Check the env:/file: credential reference.", false, 2); }
+    }
+
+    private async Task<SpecusRuntimeState> SendLoginAsync(CancellationToken cancellationToken)
+    {
         var environment = ClientEnvironmentInfo.Collect(_logger, _messageCapabilities);
         var request = new ClientAuthLoginRequest
         {
@@ -89,18 +139,18 @@ public sealed class ClientAuthService
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
-            throw new InvalidOperationException($"客户端 HTTP 登录失败 HTTP {(int)response.StatusCode}: {body}");
+            throw HttpLoginFailure.FromResponse(response);
         }
 
         var runtime = JsonSerializer.Deserialize<SpecusRuntimeState>(body, JsonOptions)
-            ?? throw new InvalidOperationException("客户端 HTTP 登录返回为空");
+            ?? throw new HttpLoginFailure("Invalid HTTP login response: empty response.", false);
         if (string.IsNullOrWhiteSpace(runtime.ClientName)
             || runtime.ClientSessionId <= 0
             || string.IsNullOrWhiteSpace(runtime.AccessToken)
             || string.IsNullOrWhiteSpace(runtime.NettyHost)
             || runtime.NettyPort <= 0)
         {
-            throw new InvalidOperationException("客户端 HTTP 登录返回缺少 clientName/session/token/netty endpoint");
+            throw new HttpLoginFailure("Invalid HTTP login response: missing client/session/token/netty endpoint.", false);
         }
         if (runtime.TokenTtlSeconds > 0)
         {

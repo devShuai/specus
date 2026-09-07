@@ -74,6 +74,20 @@ public class NettyClient {
     private final String tlsServerNameOverride;
     private final boolean verifyTlsHostname;
     private final AtomicReference<Channel> controlChannel = new AtomicReference<>();
+    private volatile boolean diagnosticControl, diagnosticReady;
+
+    public java.util.Map<String,Object> diagnosticSnapshot() {
+        var data=new java.util.LinkedHashMap<String,Object>();
+        data.put("phase",diagnosticReady?"ready":diagnosticControl?"control-authenticated":"connecting");
+        boolean authenticated=diagnosticControl;
+        data.put("controlAuthenticated",authenticated);data.put("businessReady",authenticated&&diagnosticReady);
+        data.put("peers",peerMeshClient.diagnosticPeers());
+        data.put("services",peerMeshClient.serviceRuntime().remoteServices().stream().map(s -> java.util.Map.of(
+                "publisher",s.publisherClientName(),"name",s.service().getName(),"application",s.service().getApplication(),
+                "accessTarget",com.theshuai.specusclient.cli.CliOutput.safeUrl(s.accessTarget()),"available",s.openable())).toList());
+        if(!authenticated) { data.put("peers",java.util.List.of());data.put("services",java.util.List.of()); }
+        return data;
+    }
     private final AtomicReference<Channel> dataChannel = new AtomicReference<>();
     private final PeerMeshClient peerMeshClient;
 
@@ -355,8 +369,10 @@ public class NettyClient {
                 channel.pipeline().addLast(new NatClientHandler(specusBean, localConnection));
             }
             log.info("Dedicated data channel is ready");
+            diagnosticReady = true;
             return;
         }
+        diagnosticControl = true;
         int prior = reconnectAttempts.getAndSet(0);
         if (prior > 0) {
             log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
@@ -401,6 +417,7 @@ public class NettyClient {
     }
 
     public void onConnectionInactive(String connectionRole) {
+        diagnosticControl = false; diagnosticReady = false;
         if (isShuttingDown() || isReconnectSuppressed() || isAuthRefreshInProgress()) {
             return;
         }
@@ -415,11 +432,18 @@ public class NettyClient {
         scheduleReconnect();
     }
 
+    private volatile Runnable terminalFailureListener = () -> { };
+
+    public void setTerminalFailureListener(Runnable listener) {
+        terminalFailureListener = java.util.Objects.requireNonNull(listener);
+    }
+
     public void stopReconnecting(String reason) {
-        reconnectSuppressed.set(true);
+        if (!reconnectSuppressed.compareAndSet(false, true)) return;
         reconnectScheduled.set(false);
         log.warn("Stop reconnecting to {}:{}: {}", host, port,
                 StringUtils.hasText(reason) ? reason : "login rejected");
+        terminalFailureListener.run();
     }
 
     public void refreshCredentialsAndReconnect(String reason) {
@@ -456,6 +480,11 @@ public class NettyClient {
                             return;
                         }
                         if (error != null) {
+                            Throwable cause=error;
+                            while(cause.getCause()!=null) cause=cause.getCause();
+                            if(reconnectAfterSuccess && cause instanceof com.theshuai.specusclient.auth.HttpLoginFailure failure && !failure.isRetryable()) {
+                                stopReconnecting(failure.getMessage()); return;
+                            }
                             log.warn("客户端访问令牌刷新失败: {}，稍后重试",
                                     error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
                             return;

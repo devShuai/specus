@@ -51,7 +51,7 @@ public sealed class SpecusClientConfig
 
     public void Normalize()
     {
-        ServerBaseUrl = ServerBaseUrl.Trim();
+        ServerBaseUrl = ServerBaseUrl?.Trim() ?? "";
         ApiKey = ApiKey?.Trim();
         Secret = Secret?.Trim();
         ControlTls ??= new ControlTlsConfig();

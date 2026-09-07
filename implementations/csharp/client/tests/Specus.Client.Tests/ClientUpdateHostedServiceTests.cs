@@ -8,6 +8,41 @@ namespace Specus.Client.Tests;
 public sealed class ClientUpdateHostedServiceTests
 {
     [Fact]
+    public async Task AvailableMandatoryUpdateWithoutAuthorizationDoesNotInstallOrBlockShutdown()
+    {
+        var updates = new AvailableUpdateService();
+        var lifetime = new TestLifetime();
+        using var service = new ClientUpdateHostedService(new SpecusClientConfig
+        {
+            ServerBaseUrl = "https://specus.example", UpdateEnabled = true, AutoUpdate = false,
+        }, updates, lifetime, NullLogger<ClientUpdateHostedService>.Instance);
+        await service.StartAsync(CancellationToken.None);
+        await updates.Called.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(updates.DownloadCalled);
+        Assert.False(lifetime.ApplicationStopping.IsCancellationRequested);
+    }
+
+    private sealed class AvailableUpdateService : IClientUpdateService
+    {
+        public TaskCompletionSource Called { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool DownloadCalled { get; private set; }
+        public Task<ClientUpdateCheck> CheckAsync(Uri serverBaseUri, ClientUpdateTarget target,
+            string currentVersion, CancellationToken cancellationToken = default)
+        {
+            Called.SetResult();
+            return Task.FromResult(new ClientUpdateCheck(true, true, "99.0.0", 1, null, null, 1, null, serverBaseUri));
+        }
+        public Task<ClientUpdateInstallationPlan> DownloadAndPrepareAsync(ClientUpdateCheck update,
+            ClientUpdateInstallationRequest installation, IProgress<ClientUpdateProgress>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            DownloadCalled = true;
+            throw new InvalidOperationException("Installation was not authorized");
+        }
+    }
+
+    [Fact]
     public async Task UnexpectedUpdateFailureDoesNotTerminateTheTunnelHostService()
     {
         var updates = new ThrowingUpdateService();

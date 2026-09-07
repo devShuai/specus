@@ -50,6 +50,9 @@ public class PeerServiceRuntimeTests
         config.LocalServices[0].Name = "fixture-http";
         config.LocalServices[0].Description = "wire fixture";
         config.LocalServices[0].Path = "/health";
+        // Java and .NET suites can run concurrently on the same host; do not compete
+        // for the fixture's illustrative 18080 port when asserting a live bridge.
+        config.LocalServices[0].PublishedPort = FreePort();
         runtime.ApplyConfig(config);
         WaitUntil(() => sent.Count > 0);
         Assert.Contains("service-report", sent[0]);
@@ -59,6 +62,7 @@ public class PeerServiceRuntimeTests
         var vectors = ProtocolVectorTestHelper.Read<PeerServiceWireVectors>(
             "protocol/test-vectors/peer-service-discovery-v2.json");
         var expectedReport = JsonNode.Parse(vectors.ServiceReports["dotnet"].GetRawText())!.AsObject();
+        expectedReport["services"]![0]!["publishedPort"] = config.LocalServices[0].PublishedPort;
         foreach (var field in new[] { "revision", "instanceId", "generatedAt", "expiresAt", "createdAtMillis" })
         {
             expectedReport[field] = actualReport[field]?.DeepClone();

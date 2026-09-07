@@ -3,6 +3,7 @@ package com.theshuai.specusclient.client;
 import com.theshuai.specusclient.bean.ClientStartupConfig;
 import com.theshuai.specusclient.bean.ControlTlsConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
+import com.theshuai.specusclient.cli.ClientExitStatus;
 import io.netty.handler.ssl.SslContext;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -17,10 +18,15 @@ public class NettyClientLifecycle implements ApplicationRunner {
     private final SpecusBean specusBean;
     private final ClientStartupConfig startupConfig;
     private volatile NettyClient nettyClient;
+    private final ClientExitStatus exitStatus;
+    private final com.theshuai.specusclient.cli.CliState cliState;
 
-    public NettyClientLifecycle(SpecusBean specusBean, ClientStartupConfig startupConfig) {
+    public NettyClientLifecycle(SpecusBean specusBean, ClientStartupConfig startupConfig, ClientExitStatus exitStatus,
+            com.theshuai.specusclient.cli.CliState cliState) {
         this.specusBean = specusBean;
         this.startupConfig = startupConfig;
+        this.exitStatus = exitStatus;
+        this.cliState = cliState;
     }
 
     @Override
@@ -47,6 +53,8 @@ public class NettyClientLifecycle implements ApplicationRunner {
                 tls.getServerName(),
                 tlsEnabled && !tls.isInsecureSkipVerify());
         nettyClient = client;
+        client.setTerminalFailureListener(exitStatus::fail);
+        cliState.observe(client::diagnosticSnapshot);
         if (tlsEnabled && tls.isInsecureSkipVerify()) {
             log.warn("Control TLS enabled with certificate and hostname verification disabled (development only)");
         } else {

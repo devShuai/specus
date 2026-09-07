@@ -196,11 +196,17 @@ func TestUpdaterRequiresConfirmationButDeclinedMandatoryUpdateDoesNotBlockStartu
 		t.Fatalf("declined update changed executable: %q", current)
 	}
 	updater.confirm = nil
-	updater.input = strings.NewReader("")
+	updater.input = forbiddenUpdateInput{}
 	result, err = updater.CheckAndApply(context.Background())
 	if err != nil || result.Installed || !result.Mandatory {
 		t.Fatalf("non-interactive mandatory result=%+v err=%v", result, err)
 	}
+}
+
+type forbiddenUpdateInput struct{}
+
+func (forbiddenUpdateInput) Read([]byte) (int, error) {
+	panic("automatic update checks must never read stdin")
 }
 
 func TestUpdateMonitorContinuesAfterDeclinedMandatoryUpdate(t *testing.T) {

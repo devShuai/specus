@@ -380,6 +380,13 @@ public class PeerMeshClient implements AutoCloseable {
         return serviceRuntime;
     }
 
+    public java.util.List<java.util.Map<String,Object>> diagnosticPeers() {
+        return peerIndex.byId().values().stream().map(p -> {
+            java.util.Map<String,Object> view=new java.util.LinkedHashMap<>();
+            view.put("clientName",p.clientName());view.put("virtualIp",p.virtualIp());view.put("online",p.online());return view;
+        }).toList();
+    }
+
     private String runtimeConfigKey(ClientAuthLoginResponse.PeerMeshConfig value) {
         if (value == null || !value.isEnabled()) {
             return "disabled";

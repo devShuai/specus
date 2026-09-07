@@ -4,6 +4,8 @@ namespace Specus.Client.Runtime;
 
 public interface ISpecusClientObserver
 {
+    /// <summary>Control authentication succeeded; the dedicated data channel may still be pending.</summary>
+    void OnControlAuthenticated() { }
     void OnStatusChanged(SpecusClientStatusSnapshot snapshot) { }
 
     void OnRoutesChanged(SpecusClientRoutesSnapshot snapshot) { }

@@ -206,7 +206,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
             {
                 _logger.LogWarning("control login rejected: {reason}; stopping reconnect", ex.ReasonOrDefault);
                 PublishStatus("STOPPED", ex.ReasonOrDefault, running: false, controlConnected: false, loggedIn: false);
-                return;
+                throw new HttpLoginFailure("Control login rejected. Check credentials, account policy and concurrent instance limits.", false, 3);
             }
             catch (ControlLoginRejectedException ex)
             {
@@ -215,7 +215,13 @@ public sealed class SpecusControlClient : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "control channel session ended");
+                if (ex is HttpLoginFailure { Retryable: false })
+                {
+                    PublishStatus("STOPPED", ex.Message, running: false, controlConnected: false, loggedIn: false);
+                    throw;
+                }
+                _logger.LogWarning("Control channel session ended ({Type}); check connectivity or use --debug.", ex.GetType().Name);
+                _logger.LogDebug(ex, "control channel session ended");
                 PublishStatus("RECONNECTING", ex.Message, running: true, controlConnected: false, loggedIn: false);
             }
 
@@ -282,6 +288,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
         await SendLoginAsync(controlWriter, ConnectionRole.Control, session).ConfigureAwait(false);
         var controlLogin = await ReadLoginResponseAsync(controlReader, controlWatchdog, session).ConfigureAwait(false);
         EnsureLoginSucceeded(controlLogin, ConnectionRole.Control);
+        _observer?.OnControlAuthenticated();
         _activeWriter = controlWriter;
         await _peerMesh.StartAsync(runtime, controlWriter, session).ConfigureAwait(false);
 

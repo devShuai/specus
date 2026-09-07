@@ -44,8 +44,12 @@ type priorityWriter struct {
 }
 
 type Client struct {
-	config Config
-	logger *log.Logger
+	initialLoginTimeout time.Duration
+	authenticated       atomic.Bool
+	diagnosticControl   atomic.Bool
+	diagnosticReady     atomic.Bool
+	config              Config
+	logger              *log.Logger
 
 	// Trust policy for connections to the forwarding target, built once from the configuration.
 	upstreamTLSOnce         sync.Once
@@ -172,6 +176,10 @@ func (client *Client) Run(ctx context.Context) error {
 	for {
 		err := client.runOnce(ctx)
 		if err != nil {
+			var authFailure *LoginFailure
+			if errors.As(err, &authFailure) && !authFailure.Retryable {
+				return err
+			}
 			if errors.Is(err, context.Canceled) {
 				return ctx.Err()
 			}
@@ -294,6 +302,7 @@ func (client *Client) invalidateRuntimeSession() {
 }
 
 func (client *Client) runOnce(ctx context.Context) error {
+	defer func() { client.diagnosticControl.Store(false); client.diagnosticReady.Store(false) }()
 	// A control-channel drop does not invalidate the runtime session. Reusing a token that is still
 	// comfortably valid avoids a full HTTP login (and a new server-side session row) on every
 	// reconnect; the server keeps accepting the existing clientSessionId.
@@ -595,12 +604,14 @@ func (client *Client) handleLoginResponse(connection net.Conn, packet protocol.P
 	}
 	client.logger.Printf("login succeeded as %q", response.ClientName)
 	if role == protocol.ConnectionRoleControl {
+		client.diagnosticControl.Store(true)
 		if previous := client.resetReconnectBackoff(); previous > 0 {
 			client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
 		}
 		client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
 	} else {
 		client.registerConfiguredSpecusMappings(connection)
+		client.diagnosticReady.Store(true)
 	}
 	return nil
 }

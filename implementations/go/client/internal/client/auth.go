@@ -6,8 +6,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -57,7 +59,7 @@ type clientPeerServiceCapabilities struct {
 	Applications []string `json:"applications"`
 }
 
-var authHTTPClient = &http.Client{Timeout: 20 * time.Second}
+var authHTTPClient = &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 // clientVersion is reported to the server during the login handshake. The binary sets it from the
 // version injected at package time; it stays empty for embedders that never call SetVersion, which
@@ -77,7 +79,7 @@ func currentClientVersion() string {
 	return ""
 }
 
-func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
+func (client *Client) loginOnce(ctx context.Context) (RuntimeConfig, error) {
 	environment := collectEnvironment()
 	request := authLoginRequest{
 		Environment: environment,
@@ -89,7 +91,7 @@ func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 	// effect on the next reconnect, not on the next restart. An inline secret resolves to itself.
 	secret, secretErr := resolveSecret(client.config.Secret)
 	if secretErr != nil {
-		return RuntimeConfig{}, fmt.Errorf("resolve secret: %w", secretErr)
+		return RuntimeConfig{}, &LoginFailure{Code: 2, Message: "Cannot resolve secret. Check the env:/file: credential reference."}
 	}
 	request.Signature = signAPIKey(request.APIKey, request.Timestamp, request.Nonce, environment, strings.TrimSpace(secret))
 
@@ -105,22 +107,34 @@ func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 	httpRequest.Header.Set("Content-Type", "application/json")
 	response, err := authHTTPClient.Do(httpRequest)
 	if err != nil {
-		return RuntimeConfig{}, fmt.Errorf("client HTTP login request failed: %w", err)
+		if ctx.Err() != nil {
+			return RuntimeConfig{}, ctx.Err()
+		}
+		var certificate *tls.CertificateVerificationError
+		if errors.As(err, &certificate) {
+			return RuntimeConfig{}, &LoginFailure{Code: 1, Message: "HTTP login TLS failure. Check the certificate, hostname and system trust store; do not disable verification."}
+		}
+		return RuntimeConfig{}, &LoginFailure{Code: 1, Retryable: true, Message: "HTTP login network failure. Check DNS, proxy and server availability."}
 	}
 	defer response.Body.Close()
 	var runtime RuntimeConfig
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var errorBody bytes.Buffer
-		_, _ = errorBody.ReadFrom(response.Body)
-		return RuntimeConfig{}, fmt.Errorf("client HTTP login failed HTTP %d: %s", response.StatusCode, strings.TrimSpace(errorBody.String()))
+		return RuntimeConfig{}, loginStatusFailure(response.StatusCode, response.Header.Get("Retry-After"))
 	}
 	if err := json.NewDecoder(response.Body).Decode(&runtime); err != nil {
-		return RuntimeConfig{}, fmt.Errorf("decode client HTTP login response: %w", err)
+		if ctx.Err() != nil {
+			return RuntimeConfig{}, ctx.Err()
+		}
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			return RuntimeConfig{}, &LoginFailure{Code: 1, Retryable: true, Message: "HTTP login request timeout. Check network/server availability."}
+		}
+		return RuntimeConfig{}, &LoginFailure{Code: 1, Message: "Invalid HTTP login response. Check serverBaseUrl and server/client compatibility."}
 	}
 	if strings.TrimSpace(runtime.ClientName) == "" || runtime.ClientSessionID <= 0 ||
 		strings.TrimSpace(runtime.AccessToken) == "" || strings.TrimSpace(runtime.NettyHost) == "" ||
 		runtime.NettyPort < 1 || runtime.NettyPort > 65535 {
-		return RuntimeConfig{}, fmt.Errorf("client HTTP login response is missing client/session/token/netty endpoint")
+		return RuntimeConfig{}, &LoginFailure{Code: 1, Message: "Invalid HTTP login response: missing client/session/token/netty endpoint."}
 	}
 	if runtime.TokenTTLSeconds > 0 {
 		runtime.TokenExpiresAt = time.Now().Add(time.Duration(runtime.TokenTTLSeconds) * time.Second)

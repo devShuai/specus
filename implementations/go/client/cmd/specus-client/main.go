@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/devShuai/specus/implementations/go/client/internal/client"
 )
@@ -18,89 +22,148 @@ import (
 var version = "dev"
 
 func main() {
-	configPath := flag.String("config", client.DefaultConfigFileName, "path to the specus client JSONC config")
-	showVersion := flag.Bool("version", false, "print the client version and exit")
-	autoUpdate := flag.Bool("auto-update", false, "automatically install updates published by the connected server")
-	disableUpdateCheck := flag.Bool(client.DisableUpdateCheckFlagName, false, "disable startup and 24-hour client update checks")
-	applyUpdateHelper := flag.Bool(client.UpdateHelperFlagName, false, "internal: apply a verified Windows update after the parent exits")
-	updateParentPID := flag.Int(client.UpdateParentPIDFlagName, 0, "internal: parent process id for deferred update")
-	updateCandidateHash := flag.String(client.UpdateCandidateHashFlagName, "", "internal: verified candidate executable SHA-256")
-	flag.Parse()
-	if *applyUpdateHelper {
-		if err := client.RunDeferredUpdateHelper(*updateParentPID, *updateCandidateHash, flag.Args()); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "apply deferred client update: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
+	os.Exit(runCLI(os.Args[1:]))
+}
 
-	if *showVersion {
-		fmt.Println(version)
-		return
-	}
-
-	client.SetVersion(version)
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
-	// Finish stale-helper cleanup before the startup update check so the cleanup retry loop cannot
-	// race with creation of a fresh helper for this process.
-	client.CleanupStaleUpdateHelper(logger)
-	config, err := client.LoadConfig(*configPath)
+func runCLI(args []string) int {
+	options, err := parseCLI(args)
 	if err != nil {
-		logger.Fatalf("load config failed: %v", err)
+		return resultOutput(wantsJSON(args), "arguments", 2, nil, printCLIError(err))
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if *disableUpdateCheck {
+	if options.helper {
+		if err := client.RunDeferredUpdateHelper(options.parentPID, options.candidateHash, options.helperArgs); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "apply deferred client update: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if options.help {
+		return resultOutput(options.json, "help", 0, map[string]any{"help": cliHelp}, cliHelp)
+	}
+	if options.version {
+		return resultOutput(options.json, "version", 0, map[string]any{"version": version}, version)
+	}
+	client.SetVersion(version)
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	if options.debug {
+		logger.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	}
+	path, err := filepath.Abs(options.configPath)
+	if err != nil {
+		fmt.Fprint(os.Stderr, printCLIError(err))
+		return 2
+	}
+	if options.command == "status" || options.command == "peers" || options.command == "services" {
+		return queryState(options, path)
+	}
+	config, err := client.LoadConfigWithDiagnostics(path, func(warning string) {
+		fmt.Fprintln(os.Stderr, "Warning: "+warning)
+	})
+	if err != nil {
+		return resultOutput(options.json, options.command, 2, nil, fmt.Sprintf("invalid config %s: %v; check the file or run --help", path, err))
+	}
+	if options.command == "validate" {
+		return resultOutput(options.json, "config validate", 0, map[string]any{"configPath": path, "offline": true}, fmt.Sprintf("Configuration valid: %s (offline; connectivity not tested)", path))
+	}
+	if options.autoUpdate {
+		config.AutoUpdate = true
+		enabled := true
+		config.UpdateCheckEnabled = &enabled
+	}
+	if options.noUpdate {
+		config.AutoUpdate = false
 		disabled := false
 		config.UpdateCheckEnabled = &disabled
 	}
-	updater := client.NewUpdater(config, version, config.AutoUpdate || *autoUpdate, logger)
-	if config.UpdatesEnabled() {
-		result, updateErr := updater.CheckAndApply(ctx)
-		if updateErr != nil {
-			logger.Printf("startup client update check failed: %v", updateErr)
-		} else if result.Installed {
-			if !result.RestartScheduled {
-				if err := restartSelf(result.ExecutablePath, false); err != nil {
-					logger.Printf("updated client installed, but restart failed: %v", err)
-					if rollbackErr := client.RollbackInstalledUpdate(result.ExecutablePath, result.BackupPath); rollbackErr != nil {
-						logger.Printf("client update rollback failed: %v", rollbackErr)
-					} else {
-						logger.Printf("client update rolled back to %s", result.PreviousVersion)
-						if recoveryErr := restartSelf(result.ExecutablePath, true); recoveryErr != nil {
-							logger.Printf("restarting the rolled-back client failed: %v", recoveryErr)
-						}
-					}
+	if options.command == "show" {
+		config.APIKey = "<redacted>"
+		config.Secret = "<redacted>"
+		config.ServerBaseURL = safeURL(config.ServerBaseURL)
+		encoded, _ := json.MarshalIndent(config, "", "  ")
+		return resultOutput(options.json, "config show", 0, map[string]any{"configPath": path, "config": config}, path+"\n"+string(encoded))
+	}
+	if options.command == "doctor" {
+		data := map[string]any{"configPath": path, "scope": "offline", "authenticationTested": false, "businessTested": false}
+		if options.probe {
+			data["scope"] = "server-tcp"
+			u, _ := url.Parse(config.ServerBaseURL)
+			port := u.Port()
+			if port == "" {
+				port = "80"
+				if u.Scheme == "https" {
+					port = "443"
 				}
 			}
-			return
+			connection, probeErr := net.DialTimeout("tcp", net.JoinHostPort(u.Hostname(), port), 5*time.Second)
+			if probeErr != nil {
+				return resultOutput(options.json, "doctor", 4, data, "Server TCP probe failed or timed out. Check DNS, proxy, firewall and server availability; authentication was not attempted.")
+			}
+			connection.Close()
 		}
+		return resultOutput(options.json, "doctor", 0, data, "Doctor passed ("+data["scope"].(string)+"); authentication, TLS and business readiness not tested.")
 	}
+	logger.Printf("loaded config: %s", path)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if options.noUpdate {
+		disabled := false
+		config.UpdateCheckEnabled = &disabled
+	}
+	updater := client.NewUpdater(config, version, config.AutoUpdate || options.autoUpdate, logger)
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	runErrors := make(chan error, 1)
 	appClient := client.New(config, logger)
+	appClient.SetInitialLoginTimeout(time.Duration(options.loginTimeout) * time.Second)
+	stopState, stateErr := publishState(path, appClient.DiagnosticSnapshot)
+	if stateErr != nil {
+		logger.Printf("Cannot create private CLI state. Check SPECUS_CLI_STATE_DIR permissions: %v", stateErr)
+		return 2
+	}
+	defer stopState()
 	go func() { runErrors <- appClient.Run(runCtx) }()
 	type updateOutcome struct {
 		result client.UpdateResult
 		err    error
 	}
 	updates := make(chan updateOutcome, 1)
-	if config.UpdatesEnabled() {
-		go func() {
-			result, err := updater.Monitor(runCtx, config.UpdateCheckInterval())
+	updaterDone := make(chan struct{})
+	defer func() { cancelRun(); <-updaterDone }()
+	go func() {
+		defer close(updaterDone)
+		client.CleanupStaleUpdateHelperContext(runCtx, logger)
+		if config.UpdatesEnabled() {
+			// Cleanup and the initial check cannot delay starting the tunnel. Never read stdin.
+			result, err := updater.CheckAndApply(runCtx)
+			if result.Installed {
+				updates <- updateOutcome{result: result, err: err}
+				return
+			}
+			if err != nil && runCtx.Err() == nil {
+				logger.Printf("startup client update check failed: %v", err)
+			}
+			result, err = updater.Monitor(runCtx, config.UpdateCheckInterval())
 			updates <- updateOutcome{result: result, err: err}
-		}()
-	}
+		}
+	}()
 	select {
 	case err := <-runErrors:
 		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Fatalf("client stopped: %v", err)
+			logger.Printf("client stopped: %v", err)
+			return client.ExitCode(err)
 		}
 	case outcome := <-updates:
 		if outcome.err != nil && !errors.Is(outcome.err, context.Canceled) {
 			logger.Printf("client update monitor stopped: %v", outcome.err)
+		}
+		if !outcome.result.Installed && ctx.Err() == nil {
+			// An updater failure is not a request to stop an otherwise healthy tunnel.
+			err := <-runErrors
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("client stopped: %v", err)
+				return 1
+			}
 		}
 		if outcome.result.Installed {
 			cancelRun()
@@ -116,6 +179,7 @@ func main() {
 							logger.Printf("restarting the rolled-back client failed: %v", recoveryErr)
 						}
 					}
+					return 1
 				}
 			}
 		}
@@ -123,6 +187,7 @@ func main() {
 		cancelRun()
 		<-runErrors
 	}
+	return 0
 }
 
 func restartSelf(executable string, disableUpdateCheck bool) error {

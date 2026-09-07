@@ -148,6 +148,11 @@ type LocalPeerService struct {
 }
 
 func LoadConfig(path string) (Config, error) {
+	return LoadConfigWithDiagnostics(path, nil)
+}
+
+// LoadConfigWithDiagnostics uses the same snapshot as validation. Warnings never include values.
+func LoadConfigWithDiagnostics(path string, warn func(string)) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -166,6 +171,9 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("resolve secret: %w", err)
 	}
 	config.SecretIsIndirect = secretIsIndirect(config.Secret)
+	if warn != nil {
+		configWarnings(data, config, warn)
+	}
 	return config, nil
 }
 

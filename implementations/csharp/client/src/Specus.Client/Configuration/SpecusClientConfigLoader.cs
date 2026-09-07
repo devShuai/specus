@@ -15,7 +15,10 @@ public static class SpecusClientConfigLoader
     /// Loads the config from the first matching location, or returns the explicit override.
     /// Throws <see cref="FileNotFoundException"/> when neither candidate exists.
     /// </summary>
-    public static SpecusClientConfig Load(string? overridePath = null)
+    public static SpecusClientConfig Load(string? overridePath = null) => Load(overridePath, null);
+
+    /// <summary>Loads and validates one snapshot, optionally reporting value-free diagnostics.</summary>
+    public static SpecusClientConfig Load(string? overridePath, Action<string>? warning)
     {
         var path = ResolvePath(overridePath);
         var json = File.ReadAllText(path);
@@ -23,6 +26,7 @@ public static class SpecusClientConfigLoader
             ?? throw new InvalidDataException($"Empty specus client config at {path}");
         config.Normalize();
         Validate(config, path);
+        if (warning is not null) ConfigDiagnostics.Report(json, config, warning);
         return config;
     }
 

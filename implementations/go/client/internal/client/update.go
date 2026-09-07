@@ -3,7 +3,6 @@ package client
 import (
 	"archive/tar"
 	"archive/zip"
-	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -93,7 +92,7 @@ func NewUpdater(config Config, currentVersion string, autoUpdate bool, logger *l
 		logger:           logger,
 		httpClient:       &http.Client{},
 		input:            os.Stdin,
-		output:           os.Stdout,
+		output:           os.Stderr,
 		executablePath:   os.Executable,
 		deferReplacement: runtime.GOOS == "windows",
 	}
@@ -377,23 +376,11 @@ func (updater *Updater) confirmUpdate(info UpdateInfo) bool {
 	if updater.confirm != nil {
 		return updater.confirm(info)
 	}
-	if updater.input == nil || updater.output == nil || !readerIsInteractive(updater.input) {
-		updater.logger.Printf("client update %s is available; restart with --auto-update or confirm in an interactive terminal",
-			info.LatestVersion)
-		return false
-	}
-	_, _ = fmt.Fprint(updater.output, "现在下载并安装？[y/N] ")
-	line, err := bufio.NewReader(updater.input).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		updater.logger.Printf("read update confirmation failed: %v", err)
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes", "是":
-		return true
-	default:
-		return false
-	}
+	// A tunnel is a long-running service, not an interactive installer. In particular,
+	// stdin must remain untouched so an optional update cannot block startup/shutdown.
+	updater.logger.Printf("client update %s is available; restart with --auto-update to authorize installation",
+		info.LatestVersion)
+	return false
 }
 
 func readerIsInteractive(reader io.Reader) bool {
@@ -1222,6 +1209,14 @@ func waitForProcessExit(pid int, timeout time.Duration) error {
 // executable. The explicit helper from the restart environment is retried until Windows releases
 // its image; older owned crash remnants are collected only after a conservative TTL.
 func CleanupStaleUpdateHelper(logger *log.Logger) {
+	CleanupStaleUpdateHelperContext(context.Background(), logger)
+}
+
+// Cancellation-aware variant used by the CLI's background update worker.
+func CleanupStaleUpdateHelperContext(ctx context.Context, logger *log.Logger) {
+	if ctx.Err() != nil {
+		return
+	}
 	if runtime.GOOS != "windows" {
 		return
 	}
@@ -1238,7 +1233,11 @@ func CleanupStaleUpdateHelper(logger *log.Logger) {
 			if err := removeOwnedUpdateHelper(helperPath, executable, false); err == nil || errors.Is(err, os.ErrNotExist) {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 		_ = os.Unsetenv(updateHelperCleanupEnv)
 	}

@@ -75,9 +75,9 @@ internal sealed class ClientUpdateHostedService : BackgroundService
 
         _logger.LogInformation("client update available: {current} -> {latest}{mandatory}",
             ClientVersion.Current, update.LatestVersion, update.Mandatory ? " (required)" : string.Empty);
-        if (!_config.AutoUpdate && !ConfirmUpdate(update))
+        if (!_config.AutoUpdate)
         {
-            _logger.LogInformation("client update was deferred");
+            _logger.LogInformation("Update available; restart with --auto-update to authorize installation. The tunnel remains connected.");
             return false;
         }
 
@@ -102,25 +102,4 @@ internal sealed class ClientUpdateHostedService : BackgroundService
         return true;
     }
 
-    private static bool ConfirmUpdate(ClientUpdateCheck update)
-    {
-        if (Console.IsInputRedirected || Console.IsOutputRedirected)
-        {
-            return false;
-        }
-        Console.WriteLine();
-        Console.WriteLine(update.Mandatory
-            ? $"发现必须更新 {Safe(update.LatestVersion)}，安装后将自动重启客户端。"
-            : $"发现新版本 {Safe(update.LatestVersion)}，安装后将自动重启客户端。");
-        if (!string.IsNullOrWhiteSpace(update.ChangelogUrl))
-        {
-            Console.WriteLine($"更新说明: {Safe(update.ChangelogUrl)}");
-        }
-        Console.Write("现在安装？[y/N] ");
-        var answer = Console.ReadLine();
-        return string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string Safe(string? value) => ClientUpdateDisplay.Sanitize(value) ?? string.Empty;
 }
