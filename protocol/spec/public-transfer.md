@@ -714,13 +714,20 @@ OSS V4 签名协议要求 TTL 为正数且最长 7 天，因此上传和直达�
 
 客户端必须按 HTTP 状态处理，不得依赖自然语言 `error` 文本。实现可以增加机器可读 `code`，但不得改变上述状态语义。
 
-## 6. 轻量 C server 边界
+## 6. C server 当前边界
 
 C server 不是本协议的数据面完整实现：
 
 - C 进程不监听 STUN/TURN UDP；公共 ICE 只有在显式配置外部 STUN/TURN 服务时才可以公布该服务，不能根据请求 Host
   伪装成本进程提供了 STUN/TURN；
-- C 不实现 `/ws/public-transfer/discovery`；
+- C 已实现单进程 `/ws/public-transfer/discovery` 核心：来源绑定一次性 ticket、持久化 OWNER/EDITOR/VIEWER
+  房间解析、同公网地址合并可见域、peer/displayName 冲突与房间容量、hello/roster、定向/广播信令、ping、连接级限流、
+  UTF-8/UTF-16 边界和 STWR2 定向 relay。SQLite 模式还实现 access-token list/create/revoke、8 位配对码创建/原子兑换、
+  20 个有效邀请上限、过期/撤销拒绝和来源 IP 兑换限流；明文邀请和配对码不持久化，真实 socket 与并发兑换测试已覆盖。
+  SQLite 模式也实现本规范四个流程图版本端点：OWNER/EDITOR 可创建，VIEWER 只读，只有 OWNER 可删除；快照严格限制为
+  3 MiB 且每房间保留最新 50 份。当前仍没有 Redis presence、跨实例 revision/routing 和故障关闭，因此不能视为 P0-15
+  多实例发现已通过；在 Redis coordinator 落地前，C 对 `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true` 拒绝启动，禁止静默回退到
+  进程内 presence/routing；
 - C 没有对象存储抽象，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。响应为：
 
 ```json

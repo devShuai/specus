@@ -22,6 +22,18 @@ int st_security_build_oidc_config(const char *client_id,
                                   int password_login_enabled,
                                   char *out,
                                   size_t out_len);
+int st_security_build_oidc_config_extended(const char *client_id,
+                                           const char *authorization_endpoint,
+                                           const char *registration_endpoint,
+                                           const char *end_session_endpoint,
+                                           const char *redirect_uri,
+                                           const char *scope,
+                                           int password_login_enabled,
+                                           int registration_enabled,
+                                           int turnstile_enabled,
+                                           const char *turnstile_site_key,
+                                           char *out,
+                                           size_t out_len);
 const char *st_security_tls_mode_label(const char *mode);
 int st_security_build_tls_config(const char *mode,
                                  const char *certificate_path,
@@ -41,5 +53,9 @@ int st_security_validate_local_token(const char *token,
                                      const char *default_tenant_id,
                                      const char *admin_username,
                                      st_security_token_claims *claims);
+int st_security_pairing_code_hash(const char *code, char out[65]);
+int st_security_registration_code_hash(const char *registration_id,
+                                       const char *code,
+                                       char out[65]);
 
 #endif

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "password_hash.h"
+
 typedef struct {
     long long id;
     char tenant_id[64];
@@ -16,6 +18,11 @@ typedef struct {
     int message_attachments_capable;
     int message_media_preview_capable;
     long long message_max_attachment_bytes;
+    int peer_service_discovery_version;
+    char peer_service_applications[128];
+    char client_version[81];
+    long long upload_bytes;
+    long long download_bytes;
     char created_at[64];
     char updated_at[64];
 } st_storage_client;
@@ -23,12 +30,25 @@ typedef struct {
 typedef struct {
     char username[81];
     char tenant_id[64];
-    char password_hash[65];
+    char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     char role[20];
     int enabled;
     char created_at[64];
     char updated_at[64];
 } st_storage_management_user;
+
+typedef struct {
+    char registration_id[65];
+    char username[81];
+    char email[255];
+    char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    char code_hash[65];
+    int attempts_remaining;
+    char expires_at[64];
+    char resend_available_at[64];
+    char created_at[64];
+    char updated_at[64];
+} st_storage_registration_challenge;
 
 typedef struct {
     long long id;
@@ -52,9 +72,31 @@ typedef struct {
     char description[513];
     int display_order;
     int enabled;
+    char version[81];
+    char sha256[65];
+    long long file_size;
+    int is_latest;
+    char changelog_url[1025];
+    char min_supported_version[81];
+    int hosted;
+    char package_path[1025];
+    char package_file_name[256];
     char created_at[64];
     char updated_at[64];
 } st_storage_client_download_link;
+
+typedef struct {
+    long long id;
+    char tenant_id[81];
+    char owner_username[161];
+    char name[121];
+    uint8_t *snapshot_data;
+    size_t snapshot_len;
+    long long size_bytes;
+    long long revision;
+    char created_at[64];
+    char updated_at[64];
+} st_storage_user_diagram;
 
 typedef struct {
     long long id;
@@ -92,6 +134,8 @@ typedef struct {
     int message_attachments_capable;
     int message_media_preview_capable;
     long long message_max_attachment_bytes;
+    int peer_service_discovery_version;
+    char peer_service_applications[128];
     char http_login_at[64];
     char netty_connected_at[64];
     char disconnected_at[64];
@@ -121,7 +165,9 @@ typedef struct {
     char target_base_url[512];
     int enabled;
     int detail_capture_enabled;
+    int media_capture_enabled;
     int path_rewrite_enabled;
+    int insecure_skip_verify;
     int auth_enabled;
     char auth_username[121];
     char auth_password_hash[65];
@@ -186,8 +232,12 @@ typedef struct {
     char client_name[256];
     int enabled;
     char virtual_ip[64];
+    char cidr[64];
     char public_key[257];
     char nat_type[64];
+    char nat_mapping_behavior[64];
+    char nat_filtering_behavior[64];
+    char nat_behavior_discovery[41];
     char last_endpoint[128];
     char virtual_device_mode[32];
     char virtual_device_name[128];
@@ -237,6 +287,44 @@ typedef struct {
     long long relay_bytes;
     char last_traffic_at[64];
 } st_storage_peer_mesh_session;
+
+typedef struct {
+    int enabled;
+    int mdns_import_enabled;
+    char updated_by[128];
+    char updated_at[64];
+} st_storage_peer_mesh_service_sharing;
+
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    long long client_id;
+    char client_name[256];
+    char service_id[65];
+    char name[81];
+    char description[201];
+    char transport[8];
+    char application[16];
+    char target_host[128];
+    int target_port;
+    int published_port;
+    char path[256];
+    int enabled;
+    char visibility[16];
+    char allowed_client_ids[512];
+    char created_at[64];
+    char updated_at[64];
+} st_storage_peer_mesh_service;
+
+typedef struct {
+    char at[64];
+    char action[64];
+    char tenant_id[64];
+    long long client_id;
+    long long session_id;
+    char service_id[65];
+    char reason[256];
+} st_storage_peer_mesh_service_audit;
 
 typedef struct {
     long long id;
@@ -356,6 +444,9 @@ int st_storage_list_clients(const char *path,
                             size_t *client_count);
 int st_storage_get_client(const char *path, long long id, st_storage_client *client);
 int st_storage_get_client_by_name(const char *path, const char *client_name, st_storage_client *client);
+int st_storage_client_has_online_receive_capability(const char *path,
+                                                    long long client_id,
+                                                    int *capable);
 int st_storage_list_management_users(const char *path,
                                      const char *tenant_id,
                                      st_storage_management_user *users,
@@ -378,6 +469,26 @@ int st_storage_update_management_user(const char *path,
                                       int enabled,
                                       st_storage_management_user *out_user);
 int st_storage_delete_management_user(const char *path, const char *username);
+int st_storage_management_email_exists(const char *path, const char *email);
+int st_storage_get_registration_challenge(const char *path,
+                                          const char *registration_id,
+                                          st_storage_registration_challenge *challenge);
+int st_storage_find_registration_challenge(const char *path,
+                                           const char *username,
+                                           const char *email,
+                                           st_storage_registration_challenge *challenge);
+int st_storage_create_registration_challenge(const char *path,
+                                             const st_storage_registration_challenge *challenge);
+int st_storage_update_registration_attempts(const char *path,
+                                            const char *registration_id,
+                                            int attempts_remaining,
+                                            const char *updated_at);
+int st_storage_delete_registration_challenge(const char *path, const char *registration_id);
+int st_storage_delete_expired_registration_challenges(const char *path, const char *expires_before);
+int st_storage_complete_registration(const char *path,
+                                     const st_storage_registration_challenge *challenge,
+                                     const char *tenant_id,
+                                     st_storage_management_user *out_user);
 int st_storage_get_client_credential_by_api_key(const char *path,
                                                 const char *api_key,
                                                 st_storage_client_credential *credential);
@@ -418,6 +529,61 @@ int st_storage_upsert_client_download_link(const char *path,
                                            int display_order,
                                            int enabled,
                                            st_storage_client_download_link *out_link);
+int st_storage_upsert_client_download_link_extended(const char *path,
+                                                    long long id,
+                                                    const char *implementation,
+                                                    const char *platform,
+                                                    const char *arch,
+                                                    const char *display_name,
+                                                    const char *download_url,
+                                                    const char *description,
+                                                    int display_order,
+                                                    int enabled,
+                                                    const char *version,
+                                                    const char *sha256,
+                                                    long long file_size,
+                                                    int is_latest,
+                                                    const char *changelog_url,
+                                                    const char *min_supported_version,
+                                                    int hosted,
+                                                    const char *package_path,
+                                                    const char *package_file_name,
+                                                    st_storage_client_download_link *out_link);
+int st_storage_mark_client_download_latest(const char *path,
+                                           long long id,
+                                           st_storage_client_download_link *out_link);
+int st_storage_list_user_diagrams(const char *path,
+                                  const char *tenant_id,
+                                  const char *owner_username,
+                                  st_storage_user_diagram *items,
+                                  size_t capacity,
+                                  size_t *out_count);
+int st_storage_get_user_diagram(const char *path,
+                                long long id,
+                                const char *tenant_id,
+                                const char *owner_username,
+                                st_storage_user_diagram *out);
+int st_storage_create_user_diagram(const char *path,
+                                   const char *tenant_id,
+                                   const char *owner_username,
+                                   const char *name,
+                                   const uint8_t *snapshot,
+                                   size_t snapshot_len,
+                                   st_storage_user_diagram *out);
+int st_storage_update_user_diagram(const char *path,
+                                   long long id,
+                                   const char *tenant_id,
+                                   const char *owner_username,
+                                   long long expected_revision,
+                                   const char *name,
+                                   const uint8_t *snapshot,
+                                   size_t snapshot_len,
+                                   st_storage_user_diagram *out);
+int st_storage_delete_user_diagram(const char *path,
+                                   long long id,
+                                   const char *tenant_id,
+                                   const char *owner_username);
+void st_storage_user_diagram_free(st_storage_user_diagram *diagram);
 int st_storage_delete_client_download_link(const char *path, long long id);
 int st_storage_find_or_create_client_identity(const char *path,
                                               const st_storage_client_credential *credential,
@@ -531,7 +697,9 @@ int st_storage_create_http_route_for_client(const char *path,
                                             const char *target_base_url,
                                             int enabled,
                                             int detail_capture_enabled,
+                                            int media_capture_enabled,
                                             int path_rewrite_enabled,
+                                            int insecure_skip_verify,
                                             int auth_enabled,
                                             const char *auth_username,
                                             const char *auth_password_hash,
@@ -542,7 +710,9 @@ int st_storage_update_http_route_by_id(const char *path,
                                        const char *target_base_url,
                                        int enabled,
                                        int detail_capture_enabled,
+                                       int media_capture_enabled,
                                        int path_rewrite_enabled,
+                                       int insecure_skip_verify,
                                        int auth_enabled,
                                        const char *auth_username,
                                        const char *auth_password_hash,
@@ -698,7 +868,28 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                const st_storage_client *client,
                                                int enabled,
                                                st_storage_peer_mesh_device *out_device);
+int st_storage_get_peer_mesh_device_by_client(const char *path,
+                                              const char *tenant_id,
+                                              long long client_id,
+                                              st_storage_peer_mesh_device *out_device);
+int st_storage_update_peer_mesh_device_report(const char *path,
+                                              const st_storage_client *client,
+                                              const char *public_key,
+                                              const char *nat_type,
+                                              const char *nat_mapping_behavior,
+                                              const char *nat_filtering_behavior,
+                                              const char *nat_behavior_discovery,
+                                              const char *last_endpoint,
+                                              const char *virtual_device_mode,
+                                              const char *virtual_device_name,
+                                              const char *virtual_device_status,
+                                              const char *virtual_device_error,
+                                              st_storage_peer_mesh_device *out_device);
 int st_storage_get_peer_mesh_acl(const char *path, long long id, st_storage_peer_mesh_acl *acl);
+int st_storage_can_peer(const char *path,
+                        const st_storage_client *source,
+                        const st_storage_client *target,
+                        int *allowed);
 int st_storage_upsert_peer_mesh_acl(const char *path,
                                     const char *tenant_id,
                                     const char *owner_username,
@@ -734,6 +925,80 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
                                                      st_storage_peer_mesh_session *sessions,
                                                      size_t max_sessions,
                                                      size_t *session_count);
+int st_storage_create_peer_mesh_session(const char *path,
+                                        const st_storage_client *source,
+                                        const st_storage_client *target,
+                                        const char *path_type,
+                                        const char *token_hash,
+                                        long long ttl_seconds,
+                                        st_storage_peer_mesh_session *out_session);
+int st_storage_get_peer_mesh_session(const char *path,
+                                     const char *tenant_id,
+                                     long long id,
+                                     st_storage_peer_mesh_session *out_session);
+int st_storage_report_peer_mesh_session(const char *path,
+                                        const st_storage_client *reporter,
+                                        long long id,
+                                        const char *path_type,
+                                        const char *status,
+                                        long long rtt_millis,
+                                        const char *local_endpoint,
+                                        const char *remote_endpoint,
+                                        long long direct_bytes,
+                                        long long relay_bytes,
+                                        int close_session,
+                                        st_storage_peer_mesh_session *out_session);
+int st_storage_authorize_peer_mesh_relay(const char *path,
+                                         long long session_id,
+                                         long long from_client_id,
+                                         long long to_client_id,
+                                         long long relay_bytes,
+                                         int account_traffic);
+int st_storage_verify_peer_mesh_probe(const char *path,
+                                      long long session_id,
+                                      long long from_client_id,
+                                      long long to_client_id,
+                                      const char *token);
+int st_storage_get_peer_mesh_service_sharing(const char *path,
+                                             const char *tenant_id,
+                                             st_storage_peer_mesh_service_sharing *out_sharing);
+int st_storage_upsert_peer_mesh_service_sharing(const char *path,
+                                                const char *tenant_id,
+                                                int enabled,
+                                                int mdns_import_enabled,
+                                                const char *updated_by,
+                                                st_storage_peer_mesh_service_sharing *out_sharing);
+int st_storage_list_peer_mesh_services_visible(const char *path,
+                                               const char *tenant_id,
+                                               const char *owner_username,
+                                               int include_all_clients,
+                                               st_storage_peer_mesh_service *services,
+                                               size_t max_services,
+                                               size_t *service_count);
+int st_storage_get_peer_mesh_service_visible(const char *path,
+                                             long long id,
+                                             const char *tenant_id,
+                                             const char *owner_username,
+                                             int include_all_clients,
+                                             st_storage_peer_mesh_service *out_service);
+int st_storage_upsert_peer_mesh_service(const char *path,
+                                        const st_storage_peer_mesh_service *service,
+                                        st_storage_peer_mesh_service *out_service);
+int st_storage_delete_peer_mesh_service(const char *path,
+                                        long long id,
+                                        const char *tenant_id);
+int st_storage_record_peer_mesh_service_audit(const char *path,
+                                              const char *action,
+                                              const char *tenant_id,
+                                              long long client_id,
+                                              long long session_id,
+                                              const char *service_id,
+                                              const char *reason);
+int st_storage_list_peer_mesh_service_audits(const char *path,
+                                             const char *tenant_id,
+                                             st_storage_peer_mesh_service_audit *events,
+                                             size_t max_events,
+                                             size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,

@@ -126,40 +126,6 @@ static int64_t zigzag_decode(uint64_t value)
     return (int64_t)((value >> 1U) ^ (uint64_t)(-(int64_t)(value & 1U)));
 }
 
-static int reader_numeric_string(compact_reader *reader, char **value)
-{
-    uint8_t marker;
-    if (reader_u8(reader, &marker) != 0) {
-        return -1;
-    }
-    if (marker == 0) {
-        *value = NULL;
-        return 0;
-    }
-    if (marker == 1) {
-        uint64_t raw;
-        if (reader_varlong(reader, &raw) != 0) {
-            return -1;
-        }
-        char tmp[32];
-        int written = snprintf(tmp, sizeof(tmp), "%lld", (long long)zigzag_decode(raw));
-        if (written < 0 || (size_t)written >= sizeof(tmp)) {
-            return -1;
-        }
-        char *out = (char *)malloc((size_t)written + 1U);
-        if (out == NULL) {
-            return -1;
-        }
-        memcpy(out, tmp, (size_t)written + 1U);
-        *value = out;
-        return 0;
-    }
-    if (marker == 2) {
-        return reader_string(reader, value);
-    }
-    return -1;
-}
-
 static void write_be16(uint8_t *p, uint16_t value)
 {
     p[0] = (uint8_t)(value >> 8);
@@ -478,6 +444,27 @@ st_buffer st_protocol_encode_login_response(const char *client_name, int success
         return buffer;
     }
     buffer = encode_compact_frame(ST_CMD_LOGIN_RESPONSE, &payload);
+    free(payload.data);
+    return buffer;
+}
+
+st_buffer st_protocol_encode_message_response(const char *client_name,
+                                               const char *to_client_name,
+                                               int message_type,
+                                               const char *message)
+{
+    compact_writer payload = {0};
+    st_buffer buffer = {0};
+    if (message_type < ST_MESSAGE_TYPE_SERVER_TO_CLIENT
+        || message_type > ST_MESSAGE_TYPE_PEER_CONTROL
+        || writer_string(&payload, client_name) != 0
+        || writer_string(&payload, to_client_name) != 0
+        || writer_varint(&payload, (uint32_t)message_type) != 0
+        || writer_string(&payload, message) != 0) {
+        free(payload.data);
+        return buffer;
+    }
+    buffer = encode_compact_frame(ST_CMD_MESSAGE_RESPONSE, &payload);
     free(payload.data);
     return buffer;
 }

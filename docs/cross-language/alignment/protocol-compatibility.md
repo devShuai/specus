@@ -25,11 +25,11 @@
 - Go / .NET 客户端控制连接心跳空闲策略已对齐 Java：普通业务写出会刷新写空闲时间，5 秒没有任何写出才发送 `HEARTBEAT_REQUEST`，60 秒读空闲关闭当前连接并进入重连状态机。
 - Go / .NET 客户端普通 TCP 映射的 `OPEN` 异常分支已对齐 Java：缺少 `port`、缺少 `channelId` 或端口不在当前配置中时拒绝该 stream；本地真实拨号失败发送 `RST`，已建立通道按双向 `FIN` 半关闭，I/O 错误立即 `RST`。
 - Go / .NET 客户端与服务端 NAT metadata 读取已对齐 Java 容错语义：字符串字段对非空值使用 `toString` / `fmt.Sprint`，布尔值按 Java 小写 `true/false` 保留，整数字段接受数字值和数字字符串，`float64` / `double` 等 JSON 数字按 Java `Number.intValue()` 风格截断。
-- C server 的 `/api/client/auth/login` 已支持两条路径：SQLite 模式下读取 `specus_client_credential`、按 Java canonical HMAC 校验、创建/复用机器用户身份、写入 `specus_client_session=HTTP_AUTHENTICATED` 并签发 `cs_` token；无匹配 DB 凭证时保留环境变量 smoke-test token 模式。响应保持 Java 当前客户端可解析的 `peerMesh.enabled=false`、`specusConfigList` 和 `httpSpecusConfigList` 结构。
+- C server 的 `/api/client/auth/login` 已支持两条路径：SQLite 模式下读取 `specus_client_credential`、按 Java canonical HMAC 校验、创建/复用机器用户身份、写入 `specus_client_session=HTTP_AUTHENTICATED` 并签发 `cs_` token；无匹配 DB 凭证时保留环境变量 smoke-test token 模式。响应保持 Java 当前客户端可解析的完整 `peerMesh`、`specusConfigList` 和 `httpSpecusConfigList` 结构；`SPECUS_PEER_MESH_ENABLED=false` 时仅按 Java 语义返回禁用配置。
 
 ## 阶段 5：公共互传、客户端消息与协议边界
 
-状态：Go server 与 .NET server 的运行时主路径和持久化房间角色已对齐；C server 只提供可验证的兼容/禁用响应，Android client 已补客户端消息和控制通道边界。
+状态：Go、.NET、C server 的运行时主路径、持久化房间角色、附件和公共 discovery 已对齐 Java；Android client 已补客户端消息和控制通道边界。真实私有对象存储与全语言混部仍按环境矩阵验收。
 
 - Go server 与 .NET server 已实现 Java 的 6 个附件 REST 接口、Aliyun OSS V4 预签名 PUT/GET/HEAD/DELETE、一次性下载授权、HEAD 完成校验、附件过期清理、公开来源 IP 与房间待上传限流，以及 `/ws/public-transfer/discovery` 的 roomToken 哈希隔离、同公网 IP 附近房间、人数/消息限流、roster 和定向 signal。
 - Go server 与 .NET server 已实现 `/ws/client-messages`：管理 JWT 鉴权失败返回 `403 + X-Auth-Reason`，按 tenant/owner 严格区分大小写授权，检查所有 `NETTY_ONLINE` session 的接收能力，并支持 admin 到 client 与 client 到 admin/client 的 Java `CLIENT_TO_CLIENT` fallback。
@@ -38,4 +38,4 @@
 - Go server 与 .NET server 已实现 Java 的公共房间流程图版本与登录用户云端流程图：公共版本限制 3 MiB、每房间保留 50 份；登录用户文档按 tenant/owner 隔离、每用户最多 100 份，并用 revision 做并发更新校验。
 - Go/.NET 的公开 ICE 配置和 TURN 服务已补 Java 临时 HMAC-SHA1 credential、realm/nonce、MESSAGE-INTEGRITY、401/438 challenge；Java、Go、.NET 与 Android 客户端会按 transaction 与 TURN endpoint 跟踪受保护请求，更新 challenge 后换新 transaction 最多重试一次；STUN URL 归一化覆盖 `stun://`、显式端口和 IPv6。
 - Java、Go、.NET、C 与 Android 的 32 MiB 限制均按“11 字节 header + body 的完整帧”计算；最大 body 为配置值减 11。v2 CompactBinary 直接编码固定 schema，不含 `payloadType` 或 deflate；旧压缩 envelope 和 v1 fixture 必须拒绝。
-- C server 可返回 Java-shaped 公共 ICE 配置并为显式配置的外部 TURN 服务签发临时 credential；C 进程本身不监听 STUN/TURN。6 个附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，不会伪造成功 URL；启动登录会按真实 wire 字段持久化消息能力，但 C 尚无 live client-message / discovery / object-storage 数据面。
+- C server 在 Peer Mesh 启用时启动内置 RFC 5389/5780 STUN 与 RFC 5766 TURN UDP listener，公共 ICE 返回临时 credential 和自建/公共 STUN 配置。Public discovery 已实现来源绑定 ticket、持久 OWNER/EDITOR/VIEWER 房间、邀请撤销、原子配对码、合并可见域、信令/roster/限流与 STWR2 relay；Redis 模式实现与 Java/Go 共享 key/Lua/STCE2 帧语义的多实例 presence、revision、路由和故障关闭，并通过 C↔Java 混部门禁。公共流程图同步实现角色权限、3 MiB 与最新 50 版。6 个附件路径在存储未配置时返回 `409 OBJECT_STORAGE_DISABLED`，配置 S3-compatible/Aliyun OSS 后提供 presign/complete/download、HEAD 大小校验、一次性授权、配额/限流和过期清理；live client-message 具备管理 WebSocket 与 control fallback。

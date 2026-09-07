@@ -3,7 +3,8 @@
 本文定义管理端 `/ws/client-messages` 与已认证客户端控制连接之间的备用消息通道。Peer 直连可用时客户端优先发送
 STMSG2；服务端通道用于直连不可用时的低频消息，不传输附件字节。
 
-Java、Go 与 .NET server 必须保持相同语义。C server 不实现实时消息 WebSocket。
+Java、Go、.NET 与 C server 必须保持相同语义。C server 已实现文本消息 WebSocket 与 control fallback；附件和
+STMSG2 对象存储数据面仍未实现。
 
 ## 1. 一次性 WebSocket ticket
 
@@ -172,8 +173,13 @@ URL。接收方必须按权限向服务端换取短期单次下载跳转。
 
 ## 9. C server 边界
 
-C server 只保存启动登录中的消息能力字段，供数据库和管理视图展示；不实现 `/ws/client-messages`、实时 fan-out、
-STMSG2 客户端数据面或对象存储。C 环境必须报告实时消息不可用。
+C server 已实现 endpoint 绑定的一次性 ticket、`/ws/client-messages` hello/文本命令、管理端到在线 control 的
+`MessageResponsePacket` 写入、客户端到管理订阅的 tenant/username fan-out，以及受 Peer device/方向性 ACL 约束的
+客户端间 control fallback。WebSocket 输入会验证完整 JSON、UTF-8、分片顺序、控制帧和 65,536 UTF-16 code unit
+上限；能力检查遍历全部 `NETTY_ONLINE` session。
+
+C server 仍不实现 STMSG2 附件对象存储、附件 REST 的可用数据面或离线 outbox；6 个附件路径继续明确返回
+`409 OBJECT_STORAGE_DISABLED`。当前 C 运行时每个 clientName 只允许一个活动 control，因此目标写入只选择该连接。
 
 ## 10. 参考入口
 

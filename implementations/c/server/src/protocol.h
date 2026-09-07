@@ -85,6 +85,10 @@ int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_lo
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response);
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message);
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason);
+st_buffer st_protocol_encode_message_response(const char *client_name,
+                                               const char *to_client_name,
+                                               int message_type,
+                                               const char *message);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
 st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
                                          const char *meta_json, const uint8_t *data, size_t data_len);

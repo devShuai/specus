@@ -2,15 +2,31 @@
 
 #include "admin_http.h"
 
+#include "client_address.h"
+#include "client_package.h"
 #include "crypto.h"
+#include "decompression_limits.h"
+#include "github_release.h"
+#include "http_client.h"
 #include "json.h"
+#include "login_rate_limiter.h"
+#include "media_capture.h"
+#include "object_storage.h"
+#include "password_hash.h"
+#include "peer_mesh.h"
+#include "public_discovery.h"
+#include "public_room.h"
+#include "registration.h"
 #include "security.h"
+#include "security_baseline.h"
 #include "storage.h"
+#include "turn_auth.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -18,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -42,6 +59,17 @@
 #define ST_ADMIN_WS_TICKET_BYTES 32U
 #define ST_ADMIN_WS_TICKET_TTL_SECONDS 45
 #define ST_ADMIN_MAX_WS_TICKETS 1024U
+#define ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS (64U * 1024U)
+#define ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES (3U * ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS)
+#define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES 1024U
+#define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES_PER_SOCKET 64U
+
+static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
+static const char *admin_reason_phrase(int status);
+static int write_registration_error_response(int status,
+                                             const char *error,
+                                             char *out,
+                                             size_t out_len);
 
 typedef struct {
     char *data;
@@ -58,6 +86,7 @@ typedef struct {
 typedef struct {
     char route[128];
     char target_base_url[512];
+    int insecure_skip_verify;
 } st_admin_http_route;
 
 typedef struct {
@@ -75,10 +104,14 @@ typedef struct {
 
 typedef struct st_admin_ws_client {
     int fd;
+    char endpoint[32];
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     int admin;
+    int closing;
+    size_t pending_message_writes;
     pthread_mutex_t send_lock;
+    pthread_cond_t pending_cond;
     struct st_admin_ws_client *next;
 } st_admin_ws_client;
 
@@ -87,6 +120,7 @@ typedef struct st_admin_ws_ticket {
     uint8_t remote_address_hash[ST_SHA256_LEN];
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
+    char endpoint[32];
     int admin;
     time_t expires_at;
     struct st_admin_ws_ticket *next;
@@ -99,6 +133,8 @@ struct st_admin_direct_ws_stream {
     pthread_cond_t flow_cond;
     uint64_t send_credit;
     uint8_t outbound_fragment_opcode;
+    size_t outbound_fragment_bytes;
+    int close_sent;
     int flow_closed;
     int closed;
 };
@@ -107,6 +143,19 @@ static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
 static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_ticket *admin_ws_tickets = NULL;
+static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_nat_control_handler admin_nat_control_handler = NULL;
+static void *admin_nat_control_ctx = NULL;
+static pthread_mutex_t admin_client_runtime_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_client_runtime_status_handler admin_client_runtime_status_handler = NULL;
+static void *admin_client_runtime_status_ctx = NULL;
+static pthread_mutex_t admin_client_message_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_client_message_handler admin_client_message_handler = NULL;
+static void *admin_client_message_ctx = NULL;
+static size_t admin_pending_client_message_writes = 0U;
+static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
+static void *admin_peer_mesh_refresh_ctx = NULL;
 
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
@@ -115,6 +164,94 @@ static char *admin_join_headers(char **headers, size_t headers_len);
 static char *admin_header_array_value(char **headers, size_t headers_len, const char *name);
 static int password_hash_hex(const char *password, char out[ST_SHA256_HEX_LEN + 1]);
 static int password_hash_matches(const char *password, const char *expected_hash);
+
+void st_admin_set_nat_control_handler(st_admin_nat_control_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_nat_control_lock);
+    admin_nat_control_handler = handler;
+    admin_nat_control_ctx = ctx;
+    pthread_mutex_unlock(&admin_nat_control_lock);
+}
+
+void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_handler handler,
+                                                void *ctx)
+{
+    pthread_mutex_lock(&admin_client_runtime_status_lock);
+    admin_client_runtime_status_handler = handler;
+    admin_client_runtime_status_ctx = ctx;
+    pthread_mutex_unlock(&admin_client_runtime_status_lock);
+}
+
+void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_client_message_lock);
+    admin_client_message_handler = handler;
+    admin_client_message_ctx = ctx;
+    pthread_mutex_unlock(&admin_client_message_lock);
+}
+
+void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    admin_peer_mesh_refresh_handler = handler;
+    admin_peer_mesh_refresh_ctx = ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+static void admin_notify_peer_mesh_refresh(const char *tenant_id)
+{
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    st_admin_peer_mesh_refresh_handler handler = admin_peer_mesh_refresh_handler;
+    void *ctx = admin_peer_mesh_refresh_ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+    if (handler != NULL && tenant_id != NULL && *tenant_id != '\0') {
+        (void)handler(ctx, tenant_id);
+    }
+}
+
+static int admin_send_client_message(long long client_id,
+                                     const char *client_name,
+                                     const char *from_admin_name,
+                                     const char *message)
+{
+    pthread_mutex_lock(&admin_client_message_lock);
+    st_admin_client_message_handler handler = admin_client_message_handler;
+    void *ctx = admin_client_message_ctx;
+    pthread_mutex_unlock(&admin_client_message_lock);
+    return handler == NULL
+        ? -1
+        : handler(ctx, client_id, client_name, from_admin_name, message);
+}
+
+static void admin_get_client_runtime_status(long long client_id,
+                                            const char *client_name,
+                                            st_admin_client_runtime_status *status)
+{
+    memset(status, 0, sizeof(*status));
+    pthread_mutex_lock(&admin_client_runtime_status_lock);
+    st_admin_client_runtime_status_handler handler = admin_client_runtime_status_handler;
+    void *ctx = admin_client_runtime_status_ctx;
+    pthread_mutex_unlock(&admin_client_runtime_status_lock);
+    if (handler != NULL && handler(ctx, client_id, client_name, status) != 0) {
+        memset(status, 0, sizeof(*status));
+    }
+}
+
+static int admin_push_nat_control(long long client_id, const char *client_name)
+{
+    pthread_mutex_lock(&admin_nat_control_lock);
+    st_admin_nat_control_handler handler = admin_nat_control_handler;
+    void *ctx = admin_nat_control_ctx;
+    pthread_mutex_unlock(&admin_nat_control_lock);
+    return handler == NULL ? -1 : handler(ctx, client_id, client_name);
+}
+
+static void admin_notify_nat_control(const st_storage_client *client)
+{
+    if (client != NULL) {
+        (void)admin_push_nat_control(client->id, client->client_name);
+    }
+}
 
 static int write_response(char *out, size_t out_len, int status, const char *reason, const char *body)
 {
@@ -132,6 +269,50 @@ static int write_response(char *out, size_t out_len, int status, const char *rea
                            "%s",
                            status,
                            reason,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+static int write_login_rate_limited_response(char *out, size_t out_len, int64_t retry_after_seconds)
+{
+    const char *body = "{\"error\":\"登录尝试过于频繁,请稍后再试\"}";
+    if (retry_after_seconds < 1) {
+        retry_after_seconds = 1;
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 429 Too Many Requests\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Retry-After: %lld\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           (long long)retry_after_seconds,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+static int write_client_package_rate_limited_response(char *out,
+                                                      size_t out_len,
+                                                      long long retry_after_seconds)
+{
+    const char *body = "{\"error\":\"请求过于频繁,请稍后再试\"}";
+    if (retry_after_seconds < 1) retry_after_seconds = 1;
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 429 Too Many Requests\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Retry-After: %lld\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           retry_after_seconds,
                            strlen(body),
                            body);
     return written < 0 || (size_t)written >= out_len ? -1 : written;
@@ -198,12 +379,49 @@ static int client_auth_default_max_online_instances(void)
 
 static int env_bool(const char *name, int fallback)
 {
+    if (strcmp(name, "SPECUS_DB_SEED_DEMO_CLIENT") == 0
+        && !st_deployment_environment_allows_demo_data(getenv("SPECUS_ENV"))) {
+        return 0;
+    }
     const char *value = getenv(name);
     if (value == NULL || *value == '\0') {
         return fallback;
     }
     return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0
         || strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
+}
+
+static int admin_text_present(const char *value)
+{
+    if (value == NULL) {
+        return 0;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isspace(*cursor)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int management_password_login_enabled(void)
+{
+    return env_bool("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", 1)
+        && admin_text_present(getenv("SPECUS_AUTH_PASSWORD"));
+}
+
+static st_login_rate_limit_config management_login_rate_limit_config(void)
+{
+    long long per_ip = env_i64("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP", 20);
+    long long per_account = env_i64("SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT", 10);
+    long long window_seconds = env_i64("SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300);
+    st_login_rate_limit_config config = {
+        .enabled = env_bool("SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED", 1),
+        .per_ip = per_ip > UINT_MAX ? UINT_MAX : (unsigned int)per_ip,
+        .per_account = per_account > UINT_MAX ? UINT_MAX : (unsigned int)per_account,
+        .window_seconds = window_seconds
+    };
+    return config;
 }
 
 static size_t admin_path_len_no_query(const char *path)
@@ -492,6 +710,9 @@ static int admin_path_requires_auth(const char *method, const char *path)
 {
     (void)method;
     return strncmp(path, "/api/admin/", strlen("/api/admin/")) == 0
+        || strncmp(path,
+                   "/api/public/transfer/attachments/",
+                   strlen("/api/public/transfer/attachments/")) == 0
         || admin_path_equals(path, "/auth/refresh");
 }
 
@@ -752,6 +973,7 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
         st_admin_http_route *item = &routes[*route_count];
         strcpy(item->route, route);
         strcpy(item->target_base_url, target);
+        item->insecure_skip_verify = 0;
         ++(*route_count);
         token = admin_next_csv_token(&cursor);
     }
@@ -787,6 +1009,7 @@ static int load_database_http_routes(const char *client_name, st_admin_http_rout
         st_admin_http_route *item = &routes[*route_count];
         strcpy(item->route, stored[i].route);
         strcpy(item->target_base_url, stored[i].target_base_url);
+        item->insecure_skip_verify = stored[i].insecure_skip_verify;
         ++(*route_count);
     }
     return 0;
@@ -837,10 +1060,11 @@ static int append_http_route_config_list(st_admin_string_builder *builder,
             return -1;
         }
         int rc = admin_sb_appendf(builder,
-                                  "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\"}",
+                                  "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
                                   i == 0 ? "" : ",",
                                   route,
-                                  target);
+                                  target,
+                                  routes[i].insecure_skip_verify ? "true" : "false");
         free(route);
         free(target);
         if (rc != 0) {
@@ -1115,24 +1339,6 @@ static void build_prefixed_token(const char *prefix, char *out, size_t out_len)
     snprintf(out, out_len, "%s%s%s", prefix == NULL ? "" : prefix, hex1, hex2);
 }
 
-static char turn_runtime_secret[160];
-static pthread_once_t turn_runtime_secret_once = PTHREAD_ONCE_INIT;
-
-static void initialize_turn_runtime_secret(void)
-{
-    build_prefixed_token("turn_", turn_runtime_secret, sizeof(turn_runtime_secret));
-}
-
-static const char *turn_credential_secret(void)
-{
-    const char *configured = getenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET");
-    if (configured != NULL && *configured != '\0') {
-        return configured;
-    }
-    pthread_once(&turn_runtime_secret_once, initialize_turn_runtime_secret);
-    return turn_runtime_secret;
-}
-
 static void base64url_no_padding(const uint8_t *data, size_t len, char *out, size_t out_len)
 {
     static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1196,11 +1402,13 @@ static size_t admin_prune_websocket_tickets_locked(time_t now)
 }
 
 static int admin_issue_websocket_ticket(const st_admin_context *context,
+                                        const char *endpoint,
                                         const char *remote_address,
                                         char out[64],
                                         time_t *expires_at)
 {
-    if (context == NULL || !context->authenticated || out == NULL || expires_at == NULL) {
+    if (context == NULL || !context->authenticated || endpoint == NULL
+        || out == NULL || expires_at == NULL) {
         return -1;
     }
     uint8_t random_bytes[ST_ADMIN_WS_TICKET_BYTES];
@@ -1221,6 +1429,7 @@ static int admin_issue_websocket_ticket(const st_admin_context *context,
     memcpy(ticket->remote_address_hash, remote_address_hash, sizeof(remote_address_hash));
     snprintf(ticket->username, sizeof(ticket->username), "%s", context->username);
     snprintf(ticket->tenant_id, sizeof(ticket->tenant_id), "%s", context->tenant_id);
+    snprintf(ticket->endpoint, sizeof(ticket->endpoint), "%s", endpoint);
     ticket->admin = context->admin;
     ticket->expires_at = time(NULL) + ST_ADMIN_WS_TICKET_TTL_SECONDS;
 
@@ -1246,10 +1455,12 @@ static int admin_issue_websocket_ticket(const st_admin_context *context,
 }
 
 static int admin_consume_websocket_ticket(const char *token,
+                                          const char *endpoint,
                                           const char *remote_address,
                                           st_admin_context *context)
 {
-    if (token == NULL || strlen(token) < 32U || strlen(token) > 128U || context == NULL) {
+    if (token == NULL || endpoint == NULL
+        || strlen(token) < 32U || strlen(token) > 128U || context == NULL) {
         return -1;
     }
     uint8_t token_hash[ST_SHA256_LEN];
@@ -1266,7 +1477,8 @@ static int admin_consume_websocket_ticket(const char *token,
             cursor = &ticket->next;
             continue;
         }
-        if (!st_constant_time_eq(ticket->remote_address_hash,
+        if (strcmp(ticket->endpoint, endpoint) != 0
+            || !st_constant_time_eq(ticket->remote_address_hash,
                                  remote_address_hash,
                                  sizeof(remote_address_hash))) {
             pthread_mutex_unlock(&admin_ws_ticket_lock);
@@ -1293,20 +1505,22 @@ static int handle_admin_websocket_ticket(const st_admin_context *context,
                                          char *out,
                                          size_t out_len)
 {
-    char *endpoint = st_json_get_string(body, "endpoint");
-    if (endpoint == NULL || strcmp(endpoint, "connections") != 0) {
+    char *endpoint = st_json_get_top_level_string(body, "endpoint");
+    if (endpoint == NULL
+        || (strcmp(endpoint, "connections") != 0
+            && strcmp(endpoint, "client-messages") != 0)) {
         free(endpoint);
         return write_response(out,
                               out_len,
                               400,
                               "Bad Request",
-                              "{\"error\":\"endpoint must be connections\"}");
+                              "{\"error\":\"endpoint must be connections or client-messages\"}");
     }
-    free(endpoint);
 
     char token[64];
     time_t expires_at = 0;
-    int issue_rc = admin_issue_websocket_ticket(context, remote_address, token, &expires_at);
+    int issue_rc = admin_issue_websocket_ticket(context, endpoint, remote_address, token, &expires_at);
+    free(endpoint);
     if (issue_rc == -2) {
         return write_response(out,
                               out_len,
@@ -1384,6 +1598,73 @@ static int build_public_ice_url(const char *scheme,
     return written > 0 && (size_t)written < out_len ? 0 : -1;
 }
 
+static int normalize_public_host(const char *value, char *out, size_t out_len)
+{
+    if (value == NULL || out == NULL || out_len == 0U) return -1;
+    while (isspace((unsigned char)*value)) ++value;
+    if (strncasecmp(value, "http://", 7U) == 0) value += 7;
+    else if (strncasecmp(value, "https://", 8U) == 0) value += 8;
+    const char *end = value + strlen(value);
+    const char *comma = strchr(value, ',');
+    const char *slash = strchr(value, '/');
+    if (comma != NULL && comma < end) end = comma;
+    if (slash != NULL && slash < end) end = slash;
+    while (end > value && isspace((unsigned char)end[-1])) --end;
+    if (end <= value) return -1;
+    if (*value == '[') {
+        const char *close = memchr(value + 1, ']', (size_t)(end - value - 1));
+        if (close == NULL) return -1;
+        ++value;
+        end = close;
+    } else {
+        int colons = 0;
+        const char *last_colon = NULL;
+        for (const char *cursor = value; cursor < end; ++cursor) {
+            if (*cursor == ':') {
+                ++colons;
+                last_colon = cursor;
+            }
+            if ((unsigned char)*cursor < 0x20U) return -1;
+        }
+        if (colons == 1 && last_colon != NULL) end = last_colon;
+    }
+    size_t len = (size_t)(end - value);
+    if (len == 0U || len >= out_len) return -1;
+    memcpy(out, value, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int public_primary_stun(const char *host_hint,
+                               char host[384],
+                               int *port,
+                               int *standalone)
+{
+    const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS");
+    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    *standalone = configured != NULL && *configured != '\0' && configured_port > 0;
+    if (*standalone) {
+        *port = configured_port;
+        return normalize_public_host(configured, host, 384U);
+    }
+    configured = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    if (configured == NULL || *configured == '\0') configured = host_hint;
+    *port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+    return *port > 0 ? normalize_public_host(configured, host, 384U) : -1;
+}
+
+static int public_alternate_stun(char host[384], int *port)
+{
+    const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
+    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
+    if (configured == NULL || *configured == '\0') {
+        configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
+        configured_port = env_int("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
+    }
+    *port = configured_port;
+    return configured_port > 0 ? normalize_public_host(configured, host, 384U) : -1;
+}
+
 static int normalize_public_stun_url(const char *value, char *out, size_t out_len)
 {
     while (isspace((unsigned char)*value)) ++value;
@@ -1424,14 +1705,30 @@ static int normalize_public_stun_url(const char *value, char *out, size_t out_le
     return build_public_ice_url("stun", host, port, "", out, out_len);
 }
 
-static size_t collect_public_stun_urls(char urls[][512], size_t max_urls, int include_self)
+static size_t collect_public_stun_urls(char urls[][512], size_t max_urls,
+                                       int peer_mesh_enabled, const char *host_hint)
 {
     size_t count = 0;
-    int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
-    const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (count < max_urls && include_self && public_address != NULL && *public_address != '\0'
-        && build_public_ice_url("stun", public_address, port, "", urls[count], sizeof(urls[count])) == 0) {
+    char primary_host[384];
+    int primary_port = 0;
+    int standalone = 0;
+    if (count < max_urls
+        && public_primary_stun(host_hint, primary_host, &primary_port, &standalone) == 0
+        && (peer_mesh_enabled || standalone)
+        && build_public_ice_url("stun", primary_host, primary_port, "",
+                                urls[count], sizeof(urls[count])) == 0) {
         ++count;
+    }
+    char alternate_host[384];
+    int alternate_port = 0;
+    if (count < max_urls && standalone
+        && public_alternate_stun(alternate_host, &alternate_port) == 0) {
+        (void)alternate_port;
+        char normalized[512];
+        if (build_public_ice_url("stun", alternate_host, primary_port, "",
+                                 normalized, sizeof(normalized)) == 0
+            && (count == 0U || strcmp(urls[0], normalized) != 0))
+            snprintf(urls[count++], sizeof(urls[0]), "%s", normalized);
     }
     const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
     if (configured == NULL || *configured == '\0') return count;
@@ -1451,16 +1748,18 @@ static size_t collect_public_stun_urls(char urls[][512], size_t max_urls, int in
     return count;
 }
 
-static int build_public_stun_config_response(char *out, size_t out_len)
+static int build_public_stun_config_response(const char *host_hint, char *out, size_t out_len)
 {
     int enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
-    int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+    int port = 0;
+    int standalone = 0;
+    char primary_host[384];
+    int has_primary = public_primary_stun(host_hint, primary_host, &port, &standalone) == 0;
     char urls[16][512];
-    size_t count = collect_public_stun_urls(urls, 16U, enabled);
+    size_t count = collect_public_stun_urls(urls, 16U, enabled, host_hint);
     char self_url[512] = "";
-    const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (enabled && public_address != NULL && *public_address != '\0') {
-        (void)build_public_ice_url("stun", public_address, port, "", self_url, sizeof(self_url));
+    if (has_primary && (enabled || standalone)) {
+        (void)build_public_ice_url("stun", primary_host, port, "", self_url, sizeof(self_url));
     }
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(&builder,
@@ -1482,13 +1781,13 @@ static int build_public_stun_config_response(char *out, size_t out_len)
     return result;
 }
 
-static int build_public_ice_config_response(char *out, size_t out_len)
+static int build_public_ice_config_response(const char *host_hint, char *out, size_t out_len)
 {
     int enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int auth_required = env_bool("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", 1);
     int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     char urls[16][512];
-    size_t count = collect_public_stun_urls(urls, 16U, enabled);
+    size_t count = collect_public_stun_urls(urls, 16U, enabled, host_hint);
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(&builder, "{\"peerMeshEnabled\":%s,\"iceServers\":[", enabled ? "true" : "false");
     for (size_t i = 0; rc == 0 && i < count; ++i) {
@@ -1498,24 +1797,16 @@ static int build_public_ice_config_response(char *out, size_t out_len)
         if (rc == 0) rc = admin_sb_append(&builder, ",\"username\":\"\",\"credential\":\"\"}");
     }
     const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    const char *shared_secret = getenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET");
-    int turn_publishable = enabled && public_address != NULL && *public_address != '\0'
-        && (!auth_required || (shared_secret != NULL && *shared_secret != '\0'));
+    if (public_address == NULL || *public_address == '\0') public_address = host_hint;
+    int turn_publishable = enabled && public_address != NULL && *public_address != '\0';
     if (rc == 0 && turn_publishable) {
-        long long ttl = env_i64("SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", 3600);
-        if (ttl < 60) ttl = 60;
-        long long expires = current_time_millis() / 1000LL + ttl;
-        char random_hex[160];
-        char username[128];
-        build_prefixed_token("", random_hex, sizeof(random_hex));
-        snprintf(username, sizeof(username), "%lld:public-transfer:%.8s", expires, random_hex);
-        uint8_t mac[ST_SHA1_LEN];
+        char username[192];
         char credential[64];
-        const char *secret = turn_credential_secret();
-        st_hmac_sha1((const uint8_t *)secret, strlen(secret), (const uint8_t *)username, strlen(username), mac);
-        base64url_no_padding(mac, sizeof(mac), credential, sizeof(credential));
         char turn_url[512];
-        if (build_public_ice_url("turn", public_address, port, "?transport=udp", turn_url, sizeof(turn_url)) == 0) {
+        if (st_turn_auth_issue("public-transfer", username, sizeof(username),
+                               credential, sizeof(credential)) == 0
+            && build_public_ice_url("turn", public_address, port, "?transport=udp",
+                                    turn_url, sizeof(turn_url)) == 0) {
             if (count > 0) rc = admin_sb_append(&builder, ",");
             if (rc == 0) rc = admin_sb_append(&builder, "{\"urls\":");
             if (rc == 0) rc = admin_sb_append_json_string(&builder, turn_url);
@@ -1535,6 +1826,69 @@ static int build_public_ice_config_response(char *out, size_t out_len)
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"ice config response failed\"}");
+    }
+    int result = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return result;
+}
+
+static int build_public_nat_probe_config_response(const char *host_hint,
+                                                  char *out,
+                                                  size_t out_len)
+{
+    char primary_host[384];
+    char alternate_host[384];
+    int primary_port = 0;
+    int alternate_port = 0;
+    int standalone = 0;
+    int has_primary = public_primary_stun(host_hint, primary_host, &primary_port, &standalone) == 0;
+    int has_alternate = public_alternate_stun(alternate_host, &alternate_port) == 0;
+    int rfc5780 = has_primary && has_alternate && primary_port > 0 && alternate_port > 0
+        && primary_port != alternate_port && strcasecmp(primary_host, alternate_host) != 0;
+    (void)standalone;
+    const char *ids[] = {"A1P1", "A1P2", "A2P1", "A2P2"};
+    const char *address_slots[] = {"PRIMARY", "PRIMARY", "ALTERNATE", "ALTERNATE"};
+    const char *port_slots[] = {"PRIMARY", "ALTERNATE", "PRIMARY", "ALTERNATE"};
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+        "{\"available\":%s,\"protocol\":\"RFC8489\",\"discoveryMethod\":\"%s\",\"endpoints\":[",
+        has_primary ? "true" : "false", rfc5780 ? "RFC5780" : "BASIC_STUN");
+    size_t endpoint_count = has_primary ? (rfc5780 ? 4U : 1U) : 0U;
+    for (size_t i = 0; rc == 0 && i < endpoint_count; ++i) {
+        const char *host = i < 2U ? primary_host : alternate_host;
+        int port = i == 0U || i == 2U ? primary_port : alternate_port;
+        char url[512];
+        if (build_public_ice_url("stun", host, port, "", url, sizeof(url)) != 0) {
+            rc = -1;
+            break;
+        }
+        if (i > 0U) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = admin_sb_append(&builder, "{\"id\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, ids[i]);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"url\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, url);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"host\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, host);
+        if (rc == 0) rc = admin_sb_appendf(&builder, ",\"port\":%d,\"addressSlot\":", port);
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, address_slots[i]);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"portSlot\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, port_slots[i]);
+        if (rc == 0) rc = admin_sb_append(&builder, "}");
+    }
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder,
+            "],\"capabilities\":{\"binding\":true,\"changeRequest\":%s,"
+            "\"responseOrigin\":%s,\"otherAddress\":%s,\"responsePort\":%s,"
+            "\"padding\":%s,\"browserMappingObservation\":true,"
+            "\"browserFilteringObservation\":false}}",
+            rfc5780 ? "true" : "false", rfc5780 ? "true" : "false",
+            rfc5780 ? "true" : "false", rfc5780 ? "true" : "false",
+            rfc5780 ? "true" : "false");
+    }
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"nat probe config response failed\"}");
     }
     int result = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
@@ -1579,17 +1933,30 @@ static int append_db_client_auth_response(char *out,
     long long token_ttl_seconds = env_i64_alias("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS",
                                                 "SPECUS_CLIENT_TOKEN_TTL_SECONDS",
                                                 28800);
+    char *peer_mesh_config = st_peer_mesh_build_login_config(admin_database_path(), identity->client_name,
+                                                              session->peer_service_discovery_version);
+    if (peer_mesh_config == NULL) {
+        peer_mesh_config = strdup("{\"enabled\":false,\"clientId\":0,\"clientName\":\"\","
+                                  "\"virtualIp\":\"\",\"cidr\":\"100.96.0.0/11\","
+                                  "\"stunHost\":\"\",\"stunPort\":0,\"turnHost\":\"\",\"turnPort\":0,"
+                                  "\"publicStunServers\":[],\"iceUsername\":\"\",\"iceCredential\":\"\","
+                                  "\"iceRealm\":\"specus\",\"iceNonce\":\"\",\"serverPublicKey\":\"\","
+                                  "\"clientPublicKey\":\"\",\"sessionTtlSeconds\":3600,"
+                                  "\"peerServiceDiscoveryVersion\":2,\"serviceSharing\":{"
+                                  "\"deploymentEnabled\":false,\"configuredEnabled\":false,"
+                                  "\"effectiveEnabled\":false,\"mdnsImportEnabled\":false},\"localServices\":[]}");
+    }
+    if (peer_mesh_config == NULL) {
+        free(tenant_id); free(client_name); free(netty_host); free(token);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh response build failed\"}");
+    }
     st_admin_string_builder builder = {0};
     int build_rc = admin_sb_appendf(&builder,
                                     "{\"tenantId\":\"%s\",\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":%lld,"
                                     "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":%d,"
                                     "\"policy\":{\"enabled\":true,\"billingStatus\":\"ACTIVE\",\"retryAfterSeconds\":0},"
-                                    "\"peerMesh\":{\"enabled\":false,\"clientId\":%lld,\"clientName\":\"%s\","
-                                    "\"virtualIp\":\"\",\"cidr\":\"\",\"stunHost\":\"\",\"stunPort\":0,"
-                                    "\"turnHost\":\"\",\"turnPort\":0,\"iceUsername\":\"\",\"iceCredential\":\"\","
-                                    "\"serverPublicKey\":\"\",\"clientPublicKey\":\"\",\"sessionTtlSeconds\":0},"
-                                    "\"specusConfigList\":[",
+                                    "\"peerMesh\":",
                                     tenant_id,
                                     identity->client_id,
                                     client_name,
@@ -1600,9 +1967,9 @@ static int append_db_client_auth_response(char *out,
                                     env_int("SPECUS_NETTY_PORT", 7010),
                                     credential->max_online_instances <= 0
                                         ? client_auth_default_max_online_instances()
-                                        : credential->max_online_instances,
-                                    identity->client_id,
-                                    client_name);
+                                        : credential->max_online_instances);
+    if (build_rc == 0) build_rc = admin_sb_append(&builder, peer_mesh_config);
+    if (build_rc == 0) build_rc = admin_sb_append(&builder, ",\"specusConfigList\":[");
     if (build_rc == 0) {
         build_rc = append_specus_config_list(&builder, mappings, mapping_count);
     }
@@ -1619,6 +1986,7 @@ static int append_db_client_auth_response(char *out,
     free(client_name);
     free(netty_host);
     free(token);
+    free(peer_mesh_config);
     if (build_rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
@@ -1663,6 +2031,8 @@ static int build_database_client_auth_login_response(const char *database_path,
     int message_attachments_capable = 0;
     int message_media_preview_capable = 0;
     long long message_max_attachment_bytes = 0;
+    int peer_service_discovery_version = 0;
+    char peer_service_applications[128] = "";
     /* ClientEnvironmentInfo uses the wire-level capability names below.  The
      * management projection deliberately keeps its message*Capable names, but
      * accepting those projection names here would silently discard the real
@@ -1672,6 +2042,36 @@ static int build_database_client_auth_login_response(const char *database_path,
     (void)st_json_get_bool(body, "attachments", &message_attachments_capable);
     (void)st_json_get_bool(body, "mediaPreview", &message_media_preview_capable);
     (void)st_json_get_i64(body, "maxAttachmentBytes", &message_max_attachment_bytes);
+    (void)st_json_get_int(body, "version", &peer_service_discovery_version);
+    if (peer_service_discovery_version < 1) peer_service_discovery_version = 0;
+    else if (peer_service_discovery_version > 2) peer_service_discovery_version = 2;
+    char **peer_apps = NULL;
+    size_t peer_app_count = 0U;
+    if (peer_service_discovery_version > 0
+        && st_json_get_string_array(body, "applications", &peer_apps, &peer_app_count) == 0) {
+        size_t offset = 0U;
+        for (size_t i = 0; i < peer_app_count; ++i) {
+            const char *app = peer_apps[i];
+            int allowed = strcmp(app, "http") == 0 || strcmp(app, "https") == 0
+                || strcmp(app, "ssh") == 0 || strcmp(app, "tcp") == 0 || strcmp(app, "udp") == 0;
+            int duplicate = 0;
+            if (allowed && peer_service_applications[0] != '\0') {
+                char copy[sizeof(peer_service_applications)];
+                snprintf(copy, sizeof(copy), "%s", peer_service_applications);
+                char *save = NULL;
+                for (char *part = strtok_r(copy, ",", &save); part != NULL; part = strtok_r(NULL, ",", &save)) {
+                    if (strcmp(part, app) == 0) duplicate = 1;
+                }
+            }
+            if (!allowed || duplicate) continue;
+            int written = snprintf(peer_service_applications + offset,
+                                   sizeof(peer_service_applications) - offset,
+                                   "%s%s", offset == 0U ? "" : ",", app);
+            if (written < 0 || (size_t)written >= sizeof(peer_service_applications) - offset) break;
+            offset += (size_t)written;
+        }
+    }
+    st_json_free_string_array(peer_apps, peer_app_count);
     if (message_max_attachment_bytes < 0) {
         message_max_attachment_bytes = 0;
     }
@@ -1785,6 +2185,20 @@ static int build_database_client_auth_login_response(const char *database_path,
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
 
+    char *peer_public_key = st_json_get_string(body, "peerPublicKey");
+    if (peer_public_key != NULL && *peer_public_key != '\0'
+        && strlen(peer_public_key) <= 256U && env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        st_storage_client peer_client;
+        if (st_storage_get_client(database_path, identity.client_id, &peer_client) == 0) {
+            (void)st_storage_update_peer_mesh_device_report(database_path,
+                                                            &peer_client,
+                                                            peer_public_key,
+                                                            NULL, NULL, NULL, NULL, NULL,
+                                                            NULL, NULL, NULL, NULL, NULL);
+        }
+    }
+    free(peer_public_key);
+
     char access_token[160];
     char token_hash[ST_SHA256_HEX_LEN + 1];
     uint8_t token_digest[ST_SHA256_LEN];
@@ -1827,6 +2241,9 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.message_attachments_capable = message_attachments_capable;
     session.message_media_preview_capable = message_media_preview_capable;
     session.message_max_attachment_bytes = message_max_attachment_bytes;
+    session.peer_service_discovery_version = peer_service_discovery_version;
+    snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
+             "%s", peer_service_applications);
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", now_text);
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", expires_text);
     if (st_storage_create_client_session(database_path, &session, &session) != 0) {
@@ -2031,7 +2448,7 @@ static void record_direct_http_traffic(const char *client_name,
         resource_id = http_route.id;
         snprintf(resource_name,
                  sizeof(resource_name),
-                 "%s -> %s",
+                 "%.127s -> %.380s",
                  http_route.route,
                  http_route.target_base_url);
     } else {
@@ -2082,7 +2499,11 @@ static void record_direct_http_exchange(const char *client_name,
         return;
     }
     char resource_name[512];
-    snprintf(resource_name, sizeof(resource_name), "%s -> %s", http_route.route, http_route.target_base_url);
+    snprintf(resource_name,
+             sizeof(resource_name),
+             "%.127s -> %.380s",
+             http_route.route,
+             http_route.target_base_url);
     char *request_headers = admin_join_headers(request->headers, request->headers_len);
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
@@ -2195,27 +2616,47 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
         free(updated);
         return -1;
     }
+    st_admin_client_runtime_status status;
+    admin_get_client_runtime_status(client->id, client->client_name, &status);
+    int online = status.online != 0;
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"clientName\":\"%s\",\"ownerUsername\":\"%s\","
                               "\"enabled\":%s,\"connectionRateLimitPerMinute\":%d,"
-                              "\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
-                              "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
-                              "\"messageMaxAttachmentBytes\":%lld,"
-                              "\"online\":false,\"connectedSinceMs\":null,"
-                              "\"uploadBytes\":0,\"downloadBytes\":0,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"online\":%s,\"connectedSinceMs\":",
                               client->id,
                               client_name,
                               owner,
                               client->enabled ? "true" : "false",
                               client->connection_rate_limit_per_minute,
-                              "false",
-                              "false",
-                              "false",
-                              "false",
-                              0LL,
+                              online ? "true" : "false");
+    if (rc == 0) {
+        rc = online
+            ? admin_sb_appendf(builder, "%lld", status.connected_since_ms)
+            : admin_sb_append(builder, "null");
+    }
+    if (rc == 0) rc = admin_sb_append(builder, ",\"clientVersion\":");
+    if (rc == 0) {
+        rc = online
+            ? admin_sb_append_nullable_json_string(builder, client->client_version)
+            : admin_sb_append(builder, "null");
+    }
+    if (rc == 0) {
+        rc = admin_sb_appendf(builder,
+                              ",\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
+                              "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
+                              "\"messageMaxAttachmentBytes\":%lld,"
+                              "\"uploadBytes\":%lld,\"downloadBytes\":%lld,"
+                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              online && client->message_send_capable ? "true" : "false",
+                              online && client->message_receive_capable ? "true" : "false",
+                              online && client->message_attachments_capable ? "true" : "false",
+                              online && client->message_media_preview_capable ? "true" : "false",
+                              online ? client->message_max_attachment_bytes : 0LL,
+                              client->upload_bytes,
+                              client->download_bytes,
                               created,
                               updated);
+    }
     free(client_name);
     free(owner);
     free(created);
@@ -2225,25 +2666,33 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
 
 static int append_peer_mesh_device_view(st_admin_string_builder *builder, const st_storage_peer_mesh_device *device)
 {
+    st_admin_client_runtime_status runtime_status;
+    admin_get_client_runtime_status(device->client_id, device->client_name, &runtime_status);
     const char *nat_type = device->nat_type[0] == '\0' ? "UNKNOWN" : device->nat_type;
-    const char *device_mode = device->virtual_device_mode[0] == '\0' ? "UNSUPPORTED" : device->virtual_device_mode;
+    const char *device_mode = device->virtual_device_mode[0] == '\0' ? "AUTO" : device->virtual_device_mode;
     const char *device_status = device->virtual_device_status[0] == '\0'
-                                    ? "UNSUPPORTED"
+                                    ? "DOWN"
                                     : device->virtual_device_status;
-    const char *device_error = device->virtual_device_error[0] == '\0'
-                                   ? "C server does not implement Peer Mesh data plane"
-                                   : device->virtual_device_error;
     int rc = admin_sb_appendf(builder, "{\"id\":%lld,\"clientId\":%lld,\"clientName\":", device->id, device->client_id);
     if (rc == 0) rc = admin_sb_append_json_string(builder, device->client_name);
     if (rc == 0) rc = admin_sb_append(builder, ",\"ownerUsername\":");
     if (rc == 0) rc = admin_sb_append_json_string(builder, device->owner_username);
-    if (rc == 0) rc = admin_sb_appendf(builder, ",\"enabled\":%s,\"online\":false,\"virtualIp\":",
-                                       device->enabled ? "true" : "false");
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"enabled\":%s,\"online\":%s,\"virtualIp\":",
+                                       device->enabled ? "true" : "false",
+                                       runtime_status.online ? "true" : "false");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_ip);
-    if (rc == 0) rc = admin_sb_append(builder, ",\"cidr\":null,\"publicKey\":");
+    if (rc == 0) rc = admin_sb_append(builder, ",\"cidr\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, device->cidr);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"publicKey\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->public_key);
     if (rc == 0) rc = admin_sb_append(builder, ",\"natType\":");
     if (rc == 0) rc = admin_sb_append_json_string(builder, nat_type);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"natMappingBehavior\":");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->nat_mapping_behavior);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"natFilteringBehavior\":");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->nat_filtering_behavior);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"natBehaviorDiscovery\":");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->nat_behavior_discovery);
     if (rc == 0) rc = admin_sb_append(builder, ",\"lastEndpoint\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->last_endpoint);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceMode\":");
@@ -2253,7 +2702,7 @@ static int append_peer_mesh_device_view(st_admin_string_builder *builder, const 
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceStatus\":");
     if (rc == 0) rc = admin_sb_append_json_string(builder, device_status);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceError\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, device_error);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_error);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceUpdatedAt\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_updated_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"lastSeenAt\":");
@@ -2263,11 +2712,11 @@ static int append_peer_mesh_device_view(st_admin_string_builder *builder, const 
                               ",\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
                               "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
                               "\"messageMaxAttachmentBytes\":%lld",
-                              "false",
-                              "false",
-                              "false",
-                              "false",
-                              0LL);
+                              runtime_status.online && device->message_send_capable ? "true" : "false",
+                              runtime_status.online && device->message_receive_capable ? "true" : "false",
+                              runtime_status.online && device->message_attachments_capable ? "true" : "false",
+                              runtime_status.online && device->message_media_preview_capable ? "true" : "false",
+                              runtime_status.online ? device->message_max_attachment_bytes : 0LL);
     }
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
     if (rc == 0) rc = admin_sb_append_json_string(builder, device->updated_at);
@@ -2430,10 +2879,24 @@ static int append_client_download_link_view(st_admin_string_builder *builder,
     }
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
-                              ",\"displayOrder\":%d,\"enabled\":%s,\"createdAt\":",
+                              ",\"displayOrder\":%d,\"enabled\":%s,\"version\":",
                               link->display_order,
                               link->enabled ? "true" : "false");
     }
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, link->version);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"sha256\":");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, link->sha256);
+    if (rc == 0) rc = admin_sb_appendf(builder,
+        ",\"fileSize\":%lld,\"isLatest\":%s,\"changelogUrl\":",
+        link->file_size, link->is_latest ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, link->changelog_url);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"minSupportedVersion\":");
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, link->min_supported_version);
+    if (rc == 0) rc = admin_sb_appendf(builder,
+        ",\"hosted\":%s,\"packageId\":", link->hosted ? "true" : "false");
+    if (rc == 0) rc = link->hosted
+        ? admin_sb_appendf(builder, "%lld", link->id) : admin_sb_append(builder, "null");
+    if (rc == 0) rc = admin_sb_append(builder, ",\"createdAt\":");
     if (rc == 0) {
         rc = admin_sb_append_json_string(builder, link->created_at);
     }
@@ -2505,7 +2968,8 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"clientId\":%lld,\"clientName\":\"%s\","
                               "\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"enabled\":%s,"
-                              "\"detailCaptureEnabled\":%s,\"pathRewriteEnabled\":%s,"
+                              "\"detailCaptureEnabled\":%s,\"mediaCaptureEnabled\":%s,"
+                              "\"pathRewriteEnabled\":%s,\"insecureSkipVerify\":%s,"
                               "\"authEnabled\":%s,\"authUsername\":\"%s\",\"authPasswordConfigured\":%s,"
                               "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
                               route->id,
@@ -2515,7 +2979,9 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
                               target,
                               route->enabled ? "true" : "false",
                               route->detail_capture_enabled ? "true" : "false",
+                              route->media_capture_enabled ? "true" : "false",
                               route->path_rewrite_enabled ? "true" : "false",
+                              route->insecure_skip_verify ? "true" : "false",
                               route->auth_enabled ? "true" : "false",
                               auth_username,
                               route->auth_password_hash[0] != '\0' ? "true" : "false",
@@ -2842,192 +3308,6 @@ static int admin_form_append_pair(st_admin_string_builder *builder, const char *
     return 0;
 }
 
-static int admin_parse_http_url(const char *url, char *host, size_t host_len, int *port, char *path, size_t path_len)
-{
-    const char *prefix = "http://";
-    size_t prefix_len = strlen(prefix);
-    if (url == NULL || strncmp(url, prefix, prefix_len) != 0) {
-        return -1;
-    }
-    const char *authority = url + prefix_len;
-    const char *slash = strchr(authority, '/');
-    size_t authority_len = slash == NULL ? strlen(authority) : (size_t)(slash - authority);
-    if (authority_len == 0 || authority_len >= host_len) {
-        return -1;
-    }
-    char authority_buf[512];
-    if (authority_len >= sizeof(authority_buf)) {
-        return -1;
-    }
-    memcpy(authority_buf, authority, authority_len);
-    authority_buf[authority_len] = '\0';
-    char *colon = strrchr(authority_buf, ':');
-    *port = 80;
-    if (colon != NULL) {
-        *colon = '\0';
-        char *end = NULL;
-        long parsed = strtol(colon + 1, &end, 10);
-        if (end == colon + 1 || *end != '\0' || parsed <= 0 || parsed > 65535) {
-            return -1;
-        }
-        *port = (int)parsed;
-    }
-    if (authority_buf[0] == '\0' || strlen(authority_buf) >= host_len) {
-        return -1;
-    }
-    snprintf(host, host_len, "%s", authority_buf);
-    const char *request_path = slash == NULL || *slash == '\0' ? "/" : slash;
-    if (strlen(request_path) >= path_len) {
-        return -1;
-    }
-    snprintf(path, path_len, "%s", request_path);
-    return 0;
-}
-
-static int admin_oidc_send_all(int fd, const char *buffer, size_t len)
-{
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t sent = send(fd, buffer + offset, len - offset, 0);
-        if (sent <= 0) {
-            return -1;
-        }
-        offset += (size_t)sent;
-    }
-    return 0;
-}
-
-static int admin_oidc_post_http(const char *endpoint,
-                                const char *authorization,
-                                const char *form,
-                                int *status_code,
-                                char **body_out)
-{
-    char host[256];
-    char path[1024];
-    int port = 0;
-    if (admin_parse_http_url(endpoint, host, sizeof(host), &port, path, sizeof(path)) != 0) {
-        return -1;
-    }
-    char port_text[16];
-    snprintf(port_text, sizeof(port_text), "%d", port);
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-    struct addrinfo *result = NULL;
-    if (getaddrinfo(host, port_text, &hints, &result) != 0) {
-        return -1;
-    }
-    int fd = -1;
-    for (struct addrinfo *item = result; item != NULL; item = item->ai_next) {
-        fd = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
-        if (connect(fd, item->ai_addr, item->ai_addrlen) == 0) {
-            break;
-        }
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(result);
-    if (fd < 0) {
-        return -1;
-    }
-    char host_header[300];
-    if (port == 80) {
-        snprintf(host_header, sizeof(host_header), "%s", host);
-    } else {
-        snprintf(host_header, sizeof(host_header), "%s:%d", host, port);
-    }
-    st_admin_string_builder request = {0};
-    int rc = admin_sb_appendf(&request,
-                              "POST %s HTTP/1.1\r\n"
-                              "Host: %s\r\n"
-                              "Content-Type: application/x-www-form-urlencoded\r\n"
-                              "Accept: application/json\r\n"
-                              "Connection: close\r\n"
-                              "Content-Length: %zu\r\n",
-                              path,
-                              host_header,
-                              strlen(form));
-    if (rc == 0 && authorization != NULL && *authorization != '\0') {
-        rc = admin_sb_appendf(&request, "Authorization: Basic %s\r\n", authorization);
-    }
-    if (rc == 0) {
-        rc = admin_sb_append(&request, "\r\n");
-    }
-    if (rc == 0) {
-        rc = admin_sb_append(&request, form);
-    }
-    if (rc != 0 || request.data == NULL || admin_oidc_send_all(fd, request.data, request.len) != 0) {
-        free(request.data);
-        close(fd);
-        return -1;
-    }
-    free(request.data);
-
-    size_t cap = 8192;
-    size_t len = 0;
-    char *response = (char *)malloc(cap + 1U);
-    if (response == NULL) {
-        close(fd);
-        return -1;
-    }
-    for (;;) {
-        if (len == cap) {
-            if (cap >= 65536U) {
-                free(response);
-                close(fd);
-                return -1;
-            }
-            size_t next_cap = cap * 2U;
-            char *next = (char *)realloc(response, next_cap + 1U);
-            if (next == NULL) {
-                free(response);
-                close(fd);
-                return -1;
-            }
-            response = next;
-            cap = next_cap;
-        }
-        ssize_t got = recv(fd, response + len, cap - len, 0);
-        if (got < 0) {
-            free(response);
-            close(fd);
-            return -1;
-        }
-        if (got == 0) {
-            break;
-        }
-        len += (size_t)got;
-    }
-    close(fd);
-    response[len] = '\0';
-    int parsed_status = 0;
-    if (sscanf(response, "HTTP/%*s %d", &parsed_status) != 1 || parsed_status <= 0) {
-        free(response);
-        return -1;
-    }
-    char *body = strstr(response, "\r\n\r\n");
-    if (body == NULL) {
-        free(response);
-        return -1;
-    }
-    body += 4;
-    char *copy = (char *)malloc(strlen(body) + 1U);
-    if (copy == NULL) {
-        free(response);
-        return -1;
-    }
-    strcpy(copy, body);
-    free(response);
-    *status_code = parsed_status;
-    *body_out = copy;
-    return 0;
-}
-
 static int build_oidc_token_proxy_response(const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -3053,15 +3333,6 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
         free(code);
         free(code_verifier);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"code or code_verifier is required\"}");
-    }
-    if (strncmp(token_endpoint, "https://", strlen("https://")) == 0) {
-        free(code);
-        free(code_verifier);
-        return write_response(out,
-                              out_len,
-                              502,
-                              "Bad Gateway",
-                              "{\"error\":\"C server OIDC token exchange does not support HTTPS token endpoint yet\"}");
     }
     st_admin_string_builder form = {0};
     int rc = admin_form_append_pair(&form, "grant_type", "authorization_code");
@@ -3089,9 +3360,20 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC authorization build failed\"}");
         }
     }
-    int status_code = 0;
+    long status_code = 0L;
     char *token_body = NULL;
-    if (admin_oidc_post_http(token_endpoint, authorization, form.data, &status_code, &token_body) != 0) {
+    const char *ca_certificate_path = getenv("SPECUS_OIDC_CA_CERTIFICATE_PATH");
+    st_http_client_options http_options = {
+        .timeout_ms = 15000L,
+        .max_response_bytes = 65536U,
+        .ca_certificate_path = ca_certificate_path
+    };
+    if (st_http_post_form(token_endpoint,
+                          authorization,
+                          form.data,
+                          &http_options,
+                          &status_code,
+                          &token_body) != 0) {
         free(authorization);
         free(form.data);
         return write_response(out, out_len, 502, "Bad Gateway", "{\"error\":\"cannot connect to OIDC token endpoint\"}");
@@ -3370,6 +3652,92 @@ static int build_clients_response(const st_admin_context *context, char *out, si
     return response_len;
 }
 
+static int build_client_name_availability_response(const st_admin_context *context,
+                                                   const char *path,
+                                                   char *out,
+                                                   size_t out_len)
+{
+    char *client_name = admin_query_string(path, "clientName");
+    if (!admin_text_present(client_name)) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"clientName is required\"}");
+    }
+    long long exclude_id = 0;
+    (void)admin_query_i64(path, "excludeClientId", &exclude_id);
+    const char *database_path = admin_database_path();
+    st_storage_client excluded;
+    if (exclude_id > 0 && (database_path == NULL
+        || !admin_load_accessible_client(database_path, context, exclude_id, &excluded))) {
+        free(client_name);
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    }
+    st_storage_client existing;
+    int available = database_path == NULL
+        || st_storage_get_client_by_name(database_path, client_name, &existing) != 0
+        || (exclude_id > 0 && existing.id == exclude_id);
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"clientName\":") == 0
+        && admin_sb_append_json_string(&builder, client_name) == 0
+        && admin_sb_appendf(&builder, ",\"available\":%s}", available ? "true" : "false") == 0
+        ? 0 : -1;
+    free(client_name);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client availability failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int build_client_detail_response(const st_admin_context *context,
+                                        long long client_id,
+                                        char *out,
+                                        size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_client client;
+    if (database_path == NULL
+        || !admin_load_accessible_client(database_path, context, client_id, &client)) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    }
+    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    size_t mapping_count = 0U;
+    size_t route_count = 0U;
+    if (st_storage_list_mappings(database_path, client_id, mappings,
+                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, routes,
+                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client detail failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"client\":");
+    if (rc == 0) rc = append_client_view(&builder, &client);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"specusMappings\":[");
+    for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = append_mapping_view(&builder, &mappings[i]);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "],\"httpRoutes\":[");
+    for (size_t i = 0; rc == 0 && i < route_count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = append_http_route_view(&builder, &routes[i]);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]}");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client detail failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
 static int build_peer_mesh_devices_response(const st_admin_context *context, char *out, size_t out_len)
 {
     st_admin_string_builder builder = {0};
@@ -3455,6 +3823,7 @@ static int handle_peer_mesh_device_update(const st_admin_context *context,
     if (st_storage_update_peer_mesh_device_enabled(database_path, &client, enabled, &updated) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device update failed\"}");
     }
+    admin_notify_peer_mesh_refresh(client.tenant_id);
     return build_peer_mesh_device_result_response(&updated, 200, "OK", out, out_len);
 }
 
@@ -3614,6 +3983,734 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
     return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+}
+
+static int build_peer_mesh_stats_response(const st_admin_context *context, char *out, size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
+    size_t count = 0U;
+    if (database_path != NULL
+        && st_storage_list_peer_mesh_sessions_visible(database_path, context->tenant_id,
+            context->username, context->admin, 1, ST_ADMIN_MAX_PEER_SESSIONS,
+            sessions, ST_ADMIN_MAX_PEER_SESSIONS, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
+    }
+    long long reported = 0, active = 0, direct = 0, relay = 0;
+    long long direct_bytes = 0, relay_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        int is_reported = sessions[i].rtt_millis >= 0 || sessions[i].local_endpoint[0] != '\0'
+            || sessions[i].remote_endpoint[0] != '\0' || sessions[i].last_traffic_at[0] != '\0';
+        if (is_reported) ++reported;
+        if (strcmp(sessions[i].status, "ACTIVE") == 0) {
+            ++active;
+            if (strcmp(sessions[i].path_type, "RELAY") == 0) ++relay;
+            else if (strcmp(sessions[i].path_type, "DIRECT") == 0) ++direct;
+        }
+        direct_bytes += sessions[i].direct_bytes;
+        relay_bytes += sessions[i].relay_bytes;
+    }
+    char body[4096];
+    int written = snprintf(body, sizeof(body),
+        "{\"totalSessions\":%zu,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
+        "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":%s,"
+        "\"pathTypes\":[{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
+        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":%lld,\"relayBytes\":0},"
+        "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
+        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":%lld}],"
+        "\"addressFamilies\":[],\"natTypes\":[],\"natBehaviorDevices\":0,"
+        "\"natBehaviorClassifiedDevices\":0,\"natBehaviorSuccessRatio\":null,"
+        "\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],\"natBehaviorDiscoveries\":[]}",
+        count, reported, active, direct, relay, active > 0 ? "0" : "null",
+        direct, direct, direct_bytes, relay, relay, relay_bytes);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
+    }
+    if (active > 0) {
+        char ratio[32];
+        snprintf(ratio, sizeof(ratio), "%.6f", (double)direct / (double)active);
+        char *placeholder = strstr(body, "\"activeDirectRatio\":0,");
+        if (placeholder != NULL) {
+            size_t prefix = (size_t)(placeholder - body) + strlen("\"activeDirectRatio\":");
+            char rebuilt[4096];
+            snprintf(rebuilt, sizeof(rebuilt), "%.*s%s%s", (int)prefix, body, ratio,
+                     placeholder + strlen("\"activeDirectRatio\":0"));
+            snprintf(body, sizeof(body), "%s", rebuilt);
+        }
+    }
+    return write_response(out, out_len, 200, "OK", body);
+}
+
+static int append_peer_mesh_service_view(st_admin_string_builder *builder,
+                                         const st_storage_peer_mesh_service *service,
+                                         int include_target)
+{
+    int rc = admin_sb_appendf(builder, "{\"id\":%lld,\"serviceId\":", service->id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->service_id);
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"clientId\":%lld,\"clientName\":", service->client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->client_name);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"name\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->name);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"description\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->description);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"transport\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->transport);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"application\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->application);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"targetHost\":");
+    if (rc == 0) rc = include_target
+        ? admin_sb_append_json_string(builder, service->target_host) : admin_sb_append(builder, "null");
+    if (rc == 0) rc = admin_sb_appendf(builder,
+        ",\"targetPort\":%d,\"publishedPort\":%d,\"path\":",
+        include_target ? service->target_port : 0, service->published_port);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->path);
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"enabled\":%s,\"visibility\":",
+                                       service->enabled ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->visibility);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"allowedClientIds\":[");
+    if (rc == 0 && service->allowed_client_ids[0] != '\0') {
+        char copy[sizeof(service->allowed_client_ids)];
+        snprintf(copy, sizeof(copy), "%s", service->allowed_client_ids);
+        char *save = NULL;
+        int first = 1;
+        for (char *part = strtok_r(copy, ",", &save); part != NULL; part = strtok_r(NULL, ",", &save)) {
+            char *end = NULL;
+            long long id = strtoll(part, &end, 10);
+            if (end != part && *end == '\0' && id > 0) {
+                if (admin_sb_appendf(builder, "%s%lld", first ? "" : ",", id) != 0) { rc = -1; break; }
+                first = 0;
+            }
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(builder, "],\"publishedAddress\":");
+    st_storage_peer_mesh_device device;
+    const char *database_path = admin_database_path();
+    if (rc == 0 && database_path != NULL
+        && st_storage_get_peer_mesh_device_by_client(database_path, service->tenant_id,
+                                                     service->client_id, &device) == 0
+        && device.virtual_ip[0] != '\0') {
+        char published_address[320];
+        snprintf(published_address, sizeof(published_address), "%s:%d",
+                 device.virtual_ip, service->published_port);
+        rc = admin_sb_append_json_string(builder, published_address);
+    } else if (rc == 0) {
+        rc = admin_sb_append(builder, "null");
+    }
+    if (rc == 0) rc = admin_sb_append(builder, ",\"instances\":[");
+    st_peer_mesh_service_instance instances[64];
+    size_t instance_count = 0U;
+    if (rc == 0 && st_peer_mesh_list_service_instances(service->tenant_id, service->client_id,
+            service->service_id, instances, 64U, &instance_count) != 0) rc = -1;
+    for (size_t i = 0; rc == 0 && i < instance_count; ++i) {
+        st_peer_mesh_service_instance *instance = &instances[i];
+        if (i > 0) rc = admin_sb_append(builder, ",");
+        if (rc == 0) rc = admin_sb_appendf(builder,
+            "{\"publisherSessionId\":%lld,\"instanceId\":", instance->publisher_session_id);
+        if (rc == 0) rc = admin_sb_append_json_string(builder, instance->instance_id);
+        if (rc == 0) rc = admin_sb_appendf(builder,
+            ",\"online\":%s,\"advertised\":%s,\"revision\":%lld,\"lastReportedAt\":",
+            instance->online ? "true" : "false", instance->advertised ? "true" : "false",
+            instance->revision);
+        if (rc == 0) rc = admin_sb_append_json_string(builder, instance->last_reported_at);
+        if (rc == 0) rc = admin_sb_append(builder, ",\"expiresAt\":");
+        if (rc == 0) rc = admin_sb_append_json_string(builder, instance->expires_at);
+        if (rc == 0) rc = admin_sb_append(builder, ",\"service\":");
+        if (rc == 0 && instance->advertised) {
+            rc = admin_sb_append(builder, "{\"serviceId\":");
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->service_id);
+            if (rc == 0) rc = admin_sb_append(builder, ",\"name\":");
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->name);
+            if (rc == 0) rc = admin_sb_append(builder, ",\"description\":");
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->description);
+            if (rc == 0) rc = admin_sb_append(builder, ",\"transport\":");
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->transport);
+            if (rc == 0) rc = admin_sb_append(builder, ",\"application\":");
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->application);
+            if (rc == 0) rc = admin_sb_appendf(builder, ",\"publishedPort\":%d,\"path\":",
+                                               service->published_port);
+            if (rc == 0) rc = admin_sb_append_json_string(builder, service->path);
+            if (rc == 0) rc = admin_sb_append(builder, "}");
+        } else if (rc == 0) {
+            rc = admin_sb_append(builder, "null");
+        }
+        if (rc == 0) rc = admin_sb_appendf(builder,
+            ",\"bytesIn\":%lld,\"bytesOut\":%lld,\"activeConnections\":%d,"
+            "\"totalConnections\":%lld}", instance->bytes_in, instance->bytes_out,
+            instance->active_connections, instance->total_connections);
+    }
+    if (rc == 0) rc = admin_sb_append(builder, "],\"createdAt\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, service->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
+    return rc;
+}
+
+static int build_peer_mesh_services_response(const st_admin_context *context, char *out, size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
+    st_storage_peer_mesh_service services[256];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
+            context->username, context->admin, services, 256, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service list failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = append_peer_mesh_service_view(&builder, &services[i], context->admin);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int build_peer_mesh_sharing_response(const st_admin_context *context, char *out, size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_peer_mesh_service_sharing sharing = {0};
+    int found = database_path == NULL ? 1
+        : st_storage_get_peer_mesh_service_sharing(database_path, context->tenant_id, &sharing);
+    if (found < 0) return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer sharing status failed\"}");
+    st_storage_peer_mesh_service services[256];
+    size_t count = 0U;
+    long long enabled_count = 0;
+    if (database_path != NULL
+        && st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
+            context->username, 1, services, 256, &count) == 0) {
+        for (size_t i = 0; i < count; ++i) if (services[i].enabled) ++enabled_count;
+    }
+    int deployment = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+        "{\"deploymentEnabled\":%s,\"configuredEnabled\":%s,\"effectiveEnabled\":%s,"
+        "\"peerServiceDiscoveryVersion\":2,\"supportedApplications\":[\"http\",\"https\",\"ssh\",\"tcp\",\"udp\"],"
+        "\"enabledServiceCount\":%lld,\"updatedAt\":",
+        deployment ? "true" : "false", sharing.enabled ? "true" : "false",
+        deployment && sharing.enabled ? "true" : "false", enabled_count);
+    if (rc == 0) rc = found == 0 ? admin_sb_append_json_string(&builder, sharing.updated_at) : admin_sb_append(&builder, "null");
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"updatedBy\":");
+    if (rc == 0) rc = found == 0 && sharing.updated_by[0] != '\0'
+        ? admin_sb_append_json_string(&builder, sharing.updated_by) : admin_sb_append(&builder, "null");
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"mdnsImportEnabled\":%s}",
+                                       sharing.mdns_import_enabled ? "true" : "false");
+    if (rc != 0 || builder.data == NULL) { free(builder.data); return -1; }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_peer_mesh_sharing_update(const st_admin_context *context,
+                                           const char *body,
+                                           char *out,
+                                           size_t out_len)
+{
+    if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    int enabled = 0, mdns = 0;
+    int has_enabled = st_json_get_bool(body, "enabled", &enabled) == 0;
+    int has_mdns = st_json_get_bool(body, "mdnsImportEnabled", &mdns) == 0;
+    if (!has_enabled && !has_mdns) return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled or mdnsImportEnabled is required\"}");
+    if (has_enabled && enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
+    }
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"database-backed peer sharing is unavailable\"}");
+    }
+    st_storage_peer_mesh_service_sharing current = {0};
+    (void)st_storage_get_peer_mesh_service_sharing(database_path, context->tenant_id, &current);
+    if (st_storage_upsert_peer_mesh_service_sharing(database_path, context->tenant_id,
+            has_enabled ? enabled : current.enabled, has_mdns ? mdns : current.mdns_import_enabled,
+            context->username, NULL) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer sharing update failed\"}");
+    }
+    (void)st_storage_record_peer_mesh_service_audit(database_path, "sharing-toggle",
+        context->tenant_id, 0, 0, NULL,
+        has_enabled && enabled ? "enabled" : "updated");
+    admin_notify_peer_mesh_refresh(context->tenant_id);
+    return build_peer_mesh_sharing_response(context, out, out_len);
+}
+
+static int peer_service_string_valid(const char *value, size_t min_len, size_t max_len)
+{
+    size_t len = value == NULL ? 0U : strlen(value);
+    return len >= min_len && len <= max_len;
+}
+
+static int peer_service_id_valid(const char *value)
+{
+    if (!peer_service_string_valid(value, 8U, 64U)) return 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
+        if (!isalnum(*p) && *p != '.' && *p != '_' && *p != '-') return 0;
+    }
+    return 1;
+}
+
+static int peer_service_allowed_ids(const char *body, char out[512], int preserve_missing)
+{
+    char **items = NULL;
+    size_t count = 0U;
+    if (st_json_get_raw_array(body, "allowedClientIds", &items, &count) != 0) {
+        return preserve_missing ? 1 : 0;
+    }
+    if (count > 32U) { st_json_free_string_array(items, count); return -1; }
+    out[0] = '\0';
+    size_t offset = 0U;
+    long long unique_ids[32];
+    size_t unique_count = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        char *end = NULL;
+        long long id = strtoll(items[i], &end, 10);
+        if (end == items[i] || *end != '\0' || id <= 0) continue;
+        int duplicate = 0;
+        for (size_t j = 0; j < unique_count; ++j) if (unique_ids[j] == id) duplicate = 1;
+        if (duplicate) continue;
+        unique_ids[unique_count++] = id;
+        int written = snprintf(out + offset, 512U - offset, "%s%lld", offset == 0U ? "" : ",", id);
+        if (written < 0 || (size_t)written >= 512U - offset) { st_json_free_string_array(items, count); return -1; }
+        offset += (size_t)written;
+    }
+    st_json_free_string_array(items, count);
+    return 0;
+}
+
+static int handle_peer_mesh_service_mutation(const st_admin_context *context,
+                                             long long id,
+                                             const char *body,
+                                             char *out,
+                                             size_t out_len)
+{
+    if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"database-backed peer services are unavailable\"}");
+    }
+    int creating = id <= 0;
+    st_storage_peer_mesh_service service;
+    memset(&service, 0, sizeof(service));
+    if (!creating) {
+        int found = st_storage_get_peer_mesh_service_visible(database_path, id, context->tenant_id,
+                                                              context->username, 1, &service);
+        if (found != 0) return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
+    } else {
+        long long client_id = 0;
+        if (st_json_get_i64(body, "clientId", &client_id) != 0 || client_id <= 0) {
+            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientId is required\"}");
+        }
+        st_storage_client client;
+        if (st_storage_get_client(database_path, client_id, &client) != 0
+            || strcmp(client.tenant_id, context->tenant_id) != 0) {
+            return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        }
+        service.client_id = client.id;
+        snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client.tenant_id);
+        snprintf(service.client_name, sizeof(service.client_name), "%s", client.client_name);
+        snprintf(service.visibility, sizeof(service.visibility), "OWNER");
+    }
+    char *service_id = st_json_get_string(body, "serviceId");
+    char *name = st_json_get_string(body, "name");
+    char *description = st_json_get_string(body, "description");
+    char *transport = st_json_get_string(body, "transport");
+    char *application = st_json_get_string(body, "application");
+    char *target_host = st_json_get_string(body, "targetHost");
+    char *path = st_json_get_string(body, "path");
+    char *visibility = st_json_get_string(body, "visibility");
+    if (creating) {
+        if (service_id == NULL) snprintf(service.service_id, sizeof(service.service_id),
+                                         "svc-%lld-%lld", service.client_id, current_time_millis());
+        else snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
+    }
+    if (name != NULL) snprintf(service.name, sizeof(service.name), "%s", name);
+    if (description != NULL) snprintf(service.description, sizeof(service.description), "%s", description);
+    if (application != NULL) snprintf(service.application, sizeof(service.application), "%s", application);
+    if (transport != NULL) snprintf(service.transport, sizeof(service.transport), "%s", transport);
+    if (target_host != NULL) snprintf(service.target_host, sizeof(service.target_host), "%s",
+                                      strcmp(target_host, "localhost") == 0 ? "127.0.0.1" : target_host);
+    if (path != NULL) snprintf(service.path, sizeof(service.path), "%s", path);
+    if (visibility != NULL) snprintf(service.visibility, sizeof(service.visibility), "%s",
+                                     strcmp(visibility, "ACL") == 0 ? "ACL" : "OWNER");
+    if (creating && service.path[0] == '\0'
+        && (strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0)) snprintf(service.path, sizeof(service.path), "/");
+    if (creating && service.transport[0] == '\0') snprintf(service.transport, sizeof(service.transport),
+                                                            "%s", strcmp(service.application, "udp") == 0 ? "udp" : "tcp");
+    int target_port = 0, published_port = 0, enabled = 0;
+    if (st_json_get_int(body, "targetPort", &target_port) == 0) service.target_port = target_port;
+    if (st_json_get_int(body, "publishedPort", &published_port) == 0) service.published_port = published_port;
+    if (st_json_get_bool(body, "enabled", &enabled) == 0) service.enabled = enabled;
+    int ids_rc = peer_service_allowed_ids(body, service.allowed_client_ids, !creating);
+    int app_ok = strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0
+        || strcmp(service.application, "ssh") == 0 || strcmp(service.application, "tcp") == 0
+        || strcmp(service.application, "udp") == 0;
+    int transport_ok = strcmp(service.transport, "tcp") == 0 || strcmp(service.transport, "udp") == 0;
+    if (!peer_service_id_valid(service.service_id) || !peer_service_string_valid(service.name, 1U, 80U)
+        || strlen(service.description) > 200U || !app_ok || !transport_ok
+        || (strcmp(service.application, "udp") == 0) != (strcmp(service.transport, "udp") == 0)
+        || !peer_service_string_valid(service.target_host, 1U, 127U)
+        || service.target_port < 1 || service.target_port > 65535
+        || service.published_port < 1 || service.published_port > 65535
+        || strstr(service.path, "..") != NULL || ids_rc < 0) {
+        free(service_id); free(name); free(description); free(transport); free(application);
+        free(target_host); free(path); free(visibility);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid peer service definition\"}");
+    }
+    service.id = id;
+    if (service.enabled) {
+        st_storage_peer_mesh_service services[256];
+        size_t count = 0U;
+        if (st_storage_list_peer_mesh_services_visible(database_path, service.tenant_id, "", 1,
+                                                        services, 256U, &count) != 0) {
+            free(service_id); free(name); free(description); free(transport); free(application);
+            free(target_host); free(path); free(visibility);
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service conflict check failed\"}");
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (services[i].id != service.id && services[i].client_id == service.client_id
+                && services[i].enabled && services[i].published_port == service.published_port) {
+                free(service_id); free(name); free(description); free(transport); free(application);
+                free(target_host); free(path); free(visibility);
+                return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"publishedPort already used by another enabled service\"}");
+            }
+        }
+    }
+    st_storage_peer_mesh_service saved;
+    int save_rc = st_storage_upsert_peer_mesh_service(database_path, &service, &saved);
+    free(service_id); free(name); free(description); free(transport); free(application);
+    free(target_host); free(path); free(visibility);
+    if (save_rc != 0) return write_response(out, out_len, 409, "Conflict", "{\"error\":\"peer service conflict\"}");
+    (void)st_storage_record_peer_mesh_service_audit(database_path,
+        creating ? "service-create" : "service-update", context->tenant_id,
+        saved.client_id, 0, saved.service_id,
+        creating ? "created" : (saved.enabled ? "enabled" : "updated"));
+    admin_notify_peer_mesh_refresh(saved.tenant_id);
+    st_admin_string_builder builder = {0};
+    if (append_peer_mesh_service_view(&builder, &saved, 1) != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service response failed\"}");
+    }
+    int len = write_response(out, out_len, creating ? 201 : 200, creating ? "Created" : "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_peer_mesh_service_delete(const st_admin_context *context,
+                                           long long id,
+                                           char *out,
+                                           size_t out_len)
+{
+    if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    const char *database_path = admin_database_path();
+    st_storage_peer_mesh_service service;
+    if (database_path == NULL
+        || st_storage_get_peer_mesh_service_visible(database_path, id, context->tenant_id,
+                                                     context->username, 1, &service) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
+    }
+    int rc = st_storage_delete_peer_mesh_service(database_path, id, context->tenant_id);
+    if (rc != 0) return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
+    (void)st_storage_record_peer_mesh_service_audit(database_path, "service-delete",
+        context->tenant_id, service.client_id, 0, service.service_id, "deleted");
+    admin_notify_peer_mesh_refresh(service.tenant_id);
+    return write_response(out, out_len, 204, "No Content", "");
+}
+
+static int peer_service_target_used(const st_storage_peer_mesh_service *services,
+                                    size_t count,
+                                    const char *host,
+                                    int port)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (services[i].target_port == port && strcmp(services[i].target_host, host) == 0) return 1;
+    }
+    return 0;
+}
+
+static int parse_peer_http_target(const char *url,
+                                  char host[128],
+                                  int *port,
+                                  char application[16],
+                                  char path[256])
+{
+    if (url == NULL || host == NULL || port == NULL || application == NULL || path == NULL) return -1;
+    const char *authority = NULL;
+    if (strncasecmp(url, "https://", 8U) == 0) {
+        snprintf(application, 16U, "https");
+        *port = 443;
+        authority = url + 8U;
+    } else if (strncasecmp(url, "http://", 7U) == 0) {
+        snprintf(application, 16U, "http");
+        *port = 80;
+        authority = url + 7U;
+    } else return -1;
+    const char *path_start = strchr(authority, '/');
+    const char *authority_end = path_start == NULL ? authority + strlen(authority) : path_start;
+    if (authority_end == authority || (size_t)(authority_end - authority) >= 160U) return -1;
+    const char *host_start = authority;
+    const char *host_end = authority_end;
+    const char *port_start = NULL;
+    if (*host_start == '[') {
+        const char *close = memchr(host_start, ']', (size_t)(authority_end - host_start));
+        if (close == NULL) return -1;
+        host_start++;
+        host_end = close;
+        if (close + 1 < authority_end && close[1] == ':') port_start = close + 2;
+        else if (close + 1 != authority_end) return -1;
+    } else {
+        const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
+        if (colon != NULL) {
+            host_end = colon;
+            port_start = colon + 1;
+        }
+    }
+    if (host_end == host_start || (size_t)(host_end - host_start) >= 128U) return -1;
+    memcpy(host, host_start, (size_t)(host_end - host_start));
+    host[host_end - host_start] = '\0';
+    if (strcmp(host, "localhost") == 0) snprintf(host, 128U, "127.0.0.1");
+    if (port_start != NULL) {
+        char port_text[16];
+        size_t port_len = (size_t)(authority_end - port_start);
+        if (port_len == 0U || port_len >= sizeof(port_text)) return -1;
+        memcpy(port_text, port_start, port_len);
+        port_text[port_len] = '\0';
+        char *end = NULL;
+        long parsed = strtol(port_text, &end, 10);
+        if (end == port_text || *end != '\0' || parsed < 1 || parsed > 65535) return -1;
+        *port = (int)parsed;
+    }
+    snprintf(path, 256U, "%s", path_start == NULL || *path_start == '\0' ? "/" : path_start);
+    return strstr(path, "..") == NULL ? 0 : -1;
+}
+
+static int append_imported_peer_service(st_admin_string_builder *builder,
+                                        const char *database_path,
+                                        const st_storage_client *client,
+                                        const char *service_id,
+                                        const char *name,
+                                        const char *transport,
+                                        const char *application,
+                                        const char *target_host,
+                                        int target_port,
+                                        int published_port,
+                                        const char *path,
+                                        st_storage_peer_mesh_service *existing,
+                                        size_t *existing_count,
+                                        int *first)
+{
+    if (peer_service_target_used(existing, *existing_count, target_host, target_port)) return 1;
+    st_storage_peer_mesh_service service;
+    memset(&service, 0, sizeof(service));
+    snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client->tenant_id);
+    service.client_id = client->id;
+    snprintf(service.client_name, sizeof(service.client_name), "%s", client->client_name);
+    snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
+    snprintf(service.name, sizeof(service.name), "%.80s", name);
+    snprintf(service.description, sizeof(service.description), "imported candidate");
+    snprintf(service.transport, sizeof(service.transport), "%s", transport);
+    snprintf(service.application, sizeof(service.application), "%s", application);
+    snprintf(service.target_host, sizeof(service.target_host), "%s", target_host);
+    service.target_port = target_port;
+    service.published_port = published_port;
+    snprintf(service.path, sizeof(service.path), "%s", path == NULL ? "" : path);
+    service.enabled = 0;
+    snprintf(service.visibility, sizeof(service.visibility), "OWNER");
+    st_storage_peer_mesh_service saved;
+    if (st_storage_upsert_peer_mesh_service(database_path, &service, &saved) != 0) return 1;
+    if (*existing_count < 256U) existing[(*existing_count)++] = saved;
+    if ((!*first && admin_sb_append(builder, ",") != 0)
+        || append_peer_mesh_service_view(builder, &saved, 1) != 0) return -1;
+    *first = 0;
+    (void)st_storage_record_peer_mesh_service_audit(database_path, "service-create",
+        client->tenant_id, client->id, 0, saved.service_id, "created");
+    return 0;
+}
+
+static int handle_peer_mesh_service_import(const st_admin_context *context,
+                                           const char *body,
+                                           char *out,
+                                           size_t out_len)
+{
+    if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    long long client_id = 0;
+    if (st_json_get_i64(body, "clientId", &client_id) != 0 || client_id <= 0) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientId is required\"}");
+    }
+    char *source = st_json_get_top_level_string(body, "source");
+    int import_mdns = source != NULL && strcasecmp(source, "mdns") == 0;
+    free(source);
+    const char *database_path = admin_database_path();
+    st_storage_client client;
+    if (database_path == NULL || st_storage_get_client(database_path, client_id, &client) != 0
+        || strcmp(client.tenant_id, context->tenant_id) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    }
+    st_storage_peer_mesh_service existing[256];
+    size_t existing_count = 0U;
+    if (st_storage_list_peer_mesh_services_visible(database_path, client.tenant_id, "", 1,
+                                                    existing, 256U, &existing_count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
+    }
+    if (import_mdns) {
+        st_storage_peer_mesh_service_sharing sharing = {0};
+        if (st_storage_get_peer_mesh_service_sharing(database_path, client.tenant_id, &sharing) != 0
+            || !sharing.mdns_import_enabled) {
+            return write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"mDNS candidate import is disabled\"}");
+        }
+        st_peer_mesh_mdns_candidate candidates[256];
+        size_t candidate_count = 0U;
+        if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
+                                              256U, &candidate_count) != 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"peer service import failed\"}");
+        }
+        st_admin_string_builder imported_services = {0};
+        int import_rc = admin_sb_append(&imported_services, "[");
+        int import_first = 1;
+        int imported_created = 0;
+        int imported_skipped = 0;
+        for (size_t i = 0; import_rc == 0 && i < candidate_count; ++i) {
+            char service_id[65];
+            const char *path = strcmp(candidates[i].application, "http") == 0
+                || strcmp(candidates[i].application, "https") == 0 ? "/" : "";
+            snprintf(service_id, sizeof(service_id), "import-mdns-%lld-%zu", client.id, i + 1U);
+            int imported = append_imported_peer_service(&imported_services, database_path, &client,
+                service_id, candidates[i].name, candidates[i].transport, candidates[i].application,
+                candidates[i].target_host, candidates[i].target_port, candidates[i].target_port,
+                path, existing, &existing_count, &import_first);
+            if (imported == 0) ++imported_created;
+            else if (imported == 1) ++imported_skipped;
+            else import_rc = -1;
+        }
+        if (import_rc == 0) import_rc = admin_sb_append(&imported_services, "]");
+        st_admin_string_builder imported_response = {0};
+        if (import_rc == 0) import_rc = admin_sb_appendf(&imported_response,
+            "{\"created\":%d,\"skipped\":%d,\"services\":",
+            imported_created, imported_skipped);
+        if (import_rc == 0) import_rc = admin_sb_append(&imported_response, imported_services.data);
+        if (import_rc == 0) import_rc = admin_sb_append(&imported_response, "}");
+        free(imported_services.data);
+        if (import_rc != 0 || imported_response.data == NULL) {
+            free(imported_response.data);
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"peer service import failed\"}");
+        }
+        char imported_reason[64];
+        snprintf(imported_reason, sizeof(imported_reason), "created=%d,skipped=%d",
+                 imported_created, imported_skipped);
+        (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import-mdns",
+            client.tenant_id, client.id, 0, NULL, imported_reason);
+        if (imported_created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
+        int imported_len = write_response(out, out_len, 200, "OK", imported_response.data);
+        free(imported_response.data);
+        return imported_len;
+    }
+    st_admin_string_builder services = {0};
+    int rc = admin_sb_append(&services, "[");
+    int first = 1;
+    int created = 0;
+    int skipped = 0;
+    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+    size_t mapping_count = 0U;
+    if (rc == 0 && st_storage_list_mappings(database_path, client.id, mappings,
+                                             ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) rc = -1;
+    for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
+        char service_id[65];
+        char name[81];
+        const char *host = strcmp(mappings[i].target_address, "localhost") == 0
+            ? "127.0.0.1" : mappings[i].target_address;
+        snprintf(service_id, sizeof(service_id), "import-tcp-%lld", mappings[i].id);
+        snprintf(name, sizeof(name), "tcp-%d", mappings[i].listen_port);
+        int imported = append_imported_peer_service(&services, database_path, &client,
+            service_id, name, "tcp", "tcp", host, mappings[i].target_port,
+            mappings[i].listen_port, "", existing, &existing_count, &first);
+        if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+    }
+    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    size_t route_count = 0U;
+    if (rc == 0 && st_storage_list_http_routes(database_path, client.id, routes,
+                                                ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) rc = -1;
+    for (size_t i = 0; rc == 0 && i < route_count; ++i) {
+        char host[128], application[16], target_path[256], service_id[65];
+        int target_port = 0;
+        if (parse_peer_http_target(routes[i].target_base_url, host, &target_port,
+                                   application, target_path) != 0) {
+            ++skipped;
+            continue;
+        }
+        snprintf(service_id, sizeof(service_id), "import-http-%lld", routes[i].id);
+        int imported = append_imported_peer_service(&services, database_path, &client,
+            service_id, routes[i].route, "tcp", application, host, target_port,
+            target_port, target_path, existing, &existing_count, &first);
+        if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+    }
+    if (rc == 0) rc = admin_sb_append(&services, "]");
+    st_admin_string_builder response = {0};
+    if (rc == 0) rc = admin_sb_appendf(&response, "{\"created\":%d,\"skipped\":%d,\"services\":", created, skipped);
+    if (rc == 0) rc = admin_sb_append(&response, services.data);
+    if (rc == 0) rc = admin_sb_append(&response, "}");
+    free(services.data);
+    if (rc != 0 || response.data == NULL) {
+        free(response.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
+    }
+    char reason[64];
+    snprintf(reason, sizeof(reason), "created=%d,skipped=%d", created, skipped);
+    (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import",
+        client.tenant_id, client.id, 0, NULL, reason);
+    if (created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
+    int len = write_response(out, out_len, 200, "OK", response.data);
+    free(response.data);
+    return len;
+}
+
+static int build_peer_mesh_service_audit_response(const st_admin_context *context,
+                                                  char *out,
+                                                  size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
+    st_storage_peer_mesh_service_audit events[50];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_service_audits(database_path, context->tenant_id,
+                                                 events, 50U, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service audit failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        st_storage_peer_mesh_service_audit *event = &events[i];
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = admin_sb_append(&builder, "{\"at\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, event->at);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"action\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, event->action);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"tenantId\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, event->tenant_id);
+        if (rc == 0) rc = event->client_id > 0
+            ? admin_sb_appendf(&builder, ",\"clientId\":%lld", event->client_id)
+            : admin_sb_append(&builder, ",\"clientId\":null");
+        if (rc == 0) rc = event->session_id > 0
+            ? admin_sb_appendf(&builder, ",\"sessionId\":%lld", event->session_id)
+            : admin_sb_append(&builder, ",\"sessionId\":null");
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"serviceId\":");
+        if (rc == 0) rc = event->service_id[0] == '\0'
+            ? admin_sb_append(&builder, "null") : admin_sb_append_json_string(&builder, event->service_id);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"reason\":");
+        if (rc == 0) rc = event->reason[0] == '\0'
+            ? admin_sb_append(&builder, "null") : admin_sb_append_json_string(&builder, event->reason);
+        if (rc == 0) rc = admin_sb_append(&builder, "}");
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc != 0 || builder.data == NULL) { free(builder.data); return -1; }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
 }
 
 static int build_client_result_response(const st_storage_client *client, int status, const char *reason, char *out, size_t out_len)
@@ -3783,7 +4880,7 @@ static int build_http_routes_response(const st_admin_context *context, const cha
             route.id = (long long)i + 1;
             route.client_id = client_id;
             snprintf(route.client_name, sizeof(route.client_name), "%s", client_name);
-            snprintf(route.route, sizeof(route.route), "%s", routes[i].route);
+            snprintf(route.route, sizeof(route.route), "%.127s", routes[i].route);
             snprintf(route.target_base_url, sizeof(route.target_base_url), "%s", routes[i].target_base_url);
             route.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
@@ -4198,6 +5295,70 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     return response_len;
 }
 
+static int build_http_exchange_detail_response(const st_admin_context *context,
+                                               long long exchange_id,
+                                               char *out,
+                                               size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL || exchange_id <= 0) {
+        return write_response(out, out_len, 404, "Not Found",
+                              "{\"error\":\"HTTP exchange not found\"}");
+    }
+    const int page_size = 100;
+    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
+        (size_t)page_size, sizeof(*items));
+    if (items == NULL) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"http exchange lookup failed\"}");
+    }
+    long long total = 0;
+    int found = 0;
+    st_storage_http_exchange match;
+    for (int page = 0; !found; ++page) {
+        size_t count = 0U;
+        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
+                context->tenant_id, context->username, context->admin, page, page_size,
+                items, (size_t)page_size, &count, &total) != 0) {
+            free(items);
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"http exchange lookup failed\"}");
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (items[i].id == exchange_id) {
+                match = items[i];
+                found = 1;
+                break;
+            }
+        }
+        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
+    }
+    free(items);
+    if (!found) {
+        return write_response(out, out_len, 404, "Not Found",
+                              "{\"error\":\"HTTP exchange not found\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = append_http_exchange_view(&builder, &match);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"http exchange response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int build_traffic_inspection_status_response(char *out, size_t out_len)
+{
+    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
+    return write_response(out, out_len, 200, "OK",
+        enabled
+            ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
+            : "{\"enabled\":false,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}");
+}
+
 static int build_tcp_frames_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -4428,6 +5589,7 @@ static int handle_client_create(const st_admin_context *context, const char *bod
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client create failed\"}");
     }
+    admin_notify_peer_mesh_refresh(client.tenant_id);
     return build_client_result_response(&client, 201, "Created", out, out_len);
 }
 
@@ -4464,6 +5626,7 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
     }
+    admin_notify_peer_mesh_refresh(updated.tenant_id);
     return build_client_result_response(&updated, 200, "OK", out, out_len);
 }
 
@@ -4481,6 +5644,7 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     if (st_storage_delete_client(database_path, id) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
@@ -4567,6 +5731,7 @@ static int handle_peer_mesh_acl_create(const st_admin_context *context, const ch
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"peer mesh acl create failed\"}");
     }
     free(direction_value);
+    admin_notify_peer_mesh_refresh(context->tenant_id);
     return build_peer_mesh_acl_result_response(&acl, 201, "Created", out, out_len);
 }
 
@@ -4586,6 +5751,7 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
                                                 context->admin) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh acl not found\"}");
     }
+    admin_notify_peer_mesh_refresh(context->tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
@@ -4629,6 +5795,7 @@ static int handle_specus_create(const st_admin_context *context, long long clien
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or specus create failed\"}");
     }
+    admin_notify_nat_control(&owner);
     return build_mapping_response(&mapping, 201, "Created", out, out_len);
 }
 
@@ -4643,11 +5810,40 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
     if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    return write_response(out,
-                          out_len,
-                          409,
-                          "Conflict",
-                          "{\"error\":\"客户端不在线，无法下发映射\"}");
+    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    size_t mapping_count = 0U;
+    size_t route_count = 0U;
+    if (st_storage_list_mappings(database_path, client_id, mappings,
+                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, routes,
+                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"映射下发失败\"}");
+    }
+    int enabled_mappings = 0;
+    int enabled_routes = 0;
+    for (size_t i = 0; i < mapping_count; ++i) if (mappings[i].enabled) ++enabled_mappings;
+    for (size_t i = 0; i < route_count; ++i) if (routes[i].enabled) ++enabled_routes;
+    int push_result = admin_push_nat_control(owner.id, owner.client_name);
+    if (push_result == 0) {
+        char response[160];
+        snprintf(response, sizeof(response),
+                 "{\"pushed\":%d,\"specusMappings\":%d,\"httpRoutes\":%d}",
+                 enabled_mappings, enabled_mappings, route_count == 0U ? -1 : enabled_routes);
+        return write_response(out, out_len, 200, "OK", response);
+    }
+    return push_result == -1
+        ? write_response(out,
+                         out_len,
+                         409,
+                         "Conflict",
+                         "{\"error\":\"客户端不在线，无法下发映射\"}")
+        : write_response(out,
+                         out_len,
+                         500,
+                         "Internal Server Error",
+                         "{\"error\":\"映射下发失败\"}");
 }
 
 static int handle_specus_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
@@ -4691,6 +5887,7 @@ static int handle_specus_update(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"specus update failed\"}");
     }
+    admin_notify_nat_control(&owner);
     return build_mapping_response(&mapping, 200, "OK", out, out_len);
 }
 
@@ -4710,6 +5907,7 @@ static int handle_specus_delete(const st_admin_context *context, long long id, c
     if (st_storage_delete_mapping_by_id(database_path, id) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
     }
+    admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
@@ -4782,8 +5980,12 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = 0;
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    int media_capture_enabled = 0;
+    (void)st_json_get_bool(body, "mediaCaptureEnabled", &media_capture_enabled);
     int path_rewrite_enabled = 0;
     (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    int insecure_skip_verify = 0;
+    (void)st_json_get_bool(body, "insecureSkipVerify", &insecure_skip_verify);
     int auth_enabled = 0;
     (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
     char *auth_username = st_json_get_string(body, "authUsername");
@@ -4811,7 +6013,9 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                      target_base_url,
                                                      enabled,
                                                      detail_capture_enabled,
+                                                     media_capture_enabled,
                                                      path_rewrite_enabled,
+                                                     insecure_skip_verify,
                                                      auth_enabled,
                                                      auth_username,
                                                      auth_password_hash,
@@ -4823,6 +6027,7 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
+    admin_notify_nat_control(&owner);
     return build_http_route_response(&route, 201, "Created", out, out_len);
 }
 
@@ -4852,8 +6057,12 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    int media_capture_enabled = existing.media_capture_enabled;
+    (void)st_json_get_bool(body, "mediaCaptureEnabled", &media_capture_enabled);
     int path_rewrite_enabled = existing.path_rewrite_enabled;
     (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    int insecure_skip_verify = existing.insecure_skip_verify;
+    (void)st_json_get_bool(body, "insecureSkipVerify", &insecure_skip_verify);
     int auth_enabled = existing.auth_enabled;
     (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
     char *auth_username = st_json_get_string(body, "authUsername");
@@ -4882,7 +6091,9 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                 next_target,
                                                 enabled,
                                                 detail_capture_enabled,
+                                                media_capture_enabled,
                                                 path_rewrite_enabled,
+                                                insecure_skip_verify,
                                                 auth_enabled,
                                                 next_auth_username,
                                                 auth_password_hash,
@@ -4894,6 +6105,7 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
+    admin_notify_nat_control(&owner);
     return build_http_route_response(&route, 200, "OK", out, out_len);
 }
 
@@ -4913,6 +6125,7 @@ static int handle_http_route_delete(const st_admin_context *context, long long i
     if (st_storage_delete_http_route_by_id(database_path, id) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
+    admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
@@ -5221,6 +6434,12 @@ typedef struct {
     char description[513];
     int display_order;
     int enabled;
+    char version[81];
+    char sha256[65];
+    long long file_size;
+    int is_latest;
+    char changelog_url[1025];
+    char min_supported_version[81];
 } st_admin_client_download_mutation;
 
 static int client_download_enum_allowed(const char *value, const char *const *allowed, size_t allowed_count)
@@ -5309,14 +6528,131 @@ static int valid_client_download_url(const char *url)
     return cursor > authority;
 }
 
+static int valid_sha256_text(const char *value)
+{
+    if (value == NULL || strlen(value) != 64U) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isxdigit(*cursor)) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    char major[33];
+    char minor[33];
+    char patch[33];
+    char prerelease[33];
+} st_admin_semver;
+
+static int semver_numeric_part(const char *value)
+{
+    if (value == NULL || *value == '\0' || (value[0] == '0' && value[1] != '\0')) return 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
+        if (!isdigit(*p)) return 0;
+    }
+    return 1;
+}
+
+static int parse_admin_semver(const char *value, st_admin_semver *out)
+{
+    if (value == NULL || out == NULL) return -1;
+    while (isspace((unsigned char)*value)) ++value;
+    if (*value == 'v') ++value;
+    const char *end = value + strlen(value);
+    while (end > value && isspace((unsigned char)end[-1])) --end;
+    size_t len = (size_t)(end - value);
+    if (len == 0U || len > 32U) return -1;
+    char copy[33];
+    memcpy(copy, value, len);
+    copy[len] = '\0';
+    char *build = strchr(copy, '+');
+    if (build != NULL) {
+        if (build[1] == '\0') return -1;
+        for (char *p = build + 1; *p != '\0'; ++p) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
+        }
+        *build = '\0';
+    }
+    char *prerelease = strchr(copy, '-');
+    memset(out, 0, sizeof(*out));
+    if (prerelease != NULL) {
+        *prerelease++ = '\0';
+        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
+        char validation[33];
+        snprintf(validation, sizeof(validation), "%s", prerelease);
+        char *save = NULL;
+        for (char *part = strtok_r(validation, ".", &save); part != NULL;
+             part = strtok_r(NULL, ".", &save)) {
+            int all_numeric = *part != '\0';
+            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
+            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
+            for (char *p = part; *p != '\0'; ++p) {
+                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
+            }
+        }
+        snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
+    }
+    char *save = NULL;
+    char *major = strtok_r(copy, ".", &save);
+    char *minor = strtok_r(NULL, ".", &save);
+    char *patch = strtok_r(NULL, ".", &save);
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
+        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    snprintf(out->major, sizeof(out->major), "%s", major);
+    snprintf(out->minor, sizeof(out->minor), "%s", minor);
+    snprintf(out->patch, sizeof(out->patch), "%s", patch);
+    return 0;
+}
+
+static int compare_semver_numeric(const char *left, const char *right)
+{
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    if (left_len != right_len) return left_len < right_len ? -1 : 1;
+    int compared = strcmp(left, right);
+    return compared < 0 ? -1 : (compared > 0 ? 1 : 0);
+}
+
+static int compare_admin_semver(const st_admin_semver *left, const st_admin_semver *right)
+{
+    int compared = compare_semver_numeric(left->major, right->major);
+    if (compared == 0) compared = compare_semver_numeric(left->minor, right->minor);
+    if (compared == 0) compared = compare_semver_numeric(left->patch, right->patch);
+    if (compared != 0) return compared;
+    if (left->prerelease[0] == '\0' || right->prerelease[0] == '\0') {
+        return left->prerelease[0] == right->prerelease[0]
+            ? 0 : (left->prerelease[0] == '\0' ? 1 : -1);
+    }
+    char left_copy[33], right_copy[33];
+    snprintf(left_copy, sizeof(left_copy), "%s", left->prerelease);
+    snprintf(right_copy, sizeof(right_copy), "%s", right->prerelease);
+    char *left_save = NULL, *right_save = NULL;
+    char *left_part = strtok_r(left_copy, ".", &left_save);
+    char *right_part = strtok_r(right_copy, ".", &right_save);
+    while (left_part != NULL && right_part != NULL) {
+        int left_numeric = semver_numeric_part(left_part);
+        int right_numeric = semver_numeric_part(right_part);
+        if (left_numeric && right_numeric) compared = compare_semver_numeric(left_part, right_part);
+        else if (left_numeric != right_numeric) compared = left_numeric ? -1 : 1;
+        else {
+            compared = strcmp(left_part, right_part);
+            compared = compared < 0 ? -1 : (compared > 0 ? 1 : 0);
+        }
+        if (compared != 0) return compared;
+        left_part = strtok_r(NULL, ".", &left_save);
+        right_part = strtok_r(NULL, ".", &right_save);
+    }
+    return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
+}
+
 static int read_client_download_mutation(const char *body,
                                          const st_storage_client_download_link *existing,
                                          st_admin_client_download_mutation *mutation,
                                          char *out,
                                          size_t out_len)
 {
-    static const char *const implementations[] = {"java", "go", "csharp"};
-    static const char *const platforms[] = {"windows", "linux", "macos", "any"};
+    static const char *const implementations[] = {"java", "go", "csharp", "android"};
+    static const char *const platforms[] = {"windows", "linux", "macos", "android", "any"};
     static const char *const archs[] = {"x64", "arm64", "any"};
     char *implementation = st_json_get_string(body, "implementation");
     char *platform = st_json_get_string(body, "platform");
@@ -5324,11 +6660,18 @@ static int read_client_download_mutation(const char *body,
     char *display_name = st_json_get_string(body, "displayName");
     char *download_url = st_json_get_string(body, "downloadUrl");
     char *description = st_json_get_string(body, "description");
+    char *version = st_json_get_string(body, "version");
+    char *sha256 = st_json_get_string(body, "sha256");
+    char *changelog_url = st_json_get_string(body, "changelogUrl");
+    char *min_supported_version = st_json_get_string(body, "minSupportedVersion");
     int response = 0;
     memset(mutation, 0, sizeof(*mutation));
     mutation->display_order = existing == NULL ? 0 : existing->display_order;
     mutation->enabled = existing == NULL ? 1 : existing->enabled;
-    if (normalize_client_download_enum(implementation,
+    mutation->file_size = existing == NULL ? 0 : existing->file_size;
+    mutation->is_latest = existing == NULL ? 0 : existing->is_latest;
+    if (normalize_client_download_enum(implementation != NULL ? implementation
+                                                              : (char *)(existing == NULL ? NULL : existing->implementation),
                                        mutation->implementation,
                                        sizeof(mutation->implementation),
                                        implementations,
@@ -5337,10 +6680,11 @@ static int read_client_download_mutation(const char *body,
                                   out_len,
                                   400,
                                   "Bad Request",
-                                  "{\"error\":\"implementation must be one of [java go csharp]\"}");
+                                  "{\"error\":\"implementation must be one of [java go csharp android]\"}");
         goto done;
     }
-    if (normalize_client_download_enum(platform,
+    if (normalize_client_download_enum(platform != NULL ? platform
+                                                        : (char *)(existing == NULL ? NULL : existing->platform),
                                        mutation->platform,
                                        sizeof(mutation->platform),
                                        platforms,
@@ -5349,10 +6693,11 @@ static int read_client_download_mutation(const char *body,
                                   out_len,
                                   400,
                                   "Bad Request",
-                                  "{\"error\":\"platform must be one of [windows linux macos any]\"}");
+                                  "{\"error\":\"platform must be one of [windows linux macos android any]\"}");
         goto done;
     }
-    if (normalize_client_download_enum(arch,
+    if (normalize_client_download_enum(arch != NULL ? arch
+                                                    : (char *)(existing == NULL ? NULL : existing->arch),
                                        mutation->arch,
                                        sizeof(mutation->arch),
                                        archs,
@@ -5364,7 +6709,9 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"arch must be one of [x64 arm64 any]\"}");
         goto done;
     }
-    if (copy_trimmed_required(display_name, mutation->display_name, sizeof(mutation->display_name)) != 0) {
+    if (copy_trimmed_required(display_name != NULL ? display_name
+                                                   : (char *)(existing == NULL ? NULL : existing->display_name),
+                              mutation->display_name, sizeof(mutation->display_name)) != 0) {
         response = write_response(out,
                                   out_len,
                                   400,
@@ -5372,8 +6719,12 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"displayName cannot be blank or longer than 120\"}");
         goto done;
     }
-    if (copy_trimmed_required(download_url, mutation->download_url, sizeof(mutation->download_url)) != 0
-        || !valid_client_download_url(mutation->download_url)) {
+    if (copy_trimmed_required(download_url != NULL ? download_url
+                                                   : (char *)(existing == NULL ? NULL : existing->download_url),
+                              mutation->download_url, sizeof(mutation->download_url)) != 0
+        || (!valid_client_download_url(mutation->download_url)
+            && !(existing != NULL && existing->hosted
+                 && strncmp(mutation->download_url, "/api/public/client-packages/", 28U) == 0))) {
         response = write_response(out,
                                   out_len,
                                   400,
@@ -5381,9 +6732,72 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"downloadUrl must be an absolute http(s) URL\"}");
         goto done;
     }
-    copy_trimmed_optional_truncated(description, mutation->description, sizeof(mutation->description));
+    copy_trimmed_optional_truncated(description != NULL ? description
+        : (char *)(existing == NULL ? NULL : existing->description),
+        mutation->description, sizeof(mutation->description));
+    copy_trimmed_optional_truncated(version != NULL ? version
+        : (char *)(existing == NULL ? NULL : existing->version),
+        mutation->version, sizeof(mutation->version));
+    copy_trimmed_optional_truncated(sha256 != NULL ? sha256
+        : (char *)(existing == NULL ? NULL : existing->sha256),
+        mutation->sha256, sizeof(mutation->sha256));
+    for (char *cursor = mutation->sha256; *cursor != '\0'; ++cursor) {
+        *cursor = (char)tolower((unsigned char)*cursor);
+    }
+    copy_trimmed_optional_truncated(changelog_url != NULL ? changelog_url
+        : (char *)(existing == NULL ? NULL : existing->changelog_url),
+        mutation->changelog_url, sizeof(mutation->changelog_url));
+    copy_trimmed_optional_truncated(min_supported_version != NULL ? min_supported_version
+        : (char *)(existing == NULL ? NULL : existing->min_supported_version),
+        mutation->min_supported_version, sizeof(mutation->min_supported_version));
+    if (mutation->version[0] == 'v') memmove(mutation->version, mutation->version + 1,
+                                             strlen(mutation->version));
+    if (mutation->min_supported_version[0] == 'v') {
+        memmove(mutation->min_supported_version, mutation->min_supported_version + 1,
+                strlen(mutation->min_supported_version));
+    }
     (void)st_json_get_int(body, "displayOrder", &mutation->display_order);
     (void)st_json_get_bool(body, "enabled", &mutation->enabled);
+    (void)st_json_get_i64(body, "fileSize", &mutation->file_size);
+    (void)st_json_get_bool(body, "isLatest", &mutation->is_latest);
+    if ((strcmp(mutation->implementation, "android") == 0
+         && (strcmp(mutation->platform, "android") != 0 || strcmp(mutation->arch, "any") != 0))
+        || (strcmp(mutation->platform, "android") == 0
+            && (strcmp(mutation->implementation, "android") != 0
+                || strcmp(mutation->arch, "any") != 0))) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"android packages require android/any\"}");
+        goto done;
+    }
+    st_admin_semver release_version;
+    st_admin_semver minimum_version;
+    if ((mutation->version[0] != '\0' && parse_admin_semver(mutation->version, &release_version) != 0)
+        || (mutation->min_supported_version[0] != '\0'
+            && parse_admin_semver(mutation->min_supported_version, &minimum_version) != 0)
+        || (mutation->min_supported_version[0] != '\0' && mutation->version[0] == '\0')
+        || (mutation->min_supported_version[0] != '\0'
+            && compare_admin_semver(&minimum_version, &release_version) > 0)) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"invalid version or minSupportedVersion\"}");
+        goto done;
+    }
+    if (mutation->file_size < 0 || (mutation->sha256[0] != '\0' && !valid_sha256_text(mutation->sha256))) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"invalid fileSize or sha256\"}");
+        goto done;
+    }
+    if (mutation->is_latest && (!mutation->enabled || mutation->version[0] == '\0')) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"an enabled version is required for latest\"}");
+        goto done;
+    }
+    if (mutation->is_latest && (existing == NULL || !existing->hosted)
+        && (admin_ascii_ncasecmp(mutation->download_url, "https://", 8U) != 0
+            || !valid_sha256_text(mutation->sha256) || mutation->file_size <= 0)) {
+        response = write_response(out, out_len, 400, "Bad Request",
+            "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
+        goto done;
+    }
 done:
     free(implementation);
     free(platform);
@@ -5391,7 +6805,29 @@ done:
     free(display_name);
     free(download_url);
     free(description);
+    free(version);
+    free(sha256);
+    free(changelog_url);
+    free(min_supported_version);
     return response;
+}
+
+static int client_download_same_target(const st_storage_client_download_link *left,
+                                       const st_storage_client_download_link *right)
+{
+    return strcmp(left->implementation, right->implementation) == 0
+        && strcmp(left->platform, right->platform) == 0
+        && strcmp(left->arch, right->arch) == 0;
+}
+
+static int compare_client_download_order(const void *left_raw, const void *right_raw)
+{
+    const st_storage_client_download_link *left = left_raw;
+    const st_storage_client_download_link *right = right_raw;
+    if (left->display_order != right->display_order) {
+        return left->display_order < right->display_order ? -1 : 1;
+    }
+    return left->id < right->id ? -1 : (left->id > right->id ? 1 : 0);
 }
 
 static int build_client_downloads_response(const st_admin_context *context,
@@ -5399,40 +6835,75 @@ static int build_client_downloads_response(const st_admin_context *context,
                                            char *out,
                                            size_t out_len)
 {
-    if (!enabled_only && !context->admin) {
-        return write_admin_forbidden(out, out_len);
-    }
+    if (!enabled_only && !context->admin) return write_admin_forbidden(out, out_len);
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download list failed\"}");
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
-        size_t link_count = 0;
-        if (st_storage_list_client_download_links(database_path,
-                                                  enabled_only,
-                                                  links,
-                                                  ST_ADMIN_MAX_CLIENT_DOWNLOADS,
-                                                  &link_count) != 0) {
+        st_storage_client_download_link catalogue[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
+        size_t catalogue_count = 0U;
+        if (st_storage_list_client_download_links(database_path, 0, catalogue,
+                ST_ADMIN_MAX_CLIENT_DOWNLOADS, &catalogue_count) != 0) {
             free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download list failed\"}");
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"client download list failed\"}");
         }
-        for (size_t i = 0; rc == 0 && i < link_count; ++i) {
-            rc = admin_sb_append(&builder, i == 0 ? "" : ",");
-            if (rc == 0) {
-                rc = append_client_download_link_view(&builder, &links[i]);
+        st_storage_client_download_link links[
+            ST_ADMIN_MAX_CLIENT_DOWNLOADS + ST_GITHUB_RELEASE_MAX_PACKAGES];
+        size_t link_count = 0U;
+        if (!enabled_only) {
+            memcpy(links, catalogue, catalogue_count * sizeof(*links));
+            link_count = catalogue_count;
+        } else {
+            for (size_t i = 0U; i < catalogue_count; ++i) {
+                if (!catalogue[i].enabled) continue;
+                int versioned_target = 0;
+                for (size_t j = 0U; j < catalogue_count; ++j) {
+                    if (client_download_same_target(&catalogue[i], &catalogue[j])
+                        && catalogue[j].version[0] != '\0') {
+                        versioned_target = 1;
+                        break;
+                    }
+                }
+                if ((versioned_target && catalogue[i].is_latest)
+                    || (!versioned_target && catalogue[i].version[0] == '\0')) {
+                    links[link_count++] = catalogue[i];
+                }
             }
+            st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
+            size_t fallback_count = 0U;
+            if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
+                                         &fallback_count) == 0) {
+                for (size_t i = 0U; i < fallback_count; ++i) {
+                    int configured = 0;
+                    for (size_t j = 0U; j < catalogue_count; ++j) {
+                        if (client_download_same_target(&fallback[i], &catalogue[j])) {
+                            configured = 1;
+                            break;
+                        }
+                    }
+                    if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
+                        links[link_count++] = fallback[i];
+                    }
+                }
+            }
+            qsort(links, link_count, sizeof(*links), compare_client_download_order);
+        }
+        for (size_t i = 0U; rc == 0 && i < link_count; ++i) {
+            rc = admin_sb_append(&builder, i == 0U ? "" : ",");
+            if (rc == 0) rc = append_client_download_link_view(&builder, &links[i]);
         }
     }
-    if (rc == 0) {
-        rc = admin_sb_append(&builder, "]");
-    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download response failed\"}");
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client download response failed\"}");
     }
     int response_len = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
@@ -5477,18 +6948,45 @@ static int handle_client_download_create(const st_admin_context *context,
         return validation_response;
     }
     st_storage_client_download_link link;
-    if (st_storage_upsert_client_download_link(database_path,
-                                               0,
-                                               mutation.implementation,
-                                               mutation.platform,
-                                               mutation.arch,
-                                               mutation.display_name,
-                                               mutation.download_url,
-                                               mutation.description,
-                                               mutation.display_order,
-                                               mutation.enabled,
-                                               &link) != 0) {
+    if (st_storage_upsert_client_download_link_extended(database_path, 0,
+            mutation.implementation, mutation.platform, mutation.arch, mutation.display_name,
+            mutation.download_url, mutation.description, mutation.display_order, mutation.enabled,
+            mutation.version, mutation.sha256, mutation.file_size, mutation.is_latest,
+            mutation.changelog_url, mutation.min_supported_version, 0, NULL, NULL, &link) != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download create failed\"}");
+    }
+    return build_client_download_result_response(&link, 201, "Created", out, out_len);
+}
+
+static int handle_client_package_upload(const st_admin_context *context,
+                                        const char *content_type,
+                                        const uint8_t *body,
+                                        size_t body_len,
+                                        char *out,
+                                        size_t out_len)
+{
+    if (!context->admin) return write_admin_forbidden(out, out_len);
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) return init_response;
+    st_storage_client_download_link link;
+    int status = 400;
+    char error[256];
+    if (st_client_package_upload(database_path, content_type, body, body_len,
+                                 &link, &status, error, sizeof(error)) != 0) {
+        char *escaped = st_json_escape(error);
+        if (escaped == NULL) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"client package upload failed\"}");
+        }
+        char response_body[512];
+        int written = snprintf(response_body, sizeof(response_body), "{\"error\":\"%s\"}", escaped);
+        free(escaped);
+        if (written <= 0 || (size_t)written >= sizeof(response_body)) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"client package upload failed\"}");
+        }
+        return write_response(out, out_len, status, admin_reason_phrase(status), response_body);
     }
     return build_client_download_result_response(&link, 201, "Created", out, out_len);
 }
@@ -5520,20 +7018,180 @@ static int handle_client_download_update(const st_admin_context *context,
         return validation_response;
     }
     st_storage_client_download_link link;
-    if (st_storage_upsert_client_download_link(database_path,
-                                               id,
-                                               mutation.implementation,
-                                               mutation.platform,
-                                               mutation.arch,
-                                               mutation.display_name,
-                                               mutation.download_url,
-                                               mutation.description,
-                                               mutation.display_order,
-                                               mutation.enabled,
-                                               &link) != 0) {
+    if (st_storage_upsert_client_download_link_extended(database_path, id,
+            mutation.implementation, mutation.platform, mutation.arch, mutation.display_name,
+            mutation.download_url, mutation.description, mutation.display_order, mutation.enabled,
+            mutation.version, mutation.sha256, mutation.file_size, mutation.is_latest,
+            mutation.changelog_url, mutation.min_supported_version, existing.hosted,
+            existing.package_path, existing.package_file_name, &link) != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client download update failed\"}");
     }
     return build_client_download_result_response(&link, 200, "OK", out, out_len);
+}
+
+static int handle_client_download_mark_latest(const st_admin_context *context,
+                                              long long id,
+                                              char *out,
+                                              size_t out_len)
+{
+    if (!context->admin) return write_admin_forbidden(out, out_len);
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) return init_response;
+    st_storage_client_download_link existing;
+    if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
+        return write_response(out, out_len, 404, "Not Found",
+                              "{\"error\":\"client download not found\"}");
+    }
+    st_admin_semver parsed;
+    if (!existing.enabled || parse_admin_semver(existing.version, &parsed) != 0
+        || (existing.hosted && !st_client_package_is_readable(&existing))
+        || (!existing.hosted && (admin_ascii_ncasecmp(existing.download_url, "https://", 8U) != 0
+            || !valid_sha256_text(existing.sha256) || existing.file_size <= 0))) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"download is not publishable as latest\"}");
+    }
+    st_storage_client_download_link updated;
+    if (st_storage_mark_client_download_latest(database_path, id, &updated) != 0) {
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"client download latest update failed\"}");
+    }
+    return build_client_download_result_response(&updated, 200, "OK", out, out_len);
+}
+
+static int build_client_version_check_response(const char *path, char *out, size_t out_len)
+{
+    char *implementation = admin_query_string(path, "implementation");
+    char *platform = admin_query_string(path, "platform");
+    char *arch = admin_query_string(path, "arch");
+    char *current_text = admin_query_string(path, "current");
+    char normalized_implementation[33];
+    char normalized_platform[33];
+    char normalized_arch[33];
+    static const char *const implementations[] = {"java", "go", "csharp", "android"};
+    static const char *const platforms[] = {"windows", "linux", "macos", "android", "any"};
+    static const char *const archs[] = {"x64", "arm64", "any"};
+    st_admin_semver current;
+    int valid = normalize_client_download_enum(implementation, normalized_implementation,
+            sizeof(normalized_implementation), implementations, 4U) == 0
+        && normalize_client_download_enum(platform, normalized_platform,
+            sizeof(normalized_platform), platforms, 5U) == 0
+        && normalize_client_download_enum(arch, normalized_arch,
+            sizeof(normalized_arch), archs, 3U) == 0
+        && parse_admin_semver(current_text, &current) == 0;
+    free(implementation); free(platform); free(arch); free(current_text);
+    if (!valid) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"invalid client version target\"}");
+    }
+    const char *database_path = admin_database_path();
+    st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
+    size_t count = 0U;
+    if (database_path == NULL || st_storage_list_client_download_links(database_path, 0, links,
+            ST_ADMIN_MAX_CLIENT_DOWNLOADS, &count) != 0) {
+        return write_response(out, out_len, 200, "OK",
+            "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
+            "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
+            "\"changelogUrl\":null,\"packageId\":null}");
+    }
+    st_storage_client_download_link *best = NULL;
+    st_admin_semver best_version;
+    int best_specificity = -1;
+    for (size_t i = 0; i < count; ++i) {
+        st_storage_client_download_link *candidate = &links[i];
+        st_admin_semver candidate_version;
+        if (!candidate->enabled || !candidate->is_latest
+            || strcmp(candidate->implementation, normalized_implementation) != 0
+            || (strcmp(candidate->platform, normalized_platform) != 0
+                && strcmp(candidate->platform, "any") != 0)
+            || (strcmp(candidate->arch, normalized_arch) != 0 && strcmp(candidate->arch, "any") != 0)
+            || candidate->file_size <= 0 || !valid_sha256_text(candidate->sha256)
+            || parse_admin_semver(candidate->version, &candidate_version) != 0
+            || (!candidate->hosted
+                && admin_ascii_ncasecmp(candidate->download_url, "https://", 8U) != 0)) continue;
+        int specificity = (strcmp(candidate->platform, normalized_platform) == 0 ? 2 : 0)
+            + (strcmp(candidate->arch, normalized_arch) == 0 ? 1 : 0);
+        if (best == NULL || specificity > best_specificity
+            || (specificity == best_specificity
+                && compare_admin_semver(&candidate_version, &best_version) > 0)) {
+            best = candidate;
+            best_version = candidate_version;
+            best_specificity = specificity;
+        }
+    }
+    if (best == NULL) {
+        int configured_target = 0;
+        for (size_t i = 0U; i < count; ++i) {
+            if (strcmp(links[i].implementation, normalized_implementation) == 0
+                && (strcmp(links[i].platform, normalized_platform) == 0
+                    || strcmp(links[i].platform, "any") == 0)
+                && (strcmp(links[i].arch, normalized_arch) == 0
+                    || strcmp(links[i].arch, "any") == 0)) {
+                configured_target = 1;
+                break;
+            }
+        }
+        if (!configured_target) {
+            st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
+            size_t fallback_count = 0U;
+            if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
+                                         &fallback_count) == 0) {
+                for (size_t i = 0U; i < fallback_count; ++i) {
+                    st_admin_semver candidate_version;
+                    if (strcmp(fallback[i].implementation, normalized_implementation) != 0
+                        || (strcmp(fallback[i].platform, normalized_platform) != 0
+                            && strcmp(fallback[i].platform, "any") != 0)
+                        || (strcmp(fallback[i].arch, normalized_arch) != 0
+                            && strcmp(fallback[i].arch, "any") != 0)
+                        || parse_admin_semver(fallback[i].version, &candidate_version) != 0) continue;
+                    int specificity = (strcmp(fallback[i].platform, normalized_platform) == 0 ? 2 : 0)
+                        + (strcmp(fallback[i].arch, normalized_arch) == 0 ? 1 : 0);
+                    if (best == NULL || specificity > best_specificity
+                        || (specificity == best_specificity
+                            && compare_admin_semver(&candidate_version, &best_version) > 0)) {
+                        links[0] = fallback[i];
+                        best = &links[0];
+                        best_version = candidate_version;
+                        best_specificity = specificity;
+                    }
+                }
+            }
+        }
+        if (best == NULL) {
+            return write_response(out, out_len, 200, "OK",
+                "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
+                "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
+                "\"changelogUrl\":null,\"packageId\":null}");
+        }
+    }
+    int update_available = compare_admin_semver(&best_version, &current) > 0;
+    int mandatory = 0;
+    st_admin_semver minimum;
+    if (update_available && parse_admin_semver(best->min_supported_version, &minimum) == 0) {
+        mandatory = compare_admin_semver(&current, &minimum) < 0;
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder, "{\"updateAvailable\":%s,\"mandatory\":%s,\"latestVersion\":",
+                              update_available ? "true" : "false", mandatory ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->version);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"downloadUrl\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->download_url);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"sha256\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->sha256);
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"fileSize\":%lld,\"changelogUrl\":", best->file_size);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(&builder, best->changelog_url);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"packageId\":");
+    if (rc == 0) rc = best->hosted
+        ? admin_sb_appendf(&builder, "%lld", best->id) : admin_sb_append(&builder, "null");
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"version check failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
 }
 
 static int handle_client_download_delete(const st_admin_context *context,
@@ -5549,10 +7207,191 @@ static int handle_client_download_delete(const st_admin_context *context,
     if (init_response != 0) {
         return init_response;
     }
-    st_storage_client_download_link existing;
-    if (st_storage_get_client_download_link(database_path, id, &existing) != 0
-        || st_storage_delete_client_download_link(database_path, id) != 0) {
+    if (st_client_package_delete(database_path, id) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+    }
+    return write_response(out, out_len, 204, "No Content", "");
+}
+
+static int append_user_diagram_view(st_admin_string_builder *builder,
+                                    const st_storage_user_diagram *diagram)
+{
+    int rc = admin_sb_appendf(builder, "{\"id\":%lld,\"name\":", diagram->id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, diagram->name);
+    if (rc == 0) rc = admin_sb_appendf(builder,
+        ",\"sizeBytes\":%lld,\"revision\":%lld,\"createdAt\":",
+        diagram->size_bytes, diagram->revision);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, diagram->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, diagram->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
+    return rc;
+}
+
+static int build_user_diagrams_response(const st_admin_context *context,
+                                        char *out,
+                                        size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
+    st_storage_user_diagram diagrams[100];
+    size_t count = 0U;
+    if (st_storage_list_user_diagrams(database_path, context->tenant_id, context->username,
+                                      diagrams, 100U, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"diagram list failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = append_user_diagram_view(&builder, &diagrams[i]);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"diagram response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int build_user_diagram_detail_response(const st_admin_context *context,
+                                              long long id,
+                                              char *out,
+                                              size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram diagram;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &diagram) != 0) {
+        return write_response(out, out_len, 404, "Not Found",
+                              "{\"error\":\"diagram not found\"}");
+    }
+    char *encoded = admin_base64_encode(diagram.snapshot_data, diagram.snapshot_len);
+    st_admin_string_builder builder = {0};
+    int rc = encoded == NULL ? -1 : admin_sb_append(&builder, "{\"document\":");
+    if (rc == 0) rc = append_user_diagram_view(&builder, &diagram);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"update\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, encoded);
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(encoded);
+    st_storage_user_diagram_free(&diagram);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"diagram response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int read_user_diagram_mutation(const char *body,
+                                      char name[121],
+                                      uint8_t **snapshot,
+                                      size_t *snapshot_len,
+                                      char *out,
+                                      size_t out_len)
+{
+    char *raw_name = st_json_get_top_level_string(body, "name");
+    char *encoded = st_json_get_top_level_string(body, "update");
+    char *trimmed = raw_name == NULL ? NULL : admin_trim(raw_name);
+    if (!admin_text_present(trimmed) || strlen(trimmed) > 120U
+        || strchr(trimmed, '\r') != NULL || strchr(trimmed, '\n') != NULL) {
+        free(raw_name); free(encoded);
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"invalid diagram name\"}");
+    }
+    snprintf(name, 121U, "%s", trimmed);
+    int decoded = admin_base64_decode_alloc(encoded, snapshot, snapshot_len);
+    free(raw_name); free(encoded);
+    return decoded == 0 ? 0 : write_response(out, out_len, 400, "Bad Request",
+                                              "{\"error\":\"invalid diagram snapshot\"}");
+}
+
+static int handle_user_diagram_create(const st_admin_context *context,
+                                      const char *body,
+                                      char *out,
+                                      size_t out_len)
+{
+    char name[121];
+    uint8_t *snapshot = NULL;
+    size_t snapshot_len = 0U;
+    int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
+    if (validation != 0) return validation;
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) { free(snapshot); return init_response; }
+    st_storage_user_diagram diagram;
+    int rc = st_storage_create_user_diagram(database_path, context->tenant_id, context->username,
+                                            name, snapshot, snapshot_len, &diagram);
+    free(snapshot);
+    if (rc == 1) return write_response(out, out_len, 409, "Conflict",
+                                       "{\"error\":\"diagram limit reached\"}");
+    if (rc != 0) return write_response(out, out_len, 500, "Internal Server Error",
+                                       "{\"error\":\"diagram create failed\"}");
+    st_admin_string_builder builder = {0};
+    rc = append_user_diagram_view(&builder, &diagram);
+    st_storage_user_diagram_free(&diagram);
+    if (rc != 0 || builder.data == NULL) { free(builder.data); return -1; }
+    int len = write_response(out, out_len, 201, "Created", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_user_diagram_update(const st_admin_context *context,
+                                      long long id,
+                                      const char *body,
+                                      char *out,
+                                      size_t out_len)
+{
+    long long revision = -1;
+    if (st_json_get_i64(body, "revision", &revision) != 0 || revision < 0) {
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"diagram revision conflict\"}");
+    }
+    char name[121];
+    uint8_t *snapshot = NULL;
+    size_t snapshot_len = 0U;
+    int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
+    if (validation != 0) return validation;
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram existing;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &existing) != 0) {
+        free(snapshot);
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
+    }
+    st_storage_user_diagram_free(&existing);
+    st_storage_user_diagram updated;
+    int rc = st_storage_update_user_diagram(database_path, id, context->tenant_id, context->username,
+                                            revision, name, snapshot, snapshot_len, &updated);
+    free(snapshot);
+    if (rc == 1) return write_response(out, out_len, 409, "Conflict",
+                                       "{\"error\":\"diagram revision conflict\"}");
+    if (rc != 0) return write_response(out, out_len, 500, "Internal Server Error",
+                                       "{\"error\":\"diagram update failed\"}");
+    st_admin_string_builder builder = {0};
+    rc = append_user_diagram_view(&builder, &updated);
+    st_storage_user_diagram_free(&updated);
+    if (rc != 0 || builder.data == NULL) { free(builder.data); return -1; }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_user_diagram_delete(const st_admin_context *context,
+                                      long long id,
+                                      char *out,
+                                      size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL || st_storage_delete_user_diagram(database_path, id,
+            context->tenant_id, context->username) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -5731,8 +7570,8 @@ static int handle_management_user_create(const st_admin_context *context, const 
         free(role);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"username already exists\"}");
     }
-    char hash[ST_SHA256_HEX_LEN + 1];
-    if (password_hash_hex(admin_trim(password), hash) != 0) {
+    char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    if (st_password_hash(admin_trim(password), hash) != 0) {
         free(username);
         free(password);
         free(role);
@@ -5813,10 +7652,10 @@ static int handle_management_user_update(const st_admin_context *context,
     char *role = st_json_get_string(body, "role");
     int enabled = existing.enabled;
     (void)st_json_get_bool(body, "enabled", &enabled);
-    char hash[ST_SHA256_HEX_LEN + 1];
+    char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     const char *hash_ptr = NULL;
     if (password != NULL && *admin_trim(password) != '\0') {
-        if (password_hash_hex(admin_trim(password), hash) != 0) {
+        if (st_password_hash(admin_trim(password), hash) != 0) {
             free(username);
             free(password);
             free(role);
@@ -5908,13 +7747,40 @@ static int write_management_token_response(const char *username,
     return write_response(out, out_len, 200, "OK", body);
 }
 
-static int handle_management_auth_login(const char *body, char *out, size_t out_len)
+static int handle_management_auth_login(const char *body,
+                                        const char *remote_address,
+                                        char *out,
+                                        size_t out_len)
 {
     if (body == NULL) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
     char *username = st_json_get_string(body, "username");
     char *password = st_json_get_string(body, "password");
+    char *turnstile_token = st_json_get_string(body, "turnstileToken");
+    st_login_rate_limit_config rate_limit = management_login_rate_limit_config();
+    int64_t retry_after_seconds = 0;
+    time_t now = time(NULL);
+    if (st_login_rate_limiter_check(remote_address,
+                                    username,
+                                    &rate_limit,
+                                    now < 0 ? 0 : (int64_t)now,
+                                    &retry_after_seconds) != 0) {
+        free(username);
+        free(password);
+        free(turnstile_token);
+        return write_login_rate_limited_response(out, out_len, retry_after_seconds);
+    }
+    int turnstile_status = 400;
+    char turnstile_error[256];
+    if (st_auth_turnstile_verify(turnstile_token, "login", &turnstile_status,
+                                 turnstile_error, sizeof(turnstile_error)) != 0) {
+        free(username);
+        free(password);
+        free(turnstile_token);
+        return write_registration_error_response(turnstile_status, turnstile_error, out, out_len);
+    }
+    free(turnstile_token);
     if (normalize_username_in_place(username) != 0 || password == NULL) {
         free(username);
         free(password);
@@ -5928,12 +7794,15 @@ static int handle_management_auth_login(const char *body, char *out, size_t out_
     snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
     snprintf(token_role, sizeof(token_role), "%s", "USER");
     if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
-        const char *admin_password = env_text("SPECUS_AUTH_PASSWORD", "admin");
+        const char *admin_password = getenv("SPECUS_AUTH_PASSWORD");
+        if (admin_password == NULL) {
+            admin_password = "";
+        }
         uint8_t expected[ST_SHA256_LEN];
         uint8_t actual[ST_SHA256_LEN];
         st_sha256((const uint8_t *)admin_password, strlen(admin_password), expected);
         st_sha256((const uint8_t *)password, strlen(password), actual);
-        ok = env_bool("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", 1)
+        ok = management_password_login_enabled()
             && st_constant_time_eq(expected, actual, sizeof(expected));
         if (ok) {
             snprintf(token_username, sizeof(token_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
@@ -5945,15 +7814,28 @@ static int handle_management_auth_login(const char *body, char *out, size_t out_
         if (database_path != NULL
             && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
             st_storage_management_user user;
+            st_password_verification verification;
             ok = st_storage_get_management_user(database_path, username, &user) == 0
                 && user.enabled
-                && password_hash_matches(password, user.password_hash);
+                && st_password_verify(password, user.password_hash, &verification) == 0
+                && verification.matches;
             if (ok) {
+                if (verification.needs_upgrade) {
+                    (void)st_storage_update_management_user(database_path,
+                                                            user.username,
+                                                            verification.upgraded_hash,
+                                                            NULL,
+                                                            user.enabled,
+                                                            NULL);
+                }
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
             }
         }
+    }
+    if (ok) {
+        st_login_rate_limiter_record_success(username);
     }
     free(username);
     free(password);
@@ -5971,10 +7853,76 @@ static int handle_management_auth_refresh(const st_admin_context *context, char 
     return write_management_token_response(context->username, context->tenant_id, context->role, out, out_len);
 }
 
+static int write_registration_error_response(int status,
+                                             const char *error,
+                                             char *out,
+                                             size_t out_len)
+{
+    char *escaped = st_json_escape(error == NULL ? "注册请求失败" : error);
+    if (escaped == NULL) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"registration response failed\"}");
+    }
+    char body[512];
+    int written = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", escaped);
+    free(escaped);
+    if (written <= 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"registration response failed\"}");
+    }
+    return write_response(out, out_len, status, admin_reason_phrase(status), body);
+}
+
+static int handle_management_registration_request(const char *body, char *out, size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_registration_challenge_response challenge;
+    int status = 400;
+    char error[256];
+    if (st_registration_request(database_path, body, &challenge,
+                                &status, error, sizeof(error)) != 0) {
+        return write_registration_error_response(status, error, out, out_len);
+    }
+    char *registration_id = st_json_escape(challenge.registration_id);
+    char *email_masked = st_json_escape(challenge.email_masked);
+    char *expires_at = st_json_escape(challenge.expires_at);
+    if (registration_id == NULL || email_masked == NULL || expires_at == NULL) {
+        free(registration_id); free(email_masked); free(expires_at);
+        return write_registration_error_response(500, "registration response failed", out, out_len);
+    }
+    char response_body[1024];
+    int written = snprintf(response_body, sizeof(response_body),
+        "{\"registrationId\":\"%s\",\"emailMasked\":\"%s\","
+        "\"expiresAt\":\"%s\",\"resendAfterSeconds\":%lld}",
+        registration_id, email_masked, expires_at, challenge.resend_after_seconds);
+    free(registration_id); free(email_masked); free(expires_at);
+    if (written <= 0 || (size_t)written >= sizeof(response_body)) {
+        return write_registration_error_response(500, "registration response failed", out, out_len);
+    }
+    return write_response(out, out_len, 202, "Accepted", response_body);
+}
+
+static int handle_management_registration_verify(const char *body, char *out, size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_management_user user;
+    int status = 400;
+    char error[256];
+    if (st_registration_verify(database_path, body, &user, &status, error, sizeof(error)) != 0) {
+        return write_registration_error_response(status, error, out, out_len);
+    }
+    return write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+}
+
 static int st_admin_build_response_internal(const char *method,
                                             const char *path,
                                             const char *authorization,
+                                            const char *oss_public_key_url,
+                                            const char *range_header,
+                                            const char *host_header,
+                                            const char *content_type,
                                             const char *body,
+                                            size_t body_len,
                                             const char *remote_address,
                                             int allow_default_admin,
                                             char *out,
@@ -5998,37 +7946,75 @@ static int st_admin_build_response_internal(const char *method,
         return write_response(out, out_len, 200, "OK", "{\"status\":\"ok\"}");
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/peer-mesh/stun-config")) {
-        return build_public_stun_config_response(out, out_len);
+        return build_public_stun_config_response(host_header, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/transfer/ice-config")) {
-        return build_public_ice_config_response(out, out_len);
+        return build_public_ice_config_response(host_header, out, out_len);
     }
-    long long attachment_id = 0;
-    int public_attachment_path = admin_path_equals(path, "/api/public/transfer/attachments/presign-upload")
-        || admin_parse_nested_path_id(path,
-                                      "/api/public/transfer/attachments/",
-                                      "/complete",
-                                      &attachment_id) == 0
-        || admin_parse_nested_path_id(path,
-                                      "/api/public/transfer/attachments/",
-                                      "/presign-download",
-                                      &attachment_id) == 0;
-    int admin_attachment_path = admin_path_equals(path, "/api/admin/client-messages/attachments/presign-upload")
-        || admin_parse_nested_path_id(path,
-                                      "/api/admin/client-messages/attachments/",
-                                      "/complete",
-                                      &attachment_id) == 0
-        || admin_parse_nested_path_id(path,
-                                      "/api/admin/client-messages/attachments/",
-                                      "/presign-download",
-                                      &attachment_id) == 0;
-    if (strcmp(method, "POST") == 0 && (public_attachment_path || admin_attachment_path)) {
-        return write_response(out,
-                              out_len,
-                              409,
-                              "Conflict",
-                              "{\"error\":\"object storage is not configured\","
-                              "\"code\":\"OBJECT_STORAGE_DISABLED\",\"enabled\":false}");
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/peer-mesh/nat-probe-config")) {
+        return build_public_nat_probe_config_response(host_header, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0
+        && admin_path_equals(path, "/api/public/transfer/ws-tickets")) {
+        return st_public_discovery_issue_ticket_response(body, remote_address, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0
+        && admin_path_equals(path, "/api/public/transfer/clients/name-availability")) {
+        return st_public_discovery_name_availability_response(path, out, out_len);
+    }
+    st_object_storage_identity attachment_identity = {
+        .tenant_id = context.tenant_id,
+        .username = context.username,
+        .admin = context.admin,
+        .authenticated = context.authenticated
+    };
+    int attachment_response = st_object_storage_build_response(method,
+                                                                path,
+                                                                body,
+                                                                remote_address,
+                                                                authorization,
+                                                                oss_public_key_url,
+                                                                &attachment_identity,
+                                                                out,
+                                                                out_len);
+    if (attachment_response != 0) {
+        return attachment_response;
+    }
+    if (strncmp(path, "/api/admin/traffic/media-captures",
+                strlen("/api/admin/traffic/media-captures")) == 0
+        || strncmp(path, "/api/public/media-playback/",
+                   strlen("/api/public/media-playback/")) == 0) {
+        const char *media_database_path = admin_database_path();
+        if (media_database_path == NULL
+            || st_storage_init(media_database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"media capture database unavailable\"}");
+        }
+        st_media_capture_identity media_identity = {
+            .tenant_id = context.tenant_id,
+            .username = context.username,
+            .admin = context.admin,
+            .authenticated = context.authenticated
+        };
+        int media_response = st_media_capture_build_response_with_range(method,
+                                                                        path,
+                                                                        range_header,
+                                                                        &media_identity,
+                                                                        media_database_path,
+                                                                        out,
+                                                                        out_len);
+        if (media_response != 0) {
+            return media_response;
+        }
+    }
+    int public_room_response = st_public_room_build_response(method,
+                                                             path,
+                                                             body,
+                                                             remote_address,
+                                                             out,
+                                                             out_len);
+    if (public_room_response != 0) {
+        return public_room_response;
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/ws-tickets")) {
         return handle_admin_websocket_ticket(&context, body, remote_address, out, out_len);
@@ -6043,7 +8029,19 @@ static int st_admin_build_response_internal(const char *method,
         return handle_database_initialize(&context, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/client-downloads")) {
+        long long retry_after = 1;
+        if (st_client_package_rate_limit(remote_address, &retry_after) != 0) {
+            return write_client_package_rate_limited_response(out, out_len, retry_after);
+        }
         return build_client_downloads_response(&context, 1, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0
+        && admin_path_equals(path, "/api/public/client-version-check")) {
+        long long retry_after = 1;
+        if (st_client_package_rate_limit(remote_address, &retry_after) != 0) {
+            return write_client_package_rate_limited_response(out, out_len, retry_after);
+        }
+        return build_client_version_check_response(path, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/client-downloads")) {
         return build_client_downloads_response(&context, 0, out, out_len);
@@ -6051,7 +8049,15 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/client-downloads")) {
         return handle_client_download_create(&context, body, out, out_len);
     }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/client-packages")) {
+        return handle_client_package_upload(&context, content_type, (const uint8_t *)body,
+                                            body_len, out, out_len);
+    }
     long long path_id = 0;
+    if (strcmp(method, "POST") == 0
+        && admin_parse_nested_path_id(path, "/api/admin/client-downloads/", "/latest", &path_id) == 0) {
+        return handle_client_download_mark_latest(&context, path_id, out, out_len);
+    }
     if (admin_parse_path_id(path, "/api/admin/client-downloads/", &path_id) == 0) {
         if (strcmp(method, "PUT") == 0) {
             return handle_client_download_update(&context, path_id, body, out, out_len);
@@ -6077,10 +8083,22 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/clients")) {
         return build_clients_response(&context, out, out_len);
     }
+    if (strcmp(method, "GET") == 0
+        && admin_path_equals(path, "/api/admin/clients/name-availability")) {
+        return build_client_name_availability_response(&context, path, out, out_len);
+    }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/clients")) {
         return handle_client_create(&context, body, out, out_len);
     }
+    if (strcmp(method, "POST") == 0
+        && admin_parse_nested_path_id(path, "/api/admin/clients/",
+                                      "/force-refresh-port-mapping", &path_id) == 0) {
+        return handle_nat_control_push(&context, path_id, out, out_len);
+    }
     if (admin_parse_path_id(path, "/api/admin/clients/", &path_id) == 0) {
+        if (strcmp(method, "GET") == 0) {
+            return build_client_detail_response(&context, path_id, out, out_len);
+        }
         if (strcmp(method, "PUT") == 0) {
             return handle_client_update(&context, path_id, body, out, out_len);
         }
@@ -6137,11 +8155,19 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/traffic/http-exchanges")) {
         return build_http_exchanges_response(&context, path, out, out_len);
     }
+    if (strcmp(method, "GET") == 0
+        && admin_parse_path_id(path, "/api/admin/traffic/http-exchanges/", &path_id) == 0) {
+        return build_http_exchange_detail_response(&context, path_id, out, out_len);
+    }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/traffic/tcp-frames")) {
         return build_tcp_frames_response(&context, path, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/traffic/tcp-streams")) {
         return build_tcp_stream_response(&context, path, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0
+        && admin_path_equals(path, "/api/admin/traffic/inspection-status")) {
+        return build_traffic_inspection_status_response(out, out_len);
     }
     if (strcmp(method, "GET") == 0
         && admin_parse_path_id(path, "/api/admin/traffic/tcp-frames/", &path_id) == 0) {
@@ -6170,6 +8196,27 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/sessions")) {
         return build_peer_mesh_sessions_response(&context, path, out, out_len);
     }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/stats")) {
+        return build_peer_mesh_stats_response(&context, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-sharing")) {
+        return build_peer_mesh_sharing_response(&context, out, out_len);
+    }
+    if (strcmp(method, "PUT") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-sharing")) {
+        return handle_peer_mesh_sharing_update(&context, body, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services")) {
+        return build_peer_mesh_services_response(&context, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services")) {
+        return handle_peer_mesh_service_mutation(&context, 0, body, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services/import")) {
+        return handle_peer_mesh_service_import(&context, body, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-audit")) {
+        return build_peer_mesh_service_audit_response(&context, out, out_len);
+    }
     if (strcmp(method, "DELETE") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/sessions")) {
         return handle_peer_mesh_sessions_close_open(&context, out, out_len);
     }
@@ -6188,12 +8235,30 @@ static int st_admin_build_response_internal(const char *method,
             return handle_peer_mesh_acl_delete(&context, path_id, out, out_len);
         }
     }
-    if (strncmp(path, "/api/admin/peer-mesh/", 21) == 0) {
-        return write_response(out,
-                              out_len,
-                              501,
-                              "Not Implemented",
-                              "{\"error\":\"C server does not implement this Peer Mesh operation\"}");
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/diagrams")) {
+        return build_user_diagrams_response(&context, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/diagrams")) {
+        return handle_user_diagram_create(&context, body, out, out_len);
+    }
+    if (admin_parse_path_id(path, "/api/admin/diagrams/", &path_id) == 0) {
+        if (strcmp(method, "GET") == 0) {
+            return build_user_diagram_detail_response(&context, path_id, out, out_len);
+        }
+        if (strcmp(method, "PUT") == 0) {
+            return handle_user_diagram_update(&context, path_id, body, out, out_len);
+        }
+        if (strcmp(method, "DELETE") == 0) {
+            return handle_user_diagram_delete(&context, path_id, out, out_len);
+        }
+    }
+    if (admin_parse_path_id(path, "/api/admin/peer-mesh/services/", &path_id) == 0) {
+        if (strcmp(method, "PUT") == 0) {
+            return handle_peer_mesh_service_mutation(&context, path_id, body, out, out_len);
+        }
+        if (strcmp(method, "DELETE") == 0) {
+            return handle_peer_mesh_service_delete(&context, path_id, out, out_len);
+        }
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/me")) {
         return build_management_me_response(&context, out, out_len);
@@ -6213,7 +8278,13 @@ static int st_admin_build_response_internal(const char *method,
         }
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/auth/login")) {
-        return handle_management_auth_login(body, out, out_len);
+        return handle_management_auth_login(body, remote_address, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/auth/register")) {
+        return handle_management_registration_request(body, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/auth/register/verify")) {
+        return handle_management_registration_verify(body, out, out_len);
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/auth/refresh")) {
         return handle_management_auth_refresh(&context, out, out_len);
@@ -6228,7 +8299,9 @@ static int st_admin_build_response_internal(const char *method,
                               "Not Implemented",
                               "{\"error\":\"direct http dispatch is not wired yet\"}");
     }
-    if (admin_path_equals(path, "/ws/connections")) {
+    if (admin_path_equals(path, "/ws/connections")
+        || admin_path_equals(path, "/ws/client-messages")
+        || admin_path_equals(path, "/ws/public-transfer/discovery")) {
         return write_response(out,
                               out_len,
                               426,
@@ -6237,14 +8310,24 @@ static int st_admin_build_response_internal(const char *method,
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/oidc-config") == 0) {
         char body[1024];
-        if (st_security_build_oidc_config(getenv("SPECUS_OIDC_CLIENT_ID"),
-                                          getenv("SPECUS_OIDC_AUTHORIZATION_ENDPOINT"),
-                                          getenv("SPECUS_OIDC_END_SESSION_ENDPOINT"),
-                                          getenv("SPECUS_OIDC_REDIRECT_URI"),
-                                          getenv("SPECUS_OIDC_SCOPE"),
-                                          env_bool("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", 1),
-                                          body,
-                                          sizeof(body)) < 0) {
+        int turnstile_available = st_auth_turnstile_available();
+        if (st_security_build_oidc_config_extended(getenv("SPECUS_OIDC_CLIENT_ID"),
+                                                   env_text("SPECUS_OIDC_AUTHORIZATION_ENDPOINT",
+                                                            "https://certus.devshuai.com/oauth2/authorize"),
+                                                   env_text("SPECUS_OIDC_REGISTRATION_ENDPOINT",
+                                                            "https://certus.devshuai.com/register"),
+                                                   env_text("SPECUS_OIDC_END_SESSION_ENDPOINT",
+                                                            "https://certus.devshuai.com/oauth2/logout"),
+                                                   env_text("SPECUS_OIDC_REDIRECT_URI",
+                                                            "http://127.0.0.1:8088/"),
+                                                   env_text("SPECUS_OIDC_SCOPE", "openid profile email"),
+                                                   management_password_login_enabled(),
+                                                   st_registration_available(),
+                                                   turnstile_available,
+                                                   turnstile_available
+                                                       ? getenv("SPECUS_AUTH_TURNSTILE_SITE_KEY") : "",
+                                                   body,
+                                                   sizeof(body)) < 0) {
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"oidc config failed\"}");
         }
         return write_response(out, out_len, 200, "OK", body);
@@ -6262,7 +8345,23 @@ int st_admin_build_response_with_auth(const char *method,
                                       char *out,
                                       size_t out_len)
 {
-    return st_admin_build_response_internal(method, path, authorization, body, "", 0, out, out_len);
+    return st_admin_build_response_internal(method, path, authorization, NULL, NULL, NULL,
+                                            NULL, body, body == NULL ? 0U : strlen(body),
+                                            "", 0, out, out_len);
+}
+
+int st_admin_build_response_with_content(const char *method,
+                                         const char *path,
+                                         const char *authorization,
+                                         const char *content_type,
+                                         const uint8_t *body,
+                                         size_t body_len,
+                                         char *out,
+                                         size_t out_len)
+{
+    return st_admin_build_response_internal(method, path, authorization, NULL, NULL, NULL,
+                                            content_type, (const char *)body, body_len,
+                                            "", authorization == NULL, out, out_len);
 }
 
 int st_admin_build_response_with_body(const char *method,
@@ -6271,7 +8370,31 @@ int st_admin_build_response_with_body(const char *method,
                                       char *out,
                                       size_t out_len)
 {
-    return st_admin_build_response_internal(method, path, NULL, body, "", 1, out, out_len);
+    return st_admin_build_response_internal(method, path, NULL, NULL, NULL, NULL,
+                                            NULL, body, body == NULL ? 0U : strlen(body),
+                                            "", 1, out, out_len);
+}
+
+int st_admin_build_response_with_remote(const char *method,
+                                        const char *path,
+                                        const char *body,
+                                        const char *remote_address,
+                                        char *out,
+                                        size_t out_len)
+{
+    return st_admin_build_response_internal(method,
+                                            path,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            body,
+                                            body == NULL ? 0U : strlen(body),
+                                            remote_address == NULL ? "" : remote_address,
+                                            1,
+                                            out,
+                                            out_len);
 }
 
 int st_admin_build_response(const char *method, const char *path, char *out, size_t out_len)
@@ -6367,7 +8490,86 @@ static char *admin_url_decode(const char *value, size_t len)
     return out;
 }
 
-static int admin_parse_content_length(const char *request, size_t *content_length)
+static int admin_snapshot_base64_value(unsigned char value)
+{
+    if (value >= 'A' && value <= 'Z') return value - 'A';
+    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+    if (value >= '0' && value <= '9') return value - '0' + 52;
+    if (value == '+') return 62;
+    if (value == '/') return 63;
+    return -1;
+}
+
+static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len)
+{
+    size_t len = encoded == NULL ? 0U : strlen(encoded);
+    *out = NULL;
+    *out_len = 0U;
+    if (len == 0U || len > 4U * 1024U * 1024U + 16U || len % 4U != 0U) return -1;
+    size_t capacity = (len / 4U) * 3U;
+    uint8_t *decoded = (uint8_t *)malloc(capacity == 0U ? 1U : capacity);
+    if (decoded == NULL) return -1;
+    for (size_t i = 0U; i < len; i += 4U) {
+        int a = admin_snapshot_base64_value((unsigned char)encoded[i]);
+        int b = admin_snapshot_base64_value((unsigned char)encoded[i + 1U]);
+        int c = encoded[i + 2U] == '=' ? -2
+            : admin_snapshot_base64_value((unsigned char)encoded[i + 2U]);
+        int d = encoded[i + 3U] == '=' ? -2
+            : admin_snapshot_base64_value((unsigned char)encoded[i + 3U]);
+        if (a < 0 || b < 0 || c == -1 || d == -1 || (c == -2 && d != -2)
+            || ((c == -2 || d == -2) && i + 4U != len)) {
+            free(decoded);
+            return -1;
+        }
+        uint32_t value = (uint32_t)a << 18U | (uint32_t)b << 12U;
+        if (c >= 0) value |= (uint32_t)c << 6U;
+        if (d >= 0) value |= (uint32_t)d;
+        decoded[(*out_len)++] = (uint8_t)(value >> 16U);
+        if (c >= 0) decoded[(*out_len)++] = (uint8_t)(value >> 8U);
+        if (d >= 0) decoded[(*out_len)++] = (uint8_t)value;
+    }
+    if (*out_len == 0U || *out_len > 3U * 1024U * 1024U) {
+        free(decoded);
+        *out_len = 0U;
+        return -1;
+    }
+    *out = decoded;
+    return 0;
+}
+
+/* The public listener deliberately accepts raw query braces used by some legacy web apps.
+ * Encode only those relaxed characters before they leave the server so every client can build a
+ * standards-compliant upstream URI without changing any other byte in the original query. */
+static char *admin_encode_raw_query_for_forwarding(const char *value)
+{
+    if (value == NULL) {
+        return admin_dup_string("");
+    }
+    size_t len = strlen(value);
+    if (len > (SIZE_MAX - 1U) / 3U) {
+        return NULL;
+    }
+    char *encoded = (char *)malloc(len * 3U + 1U);
+    if (encoded == NULL) {
+        return NULL;
+    }
+    size_t written = 0U;
+    for (size_t i = 0; i < len; ++i) {
+        if (value[i] == '{' || value[i] == '}') {
+            const char *escape = value[i] == '{' ? "%7B" : "%7D";
+            memcpy(encoded + written, escape, 3U);
+            written += 3U;
+        } else {
+            encoded[written++] = value[i];
+        }
+    }
+    encoded[written] = '\0';
+    return encoded;
+}
+
+static int admin_parse_content_length(const char *request,
+                                      size_t max_content_length,
+                                      size_t *content_length)
 {
     *content_length = 0;
     const char *line = strstr(request, "\r\n");
@@ -6388,7 +8590,7 @@ static int admin_parse_content_length(const char *request, size_t *content_lengt
             if (end == colon + 1) {
                 return -1;
             }
-            if (parsed > ST_ADMIN_MAX_DIRECT_HTTP_BODY) {
+            if (parsed > max_content_length || parsed > (unsigned long long)SIZE_MAX) {
                 return -2;
             }
             *content_length = (size_t)parsed;
@@ -6523,7 +8725,23 @@ static int admin_collect_headers(const char *request,
         if (len > 0 && count < ST_ADMIN_MAX_HTTP_HEADERS
             && !admin_skip_direct_request_header(line)
             && !(strip_authorization && admin_header_name_equals(line, "Authorization"))) {
-            items[count] = (char *)malloc(len + 1U);
+            const char *colon = memchr(line, ':', len);
+            if (colon == NULL || colon == line) {
+                line = next + 2;
+                continue;
+            }
+            const char *value = colon + 1;
+            while (value < next && (*value == ' ' || *value == '\t')) {
+                ++value;
+            }
+            const char *value_end = next;
+            while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t')) {
+                --value_end;
+            }
+            size_t name_len = (size_t)(colon - line);
+            size_t value_len = (size_t)(value_end - value);
+            size_t normalized_len = name_len + 1U + value_len;
+            items[count] = (char *)malloc(normalized_len + 1U);
             if (items[count] == NULL) {
                 for (size_t i = 0; i < count; ++i) {
                     free(items[i]);
@@ -6531,8 +8749,10 @@ static int admin_collect_headers(const char *request,
                 free(items);
                 return -1;
             }
-            memcpy(items[count], line, len);
-            items[count][len] = '\0';
+            memcpy(items[count], line, name_len);
+            items[count][name_len] = ':';
+            memcpy(items[count] + name_len + 1U, value, value_len);
+            items[count][normalized_len] = '\0';
             ++count;
         }
         line = next + 2;
@@ -6824,17 +9044,21 @@ static int admin_rewrite_html_attrs(const char *input,
     return 0;
 }
 
-static char *admin_escape_js_single_quoted(const char *value)
+static char *admin_escape_html_attribute(const char *value)
 {
     st_admin_string_builder builder = {0};
     for (const char *cursor = value; *cursor != '\0'; ++cursor) {
-        if (*cursor == '\\' || *cursor == '\'') {
-            if (admin_sb_append_len(&builder, "\\", 1U) != 0) {
-                free(builder.data);
-                return NULL;
-            }
+        const char *replacement = NULL;
+        switch (*cursor) {
+            case '&': replacement = "&amp;"; break;
+            case '<': replacement = "&lt;"; break;
+            case '>': replacement = "&gt;"; break;
+            case '"': replacement = "&quot;"; break;
+            case '\'': replacement = "&#39;"; break;
+            default: break;
         }
-        if (admin_sb_append_len(&builder, cursor, 1U) != 0) {
+        if ((replacement == NULL && admin_sb_append_len(&builder, cursor, 1U) != 0)
+            || (replacement != NULL && admin_sb_append(&builder, replacement) != 0)) {
             free(builder.data);
             return NULL;
         }
@@ -6847,53 +9071,14 @@ static char *admin_escape_js_single_quoted(const char *value)
 
 static char *admin_build_polyfill_script(const char *prefix)
 {
-    char *escaped = admin_escape_js_single_quoted(prefix);
+    char *escaped = admin_escape_html_attribute(prefix);
     if (escaped == NULL) {
         return NULL;
     }
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(
         &builder,
-        "<script>(function(){try{"
-        "var P='%s';"
-        "function hrefOf(u){if(typeof u==='string')return u;if(u&&typeof u.href==='string')return u.href;"
-        "if(u&&typeof u.url==='string')return u.url;return '';}"
-        "function locParts(){if(typeof location==='undefined')return null;"
-        "return {http:location.origin,ws:(location.protocol==='https:'?'wss://':'ws://')+location.host};}"
-        "function need(u){if(typeof u!=='string'||!u)return false;var path=u,loc=locParts(),base=null;"
-        "if(u.charAt(0)!=='/'){if(!loc)return false;if(u.indexOf(loc.http)===0)base=loc.http;"
-        "else if(u.indexOf(loc.ws)===0)base=loc.ws;else return false;path=u.slice(base.length);"
-        "if(!path||path.charAt(0)!=='/')return false;}"
-        "if(path.length>1&&path.charAt(1)==='/')return false;"
-        "if(path.indexOf(P+'/')===0||path===P||path.indexOf(P+'?')===0||path.indexOf(P+'#')===0)return false;return true;}"
-        "function fix(u){if(!need(u))return u;if(u.charAt(0)==='/')return P+u;var loc=locParts();"
-        "var base=u.indexOf(loc.http)===0?loc.http:loc.ws;return base+P+u.slice(base.length);}"
-        "function rewriteInput(input){var h=hrefOf(input);if(!h||!need(h))return input;var rewritten=fix(h);"
-        "if(typeof Request==='function'&&input instanceof Request)return new Request(rewritten,input);return rewritten;}"
-        "if(typeof fetch==='function'){var of=fetch;window.fetch=function(i,n){try{i=rewriteInput(i);}catch(e){}return of.call(this,i,n);};}"
-        "if(typeof XMLHttpRequest!=='undefined'){var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){"
-        "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}arguments[1]=u;return oo.apply(this,arguments);};}"
-        "function wh(n){var o=history[n];if(typeof o==='function')history[n]=function(s,t,u){try{if(typeof u==='string')u=fix(u);}catch(e){}return o.call(this,s,t,u);};}"
-        "if(typeof history!=='undefined'){wh('pushState');wh('replaceState');}"
-        "if(typeof Element!=='undefined'){var osa=Element.prototype.setAttribute;"
-        "var A={src:1,href:1,action:1,formaction:1,poster:1,background:1,'data-src':1,'data-href':1};"
-        "Element.prototype.setAttribute=function(n,v){try{if(n&&A[String(n).toLowerCase()]&&typeof v==='string')v=fix(v);}catch(e){}return osa.call(this,n,v);};}"
-        "function wrapAttr(N,p){var C=window[N];if(typeof C!=='function'||!C.prototype)return;"
-        "var proto=C.prototype,from=proto,d;while(from&&!(d=Object.getOwnPropertyDescriptor(from,p)))from=Object.getPrototypeOf(from);"
-        "if(!d||typeof d.set!=='function')return;var desc={configurable:true,enumerable:d.enumerable,"
-        "set:function(v){try{if(typeof v==='string')v=fix(v);}catch(e){}d.set.call(this,v);}};"
-        "if(d.get)desc.get=function(){return d.get.call(this);};Object.defineProperty(proto,p,desc);}"
-        "var S=['HTMLScriptElement','HTMLImageElement','HTMLIFrameElement','HTMLSourceElement',"
-        "'HTMLVideoElement','HTMLAudioElement','HTMLEmbedElement','HTMLInputElement','HTMLMediaElement'];"
-        "for(var si=0;si<S.length;si++){wrapAttr(S[si],'src');wrapAttr(S[si],'srcset');wrapAttr(S[si],'poster');}"
-        "var H=['HTMLLinkElement','HTMLAnchorElement','HTMLBaseElement','SVGAElement','SVGImageElement'];"
-        "for(var hi=0;hi<H.length;hi++)wrapAttr(H[hi],'href');wrapAttr('HTMLFormElement','action');wrapAttr('HTMLObjectElement','data');"
-        "if(typeof EventSource==='function'){var OE=EventSource;window.EventSource=function(u,c){"
-        "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}return new OE(u,c);};window.EventSource.prototype=OE.prototype;}"
-        "if(typeof WebSocket==='function'){var OW=WebSocket;window.WebSocket=function(u,p){"
-        "try{var h=hrefOf(u);if(h)u=fix(h);}catch(e){}return p===undefined?new OW(u):new OW(u,p);};"
-        "window.WebSocket.prototype=OW.prototype;}"
-        "}catch(e){}})();</script>",
+        "<script src=\"/specus-http-route-runtime.js?v=4\" data-specus-prefix=\"%s\"></script>",
         escaped);
     free(escaped);
     if (rc != 0) {
@@ -7128,74 +9313,7 @@ static int admin_rewrite_css_body(const char *input,
     return 0;
 }
 
-static int admin_inflate_body(const uint8_t *body,
-                              size_t body_len,
-                              int window_bits,
-                              size_t max_body_bytes,
-                              uint8_t **out,
-                              size_t *out_len)
-{
-    if (body_len > (size_t)((uInt)-1) || max_body_bytes == 0) {
-        return -1;
-    }
-    z_stream stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.next_in = (Bytef *)body;
-    stream.avail_in = (uInt)body_len;
-    if (inflateInit2(&stream, window_bits) != Z_OK) {
-        return -1;
-    }
-    size_t cap = body_len * 2U + 1024U;
-    if (cap < 1024U) {
-        cap = 1024U;
-    }
-    if (cap > max_body_bytes) {
-        cap = max_body_bytes;
-    }
-    uint8_t *buffer = (uint8_t *)malloc(cap + 1U);
-    if (buffer == NULL) {
-        inflateEnd(&stream);
-        return -1;
-    }
-    int status;
-    do {
-        if ((size_t)stream.total_out == cap) {
-            if (cap >= max_body_bytes) {
-                free(buffer);
-                inflateEnd(&stream);
-                return -1;
-            }
-            size_t next = cap * 2U;
-            if (next > max_body_bytes) {
-                next = max_body_bytes;
-            }
-            uint8_t *grown = (uint8_t *)realloc(buffer, next + 1U);
-            if (grown == NULL) {
-                free(buffer);
-                inflateEnd(&stream);
-                return -1;
-            }
-            buffer = grown;
-            cap = next;
-        }
-        stream.next_out = buffer + stream.total_out;
-        stream.avail_out = (uInt)(cap - (size_t)stream.total_out);
-        status = inflate(&stream, Z_NO_FLUSH);
-    } while (status == Z_OK);
-    if (status != Z_STREAM_END) {
-        free(buffer);
-        inflateEnd(&stream);
-        return -1;
-    }
-    *out_len = (size_t)stream.total_out;
-    buffer[*out_len] = '\0';
-    *out = buffer;
-    inflateEnd(&stream);
-    return 0;
-}
-
 static int admin_plain_response_body(const st_direct_http_response *response,
-                                     size_t max_body_bytes,
                                      uint8_t **out,
                                      size_t *out_len,
                                      int *decompressed)
@@ -7221,12 +9339,24 @@ static int admin_plain_response_body(const st_direct_http_response *response,
             rc = 0;
         }
     } else if (strcmp(encoding, "gzip") == 0 || strcmp(encoding, "x-gzip") == 0) {
-        rc = admin_inflate_body(response->body, response->body_len, 16 + MAX_WBITS, max_body_bytes, out, out_len);
+        rc = st_decompress_bounded(response->body,
+                                   response->body_len,
+                                   ST_DECOMPRESSION_GZIP,
+                                   out,
+                                   out_len);
         *decompressed = rc == 0;
     } else if (strcmp(encoding, "deflate") == 0) {
-        rc = admin_inflate_body(response->body, response->body_len, MAX_WBITS, max_body_bytes, out, out_len);
-        if (rc != 0) {
-            rc = admin_inflate_body(response->body, response->body_len, -MAX_WBITS, max_body_bytes, out, out_len);
+        rc = st_decompress_bounded(response->body,
+                                   response->body_len,
+                                   ST_DECOMPRESSION_ZLIB,
+                                   out,
+                                   out_len);
+        if (rc == ST_DECOMPRESSION_INVALID) {
+            rc = st_decompress_bounded(response->body,
+                                       response->body_len,
+                                       ST_DECOMPRESSION_RAW_DEFLATE,
+                                       out,
+                                       out_len);
         }
         *decompressed = rc == 0;
     }
@@ -7280,7 +9410,7 @@ int st_admin_rewrite_direct_http_response(const char *client_name,
     uint8_t *plain = NULL;
     size_t plain_len = 0;
     int decompressed = 0;
-    if (admin_plain_response_body(response, (size_t)max_body, &plain, &plain_len, &decompressed) != 0) {
+    if (admin_plain_response_body(response, &plain, &plain_len, &decompressed) != 0) {
         return 0;
     }
     char *rewritten = NULL;
@@ -7643,6 +9773,9 @@ typedef struct {
     size_t response_bytes;
     const char *client_name;
     const char *route;
+    const char *method;
+    const char *source_url;
+    st_media_capture_session *media_capture;
     st_direct_http_response response;
     char **trailer_names;
     size_t trailer_names_len;
@@ -7825,6 +9958,14 @@ static int direct_sink_on_headers(void *ctx,
         return -1;
     }
     state->response.status_code = status_code;
+    state->media_capture = st_media_capture_open(admin_database_path(),
+                                                state->client_name,
+                                                state->route,
+                                                state->method,
+                                                state->source_url,
+                                                status_code,
+                                                state->response.headers,
+                                                state->response.headers_len);
     state->buffer_for_rewrite = trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
@@ -7840,6 +9981,10 @@ static int direct_sink_on_data(void *ctx, const uint8_t *data, size_t data_len)
         return -1;
     }
     state->response_bytes += data_len;
+    if (state->media_capture != NULL
+        && st_media_capture_append(state->media_capture, data, data_len) != 0) {
+        st_media_capture_fail(state->media_capture, "RustFS media part upload failed");
+    }
     if (state->buffer_for_rewrite) {
         if (state->response.body_len <= state->rewrite_limit
             && data_len <= state->rewrite_limit - state->response.body_len) {
@@ -7874,6 +10019,7 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
         }
         state->started = 1;
         state->ended = 1;
+        st_media_capture_complete(state->media_capture);
         return 0;
     }
     if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
@@ -7895,6 +10041,7 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
         return -1;
     }
     state->ended = 1;
+    st_media_capture_complete(state->media_capture);
     return 0;
 }
 
@@ -8087,6 +10234,35 @@ static void admin_write_u32_be(uint8_t *value, uint32_t number)
     value[3] = (uint8_t)number;
 }
 
+static void admin_request_client_address(int fd,
+                                         const char *request,
+                                         char out[ST_CLIENT_ADDRESS_MAX_LEN])
+{
+    char peer[INET6_ADDRSTRLEN];
+    admin_socket_peer_address(fd, peer);
+    char *forwarded_for = admin_extract_header_value(request, "X-Forwarded-For");
+    char *real_ip = admin_extract_header_value(request, "X-Real-IP");
+    if (st_client_address_resolve(peer,
+                                  forwarded_for,
+                                  real_ip,
+                                  getenv("SPECUS_TRUSTED_PROXIES"),
+                                  out,
+                                  ST_CLIENT_ADDRESS_MAX_LEN) != 0) {
+        snprintf(out, ST_CLIENT_ADDRESS_MAX_LEN, "%s", "unknown");
+    }
+    free(forwarded_for);
+    free(real_ip);
+}
+
+static int admin_sws2_close_code_valid(uint16_t close_code)
+{
+    return close_code >= 1000U && close_code < 5000U
+        && close_code != 1004U
+        && close_code != 1005U
+        && close_code != 1006U
+        && close_code != 1015U;
+}
+
 static int admin_sws2_validate(uint8_t opcode,
                                int fin,
                                uint8_t rsv,
@@ -8104,7 +10280,7 @@ static int admin_sws2_validate(uint8_t opcode,
         return -1;
     }
     if (opcode == 0x8U) {
-        if (payload_len > 123U || (close_code != 0U && (close_code < 1000U || close_code >= 5000U))
+        if (payload_len > 123U || (close_code != 0U && !admin_sws2_close_code_valid(close_code))
             || (close_code == 0U && payload_len != 0U)) {
             return -1;
         }
@@ -8142,6 +10318,28 @@ static uint8_t *admin_sws2_encode(uint8_t opcode,
     return encoded;
 }
 
+int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len)
+{
+    if (payload == NULL || payload_len < ST_ADMIN_SWS2_HEADER_BYTES
+        || memcmp(payload, "SWS2", 4U) != 0) {
+        return -1;
+    }
+    uint8_t flags = payload[5];
+    if ((flags & 0xf0U) != 0U) {
+        return -1;
+    }
+    uint32_t data_len = admin_read_u32_be(payload + 8U);
+    return data_len <= ST_ADMIN_SWS2_MAX_PAYLOAD
+            && (size_t)data_len == payload_len - ST_ADMIN_SWS2_HEADER_BYTES
+            && admin_sws2_validate(payload[4],
+                                   (flags & 1U) != 0U,
+                                   (uint8_t)((flags >> 1U) & 7U),
+                                   admin_read_u16_be(payload + 6U),
+                                   data_len) == 0
+        ? 0
+        : -1;
+}
+
 static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream, size_t bytes)
 {
     if (stream == NULL || bytes == 0U || bytes > ST_ADMIN_STREAM_MAX_WINDOW) {
@@ -8164,24 +10362,15 @@ int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len)
 {
-    if (stream == NULL || payload == NULL || payload_len < ST_ADMIN_SWS2_HEADER_BYTES
-        || memcmp(payload, "SWS2", 4U) != 0) {
+    if (stream == NULL || st_admin_validate_sws2_payload(payload, payload_len) != 0) {
         return -1;
     }
     uint8_t opcode = payload[4];
     uint8_t flags = payload[5];
-    if ((flags & 0xf0U) != 0U) {
-        return -1;
-    }
     int fin = (flags & 1U) != 0U;
     uint8_t rsv = (uint8_t)((flags >> 1U) & 7U);
     uint16_t close_code = admin_read_u16_be(payload + 6U);
     uint32_t data_len = admin_read_u32_be(payload + 8U);
-    if (data_len > ST_ADMIN_SWS2_MAX_PAYLOAD
-        || (size_t)data_len != payload_len - ST_ADMIN_SWS2_HEADER_BYTES
-        || admin_sws2_validate(opcode, fin, rsv, close_code, data_len) != 0) {
-        return -1;
-    }
     const uint8_t *data = payload + ST_ADMIN_SWS2_HEADER_BYTES;
     uint8_t close_payload[125];
     if (opcode == 0x8U && close_code != 0U) {
@@ -8194,20 +10383,45 @@ int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
     }
     pthread_mutex_lock(&stream->send_lock);
     int invalid_sequence = 0;
-    if (opcode == 0x0U) {
+    size_t next_fragment_bytes = stream->outbound_fragment_bytes;
+    if (stream->close_sent) {
+        invalid_sequence = 1;
+    } else if (opcode == 0x0U) {
         invalid_sequence = stream->outbound_fragment_opcode == 0U;
-        if (fin) {
-            stream->outbound_fragment_opcode = 0U;
+        if (!invalid_sequence) {
+            if (next_fragment_bytes > ST_ADMIN_MAX_DIRECT_HTTP_BODY - data_len) {
+                invalid_sequence = 1;
+            } else {
+                next_fragment_bytes += data_len;
+            }
+        }
+        if (!invalid_sequence && fin) {
+            next_fragment_bytes = 0U;
         }
     } else if (opcode == 0x1U || opcode == 0x2U) {
         invalid_sequence = stream->outbound_fragment_opcode != 0U;
-        if (!fin) {
-            stream->outbound_fragment_opcode = opcode;
+        if (!invalid_sequence && !fin) {
+            next_fragment_bytes = data_len;
         }
     }
     int rc = stream->closed || invalid_sequence
         ? -1
         : admin_send_websocket_frame_ex(stream->fd, fin, rsv, opcode, data, data_len);
+    if (rc == 0) {
+        if (opcode == 0x8U) {
+            stream->close_sent = 1;
+            stream->outbound_fragment_opcode = 0U;
+            stream->outbound_fragment_bytes = 0U;
+        } else if (opcode == 0x0U) {
+            stream->outbound_fragment_bytes = next_fragment_bytes;
+            if (fin) {
+                stream->outbound_fragment_opcode = 0U;
+            }
+        } else if ((opcode == 0x1U || opcode == 0x2U) && !fin) {
+            stream->outbound_fragment_opcode = opcode;
+            stream->outbound_fragment_bytes = next_fragment_bytes;
+        }
+    }
     pthread_mutex_unlock(&stream->send_lock);
     return rc;
 }
@@ -8245,18 +10459,22 @@ void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
     pthread_mutex_unlock(&stream->flow_lock);
 }
 
-static st_admin_ws_client *admin_ws_add(int fd, const st_admin_context *context)
+static st_admin_ws_client *admin_ws_add(int fd,
+                                        const st_admin_context *context,
+                                        const char *endpoint)
 {
     st_admin_ws_client *client = (st_admin_ws_client *)calloc(1, sizeof(*client));
-    if (client == NULL || context == NULL || !context->authenticated) {
+    if (client == NULL || context == NULL || !context->authenticated || endpoint == NULL) {
         free(client);
         return NULL;
     }
     client->fd = fd;
+    snprintf(client->endpoint, sizeof(client->endpoint), "%s", endpoint);
     snprintf(client->username, sizeof(client->username), "%s", context->username);
     snprintf(client->tenant_id, sizeof(client->tenant_id), "%s", context->tenant_id);
     client->admin = context->admin;
     pthread_mutex_init(&client->send_lock, NULL);
+    pthread_cond_init(&client->pending_cond, NULL);
     pthread_mutex_lock(&admin_ws_lock);
     client->next = admin_ws_clients;
     admin_ws_clients = client;
@@ -8270,6 +10488,7 @@ static void admin_ws_remove(st_admin_ws_client *client)
         return;
     }
     pthread_mutex_lock(&admin_ws_lock);
+    client->closing = 1;
     st_admin_ws_client **cursor = &admin_ws_clients;
     while (*cursor != NULL) {
         if (*cursor == client) {
@@ -8278,7 +10497,11 @@ static void admin_ws_remove(st_admin_ws_client *client)
         }
         cursor = &(*cursor)->next;
     }
+    while (client->pending_message_writes > 0U) {
+        pthread_cond_wait(&client->pending_cond, &admin_ws_lock);
+    }
     pthread_mutex_unlock(&admin_ws_lock);
+    pthread_cond_destroy(&client->pending_cond);
     pthread_mutex_destroy(&client->send_lock);
     free(client);
 }
@@ -8292,6 +10515,41 @@ static int admin_ws_send_frame(st_admin_ws_client *client,
     int rc = admin_send_websocket_frame(client->fd, opcode, payload, payload_len);
     pthread_mutex_unlock(&client->send_lock);
     return rc;
+}
+
+static int admin_ws_reserve_client_message_write(st_admin_ws_client *client)
+{
+    pthread_mutex_lock(&admin_ws_lock);
+    int rejected = client->closing
+        || client->pending_message_writes >= ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES_PER_SOCKET
+        || admin_pending_client_message_writes >= ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES;
+    if (!rejected) {
+        ++client->pending_message_writes;
+        ++admin_pending_client_message_writes;
+    }
+    pthread_mutex_unlock(&admin_ws_lock);
+    return rejected ? -1 : 0;
+}
+
+static int admin_ws_client_is_open(st_admin_ws_client *client)
+{
+    pthread_mutex_lock(&admin_ws_lock);
+    int open = !client->closing;
+    pthread_mutex_unlock(&admin_ws_lock);
+    return open;
+}
+
+static void admin_ws_release_client_message_write(st_admin_ws_client *client)
+{
+    pthread_mutex_lock(&admin_ws_lock);
+    if (client->pending_message_writes > 0U) {
+        --client->pending_message_writes;
+    }
+    if (admin_pending_client_message_writes > 0U) {
+        --admin_pending_client_message_writes;
+    }
+    pthread_cond_broadcast(&client->pending_cond);
+    pthread_mutex_unlock(&admin_ws_lock);
 }
 
 static void admin_drain_websocket(st_admin_ws_client *client)
@@ -8357,6 +10615,364 @@ static void admin_drain_websocket(st_admin_ws_client *client)
     }
 }
 
+static int admin_ws_send_message_status(st_admin_ws_client *client,
+                                        const char *type,
+                                        const char *message_id,
+                                        const char *to_client_name,
+                                        const char *message,
+                                        const char *error)
+{
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"type\":")
+        || admin_sb_append_json_string(&builder, type);
+    if (rc == 0 && message_id != NULL) {
+        rc = admin_sb_append(&builder, ",\"messageId\":")
+            || admin_sb_append_json_string(&builder, message_id);
+    }
+    if (rc == 0 && to_client_name != NULL) {
+        rc = admin_sb_append(&builder, ",\"toClientName\":")
+            || admin_sb_append_json_string(&builder, to_client_name);
+    }
+    if (rc == 0 && message != NULL) {
+        rc = admin_sb_append(&builder, ",\"message\":")
+            || admin_sb_append_json_string(&builder, message);
+    }
+    if (rc == 0 && error != NULL) {
+        rc = admin_sb_append(&builder, ",\"error\":")
+            || admin_sb_append_json_string(&builder, error);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, "}");
+    }
+    if (rc == 0) {
+        rc = admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len);
+    }
+    free(builder.data);
+    return rc;
+}
+
+typedef struct {
+    st_admin_ws_client *client;
+    long long client_id;
+    char client_name[256];
+    char from_admin_name[ST_SECURITY_TOKEN_USERNAME_LEN + 8U];
+    char *message_id;
+    char *message;
+} st_admin_client_message_write;
+
+static void admin_client_message_write_free(st_admin_client_message_write *write)
+{
+    if (write == NULL) {
+        return;
+    }
+    free(write->message_id);
+    free(write->message);
+    free(write);
+}
+
+static void *admin_client_message_write_thread(void *arg)
+{
+    st_admin_client_message_write *write = (st_admin_client_message_write *)arg;
+    int send_rc = admin_send_client_message(write->client_id,
+                                            write->client_name,
+                                            write->from_admin_name,
+                                            write->message);
+    if (admin_ws_client_is_open(write->client)) {
+        if (send_rc == 0) {
+            (void)admin_ws_send_message_status(write->client,
+                                               "written",
+                                               write->message_id,
+                                               write->client_name,
+                                               write->message,
+                                               NULL);
+        } else {
+            (void)admin_ws_send_message_status(write->client,
+                                               send_rc == -1 ? "error" : "failed",
+                                               write->message_id,
+                                               NULL,
+                                               NULL,
+                                               send_rc == -1
+                                                   ? "target-offline"
+                                                   : "target-write-failed");
+        }
+    }
+    admin_ws_release_client_message_write(write->client);
+    admin_client_message_write_free(write);
+    return NULL;
+}
+
+static void admin_handle_client_message_command(st_admin_ws_client *client, const char *json)
+{
+    if (!st_json_is_valid_object(json)) {
+        (void)admin_ws_send_message_status(client, "error", NULL, NULL, NULL, "invalid-json");
+        return;
+    }
+    char *type = st_json_get_top_level_string(json, "type");
+    char *message_id = st_json_get_top_level_string(json, "messageId");
+    char *to_client_name = st_json_get_top_level_string(json, "toClientName");
+    char *message = st_json_get_top_level_string(json, "message");
+    if (type == NULL || strcmp(type, "message") != 0) {
+        (void)admin_ws_send_message_status(client,
+                                           "error",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "unsupported-type");
+        goto done;
+    }
+    char *target = to_client_name == NULL ? NULL : admin_trim(to_client_name);
+    char *body = message == NULL ? NULL : admin_trim(message);
+    if (target == NULL || *target == '\0' || body == NULL || *body == '\0') {
+        (void)admin_ws_send_message_status(client,
+                                           "error",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-and-message-required");
+        goto done;
+    }
+    st_storage_client target_client;
+    const char *database_path = admin_database_path();
+    st_admin_context context;
+    memset(&context, 0, sizeof(context));
+    snprintf(context.username, sizeof(context.username), "%s", client->username);
+    snprintf(context.tenant_id, sizeof(context.tenant_id), "%s", client->tenant_id);
+    context.admin = client->admin;
+    context.authenticated = 1;
+    if (database_path == NULL
+        || st_storage_get_client_by_name(database_path, target, &target_client) != 0
+        || !target_client.enabled
+        || !admin_can_access_client(&context, &target_client)) {
+        (void)admin_ws_send_message_status(client,
+                                           "error",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-not-found");
+        goto done;
+    }
+    int can_receive_message = 0;
+    if (st_storage_client_has_online_receive_capability(database_path,
+                                                        target_client.id,
+                                                        &can_receive_message) != 0
+        || !can_receive_message) {
+        (void)admin_ws_send_message_status(client,
+                                           "error",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-cannot-receive-message");
+        goto done;
+    }
+    st_admin_client_runtime_status runtime_status;
+    admin_get_client_runtime_status(target_client.id, target_client.client_name, &runtime_status);
+    if (!runtime_status.online) {
+        (void)admin_ws_send_message_status(client,
+                                           "error",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-offline");
+        goto done;
+    }
+    char from_admin_name[ST_SECURITY_TOKEN_USERNAME_LEN + 8U];
+    snprintf(from_admin_name, sizeof(from_admin_name), "admin:%s", client->username);
+    st_admin_client_message_write *write = (st_admin_client_message_write *)calloc(1, sizeof(*write));
+    if (write != NULL) {
+        write->client = client;
+        write->client_id = target_client.id;
+        snprintf(write->client_name, sizeof(write->client_name), "%s", target_client.client_name);
+        snprintf(write->from_admin_name, sizeof(write->from_admin_name), "%s", from_admin_name);
+        write->message_id = strdup(message_id == NULL ? "" : message_id);
+        write->message = strdup(body);
+    }
+    if (write == NULL || write->message_id == NULL || write->message == NULL
+        || admin_ws_reserve_client_message_write(client) != 0) {
+        admin_client_message_write_free(write);
+        (void)admin_ws_send_message_status(client,
+                                           "failed",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-write-failed");
+        goto done;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, admin_client_message_write_thread, write) != 0) {
+        admin_ws_release_client_message_write(client);
+        admin_client_message_write_free(write);
+        (void)admin_ws_send_message_status(client,
+                                           "failed",
+                                           message_id == NULL ? "" : message_id,
+                                           NULL,
+                                           NULL,
+                                           "target-write-failed");
+    } else {
+        pthread_detach(thread);
+    }
+
+done:
+    free(type);
+    free(message_id);
+    free(to_client_name);
+    free(message);
+}
+
+static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units)
+{
+    size_t offset = 0U;
+    size_t count = 0U;
+    while (offset < len) {
+        uint32_t codepoint;
+        uint8_t first = data[offset++];
+        size_t continuation;
+        if (first <= 0x7fU) {
+            codepoint = first;
+            continuation = 0U;
+        } else if (first >= 0xc2U && first <= 0xdfU) {
+            codepoint = first & 0x1fU;
+            continuation = 1U;
+        } else if (first >= 0xe0U && first <= 0xefU) {
+            codepoint = first & 0x0fU;
+            continuation = 2U;
+        } else if (first >= 0xf0U && first <= 0xf4U) {
+            codepoint = first & 0x07U;
+            continuation = 3U;
+        } else {
+            return -1;
+        }
+        if (continuation > len - offset) {
+            return -1;
+        }
+        for (size_t i = 0U; i < continuation; ++i) {
+            uint8_t next = data[offset++];
+            if ((next & 0xc0U) != 0x80U) {
+                return -1;
+            }
+            codepoint = (codepoint << 6U) | (next & 0x3fU);
+        }
+        if ((continuation == 2U && codepoint < 0x800U)
+            || (continuation == 3U && codepoint < 0x10000U)
+            || (codepoint >= 0xd800U && codepoint <= 0xdfffU)
+            || codepoint > 0x10ffffU) {
+            return -1;
+        }
+        size_t increment = codepoint > 0xffffU ? 2U : 1U;
+        if (count > ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS - increment) {
+            return -2;
+        }
+        count += increment;
+    }
+    if (units != NULL) {
+        *units = count;
+    }
+    return 0;
+}
+
+static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
+{
+    st_admin_string_builder fragmented = {0};
+    int fragment_active = 0;
+    for (;;) {
+        uint8_t header[2];
+        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) {
+            break;
+        }
+        int fin = (header[0] & 0x80U) != 0U;
+        uint8_t rsv = (uint8_t)((header[0] >> 4U) & 7U);
+        uint8_t opcode = header[0] & 0x0fU;
+        int masked = (header[1] & 0x80U) != 0;
+        uint64_t payload_len = header[1] & 0x7fU;
+        if (payload_len == 126U) {
+            uint8_t extended[2];
+            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) break;
+            payload_len = ((uint64_t)extended[0] << 8U) | extended[1];
+        } else if (payload_len == 127U) {
+            uint8_t extended[8];
+            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) break;
+            payload_len = 0U;
+            for (size_t i = 0; i < sizeof(extended); ++i) {
+                payload_len = (payload_len << 8U) | extended[i];
+            }
+        }
+        int control_frame = opcode >= 0x8U;
+        int too_large = !control_frame
+            && (payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES
+                || (fragment_active
+                    && payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES - fragmented.len));
+        int protocol_error = !masked || rsv != 0U
+            || (control_frame && (!fin || payload_len > 125U));
+        if (protocol_error || too_large) {
+            uint8_t close_payload[2] = {0x03U, too_large ? 0xf1U : 0xeaU};
+            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            break;
+        }
+        uint8_t mask[4];
+        if (admin_recv_all(client->fd, mask, sizeof(mask)) != 0) break;
+        uint8_t *payload = (uint8_t *)malloc(payload_len == 0U ? 1U : (size_t)payload_len);
+        if (payload == NULL) break;
+        if (payload_len > 0U && admin_recv_all(client->fd, payload, (size_t)payload_len) != 0) {
+            free(payload);
+            break;
+        }
+        for (size_t i = 0; i < (size_t)payload_len; ++i) {
+            payload[i] ^= mask[i % 4U];
+        }
+        if (opcode == 0x8U) {
+            if (payload_len == 1U) {
+                uint8_t close_payload[2] = {0x03U, 0xeaU};
+                (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+                free(payload);
+                break;
+            }
+            (void)admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
+            free(payload);
+            break;
+        }
+        if (opcode == 0x9U) {
+            (void)admin_ws_send_frame(client, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
+            free(payload);
+            continue;
+        }
+        if (opcode == 0xAU) {
+            free(payload);
+            continue;
+        }
+        if (opcode == 0x2U) {
+            uint8_t close_payload[2] = {0x03U, 0xebU};
+            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            free(payload);
+            break;
+        }
+        if ((opcode == 0x1U && fragment_active) || (opcode == 0x0U && !fragment_active)
+            || (opcode != 0x0U && opcode != 0x1U)) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            free(payload);
+            break;
+        }
+        if (admin_sb_append_len(&fragmented, (const char *)payload, (size_t)payload_len) != 0) {
+            free(payload);
+            break;
+        }
+        free(payload);
+        fragment_active = !fin;
+        if (fin) {
+            const uint8_t *text = (const uint8_t *)(fragmented.data == NULL ? "" : fragmented.data);
+            int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, NULL);
+            if (utf8_rc != 0 || memchr(text, '\0', fragmented.len) != NULL) {
+                uint8_t close_payload[2] = {0x03U, utf8_rc == -2 ? 0xf1U : 0xefU};
+                (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+                break;
+            }
+            admin_handle_client_message_command(client, (const char *)text);
+            free(fragmented.data);
+            memset(&fragmented, 0, sizeof(fragmented));
+        }
+    }
+    free(fragmented.data);
+}
+
 static int handle_connection_websocket_request(int fd, const char *method, const char *path, const char *request)
 {
     if (strcmp(method, "GET") != 0 || !admin_path_equals(path, "/ws/connections")) {
@@ -8369,31 +10985,39 @@ static int handle_connection_websocket_request(int fd, const char *method, const
     }
     const char *query = strchr(path, '?');
     char *ticket = NULL;
+    int single_ticket_query = 0;
     if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
+        single_ticket_query = 1;
         ticket = admin_query_string(path, "ticket");
     }
-    char remote_address[INET6_ADDRSTRLEN];
-    admin_socket_peer_address(fd, remote_address);
+    char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
+    admin_request_client_address(fd, request, remote_address);
     st_admin_context context;
     int ticket_valid = ticket != NULL
         && *ticket != '\0'
-        && admin_consume_websocket_ticket(ticket, remote_address, &context) == 0;
+        && admin_consume_websocket_ticket(ticket, "connections", remote_address, &context) == 0;
     free(ticket);
     if (!ticket_valid) {
         char header[256];
-        const char body[] = "{\"error\":\"invalid or consumed websocket ticket\"}";
+        const char *reason = single_ticket_query
+            ? "invalid or consumed ticket"
+            : "single-use ticket required";
+        char body[128];
+        int body_len = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", reason);
         int header_len = snprintf(header,
                                   sizeof(header),
                                   "HTTP/1.1 403 Forbidden\r\n"
                                   "Content-Type: application/json\r\n"
                                   "Cache-Control: no-store\r\n"
-                                  "X-Auth-Reason: invalid ticket\r\n"
+                                  "X-Auth-Reason: %s\r\n"
                                   "Content-Length: %zu\r\n"
                                   "\r\n",
-                                  sizeof(body) - 1U);
-        if (header_len > 0 && (size_t)header_len < sizeof(header)) {
+                                  reason,
+                                  body_len > 0 ? (size_t)body_len : 0U);
+        if (body_len > 0 && (size_t)body_len < sizeof(body)
+            && header_len > 0 && (size_t)header_len < sizeof(header)) {
             send_all(fd, header, (size_t)header_len);
-            send_all(fd, body, sizeof(body) - 1U);
+            send_all(fd, body, (size_t)body_len);
         }
         return 1;
     }
@@ -8423,7 +11047,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         || send_all(fd, response, (size_t)response_len) != 0) {
         return 1;
     }
-    st_admin_ws_client *client = admin_ws_add(fd, &context);
+    st_admin_ws_client *client = admin_ws_add(fd, &context, "connections");
     if (client == NULL) {
         uint8_t close_payload[2] = {0x03U, 0xf3U};
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
@@ -8432,6 +11056,234 @@ static int handle_connection_websocket_request(int fd, const char *method, const
     admin_drain_websocket(client);
     admin_ws_remove(client);
     return 1;
+}
+
+static int admin_ws_send_client_messages_hello(st_admin_ws_client *client)
+{
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"type\":\"hello\",\"channel\":\"client-messages\",\"username\":");
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(&builder, client->username);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, ",\"tenantId\":");
+    }
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(&builder, client->tenant_id);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, "}");
+    }
+    if (rc == 0) {
+        rc = admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len);
+    }
+    free(builder.data);
+    return rc;
+}
+
+static int handle_client_messages_websocket_request(int fd,
+                                                    const char *method,
+                                                    const char *path,
+                                                    const char *request)
+{
+    if (strcmp(method, "GET") != 0 || !admin_path_equals(path, "/ws/client-messages")) {
+        return 0;
+    }
+    if (!admin_header_value_contains_token_ci(request, "Connection", "Upgrade")
+        || !admin_header_value_equals_ci(request, "Upgrade", "websocket")) {
+        send_text_http_error(fd, 426, "websocket upgrade required");
+        return 1;
+    }
+    const char *query = strchr(path, '?');
+    char *ticket = NULL;
+    int single_ticket_query = 0;
+    if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
+        single_ticket_query = 1;
+        ticket = admin_query_string(path, "ticket");
+    }
+    char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
+    admin_request_client_address(fd, request, remote_address);
+    st_admin_context context;
+    int ticket_valid = ticket != NULL
+        && *ticket != '\0'
+        && admin_consume_websocket_ticket(ticket, "client-messages", remote_address, &context) == 0;
+    free(ticket);
+    if (!ticket_valid) {
+        char header[256];
+        const char *reason = single_ticket_query
+            ? "invalid or consumed ticket"
+            : "single-use ticket required";
+        char body[128];
+        int body_len = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", reason);
+        int header_len = snprintf(header,
+                                  sizeof(header),
+                                  "HTTP/1.1 403 Forbidden\r\n"
+                                  "Content-Type: application/json\r\n"
+                                  "Cache-Control: no-store\r\n"
+                                  "X-Auth-Reason: %s\r\n"
+                                  "Content-Length: %zu\r\n"
+                                  "\r\n",
+                                  reason,
+                                  body_len > 0 ? (size_t)body_len : 0U);
+        if (body_len > 0 && (size_t)body_len < sizeof(body)
+            && header_len > 0 && (size_t)header_len < sizeof(header)) {
+            send_all(fd, header, (size_t)header_len);
+            send_all(fd, body, (size_t)body_len);
+        }
+        return 1;
+    }
+    char *client_key = admin_extract_header_value(request, "Sec-WebSocket-Key");
+    if (client_key == NULL || *client_key == '\0') {
+        free(client_key);
+        send_text_http_error(fd, 400, "Sec-WebSocket-Key is required");
+        return 1;
+    }
+    char *accept_key = admin_websocket_accept_key(client_key);
+    free(client_key);
+    if (accept_key == NULL) {
+        send_text_http_error(fd, 500, "websocket accept key build failed");
+        return 1;
+    }
+    char response[512];
+    int response_len = snprintf(response,
+                                sizeof(response),
+                                "HTTP/1.1 101 Switching Protocols\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Accept: %s\r\n"
+                                "\r\n",
+                                accept_key);
+    free(accept_key);
+    if (response_len <= 0 || (size_t)response_len >= sizeof(response)
+        || send_all(fd, response, (size_t)response_len) != 0) {
+        return 1;
+    }
+    st_admin_ws_client *client = admin_ws_add(fd, &context, "client-messages");
+    if (client == NULL) {
+        uint8_t close_payload[2] = {0x03U, 0xf3U};
+        admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
+        return 1;
+    }
+    if (admin_ws_send_client_messages_hello(client) == 0) {
+        admin_drain_client_messages_websocket(client);
+    }
+    admin_ws_remove(client);
+    return 1;
+}
+
+static int admin_normalize_admin_message_target(const char *value,
+                                                char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1])
+{
+    static const char prefix[] = "admin:";
+    username[0] = '\0';
+    if (value == NULL) {
+        return -1;
+    }
+    while (*value != '\0' && isspace((unsigned char)*value)) {
+        ++value;
+    }
+    for (size_t i = 0; i < sizeof(prefix) - 1U; ++i) {
+        if (value[i] == '\0'
+            || tolower((unsigned char)value[i]) != (unsigned char)prefix[i]) {
+            return -1;
+        }
+    }
+    value += sizeof(prefix) - 1U;
+    while (*value != '\0' && isspace((unsigned char)*value)) {
+        ++value;
+    }
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) {
+        --len;
+    }
+    if (len == 0U || len > ST_SECURITY_TOKEN_USERNAME_LEN) {
+        return -1;
+    }
+    memcpy(username, value, len);
+    username[len] = '\0';
+    return 0;
+}
+
+static int admin_message_body_has_text(const char *message)
+{
+    if (message == NULL) {
+        return 0;
+    }
+    for (; *message != '\0'; ++message) {
+        if (!isspace((unsigned char)*message)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int st_admin_deliver_client_message_to_admin(const char *tenant_id,
+                                             const char *from_client_name,
+                                             const char *to_admin_name,
+                                             const char *message)
+{
+    char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
+    if (tenant_id == NULL || from_client_name == NULL || *from_client_name == '\0'
+        || admin_normalize_admin_message_target(to_admin_name, username) != 0
+        || !admin_message_body_has_text(message)) {
+        return -1;
+    }
+    char created_at[64];
+    if (admin_current_utc_timestamp(created_at) != 0) {
+        return -1;
+    }
+
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder,
+                             "{\"type\":\"message\",\"direction\":\"in\",\"fromClientName\":");
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(&builder, from_client_name);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, ",\"toClientName\":");
+    }
+    if (rc == 0) {
+        char target[ST_SECURITY_TOKEN_USERNAME_LEN + 8U];
+        snprintf(target, sizeof(target), "admin:%s", username);
+        rc = admin_sb_append_json_string(&builder, target);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, ",\"message\":");
+    }
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(&builder, message);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, ",\"createdAt\":");
+    }
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(&builder, created_at);
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, "}");
+    }
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return -1;
+    }
+
+    int delivered = 0;
+    pthread_mutex_lock(&admin_ws_lock);
+    for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
+        if (strcmp(client->endpoint, "client-messages") != 0
+            || strcmp(client->tenant_id, tenant_id) != 0
+            || strcmp(client->username, username) != 0) {
+            continue;
+        }
+        if (admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len) == 0) {
+            delivered = 1;
+        } else {
+            shutdown(client->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&admin_ws_lock);
+    free(builder.data);
+    return delivered ? 0 : -1;
 }
 
 void st_admin_broadcast_connection_event(const char *tenant_id,
@@ -8477,7 +11329,8 @@ void st_admin_broadcast_connection_event(const char *tenant_id,
     }
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
-        if (strcmp(client->tenant_id, event_tenant) != 0) {
+        if (strcmp(client->endpoint, "connections") != 0
+            || strcmp(client->tenant_id, event_tenant) != 0) {
             continue;
         }
         if (!client->admin
@@ -8509,9 +11362,19 @@ static int admin_direct_ws_send_frame(st_admin_direct_ws_stream *stream,
                                       size_t payload_len)
 {
     pthread_mutex_lock(&stream->send_lock);
-    int rc = stream->closed
-        ? -1
-        : admin_send_websocket_frame(stream->fd, opcode, payload, payload_len);
+    int rc;
+    if (stream->closed) {
+        rc = -1;
+    } else if (opcode == 0x8U && stream->close_sent) {
+        rc = 0;
+    } else {
+        rc = admin_send_websocket_frame(stream->fd, opcode, payload, payload_len);
+        if (rc == 0 && opcode == 0x8U) {
+            stream->close_sent = 1;
+            stream->outbound_fragment_opcode = 0U;
+            stream->outbound_fragment_bytes = 0U;
+        }
+    }
     pthread_mutex_unlock(&stream->send_lock);
     return rc;
 }
@@ -8544,6 +11407,7 @@ static void admin_drain_direct_websocket(st_admin_server *server,
                                          const char *channel_id)
 {
     uint8_t incoming_fragment_opcode = 0U;
+    size_t incoming_fragment_bytes = 0U;
     for (;;) {
         uint8_t header[2];
         if (admin_recv_all(stream->fd, header, sizeof(header)) != 0) {
@@ -8615,8 +11479,16 @@ static void admin_drain_direct_websocket(st_admin_server *server,
                 free(payload);
                 return;
             }
+            if (incoming_fragment_bytes > ST_ADMIN_MAX_DIRECT_HTTP_BODY - (size_t)payload_len) {
+                uint8_t close_payload[2] = {0x03U, 0xf1U};
+                admin_direct_ws_send_frame(stream, 0x8U, close_payload, sizeof(close_payload));
+                free(payload);
+                return;
+            }
+            incoming_fragment_bytes += (size_t)payload_len;
             if (fin) {
                 incoming_fragment_opcode = 0U;
+                incoming_fragment_bytes = 0U;
             }
         } else if (opcode == 0x1U || opcode == 0x2U) {
             if (incoming_fragment_opcode != 0U) {
@@ -8625,7 +11497,14 @@ static void admin_drain_direct_websocket(st_admin_server *server,
             }
             if (!fin) {
                 incoming_fragment_opcode = opcode;
+                incoming_fragment_bytes = (size_t)payload_len;
             }
+        }
+
+        if (opcode == 0x9U) {
+            admin_direct_ws_send_frame(stream, 0xAU, payload, (size_t)payload_len);
+            free(payload);
+            continue;
         }
 
         uint16_t close_code = 0U;
@@ -8741,7 +11620,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
     char *relative_path = route_end < path + path_len
         ? admin_url_decode(route_end, (size_t)(path + path_len - route_end))
         : admin_dup_string("/");
-    char *raw_query = query == NULL ? admin_dup_string("") : admin_dup_string(query + 1);
+    char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
     if (client_name == NULL || route == NULL || relative_path == NULL || raw_query == NULL) {
         free(accept_key);
         free(client_name);
@@ -8895,7 +11774,7 @@ static int handle_direct_http_request(st_admin_server *server,
     } else {
         relative_path = admin_dup_string("/");
     }
-    char *raw_query = query == NULL ? admin_dup_string("") : admin_dup_string(query + 1);
+    char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
     if (client_name == NULL || route == NULL || relative_path == NULL || raw_query == NULL) {
         free(client_name);
         free(route);
@@ -8925,11 +11804,26 @@ static int handle_direct_http_request(st_admin_server *server,
         .body = body,
         .body_len = body_len
     };
+    size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
+    char *source_url = (char *)malloc(source_len);
+    if (source_url == NULL) {
+        free_header_array(headers, headers_len);
+        free(client_name);
+        free(route);
+        free(relative_path);
+        free(raw_query);
+        send_text_http_error(fd, 500, "direct http media source build failed");
+        return 1;
+    }
+    snprintf(source_url, source_len, "%s%s%s", relative_path,
+             *raw_query == '\0' ? "" : "?", raw_query);
     admin_direct_http_sink_state sink_state = {
         .fd = fd,
         .include_body = admin_ascii_casecmp(method, "HEAD") != 0,
         .client_name = client_name,
-        .route = route
+        .route = route,
+        .method = method,
+        .source_url = source_url
     };
     st_admin_direct_http_sink sink = {
         .ctx = &sink_state,
@@ -8958,6 +11852,11 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 502, "direct http target client is offline");
     }
 
+    if (rc != 0) {
+        st_media_capture_fail(sink_state.media_capture, "媒体响应中断");
+    }
+    st_media_capture_free(sink_state.media_capture);
+
     st_direct_http_response_free(&sink_state.response);
     direct_free_strings(sink_state.trailer_names, sink_state.trailer_names_len);
     free_header_array(headers, headers_len);
@@ -8965,6 +11864,7 @@ static int handle_direct_http_request(st_admin_server *server,
     free(route);
     free(relative_path);
     free(raw_query);
+    free(source_url);
     return 1;
 }
 
@@ -9064,7 +11964,9 @@ static void handle_client(st_admin_server *server, int fd)
     if (body != NULL) {
         body += 4;
         available_body_len = (size_t)(request + len - body);
-        int length_rc = admin_parse_content_length(request, &content_length);
+        size_t max_content_length = admin_path_equals(path, "/api/admin/client-packages")
+            ? st_client_package_max_request_bytes() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
+        int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
         if (length_rc == -2) {
             send_text_http_error(fd, 413, "HTTP 请求体超过限制");
             close(fd);
@@ -9105,7 +12007,25 @@ static void handle_client(st_admin_server *server, int fd)
         body = "";
     }
 
+    char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
+    admin_request_client_address(fd, request, request_remote_address);
+
+    if (st_public_discovery_handle_websocket(fd,
+                                             method,
+                                             path,
+                                             request,
+                                             request_remote_address)) {
+        free(body_buffer);
+        close(fd);
+        return;
+    }
+
     if (handle_connection_websocket_request(fd, method, path, request)) {
+        free(body_buffer);
+        close(fd);
+        return;
+    }
+    if (handle_client_messages_websocket_request(fd, method, path, request)) {
         free(body_buffer);
         close(fd);
         return;
@@ -9132,27 +12052,90 @@ static void handle_client(st_admin_server *server, int fd)
         close(fd);
         return;
     }
+    const char *database_path = admin_database_path();
+    int package_download_response = st_client_package_send_download(
+        fd, method, path, database_path, request_remote_address);
+    if (package_download_response != 0) {
+        free(body_buffer);
+        close(fd);
+        return;
+    }
     if (send_static_file(fd, method, path, server->static_root)) {
         free(body_buffer);
         close(fd);
         return;
     }
     char *authorization = admin_extract_header_value(request, "Authorization");
-    char remote_address[INET6_ADDRSTRLEN];
-    admin_socket_peer_address(fd, remote_address);
-    char response[32768];
+    char *oss_public_key_url = admin_extract_header_value(request, "x-oss-pub-key-url");
+    char *range_header = admin_extract_header_value(request, "Range");
+    char *content_type = admin_extract_header_value(request, "Content-Type");
+    char *host_header = admin_extract_header_value(request, "X-Forwarded-Host");
+    if (host_header == NULL || *host_header == '\0') {
+        free(host_header);
+        host_header = admin_extract_header_value(request, "Host");
+    }
+    char response_stack[32768];
+    size_t response_capacity = sizeof(response_stack);
+    char *response = response_stack;
+    if (strncmp(path,
+                "/api/public/transfer/rooms/diagram/versions",
+                strlen("/api/public/transfer/rooms/diagram/versions")) == 0) {
+        response_capacity = 5U * 1024U * 1024U;
+        response = (char *)malloc(response_capacity);
+        if (response == NULL) {
+            free(authorization);
+            free(oss_public_key_url);
+            free(range_header);
+            free(content_type);
+            free(host_header);
+            free(body_buffer);
+            send_text_http_error(fd, 500, "HTTP 响应分配失败");
+            close(fd);
+            return;
+        }
+    }
+    if (strncmp(path, "/api/admin/traffic/media-captures",
+                strlen("/api/admin/traffic/media-captures")) == 0
+        || strncmp(path, "/api/public/media-playback/",
+                   strlen("/api/public/media-playback/")) == 0) {
+        response_capacity = 20U * 1024U * 1024U;
+        response = (char *)malloc(response_capacity);
+        if (response == NULL) {
+            free(authorization);
+            free(oss_public_key_url);
+            free(range_header);
+            free(content_type);
+            free(host_header);
+            free(body_buffer);
+            send_text_http_error(fd, 500, "HTTP media response allocation failed");
+            close(fd);
+            return;
+        }
+    }
     int response_len = st_admin_build_response_internal(method,
                                                         path,
                                                         authorization,
+                                                        oss_public_key_url,
+                                                        range_header,
+                                                        host_header,
+                                                        content_type,
                                                         body,
-                                                        remote_address,
+                                                        available_body_len,
+                                                        request_remote_address,
                                                         0,
                                                         response,
-                                                        sizeof(response));
+                                                        response_capacity);
     if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
     }
+    if (response != response_stack) {
+        free(response);
+    }
     free(authorization);
+    free(oss_public_key_url);
+    free(range_header);
+    free(content_type);
+    free(host_header);
     free(body_buffer);
     close(fd);
 }

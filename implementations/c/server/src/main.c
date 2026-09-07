@@ -1,12 +1,24 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "admin_http.h"
 #include "crypto.h"
+#include "elasticsearch_traffic.h"
 #include "json.h"
+#include "media_capture.h"
+#include "object_storage.h"
+#include "peer_mesh.h"
 #include "protocol.h"
+#include "public_discovery.h"
+#include "security_baseline.h"
 #include "storage.h"
+#include "stun_turn.h"
+#include "tls_transport.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -24,7 +36,11 @@
 #define ST_CHANNEL_ID_SIZE 64U
 #define ST_IO_BUFFER_SIZE 16384U
 #define ST_STREAM_INITIAL_WINDOW (1024U * 1024U)
+#define ST_MAX_DATA_FRAME_BYTES (64U * 1024U)
+#define ST_STREAM_MAX_PENDING_BYTES (4U * 1024U * 1024U)
 #define ST_STREAM_MAX_WINDOW (16U * 1024U * 1024U)
+#define ST_MAX_PENDING_DIRECT_STREAMS 1024U
+#define ST_MAX_QUEUED_DATA_EVENTS 4096U
 #define ST_HTTP_MAX_REQUEST_BODY (16U * 1024U * 1024U)
 #define ST_HTTP_MAX_RESPONSE_BODY (64U * 1024U * 1024U)
 
@@ -42,17 +58,21 @@ typedef struct {
     char target_base_url[512];
     int detail_capture_enabled;
     int path_rewrite_enabled;
+    int insecure_skip_verify;
 } http_route_mapping;
 
 typedef struct {
-    long long client_id;
+    int64_t client_id;
     char tenant_id[64];
     char client_name[128];
     int64_t client_session_id;
+    int peer_service_discovery_version;
     uint8_t access_token_hash[ST_SHA256_LEN];
     int port;
+    char bind_address[128];
     char public_address[256];
     int control_read_idle_seconds;
+    int control_write_timeout_seconds;
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
@@ -66,9 +86,16 @@ typedef struct {
     char *nat_control_json;
     int owns_nat_control_json;
     int client_session_db_backed;
+    st_tls_server_context *tls_context;
 } server_config;
 
 typedef struct specus_session specus_session;
+
+typedef struct external_write_chunk {
+    uint8_t *data;
+    size_t len;
+    struct external_write_chunk *next;
+} external_write_chunk;
 
 typedef struct external_conn {
     int fd;
@@ -84,6 +111,8 @@ typedef struct external_conn {
     long long client_to_public_frame_index;
     pthread_t thread;
     int thread_started;
+    pthread_t writer_thread;
+    int writer_thread_started;
     int done;
     int counted;
     pthread_mutex_t flow_lock;
@@ -92,6 +121,13 @@ typedef struct external_conn {
     int flow_closed;
     int public_finished;
     int client_finished;
+    int client_write_drained;
+    pthread_mutex_t write_lock;
+    pthread_cond_t write_cond;
+    external_write_chunk *write_head;
+    external_write_chunk *write_tail;
+    size_t queued_write_bytes;
+    int write_closed;
     specus_session *session;
     struct external_conn *next;
 } external_conn;
@@ -139,19 +175,23 @@ typedef struct ws_conn {
 
 struct specus_session {
     int control_fd;
+    st_tls_connection *tls_connection;
     int is_data_connection;
     server_config config;
     pthread_mutex_t send_lock;
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
+    pthread_cond_t reference_cond;
     external_conn *conns;
     ws_conn *ws_conns;
     specus_listener *listeners;
     direct_http_pending *direct_pending;
     int active;
+    size_t references;
     uint32_t next_stream_id;
     char remote[128];
     long long connection_record_id;
+    long long connected_since_ms;
     char connected_at[64];
     struct specus_session *active_next;
 };
@@ -318,6 +358,10 @@ static int copy_config_string(char *dest, size_t dest_len, const char *name, con
 
 static int env_bool(const char *name, int default_value)
 {
+    if (strcmp(name, "SPECUS_DB_SEED_DEMO_CLIENT") == 0
+        && !st_deployment_environment_allows_demo_data(getenv("SPECUS_ENV"))) {
+        return 0;
+    }
     const char *value = getenv(name);
     if (value == NULL || *value == '\0') {
         return default_value;
@@ -539,6 +583,7 @@ static int load_database_config(server_config *config, const char *database_path
         strcpy(route->target_base_url, routes[i].target_base_url);
         route->detail_capture_enabled = routes[i].detail_capture_enabled;
         route->path_rewrite_enabled = routes[i].path_rewrite_enabled;
+        route->insecure_skip_verify = routes[i].insecure_skip_verify;
     }
     return 0;
 }
@@ -599,10 +644,11 @@ static int build_nat_control_json(server_config *config)
             return -1;
         }
         int rc = sb_appendf(&builder,
-                            "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\"}",
+                            "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
                             i == 0 ? "" : ",",
                             route,
-                            target);
+                            target,
+                            config->http_routes[i].insecure_skip_verify ? "true" : "false");
         free(route);
         free(target);
         if (rc != 0) {
@@ -624,6 +670,7 @@ static int load_config(server_config *config)
     const char *access_token = getenv("SPECUS_CLIENT_ACCESS_TOKEN");
     const char *access_token_hash = getenv("SPECUS_CLIENT_ACCESS_TOKEN_HASH");
     const char *public_address = getenv("SPECUS_PUBLIC_ADDRESS");
+    const char *bind_address = getenv("SPECUS_NETTY_BIND_ADDRESS");
     const char *database_path = getenv("SPECUS_DATABASE_PATH");
     const char *static_root = getenv("SPECUS_STATIC_ROOT");
     const char *tenant_id = getenv("SPECUS_CLIENT_TENANT_ID");
@@ -641,11 +688,16 @@ static int load_config(server_config *config)
         || copy_config_string(config->public_address, sizeof(config->public_address),
                               "SPECUS_PUBLIC_ADDRESS",
                               (public_address != NULL && *public_address != '\0') ? public_address : "127.0.0.1") != 0
+        || copy_config_string(config->bind_address, sizeof(config->bind_address),
+                              "SPECUS_NETTY_BIND_ADDRESS",
+                              (bind_address != NULL && *bind_address != '\0') ? bind_address : "0.0.0.0") != 0
         || env_int_range("SPECUS_NETTY_PORT", 7010, 1, 65535, &config->port) != 0
         || env_i64_range("SPECUS_CLIENT_ID", 0, 0, INT64_MAX, &config->client_id) != 0
         || env_i64_range("SPECUS_CLIENT_SESSION_ID", 1, 1, INT64_MAX, &config->client_session_id) != 0
         || env_int_range("SPECUS_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
                          &config->control_read_idle_seconds) != 0
+        || env_int_range("SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS", 30, 1, 300,
+                         &config->control_write_timeout_seconds) != 0
         || env_int_range("SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
                          &config->max_global_external_connections) != 0
         || env_int_range("SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
@@ -938,7 +990,15 @@ static void record_tcp_traffic(specus_session *session, int port, long long uplo
     long long client_id = session->config.client_id;
     st_storage_record_traffic_usage(database_path, client_id, client_name, usage_date, upload_bytes, download_bytes);
 
-    const tcp_mapping *mapping = find_tcp_mapping_by_port(&session->config, port);
+    tcp_mapping mapping_copy;
+    const tcp_mapping *mapping = NULL;
+    pthread_mutex_lock(&session->map_lock);
+    const tcp_mapping *configured = find_tcp_mapping_by_port(&session->config, port);
+    if (configured != NULL) {
+        mapping_copy = *configured;
+        mapping = &mapping_copy;
+    }
+    pthread_mutex_unlock(&session->map_lock);
     char resource_key[64];
     char resource_name[512];
     snprintf(resource_key, sizeof(resource_key), "tcp:%d", port);
@@ -966,7 +1026,15 @@ static void record_tcp_frame(specus_session *session,
         || session->config.database_path[0] == '\0') {
         return;
     }
-    const tcp_mapping *mapping = find_tcp_mapping_by_port(&session->config, conn->port);
+    tcp_mapping mapping_copy;
+    const tcp_mapping *mapping = NULL;
+    pthread_mutex_lock(&session->map_lock);
+    const tcp_mapping *configured = find_tcp_mapping_by_port(&session->config, conn->port);
+    if (configured != NULL) {
+        mapping_copy = *configured;
+        mapping = &mapping_copy;
+    }
+    pthread_mutex_unlock(&session->map_lock);
     if (mapping == NULL || !mapping->detail_capture_enabled) {
         return;
     }
@@ -1062,7 +1130,9 @@ static int session_send_packet(specus_session *session, st_buffer *packet)
     if (packet->data != NULL) {
         pthread_mutex_lock(&session->send_lock);
         if (session->control_fd >= 0) {
-            rc = send_all(session->control_fd, packet->data, packet->len);
+            rc = session->tls_connection == NULL
+                ? send_all(session->control_fd, packet->data, packet->len)
+                : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
         }
         pthread_mutex_unlock(&session->send_lock);
     }
@@ -1129,13 +1199,24 @@ static direct_http_pending *find_direct_pending_locked(specus_session *session, 
     return NULL;
 }
 
+static size_t direct_pending_count_locked(const specus_session *session)
+{
+    size_t count = 0U;
+    for (const direct_http_pending *pending = session->direct_pending;
+         pending != NULL;
+         pending = pending->next) {
+        ++count;
+    }
+    return count;
+}
+
 static int direct_pending_enqueue(direct_http_pending *pending,
                                   int type,
                                   const char *meta_json,
                                   const uint8_t *data,
                                   size_t data_len)
 {
-    if (pending->event_count >= 32U) {
+    if (pending->event_count >= ST_MAX_QUEUED_DATA_EVENTS + 2U) {
         return -1;
     }
     direct_http_event *event = (direct_http_event *)calloc(1, sizeof(*event));
@@ -1168,6 +1249,30 @@ static int direct_pending_enqueue(direct_http_pending *pending,
     ++pending->event_count;
     pthread_cond_broadcast(&pending->cond);
     return 0;
+}
+
+static int session_recv_all(specus_session *session, uint8_t *buffer, size_t len)
+{
+    if (session->tls_connection == NULL) {
+        return recv_all(session->control_fd, buffer, len);
+    }
+    size_t offset = 0U;
+    while (offset < len) {
+        ssize_t read_len = st_tls_connection_read(session->tls_connection,
+                                                  buffer + offset,
+                                                  len - offset);
+        if (read_len == 0) {
+            return 0;
+        }
+        if (read_len == -2) {
+            return -2;
+        }
+        if (read_len < 0) {
+            return -1;
+        }
+        offset += (size_t)read_len;
+    }
+    return 1;
 }
 
 static direct_http_event *direct_pending_pop(direct_http_pending *pending)
@@ -1214,6 +1319,7 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     } else if (message->type == ST_NAT_DATA) {
         invalid = !pending->response_started || pending->done
             || message->data_len == 0U
+            || message->data_len > ST_MAX_DATA_FRAME_BYTES
             || message->data_len > pending->receive_credit
             || message->data_len > ST_HTTP_MAX_RESPONSE_BODY
             || pending->response_bytes > ST_HTTP_MAX_RESPONSE_BODY - message->data_len
@@ -1302,6 +1408,49 @@ static specus_session *active_data_session_find_locked(const char *client_name)
     return active_session_find_role_locked(client_name, 1);
 }
 
+static specus_session *active_data_session_acquire_locked(const char *client_name)
+{
+    specus_session *session = active_data_session_find_locked(client_name);
+    if (session != NULL) {
+        ++session->references;
+    }
+    return session;
+}
+
+static int get_client_runtime_status(void *ctx,
+                                     long long client_id,
+                                     const char *client_name,
+                                     st_admin_client_runtime_status *status)
+{
+    (void)ctx;
+    if (client_name == NULL || status == NULL) {
+        return -1;
+    }
+    memset(status, 0, sizeof(*status));
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *control = active_session_find_role_locked(client_name, 0);
+    if (control != NULL
+        && (client_id <= 0 || control->config.client_id <= 0 || control->config.client_id == client_id)) {
+        status->online = 1;
+        status->connected_since_ms = control->connected_since_ms;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    return 0;
+}
+
+static void session_reference_release(specus_session *session)
+{
+    if (session == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&active_session_lock);
+    if (session->references > 1U) {
+        --session->references;
+    }
+    pthread_cond_broadcast(&session->reference_cond);
+    pthread_mutex_unlock(&active_session_lock);
+}
+
 static void active_session_close_peer_locked(specus_session *session)
 {
     if (session == NULL) {
@@ -1328,13 +1477,16 @@ static int direct_http_forward(void *ctx,
     }
 
     pthread_mutex_lock(&active_session_lock);
-    specus_session *session = active_data_session_find_locked(client_name);
+    specus_session *session = active_data_session_acquire_locked(client_name);
+    pthread_mutex_unlock(&active_session_lock);
     if (session == NULL) {
-        pthread_mutex_unlock(&active_session_lock);
         return -1;
     }
-    if (!config_has_http_route(&session->config, request->route)) {
-        pthread_mutex_unlock(&active_session_lock);
+    pthread_mutex_lock(&session->map_lock);
+    int route_configured = config_has_http_route(&session->config, request->route);
+    pthread_mutex_unlock(&session->map_lock);
+    if (!route_configured) {
+        session_reference_release(session);
         return -3;
     }
 
@@ -1352,6 +1504,12 @@ static int direct_http_forward(void *ctx,
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
+    if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        return -2;
+    }
     pending.next = session->direct_pending;
     session->direct_pending = &pending;
     pthread_mutex_unlock(&session->direct_lock);
@@ -1503,7 +1661,7 @@ static int direct_http_forward(void *ctx,
     pthread_mutex_unlock(&session->direct_lock);
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
-    pthread_mutex_unlock(&active_session_lock);
+    session_reference_release(session);
     return result;
 
 failed:
@@ -1513,7 +1671,7 @@ failed:
     pthread_mutex_unlock(&session->direct_lock);
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
-    pthread_mutex_unlock(&active_session_lock);
+    session_reference_release(session);
     return -1;
 }
 
@@ -1522,19 +1680,22 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     (void)ctx;
 
     pthread_mutex_lock(&active_session_lock);
-    specus_session *session = active_data_session_find_locked(request->client_name);
+    specus_session *session = active_data_session_acquire_locked(request->client_name);
+    pthread_mutex_unlock(&active_session_lock);
     if (session == NULL) {
-        pthread_mutex_unlock(&active_session_lock);
         return -1;
     }
-    if (!config_has_http_route(&session->config, request->route)) {
-        pthread_mutex_unlock(&active_session_lock);
+    pthread_mutex_lock(&session->map_lock);
+    int route_configured = config_has_http_route(&session->config, request->route);
+    pthread_mutex_unlock(&session->map_lock);
+    if (!route_configured) {
+        session_reference_release(session);
         return -3;
     }
 
     ws_conn *conn = (ws_conn *)calloc(1, sizeof(*conn));
     if (conn == NULL) {
-        pthread_mutex_unlock(&active_session_lock);
+        session_reference_release(session);
         return -2;
     }
     snprintf(conn->channel_id, sizeof(conn->channel_id), "%s", request->channel_id);
@@ -1554,13 +1715,13 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         ws_conn *removed = remove_ws_conn_locked(session, request->channel_id);
         pthread_mutex_unlock(&session->map_lock);
         free(removed);
-        pthread_mutex_unlock(&active_session_lock);
+        session_reference_release(session);
         return -1;
     }
 
     printf("[ws-specus] open client=%s route=%s channel=%s\n",
            request->client_name, request->route, request->channel_id);
-    pthread_mutex_unlock(&active_session_lock);
+    session_reference_release(session);
     return 0;
 }
 
@@ -1570,25 +1731,36 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
     int rc = -1;
     st_admin_direct_ws_stream *stream_to_close = NULL;
     ws_conn *removed = NULL;
+    specus_session *target_session = NULL;
+    uint32_t stream_id = 0U;
 
     pthread_mutex_lock(&active_session_lock);
     for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
         pthread_mutex_lock(&session->map_lock);
         ws_conn *conn = find_ws_conn_locked(session, channel_id);
         if (conn != NULL) {
-            rc = send_ws_data(session, conn->stream_id, payload, payload_len);
-            if (rc != 0) {
-                removed = remove_ws_conn_locked(session, channel_id);
-                if (removed != NULL) {
-                    stream_to_close = removed->stream;
-                }
-            }
+            ++session->references;
+            target_session = session;
+            stream_id = conn->stream_id;
             pthread_mutex_unlock(&session->map_lock);
             break;
         }
         pthread_mutex_unlock(&session->map_lock);
     }
     pthread_mutex_unlock(&active_session_lock);
+
+    if (target_session != NULL) {
+        rc = send_ws_data(target_session, stream_id, payload, payload_len);
+        if (rc != 0) {
+            pthread_mutex_lock(&target_session->map_lock);
+            removed = remove_ws_conn_locked(target_session, channel_id);
+            if (removed != NULL) {
+                stream_to_close = removed->stream;
+            }
+            pthread_mutex_unlock(&target_session->map_lock);
+        }
+        session_reference_release(target_session);
+    }
 
     if (stream_to_close != NULL) {
         st_admin_direct_ws_close(stream_to_close);
@@ -1600,29 +1772,39 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
 static void direct_ws_close(void *ctx, const char *channel_id)
 {
     (void)ctx;
+    specus_session *target_session = NULL;
+    ws_conn *removed = NULL;
     pthread_mutex_lock(&active_session_lock);
     for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
         pthread_mutex_lock(&session->map_lock);
-        ws_conn *removed = remove_ws_conn_locked(session, channel_id);
+        removed = remove_ws_conn_locked(session, channel_id);
         pthread_mutex_unlock(&session->map_lock);
         if (removed != NULL) {
-            send_ws_fin(session, removed->stream_id);
-            printf("[ws-specus] close client=%s channel=%s\n",
-                   session->config.client_name, channel_id);
-            free(removed);
+            ++session->references;
+            target_session = session;
             break;
         }
     }
     pthread_mutex_unlock(&active_session_lock);
+    if (target_session != NULL) {
+        send_ws_fin(target_session, removed->stream_id);
+        printf("[ws-specus] close client=%s channel=%s\n",
+               target_session->config.client_name, channel_id);
+        free(removed);
+        session_reference_release(target_session);
+    }
 }
 
-static int read_frame(int fd, size_t max_frame_size, st_frame_header *header, uint8_t **body)
+static int read_frame(specus_session *session,
+                      size_t max_frame_size,
+                      st_frame_header *header,
+                      uint8_t **body)
 {
     if (max_frame_size < ST_HEADER_SIZE || max_frame_size > ST_MAX_FRAME_SIZE) {
         return -1;
     }
     uint8_t raw_header[ST_HEADER_SIZE];
-    int rc = recv_all(fd, raw_header, sizeof(raw_header));
+    int rc = session_recv_all(session, raw_header, sizeof(raw_header));
     if (rc <= 0) {
         return rc;
     }
@@ -1636,7 +1818,7 @@ static int read_frame(int fd, size_t max_frame_size, st_frame_header *header, ui
     if (frame_body == NULL) {
         return -1;
     }
-    rc = recv_all(fd, frame_body, header->length);
+    rc = session_recv_all(session, frame_body, header->length);
     if (rc <= 0) {
         free(frame_body);
         return rc;
@@ -1671,6 +1853,7 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     }
     config->client_id = client_session->client_id;
     config->client_session_id = client_session->id;
+    config->peer_service_discovery_version = client_session->peer_service_discovery_version;
     config->client_session_db_backed = 1;
     if (load_database_config(config, database_path) != 0
         || parse_tcp_mappings(config) != 0
@@ -1680,6 +1863,444 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     }
     config->owns_nat_control_json = 1;
     return 0;
+}
+
+static int prepare_runtime_route_config(const server_config *current, server_config *refreshed)
+{
+    if (current == NULL || refreshed == NULL || current->database_path[0] == '\0') {
+        return -1;
+    }
+    *refreshed = *current;
+    memset(refreshed->mappings, 0, sizeof(refreshed->mappings));
+    memset(refreshed->http_routes, 0, sizeof(refreshed->http_routes));
+    refreshed->mapping_count = 0U;
+    refreshed->http_route_count = 0U;
+    refreshed->nat_control_json = NULL;
+    refreshed->owns_nat_control_json = 0;
+    if (load_database_config(refreshed, refreshed->database_path) != 0
+        || parse_tcp_mappings(refreshed) != 0
+        || parse_http_routes(refreshed) != 0
+        || build_nat_control_json(refreshed) != 0) {
+        free(refreshed->nat_control_json);
+        refreshed->nat_control_json = NULL;
+        return -1;
+    }
+    refreshed->owns_nat_control_json = 1;
+    return 0;
+}
+
+static void apply_runtime_route_config(specus_session *session, server_config *refreshed)
+{
+    char *old_json = NULL;
+    pthread_mutex_lock(&session->map_lock);
+    if (session->config.owns_nat_control_json) {
+        old_json = session->config.nat_control_json;
+    }
+    session->config.client_id = refreshed->client_id;
+    snprintf(session->config.tenant_id,
+             sizeof(session->config.tenant_id),
+             "%s",
+             refreshed->tenant_id);
+    memcpy(session->config.mappings, refreshed->mappings, sizeof(refreshed->mappings));
+    session->config.mapping_count = refreshed->mapping_count;
+    memcpy(session->config.http_routes, refreshed->http_routes, sizeof(refreshed->http_routes));
+    session->config.http_route_count = refreshed->http_route_count;
+    session->config.nat_control_json = refreshed->nat_control_json;
+    session->config.owns_nat_control_json = 1;
+    refreshed->nat_control_json = NULL;
+    refreshed->owns_nat_control_json = 0;
+    pthread_mutex_unlock(&session->map_lock);
+    free(old_json);
+}
+
+static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int push_runtime_nat_control(void *ctx, long long client_id, const char *client_name)
+{
+    (void)ctx;
+    if (client_name == NULL || *client_name == '\0') {
+        return -2;
+    }
+
+    pthread_mutex_lock(&runtime_nat_control_lock);
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *control = active_session_find_role_locked(client_name, 0);
+    specus_session *data = active_session_find_role_locked(client_name, 1);
+    if (control == NULL || control->config.client_id != client_id) {
+        pthread_mutex_unlock(&active_session_lock);
+        pthread_mutex_unlock(&runtime_nat_control_lock);
+        return -1;
+    }
+    ++control->references;
+    if (data != NULL && data->config.client_id == client_id) {
+        ++data->references;
+    } else {
+        data = NULL;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+
+    server_config control_current;
+    server_config data_current;
+    server_config refreshed_control;
+    server_config refreshed_data;
+    memset(&refreshed_control, 0, sizeof(refreshed_control));
+    memset(&refreshed_data, 0, sizeof(refreshed_data));
+    pthread_mutex_lock(&control->map_lock);
+    control_current = control->config;
+    pthread_mutex_unlock(&control->map_lock);
+    if (data != NULL) {
+        pthread_mutex_lock(&data->map_lock);
+        data_current = data->config;
+        pthread_mutex_unlock(&data->map_lock);
+    }
+
+    int result = prepare_runtime_route_config(&control_current, &refreshed_control) == 0
+        && (data == NULL || prepare_runtime_route_config(&data_current, &refreshed_data) == 0)
+        ? 0 : -2;
+    st_buffer packet = {0};
+    if (result == 0) {
+        packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
+        if (packet.data == NULL) {
+            result = -2;
+        }
+    }
+    if (result == 0) {
+        apply_runtime_route_config(control, &refreshed_control);
+        if (data != NULL) {
+            apply_runtime_route_config(data, &refreshed_data);
+        }
+        if (session_send_packet(control, &packet) != 0) {
+            result = -2;
+        } else {
+            printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
+                   client_name,
+                   control->config.mapping_count,
+                   control->config.http_route_count);
+        }
+    } else {
+        st_buffer_free(&packet);
+        free(refreshed_control.nat_control_json);
+        if (data != NULL) {
+            free(refreshed_data.nat_control_json);
+        }
+    }
+
+    session_reference_release(data);
+    session_reference_release(control);
+    pthread_mutex_unlock(&runtime_nat_control_lock);
+    return result;
+}
+
+static int push_runtime_client_message(void *ctx,
+                                       long long client_id,
+                                       const char *client_name,
+                                       const char *from_admin_name,
+                                       const char *message)
+{
+    (void)ctx;
+    if (client_name == NULL || *client_name == '\0'
+        || from_admin_name == NULL || *from_admin_name == '\0'
+        || message == NULL || *message == '\0') {
+        return -2;
+    }
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *control = active_session_find_role_locked(client_name, 0);
+    if (control == NULL
+        || (client_id > 0 && control->config.client_id > 0
+            && control->config.client_id != client_id)) {
+        pthread_mutex_unlock(&active_session_lock);
+        return -1;
+    }
+    ++control->references;
+    pthread_mutex_unlock(&active_session_lock);
+
+    st_buffer packet = st_protocol_encode_message_response(from_admin_name,
+                                                           client_name,
+                                                           ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
+                                                           message);
+    int result = packet.data != NULL && session_send_packet(control, &packet) == 0 ? 0 : -2;
+    session_reference_release(control);
+    return result;
+}
+
+static int message_target_is_admin(const char *value)
+{
+    static const char prefix[] = "admin:";
+    if (value == NULL) {
+        return 0;
+    }
+    while (*value != '\0' && isspace((unsigned char)*value)) {
+        ++value;
+    }
+    for (size_t i = 0; i < sizeof(prefix) - 1U; ++i) {
+        if (value[i] == '\0'
+            || tolower((unsigned char)value[i]) != (unsigned char)prefix[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int message_body_has_text(const char *value)
+{
+    if (value == NULL) {
+        return 0;
+    }
+    for (; *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int forward_runtime_client_message(specus_session *source_session,
+                                          const st_message_response *request)
+{
+    if (source_session == NULL || request == NULL
+        || request->to_client_name == NULL || request->message == NULL
+        || !message_body_has_text(request->to_client_name)
+        || !message_body_has_text(request->message)
+        || source_session->config.database_path[0] == '\0') {
+        return -1;
+    }
+    size_t target_len = strlen(request->to_client_name);
+    if (target_len >= sizeof(((st_storage_client *)0)->client_name)) {
+        return -1;
+    }
+    char target_name[sizeof(((st_storage_client *)0)->client_name)];
+    memcpy(target_name, request->to_client_name, target_len + 1U);
+    char *canonical_input = trim(target_name);
+    if (*canonical_input == '\0') {
+        return -1;
+    }
+
+    st_storage_client source;
+    st_storage_client target;
+    if (st_storage_get_client_by_name(source_session->config.database_path,
+                                      source_session->config.client_name,
+                                      &source) != 0
+        || st_storage_get_client_by_name(source_session->config.database_path,
+                                         canonical_input,
+                                         &target) != 0
+        || !source.enabled || !target.enabled
+        || strcmp(source.tenant_id, source_session->config.tenant_id) != 0) {
+        return -1;
+    }
+    int allowed = 0;
+    if (st_storage_can_peer(source_session->config.database_path, &source, &target, &allowed) != 0
+        || !allowed) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *target_control = active_session_find_role_locked(target.client_name, 0);
+    if (target_control == NULL
+        || strcmp(target_control->config.tenant_id, source.tenant_id) != 0
+        || (target.id > 0 && target_control->config.client_id > 0
+            && target_control->config.client_id != target.id)) {
+        pthread_mutex_unlock(&active_session_lock);
+        return -1;
+    }
+    ++target_control->references;
+    pthread_mutex_unlock(&active_session_lock);
+
+    st_buffer packet = st_protocol_encode_message_response(source.client_name,
+                                                           target.client_name,
+                                                           ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
+                                                           request->message);
+    int result = packet.data != NULL && session_send_packet(target_control, &packet) == 0 ? 0 : -2;
+    session_reference_release(target_control);
+    return result;
+}
+
+static int peer_mesh_runtime_online(void *ctx,
+                                    long long client_id,
+                                    const char *client_name)
+{
+    (void)ctx;
+    int online = 0;
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *control = active_session_find_role_locked(client_name, 0);
+    if (control != NULL
+        && (client_id <= 0 || control->config.client_id <= 0
+            || control->config.client_id == client_id)) online = 1;
+    pthread_mutex_unlock(&active_session_lock);
+    return online;
+}
+
+static int peer_mesh_runtime_send(void *ctx,
+                                  const char *target_client_name,
+                                  const char *source_client_name,
+                                  const char *message)
+{
+    (void)ctx;
+    if (!message_body_has_text(target_client_name)
+        || !message_body_has_text(source_client_name)
+        || !message_body_has_text(message)) return -1;
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *target = active_session_find_role_locked(target_client_name, 0);
+    if (target != NULL) ++target->references;
+    pthread_mutex_unlock(&active_session_lock);
+    if (target == NULL) return -1;
+    st_buffer packet = st_protocol_encode_message_response(source_client_name,
+                                                           target_client_name,
+                                                           ST_MESSAGE_TYPE_PEER_CONTROL,
+                                                           message);
+    int rc = packet.data != NULL && session_send_packet(target, &packet) == 0 ? 0 : -1;
+    session_reference_release(target);
+    return rc;
+}
+
+static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *session)
+{
+    st_peer_mesh_runtime runtime;
+    runtime.database_path = session->config.database_path;
+    runtime.send = peer_mesh_runtime_send;
+    runtime.online = peer_mesh_runtime_online;
+    runtime.ctx = session;
+    runtime.publisher_session_id = session->config.client_session_id;
+    runtime.peer_service_discovery_version = session->config.peer_service_discovery_version;
+    return runtime;
+}
+
+static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
+{
+    const server_config *config = (const server_config *)ctx;
+    if (config == NULL || config->database_path[0] == '\0'
+        || tenant_id == NULL || *tenant_id == '\0') return -1;
+    st_peer_mesh_runtime runtime = {
+        config->database_path,
+        peer_mesh_runtime_send,
+        peer_mesh_runtime_online,
+        NULL,
+        0,
+        2
+    };
+    return st_peer_mesh_refresh_tenant(&runtime, tenant_id);
+}
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+    int started;
+    int stop;
+    char database_path[512];
+    time_t next_registration_cleanup;
+    time_t next_object_cleanup;
+    time_t next_media_cleanup;
+} peer_mesh_maintenance_state;
+
+static peer_mesh_maintenance_state peer_mesh_maintenance = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .condition = PTHREAD_COND_INITIALIZER
+};
+
+static time_t maintenance_interval_seconds(const char *name, long long fallback_ms)
+{
+    int64_t parsed = fallback_ms;
+    if (env_i64_range(name, fallback_ms, 1LL, INT64_MAX, &parsed) != 0) parsed = fallback_ms;
+    long long milliseconds = parsed < 1000LL ? 1000LL : (long long)parsed;
+    long long seconds = (milliseconds + 999LL) / 1000LL;
+    return seconds > (long long)INT_MAX ? (time_t)INT_MAX : (time_t)seconds;
+}
+
+static void *peer_mesh_maintenance_thread(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&peer_mesh_maintenance.lock);
+    while (!peer_mesh_maintenance.stop) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) break;
+        deadline.tv_sec += 30;
+        int wait_rc = pthread_cond_timedwait(&peer_mesh_maintenance.condition,
+                                             &peer_mesh_maintenance.lock,
+                                             &deadline);
+        if (peer_mesh_maintenance.stop) break;
+        if (wait_rc != ETIMEDOUT) continue;
+        st_peer_mesh_runtime runtime = {
+            peer_mesh_maintenance.database_path,
+            peer_mesh_runtime_send,
+            peer_mesh_runtime_online,
+            NULL,
+            0,
+            2
+        };
+        pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        if (st_peer_mesh_expire_catalogs(&runtime) != 0) {
+            fprintf(stderr, "[peer-mesh] stale catalog cleanup failed\n");
+        }
+        time_t now = time(NULL);
+        if (now >= peer_mesh_maintenance.next_registration_cleanup) {
+            char now_text[64];
+            if (current_utc_timestamp(now_text) != 0
+                || st_storage_delete_expired_registration_challenges(
+                    peer_mesh_maintenance.database_path, now_text) != 0) {
+                fprintf(stderr, "[registration] expired challenge cleanup failed\n");
+            }
+            peer_mesh_maintenance.next_registration_cleanup = now
+                + maintenance_interval_seconds("SPECUS_AUTH_EMAIL_CLEANUP_INTERVAL_MS", 3600000LL);
+        }
+        if (now >= peer_mesh_maintenance.next_object_cleanup) {
+            if (st_object_storage_cleanup_expired() != 0) {
+                fprintf(stderr, "[object-storage] expiration cleanup failed\n");
+            }
+            peer_mesh_maintenance.next_object_cleanup = now
+                + maintenance_interval_seconds("SPECUS_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS", 3600000LL);
+        }
+        if (now >= peer_mesh_maintenance.next_media_cleanup) {
+            if (st_media_capture_cleanup_expired(peer_mesh_maintenance.database_path) != 0) {
+                fprintf(stderr, "[media-capture] retention cleanup failed\n");
+            }
+            peer_mesh_maintenance.next_media_cleanup = now
+                + maintenance_interval_seconds("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", 60000LL);
+        }
+        pthread_mutex_lock(&peer_mesh_maintenance.lock);
+    }
+    pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+    return NULL;
+}
+
+static int peer_mesh_maintenance_start(const char *database_path)
+{
+    if (database_path == NULL || database_path[0] == '\0') return 0;
+    pthread_mutex_lock(&peer_mesh_maintenance.lock);
+    peer_mesh_maintenance.stop = 0;
+    time_t now = time(NULL);
+    peer_mesh_maintenance.next_registration_cleanup = now
+        + maintenance_interval_seconds("SPECUS_AUTH_EMAIL_CLEANUP_INTERVAL_MS", 3600000LL);
+    peer_mesh_maintenance.next_object_cleanup = now
+        + maintenance_interval_seconds("SPECUS_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS", 3600000LL);
+    peer_mesh_maintenance.next_media_cleanup = now
+        + maintenance_interval_seconds("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", 60000LL);
+    snprintf(peer_mesh_maintenance.database_path,
+             sizeof(peer_mesh_maintenance.database_path), "%s", database_path);
+    if (pthread_create(&peer_mesh_maintenance.thread, NULL,
+                       peer_mesh_maintenance_thread, NULL) != 0) {
+        pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        return -1;
+    }
+    peer_mesh_maintenance.started = 1;
+    pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+    return 0;
+}
+
+static void peer_mesh_maintenance_stop(void)
+{
+    pthread_mutex_lock(&peer_mesh_maintenance.lock);
+    int started = peer_mesh_maintenance.started;
+    peer_mesh_maintenance.stop = 1;
+    pthread_cond_broadcast(&peer_mesh_maintenance.condition);
+    pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+    if (started) pthread_join(peer_mesh_maintenance.thread, NULL);
+    pthread_mutex_lock(&peer_mesh_maintenance.lock);
+    peer_mesh_maintenance.started = 0;
+    peer_mesh_maintenance.database_path[0] = '\0';
+    peer_mesh_maintenance.next_registration_cleanup = 0;
+    peer_mesh_maintenance.next_object_cleanup = 0;
+    peer_mesh_maintenance.next_media_cleanup = 0;
+    pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 
 static int verify_database_login(specus_session *session, const st_login_request *request, const char **reason)
@@ -1694,11 +2315,16 @@ static int verify_database_login(specus_session *session, const st_login_request
     st_hex_encode(actual_hash, sizeof(actual_hash), token_hash);
 
     st_storage_client_session client_session;
-    if (st_storage_get_client_session_for_login(config->database_path,
-                                                request->client_session_id,
-                                                token_hash,
-                                                &client_session) != 0) {
+    int session_lookup = st_storage_get_client_session_for_login(config->database_path,
+                                                                 request->client_session_id,
+                                                                 token_hash,
+                                                                 &client_session);
+    if (session_lookup > 0) {
         return -1;
+    }
+    if (session_lookup < 0) {
+        *reason = "客户端认证存储暂不可用";
+        return 0;
     }
     if (strcmp(request->client_name, client_session.client_name) != 0) {
         *reason = "客户端访问令牌无效";
@@ -1877,46 +2503,62 @@ static void remote_endpoint(const struct sockaddr_storage *remote,
         const struct sockaddr_in *addr = (const struct sockaddr_in *)remote;
         inet_ntop(AF_INET, &addr->sin_addr, address, address_len);
         *port = ntohs(addr->sin_port);
-        snprintf(text, text_len, "%s:%d", address, *port);
+        snprintf(text, text_len, "%.45s:%d", address, *port);
         return;
     }
     if (remote->ss_family == AF_INET6) {
         const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)remote;
         inet_ntop(AF_INET6, &addr->sin6_addr, address, address_len);
         *port = ntohs(addr->sin6_port);
-        snprintf(text, text_len, "[%s]:%d", address, *port);
+        snprintf(text, text_len, "[%.45s]:%d", address, *port);
         return;
     }
     snprintf(address, address_len, "unknown");
     snprintf(text, text_len, "unknown");
 }
 
-static int create_listener(int port)
+static int create_listener_on(const char *bind_address, int port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    char port_text[16];
+    snprintf(port_text, sizeof(port_text), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    struct addrinfo *addresses = NULL;
+    int gai = getaddrinfo(bind_address, port_text, &hints, &addresses);
+    if (gai != 0) {
+        fprintf(stderr, "invalid listener bind address %s: %s\n", bind_address, gai_strerror(gai));
+        return -1;
+    }
+    int fd = -1;
+    for (const struct addrinfo *address = addresses; address != NULL; address = address->ai_next) {
+        fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        if (address->ai_family == AF_INET6) {
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
+        }
+        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(addresses);
     if (fd < 0) {
-        perror("socket");
-        return -1;
-    }
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("bind");
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 128) != 0) {
-        perror("listen");
-        close(fd);
-        return -1;
+        perror("bind/listen");
     }
     return fd;
+}
+
+static int create_listener(int port)
+{
+    return create_listener_on("0.0.0.0", port);
 }
 
 static void configure_control_socket(int fd, const server_config *config)
@@ -1925,6 +2567,9 @@ static void configure_control_socket(int fd, const server_config *config)
     timeout.tv_sec = config->control_read_idle_seconds;
     timeout.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    timeout.tv_sec = config->control_write_timeout_seconds;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 }
 
 static int mapping_allowed(const server_config *config, int port, const char *address, int specus_port)
@@ -1966,38 +2611,6 @@ static char *json_connected(const char *channel_id, int port)
     }
     string_builder builder = {0};
     int rc = sb_appendf(&builder, "{\"channelId\":\"%s\",\"port\":%d}", escaped_id, port);
-    free(escaped_id);
-    if (rc != 0) {
-        free(builder.data);
-        return NULL;
-    }
-    return sb_finish(&builder);
-}
-
-static char *json_channel(const char *channel_id)
-{
-    char *escaped_id = st_json_escape(channel_id);
-    if (escaped_id == NULL) {
-        return NULL;
-    }
-    string_builder builder = {0};
-    int rc = sb_appendf(&builder, "{\"channelId\":\"%s\"}", escaped_id);
-    free(escaped_id);
-    if (rc != 0) {
-        free(builder.data);
-        return NULL;
-    }
-    return sb_finish(&builder);
-}
-
-static char *json_ws_channel(const char *channel_id)
-{
-    char *escaped_id = st_json_escape(channel_id);
-    if (escaped_id == NULL) {
-        return NULL;
-    }
-    string_builder builder = {0};
-    int rc = sb_appendf(&builder, "{\"channelId\":\"%s\",\"source\":\"ws\"}", escaped_id);
     free(escaped_id);
     if (rc != 0) {
         free(builder.data);
@@ -2280,6 +2893,10 @@ static void close_conn_locked(external_conn *conn)
     conn->flow_closed = 1;
     pthread_cond_broadcast(&conn->flow_cond);
     pthread_mutex_unlock(&conn->flow_lock);
+    pthread_mutex_lock(&conn->write_lock);
+    conn->write_closed = 1;
+    pthread_cond_broadcast(&conn->write_cond);
+    pthread_mutex_unlock(&conn->write_lock);
     if (conn->fd >= 0) {
         shutdown(conn->fd, SHUT_RDWR);
         close(conn->fd);
@@ -2287,6 +2904,76 @@ static void close_conn_locked(external_conn *conn)
     }
     release_external_count(conn);
     conn->done = 1;
+}
+
+static void free_external_write_queue(external_conn *conn)
+{
+    external_write_chunk *chunk = conn->write_head;
+    while (chunk != NULL) {
+        external_write_chunk *next = chunk->next;
+        free(chunk->data);
+        free(chunk);
+        chunk = next;
+    }
+    conn->write_head = NULL;
+    conn->write_tail = NULL;
+    conn->queued_write_bytes = 0U;
+}
+
+static int enqueue_external_write(external_conn *conn,
+                                  const uint8_t *data,
+                                  size_t data_len,
+                                  int end_stream)
+{
+    if (data == NULL || data_len == 0U || data_len > ST_MAX_DATA_FRAME_BYTES) {
+        return -1;
+    }
+    external_write_chunk *chunk = (external_write_chunk *)calloc(1, sizeof(*chunk));
+    if (chunk == NULL) {
+        return -1;
+    }
+    chunk->data = (uint8_t *)malloc(data_len);
+    if (chunk->data == NULL) {
+        free(chunk);
+        return -1;
+    }
+    memcpy(chunk->data, data, data_len);
+    chunk->len = data_len;
+
+    pthread_mutex_lock(&conn->write_lock);
+    if (conn->write_closed || conn->client_finished
+        || conn->queued_write_bytes > ST_STREAM_MAX_PENDING_BYTES - data_len) {
+        pthread_mutex_unlock(&conn->write_lock);
+        free(chunk->data);
+        free(chunk);
+        return -1;
+    }
+    if (conn->write_tail == NULL) {
+        conn->write_head = chunk;
+    } else {
+        conn->write_tail->next = chunk;
+    }
+    conn->write_tail = chunk;
+    conn->queued_write_bytes += data_len;
+    if (end_stream) {
+        conn->client_finished = 1;
+    }
+    pthread_cond_broadcast(&conn->write_cond);
+    pthread_mutex_unlock(&conn->write_lock);
+    return 0;
+}
+
+static int finish_external_write(external_conn *conn)
+{
+    pthread_mutex_lock(&conn->write_lock);
+    if (conn->write_closed || conn->client_finished) {
+        pthread_mutex_unlock(&conn->write_lock);
+        return -1;
+    }
+    conn->client_finished = 1;
+    pthread_cond_broadcast(&conn->write_cond);
+    pthread_mutex_unlock(&conn->write_lock);
+    return 0;
 }
 
 static int consume_send_credit(external_conn *conn, size_t bytes)
@@ -2370,6 +3057,72 @@ static void mark_conn_done(external_conn *conn)
     pthread_mutex_unlock(&session->map_lock);
 }
 
+static void *external_writer_thread(void *arg)
+{
+    external_conn *conn = (external_conn *)arg;
+    specus_session *session = conn->session;
+    for (;;) {
+        pthread_mutex_lock(&conn->write_lock);
+        while (!conn->write_closed && conn->write_head == NULL && !conn->client_finished) {
+            pthread_cond_wait(&conn->write_cond, &conn->write_lock);
+        }
+        if (conn->write_closed) {
+            pthread_mutex_unlock(&conn->write_lock);
+            break;
+        }
+        external_write_chunk *chunk = conn->write_head;
+        if (chunk != NULL) {
+            conn->write_head = chunk->next;
+            if (conn->write_head == NULL) {
+                conn->write_tail = NULL;
+            }
+            conn->queued_write_bytes -= chunk->len;
+            pthread_mutex_unlock(&conn->write_lock);
+
+            int fd;
+            pthread_mutex_lock(&session->map_lock);
+            fd = conn->fd;
+            pthread_mutex_unlock(&session->map_lock);
+            if (fd < 0 || send_all(fd, chunk->data, chunk->len) != 0) {
+                fprintf(stderr,
+                        "[nat] external write failed stream=%u client=%s bytes=%zu errno=%d\n",
+                        conn->stream_id,
+                        session->config.client_name,
+                        chunk->len,
+                        errno);
+                free(chunk->data);
+                free(chunk);
+                mark_conn_done(conn);
+                break;
+            }
+            record_tcp_traffic(session, conn->port, 0, (long long)chunk->len);
+            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
+            if (send_window_update(session, conn->stream_id, chunk->len) != 0) {
+                free(chunk->data);
+                free(chunk);
+                mark_conn_done(conn);
+                break;
+            }
+            free(chunk->data);
+            free(chunk);
+            continue;
+        }
+        pthread_mutex_unlock(&conn->write_lock);
+
+        pthread_mutex_lock(&session->map_lock);
+        if (conn->fd >= 0) {
+            (void)shutdown(conn->fd, SHUT_WR);
+        }
+        conn->client_write_drained = 1;
+        if (conn->public_finished) {
+            close_conn_locked(conn);
+        }
+        pthread_mutex_unlock(&session->map_lock);
+        break;
+    }
+    return NULL;
+}
+
 static void *external_conn_thread(void *arg)
 {
     external_conn *conn = (external_conn *)arg;
@@ -2412,7 +3165,7 @@ static void *external_conn_thread(void *arg)
     send_fin(session, conn->stream_id);
     pthread_mutex_lock(&session->map_lock);
     conn->public_finished = 1;
-    if (conn->client_finished) {
+    if (conn->client_write_drained) {
         close_conn_locked(conn);
     }
     pthread_mutex_unlock(&session->map_lock);
@@ -2437,6 +3190,8 @@ static int start_external_conn(specus_session *session,
     conn->send_credit = ST_STREAM_INITIAL_WINDOW;
     pthread_mutex_init(&conn->flow_lock, NULL);
     pthread_cond_init(&conn->flow_cond, NULL);
+    pthread_mutex_init(&conn->write_lock, NULL);
+    pthread_cond_init(&conn->write_cond, NULL);
     if (remote != NULL) {
         remote_endpoint(remote,
                         conn->remote_ip,
@@ -2454,6 +3209,8 @@ static int start_external_conn(specus_session *session,
         close(fd);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
+        pthread_cond_destroy(&conn->write_cond);
+        pthread_mutex_destroy(&conn->write_lock);
         free(conn);
         return -1;
     }
@@ -2466,11 +3223,21 @@ static int start_external_conn(specus_session *session,
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
 
+    if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
+        perror("pthread_create");
+        pthread_mutex_lock(&session->map_lock);
+        close_conn_locked(conn);
+        pthread_mutex_unlock(&session->map_lock);
+        return -1;
+    }
+    conn->writer_thread_started = 1;
     if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
+        pthread_join(conn->writer_thread, NULL);
+        conn->writer_thread_started = 0;
         return -1;
     }
     conn->thread_started = 1;
@@ -2603,7 +3370,10 @@ static void process_register(specus_session *session, const st_nat_message *mess
         free(client_name);
         return;
     }
-    if (!mapping_allowed(&session->config, port, specus_address, specus_port)) {
+    pthread_mutex_lock(&session->map_lock);
+    int allowed = mapping_allowed(&session->config, port, specus_address, specus_port);
+    pthread_mutex_unlock(&session->map_lock);
+    if (!allowed) {
         send_register_result(session, port, 0, "port mapping not configured");
         free(specus_address);
         free(client_name);
@@ -2635,22 +3405,19 @@ static void process_control_data(specus_session *session, const st_nat_message *
     ws_conn *ws = NULL;
     ws_conn *removed_ws = NULL;
     st_admin_direct_ws_stream *stream_to_close = NULL;
-    int port = 0;
-    int record_download = 0;
+    int reset_overflow = 0;
     if (conn != NULL && conn->fd >= 0) {
-        port = conn->port;
-        if (send_all(conn->fd, message->data, message->data_len) != 0) {
+        if (enqueue_external_write(conn,
+                                   message->data,
+                                   message->data_len,
+                                   (message->flags & ST_NAT_FLAG_END_STREAM) != 0U) != 0) {
             close_conn_locked(conn);
-        } else {
-            record_download = 1;
-            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", message->data, message->data_len);
-            if ((message->flags & ST_NAT_FLAG_END_STREAM) != 0U) {
-                shutdown(conn->fd, SHUT_WR);
-                conn->client_finished = 1;
-                if (conn->public_finished) {
-                    close_conn_locked(conn);
-                }
-            }
+            reset_overflow = 1;
+            fprintf(stderr,
+                    "[nat] client-to-public queue rejected stream=%u client=%s bytes=%zu\n",
+                    message->stream_id,
+                    session->config.client_name,
+                    message->data_len);
         }
     }
     if (conn == NULL) {
@@ -2668,10 +3435,10 @@ static void process_control_data(specus_session *session, const st_nat_message *
         st_admin_direct_ws_close(stream_to_close);
     }
     free(removed_ws);
-    if (record_download) {
-        record_tcp_traffic(session, port, 0, (long long)message->data_len);
+    if (reset_overflow) {
+        (void)send_reset(session, message->stream_id, 6U, "stream send queue exceeded");
     }
-    if (record_download || ws != NULL) {
+    if (ws != NULL) {
         send_window_update(session, message->stream_id, message->data_len);
     }
 }
@@ -2684,9 +3451,7 @@ static void process_control_closed(specus_session *session, const st_nat_message
         if (message->type == ST_NAT_RST) {
             close_conn_locked(conn);
         } else {
-            shutdown(conn->fd, SHUT_WR);
-            conn->client_finished = 1;
-            if (conn->public_finished) {
+            if (finish_external_write(conn) != 0) {
                 close_conn_locked(conn);
             }
         }
@@ -2765,6 +3530,8 @@ static void session_shutdown(specus_session *session)
 
     pthread_mutex_lock(&session->send_lock);
     if (session->control_fd >= 0) {
+        st_tls_connection_free(session->tls_connection);
+        session->tls_connection = NULL;
         shutdown(session->control_fd, SHUT_RDWR);
         close(session->control_fd);
         session->control_fd = -1;
@@ -2797,6 +3564,9 @@ static void session_shutdown(specus_session *session)
         if (conn->thread_started) {
             pthread_join(conn->thread, NULL);
         }
+        if (conn->writer_thread_started) {
+            pthread_join(conn->writer_thread, NULL);
+        }
     }
 
     specus_listener *listener = session->listeners;
@@ -2808,8 +3578,11 @@ static void session_shutdown(specus_session *session)
     external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
+        free_external_write_queue(conn);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
+        pthread_cond_destroy(&conn->write_cond);
+        pthread_mutex_destroy(&conn->write_lock);
         free(conn);
         conn = next;
     }
@@ -2839,14 +3612,35 @@ static void *client_thread(void *arg)
     session->control_fd = args->fd;
     session->config = args->config;
     session->active = 1;
+    session->references = 1U;
     session->next_stream_id = 1U;
     pthread_mutex_init(&session->send_lock, NULL);
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
+    pthread_cond_init(&session->reference_cond, NULL);
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
     printf("[control] accepted %s\n", session->remote);
+
+    if (st_tls_server_context_enabled(session->config.tls_context)) {
+        char tls_error[512];
+        if (st_tls_connection_accept(session->config.tls_context,
+                                     session->control_fd,
+                                     &session->tls_connection,
+                                     tls_error,
+                                     sizeof(tls_error)) != 0) {
+            fprintf(stderr, "[tls] handshake rejected remote=%s: %s\n", session->remote, tls_error);
+            session_shutdown(session);
+            pthread_mutex_destroy(&session->send_lock);
+            pthread_mutex_destroy(&session->map_lock);
+            pthread_mutex_destroy(&session->direct_lock);
+            pthread_cond_destroy(&session->reference_cond);
+            free(session);
+            return NULL;
+        }
+        printf("[tls] handshake complete remote=%s\n", session->remote);
+    }
 
     int logged_in = 0;
     const char *disconnect_reason = "CLIENT_CLOSED";
@@ -2854,7 +3648,7 @@ static void *client_thread(void *arg)
         st_frame_header header;
         uint8_t *body = NULL;
         size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
-        int rc = read_frame(session->control_fd, frame_limit, &header, &body);
+        int rc = read_frame(session, frame_limit, &header, &body);
         if (rc == 0) {
             disconnect_reason = "CLIENT_CLOSED";
             printf("[control] closed %s\n", session->remote);
@@ -2926,6 +3720,7 @@ static void *client_thread(void *arg)
             printf("[%s] login ok client=%s remote=%s\n",
                    session->is_data_connection ? "data" : "control",
                    request.client_name, session->remote);
+            session->connected_since_ms = now_ms();
             pthread_mutex_lock(&active_session_lock);
             active_session_add_locked(session);
             pthread_mutex_unlock(&active_session_lock);
@@ -2940,6 +3735,13 @@ static void *client_thread(void *arg)
                 }
                 printf("[nat-control] pushed %zu tcp route(s) to %s\n",
                        session->config.mapping_count, session->config.client_name);
+                if (session->config.database_path[0] != '\0') {
+                    st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+                    if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
+                        fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n",
+                                session->config.client_name);
+                    }
+                }
             }
             st_login_request_free(&request);
             continue;
@@ -2961,6 +3763,63 @@ static void *client_thread(void *arg)
             session_send_packet(session, &response);
             disconnect_reason = "CLIENT_CLOSED";
             break;
+        }
+
+        if (header.command == ST_CMD_MESSAGE_REQUEST) {
+            if (session->is_data_connection) {
+                disconnect_reason = "PROTOCOL_VIOLATION";
+                fprintf(stderr, "[data] message request received on data connection from %s\n", session->remote);
+                free(body);
+                break;
+            }
+            st_message_response message_request;
+            if (st_protocol_decode_message_response(body, header.length, &message_request) != 0) {
+                disconnect_reason = "PROTOCOL_VIOLATION";
+                fprintf(stderr, "[message] invalid request from %s\n", session->remote);
+                free(body);
+                break;
+            }
+            free(body);
+            if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT
+                && message_request.to_client_name != NULL
+                && message_request.message != NULL) {
+                int admin_target = message_target_is_admin(message_request.to_client_name);
+                int delivery_rc = admin_target
+                    ? st_admin_deliver_client_message_to_admin(session->config.tenant_id,
+                                                               session->config.client_name,
+                                                               message_request.to_client_name,
+                                                               message_request.message)
+                    : forward_runtime_client_message(session, &message_request);
+                printf("[message] client->%s %s source=%s target=%s\n",
+                       admin_target ? "admin" : "client",
+                       delivery_rc == 0 ? "delivered" : "not-delivered",
+                       session->config.client_name,
+                       message_request.to_client_name);
+            } else if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_SERVER) {
+                printf("[message] client->server source=%s bytes=%zu\n",
+                       session->config.client_name,
+                       message_request.message == NULL ? 0U : strlen(message_request.message));
+            } else if (message_request.message_type == ST_MESSAGE_TYPE_PEER_CONTROL
+                       && message_request.message != NULL
+                       && session->config.database_path[0] != '\0') {
+                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+                int delivery_rc = st_peer_mesh_handle_control(&peer_runtime,
+                                                              session->config.client_name,
+                                                              message_request.to_client_name,
+                                                              message_request.message);
+                printf("[peer-mesh] signal %s source=%s target=%s\n",
+                       delivery_rc == 0 ? "accepted" : "rejected",
+                       session->config.client_name,
+                       message_request.to_client_name == NULL ? "" : message_request.to_client_name);
+            } else {
+                fprintf(stderr,
+                        "[message] unsupported type=%d source=%s target=%s\n",
+                        message_request.message_type,
+                        session->config.client_name,
+                        message_request.to_client_name == NULL ? "" : message_request.to_client_name);
+            }
+            st_message_response_free(&message_request);
+            continue;
         }
 
         if (header.command == ST_CMD_NAT_MESSAGE) {
@@ -2996,8 +3855,19 @@ static void *client_thread(void *arg)
     pthread_mutex_lock(&active_session_lock);
     active_session_close_peer_locked(session);
     active_session_remove_locked(session);
+    while (session->references > 1U) {
+        pthread_cond_wait(&session->reference_cond, &active_session_lock);
+    }
     pthread_mutex_unlock(&active_session_lock);
     if (logged_in && !session->is_data_connection) {
+        if (session->config.database_path[0] != '\0') {
+            st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            if (st_peer_mesh_handle_disconnect(&peer_runtime,
+                                               session->config.client_name) != 0) {
+                fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
+                        session->config.client_name);
+            }
+        }
         if (session->config.database_path[0] != '\0'
             && session->config.client_session_db_backed
             && session->config.client_session_id > 0) {
@@ -3014,6 +3884,7 @@ static void *client_thread(void *arg)
     pthread_mutex_destroy(&session->send_lock);
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
+    pthread_cond_destroy(&session->reference_cond);
     free(session);
     return NULL;
 }
@@ -3022,20 +3893,76 @@ int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
 
+    if (st_security_baseline_validate_current() != 0) {
+        return 1;
+    }
+    if (st_elasticsearch_traffic_initialize_current() != 0) {
+        return 1;
+    }
+    if (st_media_capture_validate_current() != 0) {
+        return 1;
+    }
+    if (st_public_discovery_initialize() != 0) {
+        fprintf(stderr, "public transfer discovery initialization failed\n");
+        return 1;
+    }
+
     server_config config;
     if (load_config(&config) != 0) {
+        st_public_discovery_shutdown();
+        return 1;
+    }
+    st_stun_turn_server *stun_turn_server = NULL;
+    if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        if (st_stun_turn_server_start(&stun_turn_server) != 0) {
+            fprintf(stderr, "Peer Mesh STUN/TURN listener failed to start\n");
+            free(config.nat_control_json);
+            st_public_discovery_shutdown();
+            return 1;
+        }
+        printf("[peer-mesh] STUN/TURN UDP listener active on port %d\n",
+               st_stun_turn_server_port(stun_turn_server));
+    }
+
+    st_tls_config tls_config;
+    st_tls_config_from_env(&tls_config);
+    char tls_error[512];
+    if (st_tls_validate_deployment(&tls_config,
+                                   getenv("SPECUS_ENV"),
+                                   config.bind_address,
+                                   tls_error,
+                                   sizeof(tls_error)) != 0
+        || st_tls_server_context_create(&tls_config,
+                                        &config.tls_context,
+                                        tls_error,
+                                        sizeof(tls_error)) != 0) {
+        fprintf(stderr, "TLS configuration rejected: %s\n", tls_error);
+        st_stun_turn_server_stop(stun_turn_server);
+        free(config.nat_control_json);
+        st_public_discovery_shutdown();
         return 1;
     }
 
-    int listener = create_listener(config.port);
+    int listener = create_listener_on(config.bind_address, config.port);
     if (listener < 0) {
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
+        st_public_discovery_shutdown();
         return 1;
     }
-    printf("specus-server-c listening on 0.0.0.0:%d for client \"%s\" (%zu tcp route(s))\n",
-           config.port, config.client_name, config.mapping_count);
+    printf("specus-server-c listening on %s:%d tls=%s for client \"%s\" (%zu tcp route(s))\n",
+           config.bind_address,
+           config.port,
+           st_tls_mode_name(tls_config.mode),
+           config.client_name,
+           config.mapping_count);
 
     st_admin_server admin_server;
+    st_admin_set_nat_control_handler(push_runtime_nat_control, NULL);
+    st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
+    st_admin_set_client_message_handler(push_runtime_client_message, NULL);
+    st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
     if (config.admin_port > 0
         && st_admin_server_start_with_handlers(&admin_server,
                                                config.admin_port,
@@ -3047,8 +3974,28 @@ int main(void)
                                                direct_ws_close,
                                                &config)
             != 0) {
+        st_admin_set_nat_control_handler(NULL, NULL);
+        st_admin_set_client_runtime_status_handler(NULL, NULL);
+        st_admin_set_client_message_handler(NULL, NULL);
+        st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         close(listener);
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
+        st_public_discovery_shutdown();
+        return 1;
+    }
+    if (peer_mesh_maintenance_start(config.database_path) != 0) {
+        fprintf(stderr, "Peer Mesh catalog maintenance failed to start\n");
+        st_admin_set_nat_control_handler(NULL, NULL);
+        st_admin_set_client_runtime_status_handler(NULL, NULL);
+        st_admin_set_client_message_handler(NULL, NULL);
+        st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        close(listener);
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
+        free(config.nat_control_json);
+        st_public_discovery_shutdown();
         return 1;
     }
 
@@ -3085,6 +4032,14 @@ int main(void)
     }
 
     close(listener);
+    peer_mesh_maintenance_stop();
+    st_admin_set_nat_control_handler(NULL, NULL);
+    st_admin_set_client_runtime_status_handler(NULL, NULL);
+    st_admin_set_client_message_handler(NULL, NULL);
+    st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+    st_stun_turn_server_stop(stun_turn_server);
+    st_tls_server_context_free(config.tls_context);
     free(config.nat_control_json);
+    st_public_discovery_shutdown();
     return 0;
 }

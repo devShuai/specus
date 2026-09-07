@@ -1,6 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "security.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int contains(const char *haystack, const char *needle)
@@ -34,10 +37,30 @@ int main(void)
         fprintf(stderr, "OIDC disabled response mismatch\n");
         return 1;
     }
+    if (st_security_build_oidc_config_extended(
+            "client-2", "https://idp.example/auth", "https://idp.example/register",
+            "https://idp.example/logout", "http://127.0.0.1:8088/", "openid email",
+            1, 1, 1, "site-key", buffer, sizeof(buffer)) <= 0
+        || !contains(buffer, "\"registrationEndpoint\":\"https://idp.example/register\"")
+        || !contains(buffer, "\"registrationEnabled\":true")
+        || !contains(buffer, "\"emailVerificationRequired\":true")
+        || !contains(buffer, "\"turnstileEnabled\":true")
+        || !contains(buffer, "\"turnstileSiteKey\":\"site-key\"")) {
+        fprintf(stderr, "OIDC extended browser configuration mismatch\n");
+        return 1;
+    }
     if (st_security_token_ttl_seconds("30") != 60 || st_security_token_ttl_seconds("7200") != 7200) {
         fprintf(stderr, "token ttl normalization mismatch\n");
         return 1;
     }
+    char pairing_hash[65];
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-room-test-jwt-secret-with-more-than-32-bytes", 1);
+    if (st_security_pairing_code_hash("12345678", pairing_hash) != 0
+        || strcmp(pairing_hash, "6a6fd5809887eba966a7b459a8e0a8d2278cf3cba661f6a7a4ec56f3857e8c5b") != 0) {
+        fprintf(stderr, "pairing-code HMAC vector mismatch\n");
+        return 1;
+    }
+    unsetenv("SPECUS_AUTH_JWT_SECRET");
     char token[2048];
     if (st_security_issue_local_token("alice",
                                       "tenant-a",

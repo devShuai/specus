@@ -18,17 +18,17 @@
 $pbkdf2-sha256$v=1$i=<iterations>$<base64 salt>$<base64 key>
 ```
 
-Java、Go、.NET 三端共用同一格式，并各自断言同一组由**独立实现**生成的向量，因此任一端写出的哈希都能被另外两端验证。选 PBKDF2 而不是 Argon2id，是因为它在三端标准库里都有——格式分叉意味着同一个账号在一端能登录、另一端不能，这个代价高于 Argon2id 多出的内存硬度。
+Java、Go、.NET 与 C server 的管理用户共用同一格式，并各自断言同一组由**独立实现**生成的向量，因此任一 server 写出的管理用户哈希都能被其余实现验证。选 PBKDF2 而不是 Argon2id，是因为它可以由四种实现已有的标准密码学原语稳定提供——格式分叉意味着同一个账号在一端能登录、另一端不能，这个代价高于 Argon2id 多出的内存硬度。
 
 默认 210,000 轮；低于 1,000 轮的存量哈希按损坏处理。旧的裸 SHA-256 仍可验证，并在验证成功的那一刻——明文唯一存在的那一刻——就地重写为新格式。
 
 **高熵密钥不走这条路，而且不能走**：HMAC 登录流程直接使用凭据摘要的 32 字节原文作为 HMAC key，所以机器凭据的 SHA-256 摘要格式是协议的一部分。每路由 basic-auth 密钥同样保持摘要，因为它在每个被代理请求上都要校验一次，210k 轮迭代等于自我 DoS；它是闸门而不是账号。OIDC issuer+subject 索引键也是摘要——那是索引，不是凭据。
 
-四类用途现在有各自的命名（`HashPassword` / `HashToken` / `DigestKey`），不再共用一个函数，因为共用正是当初把慢 KDF 用错地方、或把快摘要用在口令上的原因。
+不同用途现在有各自的命名（Java / Go / .NET 的 `HashPassword` / `HashToken` / `DigestKey`，C 的 `st_password_hash` 与既有 token digest 路径），不再让人类口令与高熵密钥共用一个函数，因为共用正是当初把慢 KDF 用错地方、或把快摘要用在口令上的原因。
 
 ### 解压上限
 
-绝对上限 64 MiB，膨胀比上限 100:1，两者同时生效；小于 64 KiB 的输入按固定额度处理。三端取同一组数值不是为了互通，而是为了同一份恶意载荷在任何一端都被同样拒绝——否则攻击者只需挑一个部署了最宽实现的节点。
+绝对上限 64 MiB，膨胀比上限 100:1，两者同时生效；小于 64 KiB 的输入按固定额度处理。Java、Go、.NET 与 C server 取同一组数值不是为了互通，而是为了同一份恶意载荷在任何一端都被同样拒绝——否则攻击者只需挑一个部署了最宽实现的节点。C 的 gzip/x-gzip、zlib deflate 与 raw deflate 共用有界解压模块，达到上限恰好允许，超过一字节即拒绝；Direct HTTP 改写遇到损坏或超限载荷时保留原始压缩响应，不做部分改写。
 
 ## 一致的策略，不同的机制
 
@@ -57,9 +57,9 @@ Unix mode 位在 Windows 上没有意义，而把 ACL 读到足以判断"过宽"
 
 密钥必须放在本进程无需协助就能拿到的地方，因此任何以该用户身份运行的人同样能解密，而读不到文件的人本来也读不到密钥。文件权限才是真正区分这两种情况的机制——OpenSSH 对权限过宽的私钥选择拒绝而不是默认加密，正是这个道理。这一条写下来，是为了下一个人不必重新推导，也不会误以为"加密存储"是被遗漏了。
 
-### C server 不在安全门禁内
+### C server 安全门禁
 
-C server 按要求冻结为轻量兼容子集，缺少 TLS、对象存储、live discovery/client-message、HTTP 媒体采集和 Peer Mesh 数据面。它不纳入本篇任何一条结论，引用时必须显式排除。
+C server 已完成本地可构造的 Java 同语义安全门禁：管理用户 PBKDF2/旧哈希迁移、无默认口令、IP/账号登录限流、可信代理 CIDR、解压绝对/膨胀比上限、control/data TLS、严格 HTTPS OIDC/GitHub/S3 请求、邮件注册/Turnstile、client-message ticket/权限/帧校验、公共 discovery 隔离/容量/限流/Redis 故障关闭、持久房间角色/邀请/配对码、流程图 3 MiB/50 版、对象存储 tenant/owner/room-role/配额/一次性授权、媒体 ticket/Range/过期清理，以及 Peer Mesh tenant/ACL/session/service/STUN/TURN long-term credential、nonce、permission、allocation/relay quota。`SPECUS_ENV` 未设置或未知按 prod，弱口令/JWT 占位值与不安全 TLS 部署拒绝启动，prod 禁止演示数据。严格 Release 与 ASan/UBSan CTest 均为 22/22；真实私有 OSS/ES、生产证书/OIDC、跨 NAT/真机和长时间压力仍是环境验收，不能由源码门禁替代。
 
 ## 拒绝而不是告警
 

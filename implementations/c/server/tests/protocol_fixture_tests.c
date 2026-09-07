@@ -49,10 +49,21 @@ static int test_message_response_decode(void)
         && strcmp(response.to_client_name, "Demo client") == 0
         && response.message_type == ST_MESSAGE_TYPE_NAT_CONTROL
         && strcmp(response.message, "{\"clientName\":\"Demo client\",\"remotePort\":7010}") == 0;
+    st_buffer encoded = st_protocol_encode_message_response(
+        "admin",
+        "Demo client",
+        ST_MESSAGE_TYPE_NAT_CONTROL,
+        "{\"clientName\":\"Demo client\",\"remotePort\":7010}");
+    if (encoded.data == NULL
+        || encoded.len != ST_HEADER_SIZE + header.length
+        || memcmp(encoded.data, bytes, encoded.len) != 0) {
+        ok = 0;
+    }
     if (!ok) {
         fprintf(stderr, "message response content mismatch\n");
     }
     st_message_response_free(&response);
+    st_buffer_free(&encoded);
     free(bytes);
     return ok ? 0 : 1;
 }

@@ -16,6 +16,13 @@ void st_sha256(const uint8_t *data, size_t len, uint8_t out[ST_SHA256_LEN]);
 void st_hmac_sha256(const uint8_t *key, size_t key_len,
                     const uint8_t *data, size_t len,
                     uint8_t out[ST_SHA256_LEN]);
+int st_pbkdf2_hmac_sha256(const uint8_t *password,
+                          size_t password_len,
+                          const uint8_t *salt,
+                          size_t salt_len,
+                          unsigned int iterations,
+                          uint8_t *out,
+                          size_t out_len);
 
 int st_hex_decode_32(const char *hex, uint8_t out[ST_SHA256_LEN]);
 void st_hex_encode(const uint8_t *data, size_t len, char *out);

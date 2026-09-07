@@ -68,6 +68,50 @@ static void build_token_key(const char *jwt_secret, uint8_t key[ST_SHA256_LEN])
     memcpy(key, fallback_key, ST_SHA256_LEN);
 }
 
+int st_security_pairing_code_hash(const char *code, char out[65])
+{
+    static const char domain[] = "public-transfer-pairing:v1:";
+    if (code == NULL || out == NULL) {
+        return -1;
+    }
+    size_t code_len = strlen(code);
+    if (code_len > 32U) {
+        return -1;
+    }
+    char message[sizeof(domain) + 32U];
+    int written = snprintf(message, sizeof(message), "%s%s", domain, code);
+    if (written < 0 || (size_t)written >= sizeof(message)) {
+        return -1;
+    }
+    uint8_t key[ST_SHA256_LEN];
+    uint8_t digest[ST_SHA256_LEN];
+    build_token_key(getenv("SPECUS_AUTH_JWT_SECRET"), key);
+    st_hmac_sha256(key,
+                   sizeof(key),
+                   (const uint8_t *)message,
+                   (size_t)written,
+                   digest);
+    st_hex_encode(digest, sizeof(digest), out);
+    return 0;
+}
+
+int st_security_registration_code_hash(const char *registration_id,
+                                       const char *code,
+                                       char out[65])
+{
+    if (registration_id == NULL || code == NULL || out == NULL
+        || strlen(registration_id) > 64U || strlen(code) > 16U) return -1;
+    char message[96];
+    int written = snprintf(message, sizeof(message), "%s:%s", registration_id, code);
+    if (written <= 0 || (size_t)written >= sizeof(message)) return -1;
+    uint8_t key[ST_SHA256_LEN];
+    uint8_t digest[ST_SHA256_LEN];
+    build_token_key(getenv("SPECUS_AUTH_JWT_SECRET"), key);
+    st_hmac_sha256(key, sizeof(key), (const uint8_t *)message, (size_t)written, digest);
+    st_hex_encode(digest, sizeof(digest), out);
+    return 0;
+}
+
 static size_t base64url_encoded_len(size_t len)
 {
     size_t full = len / 3U;
@@ -372,6 +416,69 @@ int st_security_validate_local_token(const char *token,
     return ok ? 0 : -1;
 }
 
+int st_security_build_oidc_config_extended(const char *client_id,
+                                           const char *authorization_endpoint,
+                                           const char *registration_endpoint,
+                                           const char *end_session_endpoint,
+                                           const char *redirect_uri,
+                                           const char *scope,
+                                           int password_login_enabled,
+                                           int registration_enabled,
+                                           int turnstile_enabled,
+                                           const char *turnstile_site_key,
+                                           char *out,
+                                           size_t out_len)
+{
+    int configured = client_id != NULL && *client_id != '\0';
+    char *escaped_client_id = st_json_escape(non_null(client_id));
+    char *escaped_auth = st_json_escape(non_null(authorization_endpoint));
+    char *escaped_registration = st_json_escape(non_null(registration_endpoint));
+    char *escaped_logout = st_json_escape(non_null(end_session_endpoint));
+    char *escaped_redirect = st_json_escape(non_null(redirect_uri));
+    char *escaped_scope = st_json_escape(non_null(scope));
+    char *escaped_turnstile_site_key = st_json_escape(
+        turnstile_enabled ? non_null(turnstile_site_key) : "");
+    if (escaped_client_id == NULL || escaped_auth == NULL || escaped_logout == NULL || escaped_redirect == NULL
+        || escaped_registration == NULL || escaped_scope == NULL || escaped_turnstile_site_key == NULL) {
+        free(escaped_client_id);
+        free(escaped_auth);
+        free(escaped_registration);
+        free(escaped_logout);
+        free(escaped_redirect);
+        free(escaped_scope);
+        free(escaped_turnstile_site_key);
+        return -1;
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "{\"configured\":%s,\"authorizationEndpoint\":\"%s\","
+                           "\"registrationEndpoint\":\"%s\",\"endSessionEndpoint\":\"%s\","
+                           "\"clientId\":\"%s\",\"redirectUri\":\"%s\",\"scope\":\"%s\","
+                           "\"passwordLoginEnabled\":%s,\"registrationEnabled\":%s,"
+                           "\"emailVerificationRequired\":%s,\"turnstileEnabled\":%s,"
+                           "\"turnstileSiteKey\":\"%s\"}",
+                           configured ? "true" : "false",
+                           escaped_auth,
+                           escaped_registration,
+                           escaped_logout,
+                           escaped_client_id,
+                           escaped_redirect,
+                           escaped_scope,
+                           password_login_enabled ? "true" : "false",
+                           registration_enabled ? "true" : "false",
+                           registration_enabled ? "true" : "false",
+                           turnstile_enabled ? "true" : "false",
+                           escaped_turnstile_site_key);
+    free(escaped_client_id);
+    free(escaped_auth);
+    free(escaped_registration);
+    free(escaped_logout);
+    free(escaped_redirect);
+    free(escaped_scope);
+    free(escaped_turnstile_site_key);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
 int st_security_build_oidc_config(const char *client_id,
                                   const char *authorization_endpoint,
                                   const char *end_session_endpoint,
@@ -381,39 +488,10 @@ int st_security_build_oidc_config(const char *client_id,
                                   char *out,
                                   size_t out_len)
 {
-    int configured = client_id != NULL && *client_id != '\0';
-    char *escaped_client_id = st_json_escape(non_null(client_id));
-    char *escaped_auth = st_json_escape(non_null(authorization_endpoint));
-    char *escaped_logout = st_json_escape(non_null(end_session_endpoint));
-    char *escaped_redirect = st_json_escape(non_null(redirect_uri));
-    char *escaped_scope = st_json_escape(non_null(scope));
-    if (escaped_client_id == NULL || escaped_auth == NULL || escaped_logout == NULL || escaped_redirect == NULL
-        || escaped_scope == NULL) {
-        free(escaped_client_id);
-        free(escaped_auth);
-        free(escaped_logout);
-        free(escaped_redirect);
-        free(escaped_scope);
-        return -1;
-    }
-    int written = snprintf(out,
-                           out_len,
-                           "{\"configured\":%s,\"authorizationEndpoint\":\"%s\","
-                           "\"endSessionEndpoint\":\"%s\",\"clientId\":\"%s\","
-                           "\"redirectUri\":\"%s\",\"scope\":\"%s\",\"passwordLoginEnabled\":%s}",
-                           configured ? "true" : "false",
-                           escaped_auth,
-                           escaped_logout,
-                           escaped_client_id,
-                           escaped_redirect,
-                           escaped_scope,
-                           password_login_enabled ? "true" : "false");
-    free(escaped_client_id);
-    free(escaped_auth);
-    free(escaped_logout);
-    free(escaped_redirect);
-    free(escaped_scope);
-    return written < 0 || (size_t)written >= out_len ? -1 : written;
+    return st_security_build_oidc_config_extended(client_id, authorization_endpoint, NULL,
+                                                   end_session_endpoint, redirect_uri, scope,
+                                                   password_login_enabled, 0, 0, NULL,
+                                                   out, out_len);
 }
 
 const char *st_security_tls_mode_label(const char *mode)

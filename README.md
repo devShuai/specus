@@ -7,7 +7,7 @@
 
 引水渠 —— 内网服务接入、网络打洞与流量观测。
 
-`specus` 是项目的统一名称。项目以内网服务接入和私有组网为核心，Java 版本是当前基准实现；Go、C# 与 Android 按统一 v2 协议持续对齐，源码自动化与真实环境验收范围见下文，C server 冻结为明确列出的兼容子集。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
+`specus` 是项目的统一名称。项目以内网服务接入和私有组网为核心，Java 版本是当前基准实现；Go、C#、Android 与 C server 按统一 v2 协议持续对齐，源码自动化与真实环境验收范围见下文。C server 已解除轻量兼容子集冻结并进入 Java 全量对齐路线，但只有已经实现且通过实际门禁的能力才会标为完成。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
 
 > 当前 README 按 Java 基准实现维护；其它语言实现的覆盖范围见[当前状态](#当前状态)。
 
@@ -60,7 +60,7 @@ flowchart TD
 | `implementations/csharp/server` | .NET 服务端移植(EF Core,多库)；包含独立 `Specus.StunServer` 项目 |
 | `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端使用同一套 v2 线协议 |
 | `implementations/android/client` | Android 图形客户端，提供运行控制台、JSONC 配置、前台服务、TCP/HTTP 隧道、VpnService 和 Peer Mesh 基础数据面 |
-| `implementations/c/server` | C 服务端轻量移植 |
+| `implementations/c/server` | C 服务端 Java 全量对齐实现（进行中） |
 
 主要入口：
 
@@ -510,6 +510,9 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `specus.public-transfer.max-discovery-peers-per-room` | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | 单发现房间在线 peer 上限 |
 | `specus.public-transfer.discovery-message-rate-limit-per-connection` | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` | `360` | 单发现连接每窗口消息数 |
 | `specus.public-transfer.discovery-message-rate-limit-window-seconds` | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | `60` | 发现消息限流窗口秒数 |
+| `specus.public-transfer.pairing-code-ttl-seconds` | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS` | `300` | 配对码有效期，服务端约束为 60–900 秒 |
+| `specus.public-transfer.pairing-code-redeem-rate-limit-per-ip` | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | 单来源 IP 每窗口配对码兑换次数 |
+| `specus.public-transfer.pairing-code-redeem-rate-limit-window-seconds` | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS` | `300` | 配对码兑换固定窗口秒数 |
 | `specus.public-transfer.cluster-enabled` | `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | 启用 Redis 多实例 presence、Pub/Sub、房间修订和共享限流 |
 | `specus.public-transfer.redis-uri` | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | 空 | 集群模式必填，例如 `redis://user:password@redis.internal:6379/0` |
 | `specus.public-transfer.redis-key-prefix` | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis key 与频道前缀；环境之间必须隔离 |
@@ -668,11 +671,11 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - 免登录房间互传：匿名用户可使用 WebRTC Direct 和认证 TURN，登录用户额外支持 OSS 预签名兜底、云端下载与分享链接；Token 房间支持 OWNER/EDITOR/VIEWER 角色邀请、撤销和只读限制；专业流程图基于 maxGraph + Yjs，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标和服务端版本历史；支持 `.stdg`、多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg`、`.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
 - 使用统一 v2 线协议的 Go 客户端，支持 control/data 双连接、登录、心跳、自动重连、TCP 映射和 HTTP/WebSocket 流式直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled`、HTTP 路由 `pathRewriteEnabled`、逐 route Basic 入口认证及 `/http/**` WebSocket SWS2 隧道；C server 的 SQLite 管理路由也使用同一认证字段与数据面校验语义
-- Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
-- Go/.NET server 已对齐 Java 公共互传与客户端消息主路径：`/ws/public-transfer/discovery`、6 个公共/管理附件接口、Aliyun OSS 预签名与 HEAD 完成校验、过期清理、来源 IP/房间限流、`/ws/client-messages`、消息能力持久化和 client/admin fallback；TURN 临时 credential、MESSAGE-INTEGRITY 及 401/438 challenge 也已补齐，Java/Go/.NET/Android 客户端会更新 challenge、换新 transaction 并最多重试一次
-- Go/.NET server 已对齐 Java 的 HTTP route 媒体采集与播放：逐 route 开关、RustFS/S3 multipart、HLS/DASH 清单改写、Range 去重和中断区间保留、跨对象回放、短期 tenant 绑定播放票据及过期清理；真实 RustFS 仍需在部署环境验收
-- Go/.NET server 已对齐 Java 的持久化互传房间角色、配对码、WebSocket room role/discoverable、附件角色授权、公共流程图版本和登录用户云端流程图；.NET 的 SQLite/MySQL/PostgreSQL migration 同步覆盖这些实体与媒体采集实体
-- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 提供明确列出的轻量子集
+- Go/.NET/C server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时支持 Java 风格 Elasticsearch 可选存储与索引容量治理
+- Go/.NET/C server 已对齐 Java 公共互传与客户端消息主路径：`/ws/public-transfer/discovery`、6 个公共/管理附件接口、S3-compatible/Aliyun OSS 预签名与 HEAD 完成校验、过期清理、来源 IP/房间限流、`/ws/client-messages`、消息能力持久化和 client/admin fallback；TURN 临时 credential、MESSAGE-INTEGRITY 及 401/438 challenge 也已补齐
+- Go/.NET/C server 已对齐 Java 的 HTTP route 媒体采集与播放：逐 route 开关、RustFS/S3 multipart、HLS/DASH 清单改写、Range 去重和中断区间保留、跨对象回放、短期 tenant 绑定播放票据及过期清理；真实 RustFS 仍需在部署环境验收
+- Go/.NET/C server 已对齐 Java 的持久化互传房间角色、配对码、WebSocket room role/discoverable、附件角色授权、公共流程图版本和登录用户云端流程图；.NET 的 SQLite/MySQL/PostgreSQL migration 同步覆盖这些实体与媒体采集实体
+- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 的 signalling、service catalog、session/path/traffic 管理与内置 STUN/TURN 已完成源码对齐
 - .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
 - Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、control/data TLS、严格 TCP 半关闭、全双工 HTTP/trailers、Java 兼容的 WebSocket SWS2 frame 规范化、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、全地址 STUN、TURN、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 测试覆盖帧边界、登录、重连、流状态、真实测试证书 TLS、HTTP early response/trailers、probe 防护和端口映射 wire
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
@@ -680,7 +683,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
-- Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 只实现 v2 控制/NAT stream 与管理面的轻量子集，不包含 TLS 控制连接、HTTPS OIDC token exchange、ES 明细、live client-message/公共发现、对象存储或 Peer Mesh 数据面。C 的附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，公共 ICE 仅描述显式配置的外部 STUN/TURN 服务。
+- Peer Mesh 的 Go/.NET client 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 已完成计划内 server 源码能力，包括附件、媒体、Elasticsearch、Peer Mesh signalling/service/session 与内置 STUN/TURN。C 仓库没有 client/虚拟网卡；存储未配置时附件路径仍失败关闭为 `409 OBJECT_STORAGE_DISABLED`。真实跨 NAT、真机 VPN/TUN、私有 OSS/ES、跨语言混部和长时间压力仍需部署环境验收。
 - Android Peer Mesh 的源码能力已覆盖 direct UDP、全地址 STUN、TURN relay、session 刷新、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP 显式映射和链路/流量/设备上报；Peer 授权与 Java client 一样由服务端 roster/session grant 执行，不存在需要复制的客户端本地 ACL 镜像。完整真机端到端矩阵仍待环境验收。Direct HTTP 已改用受保护的 Netty transport，不再存在 `HttpURLConnection` 的 request trailer、带 body GET/HEAD 或 early response 能力差异。
 - Java、Go、.NET、Android 客户端已支持登录响应驱动的 control/data TLS 与显式 CA/主机名覆盖；真实生产证书和 L4 TLS 终止仍需在目标部署环境验收。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。

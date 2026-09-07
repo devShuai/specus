@@ -111,16 +111,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Java 21 for cross-language E2E
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
       - name: Refresh package metadata
         run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev
+        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev redis-server
       - name: Configure
         run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build/c-server --parallel
       - name: Test
         run: ctest --test-dir build/c-server --output-on-failure
+      - name: Build Java reference server
+        run: mvn -pl :specus-server -am package -DskipTests -Dspecus.server.web.skip=true
+      - name: C and Java Redis discovery interoperability E2E
+        run: timeout --preserve-status 120s bash implementations/c/server/scripts/java_c_discovery_interop.sh build/c-server/specus-server-c
+      - name: Build Java reference client
+        run: mvn -pl :specus-client -am package -DskipTests
+      - name: Java client NAT and Direct HTTP/WebSocket E2E
+        run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+      - name: Java client SQLite runtime configuration E2E
+        run: timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh

@@ -1,10 +1,10 @@
 # 多语言实现对齐 Java 计划
 
-本文以 `implementations/java/server` 和 `implementations/java/client` 为参考实现，记录 Go、.NET 与 Android client 的对齐状态。
+本文以 `implementations/java/server` 和 `implementations/java/client` 为参考实现，记录 Go、.NET、Android client 与 C server 的对齐状态。
 
 **这里不作"全量对齐"这类总体声明。** 这类说法把四件互相独立的事——线上格式一致、运行时行为一致、安全姿态一致、以及在真实环境里验证过——压成一句话，于是读者无法判断某一条具体结论是否成立。凡是引用对齐结论的地方，都应引用下面某一篇里的具体条目，并连同该条目的边界一起引用。
 
-C server 冻结为轻量兼容子集，不纳入下列任何一篇的结论，引用时必须显式排除。
+C server 已于 2026-08-27 解除轻量兼容子集冻结并进入 Java 全量对齐路线。2026-08-28 已完成计划内源码批次：control/data TLS、OIDC/注册、运行时热下发、client-message、Redis discovery/持久房间/流程图、对象存储附件、HTTP 媒体采集、Elasticsearch 明细、托管客户端包，以及 Peer Mesh signalling/服务目录/内置 STUN/TURN；严格 Release 与 ASan/UBSan CTest 均 `22/22`，Java client NAT/runtime E2E 和 C↔Java Redis discovery 已通过。真实私有 OSS/ES、Go/.NET 混部、跨 NAT/真机、压力/HA 和远端 CI 仍是发布验收边界，因此“源码对齐完成”不能被引用为“生产环境全量替换已完成”。
 
 ## 这份文档为什么被拆开
 

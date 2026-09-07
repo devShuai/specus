@@ -17,30 +17,37 @@ implementations/c/server/
 
 ## 当前状态
 
-当前 C server 冻结在“轻量兼容实现”阶段，用于协议联调和最小可用管理面，不继续扩展 Peer Mesh 数据面：
+2026-08-27 起，C server 已解除“轻量兼容实现”冻结，目标调整为按可验收批次全量对齐 Java server；以下状态更新至 2026-08-28。计划内源码批次与本地可构造门禁已经完成，剩余发布环境矩阵单独列出：
 
 - C11 + POSIX socket + pthread + zlib + SQLite3 构建。
 - Java v2 协议帧头：`0x14353565`、`version=2`、`serializer=4`、固定 command registry 与 body length；32 MiB 按 11 字节 header + body 的完整帧计算，错误 version/serializer/command、截断、尾随和超限长度均拒绝。
 - CompactBinary 直接编码固定 schema，不含旧 `payloadType` 或 raw/deflate envelope；NAT stream 使用固定 16 字节头、JSON metadata 与原始 data，v1 和旧压缩 fixture 只作为拒绝用例。
 - HMAC-SHA256 启动鉴权，支持 SQLite `specus_client_credential` 校验，创建/复用机器用户绑定的客户端身份，写入 `specus_client_session`，并签发 Java-shaped `cs_` runtime token。
+- 内置管理密码默认空，不再提供 `admin/admin`；管理用户使用跨 server PBKDF2-SHA256 格式并在旧 SHA-256 登录成功后迁移。登录尝试按来源 IP 与大小写不敏感账号固定窗口限流，超限返回统一 `429 + Retry-After`。来源地址只在 socket peer 命中 `SPECUS_TRUSTED_PROXIES` 后采信转发头，并从右向左剥离可信代理。
+- `SPECUS_ENV` 与 Java 同样将未设置和未知值解析为 prod；prod 拒绝已知弱管理口令与公开 JWT 占位值，并在主监听及管理 API 的所有 SQLite 初始化入口禁用演示数据播种。
 - control/data 两类连接按 `clientSessionId + accessToken` 登录并绑定角色，校验 token 过期、客户端/凭证启用状态、同机单实例和最大在线实例数；control 关闭时同步清理匹配 data，管理会话状态仍使用 `NETTY_ONLINE` / `DISCONNECTED`。
 - `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`REGISTER_RESULT`、`OPEN`、`DATA`、`FIN`、`RST`、`WINDOW_UPDATE`、`UNREGISTER`、`KEEPALIVE` 核心流程可用。
-- 轻量管理 HTTP listener 已覆盖本地密码登录、HS256 管理 JWT、管理用户、客户端凭证、客户端、TCP 映射、HTTP route、连接记录、连接归档统计、日流量、资源流量和 SQLite HTTP/TCP 明细查询。
-- Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge，并接入 Java-compatible 响应路径改写，覆盖 HTML/CSS、runtime polyfill、gzip/deflate 解码。
-- OIDC 浏览器配置接口已对齐 Java；`/oidc/token` 支持 HTTP token endpoint 的 Authorization Code + PKCE 代理交换，`https://` token endpoint 明确返回 `502`。
-- Peer Mesh 管理契约已覆盖 status、device list、device enabled 持久化、带 `OUTBOUND/INBOUND/BOTH` direction 的 ACL list/create/delete、session list/close/close-open；tenant/owner 可见性比较区分大小写。C 数据面不会主动创建真实 peer session，虚拟网卡状态固定为 `UNSUPPORTED`。
-- 公共 `/api/public/peer-mesh/stun-config` 与 `/api/public/transfer/ice-config` 可描述显式配置的外部 STUN/TURN，并用 HMAC-SHA1 生成临时 credential；C 进程本身不绑定 STUN/TURN UDP。
-- 启动登录按真实 `sendMessages/receiveMessages/attachments/mediaPreview/maxAttachmentBytes` wire 字段持久化能力；离线管理 view 按 Java 归零。6 个附件路径精确匹配 Java，但因无对象存储抽象统一返回 `409 OBJECT_STORAGE_DISABLED`。
+- SQLite mapping/route 变更会重载完整配置并向在线 control session 热推 `NAT_CONTROL`；手工推送在线返回 `200`、离线返回 `409`。客户端管理 view 从活跃 control session 投影 `online/connectedSinceMs`，在线时返回持久化版本与消息能力，并聚合上下行总量。
+- 管理 HTTP listener 已覆盖本地密码/邮件验证注册、OIDC、HS256 管理 JWT、管理用户、客户端凭证/包、客户端、TCP 映射、HTTP route、连接记录/归档、流量汇总、SQLite/Elasticsearch 明细、对象存储、媒体采集、公共房间/流程图和 Peer Mesh 管理接口。
+- Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge；SQLite route 的 `insecureSkipVerify` 与 `mediaCaptureEnabled` 会经管理 API、登录快照和 `NAT_CONTROL` 下发。响应路径改写覆盖 HTML/CSS、gzip/deflate 解码及同源外链 runtime，公网 query 的裸 `{}` 会在进入 NAT `OPEN` 前编码。SWS2 校验读取中央应用协议向量并拒绝保留 close code；启用媒体采集时使用经启动校验的专用 S3-compatible/RustFS 存储。
+- gzip/x-gzip、zlib deflate 与 raw deflate 已共用 Java 同值的有界解压模块：64 MiB 绝对上限、100:1 膨胀比、微小输入 64 KiB 固定额度；超限或损坏响应保持原始压缩字节，不进入路径改写。
+- OIDC 浏览器配置接口已对齐 Java；`/oidc/token` 支持 HTTP/HTTPS token endpoint 的 Authorization Code + PKCE 代理交换，HTTPS 默认校验证书链和主机名，并支持显式私有 CA。
+- control/data listener 已接入 OpenSSL TLS 1.2+，支持 PKCS#12、PEM 与开发期自签证书；prod 拒绝自签证书和公网明文监听，仅允许受信 L4 终止后绑定 loopback/私网。
+- Peer Mesh 已覆盖 status/device/ACL/session/stats、service-sharing、service CRUD/import/audit；认证 `PEER_CONTROL` 创建真实 session 并处理 roster、offer/answer/candidates/close、path/traffic/NAT/virtual-device report、service catalog revision/TTL。所有管理 mutation 会即时 refresh 在线租户客户端，撤权会清空陈旧 catalog。
+- `SPECUS_PEER_MESH_ENABLED=true` 时进程绑定内置 RFC 5389/5780 STUN 与 RFC 5766 TURN UDP listener，支持 alternate-address NAT probe、long-term credential、realm/nonce/MESSAGE-INTEGRITY、allocation/refresh/permission/channel/send/data/ChannelData、双 allocation、relay 端口池和配额/过期清理。
+- 启动登录按真实 `sendMessages/receiveMessages/attachments/mediaPreview/maxAttachmentBytes` wire 字段持久化能力；离线管理 view 按 Java 归零。6 个附件路径支持 S3-compatible/Aliyun OSS presign/HEAD complete/download、一次性授权、room role、tenant/owner、quota/rate/expiry；未配置 provider 时仍精确返回 `409 OBJECT_STORAGE_DISABLED`。
+- `/ws/client-messages` 已实现 endpoint 绑定 ticket、hello、管理端到 control 写入回执、客户端到管理订阅 fan-out 与方向性 Peer ACL 约束的客户端 fallback；目标写使用每管理 socket 64、进程 1,024 的有界异步任务，写成功后才回 `written`。输入执行完整 JSON、WebSocket 分片/控制帧、UTF-8 和 65,536 UTF-16 code unit 校验。附件和离线 outbox 不在该文本 fallback 内。
+- `/ws/public-transfer/discovery` 已实现来源绑定 45 秒一次性 ticket、名称预检、同持久房间跨地址与同地址跨房间的合并可见域、不同地址隔离、peer/displayName 冲突、房间容量、hello/roster、定向/广播信令、ping、固定窗口限流、写超时、65,536 UTF-16 code unit 与 STWR2/STAP2 定向 relay 校验。可选 Redis 模式已对齐 presence lease、合并 revision、全局名称/peer/容量、分布式消息限流、STCE2 Pub/Sub 路由与故障失败关闭，并通过两个 C 进程真实 WebSocket E2E。SQLite 模式已补 OWNER/EDITOR/VIEWER 房间、邀请 list/create/revoke、8 位配对码创建/原子兑换、过期/撤销拒绝、20 个有效邀请上限、来源 IP 限流和公共流程图版本四端点（3 MiB、最新 50 版、VIEWER 只读/OWNER 删除）。
+- Ubuntu `protocol-v2` CI 的 C server job 已安装 OpenSSL/libcurl/hiredis/utf8proc/Redis 依赖，并接入 CMake/CTest、Java reference server/client、C↔Java Redis discovery、NAT/Direct HTTP/WebSocket 与 SQLite runtime 热更新 E2E；合入后仍需以 GitHub Actions 实际绿灯作为远端门禁结论。
 
 > 下方 Phase 0–10 保留最初迁移过程和验收设想，出现的 v1、`CONNECTED` / `DISCONNECTED`、旧独立 HTTP command 或 wire deflate 仅代表历史阶段，不是当前协议。当前行为以本节、`protocol/spec/` 和 `cross-language-java-alignment-plan.md` 为准。
 
-仍未实现或暂不推进：
+全量对齐剩余发布环境队列：
 
-- TLS listener 与 HTTPS OIDC token exchange。
-- Elasticsearch 明细存储。
-- Peer Mesh 真实数据面、虚拟网卡、标准 STUN/TURN 子集 relay。
-- 公共发现 WebSocket、live client-message 和可用对象存储附件数据面。
-- Java 同级别的生产级背压、水位线和完整 HA 治理。
+- 真实私有 RustFS/Aliyun OSS/Elasticsearch、生产证书与生产 OIDC/SMTP/Turnstile。
+- Go/.NET client × C server、Go/.NET server 与 C 的 Redis discovery 混部，以及跨语言 binary/fault 浏览器矩阵。
+- 真实跨 NAT direct/relay、Windows/Linux/macOS/Android 真机 VPN/TUN、10 GB 长流量。
+- 多客户端并发、短连接风暴、1 小时/24 小时 soak、进程故障注入与 HA 部署观测。
 
 ## 项目布局
 
@@ -51,19 +58,35 @@ implementations/c/server/
 ├── README.md
 ├── src/
 │   ├── admin_http.c / .h         # 管理 API、静态资源、Direct HTTP / WebSocket bridge
-│   ├── crypto.c / .h             # SHA-256, HMAC-SHA256, HMAC-SHA1, hex, constant-time compare
+│   ├── client_address.c / .h     # 可信代理 CIDR、真实客户端地址与转发链解析
+│   ├── crypto.c / .h             # SHA-256、HMAC、PBKDF2、hex、constant-time compare
+│   ├── decompression_limits.c/.h # 64 MiB / 100:1 有界 gzip/deflate 解压
+│   ├── http_client.c / .h        # libcurl HTTP/HTTPS OIDC token 交换与严格证书校验
 │   ├── json.c / .h               # NAT metadata 所需的最小 JSON 解析和转义
+│   ├── login_rate_limiter.c / .h # 管理登录 IP / 账号双维固定窗口限流
+│   ├── password_hash.c / .h      # 人类口令 PBKDF2 格式、旧 SHA-256 验证与登录迁移
 │   ├── protocol.c / .h           # Java wire protocol + compact payload + NAT_MESSAGE
+│   ├── public_discovery.c / .h   # 公共互传 ticket、roster、信令与 STWR2 relay
+│   ├── public_room.c / .h        # SQLite 房间角色、邀请/配对与公共流程图版本
 │   ├── security.c / .h           # 本地 JWT、OIDC 配置与 HTTP token exchange
+│   ├── security_baseline.c / .h  # 部署环境、prod 弱凭据拒绝与演示数据门禁
 │   ├── storage.c / .h            # SQLite schema、CRUD、流量与 Peer Mesh 管理数据
+│   ├── tls_transport.c / .h      # OpenSSL control/data TLS listener 与部署门禁
 │   └── main.c                    # 控制连接 listener + TCP NAT listener
 └── tests/
     ├── admin_http_tests.c
+    ├── client_address_tests.c
     ├── crypto_tests.c
+    ├── decompression_limits_tests.c
+    ├── http_client_tests.c
     ├── json_tests.c
+    ├── login_rate_limiter_tests.c
+    ├── password_hash_tests.c
     ├── protocol_fixture_tests.c
     ├── security_tests.c
-    └── storage_tests.c
+    ├── security_baseline_tests.c
+    ├── storage_tests.c
+    └── tls_transport_tests.c
 ```
 
 ## 执行原则
@@ -73,7 +96,7 @@ implementations/c/server/
 - 协议层必须用 fixture 保底，尽量做到 Java fixture 和 C 编码字节一致。
 - 每阶段都要有明确验收命令和至少一个端到端场景。
 - C 工程保持并行目录，不替换现有 Java/C# 工程。
-- 依赖要克制：当前已接受 `pthread`、`zlib`、`sqlite3`；后续只有在继续推进 TLS / HTTPS OIDC 时再评估 TLS HTTP client 等额外库。
+- 依赖要克制：当前已接受 `pthread`、`zlib`、`sqlite3`、OpenSSL 和 libcurl；新增依赖必须对应明确验收能力。
 
 > 状态说明：以下 Phase 记录迁移过程，但已经按现行两阶段认证和当前命令修正，不能替代上面的“当前状态”。当前验证缺口以“总体验证矩阵”和“当前推荐下一步”为准。
 
@@ -239,7 +262,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 - SQLite：`sqlite3`
 - 配置文件：优先 JSON 文件，后续可接 SQLite。
-- 密码 hash：沿用 SHA-256 hex，保持与现有管理模型兼容。
+- 人类管理口令：使用跨 server 共享的版本化 PBKDF2-SHA256 格式；旧 SHA-256 hex 仅用于登录迁移。机器凭据与 route gate 等高熵密钥继续使用 SHA-256 digest。
 
 **任务**：
 
@@ -452,29 +475,35 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 | 能力 | 测试方式 | 当前状态 |
 | --- | --- | --- |
-| SHA-256/HMAC-SHA256/HMAC-SHA1 | C 单元测试 | MSVC 纯 crypto 子集通过；完整 POSIX suite 待 Linux 工具链 |
-| Java frame header | fixture encode/decode + 等号/超限边界 | 已覆盖完整帧 32 MiB 口径；待 POSIX 工具链执行 |
+| SHA-256/HMAC-SHA256/HMAC-SHA1/PBKDF2 | C 单元测试 | Ubuntu 24.04 WSL `make test` 已通过 |
+| gzip/deflate 解压安全 | `decompression_limits_tests.c` + 管理 API 集成测试 | 64 MiB/100:1、64 KiB 恰好边界、gzip/zlib/raw-deflate 与压缩炸弹拒绝均通过 |
+| Java frame header | fixture encode/decode + 等号/超限边界 | 已覆盖完整帧 32 MiB 口径；Ubuntu 24.04 WSL 已执行 |
 | compact raw payload | fixture encode/decode | 已覆盖 |
 | legacy compact deflate | v2 malformed/rejection fixture | wire deflate 已删除，只验证明确拒绝 |
-| Java client 登录 | 手动联调 | 已做过基础登录；当前需端口权限重跑 |
-| 心跳 | Java client 联调 | 待持续性测试 |
-| NAT_CONTROL | 协议测试 + Java client 联调 | 协议已覆盖，联调待重跑 |
-| TCP NAT 转发 | Java client + echo server | 待完整 E2E |
+| Java client 登录 | SQLite HTTP 登录 + control/data E2E | Windows JDK 21 Java client × WSL C server 已通过环境 token 与 SQLite credential 两条路径 |
+| 心跳 | Java client 联调 | 登录后的 heartbeat response 已在联调运行期覆盖；长时间持续性仍待 soak |
+| NAT_CONTROL | 协议测试 + Java client 联调 | 登录初始快照、手工推送、mapping/route 创建/删除/重建热推均通过 |
+| TCP NAT 转发 | Java client + echo server | 小包、1 MiB、重连、动态删除与重建均通过 |
 | 多 client | 集成测试 | 在线连接已按 `clientName` 链表隔离；多 client 集成验收未开始 |
-| SQLite 持久化 | `storage_tests.c` + 管理 API 测试 | 实现和测试用例已具备；仍待 Linux/C 工具链重跑 |
-| 管理 API | `admin_http_tests.c` | 实现和测试用例已具备；仍待 Linux/C 工具链重跑 |
+| SQLite 持久化 | `storage_tests.c` + 管理 API + 跨进程 E2E | 单元测试与 SQLite credential、在线投影、动态配置 E2E 均通过；并发打开设置 5 秒 busy timeout |
+| 管理 API / 启动安全 | `admin_http_tests.c`、`client_address_tests.c`、`security_baseline_tests.c` | PBKDF2、无默认口令、登录限流、可信代理、prod 弱凭据拒绝/演示数据禁用及既有 API 用例在 Ubuntu 24.04 WSL 通过 |
 | 管理页面 | 静态文件服务 + 浏览器手测/API E2E | 静态文件服务已接线；浏览器完整流程待验收 |
-| Direct HTTP | 协议/改写测试 + Java client E2E | 普通 HTTP、WebSocket bridge 和改写已实现；Java client E2E 待验收 |
-| OIDC | HTTP mock token endpoint + API 测试 | HTTP Authorization Code + PKCE 已覆盖；HTTPS token exchange 未实现 |
-| TLS | TLS listener E2E | 未实现 |
-| 公共 ICE / 附件禁用契约 | `admin_http_tests.c` | 外部 ICE/临时 credential 与 6 路径 409 用例已写；待 POSIX 工具链执行 |
+| Direct HTTP | 协议/改写测试 + Java client E2E | POST/path/query 与 WebSocket/SWS2 text/continuation/ping/pong/close 已通过 |
+| OIDC | HTTP/HTTPS mock token endpoint + API 测试 | Authorization Code + PKCE、严格证书链/主机名、私有 CA 正反例已通过 |
+| TLS | TLS listener E2E | TLS 1.2+、PKCS#12/PEM、自签开发模式及 prod 公网明文/自签拒绝已通过 |
+| 公共 ICE / 对象存储附件 | `admin_http_tests.c` + `object_storage_tests.c` + `object_storage_e2e.sh` | 内置 STUN/TURN 配置、临时 credential、6 路径 storage-disabled 失败关闭、S3-compatible presign/HEAD complete/download、授权/配额/过期清理均通过 |
+| Elasticsearch 明细 | `elasticsearch_traffic_tests.c` + `elasticsearch_traffic_test.sh` | HTTP/TCP index 初始化、批量写入、分页查询与容量清理通过 fake ES 真实 HTTP 门禁 |
+| HTTP 媒体采集 | `media_capture_tests.c` + `media_capture_test.sh` | multipart、HLS/DASH/渐进式、Range 去重/拼接/稀疏回放/回源、ticket/manifest/asset 和过期清理通过 fake S3 门禁 |
+| Peer Mesh / STUN / TURN | `peer_mesh_tests.c` + `stun_turn_tests.c` | roster/session/candidate/close、service catalog/refresh、路径/流量、RFC 5780 NAT probe、TURN allocation/permission/channel/relay/quota/expiry 通过 |
+| client-message control fallback | `admin_http_tests.c` + `storage_tests.c` | 真实 socket 覆盖 ticket/Upgrade/hello、双向 fan-out/回执；存储测试覆盖在线能力和方向性 Peer ACL，跨客户端 E2E 仍待补 |
+| public-transfer discovery / room | `admin_http_tests.c` + `public_coordination_tests.c` + `public_discovery_cluster_e2e.sh` + `java_c_discovery_interop.sh` | 来源绑定单次 ticket、持久 OWNER/EDITOR/VIEWER 房间、邀请创建/列表/撤销、配对码原子兑换/限流、流程图角色权限/精确 3 MiB/超限拒绝/最新 50 版、同房间/同网合并域、隔离、冲突/容量、Unicode NFC 名称键、信令/ping/分布式限流/STWR2、双实例 Pub/Sub 与 Redis 故障关闭已通过；C↔Java roster/名称/双向信令混部通过，Go/.NET 与跨语言 binary/fault 浏览器矩阵仍待补 |
 
 ## 当前推荐下一步
 
-1. 在 Linux/C 工具链环境执行 `make -C implementations/c/server test`，确认现有六组测试全部通过。
-2. 在可绑定端口的环境跑完整 Java client × C server × echo server NAT E2E，并保存登录、心跳、NAT_CONTROL 和双向流量证据。
-3. 补跑 Java / Go / .NET / Android client × C server 的 Direct HTTP 普通请求与 WebSocket E2E。
-4. 若解除“轻量兼容实现”冻结，再单独评估 TLS listener、HTTPS OIDC token exchange 与生产级背压；不要把这些能力标为已完成。
+1. 合入并观察 Ubuntu CI 中新增的 CMake/CTest `22/22`、C↔Java Redis discovery、`nat_e2e_smoke.sh` 和 `runtime_config_e2e.sh` 门禁；远端绿灯前不把本地 WSL 结果替代为 CI 结论。
+2. 补跑 Go / .NET / Android client × C server 的 TCP、Direct HTTP 与 WebSocket E2E；Android 仍需真机。
+3. 执行多客户端并发、短连接风暴、1 小时长连接和 24 小时 control soak，记录 fd/thread/memory 与延迟。
+4. 按 #35 继续执行真实私有 OSS/ES、跨 NAT、跨语言客户端/Redis 混部、长时间压力与故障注入；源码能力已完成，只有外部环境矩阵通过后才能标为生产替换完成。
 
 ## 常用命令
 

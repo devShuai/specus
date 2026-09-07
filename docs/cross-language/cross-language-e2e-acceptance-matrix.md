@@ -1,10 +1,10 @@
 # 跨语言端到端验收矩阵
 
-最后更新：2026-07-22
+最后更新：2026-08-28
 
 ## 1. 目标
 
-本文用于验收 Java、Go、C# 三套 server、Java / Go / C# / Android client 是否在真实运行环境下保持协议、功能和观测行为一致。C server 仍按轻量兼容实现单独记录，不进入完整 P0 互换矩阵。
+本文用于验收 Java、Go、C# 与 C 四套 server、Java / Go / C# / Android client 是否在真实运行环境下保持协议、功能和观测行为一致。C server 的计划内源码能力与本地可构造门禁已完成，并通过 Java client TCP/Direct HTTP/WebSocket/SWS2、运行时热更新及 C↔Java Redis discovery；但真实私有 OSS/ES、Go/.NET client、跨 NAT/真机、压力/HA 环境矩阵尚未完成，因此 C 组合仍不能并入既有 9 组合的生产全量通过结论。
 
 验收重点不是单元测试覆盖率，而是回答下面几个问题：
 
@@ -28,6 +28,16 @@
 | L-07 | C# | Java | Java | C# server 接 Java client |
 | L-08 | C# | Go | Go | C# server 接 Go client |
 | L-09 | C# | C# | C# | C# 自闭环 |
+
+C server 对齐采用补充矩阵单独记录，避免把局部证据等同于完整验收：
+
+| 编号 | Server | Client | 必测内容 | 当前证据/状态 |
+| --- | --- | --- | --- | --- |
+| C-01 | C | Java | 登录、TCP、小流量与 1 MiB、断线重连、Direct HTTP POST/query、WebSocket/SWS2 | 本地 Ubuntu/WSL 真实 E2E 已通过；CI 已配置，尚待远端 Actions 绿灯 |
+| C-02 | C | Java | NAT_CONTROL 运行时更新、管理面在线状态、映射/路由增删与重建 | 本地运行时配置 E2E 已通过 |
+| C-03 | C | Java/协议 socket | admin→client、client→admin、client→client 文本消息与权限边界 | 真实管理 WebSocket/control socket 与单元测试已通过；附件对象存储路径已实现，离线 outbox 不属于当前 live fallback |
+| C-04 | C | 浏览器协议 socket + Redis + C/Java server | 公共 discovery ticket、持久角色邀请/配对、流程图版本、合并可见域、roster、信令、限流、STWR2 | 单实例真实 socket、SQLite 邀请/撤销、并发一次性配对码、持久 room-role 与流程图权限/3 MiB/50 版边界，以及 Redis 双 C 实例名称/容量/revision/text/binary/隐藏端/故障关闭已通过；C↔Java 共享 Redis 的 roster、全局名称与双向定向信令也已通过。Go/.NET 混部和浏览器矩阵待验收 |
+| C-05 | C | Java/浏览器 | Peer Mesh、STUN/TURN、附件、ES、管理观测与完整 P0/P1/P2 | 待实现并验收，C server 暂不能声明全量对齐 |
 
 混合客户端组合用于 Peer Mesh 互通：
 
@@ -97,10 +107,10 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | P0-09 查询默认不 flush | L-01 到 L-09 | 频繁刷新流量页面和明细接口 | 查询不强制 flush；显式 `flush=true` 才准实时刷新 |
 | P0-10 ES 写入不 refresh | L-01 到 L-09 | 使用 ES 存储并压测明细写入 | 写入无 `refresh=true` 放大，查询符合最终一致性 |
 | P0-11 公共发现信令 | Java/Go/C# server | 分别测试 roomToken 房间、无 token 同公网 IP 房间、不同 IP、人数上限、64 KiB 与消息频率上限 | roster/定向 signal 只在同组传播；越界明确报错并关闭，不可跨房间泄漏 |
-| P0-12 公共/管理附件 | Java/Go/C# server | 覆盖 6 个 REST 路径、OSS PUT/HEAD/GET、错误 roomToken、跨 tenant/owner、TTL=0、超大小、过期清理，以及 storage disabled 前后的既有 PENDING | 状态码、文件名/object key、签名 header、HEAD 大小校验和删除行为与 Java 一致；未先触发 IP/房间 429 时新 presign 禁用存储返回 409，既有 PENDING complete 跳过 HEAD |
-| P0-13 客户端消息 | Java/Go/C# server + 支持消息的 client | admin→client、client→admin、client→client；制造多在线 session、大小写不同的 tenant/owner、无接收能力和离线状态；Java/Go/C#/Android 互发普通消息与 ACK | 只向有权限且任一在线 session 声明可接收的目标发送；403 带鉴权原因；fallback 不越权；普通消息/ACK 使用各端都可解的 `STMSG2`，未实现附件数据面的客户端不虚报能力 |
+| P0-12 公共/管理附件 | Java/Go/C#/C server | 覆盖 6 个 REST 路径、OSS PUT/HEAD/GET、错误 roomToken、跨 tenant/owner、TTL=0、超大小、过期清理，以及 storage disabled 前后的既有 PENDING | 状态码、文件名/object key、签名 header、HEAD 大小校验和删除行为与 Java 一致；未先触发 IP/房间 429 时新 presign 禁用存储返回 409，既有 PENDING complete 跳过 HEAD |
+| P0-13 客户端消息 | Java/Go/C#/C server + 支持消息的 client | admin→client、client→admin、client→client；制造多在线 session、大小写不同的 tenant/owner、无接收能力和离线状态；Java/Go/C#/Android 互发普通消息与 ACK | 只向有权限且任一在线 session 声明可接收的目标发送；403 带鉴权原因；fallback 不越权；普通消息/ACK 使用各端都可解的 `STMSG2`，客户端只声明真实附件/媒体能力 |
 | P0-14 协议边界 | 所有实现 | 构造登录前 16 KiB、各 command body 上限、完整帧 32 MiB 的等号/超 1 字节边界，以及截断、尾随、错误 version/serializer/command | 等号边界按规范接受，越界在分配前拒绝并给出统一原因；wire deflate 已删除，任何压缩标记或旧 fixture 都拒绝 |
-| P0-15 多实例公共互传 | Java/Go/C# 各两实例 + Redis | 客户端分布到不同实例，覆盖同名、房间人数、roster 修订、text/binary relay、presign 限速和 Redis 故障 | presence、全局名称、房间上限、revision 与限速一致；跨实例消息定向且 Redis 失败时入口失败关闭 |
+| P0-15 多实例公共互传 | Java/Go/C#/C 各两实例 + Redis | 客户端分布到不同实例，覆盖同名、房间人数、roster 修订、text/binary relay、presign 限速和 Redis 故障 | presence、全局名称、房间上限、revision 与限速一致；跨实例消息定向且 Redis 失败时入口失败关闭 |
 
 ## 6. P0 Peer Mesh 用例
 

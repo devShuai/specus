@@ -1,5 +1,7 @@
 #include "crypto.h"
 
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -357,6 +359,56 @@ void st_hmac_sha256(const uint8_t *key, size_t key_len,
     memset(normalized_key, 0, sizeof(normalized_key));
     memset(inner_hash, 0, sizeof(inner_hash));
     memset(block, 0, sizeof(block));
+}
+
+int st_pbkdf2_hmac_sha256(const uint8_t *password,
+                          size_t password_len,
+                          const uint8_t *salt,
+                          size_t salt_len,
+                          unsigned int iterations,
+                          uint8_t *out,
+                          size_t out_len)
+{
+    if (password == NULL || salt == NULL || out == NULL || iterations == 0U || out_len == 0U
+        || salt_len > SIZE_MAX - 4U) {
+        return -1;
+    }
+    size_t blocks = out_len / ST_SHA256_LEN + (out_len % ST_SHA256_LEN != 0U ? 1U : 0U);
+    if (blocks > UINT_MAX) {
+        return -1;
+    }
+    uint8_t *salt_block = malloc(salt_len + 4U);
+    if (salt_block == NULL) {
+        return -1;
+    }
+    memcpy(salt_block, salt, salt_len);
+
+    size_t written = 0;
+    uint8_t current[ST_SHA256_LEN];
+    uint8_t accumulated[ST_SHA256_LEN];
+    for (size_t block = 1U; block <= blocks; ++block) {
+        salt_block[salt_len] = (uint8_t)(block >> 24U);
+        salt_block[salt_len + 1U] = (uint8_t)(block >> 16U);
+        salt_block[salt_len + 2U] = (uint8_t)(block >> 8U);
+        salt_block[salt_len + 3U] = (uint8_t)block;
+        st_hmac_sha256(password, password_len, salt_block, salt_len + 4U, current);
+        memcpy(accumulated, current, sizeof(accumulated));
+        for (unsigned int iteration = 1U; iteration < iterations; ++iteration) {
+            st_hmac_sha256(password, password_len, current, sizeof(current), current);
+            for (size_t i = 0; i < sizeof(accumulated); ++i) {
+                accumulated[i] ^= current[i];
+            }
+        }
+        size_t remaining = out_len - written;
+        size_t copy = remaining < sizeof(accumulated) ? remaining : sizeof(accumulated);
+        memcpy(out + written, accumulated, copy);
+        written += copy;
+    }
+
+    memset(current, 0, sizeof(current));
+    memset(accumulated, 0, sizeof(accumulated));
+    free(salt_block);
+    return 0;
 }
 
 static int hex_digit(char ch)

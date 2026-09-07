@@ -9,7 +9,7 @@
 #include <string.h>
 
 #ifndef ST_FIXTURE_DIR
-#define ST_FIXTURE_DIR "../../../../protocol/test-vectors/control-v2/frames/"
+#define ST_FIXTURE_DIR "../../../protocol/test-vectors/control-v2/frames/"
 #endif
 
 static int st_test_read_file(const char *path, uint8_t **out, size_t *out_len)

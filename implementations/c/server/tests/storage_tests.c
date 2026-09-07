@@ -93,15 +93,16 @@ static int test_http_route_auth_migration(void)
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_open(path, &db) != SQLITE_OK
         || sqlite3_prepare_v2(db,
-                              "SELECT auth_enabled, auth_username, auth_password_hash "
+                              "SELECT insecure_skip_verify, auth_enabled, auth_username, auth_password_hash "
                               "FROM http_route_mapping WHERE route = 'legacy'",
                               -1,
                               &stmt,
                               NULL) != SQLITE_OK
         || sqlite3_step(stmt) != SQLITE_ROW
         || sqlite3_column_int(stmt, 0) != 0
-        || strcmp((const char *)sqlite3_column_text(stmt, 1), "") != 0
-        || strcmp((const char *)sqlite3_column_text(stmt, 2), "") != 0) {
+        || sqlite3_column_int(stmt, 1) != 0
+        || strcmp((const char *)sqlite3_column_text(stmt, 2), "") != 0
+        || strcmp((const char *)sqlite3_column_text(stmt, 3), "") != 0) {
         fprintf(stderr, "http route auth migrated defaults mismatch\n");
         sqlite3_finalize(stmt);
         sqlite3_close(db);
@@ -420,6 +421,10 @@ int main(void)
                                                 session.id,
                                                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                                                 &login_session) != 0
+        || st_storage_get_client_session_for_login(path,
+                                                   session.id,
+                                                   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                                   &login_session) != 1
         || login_session.id != session.id
         || !login_session.message_send_capable
         || !login_session.message_receive_capable
@@ -442,10 +447,7 @@ int main(void)
                                                           credential.id,
                                                           0,
                                                           &online_count) != 0
-        || online_count != 1
-        || st_storage_mark_client_session_disconnected(path,
-                                                       session.id,
-                                                       "2026-06-25T00:03:00Z") != 0) {
+        || online_count != 1) {
         fprintf(stderr, "client session runtime state mismatch\n");
         unlink(path);
         return 1;
@@ -462,6 +464,22 @@ int main(void)
         || !capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 16777216) {
         fprintf(stderr, "client message capability projection mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_mark_client_session_disconnected(path,
+                                                    session.id,
+                                                    "2026-06-25T00:03:00Z") != 0
+        || st_storage_get_client(path, identity.client_id, &capability_client) != 0
+        || capability_client.message_send_capable
+        || capability_client.message_receive_capable
+        || capability_client.message_attachments_capable
+        || capability_client.message_media_preview_capable
+        || capability_client.message_max_attachment_bytes != 0
+        || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
+        || capability_device.message_attachments_capable
+        || capability_device.message_max_attachment_bytes != 0) {
+        fprintf(stderr, "offline client message capability projection mismatch\n");
         unlink(path);
         return 1;
     }
@@ -497,7 +515,7 @@ int main(void)
     }
 
     st_storage_client acl_target;
-    if (st_storage_upsert_client(path, 0, "tenant-c", "ACL target", "owner2", 1, 30, &acl_target) != 0) {
+    if (st_storage_upsert_client(path, 0, "tenant-c", "ACL target", "owner3", 1, 30, &acl_target) != 0) {
         fprintf(stderr, "peer mesh acl target create mismatch\n");
         unlink(path);
         return 1;
@@ -532,6 +550,26 @@ int main(void)
         unlink(path);
         return 1;
     }
+    st_storage_peer_mesh_device peer_device;
+    int can_peer = -1;
+    if (st_storage_upsert_client(path,
+                                 created_client.id,
+                                 "tenant-c",
+                                 created_client.client_name,
+                                 created_client.owner_username,
+                                 1,
+                                 created_client.connection_rate_limit_per_minute,
+                                 &created_client) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &created_client, 1, &peer_device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &acl_target, 1, &peer_device) != 0
+        || st_storage_can_peer(path, &created_client, &acl_target, &can_peer) != 0
+        || can_peer
+        || st_storage_can_peer(path, &acl_target, &created_client, &can_peer) != 0
+        || can_peer) {
+        fprintf(stderr, "disabled peer mesh ACL fallback permission mismatch\n");
+        unlink(path);
+        return 1;
+    }
     if (st_storage_upsert_peer_mesh_acl(path,
                                         "tenant-c",
                                         "OwnerCase",
@@ -544,6 +582,17 @@ int main(void)
         || strcmp(acl.direction, "INBOUND") != 0
         || !acl.allowed) {
         fprintf(stderr, "peer mesh acl omitted direction should preserve existing value\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_can_peer(path, &created_client, &acl_target, &can_peer) != 0
+        || can_peer
+        || st_storage_can_peer(path, &acl_target, &created_client, &can_peer) != 0
+        || !can_peer
+        || st_storage_update_peer_mesh_device_enabled(path, &acl_target, 0, &peer_device) != 0
+        || st_storage_can_peer(path, &acl_target, &created_client, &can_peer) != 0
+        || can_peer) {
+        fprintf(stderr, "directional peer mesh fallback permission mismatch\n");
         unlink(path);
         return 1;
     }
@@ -684,6 +733,8 @@ int main(void)
                                                 1,
                                                 1,
                                                 1,
+                                                1,
+                                                1,
                                                 "visitor",
                                                 route_password_hash,
                                                 &created_route) != 0
@@ -692,7 +743,9 @@ int main(void)
         || strcmp(created_route.route, "api") != 0
         || strcmp(created_route.target_base_url, "https://example.com/base") != 0
         || created_route.detail_capture_enabled != 1
+        || created_route.media_capture_enabled != 1
         || created_route.path_rewrite_enabled != 1
+        || created_route.insecure_skip_verify != 1
         || created_route.auth_enabled != 1
         || strcmp(created_route.auth_username, "visitor") != 0
         || strcmp(created_route.auth_password_hash, route_password_hash) != 0) {
@@ -708,6 +761,8 @@ int main(void)
                                            0,
                                            0,
                                            0,
+                                           0,
+                                           0,
                                            "viewer",
                                            updated_route_password_hash,
                                            &created_route) != 0
@@ -715,7 +770,9 @@ int main(void)
         || strcmp(created_route.target_base_url, "http://127.0.0.1:8088") != 0
         || created_route.enabled != 0
         || created_route.detail_capture_enabled != 0
+        || created_route.media_capture_enabled != 0
         || created_route.path_rewrite_enabled != 0
+        || created_route.insecure_skip_verify != 0
         || created_route.auth_enabled != 0
         || strcmp(created_route.auth_username, "viewer") != 0
         || strcmp(created_route.auth_password_hash, updated_route_password_hash) != 0) {

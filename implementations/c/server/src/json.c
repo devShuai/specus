@@ -48,6 +48,222 @@ static const char *skip_json_string(const char *p)
     return NULL;
 }
 
+static int hex_value(char ch);
+
+static const char *validate_json_string(const char *p)
+{
+    if (*p++ != '"') {
+        return NULL;
+    }
+    while (*p != '\0') {
+        unsigned char ch = (unsigned char)*p++;
+        if (ch == '"') {
+            return p;
+        }
+        if (ch < 0x20U) {
+            return NULL;
+        }
+        if (ch != '\\') {
+            continue;
+        }
+        if (*p == '\0') {
+            return NULL;
+        }
+        char escaped = *p++;
+        if (escaped == '"' || escaped == '\\' || escaped == '/'
+            || escaped == 'b' || escaped == 'f' || escaped == 'n'
+            || escaped == 'r' || escaped == 't') {
+            continue;
+        }
+        if (escaped != 'u') {
+            return NULL;
+        }
+        unsigned int code_unit = 0U;
+        for (int i = 0; i < 4; ++i) {
+            if (*p == '\0') {
+                return NULL;
+            }
+            int digit = hex_value(*p++);
+            if (digit < 0) {
+                return NULL;
+            }
+            code_unit = (code_unit << 4U) | (unsigned int)digit;
+        }
+        if (code_unit >= 0xd800U && code_unit <= 0xdbffU) {
+            if (p[0] != '\\' || p[1] != 'u') {
+                return NULL;
+            }
+            p += 2;
+            unsigned int low = 0U;
+            for (int i = 0; i < 4; ++i) {
+                if (*p == '\0') {
+                    return NULL;
+                }
+                int digit = hex_value(*p++);
+                if (digit < 0) {
+                    return NULL;
+                }
+                low = (low << 4U) | (unsigned int)digit;
+            }
+            if (low < 0xdc00U || low > 0xdfffU) {
+                return NULL;
+            }
+        } else if (code_unit >= 0xdc00U && code_unit <= 0xdfffU) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static const char *validate_json_value(const char *p, unsigned int depth);
+
+static const char *validate_json_array(const char *p, unsigned int depth)
+{
+    p = skip_ws(p + 1);
+    if (*p == ']') {
+        return p + 1;
+    }
+    for (;;) {
+        p = validate_json_value(p, depth + 1U);
+        if (p == NULL) {
+            return NULL;
+        }
+        p = skip_ws(p);
+        if (*p == ']') {
+            return p + 1;
+        }
+        if (*p != ',') {
+            return NULL;
+        }
+        p = skip_ws(p + 1);
+    }
+}
+
+static const char *validate_json_object(const char *p, unsigned int depth)
+{
+    p = skip_ws(p + 1);
+    if (*p == '}') {
+        return p + 1;
+    }
+    for (;;) {
+        p = validate_json_string(p);
+        if (p == NULL) {
+            return NULL;
+        }
+        p = skip_ws(p);
+        if (*p != ':') {
+            return NULL;
+        }
+        p = validate_json_value(skip_ws(p + 1), depth + 1U);
+        if (p == NULL) {
+            return NULL;
+        }
+        p = skip_ws(p);
+        if (*p == '}') {
+            return p + 1;
+        }
+        if (*p != ',') {
+            return NULL;
+        }
+        p = skip_ws(p + 1);
+    }
+}
+
+static const char *validate_json_number(const char *p)
+{
+    if (*p == '-') {
+        ++p;
+    }
+    if (*p == '0') {
+        ++p;
+        if (isdigit((unsigned char)*p)) {
+            return NULL;
+        }
+    } else {
+        if (*p < '1' || *p > '9') {
+            return NULL;
+        }
+        do {
+            ++p;
+        } while (isdigit((unsigned char)*p));
+    }
+    if (*p == '.') {
+        ++p;
+        if (!isdigit((unsigned char)*p)) {
+            return NULL;
+        }
+        do {
+            ++p;
+        } while (isdigit((unsigned char)*p));
+    }
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        if (*p == '+' || *p == '-') {
+            ++p;
+        }
+        if (!isdigit((unsigned char)*p)) {
+            return NULL;
+        }
+        do {
+            ++p;
+        } while (isdigit((unsigned char)*p));
+    }
+    return p;
+}
+
+static const char *validate_json_value(const char *p, unsigned int depth)
+{
+    if (p == NULL || depth > 64U) {
+        return NULL;
+    }
+    p = skip_ws(p);
+    if (*p == '{') {
+        return validate_json_object(p, depth);
+    }
+    if (*p == '[') {
+        return validate_json_array(p, depth);
+    }
+    if (*p == '"') {
+        return validate_json_string(p);
+    }
+    if (*p == '-' || isdigit((unsigned char)*p)) {
+        return validate_json_number(p);
+    }
+    if (strncmp(p, "true", 4U) == 0) {
+        return p + 4U;
+    }
+    if (strncmp(p, "false", 5U) == 0) {
+        return p + 5U;
+    }
+    if (strncmp(p, "null", 4U) == 0) {
+        return p + 4U;
+    }
+    return NULL;
+}
+
+int st_json_is_valid(const char *json)
+{
+    if (json == NULL) {
+        return 0;
+    }
+    const char *start = skip_ws(json);
+    const char *end = validate_json_value(start, 0U);
+    return end != NULL && *skip_ws(end) == '\0';
+}
+
+int st_json_is_valid_object(const char *json)
+{
+    if (json == NULL) {
+        return 0;
+    }
+    const char *start = skip_ws(json);
+    if (*start != '{') {
+        return 0;
+    }
+    const char *end = validate_json_object(start, 0U);
+    return end != NULL && *skip_ws(end) == '\0';
+}
+
 static int key_equals(const char *start, const char *end, const char *key)
 {
     size_t len = (size_t)(end - start);
@@ -185,6 +401,10 @@ static char *parse_json_string_value(const char **cursor)
     while (*p != '\0' && *p != '"') {
         unsigned char ch = (unsigned char)*p++;
         if (ch == '\\') {
+            if (*p == '\0') {
+                free(out);
+                return NULL;
+            }
             ch = (unsigned char)*p++;
             switch (ch) {
                 case '"':
@@ -209,12 +429,46 @@ static char *parse_json_string_value(const char **cursor)
                 case 'u': {
                     unsigned int codepoint = 0;
                     for (int i = 0; i < 4; ++i) {
+                        if (*p == '\0') {
+                            free(out);
+                            return NULL;
+                        }
                         int hex = hex_value(*p++);
                         if (hex < 0) {
                             free(out);
                             return NULL;
                         }
                         codepoint = (codepoint << 4U) | (unsigned int)hex;
+                    }
+                    if (codepoint >= 0xd800U && codepoint <= 0xdbffU) {
+                        if (p[0] != '\\' || p[1] != 'u') {
+                            free(out);
+                            return NULL;
+                        }
+                        p += 2;
+                        unsigned int low = 0U;
+                        for (int i = 0; i < 4; ++i) {
+                            if (*p == '\0') {
+                                free(out);
+                                return NULL;
+                            }
+                            int hex = hex_value(*p++);
+                            if (hex < 0) {
+                                free(out);
+                                return NULL;
+                            }
+                            low = (low << 4U) | (unsigned int)hex;
+                        }
+                        if (low < 0xdc00U || low > 0xdfffU) {
+                            free(out);
+                            return NULL;
+                        }
+                        codepoint = 0x10000U
+                            + ((codepoint - 0xd800U) << 10U)
+                            + (low - 0xdc00U);
+                    } else if (codepoint >= 0xdc00U && codepoint <= 0xdfffU) {
+                        free(out);
+                        return NULL;
                     }
                     if (append_utf8(&out, &len, &cap, codepoint) != 0) {
                         free(out);
@@ -247,6 +501,100 @@ char *st_json_get_string(const char *json, const char *key)
 {
     const char *p = find_value(json, key);
     return p == NULL ? NULL : parse_json_string_value(&p);
+}
+
+char *st_json_get_top_level_string(const char *json, const char *key)
+{
+    if (json == NULL || key == NULL || !st_json_is_valid_object(json)) {
+        return NULL;
+    }
+    const char *p = skip_ws(json);
+    p = skip_ws(p + 1);
+    char *result = NULL;
+    while (*p != '}') {
+        char *field_name = parse_json_string_value(&p);
+        if (field_name == NULL) {
+            free(result);
+            return NULL;
+        }
+        p = skip_ws(p);
+        if (*p++ != ':') {
+            free(field_name);
+            free(result);
+            return NULL;
+        }
+        p = skip_ws(p);
+        const char *value_start = p;
+        const char *value_end = validate_json_value(value_start, 1U);
+        if (value_end == NULL) {
+            free(field_name);
+            free(result);
+            return NULL;
+        }
+        if (strcmp(field_name, key) == 0) {
+            free(result);
+            result = NULL;
+            if (*value_start == '"') {
+                const char *value_cursor = value_start;
+                result = parse_json_string_value(&value_cursor);
+                if (result == NULL) {
+                    free(field_name);
+                    return NULL;
+                }
+            }
+        }
+        free(field_name);
+        p = skip_ws(value_end);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+        }
+    }
+    return result;
+}
+
+char *st_json_get_top_level_raw(const char *json, const char *key)
+{
+    if (json == NULL || key == NULL || !st_json_is_valid_object(json)) {
+        return NULL;
+    }
+    const char *p = skip_ws(json);
+    p = skip_ws(p + 1);
+    char *result = NULL;
+    while (*p != '}') {
+        char *field_name = parse_json_string_value(&p);
+        if (field_name == NULL) {
+            free(result);
+            return NULL;
+        }
+        p = skip_ws(p);
+        if (*p++ != ':') {
+            free(field_name);
+            free(result);
+            return NULL;
+        }
+        p = skip_ws(p);
+        const char *value_start = p;
+        const char *value_end = validate_json_value(value_start, 1U);
+        if (value_end == NULL) {
+            free(field_name);
+            free(result);
+            return NULL;
+        }
+        if (strcmp(field_name, key) == 0) {
+            free(result);
+            result = st_strdup_len(value_start, (size_t)(value_end - value_start));
+            if (result == NULL) {
+                free(field_name);
+                return NULL;
+            }
+        }
+        free(field_name);
+        p = skip_ws(value_end);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+        }
+    }
+    return result;
 }
 
 void st_json_free_string_array(char **values, size_t values_len)
@@ -299,6 +647,59 @@ int st_json_get_string_array(const char *json, const char *key, char ***out, siz
         }
         values[count++] = value;
         p = skip_ws(p);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+            continue;
+        }
+        if (*p != ']') {
+            st_json_free_string_array(values, count);
+            return -1;
+        }
+    }
+    *out = values;
+    *out_len = count;
+    return 0;
+}
+
+int st_json_get_raw_array(const char *json, const char *key, char ***out, size_t *out_len)
+{
+    if (json == NULL || key == NULL || out == NULL || out_len == NULL) return -1;
+    *out = NULL;
+    *out_len = 0U;
+    const char *p = find_value(json, key);
+    if (p == NULL || *p != '[') return -1;
+    p = skip_ws(p + 1);
+    size_t count = 0U, capacity = 0U;
+    char **values = NULL;
+    while (*p != ']') {
+        const char *end = validate_json_value(p, 1U);
+        if (end == NULL) {
+            st_json_free_string_array(values, count);
+            return -1;
+        }
+        char *value = st_strdup_len(p, (size_t)(end - p));
+        if (value == NULL) {
+            st_json_free_string_array(values, count);
+            return -1;
+        }
+        if (count == capacity) {
+            size_t next = capacity == 0U ? 4U : capacity * 2U;
+            if (next < capacity || next > SIZE_MAX / sizeof(*values)) {
+                free(value);
+                st_json_free_string_array(values, count);
+                return -1;
+            }
+            char **grown = (char **)realloc(values, next * sizeof(*values));
+            if (grown == NULL) {
+                free(value);
+                st_json_free_string_array(values, count);
+                return -1;
+            }
+            values = grown;
+            capacity = next;
+        }
+        values[count++] = value;
+        p = skip_ws(end);
         if (*p == ',') {
             p = skip_ws(p + 1);
             continue;

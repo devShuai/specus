@@ -521,7 +521,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev
+          sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev
 
       - name: Build C server
         run: |
@@ -538,6 +538,8 @@ jobs:
           find build/c-server -maxdepth 2 -type f -name 'specus-server-c*' -executable
           cp "$(find build/c-server -maxdepth 2 -type f -name 'specus-server-c' -executable | head -1)" "$stage/specus-server-c"
           cp -r implementations/c/server/deploy/systemd "$stage/systemd"
+          mkdir -p "$stage/admin-web"
+          cp apps/admin-web/public/specus-http-route-runtime.js "$stage/admin-web/"
           tar -czf "release-dist/$pkg.tar.gz" -C "$stage" .
           (cd release-dist && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
 
