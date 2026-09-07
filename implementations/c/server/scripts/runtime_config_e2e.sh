@@ -158,7 +158,7 @@ cat >"$TMP_DIR/client.jsonc" <<JSON
 }
 JSON
 
-(cd "$TMP_DIR" && "$JAVA_COMMAND" -jar "$JAVA_CLIENT_JAR_ARG" --server.port=0 >"$TMP_DIR/client.log" 2>&1) &
+(cd "$TMP_DIR" && "$JAVA_COMMAND" -jar "$JAVA_CLIENT_JAR_ARG" >"$TMP_DIR/client.log" 2>&1) &
 JAVA_PID=$!
 
 if ! python3 - "$ADMIN_PORT" "$PUBLIC_PORT" "$ECHO_PORT" "$HTTP_UPSTREAM_PORT" \
