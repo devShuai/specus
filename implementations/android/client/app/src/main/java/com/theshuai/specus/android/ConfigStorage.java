@@ -19,6 +19,8 @@ final class ConfigStorage {
         return prefs(context).getString(KEY_CONFIG, defaultConfig());
     }
 
+    static boolean hasSavedConfig(Context context) { return prefs(context).contains(KEY_CONFIG); }
+
     static void saveConfig(Context context, String config) {
         prefs(context).edit().putString(KEY_CONFIG, config == null ? "" : config).apply();
     }

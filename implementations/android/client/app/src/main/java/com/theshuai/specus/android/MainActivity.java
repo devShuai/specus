@@ -46,14 +46,8 @@ public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 4208;
     private static final int FILE_REQUEST = 4209;
     private static final int MAX_BUBBLES = 100;
-    private static final int COLOR_INK = Color.rgb(18, 30, 38);
-    private static final int COLOR_MUTED = Color.rgb(99, 116, 126);
-    private static final int COLOR_PAGE = Color.rgb(240, 244, 246);
-    private static final int COLOR_PANEL = Color.rgb(255, 255, 255);
-    private static final int COLOR_LINE = Color.rgb(219, 228, 233);
-    private static final int COLOR_MESH = Color.rgb(29, 119, 109);
+    private int COLOR_INK, COLOR_MUTED, COLOR_PAGE, COLOR_PANEL, COLOR_LINE, COLOR_MESH, COLOR_DANGER;
     private static final int COLOR_BUBBLE_OUT = Color.rgb(29, 119, 109);
-    private static final int COLOR_DANGER = Color.rgb(176, 62, 71);
     private static final int COLOR_CODE = Color.rgb(15, 24, 31);
     private static volatile Supplier<String> peerServicesSnapshotSource = PeerServiceRuntime::lastSnapshotJson;
 
@@ -80,6 +74,10 @@ public class MainActivity extends Activity {
     private EditText configEditor;
     private TextView eventLogView;
     private LinearLayout servicesList;
+    private View[] pages;
+    private int selectedPage;
+    private View statusCard;
+    private Button[] pageButtons;
 
     private final Deque<String> eventLog = new ArrayDeque<>();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.ROOT);
@@ -95,10 +93,7 @@ public class MainActivity extends Activity {
             if (!StatusEvents.ACTION_STATUS.equals(intent.getAction())) {
                 return;
             }
-            updateStatus(
-                    intent.getStringExtra(StatusEvents.EXTRA_STATUS),
-                    intent.getStringExtra(StatusEvents.EXTRA_DETAIL),
-                    intent.getBooleanExtra(StatusEvents.EXTRA_RUNNING, false));
+            restoreSessionStatus();
         }
     };
 
@@ -118,23 +113,33 @@ public class MainActivity extends Activity {
             if (!ChatEvents.ACTION_CHAT.equals(intent.getAction())) {
                 return;
             }
-            addBubble(
-                    intent.getStringExtra(ChatEvents.EXTRA_DIRECTION),
-                    intent.getStringExtra(ChatEvents.EXTRA_KIND),
-                    intent.getStringExtra(ChatEvents.EXTRA_PEER),
-                    intent.getStringExtra(ChatEvents.EXTRA_TEXT),
-                    intent.getLongExtra(ChatEvents.EXTRA_TIMESTAMP, System.currentTimeMillis()));
+            restoreMessages();
         }
     };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        COLOR_INK = getColor(R.color.gui_ink);
+        COLOR_MUTED = getColor(R.color.gui_muted);
+        COLOR_PAGE = getColor(R.color.gui_page);
+        COLOR_PANEL = getColor(R.color.gui_panel);
+        COLOR_LINE = getColor(R.color.gui_line);
+        COLOR_MESH = getColor(R.color.gui_accent);
+        COLOR_DANGER = getColor(R.color.gui_danger);
         maybeRequestNotifications();
         setContentView(buildContent());
         fillSettingsFromConfig();
         targetEditor.setText(ConfigStorage.loadLastTarget(this));
-        updateStatus("就绪", "未连接", false);
+        messageEditor.setText(savedInstanceState == null ? GuiSessionStore.draft : savedInstanceState.getString("draft", ""));
+        restoreSessionStatus();
+        boolean configured = ConfigStorage.hasSavedConfig(this)
+                && !apiKeyEditor.getText().toString().isBlank() && !secretEditor.getText().toString().isBlank();
+        showPage(savedInstanceState == null ? (configured ? 0 : 2) : savedInstanceState.getInt("page", 0));
+        if (!configured) {
+            settingsBody.setVisibility(View.VISIBLE);
+            settingsChevron.setText("▼");
+        }
         reconcilePeerServices();
     }
 
@@ -159,15 +164,45 @@ public class MainActivity extends Activity {
         // A full snapshot is authoritative. Broadcasts received while this Activity was stopped
         // are intentionally not queued, so always reconcile the UI when returning to foreground.
         reconcilePeerServices();
+        restoreSessionStatus();
+        restoreMessages();
         maybeCheckForUpdate();
     }
 
     @Override
     protected void onStop() {
+        GuiSessionStore.draft = messageEditor.getText().toString();
         unregisterReceiver(statusReceiver);
         unregisterReceiver(chatReceiver);
         unregisterReceiver(servicesReceiver);
         super.onStop();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle out) {
+        out.putString("draft", messageEditor.getText().toString());
+        out.putInt("page", selectedPage);
+        super.onSaveInstanceState(out);
+    }
+
+    private void restoreSessionStatus() {
+        GuiSessionStore.Status snapshot = GuiSessionStore.status();
+        updateStatus(snapshot.title, snapshot.detail, snapshot.running);
+        statusDot.setBackground(round(snapshot.ready && !snapshot.title.equals("部分功能不可用")
+                ? COLOR_MESH : snapshot.running ? 0xffad7400 : COLOR_MUTED, 999));
+    }
+
+    private void restoreMessages() {
+        chatContainer.removeAllViews();
+        for (GuiSessionStore.Message item : GuiSessionStore.messages()) {
+            addBubble(item.direction, item.kind, item.peer, item.text + "\n" + item.state, item.timestamp);
+            View bubbleRow = chatContainer.getChildAt(chatContainer.getChildCount() - 1);
+            bubbleRow.setOnLongClickListener(v -> {
+                targetEditor.setText(item.peer);
+                messageEditor.setText(item.text);
+                Toast.makeText(this, "已恢复到输入框；结果未知时请确认对方未收到再发送", Toast.LENGTH_LONG).show();
+                return true;
+            });
+        }
     }
 
     @Override
@@ -177,6 +212,7 @@ public class MainActivity extends Activity {
     }
 
     private void maybeCheckForUpdate() {
+        if (!ConfigStorage.hasSavedConfig(this)) return;
         final String serverBaseUrl;
         try {
             JSONObject config = ConfigStorage.parseConfig(ConfigStorage.loadConfig(this));
@@ -233,27 +269,57 @@ public class MainActivity extends Activity {
     }
 
     private View buildContent() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setBackgroundColor(COLOR_PAGE);
-
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(COLOR_PAGE);
         root.setPadding(dp(10), dp(10), dp(10), dp(12));
-        scroll.addView(root, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        statusCard = buildStatusCard();
+        root.addView(statusCard);
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int bottom = insets.getSystemWindowInsetBottom();
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(android.view.WindowInsets.Type.systemBars());
+                android.graphics.Insets ime = insets.getInsets(android.view.WindowInsets.Type.ime());
+                root.setPadding(dp(10) + bars.left, dp(10) + bars.top, dp(10) + bars.right, dp(10) + Math.max(bars.bottom, ime.bottom));
+                statusCard.setVisibility(insets.isVisible(android.view.WindowInsets.Type.ime()) ? View.GONE : View.VISIBLE);
+            } else root.setPadding(dp(10), dp(10) + insets.getSystemWindowInsetTop(), dp(10), dp(10) + bottom);
+            return insets;
+        });
+        LinearLayout navigation = new LinearLayout(this);
+        String[] titles = {"设备", "互传", "设置"};
+        pageButtons = new Button[3];
+        for (int index = 0; index < titles.length; index++) {
+            final int page = index;
+            Button tab = smallButton(titles[index]);
+            pageButtons[index] = tab;
+            tab.setOnClickListener(v -> showPage(page));
+            navigation.addView(tab, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        }
+        root.addView(navigation);
+        LinearLayout settings = new LinearLayout(this);
+        settings.setOrientation(LinearLayout.VERTICAL);
+        settings.addView(buildSettingsCard());
+        settings.addView(buildAdvancedCard());
+        pages = new View[]{scrollPage(buildServicesCard()), buildChatCard(), scrollPage(settings)};
+        for (View page : pages) root.addView(page, new LinearLayout.LayoutParams(-1, 0, 1f));
+        return root;
+    }
 
-        root.addView(buildStatusCard());
-        root.addView(space(8));
-        root.addView(buildServicesCard());
-        root.addView(space(8));
-        root.addView(buildChatCard());
-        root.addView(space(8));
-        root.addView(buildSettingsCard());
-        root.addView(space(8));
-        root.addView(buildAdvancedCard());
+    private View scrollPage(View content) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.addView(content);
         return scroll;
+    }
+
+    private void showPage(int index) {
+        selectedPage = Math.max(0, Math.min(2, index));
+        for (int i = 0; i < pages.length; i++) pages[i].setVisibility(i == selectedPage ? View.VISIBLE : View.GONE);
+        for (int i = 0; i < pageButtons.length; i++) {
+            pageButtons[i].setSelected(i == selectedPage);
+            pageButtons[i].setTextColor(i == selectedPage ? Color.WHITE : COLOR_INK);
+            pageButtons[i].setBackground(round(i == selectedPage ? COLOR_MESH : COLOR_PAGE, 10));
+        }
     }
 
     private View buildStatusCard() {
@@ -275,11 +341,17 @@ public class MainActivity extends Activity {
 
         toggleButton = actionButton("启动", COLOR_MESH, Color.WHITE);
         toggleButton.setOnClickListener(v -> onToggleClicked());
-        row.addView(toggleButton, new LinearLayout.LayoutParams(dp(84), dp(36)));
+        row.addView(toggleButton, new LinearLayout.LayoutParams(dp(84), dp(48)));
+        Button retry = smallButton("重试");
+        retry.setOnClickListener(v -> {
+            if (!specusRunning) onToggleClicked();
+            else startService(new Intent(this, SpecusForegroundService.class).setAction(SpecusForegroundService.ACTION_RETRY));
+        });
+        row.addView(retry, new LinearLayout.LayoutParams(dp(68), dp(48)));
 
         statusDetail = label("", COLOR_MUTED, 12, Typeface.NORMAL);
         statusDetail.setPadding(dp(18), dp(2), 0, 0);
-        statusDetail.setSingleLine(true);
+        statusDetail.setMaxLines(3);
         panel.addView(statusDetail, matchWrap());
         return panel;
     }
@@ -398,7 +470,7 @@ public class MainActivity extends Activity {
         open.setOnClickListener(v -> openExternalUrl(target));
         actions.addView(open, new LinearLayout.LayoutParams(dp(88), dp(48)));
         actions.addView(space(8, 1));
-        Button copy = actionButton("复制", Color.rgb(232, 240, 243), COLOR_INK);
+        Button copy = actionButton("复制", COLOR_PAGE, COLOR_INK);
         copy.setContentDescription("复制服务地址 " + serviceName);
         copy.setEnabled(copyable);
         copy.setOnClickListener(v -> {
@@ -440,6 +512,7 @@ public class MainActivity extends Activity {
 
         Switch publish = new Switch(this);
         publish.setMinHeight(dp(48));
+        publish.setMinimumHeight(dp(48));
         publish.setEnabled(configEnabled && canToggle);
         publish.setContentDescription("发布本机服务 " + name);
         publish.setOnCheckedChangeListener(null);
@@ -466,7 +539,18 @@ public class MainActivity extends Activity {
         targetRow.addView(space(8, 1));
 
         targetEditor = input("对方客户端名称", false);
-        targetRow.addView(targetEditor, new LinearLayout.LayoutParams(0, dp(38), 1f));
+        targetEditor.setHint("选择在线设备");
+        targetEditor.setFocusable(false);
+        targetEditor.setOnClickListener(v -> {
+            String[] names = GuiSessionStore.targets().toArray(new String[0]);
+            if (names.length == 0) {
+                Toast.makeText(this, "暂无在线且支持消息接收的设备，请先连接并等待设备目录", Toast.LENGTH_LONG).show();
+                return;
+            }
+            new AlertDialog.Builder(this).setTitle("发送给哪台设备？")
+                    .setItems(names, (d, index) -> targetEditor.setText(names[index])).show();
+        });
+        targetRow.addView(targetEditor, new LinearLayout.LayoutParams(0, dp(48), 1f));
 
         chatScroll = new ScrollView(this);
         chatContainer = new LinearLayout(this);
@@ -476,9 +560,9 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(300));
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         scrollParams.setMargins(0, dp(8), 0, dp(8));
-        chatScroll.setBackground(stroke(Color.rgb(247, 250, 251), COLOR_LINE, 1, 10));
+        chatScroll.setBackground(stroke(COLOR_PAGE, COLOR_LINE, 1, 10));
         panel.addView(chatScroll, scrollParams);
 
         LinearLayout inputRow = new LinearLayout(this);
@@ -486,19 +570,32 @@ public class MainActivity extends Activity {
         inputRow.setOrientation(LinearLayout.HORIZONTAL);
         panel.addView(inputRow, matchWrap());
 
-        Button attachButton = actionButton("文件", Color.rgb(232, 240, 243), COLOR_INK);
+        Button attachButton = actionButton("文件", COLOR_PAGE, COLOR_INK);
         attachButton.setTextSize(13);
+        attachButton.setPadding(0, 0, 0, 0);
+        attachButton.setSingleLine(true);
         attachButton.setOnClickListener(v -> pickFile());
-        inputRow.addView(attachButton, new LinearLayout.LayoutParams(dp(56), dp(38)));
+        inputRow.addView(attachButton, new LinearLayout.LayoutParams(dp(56), dp(48)));
         inputRow.addView(space(6, 1));
 
         messageEditor = input("输入消息", false);
-        inputRow.addView(messageEditor, new LinearLayout.LayoutParams(0, dp(38), 1f));
+        inputRow.addView(messageEditor, new LinearLayout.LayoutParams(0, dp(48), 1f));
         inputRow.addView(space(6, 1));
 
         Button sendButton = actionButton("发送", COLOR_MESH, Color.WHITE);
         sendButton.setOnClickListener(v -> sendMessage());
-        inputRow.addView(sendButton, new LinearLayout.LayoutParams(dp(64), dp(38)));
+        inputRow.addView(sendButton, new LinearLayout.LayoutParams(dp(64), dp(48)));
+        TextView retention = label("本次进程最近 100 条 · 长按重新编辑", COLOR_MUTED, 12, Typeface.NORMAL);
+        panel.addView(retention);
+        Button clear = smallButton("⋯");
+        clear.setContentDescription("互传记录保留说明与清除");
+        clear.setPadding(0, 0, 0, 0);
+        clear.setOnClickListener(v -> new AlertDialog.Builder(this).setTitle("清除本次互传记录？")
+                .setMessage("仅保留本次应用进程最近 100 条；长按恢复内容，不自动重发。\n\n清除仅影响本机显示记录与草稿，不删除已下载文件或对方记录。")
+                .setNegativeButton("取消", null).setPositiveButton("清除", (d, w) -> {
+                    GuiSessionStore.clearMessages(); messageEditor.setText(""); restoreMessages();
+                }).show());
+        targetRow.addView(clear, new LinearLayout.LayoutParams(dp(48), dp(48)));
         return panel;
     }
 
@@ -507,6 +604,7 @@ public class MainActivity extends Activity {
         panel.setPadding(dp(12), dp(10), dp(12), dp(12));
 
         LinearLayout header = new LinearLayout(this);
+        header.setMinimumHeight(dp(48));
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setOrientation(LinearLayout.HORIZONTAL);
         panel.addView(header, matchWrap());
@@ -526,7 +624,7 @@ public class MainActivity extends Activity {
         header.setOnClickListener(v -> toggleSection(settingsBody, settingsChevron, this::fillSettingsFromConfig));
 
         serverEditor = settingsField("服务地址", "https://specus.devshuai.com");
-        apiKeyEditor = settingsField("API Key", "demo-client");
+        apiKeyEditor = settingsField("API Key", "管理后台提供的 API Key");
         secretEditor = settingsField("Secret", "", true);
 
         LinearLayout meshRow = new LinearLayout(this);
@@ -539,13 +637,17 @@ public class MainActivity extends Activity {
         meshRow.addView(meshLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         meshSwitch = new Switch(this);
+        meshSwitch.setContentDescription("启用私有组网，需要 VPN 授权");
+        meshSwitch.setMinHeight(dp(48));
+        meshSwitch.setMinimumHeight(dp(48));
         meshRow.addView(meshSwitch, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        Button saveButton = actionButton("保存设置", COLOR_INK, Color.WHITE);
+        settingsBody.addView(label("从管理后台「接入凭证」获取 API Key 和 Secret。私有组网需要 VPN 授权；关闭后仍可使用转发与互传。", COLOR_MUTED, 12, Typeface.NORMAL));
+        Button saveButton = actionButton("保存设置", COLOR_MESH, Color.WHITE);
         saveButton.setOnClickListener(v -> saveSettings());
         LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(40));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
         saveParams.setMargins(0, dp(10), 0, 0);
         settingsBody.addView(saveButton, saveParams);
         return panel;
@@ -565,7 +667,7 @@ public class MainActivity extends Activity {
             editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         }
         settingsBody.addView(editor, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(38)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
         return editor;
     }
 
@@ -625,17 +727,17 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "已恢复示例", Toast.LENGTH_SHORT).show();
         });
         configActions.addView(resetButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         configActions.addView(space(8, 1));
 
-        Button saveConfigButton = actionButton("保存配置", COLOR_INK, Color.WHITE);
+        Button saveConfigButton = actionButton("保存配置", COLOR_MESH, Color.WHITE);
         saveConfigButton.setOnClickListener(v -> {
             ConfigStorage.saveConfig(this, configEditor.getText().toString());
             fillSettingsFromConfig();
             Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show();
         });
         configActions.addView(saveConfigButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
 
         TextView logCaption = label("运行事件", COLOR_MUTED, 12, Typeface.BOLD);
         logCaption.setPadding(0, dp(12), 0, dp(4));
@@ -662,6 +764,10 @@ public class MainActivity extends Activity {
             serverEditor.setText(json.optString("serverBaseUrl", ""));
             apiKeyEditor.setText(json.optString("apiKey", ""));
             secretEditor.setText(json.optString("secret", ""));
+            if (!ConfigStorage.hasSavedConfig(this)) {
+                apiKeyEditor.setText("");
+                secretEditor.setText("");
+            }
             String device = json.optString("peerMeshDevice", "noop");
             meshSwitch.setChecked(!device.trim().isEmpty() && !"noop".equalsIgnoreCase(device.trim()));
         } catch (Exception ignored) {
@@ -686,6 +792,13 @@ public class MainActivity extends Activity {
         if (specusRunning) {
             startService(new Intent(this, SpecusForegroundService.class)
                     .setAction(SpecusForegroundService.ACTION_STOP));
+            return;
+        }
+        if (apiKeyEditor.getText().toString().isBlank() || secretEditor.getText().toString().isBlank()) {
+            showPage(2);
+            settingsBody.setVisibility(View.VISIBLE);
+            settingsChevron.setText("▼");
+            Toast.makeText(this, "请填写管理后台提供的 API Key 和 Secret", Toast.LENGTH_LONG).show();
             return;
         }
         String updatedConfig;
@@ -720,13 +833,32 @@ public class MainActivity extends Activity {
         if (message.isEmpty()) {
             return;
         }
+        if (!GuiSessionStore.status().ready) {
+            Toast.makeText(this, "转发通道尚未就绪，内容已保留", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (!GuiSessionStore.targets().contains(target)) {
+            Toast.makeText(this, "所选设备已离线或不支持接收，请重新选择", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (message.length() > GuiSessionStore.MAX_TEXT_CHARS) {
+            Toast.makeText(this, "消息过长，请拆分后发送", Toast.LENGTH_LONG).show();
+            return;
+        }
         ConfigStorage.saveLastTarget(this, target);
+        String id = GuiSessionStore.add(ChatEvents.DIRECTION_OUT, ChatEvents.KIND_TEXT, target, message, "发送中");
+        try {
         startService(new Intent(this, SpecusForegroundService.class)
                 .setAction(SpecusForegroundService.ACTION_SEND_MESSAGE)
                 .putExtra(SpecusForegroundService.EXTRA_TO_CLIENT_NAME, target)
-                .putExtra(SpecusForegroundService.EXTRA_MESSAGE, message));
-        addBubble(ChatEvents.DIRECTION_OUT, ChatEvents.KIND_TEXT, target, message, System.currentTimeMillis());
+                .putExtra(SpecusForegroundService.EXTRA_MESSAGE, message)
+                .putExtra(SpecusForegroundService.EXTRA_MESSAGE_ID, id));
         messageEditor.setText("");
+        GuiSessionStore.draft = "";
+        } catch (RuntimeException error) {
+            GuiSessionStore.result(id, "失败 · 系统未允许发送，内容已保留");
+        }
+        restoreMessages();
     }
 
     private void pickFile() {
@@ -748,7 +880,9 @@ public class MainActivity extends Activity {
             if (resultCode == RESULT_OK) {
                 startSpecusService();
             } else {
-                Toast.makeText(this, "已取消 VPN 授权", Toast.LENGTH_SHORT).show();
+                new AlertDialog.Builder(this).setTitle("VPN 未授权")
+                        .setMessage("私有组网暂不可用。你可以重新授权，或在设置中关闭私有组网，继续使用端口转发和互传。")
+                        .setPositiveButton("返回设置", (dialog, which) -> showPage(2)).show();
             }
             return;
         }
@@ -812,7 +946,7 @@ public class MainActivity extends Activity {
         bubble.setPadding(dp(12), dp(8), dp(12), dp(8));
         bubble.setBackground(outgoing
                 ? round(COLOR_BUBBLE_OUT, 12)
-                : stroke(Color.WHITE, COLOR_LINE, 1, 12));
+                : stroke(COLOR_PANEL, COLOR_LINE, 1, 12));
         LinearLayout bubbleRow = new LinearLayout(this);
         bubbleRow.setOrientation(LinearLayout.HORIZONTAL);
         bubbleRow.setGravity(outgoing ? Gravity.END : Gravity.START);
@@ -880,7 +1014,7 @@ public class MainActivity extends Activity {
         button.setTextSize(14);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setTextColor(foreground);
-        button.setMinHeight(0);
+        button.setMinHeight(dp(48));
         button.setMinWidth(0);
         button.setPadding(dp(10), 0, dp(10), 0);
         button.setBackground(round(background, 12));
@@ -888,7 +1022,7 @@ public class MainActivity extends Activity {
     }
 
     private Button smallButton(String text) {
-        Button button = actionButton(text, Color.rgb(232, 240, 243), COLOR_INK);
+        Button button = actionButton(text, COLOR_PAGE, COLOR_INK);
         button.setTextSize(13);
         return button;
     }
@@ -902,7 +1036,7 @@ public class MainActivity extends Activity {
         editor.setGravity(multiLine ? (Gravity.START | Gravity.TOP) : Gravity.CENTER_VERTICAL);
         editor.setPadding(dp(10), 0, dp(10), 0);
         editor.setHint(hint);
-        editor.setBackground(stroke(Color.rgb(248, 251, 252), Color.rgb(206, 218, 225), 1, 10));
+        editor.setBackground(stroke(COLOR_PAGE, COLOR_LINE, 1, 10));
         editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         return editor;
     }

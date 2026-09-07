@@ -349,13 +349,18 @@ final class PeerMeshEngine implements Closeable {
         try {
             if (!sendEncryptedPayload(peer, session, PeerAppMessageCodec.encode(appMessage))) {
                 preparePath(peer, session);
-                return null;
+                throw new MessageDeliveryUnknownException();
             }
             if (pending.latch.await(APP_MESSAGE_ACK_WAIT_MS, TimeUnit.MILLISECONDS) && pending.delivered) {
                 return new ClientMessageSendResult(messageId, peerTransportFor(peer.clientId));
             }
             preparePath(peer, session);
-            return null;
+            throw new MessageDeliveryUnknownException();
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new MessageDeliveryUnknownException();
+        } catch (Exception error) {
+            throw new MessageDeliveryUnknownException();
         } finally {
             pendingMessageAcks.remove(messageId);
         }
@@ -421,6 +426,22 @@ final class PeerMeshEngine implements Closeable {
 
     private void updateAuthoritativeMessageCapabilities(JSONArray array) {
         authoritativeMessageCapabilities = parseAuthoritativeMessageCapabilities(array);
+        List<String> names = new ArrayList<>();
+        if (array != null) for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item != null && item.optBoolean("online", false) && item.optBoolean("messageReceiveCapable", false)) {
+                String name = item.optString("clientName", "");
+                if (!name.isBlank() && !names.contains(name)) names.add(name);
+            }
+        }
+        names.sort(String.CASE_INSENSITIVE_ORDER);
+        GuiSessionStore.targets(names);
+    }
+
+    void requireMessageTarget(String target) {
+        TargetMessageCapabilities capabilities = authoritativeMessageCapabilities.get(normalizeClientName(target));
+        if (capabilities == null || !capabilities.online || !capabilities.receiveMessages)
+            throw new IllegalStateException("请选择在线且支持消息接收的设备，等待设备目录更新后再试");
     }
 
     static Map<String, TargetMessageCapabilities> parseAuthoritativeMessageCapabilities(JSONArray array) {

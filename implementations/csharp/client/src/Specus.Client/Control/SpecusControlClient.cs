@@ -21,8 +21,6 @@ namespace Specus.Client.Control;
 public sealed class SpecusControlClient : IAsyncDisposable
 {
     private const int MaxFrameSize = 32 * 1024 * 1024;
-    private const int BaseBackoffSeconds = 2;
-    private const int MaxBackoffSeconds = 60;
     private static readonly TimeSpan TokenRefreshMaxLead = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan TokenRefreshMinLead = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan TokenRefreshMinDelay = TimeSpan.FromSeconds(5);
@@ -42,6 +40,19 @@ public sealed class SpecusControlClient : IAsyncDisposable
     private SpecusRuntimeState? _runtime;
     private FrameWriter? _activeWriter;
     private volatile bool _loggedIn;
+    private readonly ReconnectWakeup _reconnectWakeup = new();
+    private readonly object _attemptGate = new();
+    private CancellationTokenSource? _attemptCts;
+    private bool _loopActive;
+
+    public void RequestReconnect()
+    {
+        lock (_attemptGate)
+        {
+            if (!_loopActive || !_reconnectWakeup.Request()) return;
+            _attemptCts?.Cancel();
+        }
+    }
 
     public SpecusControlClient(
         SpecusClientConfig config,
@@ -184,16 +195,26 @@ public sealed class SpecusControlClient : IAsyncDisposable
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         PublishStatus("STARTING", "客户端启动中", running: true, controlConnected: false, loggedIn: false);
+        lock (_attemptGate) _loopActive = true;
+        try
+        {
         while (!cancellationToken.IsCancellationRequested)
         {
             var reconnectImmediately = false;
+            string failureReason = "控制连接已断开";
+            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            lock (_attemptGate) _attemptCts = attemptCts;
             try
             {
-                await RunOnceAsync(cancellationToken).ConfigureAwait(false);
+                await RunOnceAsync(attemptCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 return;
+            }
+            catch (OperationCanceledException) when (attemptCts.IsCancellationRequested)
+            {
+                failureReason = "网络已变化或已请求立即重试，正在重新获取连接信息";
             }
             catch (ControlLoginRejectedException ex) when (ex.Action == ControlLoginFailureAction.RefreshImmediately)
             {
@@ -210,11 +231,13 @@ public sealed class SpecusControlClient : IAsyncDisposable
             }
             catch (ControlLoginRejectedException ex)
             {
+                failureReason = ex.ReasonOrDefault;
                 _logger.LogWarning("control login failed: {reason}; reconnecting with backoff", ex.ReasonOrDefault);
                 PublishStatus("RECONNECTING", ex.ReasonOrDefault, running: true, controlConnected: false, loggedIn: false);
             }
             catch (Exception ex)
             {
+                failureReason = ex.Message;
                 if (ex is HttpLoginFailure { Retryable: false })
                 {
                     PublishStatus("STOPPED", ex.Message, running: false, controlConnected: false, loggedIn: false);
@@ -223,6 +246,10 @@ public sealed class SpecusControlClient : IAsyncDisposable
                 _logger.LogWarning("Control channel session ended ({Type}); check connectivity or use --debug.", ex.GetType().Name);
                 _logger.LogDebug(ex, "control channel session ended");
                 PublishStatus("RECONNECTING", ex.Message, running: true, controlConnected: false, loggedIn: false);
+            }
+            finally
+            {
+                lock (_attemptGate) _attemptCts = null;
             }
 
             if (cancellationToken.IsCancellationRequested)
@@ -235,24 +262,27 @@ public sealed class SpecusControlClient : IAsyncDisposable
             }
             var delay = NextBackoff();
             _logger.LogInformation("reconnect attempt #{attempt} in {delay}s", _backoffAttempts, delay);
-            PublishStatus("RECONNECTING", $"控制连接断开，{delay}s 后重连", running: true, controlConnected: false, loggedIn: false);
+            PublishStatus("RECONNECTING", $"{failureReason} · {delay}s 后重试；可立即重试", running: true, controlConnected: false, loggedIn: false);
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(delay), cancellationToken).ConfigureAwait(false);
+                await _reconnectWakeup.WaitAsync(TimeSpan.FromSeconds(delay), cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 return;
             }
         }
+        }
+        finally
+        {
+            lock (_attemptGate) { _loopActive = false; _attemptCts = null; }
+        }
     }
 
     private int NextBackoff()
     {
         _backoffAttempts++;
-        var shift = Math.Min(_backoffAttempts - 1, 5);
-        var delay = BaseBackoffSeconds * (1 << shift);
-        return Math.Min(delay, MaxBackoffSeconds);
+        return ReconnectWakeup.DelaySeconds(_backoffAttempts, Random.Shared.NextDouble());
     }
 
     private async Task RunOnceAsync(CancellationToken cancellationToken)

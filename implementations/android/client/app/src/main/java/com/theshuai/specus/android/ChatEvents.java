@@ -25,6 +25,7 @@ final class ChatEvents {
         if (context == null) {
             return;
         }
+        GuiSessionStore.add(direction, kind, peer, text, DIRECTION_IN.equals(direction) ? "已收到" : "传输事件");
         Intent intent = new Intent(ACTION_CHAT)
                 .setPackage(context.getPackageName())
                 .putExtra(EXTRA_DIRECTION, direction == null ? DIRECTION_SYSTEM : direction)

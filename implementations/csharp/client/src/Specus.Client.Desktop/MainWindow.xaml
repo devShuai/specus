@@ -4,8 +4,8 @@
         Title="specus 桌面客户端"
         Width="1200"
         Height="760"
-        MinWidth="1000"
-        MinHeight="620"
+        MinWidth="800"
+        MinHeight="520"
         WindowStartupLocation="CenterScreen"
         Icon="Assets/favicon.ico"
         Background="{DynamicResource AppBackgroundBrush}"
@@ -13,7 +13,7 @@
         TextOptions.TextFormattingMode="Display"
         TextOptions.TextRenderingMode="ClearType"
         PreviewKeyDown="Window_PreviewKeyDown">
-    <Grid x:Name="RootLayoutGrid">
+    <Grid x:Name="RootLayoutGrid" Background="{DynamicResource AppBackgroundBrush}">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="300" />
             <ColumnDefinition Width="*" />
@@ -26,13 +26,12 @@
                 Padding="18,16">
             <Grid>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <ScrollViewer Grid.Row="0"
-                              Grid.RowSpan="2"
                               VerticalScrollBarVisibility="Auto"
                               HorizontalScrollBarVisibility="Disabled"
                               Padding="0,0,6,0">
@@ -94,13 +93,8 @@
                         </Grid>
 
                         <Border Style="{StaticResource SurfacePanelStyle}" Padding="14,12">
+                            <Expander x:Name="ConnectionSettingsExpander" Header="连接设置" IsExpanded="True" Foreground="{DynamicResource TextPrimaryBrush}">
                             <StackPanel>
-                                <TextBlock Text="连接配置"
-                                           FontSize="13"
-                                           FontWeight="SemiBold"
-                                           Foreground="{DynamicResource TextPrimaryBrush}"
-                                           Margin="0,0,0,10" />
-
                                 <TextBlock Text="服务端地址" Style="{StaticResource FieldLabelTextStyle}" />
                                 <TextBox x:Name="ServerBaseUrlBox"
                                          Margin="0,4,0,10"
@@ -114,6 +108,12 @@
                                 <PasswordBox x:Name="SecretBox"
                                              Margin="0,4,0,10" />
 
+                                <TextBlock Text="凭据来自管理后台的「接入凭证」。先保存，再连接。"
+                                           TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" Margin="0,0,0,10" />
+                                <Expander Header="高级设置" IsExpanded="False">
+                                <StackPanel Margin="0,8,0,0">
+                                <TextBlock Text="auto / windows-wintun 需要管理员权限；noop 不创建网卡，仍可使用转发与互传。"
+                                           TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" Margin="0,0,0,8" />
                                 <TextBlock Text="虚拟网卡模式" Style="{StaticResource FieldLabelTextStyle}" />
                                 <ComboBox x:Name="PeerMeshDeviceBox"
                                           IsEditable="True"
@@ -159,9 +159,15 @@
                                           Content="自动安装已验证更新"
                                           Margin="0,8,0,0"
                                           ToolTip="仅安装由服务端提供、且通过 SHA-256 校验的 HTTPS 更新包" />
+                                </StackPanel>
+                                </Expander>
                             </StackPanel>
+                            </Expander>
                         </Border>
 
+                    </StackPanel>
+                </ScrollViewer>
+                <StackPanel Grid.Row="1">
                         <Button x:Name="ConnectButton"
                                 Content="连接"
                                 Height="38"
@@ -176,8 +182,8 @@
                                 Margin="0,8,0,2"
                                 Style="{StaticResource SecondaryButtonStyle}"
                                 Click="SaveButton_Click" />
-                    </StackPanel>
-                </ScrollViewer>
+                        <Button Content="立即重试" Margin="0,8,0,0" Click="RetryButton_Click" />
+                </StackPanel>
 
                 <Border Grid.Row="2"
                         Margin="0,12,0,0"
@@ -220,7 +226,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
-                <RowDefinition Height="150" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
             <Border Style="{StaticResource SurfacePanelStyle}" Padding="16,12">
@@ -237,7 +243,7 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center">
-                            <TextBlock Text="运行视图"
+                            <TextBlock Text="设备与服务"
                                        FontSize="17"
                                        FontWeight="Bold" />
                             <TextBlock x:Name="RuntimeSummaryText"
@@ -324,11 +330,11 @@
                 </Grid>
             </Border>
 
-            <TabControl Grid.Row="1"
+            <TabControl Grid.Row="1" SelectedIndex="1"
                         Margin="0,12,0,12"
                         Style="{StaticResource ModernTabControlStyle}"
                         ItemContainerStyle="{StaticResource ModernTabItemStyle}">
-                <TabItem Header="对端路由">
+                <TabItem Header="连接诊断">
                     <Grid>
                             <Grid.RowDefinitions>
                                 <!-- 两张表按比例分配并设最小高度：窗口再矮也不会把
@@ -448,9 +454,9 @@
                 <TabItem Header="共享服务">
                     <Grid>
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="3*" MinHeight="140" />
+                            <RowDefinition Height="3*" MinHeight="80" />
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="2*" MinHeight="100" />
+                            <RowDefinition Height="2*" MinHeight="80" />
                         </Grid.RowDefinitions>
                         <Border Grid.Row="0" Style="{StaticResource TableShellStyle}">
                             <DataGrid x:Name="PeerRemoteServiceGrid"
@@ -580,7 +586,7 @@
                         </Border>
                     </Grid>
                 </TabItem>
-                <TabItem Header="客户端消息">
+                <TabItem Header="互传">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -774,7 +780,8 @@
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="10">
-                <Grid>
+                <Expander Header="运行日志（诊断）" IsExpanded="False">
+                <Grid x:Name="LogContentGrid" Height="180">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
@@ -817,6 +824,7 @@
                                  Style="{StaticResource LogTextBoxStyle}" />
                     </ScrollViewer>
                 </Grid>
+                </Expander>
             </Border>
         </Grid>
     </Grid>

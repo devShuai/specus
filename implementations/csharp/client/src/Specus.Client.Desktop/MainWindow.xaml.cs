@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -54,6 +55,9 @@ public partial class MainWindow : Window
     private bool _clientLoggedIn;
     private bool _updateRestarting;
     private int _updateCheckActive;
+    private System.Windows.Forms.NotifyIcon? _trayIcon;
+    private readonly string? _settingsPath;
+    private string _networkSignature = "";
 
     public ObservableCollection<TcpRouteSnapshot> TcpRoutes { get; } = new();
 
@@ -73,25 +77,37 @@ public partial class MainWindow : Window
 
     public ObservableCollection<LogLine> Logs { get; } = new();
 
-    public MainWindow()
+    public MainWindow() : this(null, true) { }
+
+    internal MainWindow(string? settingsPath, bool backgroundIntegration)
     {
+        _settingsPath = settingsPath;
         InitializeComponent();
         DataContext = this;
         _observer = new UiSpecusObserver(this);
         _transferManager.TransferEvent += OnTransferEvent;
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
-        Loaded += MainWindow_Loaded;
+        NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
+        SystemEvents.PowerModeChanged += PowerModeChanged;
+        if (backgroundIntegration) Loaded += MainWindow_Loaded;
         LoadSettingsIntoForm();
+        ConnectionSettingsExpander.IsExpanded = string.IsNullOrWhiteSpace(ApiKeyBox.Text) || string.IsNullOrWhiteSpace(SecretBox.Password);
+        _networkSignature = NetworkSignature();
         ApplyConfiguredTheme();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
+        if (backgroundIntegration) InitializeTray();
     }
 
     protected override void OnClosed(EventArgs e)
     {
+        _trayIcon?.Dispose();
+        _trayIcon = null;
         _updateCts.Cancel();
         _updateCts.Dispose();
         _updateService.Dispose();
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        NetworkChange.NetworkAddressChanged -= NetworkAddressChanged;
+        SystemEvents.PowerModeChanged -= PowerModeChanged;
         _transferManager.TransferEvent -= OnTransferEvent;
         base.OnClosed(e);
     }
@@ -111,6 +127,46 @@ public partial class MainWindow : Window
         }
 
         await StartClientAsync().ConfigureAwait(false);
+    }
+
+    private void NetworkAddressChanged(object? sender, EventArgs e) => Dispatcher.BeginInvoke(new Action(() =>
+    {
+        var signature = NetworkSignature();
+        if (signature == _networkSignature) return;
+        _networkSignature = signature;
+        if (_running && !_stopping && !_closing) _client?.RequestReconnect();
+    }));
+
+    private string NetworkSignature()
+    {
+        try
+        {
+            return string.Join("|", NetworkInterface.GetAllNetworkInterfaces()
+                .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                    && n.OperationalStatus == OperationalStatus.Up
+                    && !string.Equals(n.Name, TunNameBox.Text, StringComparison.OrdinalIgnoreCase)
+                    && !n.Description.Contains("Wintun", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(n => n.GetIPProperties().UnicastAddresses.Select(a => n.Id + ":" + a.Address))
+                .OrderBy(value => value, StringComparer.Ordinal));
+        }
+        catch (NetworkInformationException) { return _networkSignature; }
+    }
+
+    private void PowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume) WakeConnection();
+    }
+
+    private void WakeConnection() => Dispatcher.BeginInvoke(new Action(() =>
+    {
+        if (_running && !_stopping && !_closing) _client?.RequestReconnect();
+    }));
+
+    private async void RetryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_stopping || _closing) return;
+        if (_running) _client?.RequestReconnect();
+        else await StartClientAsync();
     }
 
     private void SaveButton_Click(object sender, RoutedEventArgs e)
@@ -327,6 +383,7 @@ public partial class MainWindow : Window
         Panel.SetZIndex(LogPanelBorder, 10);
         RootLayoutGrid.Children.Add(LogPanelBorder);
         LogExpandButton.Content = "还原";
+        LogContentGrid.Height = Math.Max(180, ActualHeight - 120);
         _logExpanded = true;
     }
 
@@ -344,11 +401,24 @@ public partial class MainWindow : Window
         Panel.SetZIndex(LogPanelBorder, 0);
         MainContentGrid.Children.Add(LogPanelBorder);
         LogExpandButton.Content = "放大";
+        LogContentGrid.Height = 180;
         _logExpanded = false;
     }
 
     protected override void OnClosing(CancelEventArgs e)
     {
+        if (_running && !_closing && !_updateRestarting)
+        {
+            var choice = MessageBox.Show(this,
+                "是否保留连接并在托盘后台运行？\n\n是：隐藏窗口，保持连接（托盘可恢复或退出）。\n否：停止连接并退出。\n取消：返回窗口。",
+                "关闭 specus", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (choice != MessageBoxResult.No)
+            {
+                e.Cancel = true;
+                if (choice == MessageBoxResult.Yes && _trayIcon is not null) Hide();
+                return;
+            }
+        }
         if (!_updateRestarting)
         {
             _updateCts.Cancel();
@@ -361,6 +431,39 @@ public partial class MainWindow : Window
             return;
         }
         base.OnClosing(e);
+    }
+
+    private void InitializeTray()
+    {
+        try
+        {
+            using var stream = Application.GetResourceStream(new Uri("Assets/favicon.ico", UriKind.Relative)).Stream;
+            using var icon = new System.Drawing.Icon(stream);
+            _trayIcon = new System.Windows.Forms.NotifyIcon
+            {
+                Icon = (System.Drawing.Icon)icon.Clone(), Text = "specus · 未连接", Visible = true,
+                ContextMenuStrip = new System.Windows.Forms.ContextMenuStrip(),
+            };
+            _trayIcon.DoubleClick += (_, _) => Dispatcher.BeginInvoke(new Action(RestoreFromTray));
+            _trayIcon.ContextMenuStrip.Items.Add("打开 specus", null, (_, _) => Dispatcher.BeginInvoke(new Action(RestoreFromTray)));
+            _trayIcon.ContextMenuStrip.Items.Add("停止连接并退出", null, (_, _) => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (_closing) return;
+                _closing = true;
+                _ = StopAndCloseAsync();
+            })));
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or System.ComponentModel.Win32Exception)
+        {
+            AppendLog(LogLevel.Warning, "desktop", "托盘不可用，关闭窗口时请选停止并退出", ex);
+        }
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        WindowState = WindowState.Normal;
+        Activate();
     }
 
     private async Task RunUpdateLoopAsync(CancellationToken cancellationToken)
@@ -512,6 +615,7 @@ public partial class MainWindow : Window
 
     private async Task StartClientAsync()
     {
+        if (_client is not null) await StopClientAsync("释放上次连接资源");
         SpecusClientConfig config;
         try
         {
@@ -555,6 +659,7 @@ public partial class MainWindow : Window
         var cancellationToken = _clientCts.Token;
         _clientTask = Task.Run(async () =>
         {
+            string stoppedReason = "连接已结束，可修改连接设置后重试";
             try
             {
                 await _client.RunAsync(cancellationToken).ConfigureAwait(false);
@@ -564,6 +669,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
+                stoppedReason = ex.Message;
                 await Dispatcher.InvokeAsync(() =>
                     AppendLog(LogLevel.Error, "desktop", "客户端运行异常", ex));
             }
@@ -573,7 +679,7 @@ public partial class MainWindow : Window
                 {
                     if (!_stopping)
                     {
-                        UpdateStoppedUi("已停止", "客户端运行任务已结束");
+                        UpdateStoppedUi("连接已停止", stoppedReason);
                     }
                 });
             }
@@ -582,7 +688,7 @@ public partial class MainWindow : Window
 
     private async Task StopClientAsync(string reason)
     {
-        if (!_running || _stopping)
+        if ((_client is null && !_running) || _stopping)
         {
             return;
         }
@@ -697,7 +803,7 @@ public partial class MainWindow : Window
         _loadingSettings = false;
     }
 
-    private static DesktopClientSettings LoadSettings()
+    private DesktopClientSettings LoadSettings()
     {
         var path = SettingsPath();
         if (!File.Exists(path))
@@ -754,8 +860,9 @@ public partial class MainWindow : Window
             : SpecusClientConfig.DefaultUpdateCheckIntervalHours;
     }
 
-    private static string SettingsPath()
+    private string SettingsPath()
     {
+        if (_settingsPath is not null) return _settingsPath;
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "Specus",
@@ -942,7 +1049,7 @@ public partial class MainWindow : Window
         SetSidebarStatusDot(snapshot.LoggedIn ? "SuccessBrush" : "WarningBrush");
         RuntimeSummaryText.Text = snapshot.ClientName is null
             ? "连接后显示客户端、控制端和 Peer Mesh 信息"
-            : $"{snapshot.ClientName} · {snapshot.SpecusEndpoint} · Peer Mesh {(snapshot.PeerMeshEnabled ? "启用" : "关闭")} · {snapshot.VirtualIp ?? "-"}";
+            : $"{snapshot.ClientName} · {(snapshot.LoggedIn ? "通道就绪；具体服务尚未探测" : "正在恢复连接")}";
         _clientLoggedIn = snapshot.LoggedIn;
         UpdateMessageSendState();
     }
@@ -1119,6 +1226,7 @@ public partial class MainWindow : Window
     {
         StatusPhaseText.Text = phase;
         StatusDetailText.Text = detail;
+        if (_trayIcon is not null) _trayIcon.Text = ("specus · " + phase)[..Math.Min(63, ("specus · " + phase).Length)];
     }
 
     private void SetSidebarStatusDot(string brushKey)
@@ -1166,7 +1274,7 @@ public partial class MainWindow : Window
     {
         if (snapshot.LoggedIn)
         {
-            return "已连接";
+            return "转发通道就绪";
         }
         if (!snapshot.Running)
         {
@@ -1246,6 +1354,12 @@ public partial class MainWindow : Window
         public void OnStatusChanged(SpecusClientStatusSnapshot snapshot)
         {
             _window.Dispatcher.BeginInvoke(new Action(() => _window.ApplyStatus(snapshot)));
+        }
+
+        public void OnControlAuthenticated()
+        {
+            _window.Dispatcher.BeginInvoke(new Action(() =>
+                _window.UpdateStatusText("控制通道已认证", "正在建立数据通道，尚不可转发")));
         }
 
         public void OnRoutesChanged(SpecusClientRoutesSnapshot snapshot)

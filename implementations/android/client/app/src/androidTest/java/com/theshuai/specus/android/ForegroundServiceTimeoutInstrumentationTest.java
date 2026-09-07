@@ -55,15 +55,15 @@ public class ForegroundServiceTimeoutInstrumentationTest {
      * the callback have to agree.
      */
     @Test
-    public void manifestDeclaresTheDataSyncForegroundServiceType() throws Exception {
+    public void manifestDeclaresPurposeSpecificForegroundServiceTypes() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         ServiceInfo info = context.getPackageManager().getServiceInfo(
                 new android.content.ComponentName(context, SpecusForegroundService.class),
                 PackageManager.GET_META_DATA);
 
-        assertEquals("the timeout contract applies to dataSync services",
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-                info.getForegroundServiceType() & ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        assertEquals(0, info.getForegroundServiceType() & ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED | ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                info.getForegroundServiceType());
     }
 
     /** Calling the timeout must return promptly; the platform gives the service only moments. */

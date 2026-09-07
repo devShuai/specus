@@ -138,6 +138,23 @@ public final class SpecusCore {
         private final ExecutorService ioPool = newIoPool();
         private volatile ControlConnection connection;
         private volatile AppMessageListener appMessageListener;
+        private final ReconnectSignal reconnectSignal = new ReconnectSignal();
+        private volatile Thread runtimeThread;
+        private volatile String lastFailure = "";
+        private final Set<HttpURLConnection> pendingLogins = ConcurrentHashMap.newKeySet();
+        private final AtomicBoolean refreshSession = new AtomicBoolean();
+
+        public void requestReconnect() {
+            if (running.get() && reconnectSignal.request()) {
+                refreshSession.set(true);
+                for (HttpURLConnection login : pendingLogins) login.disconnect();
+                closeQuietly(connection);
+            }
+        }
+
+        private SpecusSession login(StartupConfig config) throws Exception {
+            return AuthClient.login(context, config, running, pendingLogins);
+        }
 
         /**
          * Bounded IO pool.
@@ -185,6 +202,9 @@ public final class SpecusCore {
 
         public void stop() {
             running.set(false);
+            for (HttpURLConnection login : pendingLogins) login.disconnect();
+            Thread worker = runtimeThread;
+            if (worker != null) worker.interrupt();
             closeQuietly(connection);
             ioPool.shutdownNow();
         }
@@ -214,16 +234,18 @@ public final class SpecusCore {
 
         @Override
         public void run() {
+            runtimeThread = Thread.currentThread();
             int attempt = 0;
             try {
                 StartupConfig config = StartupConfig.parse(configText);
                 SpecusSession session = null;
                 while (running.get()) {
+                    if (refreshSession.getAndSet(false)) session = null;
                     ControlConnection next = null;
                     try {
                         if (session == null) {
                             publish("HTTP login", config.serverBaseUrl, true);
-                            session = AuthClient.login(context, config);
+                            session = login(config);
                             session.applyStartup(config);
                         }
                         startOrStopVpn(session);
@@ -235,7 +257,7 @@ public final class SpecusCore {
                                 running,
                                 vpnPlatform,
                                 () -> {
-                                    SpecusSession refreshed = AuthClient.login(context, config);
+                                    SpecusSession refreshed = login(config);
                                     refreshed.applyStartup(config);
                                     return refreshed;
                                 });
@@ -247,6 +269,13 @@ public final class SpecusCore {
                         }
                     } catch (Throwable error) {
                         if (!running.get()) {
+                            break;
+                        }
+                        lastFailure = message(error);
+                        if (error instanceof HttpLoginFailure && !((HttpLoginFailure) error).retryable
+                                || error instanceof javax.net.ssl.SSLException) {
+                            running.set(false);
+                            publish("连接已停止", lastFailure, false);
                             break;
                         }
                         if (next != null && next.exitAction() == ControlExitAction.IMMEDIATE_HTTP_LOGIN) {
@@ -276,20 +305,22 @@ public final class SpecusCore {
                         attempt = 0;
                     }
                     if (running.get()) {
-                        long delay = reconnectDelaySeconds(++attempt);
-                        publish("Reconnect pending", delay + "s", true);
-                        sleepSeconds(delay);
+                        long delay = ReconnectSignal.delayMillis(++attempt, Math.random());
+                        publish("Reconnect pending", lastFailure + " · " + (delay / 1000.0) + " 秒后重试，可立即重试", true);
+                        reconnectSignal.await(delay);
                     }
                 }
             } catch (Throwable error) {
-                publish("Stopped", message(error), false);
+                if (running.get()) lastFailure = message(error);
+                publish("Stopped", lastFailure, false);
             } finally {
                 running.set(false);
                 ioPool.shutdownNow();
                 if (vpnPlatform != null) {
                     vpnPlatform.stopVpn();
                 }
-                publish("Stopped", "", false);
+                publish("Stopped", lastFailure, false);
+                runtimeThread = null;
             }
         }
 
@@ -314,22 +345,6 @@ public final class SpecusCore {
             }
         }
 
-        private long reconnectDelaySeconds(int attempt) {
-            int shift = Math.min(Math.max(attempt - 1, 0), 5);
-            return Math.min(2L * (1L << shift), 60L);
-        }
-
-        private void sleepSeconds(long seconds) {
-            long end = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
-            while (running.get() && System.currentTimeMillis() < end) {
-                try {
-                    Thread.sleep(Math.min(1000L, end - System.currentTimeMillis()));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
     }
 
     private interface StatusSink {
@@ -816,7 +831,11 @@ public final class SpecusCore {
     }
 
     private static final class AuthClient {
-        static SpecusSession login(Context context, StartupConfig config) throws Exception {
+        private static final ScheduledExecutorService DEADLINES = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "specus-login-deadline"); thread.setDaemon(true); return thread;
+        });
+        static SpecusSession login(Context context, StartupConfig config, AtomicBoolean running,
+                                   Set<HttpURLConnection> pending) throws Exception {
             ClientEnvironment environment = ClientEnvironment.collect(context);
             String timestamp = String.valueOf(System.currentTimeMillis());
             String nonce = UUID.randomUUID().toString().replace("-", "");
@@ -836,6 +855,11 @@ public final class SpecusCore {
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             connection.setDoOutput(true);
+            connection.setInstanceFollowRedirects(false);
+            pending.add(connection);
+            ScheduledFuture<?> deadline = DEADLINES.schedule(connection::disconnect, 20, TimeUnit.SECONDS);
+            try {
+            if (!running.get()) throw new IOException("登录已取消");
             byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
             connection.setFixedLengthStreamingMode(bytes.length);
             try (OutputStream out = connection.getOutputStream()) {
@@ -843,21 +867,31 @@ public final class SpecusCore {
             }
 
             int status = connection.getResponseCode();
-            byte[] responseBody = readLimited(status >= 400 ? connection.getErrorStream() : connection.getInputStream(), 1024 * 1024);
-            String response = new String(responseBody, StandardCharsets.UTF_8);
             if (status < 200 || status >= 300) {
-                throw new IOException("HTTP login failed " + status + ": " + response);
+                throw HttpLoginFailure.fromStatus(status);
             }
-            SpecusSession session = SpecusSession.fromLoginJson(new JSONObject(response));
+            byte[] responseBody = readLimited(connection.getInputStream(), 1024 * 1024);
+            String response = new String(responseBody, StandardCharsets.UTF_8);
+            SpecusSession session;
+            try {
+                session = SpecusSession.fromLoginJson(new JSONObject(response));
+            } catch (org.json.JSONException error) {
+                throw new HttpLoginFailure("登录响应格式无效，请检查服务地址与网关（响应内容已隐藏）", false);
+            }
             if (isBlank(session.clientName)
                     || session.clientSessionId == null
                     || session.clientSessionId <= 0
                     || isBlank(session.accessToken)
                     || isBlank(session.nettyHost)
                     || session.nettyPort <= 0) {
-                throw new IOException("HTTP login response is incomplete");
+                throw new HttpLoginFailure("登录响应缺少必要字段，请检查服务地址与客户端兼容性", false);
             }
             return session;
+            } finally {
+                deadline.cancel(false);
+                pending.remove(connection);
+                connection.disconnect();
+            }
         }
     }
 
@@ -1479,6 +1513,7 @@ public final class SpecusCore {
                     requireFirstLoginResponse(loginSucceeded);
                     LoginResponse login = (LoginResponse) packet;
                     if (login.success) {
+                        status.publish("Control authenticated", login.clientName, true);
                         connectData();
                         loginSucceeded = true;
                         status.publish("Connected", login.clientName + " (control + data)", true);
@@ -1542,18 +1577,28 @@ public final class SpecusCore {
         }
 
         private Socket connectServerSocket(boolean dataChannel) throws Exception {
+            return MultiAddressDialer.connect(session.nettyHost,
+                    CONTROL_CONNECT_TIMEOUT_MILLIS + CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS,
+                    () -> closed.get() || !running.get(), InetAddress::getAllByName,
+                    (address, remainingMillis) -> connectServerAddress(dataChannel, address, remainingMillis));
+        }
+
+        private Socket connectServerAddress(boolean dataChannel, InetAddress address, int remainingMillis) throws Exception {
+            long deadline = System.nanoTime() + remainingMillis * 1_000_000L;
             Socket raw = new Socket();
             connectingSockets.track(raw);
             try {
                 protect(raw);
                 raw.setTcpNoDelay(true);
                 raw.setKeepAlive(true);
-                raw.connect(new InetSocketAddress(session.nettyHost, session.nettyPort),
-                        CONTROL_CONNECT_TIMEOUT_MILLIS);
+                raw.connect(new InetSocketAddress(address, session.nettyPort), Math.min(1500, remainingMillis));
+                int handshakeBudget = (int) Math.min(CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS,
+                        (deadline - System.nanoTime()) / 1_000_000L);
+                if (handshakeBudget <= 0) throw new java.net.SocketTimeoutException("连接总预算已耗尽");
                 Socket connected = ControlTlsSockets.wrapConnected(
                         raw, session.nettyHost, session.nettyPort,
                         session.nettyTls, session.controlTls,
-                        CONTROL_TLS_HANDSHAKE_TIMEOUT_MILLIS);
+                        handshakeBudget);
                 if (dataChannel) {
                     dataSocket = connected;
                 } else {
@@ -1648,12 +1693,16 @@ public final class SpecusCore {
             if (body.isEmpty()) {
                 throw new IllegalArgumentException("message is empty");
             }
+            if (!loginSucceeded || closed.get()) throw new IllegalStateException("控制通道尚未就绪");
+            peerMeshEngine.requireMessageTarget(target);
             try {
                 PeerMeshEngine.ClientMessageSendResult peerResult = peerMeshEngine.sendClientMessage(target, body);
                 if (peerResult != null) {
                     status.publish("Message sent", peerResult.transport + " -> " + target, true);
                     return;
                 }
+            } catch (MessageDeliveryUnknownException error) {
+                throw error;
             } catch (Exception error) {
                 status.publish("Peer message fallback", message(error), true);
             }

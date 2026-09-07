@@ -8,6 +8,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.VpnService;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
@@ -27,6 +31,8 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
     static final String ACTION_STOP = "com.theshuai.specus.android.STOP";
     static final String ACTION_SEND_MESSAGE = "com.theshuai.specus.android.SEND_MESSAGE";
     static final String ACTION_SEND_FILE = "com.theshuai.specus.android.SEND_FILE";
+    static final String ACTION_RETRY = "com.theshuai.specus.android.RETRY";
+    static final String EXTRA_MESSAGE_ID = "messageId";
     static final String EXTRA_TO_CLIENT_NAME = "toClientName";
     static final String EXTRA_MESSAGE = "message";
     static final String EXTRA_FILE_URI = "fileUri";
@@ -37,7 +43,28 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
     private ExecutorService executor;
     private ExecutorService messageExecutor;
     private ExecutorService vpnExecutor;
-    private SpecusCore.Runtime runtime;
+    private volatile SpecusCore.Runtime runtime;
+    private ConnectivityManager connectivityManager;
+    private Network lastNetwork;
+    private boolean callbackRegistered;
+    private volatile boolean vpnRequested;
+    private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+        @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return;
+            if (network.equals(lastNetwork)) return;
+            lastNetwork = network;
+            SpecusCore.Runtime active = runtime;
+            if (active != null) active.requestReconnect();
+        }
+        @Override public void onLost(Network network) {
+            if (network.equals(lastNetwork)) {
+                lastNetwork = null;
+                SpecusCore.Runtime active = runtime;
+                if (active != null) active.requestReconnect();
+            }
+        }
+    };
     private ParcelFileDescriptor vpnInterface;
     private FileOutputStream vpnOutput;
     private volatile boolean vpnRunning;
@@ -48,6 +75,15 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
     public void onCreate() {
         super.onCreate();
         ensureChannel();
+        connectivityManager = getSystemService(ConnectivityManager.class);
+        if (connectivityManager != null) {
+            try {
+                connectivityManager.registerDefaultNetworkCallback(networkCallback);
+                callbackRegistered = true;
+            } catch (RuntimeException error) {
+                android.util.Log.w("specus", "Network callbacks unavailable", error);
+            }
+        }
         executor = Executors.newSingleThreadExecutor(r -> {
             Thread thread = new Thread(r, "specus-runtime");
             thread.setDaemon(true);
@@ -67,7 +103,7 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String action = intent == null ? ACTION_START : intent.getAction();
+        String action = intent == null ? ACTION_STOP : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             stopRuntime("Stopped by user");
             stopForegroundCompat();
@@ -76,34 +112,49 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
         }
         if (ACTION_SEND_MESSAGE.equals(action)) {
             sendClientMessage(intent);
+            return START_NOT_STICKY;
+        }
+        if (ACTION_RETRY.equals(action)) {
             SpecusCore.Runtime active = runtime;
-            return active != null && active.isRunning() ? START_STICKY : START_NOT_STICKY;
+            if (active != null && active.isRunning()) active.requestReconnect();
+            else stopSelf();
+            return START_NOT_STICKY;
         }
         if (ACTION_SEND_FILE.equals(action)) {
             sendFile(intent);
-            SpecusCore.Runtime active = runtime;
-            return active != null && active.isRunning() ? START_STICKY : START_NOT_STICKY;
+            return START_NOT_STICKY;
         }
-        startForeground(NOTIFICATION_ID, notification("Starting"));
-        startRuntime();
-        return START_STICKY;
+        try {
+            boolean vpn = SpecusCore.StartupConfig.parse(ConfigStorage.loadConfig(this)).requiresVpnPermission();
+            vpnRequested = vpn;
+            if (vpn && VpnService.prepare(this) != null) throw new IllegalStateException("请返回应用授予 VPN 权限后启动");
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIFICATION_ID, notification("连接中"), vpn
+                        ? ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+                        : ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else startForeground(NOTIFICATION_ID, notification("连接中"));
+            publish("Starting", "正在建立连接", true);
+            startRuntime();
+        } catch (Exception error) {
+            stopRuntime("无法启动：" + error.getMessage());
+            stopForegroundCompat();
+            stopSelf();
+        }
+        return START_NOT_STICKY;
     }
 
     /**
-     * Android 15 caps how long a {@code dataSync} foreground service may run and calls this when
-     * the budget is spent. The service must stop itself promptly: staying up past the callback is
-     * an ANR on Android 15 and a hard crash on later releases. Tearing the runtime down here also
-     * releases the tunnel sockets rather than leaving them for the platform to reap.
+     * Stop promptly if the platform imposes a foreground-service limit. Never restart to evade it.
      */
     @Override
     public void onTimeout(int startId) {
         onTimeout(startId, 0);
     }
 
-    /** Android 16 hands the service type along; the response is the same. */
+    /** Android 15 supplies the service type; the one-argument callback is for shortService. */
     @Override
     public void onTimeout(int startId, int foregroundServiceType) {
-        stopRuntime("Foreground service time limit reached");
+        stopRuntime("系统已限制后台运行；请打开应用检查权限并手动重新连接");
         stopVpn();
         stopForeground(true);
         stopSelf(startId);
@@ -111,6 +162,10 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
 
     @Override
     public void onDestroy() {
+        if (callbackRegistered && connectivityManager != null) {
+            connectivityManager.unregisterNetworkCallback(networkCallback);
+            callbackRegistered = false;
+        }
         stopRuntime("Service destroyed");
         if (executor != null) {
             executor.shutdownNow();
@@ -128,6 +183,13 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
         super.onDestroy();
     }
 
+    @Override public void onRevoke() {
+        stopRuntime("VPN 授权已撤销；可重新授权，或关闭私有组网后使用转发和互传");
+        stopForegroundCompat();
+        stopSelf();
+        super.onRevoke();
+    }
+
     @Override
     public IBinder onBind(Intent intent) {
         if (intent != null && VpnService.SERVICE_INTERFACE.equals(intent.getAction())) {
@@ -142,7 +204,11 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
             return;
         }
         String configText = ConfigStorage.loadConfig(this);
-        runtime = new SpecusCore.Runtime(getApplicationContext(), configText, this::onRuntimeStatus, this);
+        final SpecusCore.Runtime[] owner = new SpecusCore.Runtime[1];
+        runtime = new SpecusCore.Runtime(getApplicationContext(), configText, (status, detail, running) -> {
+            if (runtime == owner[0]) onRuntimeStatus(status, detail, running);
+        }, this);
+        owner[0] = runtime;
         runtime.setAppMessageListener((from, body) -> {
             Context appContext = getApplicationContext();
             if (FileTransferManager.get().onIncomingMessage(appContext, from, body)) {
@@ -150,13 +216,24 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
             }
             ChatEvents.send(appContext, ChatEvents.DIRECTION_IN, ChatEvents.KIND_TEXT, from, body);
         });
-        executor.submit(runtime::run);
+        SpecusCore.Runtime started = runtime;
+        executor.submit(() -> {
+            started.run();
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                if (runtime == started) {
+                    runtime = null;
+                    stopForegroundCompat();
+                    stopSelf();
+                }
+            });
+        });
     }
 
     private synchronized void stopRuntime(String reason) {
         if (runtime != null) {
-            runtime.stop();
+            SpecusCore.Runtime old = runtime;
             runtime = null;
+            old.stop();
         }
         publish("Stopped", reason, false);
     }
@@ -164,26 +241,32 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
     private void sendClientMessage(Intent intent) {
         String toClientName = intent == null ? "" : intent.getStringExtra(EXTRA_TO_CLIENT_NAME);
         String message = intent == null ? "" : intent.getStringExtra(EXTRA_MESSAGE);
+        String messageId = intent == null ? "" : intent.getStringExtra(EXTRA_MESSAGE_ID);
         SpecusCore.Runtime active = runtime;
         if (active == null || !active.isRunning()) {
-            publish("Message not sent", "Specus is not running", false);
+            messageResult(messageId, "失败 · 未连接；内容已保留，可长按重新编辑");
             stopSelf();
             return;
         }
         ExecutorService worker = messageExecutor;
         if (worker == null || worker.isShutdown()) {
-            publish("Message not sent", "Message worker is stopped", active.isRunning());
+            messageResult(messageId, "失败 · 发送线程不可用；内容已保留");
             return;
         }
         worker.submit(() -> {
             try {
                 active.sendClientMessage(toClientName, message);
+                messageResult(messageId, "已提交 · 不代表对方已送达或已读");
             } catch (Exception error) {
-                publish("Message not sent", error.getMessage() == null
-                        ? error.getClass().getSimpleName()
-                        : error.getMessage(), active.isRunning());
+                messageResult(messageId, "失败或结果未知 · " + error.getClass().getSimpleName()
+                        + "；内容已保留，重发前请确认对方未收到");
             }
         });
+    }
+
+    private void messageResult(String id, String result) {
+        GuiSessionStore.result(id, result);
+        sendBroadcast(new Intent(ChatEvents.ACTION_CHAT).setPackage(getPackageName()));
     }
 
     private void sendFile(Intent intent) {
@@ -210,11 +293,12 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
         publish(status, detail, running);
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) {
-            manager.notify(NOTIFICATION_ID, notification(status));
+            manager.notify(NOTIFICATION_ID, notification(GuiSessionStore.status().title));
         }
     }
 
     private void publish(String status, String detail, boolean running) {
+        GuiSessionStore.status(status, detail, running);
         Intent intent = new Intent(StatusEvents.ACTION_STATUS)
                 .setPackage(getPackageName())
                 .putExtra(StatusEvents.EXTRA_STATUS, status)
@@ -279,12 +363,12 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
 
     @Override
     public boolean protectSocket(Socket socket) {
-        return socket != null && protect(socket);
+        return socket != null && (!vpnRequested || protect(socket));
     }
 
     @Override
     public boolean protectDatagramSocket(DatagramSocket socket) {
-        return socket != null && protect(socket);
+        return socket != null && (!vpnRequested || protect(socket));
     }
 
     @Override
@@ -320,6 +404,8 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
             flags |= PendingIntent.FLAG_IMMUTABLE;
         }
         PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, launch, flags);
+        PendingIntent stopIntent = PendingIntent.getService(this, 1,
+                new Intent(this, SpecusForegroundService.class).setAction(ACTION_STOP), flags);
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
@@ -329,6 +415,7 @@ public class SpecusForegroundService extends VpnService implements SpecusCore.Vp
                 .setSmallIcon(R.drawable.ic_stat_specus)
                 .setOngoing(true)
                 .setContentIntent(pendingIntent)
+                .addAction(new Notification.Action.Builder(null, "停止连接", stopIntent).build())
                 .build();
     }
 

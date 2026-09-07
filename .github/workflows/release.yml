@@ -572,6 +572,12 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh dist
+          notes_args=()
+          notes_file="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes_file" ]; then
+            notes_args+=(--notes-file "$notes_file")
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
+            "${notes_args[@]}" \
             --generate-notes

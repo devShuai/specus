@@ -105,7 +105,7 @@ public class MainActivityPeerServiceInstrumentationTest {
     }
 
     private static View findByDescription(View root, String description) {
-        if (description.contentEquals(root.getContentDescription())) {
+        if (root.getContentDescription() != null && description.contentEquals(root.getContentDescription())) {
             return root;
         }
         if (root instanceof ViewGroup group) {

@@ -1,0 +1,15 @@
+<resources>
+    <style name="SpecusTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#1D776D</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <color name="gui_ink">#121E26</color>
+    <color name="gui_muted">#526571</color>
+    <color name="gui_page">#F0F4F6</color>
+    <color name="gui_panel">#FFFFFF</color>
+    <color name="gui_line">#DBE4E9</color>
+    <color name="gui_accent">#1D776D</color>
+    <color name="gui_danger">#B03E47</color>
+</resources>

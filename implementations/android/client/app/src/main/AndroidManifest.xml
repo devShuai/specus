@@ -1,14 +1,17 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
+        android:theme="@style/SpecusTheme"
         android:icon="@drawable/ic_launcher_specus"
         android:label="@string/app_name"
         android:roundIcon="@drawable/ic_launcher_specus"
@@ -16,21 +19,27 @@
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
+        <!-- VPN consent is the systemExempted prerequisite; lint only models alarm permissions.
+             Do not add unrelated exact-alarm permissions. Runtime checks VpnService.prepare. -->
         <service
             android:name=".SpecusForegroundService"
             android:exported="false"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="systemExempted|specialUse"
+            tools:ignore="ForegroundServicePermission"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-started private network tunnel providing continuous inbound TCP/HTTP forwarding to this device without VPN routing. The persistent notification exposes connection state and a Stop action. Runs only until the user stops the tunnel; not a periodic synchronization task." />
         </service>
     </application>
 </manifest>
