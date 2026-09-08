@@ -1563,6 +1563,84 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("peer_mesh_device", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshEgressActivity", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ActiveFlows")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("active_flows");
+
+                    b.Property<long>("BytesIn")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("bytes_in");
+
+                    b.Property<long>("BytesOut")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("bytes_out");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<long>("EgressClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("egress_client_id");
+
+                    b.Property<string>("EgressClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("egress_client_name");
+
+                    b.Property<string>("RejectedFlows")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("rejected_flows");
+
+                    b.Property<string>("ReportedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("reported_at");
+
+                    b.Property<long>("Revision")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("revision");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("session_id");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<long>("TotalFlows")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("total_flows");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "EgressClientId")
+                        .IsUnique()
+                        .HasDatabaseName("uk_peer_egress_activity_client");
+
+                    b.ToTable("peer_mesh_egress_activity", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshEgressPolicy", b =>
                 {
                     b.Property<long>("Id")
@@ -1646,6 +1724,33 @@ namespace Specus.Server.Data.Migrations
                         .HasDatabaseName("idx_peer_egress_policy_enabled");
 
                     b.ToTable("peer_mesh_egress_policy", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshEgressSwitch", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("TenantId");
+
+                    b.ToTable("peer_mesh_egress_switch", (string)null);
                 });
 
             modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshServiceSharing", b =>

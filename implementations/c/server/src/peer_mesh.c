@@ -192,6 +192,11 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
                                     const char *target_client_name,
                                     const char *message);
 
+static int pm_handle_egress_report(const st_peer_mesh_runtime *runtime,
+                                   const st_storage_client *source,
+                                   const char *target_client_name,
+                                   const char *message);
+
 static int pm_append_named_string(pm_builder *builder,
                                   const char *name,
                                   const char *value)
@@ -374,7 +379,8 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
         || !pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)
         || !pm_has_text(authenticated_client_name) || !st_json_is_valid_object(message)) return -1;
     char *type = st_json_get_top_level_string(message, "type");
-    if (!pm_has_text(type) || strcmp(type, "service-catalog") == 0) {
+    if (!pm_has_text(type) || strcmp(type, "service-catalog") == 0
+        || strcmp(type, "egress-config") == 0 || strcmp(type, "egress-catalog") == 0) {
         free(type);
         return -1;
     }
@@ -389,6 +395,11 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
     if (strcmp(type, "service-report") == 0) {
         int rc = pm_handle_service_report(runtime, &source, &source_device,
                                           target_client_name, message);
+        free(type);
+        return rc;
+    }
+    if (strcmp(type, "egress-report") == 0) {
+        int rc = pm_handle_egress_report(runtime, &source, target_client_name, message);
         free(type);
         return rc;
     }
@@ -1476,6 +1487,13 @@ static int pm_egress_supported(const st_storage_client *client)
     return client != NULL && client->client_egress_version >= 1;
 }
 
+/* The tenant switch. Off by default: egress is opt-in for the tenant as well as per device. */
+static int pm_tenant_egress_enabled(const char *database_path, const char *tenant_id)
+{
+    st_storage_peer_mesh_egress_switch row;
+    return st_storage_get_peer_mesh_egress_switch(database_path, tenant_id, &row) == 0 && row.enabled;
+}
+
 static int pm_egress_id_listed(const char *csv, long long client_id)
 {
     if (csv == NULL || *csv == '\0') return 0;
@@ -1583,7 +1601,8 @@ static int pm_push_egress_config(const st_peer_mesh_runtime *runtime,
     pm_builder message = {0};
     int rc = pm_appendf(&message, "{\"type\":\"egress-config\",\"revision\":%lld,",
                         pm_next_egress_revision());
-    if (rc == 0 && (found != 0 || !policy.enabled)) {
+    int tenant_on = pm_tenant_egress_enabled(runtime->database_path, client->tenant_id);
+    if (rc == 0 && (found != 0 || !policy.enabled || !tenant_on)) {
         rc = pm_append(&message,
                        "\"enabled\":false,\"allowedConsumerClientIds\":[],\"destinationRules\":[]");
     } else if (rc == 0) {
@@ -1628,8 +1647,10 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
 
     st_storage_peer_mesh_egress_policy policies[64];
     size_t policy_count = 0U;
-    if (st_storage_list_peer_mesh_egress_policies(runtime->database_path, consumer->tenant_id, 1,
-                                                  policies, 64U, &policy_count) != 0) return -1;
+    if (!pm_tenant_egress_enabled(runtime->database_path, consumer->tenant_id)) {
+        policy_count = 0U;
+    } else if (st_storage_list_peer_mesh_egress_policies(runtime->database_path, consumer->tenant_id, 1,
+                                                         policies, 64U, &policy_count) != 0) return -1;
 
     pm_builder message = {0};
     int rc = pm_appendf(&message, "{\"type\":\"egress-catalog\",\"revision\":%lld,\"egresses\":[",
@@ -1692,6 +1713,168 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
     }
     free(message.data);
     return rc;
+}
+
+/*
+ * egress-report ingest.
+ *
+ * The reporter identity and session come from the authenticated control connection the caller
+ * already resolved, never from the message body. The report carries counters only: no destination,
+ * domain or request content, and refusals aggregated by result code.
+ */
+
+/* Cap on one envelope. Counters only, so this is far above what a well-formed report needs. */
+#define ST_PEER_EGRESS_MAX_REPORT_BYTES (8U * 1024U)
+#define ST_PEER_EGRESS_REPORT_RATE_LIMIT 20U
+#define ST_PEER_EGRESS_REPORT_RATE_WINDOW 60
+#define ST_PEER_EGRESS_MAX_RATE_SESSIONS 4096U
+
+typedef struct {
+    long long session_id;
+    time_t window_started_at;
+    unsigned int count;
+} pm_egress_rate_slot;
+
+static pm_egress_rate_slot peer_egress_rate_slots[ST_PEER_EGRESS_MAX_RATE_SESSIONS];
+static size_t peer_egress_rate_used;
+static pthread_mutex_t peer_egress_rate_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Bounds how often one control session may report. The table is keyed by client-driven session ids,
+ * so it carries a hard ceiling of its own: refusing at the ceiling is safer than letting an abusive
+ * peer grow it without bound.
+ */
+static int pm_enforce_egress_report_rate(long long session_id)
+{
+    time_t now = time(NULL);
+    int allowed = 0;
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    pm_egress_rate_slot *slot = NULL;
+    for (size_t i = 0; i < peer_egress_rate_used; ++i) {
+        if (peer_egress_rate_slots[i].session_id == session_id) {
+            slot = &peer_egress_rate_slots[i];
+            break;
+        }
+    }
+    if (slot == NULL && peer_egress_rate_used < ST_PEER_EGRESS_MAX_RATE_SESSIONS) {
+        slot = &peer_egress_rate_slots[peer_egress_rate_used++];
+        slot->session_id = session_id;
+        slot->window_started_at = 0;
+        slot->count = 0U;
+    }
+    if (slot != NULL) {
+        if (slot->window_started_at == 0
+            || now - slot->window_started_at >= ST_PEER_EGRESS_REPORT_RATE_WINDOW) {
+            slot->window_started_at = now;
+            slot->count = 0U;
+        }
+        if (slot->count < ST_PEER_EGRESS_REPORT_RATE_LIMIT) {
+            ++slot->count;
+            allowed = 1;
+        }
+    }
+    pthread_mutex_unlock(&peer_egress_rate_lock);
+    return allowed ? 0 : -1;
+}
+
+static long long pm_report_counter(const char *message, const char *field)
+{
+    long long value = 0;
+    if (st_json_get_i64(message, field, &value) != 0 || value < 0) {
+        return 0;
+    }
+    return value;
+}
+
+/*
+ * Keeps only codes this build defines. Without the filter a client could grow the stored map with
+ * keys of its own invention.
+ */
+static void pm_encode_rejected_flows(const char *message, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "{}");
+    char *raw = st_json_get_top_level_raw(message, "rejectedFlows");
+    if (raw == NULL) {
+        return;
+    }
+    pm_builder builder = {0};
+    int first = 1;
+    int rc = pm_append(&builder, "{");
+    for (size_t i = 0; rc == 0 && i < ST_EGRESS_ALL_CODES_LEN; ++i) {
+        long long count = 0;
+        if (st_json_get_i64(raw, ST_EGRESS_ALL_CODES[i], &count) != 0 || count < 0) {
+            continue;
+        }
+        rc = (!first && pm_append(&builder, ",") != 0) ? -1 : 0;
+        if (rc == 0) {
+            rc = pm_append_json_string(&builder, ST_EGRESS_ALL_CODES[i]) == 0
+                && pm_appendf(&builder, ":%lld", count) == 0 ? 0 : -1;
+        }
+        first = 0;
+    }
+    if (rc == 0) {
+        rc = pm_append(&builder, "}");
+    }
+    /* Cannot overflow with known codes only; refusing beats storing a truncated map. */
+    if (rc == 0 && builder.data != NULL && strlen(builder.data) < out_len) {
+        snprintf(out, out_len, "%s", builder.data);
+    }
+    free(builder.data);
+    free(raw);
+}
+
+static int pm_handle_egress_report(const st_peer_mesh_runtime *runtime,
+                                   const st_storage_client *source,
+                                   const char *target_client_name,
+                                   const char *message)
+{
+    static const char *server_fields[] = {
+        "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+        "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+        "sessionId", "token"
+    };
+    if (strlen(message) > ST_PEER_EGRESS_MAX_REPORT_BYTES || pm_has_text(target_client_name)
+        || runtime->publisher_session_id <= 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(server_fields) / sizeof(server_fields[0]); ++i) {
+        if (pm_top_level_has(message, server_fields[i])) return -1;
+    }
+    if (source->client_egress_version < 1) {
+        return -1;
+    }
+    if (pm_enforce_egress_report_rate(runtime->publisher_session_id) != 0) {
+        return -1;
+    }
+
+    long long revision = 0;
+    (void)st_json_get_i64(message, "revision", &revision);
+
+    st_storage_peer_mesh_egress_activity stored;
+    int found = st_storage_find_peer_mesh_egress_activity(runtime->database_path, source->tenant_id,
+                                                          source->id, &stored);
+    if (found < 0) {
+        return -1;
+    }
+    /* Reports can overtake each other on reconnect; an older snapshot must not overwrite a newer one. */
+    if (found == 0 && revision > 0 && revision < stored.revision) {
+        return 0;
+    }
+
+    st_storage_peer_mesh_egress_activity row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.tenant_id, sizeof(row.tenant_id), "%s", source->tenant_id);
+    row.egress_client_id = source->id;
+    snprintf(row.egress_client_name, sizeof(row.egress_client_name), "%s", source->client_name);
+    row.session_id = runtime->publisher_session_id;
+    row.revision = revision;
+    row.active_flows = pm_report_counter(message, "activeFlows");
+    row.total_flows = pm_report_counter(message, "totalFlows");
+    row.bytes_in = pm_report_counter(message, "bytesIn");
+    row.bytes_out = pm_report_counter(message, "bytesOut");
+    pm_encode_rejected_flows(message, row.rejected_flows, sizeof(row.rejected_flows));
+    pm_format_instant(time(NULL), row.reported_at);
+    return st_storage_upsert_peer_mesh_egress_activity(runtime->database_path, &row);
 }
 
 int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,

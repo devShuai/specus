@@ -4253,6 +4253,146 @@ static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
     return rc;
 }
 
+/*
+ * Latest counters each egress device reported about itself. Counters only: the report carries no
+ * destination, domain or request content, and refusals arrive aggregated by result code.
+ */
+static int build_peer_mesh_egress_activity_response(const st_admin_context *context,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
+    st_storage_peer_mesh_egress_activity rows[128];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_activity(database_path, context->tenant_id,
+                                                  rows, 128U, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress activity list failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, "{\"egressClientId\":%lld,\"egressClientName\":",
+                                  rows[i].egress_client_id);
+        }
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, rows[i].egress_client_name);
+        st_admin_client_runtime_status status;
+        admin_get_client_runtime_status(rows[i].egress_client_id, rows[i].egress_client_name, &status);
+        int online = status.online;
+        if (rc == 0) {
+            /* Resolved from the live control channel, so a node that stopped reporting reads as
+             * offline instead of frozen at its last counters. */
+            rc = admin_sb_appendf(&builder,
+                ",\"online\":%s,\"revision\":%lld,\"activeFlows\":%lld,\"totalFlows\":%lld,"
+                "\"rejectedFlows\":%s,\"bytesIn\":%lld,\"bytesOut\":%lld,\"reportedAt\":",
+                online ? "true" : "false",
+                rows[i].revision, rows[i].active_flows, rows[i].total_flows,
+                rows[i].rejected_flows[0] == '\0' ? "{}" : rows[i].rejected_flows,
+                rows[i].bytes_in, rows[i].bytes_out);
+        }
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, rows[i].reported_at);
+        if (rc == 0) rc = admin_sb_append(&builder, "}");
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress activity response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+/*
+ * Tenant-wide egress switch. Separate from the per-device flag on each policy: both must be on for a
+ * device to act as an egress, and switching this off stops the tenant without losing which devices
+ * were configured.
+ */
+static int build_peer_mesh_egress_switch_response(const st_admin_context *context,
+                                                  char *out,
+                                                  size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    st_storage_peer_mesh_egress_switch row;
+    memset(&row, 0, sizeof(row));
+    int found = database_path == NULL
+        ? 1
+        : st_storage_get_peer_mesh_egress_switch(database_path, context->tenant_id, &row);
+    if (found < 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress switch status failed\"}");
+    }
+    size_t enabled_policies = 0U;
+    if (database_path != NULL) {
+        st_storage_peer_mesh_egress_policy policies[128];
+        (void)st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 1,
+                                                        policies, 128U, &enabled_policies);
+    }
+    int deployment_enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
+    int configured = found == 0 && row.enabled;
+
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+        "{\"deploymentEnabled\":%s,\"configuredEnabled\":%s,\"effectiveEnabled\":%s,"
+        "\"protocolVersion\":%d,\"enabledPolicyCount\":%zu,\"updatedAt\":",
+        deployment_enabled ? "true" : "false",
+        configured ? "true" : "false",
+        (deployment_enabled && configured) ? "true" : "false",
+        ST_EGRESS_PROTOCOL_VERSION, enabled_policies);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, found == 0 ? row.updated_at : "");
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"updatedBy\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, found == 0 ? row.updated_by : "");
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress switch response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_peer_mesh_egress_switch_update(const st_admin_context *context,
+                                                 const char *body,
+                                                 char *out,
+                                                 size_t out_len)
+{
+    if (!context->admin) {
+        return write_response(out, out_len, 403, "Forbidden",
+                              "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
+    }
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"database-backed egress policies are unavailable\"}");
+    }
+    int enabled = 0;
+    if (st_json_get_bool(body, "enabled", &enabled) != 0) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled is required\"}");
+    }
+    if (enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"部署端未启用 Peer Mesh，不能开启出口分流\"}");
+    }
+    st_storage_peer_mesh_egress_switch row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.tenant_id, sizeof(row.tenant_id), "%s", context->tenant_id);
+    row.enabled = enabled;
+    snprintf(row.updated_by, sizeof(row.updated_by), "%s", context->username);
+    if (st_storage_upsert_peer_mesh_egress_switch(database_path, &row) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress switch save failed\"}");
+    }
+    /* Turning the tenant off has to reach the peers now, like any other authorization change. */
+    admin_notify_peer_mesh_refresh(context->tenant_id);
+    return build_peer_mesh_egress_switch_response(context, out, out_len);
+}
+
 static int build_peer_mesh_egress_policies_response(const st_admin_context *context,
                                                     char *out,
                                                     size_t out_len)
@@ -8532,6 +8672,15 @@ static int st_admin_build_response_internal(const char *method,
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
         return build_peer_mesh_egress_policies_response(&context, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/switch")) {
+        return build_peer_mesh_egress_switch_response(&context, out, out_len);
+    }
+    if (strcmp(method, "PUT") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/switch")) {
+        return handle_peer_mesh_egress_switch_update(&context, body, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/activity")) {
+        return build_peer_mesh_egress_activity_response(&context, out, out_len);
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
         return handle_peer_mesh_egress_policy_mutation(&context, body, out, out_len);

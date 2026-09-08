@@ -353,6 +353,44 @@ typedef struct {
     char updated_at[64];
 } st_storage_peer_mesh_egress_policy;
 
+/*
+ * Latest counters an egress device reported about itself. One row per device rather than an
+ * append-only log: the management view needs what the node is doing now, and history from a
+ * client-driven message would grow without bound. Counters carry no destination or request content.
+ */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    long long egress_client_id;
+    char egress_client_name[256];
+    /* Bound by the server from the authenticated control connection, not read from the body. */
+    long long session_id;
+    long long revision;
+    long long active_flows;
+    long long total_flows;
+    /* Refusals aggregated by result code, as canonical JSON. */
+    char rejected_flows[1025];
+    long long bytes_in;
+    long long bytes_out;
+    char reported_at[64];
+    char created_at[64];
+    char updated_at[64];
+} st_storage_peer_mesh_egress_activity;
+
+/*
+ * Tenant-wide egress switch. Separate from the per-device enabled flag on the policy, and both must
+ * be on for a device to act as an egress: the per-device flag says whether that device was chosen,
+ * this one lets an operator stop the tenant without losing which devices were configured.
+ */
+typedef struct {
+    char tenant_id[64];
+    int enabled;
+    char updated_by[128];
+    char updated_at[64];
+} st_storage_peer_mesh_egress_switch;
+
+
+
 
 typedef struct {
     long long id;
@@ -1035,6 +1073,23 @@ int st_storage_upsert_peer_mesh_egress_policy(const char *path,
 int st_storage_delete_peer_mesh_egress_policy(const char *path,
                                               long long id,
                                               const char *tenant_id);
+int st_storage_list_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              st_storage_peer_mesh_egress_activity *rows,
+                                              size_t max_rows,
+                                              size_t *row_count);
+int st_storage_find_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              long long egress_client_id,
+                                              st_storage_peer_mesh_egress_activity *out_row);
+int st_storage_upsert_peer_mesh_egress_activity(const char *path,
+                                                const st_storage_peer_mesh_egress_activity *row);
+/* Returns 0 on a hit, 1 when the tenant has never set it, -1 on a storage failure. */
+int st_storage_get_peer_mesh_egress_switch(const char *path,
+                                           const char *tenant_id,
+                                           st_storage_peer_mesh_egress_switch *out_row);
+int st_storage_upsert_peer_mesh_egress_switch(const char *path,
+                                              const st_storage_peer_mesh_egress_switch *row);
 int st_storage_record_peer_mesh_service_audit(const char *path,
                                               const char *action,
                                               const char *tenant_id,

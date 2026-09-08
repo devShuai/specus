@@ -1,8 +1,10 @@
 package com.theshuai.specusserver.management.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
+import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
 import com.theshuai.common.peeregress.PeerEgressProtocol;
 import com.theshuai.common.peermesh.PeerControlMessage;
@@ -11,10 +13,16 @@ import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
+import com.theshuai.specusserver.management.model.PeerMeshEgressActivity;
+import com.theshuai.specusserver.management.model.PeerMeshEgressActivityView;
+import com.theshuai.specusserver.management.model.PeerMeshEgressSwitch;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
+import com.theshuai.specusserver.management.model.PeerMeshEgressSwitchView;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicyView;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshEgressSwitchRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
 
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +38,13 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.function.Predicate;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -46,15 +61,22 @@ public class PeerEgressService {
     private final AtomicLong revisions = new AtomicLong();
 
     private final PeerMeshEgressPolicyRepository policyRepository;
+    private final PeerMeshEgressActivityRepository activityRepository;
+    private final PeerMeshEgressSwitchRepository switchRepository;
+    private final ConcurrentHashMap<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
     private final PeerMeshDeviceRepository deviceRepository;
     private final ClientAccountRepository clientAccountRepository;
     private final PeerMeshService peerMeshService;
 
     public PeerEgressService(PeerMeshEgressPolicyRepository policyRepository,
+                             PeerMeshEgressActivityRepository activityRepository,
+                             PeerMeshEgressSwitchRepository switchRepository,
                              PeerMeshDeviceRepository deviceRepository,
                              ClientAccountRepository clientAccountRepository,
                              PeerMeshService peerMeshService) {
         this.policyRepository = policyRepository;
+        this.activityRepository = activityRepository;
+        this.switchRepository = switchRepository;
         this.deviceRepository = deviceRepository;
         this.clientAccountRepository = clientAccountRepository;
         this.peerMeshService = peerMeshService;
@@ -69,6 +91,57 @@ public class PeerEgressService {
                                  Integer maxConcurrentFlows,
                                  Integer maxFlowsPerConsumer,
                                  Integer idleTimeoutSeconds) {
+    }
+
+    /** Whether the tenant switch is on. Off by default: egress is opt-in for the tenant too. */
+    @Transactional(readOnly = true)
+    public boolean egressEnabledFor(String tenantId) {
+        return switchRepository.findById(tenantId).map(PeerMeshEgressSwitch::isEnabled).orElse(false);
+    }
+
+    @Transactional(readOnly = true)
+    public PeerMeshEgressSwitchView switchStatus(ManagementContext context) {
+        String tenantId = context.tenant().tenantId();
+        PeerMeshEgressSwitch stored = switchRepository.findById(tenantId).orElse(null);
+        boolean configured = stored != null && stored.isEnabled();
+        int enabledPolicies = policyRepository
+                .findByTenantIdAndEnabledTrueOrderByEgressClientNameAsc(tenantId).size();
+        return new PeerMeshEgressSwitchView(
+                peerMeshService.isEnabled(),
+                configured,
+                peerMeshService.isEnabled() && configured,
+                PeerEgressProtocol.PROTOCOL_VERSION,
+                enabledPolicies,
+                stored == null ? null : stored.getUpdatedAt(),
+                stored == null ? null : stored.getUpdatedBy());
+    }
+
+    /**
+     * Turns egress on or off for the whole tenant.
+     *
+     * <p>Switching off leaves every per-device policy intact, so turning it back on restores what
+     * was configured rather than making the operator rebuild it.
+     */
+    @Transactional
+    public PeerMeshEgressSwitchView setSwitch(ManagementContext context, boolean enabled) {
+        if (!context.isAdmin()) {
+            throw new IllegalArgumentException("只有租户 ADMIN 可以管理出口授权");
+        }
+        if (enabled && !peerMeshService.isEnabled()) {
+            throw new IllegalArgumentException("部署端未启用 Peer Mesh，不能开启出口分流");
+        }
+        String tenantId = context.tenant().tenantId();
+        PeerMeshEgressSwitch stored = switchRepository.findById(tenantId)
+                .orElseGet(() -> {
+                    PeerMeshEgressSwitch created = new PeerMeshEgressSwitch();
+                    created.setTenantId(tenantId);
+                    return created;
+                });
+        stored.setEnabled(enabled);
+        stored.setUpdatedBy(context.username());
+        stored.setUpdatedAt(Instant.now().toString());
+        switchRepository.save(stored);
+        return switchStatus(context);
     }
 
     @Transactional(readOnly = true)
@@ -175,6 +248,174 @@ public class PeerEgressService {
     }
 
     /**
+     * Records one {@code egress-report}.
+     *
+     * <p>The reporter identity and session come from the authenticated control connection the
+     * caller resolved, never from the message body. Counters are clamped to non-negative and
+     * refusal keys are filtered to codes this build defines, so a client cannot grow the stored map
+     * with keys of its own invention.
+     */
+    @Transactional
+    public void handleReport(ClientAccount source, PeerControlMessage report, long sessionId) {
+        enforceReportRateLimit(sessionId);
+        long revision = report.getRevision() == null ? 0L : report.getRevision();
+
+        PeerMeshEgressActivity activity = activityRepository
+                .findByTenantIdAndEgressClientId(source.getTenantId(), source.getId())
+                .orElse(null);
+        String now = Instant.now().toString();
+        if (activity == null) {
+            activity = new PeerMeshEgressActivity();
+            activity.setId(ClientIdGenerator.newId());
+            activity.setTenantId(source.getTenantId());
+            activity.setEgressClientId(source.getId());
+            activity.setCreatedAt(now);
+        } else if (revision > 0 && revision < activity.getRevision()) {
+            // Reports can overtake each other on reconnect; an older snapshot must not overwrite a
+            // newer one.
+            return;
+        }
+        activity.setEgressClientName(source.getClientName());
+        activity.setSessionId(sessionId);
+        activity.setRevision(revision);
+        activity.setActiveFlows(nonNegative(report.getActiveFlows()));
+        activity.setTotalFlows(nonNegative(report.getTotalFlows()));
+        activity.setBytesIn(nonNegative(report.getBytesIn()));
+        activity.setBytesOut(nonNegative(report.getBytesOut()));
+        activity.setRejectedFlows(encodeRejectedFlows(report.getRejectedFlows()));
+        activity.setReportedAt(now);
+        activity.setUpdatedAt(now);
+        activityRepository.save(activity);
+    }
+
+    /** Latest self-reported counters for every egress device in the tenant. */
+    @Transactional(readOnly = true)
+    public List<PeerMeshEgressActivityView> listActivity(ManagementContext context,
+                                                         Predicate<String> onlineCheck) {
+        List<PeerMeshEgressActivityView> views = new ArrayList<>();
+        for (PeerMeshEgressActivity row : activityRepository
+                .findByTenantIdOrderByEgressClientNameAsc(context.tenant().tenantId())) {
+            views.add(new PeerMeshEgressActivityView(
+                    row.getEgressClientId(),
+                    row.getEgressClientName(),
+                    onlineCheck != null && onlineCheck.test(row.getEgressClientName()),
+                    row.getRevision(),
+                    row.getActiveFlows(),
+                    row.getTotalFlows(),
+                    decodeRejectedFlows(row.getRejectedFlows()),
+                    row.getBytesIn(),
+                    row.getBytesOut(),
+                    row.getReportedAt()));
+        }
+        return views;
+    }
+
+    private static long nonNegative(Long value) {
+        return value == null || value < 0L ? 0L : value;
+    }
+
+    static String encodeRejectedFlows(Map<String, Long> reported) {
+        if (reported == null || reported.isEmpty()) {
+            return "{}";
+        }
+        Map<String, Long> filtered = new LinkedHashMap<>();
+        for (Map.Entry<String, Long> entry : reported.entrySet()) {
+            if (!PeerEgressCodes.isKnown(entry.getKey()) || entry.getValue() == null || entry.getValue() < 0L) {
+                continue;
+            }
+            filtered.put(entry.getKey(), entry.getValue());
+        }
+        if (filtered.isEmpty()) {
+            return "{}";
+        }
+        String encoded = JsonUtil.objectToString(filtered);
+        if (encoded == null || encoded.getBytes(StandardCharsets.UTF_8).length
+                > PeerMeshEgressActivity.MAX_REJECTED_FLOWS_BYTES) {
+            // Cannot happen with known codes only; refusing beats storing a truncated map.
+            return "{}";
+        }
+        return encoded;
+    }
+
+    static Map<String, Long> decodeRejectedFlows(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return Map.of();
+        }
+        try {
+            Map<String, Long> decoded = JsonUtil.stringToObject(raw, new TypeReference<>() {
+            });
+            return decoded == null ? Map.of() : decoded;
+        } catch (RuntimeException ex) {
+            log.warn("[peer-egress] stored refusal counters are unreadable; reporting none");
+            return Map.of();
+        }
+    }
+
+    /**
+     * Bounds how often one control session may report.
+     *
+     * <p>The tracked table has a hard ceiling: it is keyed by client-driven session ids, so without
+     * one an abusive peer could grow it without bound.
+     */
+    void enforceReportRateLimit(long sessionId) {
+        long now = System.currentTimeMillis();
+        long windowStart = now - PeerEgressProtocol.REPORT_RATE_WINDOW.toMillis();
+        ConcurrentLinkedDeque<Long> stamps = reportTimestamps.get(sessionId);
+        if (stamps == null) {
+            synchronized (reportTimestamps) {
+                stamps = reportTimestamps.get(sessionId);
+                if (stamps == null) {
+                    if (reportTimestamps.size() >= PeerEgressProtocol.MAX_RATE_TABLE_ENTRIES) {
+                        throw new IllegalArgumentException("egress-report rate limited");
+                    }
+                    stamps = new ConcurrentLinkedDeque<>();
+                    reportTimestamps.put(sessionId, stamps);
+                }
+            }
+        }
+        synchronized (stamps) {
+            while (true) {
+                Long first = stamps.peekFirst();
+                if (first == null || first >= windowStart) {
+                    break;
+                }
+                stamps.pollFirst();
+            }
+            if (stamps.size() >= PeerEgressProtocol.REPORT_RATE_LIMIT) {
+                throw new IllegalArgumentException("egress-report rate limited");
+            }
+            stamps.addLast(now);
+        }
+    }
+
+    /**
+     * Rejects an {@code egress-report} envelope that carries routing or identity the server binds
+     * itself. An explicit {@code null} is a violation too: the field must be absent.
+     */
+    public static void validateReportEnvelope(String message, String toClientName) {
+        if (message == null
+                || message.getBytes(StandardCharsets.UTF_8).length > PeerEgressProtocol.MAX_REPORT_BYTES) {
+            throw new IllegalArgumentException(
+                    "egress-report exceeds " + PeerEgressProtocol.MAX_REPORT_BYTES + " bytes");
+        }
+        if (StringUtils.hasText(toClientName)) {
+            throw new IllegalArgumentException("egress-report toClientName must be empty");
+        }
+        JsonNode root = JsonUtil.readString(message);
+        if (root == null || !root.isObject()) {
+            throw new IllegalArgumentException("invalid egress-report");
+        }
+        for (String field : List.of(
+                "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+                "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+                "sessionId", "token")) {
+            if (root.has(field)) {
+                throw new IllegalArgumentException("egress-report " + field + " is server-bound");
+            }
+        }
+    }
+
+    /**
      * Builds the {@code egress-config} pushed to an egress device.
      *
      * <p>Returns null when the client cannot take part, so callers never push a half-formed policy
@@ -200,7 +441,8 @@ public class PeerEgressService {
 
         Optional<PeerMeshEgressPolicy> stored = policyRepository
                 .findByTenantIdAndEgressClientId(account.getTenantId(), account.getId());
-        if (stored.isEmpty() || !stored.get().isEnabled() || !peerMeshService.isEnabled()) {
+        if (stored.isEmpty() || !stored.get().isEnabled() || !peerMeshService.isEnabled()
+                || !egressEnabledFor(account.getTenantId())) {
             message.setEnabled(false);
             message.setAllowedConsumerClientIds(List.of());
             message.setDestinationRules(List.of());
@@ -235,7 +477,7 @@ public class PeerEgressService {
         PeerControlMessage message = new PeerControlMessage();
         message.setType(PeerControlMessage.TYPE_EGRESS_CATALOG);
         message.setRevision(revisions.incrementAndGet());
-        if (!peerMeshService.isEnabled()) {
+        if (!peerMeshService.isEnabled() || !egressEnabledFor(account.getTenantId())) {
             message.setEgresses(List.of());
             return message;
         }

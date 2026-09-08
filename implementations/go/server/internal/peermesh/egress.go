@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/peeregress"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
@@ -309,7 +311,8 @@ func (s *Service) BuildEgressConfig(ctx context.Context, account store.ClientAcc
 	if err != nil {
 		return nil, err
 	}
-	if policy == nil || !policy.Enabled || !s.Enabled() {
+	if policy == nil || !policy.Enabled || !s.Enabled() ||
+		!s.egressEnabledFor(ctx, account.TenantID) {
 		message.Enabled = &disabled
 		message.AllowedConsumerClientIDs = []int64{}
 		message.DestinationRules = []peeregress.DestinationRule{}
@@ -339,7 +342,7 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 	}
 	revision := egressRevisions.Add(1)
 	message := &ControlMessage{Type: ControlTypeEgressCatalog, Revision: &revision, Egresses: []EgressCatalogEntry{}}
-	if !s.Enabled() {
+	if !s.Enabled() || !s.egressEnabledFor(ctx, account.TenantID) {
 		return message, nil
 	}
 	policies, err := s.db.ListPeerMeshEgressPolicies(ctx, account.TenantID, true)
@@ -512,4 +515,300 @@ func containsInt64(values []int64, want int64) bool {
 		}
 	}
 	return false
+}
+
+// Report envelope bounds. The report carries counters only, so the size cap is far above what a
+// well-formed one needs; it exists to bound what a client can send.
+const (
+	MaxEgressReportBytes      = 8 * 1024
+	EgressReportRateLimit     = 20
+	EgressReportRateWindow    = time.Minute
+	MaxEgressRateTableEntries = 4096
+)
+
+var (
+	egressReportStamps   = map[int64][]int64{}
+	egressReportStampsMu sync.Mutex
+)
+
+// EgressActivityView is the management projection of one device's latest self-report.
+//
+// Online is resolved from the live control channel rather than from the report, so a node that
+// stopped reporting shows as offline instead of frozen at its last counters.
+type EgressActivityView struct {
+	EgressClientID   int64            `json:"egressClientId"`
+	EgressClientName string           `json:"egressClientName"`
+	Online           bool             `json:"online"`
+	Revision         int64            `json:"revision"`
+	ActiveFlows      int64            `json:"activeFlows"`
+	TotalFlows       int64            `json:"totalFlows"`
+	RejectedFlows    map[string]int64 `json:"rejectedFlows"`
+	BytesIn          int64            `json:"bytesIn"`
+	BytesOut         int64            `json:"bytesOut"`
+	ReportedAt       string           `json:"reportedAt"`
+}
+
+// validateEgressReportEnvelope rejects a report carrying routing or identity the server binds
+// itself. An explicit null counts as present: the field has to be absent.
+func validateEgressReportEnvelope(request protocol.MessageRequest) error {
+	if len([]byte(request.Message)) > MaxEgressReportBytes {
+		return fmt.Errorf("egress-report exceeds %d bytes", MaxEgressReportBytes)
+	}
+	if strings.TrimSpace(request.ToClientName) != "" {
+		return errors.New("egress-report toClientName must be empty")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(request.Message), &fields); err != nil {
+		return errors.New("invalid egress-report")
+	}
+	for _, field := range []string{
+		"sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+		"targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+		"sessionId", "token",
+	} {
+		if _, present := fields[field]; present {
+			return fmt.Errorf("egress-report %s is server-bound", field)
+		}
+	}
+	return nil
+}
+
+// enforceEgressReportRate bounds how often one control session may report.
+//
+// The table is keyed by client-driven session ids, so it carries a hard ceiling of its own.
+func enforceEgressReportRate(sessionID int64) error {
+	now := time.Now().UnixMilli()
+	windowStart := now - EgressReportRateWindow.Milliseconds()
+	egressReportStampsMu.Lock()
+	defer egressReportStampsMu.Unlock()
+	stamps, tracked := egressReportStamps[sessionID]
+	if !tracked && len(egressReportStamps) >= MaxEgressRateTableEntries {
+		return errors.New("egress-report rate limited")
+	}
+	kept := stamps[:0]
+	for _, stamp := range stamps {
+		if stamp >= windowStart {
+			kept = append(kept, stamp)
+		}
+	}
+	if len(kept) >= EgressReportRateLimit {
+		egressReportStamps[sessionID] = kept
+		return errors.New("egress-report rate limited")
+	}
+	egressReportStamps[sessionID] = append(kept, now)
+	return nil
+}
+
+// handleEgressReport records one egress-report.
+//
+// The reporter identity and session come from the authenticated control connection, never from the
+// message body. Counters are clamped to non-negative and refusal keys filtered to codes this build
+// defines, so a client cannot grow the stored map with keys of its own invention.
+func (s *Service) handleEgressReport(ctx context.Context, source store.ClientAccount,
+	report ControlMessage, reporterSessionID int64) error {
+	if reporterSessionID <= 0 {
+		online, err := s.db.GetOnlineClientSession(ctx, source.TenantID, source.ID, auth.StatusNettyOnline)
+		if err != nil {
+			return err
+		}
+		if online == nil {
+			return errors.New("egress session is required")
+		}
+		reporterSessionID = online.ID
+	}
+	session, err := s.db.GetClientSession(ctx, reporterSessionID)
+	if err != nil {
+		return err
+	}
+	if session.TenantID != source.TenantID || session.ClientID != source.ID ||
+		session.Status != auth.StatusNettyOnline {
+		return errors.New("egress session is not current")
+	}
+	if session.ClientEgressVersion < 1 {
+		return errors.New("client did not announce egress capability")
+	}
+	if err := enforceEgressReportRate(reporterSessionID); err != nil {
+		return err
+	}
+
+	revision := int64(0)
+	if report.Revision != nil {
+		revision = *report.Revision
+	}
+	existing, err := s.db.FindPeerMeshEgressActivity(ctx, source.TenantID, source.ID)
+	if err != nil {
+		return err
+	}
+	// Reports can overtake each other on reconnect; an older snapshot must not overwrite a newer one.
+	if existing != nil && revision > 0 && revision < existing.Revision {
+		return nil
+	}
+	now := time.Now()
+	row := store.PeerMeshEgressActivity{
+		ID: auth.NewClientID(), TenantID: source.TenantID, EgressClientID: source.ID,
+		CreatedAt: now,
+	}
+	if existing != nil {
+		row = *existing
+	}
+	row.EgressClientName = source.ClientName
+	row.SessionID = reporterSessionID
+	row.Revision = revision
+	row.ActiveFlows = nonNegative(report.ActiveFlows)
+	row.TotalFlows = nonNegative(report.TotalFlows)
+	row.BytesIn = nonNegative(report.BytesIn)
+	row.BytesOut = nonNegative(report.BytesOut)
+	row.RejectedFlows = EncodeEgressRejectedFlows(report.RejectedFlows)
+	row.ReportedAt = now
+	row.UpdatedAt = now
+	return s.db.UpsertPeerMeshEgressActivity(ctx, row, existing == nil)
+}
+
+// ListEgressActivity returns the latest counters each egress device reported about itself.
+func (s *Service) ListEgressActivity(ctx context.Context, access AccessContext) ([]EgressActivityView, error) {
+	rows, err := s.db.ListPeerMeshEgressActivity(ctx, access.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]EgressActivityView, 0, len(rows))
+	for _, row := range rows {
+		_, online := s.sessions.Find(row.EgressClientName)
+		views = append(views, EgressActivityView{
+			EgressClientID:   row.EgressClientID,
+			EgressClientName: row.EgressClientName,
+			Online:           online,
+			Revision:         row.Revision,
+			ActiveFlows:      row.ActiveFlows,
+			TotalFlows:       row.TotalFlows,
+			RejectedFlows:    DecodeEgressRejectedFlows(row.RejectedFlows),
+			BytesIn:          row.BytesIn,
+			BytesOut:         row.BytesOut,
+			ReportedAt:       row.ReportedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
+	return views, nil
+}
+
+func nonNegative(value *int64) int64 {
+	if value == nil || *value < 0 {
+		return 0
+	}
+	return *value
+}
+
+// EncodeEgressRejectedFlows keeps only codes this build defines. Without the filter a client could
+// grow the stored map with keys of its own invention.
+func EncodeEgressRejectedFlows(reported map[string]int64) string {
+	if len(reported) == 0 {
+		return "{}"
+	}
+	filtered := make(map[string]int64, len(reported))
+	for code, count := range reported {
+		if !peeregress.IsKnownCode(code) || count < 0 {
+			continue
+		}
+		filtered[code] = count
+	}
+	if len(filtered) == 0 {
+		return "{}"
+	}
+	encoded, err := json.Marshal(filtered)
+	if err != nil || len(encoded) > MaxEgressRejectedFlowsBytes {
+		// Cannot happen with known codes only; refusing beats storing a truncated map.
+		return "{}"
+	}
+	return string(encoded)
+}
+
+// MaxEgressRejectedFlowsBytes matches the column width in every schema dialect.
+const MaxEgressRejectedFlowsBytes = 1024
+
+// DecodeEgressRejectedFlows reads a stored refusal map. An unreadable row reports no refusals
+// rather than breaking the management view.
+func DecodeEgressRejectedFlows(raw string) map[string]int64 {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return map[string]int64{}
+	}
+	var decoded map[string]int64
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil || decoded == nil {
+		return map[string]int64{}
+	}
+	return decoded
+}
+
+// EgressSwitchView is the management projection of the tenant-wide switch.
+//
+// The three flags are reported separately so an operator can tell why egress is off: the deployment
+// never enabled Peer Mesh, the tenant switch is down, or both are on and it is the per-device
+// policies that grant nothing.
+type EgressSwitchView struct {
+	DeploymentEnabled  bool   `json:"deploymentEnabled"`
+	ConfiguredEnabled  bool   `json:"configuredEnabled"`
+	EffectiveEnabled   bool   `json:"effectiveEnabled"`
+	ProtocolVersion    int    `json:"protocolVersion"`
+	EnabledPolicyCount int    `json:"enabledPolicyCount"`
+	UpdatedAt          string `json:"updatedAt"`
+	UpdatedBy          string `json:"updatedBy"`
+}
+
+// EgressSwitchMutation is the body of the switch PUT.
+type EgressSwitchMutation struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// egressEnabledFor reports the tenant switch. Off by default: egress is opt-in for the tenant too.
+func (s *Service) egressEnabledFor(ctx context.Context, tenantID string) bool {
+	row, err := s.db.GetPeerMeshEgressSwitch(ctx, tenantID)
+	return err == nil && row != nil && row.Enabled
+}
+
+// EgressSwitchStatus returns the tenant-wide switch.
+func (s *Service) EgressSwitchStatus(ctx context.Context, access AccessContext) (EgressSwitchView, error) {
+	row, err := s.db.GetPeerMeshEgressSwitch(ctx, access.TenantID)
+	if err != nil {
+		return EgressSwitchView{}, err
+	}
+	enabled, err := s.db.ListPeerMeshEgressPolicies(ctx, access.TenantID, true)
+	if err != nil {
+		return EgressSwitchView{}, err
+	}
+	configured := row != nil && row.Enabled
+	view := EgressSwitchView{
+		DeploymentEnabled:  s.Enabled(),
+		ConfiguredEnabled:  configured,
+		EffectiveEnabled:   s.Enabled() && configured,
+		ProtocolVersion:    EgressProtocolVersion,
+		EnabledPolicyCount: len(enabled),
+	}
+	if row != nil {
+		view.UpdatedAt = row.UpdatedAt.UTC().Format(time.RFC3339Nano)
+		view.UpdatedBy = row.UpdatedBy
+	}
+	return view, nil
+}
+
+// SetEgressSwitch turns egress on or off for the whole tenant.
+//
+// Switching off leaves every per-device policy intact, so turning it back on restores what was
+// configured rather than making the operator rebuild it.
+func (s *Service) SetEgressSwitch(ctx context.Context, access AccessContext, mutation EgressSwitchMutation) (EgressSwitchView, error) {
+	if !access.Admin {
+		return EgressSwitchView{}, errors.New("只有租户 ADMIN 可以管理出口授权")
+	}
+	if mutation.Enabled == nil {
+		return EgressSwitchView{}, errors.New("enabled is required")
+	}
+	if *mutation.Enabled && !s.Enabled() {
+		return EgressSwitchView{}, errors.New("部署端未启用 Peer Mesh，不能开启出口分流")
+	}
+	if err := s.db.UpsertPeerMeshEgressSwitch(ctx, store.PeerMeshEgressSwitch{
+		TenantID: access.TenantID, Enabled: *mutation.Enabled,
+		UpdatedBy: access.Username, UpdatedAt: time.Now(),
+	}); err != nil {
+		return EgressSwitchView{}, err
+	}
+	// Turning the tenant off has to reach the peers now, like any other authorization change.
+	s.pushTenantEgress(ctx, access.TenantID)
+	return s.EgressSwitchStatus(ctx, access)
 }

@@ -1,5 +1,7 @@
 package com.theshuai.common.peeregress;
 
+import java.time.Duration;
+
 /**
  * Version negotiation for peer egress split routing.
  *
@@ -10,6 +12,23 @@ package com.theshuai.common.peeregress;
 public final class PeerEgressProtocol {
     /** The split-routing version this build speaks. */
     public static final int PROTOCOL_VERSION = 1;
+
+    /**
+     * Cap on one {@code egress-report} envelope. The report carries counters only, so this is far
+     * above what a well-formed one needs; it exists to bound what a client can send.
+     */
+    public static final int MAX_REPORT_BYTES = 8 * 1024;
+
+    /** Reports accepted per control session inside {@link #REPORT_RATE_WINDOW}. */
+    public static final int REPORT_RATE_LIMIT = 20;
+
+    public static final Duration REPORT_RATE_WINDOW = Duration.ofMinutes(1);
+
+    /**
+     * Hard ceiling on tracked rate-limit sessions. Reached only under abuse, and refusing there is
+     * safer than letting a client-driven map grow without bound.
+     */
+    public static final int MAX_RATE_TABLE_ENTRIES = 4096;
 
     private PeerEgressProtocol() {
     }

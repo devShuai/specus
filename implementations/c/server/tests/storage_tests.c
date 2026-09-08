@@ -208,6 +208,95 @@ static int test_peer_mesh_egress_policy_round_trip(void)
     return failures;
 }
 
+/*
+ * Egress activity storage. The report ingest itself lives in peer_mesh.c behind a control channel;
+ * what is checked here is that a snapshot round-trips and that the refusal map keeps its shape.
+ */
+static int test_peer_mesh_egress_activity_round_trip(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-egress-activity-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "storage init failed\n");
+        return 1;
+    }
+
+    int failures = 0;
+    st_storage_peer_mesh_egress_activity row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.tenant_id, sizeof(row.tenant_id), "default");
+    row.egress_client_id = 2002;
+    snprintf(row.egress_client_name, sizeof(row.egress_client_name), "office-gateway");
+    row.session_id = 4201;
+    row.revision = 12;
+    row.active_flows = 18;
+    row.total_flows = 2140;
+    row.bytes_in = 10485760;
+    row.bytes_out = 2097152;
+    snprintf(row.rejected_flows, sizeof(row.rejected_flows), "{\"EGRESS_DEST_DENIED\":4}");
+    snprintf(row.reported_at, sizeof(row.reported_at), "2026-09-08T12:00:00Z");
+
+    if (st_storage_upsert_peer_mesh_egress_activity(path, &row) != 0) {
+        fprintf(stderr, "egress activity insert failed\n");
+        unlink(path);
+        return failures + 1;
+    }
+
+    st_storage_peer_mesh_egress_activity found;
+    if (st_storage_find_peer_mesh_egress_activity(path, "default", 2002, &found) != 0
+        || found.active_flows != 18 || found.total_flows != 2140
+        || found.session_id != 4201 || found.revision != 12
+        || strcmp(found.rejected_flows, "{\"EGRESS_DEST_DENIED\":4}") != 0) {
+        fprintf(stderr, "egress activity did not round trip\n");
+        failures++;
+    }
+    /* A device that has never reported must read as absent rather than as an error. */
+    if (st_storage_find_peer_mesh_egress_activity(path, "default", 4242, &found) != 1) {
+        fprintf(stderr, "a missing activity row must read as absent\n");
+        failures++;
+    }
+
+    /* A second report replaces the row rather than accumulating history. */
+    row.revision = 13;
+    row.active_flows = 21;
+    if (st_storage_upsert_peer_mesh_egress_activity(path, &row) != 0) {
+        fprintf(stderr, "egress activity update failed\n");
+        failures++;
+    }
+    st_storage_peer_mesh_egress_activity rows[8];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_activity(path, "default", rows, 8U, &count) != 0
+        || count != 1U || rows[0].active_flows != 21 || rows[0].revision != 13) {
+        fprintf(stderr, "egress activity list mismatch: count=%zu\n", count);
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
+/* Refusal counters are aggregated by result code; anything else must not be storable. */
+static int test_peer_egress_known_codes(void)
+{
+    int failures = 0;
+    if (!st_egress_is_known_code(ST_EGRESS_CODE_DEST_DENIED)
+        || !st_egress_is_known_code(ST_EGRESS_CODE_PORT_DENIED)
+        || !st_egress_is_known_code(ST_EGRESS_CODE_ALLOWED)) {
+        fprintf(stderr, "a defined result code was not recognised\n");
+        failures++;
+    }
+    if (st_egress_is_known_code("EGRESS_MADE_UP") || st_egress_is_known_code("")
+        || st_egress_is_known_code(NULL)) {
+        fprintf(stderr, "an undefined result code was accepted\n");
+        failures++;
+    }
+    if (ST_EGRESS_ALL_CODES_LEN != 26U) {
+        fprintf(stderr, "expected 26 result codes, got %zu\n", ST_EGRESS_ALL_CODES_LEN);
+        failures++;
+    }
+    return failures;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
@@ -217,6 +306,12 @@ int main(void)
         return 1;
     }
     if (test_peer_mesh_egress_policy_round_trip() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_egress_activity_round_trip() != 0) {
+        return 1;
+    }
+    if (test_peer_egress_known_codes() != 0) {
         return 1;
     }
     char path[256];

@@ -42,4 +42,28 @@ public static class PeerEgressCodes
     public const string Ipv6Unsupported = "EGRESS_IPV6_UNSUPPORTED";
     public const string FrameMalformedControl = "EGRESS_FRAME_MALFORMED_CONTROL";
     public const string ControlUnsupported = "EGRESS_CONTROL_UNSUPPORTED";
+
+    /// <summary>
+    /// Every code this build defines.
+    /// </summary>
+    /// <remarks>
+    /// Built from the constants above rather than repeated as literals, so a code cannot be listed
+    /// here under a different spelling than the one implementations return.
+    /// </remarks>
+    private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
+    {
+        Allowed,
+        HopNotAllowed, Disabled, PeerAclDenied, ConsumerDenied, ForbiddenDestination,
+        ScopeDenied, DestinationDenied, ProtocolDenied, PortDenied, LimitExceeded,
+        RuleDomainUnsupported, RuleIpv6Unsupported, RuleMalformed, RuleMissingTarget,
+        RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported,
+        FrameBadMagic, FrameUnknownType, FrameReservedSet, FrameTruncated,
+        FrameTrailingBytes, Ipv6Unsupported, FrameMalformedControl, ControlUnsupported,
+    };
+
+    /// <summary>
+    /// Reports whether a code is one this build defines. Used to filter client-reported refusal
+    /// counters: without it a client could grow the stored map with keys of its own invention.
+    /// </summary>
+    public static bool IsKnown(string? code) => code is not null && Known.Contains(code);
 }

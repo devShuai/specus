@@ -380,6 +380,13 @@ public sealed partial class PeerMeshService
                 .ConfigureAwait(false);
             return;
         }
+        if (string.Equals(signal.Type, TypeEgressReport, StringComparison.Ordinal))
+        {
+            ValidateEgressReportEnvelope(request);
+            await HandleEgressReportAsync(source, signal, publisherSessionId, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
         await FillSourceAsync(signal, source, cancellationToken).ConfigureAwait(false);
 
         switch (signal.Type)
@@ -402,6 +409,9 @@ public sealed partial class PeerMeshService
                 break;
             case TypeServiceCatalog:
                 throw new ArgumentException("service-catalog is server-only");
+            case TypeEgressConfig:
+            case TypeEgressCatalog:
+                throw new ArgumentException($"{signal.Type} is server-only");
         }
 
         if (string.IsNullOrWhiteSpace(request.ToClientName))

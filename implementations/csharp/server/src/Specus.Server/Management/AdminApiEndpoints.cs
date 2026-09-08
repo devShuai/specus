@@ -870,6 +870,24 @@ public static class AdminApiEndpoints
                 service.ListEgressPoliciesAsync(ManagementContext.From(context, authOptions.Value),
                     cancellationToken));
 
+        app.MapGet("/api/admin/peer-mesh/egress/switch",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.EgressSwitchStatusAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapPut("/api/admin/peer-mesh/egress/switch",
+            (HttpContext context, PeerEgressSwitchMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.SetEgressSwitchAsync(ManagementContext.From(context, authOptions.Value),
+                    request.Enabled ?? false, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/egress/activity",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListEgressActivityAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
         app.MapPost("/api/admin/peer-mesh/egress/policies",
             (HttpContext context, PeerEgressPolicyMutation request, IOptions<AuthOptions> authOptions,
                 PeerMeshService service, CancellationToken cancellationToken) =>

@@ -41,6 +41,8 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<PeerMeshServiceSharing> PeerMeshServiceSharings => Set<PeerMeshServiceSharing>();
     public DbSet<PeerMeshSharedService> PeerMeshSharedServices => Set<PeerMeshSharedService>();
     public DbSet<PeerMeshEgressPolicy> PeerMeshEgressPolicies => Set<PeerMeshEgressPolicy>();
+    public DbSet<PeerMeshEgressActivity> PeerMeshEgressActivities => Set<PeerMeshEgressActivity>();
+    public DbSet<PeerMeshEgressSwitch> PeerMeshEgressSwitches => Set<PeerMeshEgressSwitch>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
     public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
     public DbSet<TransferAttachmentDownloadUsage> TransferAttachmentDownloadUsages =>
@@ -755,6 +757,43 @@ public sealed class SpecusDbContext : DbContext
             b.HasIndex(x => new { x.TenantId, x.EgressClientId }).IsUnique()
                 .HasDatabaseName("uk_peer_egress_policy_client");
             b.HasIndex(x => new { x.TenantId, x.Enabled }).HasDatabaseName("idx_peer_egress_policy_enabled");
+        });
+
+        modelBuilder.Entity<PeerMeshEgressActivity>(b =>
+        {
+            b.ToTable("peer_mesh_egress_activity");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.EgressClientId).HasColumnName("egress_client_id").IsRequired();
+            b.Property(x => x.EgressClientName).HasColumnName("egress_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.SessionId).HasColumnName("session_id").IsRequired();
+            b.Property(x => x.Revision).HasColumnName("revision").IsRequired();
+            b.Property(x => x.ActiveFlows).HasColumnName("active_flows").IsRequired();
+            b.Property(x => x.TotalFlows).HasColumnName("total_flows").IsRequired();
+            b.Property(x => x.RejectedFlows).HasColumnName("rejected_flows")
+                .HasMaxLength(PeerMeshEgressActivity.MaxRejectedFlowsBytes).IsRequired();
+            b.Property(x => x.BytesIn).HasColumnName("bytes_in").IsRequired();
+            b.Property(x => x.BytesOut).HasColumnName("bytes_out").IsRequired();
+            b.Property(x => x.ReportedAt).HasColumnName("reported_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.EgressClientId }).IsUnique()
+                .HasDatabaseName("uk_peer_egress_activity_client");
+        });
+
+        modelBuilder.Entity<PeerMeshEgressSwitch>(b =>
+        {
+            b.ToTable("peer_mesh_egress_switch");
+            b.HasKey(x => x.TenantId);
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.UpdatedBy).HasColumnName("updated_by").HasMaxLength(80);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
         });
 
         modelBuilder.Entity<ConnectionStat>(b =>

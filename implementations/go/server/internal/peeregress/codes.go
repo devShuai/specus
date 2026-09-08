@@ -39,3 +39,30 @@ const (
 	CodeFrameMalformedCtrl = "EGRESS_FRAME_MALFORMED_CONTROL"
 	CodeControlUnsupported = "EGRESS_CONTROL_UNSUPPORTED"
 )
+
+// knownCodes is every code this build defines, built from the constants above rather than repeated
+// as literals so a code cannot be listed under a spelling implementations never return.
+var knownCodes = map[string]struct{}{
+	CodeAllowed: {},
+
+	CodeHopNotAllowed: {}, CodeDisabled: {}, CodePeerACLDenied: {}, CodeConsumerDenied: {},
+	CodeForbiddenDestType: {}, CodeScopeDenied: {}, CodeDestinationDenied: {},
+	CodeProtocolDenied: {}, CodePortDenied: {}, CodeLimitExceeded: {},
+
+	CodeRuleDomainUnsupported: {}, CodeRuleIPv6Unsupported: {}, CodeRuleMalformed: {},
+	CodeRuleMissingTarget: {}, CodeRuleMeshOverlap: {}, CodeRuleDefaultRoute: {},
+	CodeRulePortUnsupported: {},
+
+	CodeFrameBadMagic: {}, CodeFrameUnknownType: {}, CodeFrameReservedSet: {},
+	CodeFrameTruncated: {}, CodeFrameTrailingBytes: {}, CodeIPv6Unsupported: {},
+	CodeFrameMalformedCtrl: {}, CodeControlUnsupported: {},
+}
+
+// IsKnownCode reports whether a code is one this build defines.
+//
+// Used to filter client-reported refusal counters: without it a client could grow the stored map
+// with keys of its own invention.
+func IsKnownCode(code string) bool {
+	_, ok := knownCodes[code]
+	return ok
+}

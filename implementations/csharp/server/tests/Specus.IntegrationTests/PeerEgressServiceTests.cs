@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Specus.Protocol.Packets;
 using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
@@ -250,6 +251,200 @@ public sealed class PeerEgressServiceTests
         Assert.Empty(await fixture.Service.ListEgressPoliciesAsync(fixture.Admin, default));
     }
 
+    /// <summary>
+    /// The server binds the reporter from the authenticated control connection, so a report that
+    /// carries routing or identity of its own is a protocol violation rather than something to
+    /// sanitise and accept.
+    /// </summary>
+    [Fact]
+    public void ReportEnvelopeRejectsClientControlledRoutingAndIdentity()
+    {
+        PeerMeshService.ValidateEgressReportEnvelope(new MessageRequestPacket
+        {
+            ToClientName = "",
+            Message = "{\"type\":\"egress-report\",\"revision\":1,\"activeFlows\":3}",
+        });
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateEgressReportEnvelope(
+            new MessageRequestPacket
+            {
+                ToClientName = "peer-b",
+                Message = "{\"type\":\"egress-report\",\"revision\":1}",
+            }));
+        string[] fields =
+        [
+            "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+            "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+            "sessionId", "token",
+        ];
+        foreach (var field in fields)
+        {
+            // An explicit null is a violation too: the field has to be absent.
+            Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateEgressReportEnvelope(
+                new MessageRequestPacket
+                {
+                    ToClientName = "",
+                    Message = $"{{\"type\":\"egress-report\",\"{field}\":null}}",
+                }));
+        }
+        Assert.Throws<ArgumentException>(() => PeerMeshService.ValidateEgressReportEnvelope(
+            new MessageRequestPacket
+            {
+                ToClientName = "",
+                Message = "{\"type\":\"egress-report\",\"padding\":\"" + new string('x', 9000) + "\"}",
+            }));
+    }
+
+    /// <summary>
+    /// Refusals are aggregated by result code. A client that invents keys must not be able to grow
+    /// what the server stores.
+    /// </summary>
+    [Fact]
+    public void RefusalCountersKeepOnlyCodesThisBuildDefines()
+    {
+        var encoded = PeerMeshService.EncodeRejectedFlows(new Dictionary<string, long>
+        {
+            [PeerEgressCodes.DestinationDenied] = 4,
+            ["EGRESS_MADE_UP"] = 9,
+            [PeerEgressCodes.PortDenied] = 1,
+        });
+        var decoded = PeerMeshService.DecodeRejectedFlows(encoded);
+        Assert.Equal(4, decoded[PeerEgressCodes.DestinationDenied]);
+        Assert.Equal(1, decoded[PeerEgressCodes.PortDenied]);
+        Assert.DoesNotContain("EGRESS_MADE_UP", decoded.Keys);
+
+        Assert.Equal("{}", PeerMeshService.EncodeRejectedFlows(
+            new Dictionary<string, long> { ["EGRESS_MADE_UP"] = 9 }));
+        Assert.Equal("{}", PeerMeshService.EncodeRejectedFlows(null));
+        // A negative counter is a client bug or an attempt to skew the view.
+        Assert.Equal("{}", PeerMeshService.EncodeRejectedFlows(
+            new Dictionary<string, long> { [PeerEgressCodes.PortDenied] = -3 }));
+
+        Assert.Empty(PeerMeshService.DecodeRejectedFlows("not json"));
+        Assert.Empty(PeerMeshService.DecodeRejectedFlows(""));
+        Assert.Empty(PeerMeshService.DecodeRejectedFlows(null));
+    }
+
+    /// <summary>The rate table is keyed by client-driven session ids, so it needs its own ceiling.</summary>
+    [Fact]
+    public async Task ReportRateLimitBoundsBothTheWindowAndTheTable()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        for (var i = 0; i < 20; i++)
+        {
+            fixture.Service.EnforceEgressReportRate(7001);
+        }
+        Assert.Throws<ArgumentException>(() => fixture.Service.EnforceEgressReportRate(7001));
+
+        // One slot is already taken above; fill the remainder.
+        for (var session = 2; session <= 4096; session++)
+        {
+            fixture.Service.EnforceEgressReportRate(100_000 + session);
+        }
+        Assert.Throws<ArgumentException>(() => fixture.Service.EnforceEgressReportRate(999_999));
+    }
+
+    [Fact]
+    public async Task ReportBindsIdentityAndKeepsTheNewestSnapshot()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AddOnlineSession(egress, 4201, egressVersion: 1);
+        await fixture.SaveChangesAsync();
+
+        await fixture.Service.HandleEgressReportAsync(egress, new PeerControlMessage
+        {
+            Type = "egress-report",
+            Revision = 12,
+            ActiveFlows = 18,
+            TotalFlows = 2140,
+            BytesIn = 10_485_760,
+            BytesOut = 2_097_152,
+            RejectedFlows = new Dictionary<string, long> { [PeerEgressCodes.DestinationDenied] = 4 },
+        }, 4201, default);
+
+        var view = Assert.Single(await fixture.Service.ListEgressActivityAsync(fixture.Admin, default));
+        Assert.Equal(EgressId, view.EgressClientId);
+        Assert.Equal(18, view.ActiveFlows);
+        Assert.Equal(2140, view.TotalFlows);
+        Assert.Equal(4, view.RejectedFlows[PeerEgressCodes.DestinationDenied]);
+        // No live control channel, so the device must read as offline rather than stay frozen at
+        // whatever it last reported.
+        Assert.False(view.Online);
+
+        await fixture.Service.HandleEgressReportAsync(egress, new PeerControlMessage
+        {
+            Type = "egress-report",
+            Revision = 5,
+            ActiveFlows = 1,
+        }, 4201, default);
+        view = Assert.Single(await fixture.Service.ListEgressActivityAsync(fixture.Admin, default));
+        Assert.Equal(18, view.ActiveFlows);
+    }
+
+    /// <summary>
+    /// A session belonging to another device, or one that never announced the capability, cannot
+    /// report.
+    /// </summary>
+    [Fact]
+    public async Task ReportRejectsAnUnboundOrIncapableSession()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        var other = fixture.AddClient(OutsiderId, "outsider-owner", "phone");
+        fixture.AddOnlineSession(egress, 4301, egressVersion: 1);
+        fixture.AddOnlineSession(other, 4302, egressVersion: 0);
+        await fixture.SaveChangesAsync();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.HandleEgressReportAsync(
+            other, new PeerControlMessage { Type = "egress-report" }, 4301, default));
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.HandleEgressReportAsync(
+            other, new PeerControlMessage { Type = "egress-report" }, 4302, default));
+    }
+
+    /// <summary>The tenant switch and the per-device flag are two gates; both must be on.</summary>
+    [Fact]
+    public async Task TenantSwitchGatesEveryPolicyWithoutErasingThem()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId],
+            rules: [Rule("203.0.113.0/24", "tcp", 443)]);
+
+        var status = await fixture.Service.EgressSwitchStatusAsync(fixture.Admin, default);
+        Assert.True(status.ConfiguredEnabled);
+        Assert.True(status.EffectiveEnabled);
+        Assert.Equal(1, status.EnabledPolicyCount);
+
+        var config = await fixture.Service.BuildEgressConfigAsync(egress, Capable(), default);
+        Assert.True(config!.Enabled);
+
+        await fixture.Service.SetEgressSwitchAsync(fixture.Admin, false, default);
+        config = await fixture.Service.BuildEgressConfigAsync(egress, Capable(), default);
+        Assert.False(config!.Enabled);
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+        Assert.Empty(catalog!.Egresses!);
+
+        // The policies survive the switch, so turning it back on restores what was configured
+        // rather than making the operator rebuild it.
+        status = await fixture.Service.EgressSwitchStatusAsync(fixture.Admin, default);
+        Assert.Equal(1, status.EnabledPolicyCount);
+        var view = Assert.Single(await fixture.Service.ListEgressPoliciesAsync(fixture.Admin, default));
+        Assert.Single(view.AllowedConsumerClientIds);
+    }
+
+    /// <summary>Only admins may flip the tenant switch, same as every other egress mutation.</summary>
+    [Fact]
+    public async Task OnlyAdminsCanFlipTheTenantSwitch()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var user = new ManagementContext("default", "someone", ManagementRole.User, false);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Service.SetEgressSwitchAsync(user, true, default));
+    }
+
     private static ClientEgressCapabilities Capable() => new()
     {
         Version = 1,
@@ -336,6 +531,27 @@ public sealed class PeerEgressServiceTests
             return account;
         }
 
+        /// <summary>An online control session, which is where the reporter identity is bound from.</summary>
+        public void AddOnlineSession(ClientAccount account, long sessionId, int egressVersion)
+        {
+            var now = DateTimeOffset.UtcNow;
+            Db.ClientSessions.Add(new ClientSession
+            {
+                Id = sessionId,
+                TenantId = account.TenantId,
+                ClientId = account.Id,
+                ClientName = account.ClientName,
+                TokenHash = $"egress-report-{sessionId}",
+                Status = "NETTY_ONLINE",
+                MachineFingerprint = "machine",
+                OsUser = "user",
+                ClientEgressVersion = egressVersion,
+                HttpLoginAt = now,
+                NettyConnectedAt = now,
+                ExpiresAt = now.AddHours(1),
+            });
+        }
+
         public void AllowPeering(ClientAccount source, ClientAccount target)
         {
             var now = DateTimeOffset.UtcNow;
@@ -355,10 +571,17 @@ public sealed class PeerEgressServiceTests
             });
         }
 
-        public Task UpsertAsync(long egressClientId, bool enabled, IReadOnlyList<long> consumers,
+        /// <summary>
+        /// The tenant switch is off by default, so any fixture expecting a policy to take effect has
+        /// to turn it on. That default is the point: egress is opt-in for the tenant as well as per
+        /// device.
+        /// </summary>
+        public async Task UpsertAsync(long egressClientId, bool enabled, IReadOnlyList<long> consumers,
             IReadOnlyList<PeerEgressDestinationRule>? rules = null, int? maxConcurrentFlows = null,
-            int? maxFlowsPerConsumer = null, int? idleTimeoutSeconds = null) =>
-            Service.UpsertEgressPolicyAsync(Admin, new PeerEgressPolicyMutation(
+            int? maxFlowsPerConsumer = null, int? idleTimeoutSeconds = null)
+        {
+            await Service.SetEgressSwitchAsync(Admin, true, default).ConfigureAwait(false);
+            await Service.UpsertEgressPolicyAsync(Admin, new PeerEgressPolicyMutation(
                 EgressClientId: egressClientId,
                 Enabled: enabled,
                 Scope: PeerEgressAuthorization.ScopePublic,
@@ -366,7 +589,8 @@ public sealed class PeerEgressServiceTests
                 DestinationRules: rules ?? [],
                 MaxConcurrentFlows: maxConcurrentFlows,
                 MaxFlowsPerConsumer: maxFlowsPerConsumer,
-                IdleTimeoutSeconds: idleTimeoutSeconds), default);
+                IdleTimeoutSeconds: idleTimeoutSeconds), default).ConfigureAwait(false);
+        }
 
         public Task SaveChangesAsync() => Db.SaveChangesAsync();
 

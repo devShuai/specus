@@ -242,6 +242,15 @@ extern const char *const ST_EGRESS_CLOUD_METADATA_CIDRS[];
 extern const size_t ST_EGRESS_CLOUD_METADATA_CIDRS_LEN;
 
 /* RFC 1918 private use plus RFC 6598 shared address space. */
+/*
+ * Every result code this build defines, built from the macros above rather than repeated as
+ * literals. Used to filter client-reported refusal counters: without it a client could grow the
+ * stored map with keys of its own invention.
+ */
+extern const char *const ST_EGRESS_ALL_CODES[];
+extern const size_t ST_EGRESS_ALL_CODES_LEN;
+int st_egress_is_known_code(const char *code);
+
 extern const char *const ST_EGRESS_LAN_CIDRS[];
 extern const size_t ST_EGRESS_LAN_CIDRS_LEN;
 

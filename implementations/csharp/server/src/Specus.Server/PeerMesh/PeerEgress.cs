@@ -1,8 +1,11 @@
+using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
+using Specus.Protocol.Packets;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
 
@@ -120,6 +123,304 @@ public sealed partial class PeerMeshService
             .MaxAsync(row => (int?)row.ClientEgressVersion, cancellationToken)
             .ConfigureAwait(false);
         return version ?? 0;
+    }
+
+    /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
+    internal const int MaxEgressReportBytes = 8 * 1024;
+
+    private const int EgressReportRateLimit = 20;
+    private const int MaxEgressRateTableEntries = 4096;
+
+    /// <summary>
+    /// Rejects an egress-report envelope carrying routing or identity the server binds itself.
+    /// </summary>
+    /// <remarks>An explicit null counts as present: the field has to be absent.</remarks>
+    internal static void ValidateEgressReportEnvelope(MessageRequestPacket request)
+    {
+        var message = request.Message ?? string.Empty;
+        if (Encoding.UTF8.GetByteCount(message) > MaxEgressReportBytes)
+        {
+            throw new ArgumentException($"egress-report exceeds {MaxEgressReportBytes} bytes");
+        }
+        if (!string.IsNullOrWhiteSpace(request.ToClientName))
+        {
+            throw new ArgumentException("egress-report toClientName must be empty");
+        }
+        using var document = ParseReport(message);
+        foreach (var field in new[]
+                 {
+                     "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey",
+                     "sourceKeyEpoch", "targetClientId", "targetClientName", "targetVirtualIp",
+                     "targetPublicKey", "sessionId", "token",
+                 })
+        {
+            if (document.RootElement.TryGetProperty(field, out _))
+            {
+                throw new ArgumentException($"egress-report {field} is server-bound");
+            }
+        }
+    }
+
+    private static JsonDocument ParseReport(string message)
+    {
+        try
+        {
+            var document = JsonDocument.Parse(message);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                document.Dispose();
+                throw new ArgumentException("invalid egress-report");
+            }
+            return document;
+        }
+        catch (JsonException)
+        {
+            throw new ArgumentException("invalid egress-report");
+        }
+    }
+
+    /// <summary>
+    /// Bounds how often one control session may report. The table is keyed by client-driven session
+    /// ids, so it carries a ceiling of its own.
+    /// </summary>
+    internal void EnforceEgressReportRate(long sessionId)
+    {
+        if (!_state.EgressReportWindows.ContainsKey(sessionId)
+            && _state.EgressReportWindows.Count >= MaxEgressRateTableEntries)
+        {
+            throw new ArgumentException("egress-report rate limited");
+        }
+        var window = _state.EgressReportWindows.GetOrAdd(sessionId, static _ => new ConcurrentQueue<long>());
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var cutoff = now - 60_000;
+        lock (window)
+        {
+            while (window.TryPeek(out var first) && first < cutoff)
+            {
+                window.TryDequeue(out _);
+            }
+            if (window.Count >= EgressReportRateLimit)
+            {
+                throw new ArgumentException("egress-report rate limited");
+            }
+            window.Enqueue(now);
+        }
+    }
+
+    /// <summary>
+    /// Records one egress-report.
+    /// </summary>
+    /// <remarks>
+    /// The reporter identity and session come from the authenticated control connection, never from
+    /// the message body. Counters are clamped to non-negative and refusal keys filtered to codes
+    /// this build defines.
+    /// </remarks>
+    internal async Task HandleEgressReportAsync(ClientAccount source, PeerControlMessage report,
+        long? reporterSessionId, CancellationToken cancellationToken)
+    {
+        var sessionId = reporterSessionId ?? 0;
+        if (sessionId <= 0)
+        {
+            sessionId = await _db.ClientSessions.AsNoTracking()
+                .Where(row => row.TenantId == source.TenantId && row.ClientId == source.Id
+                    && row.Status == "NETTY_ONLINE")
+                .Select(row => row.Id)
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        var session = sessionId <= 0
+            ? null
+            : await _db.ClientSessions.AsNoTracking()
+                .FirstOrDefaultAsync(row => row.Id == sessionId, cancellationToken)
+                .ConfigureAwait(false);
+        if (session is null || session.ClientId != source.Id
+            || !string.Equals(session.TenantId, source.TenantId, StringComparison.Ordinal)
+            || session.Status != "NETTY_ONLINE")
+        {
+            throw new ArgumentException("egress session is not current");
+        }
+        if (session.ClientEgressVersion < 1)
+        {
+            throw new ArgumentException("client did not announce egress capability");
+        }
+        EnforceEgressReportRate(sessionId);
+
+        var revision = report.Revision ?? 0;
+        var activity = await _db.PeerMeshEgressActivities
+            .FirstOrDefaultAsync(row => row.TenantId == source.TenantId && row.EgressClientId == source.Id,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        if (activity is null)
+        {
+            activity = new PeerMeshEgressActivity
+            {
+                Id = ClientIdGenerator.NewId(),
+                TenantId = source.TenantId,
+                EgressClientId = source.Id,
+                CreatedAt = now,
+            };
+            _db.PeerMeshEgressActivities.Add(activity);
+        }
+        else if (revision > 0 && revision < activity.Revision)
+        {
+            // Reports can overtake each other on reconnect; an older snapshot must not overwrite a
+            // newer one.
+            return;
+        }
+        activity.EgressClientName = source.ClientName;
+        activity.SessionId = sessionId;
+        activity.Revision = revision;
+        activity.ActiveFlows = NonNegative(report.ActiveFlows);
+        activity.TotalFlows = NonNegative(report.TotalFlows);
+        activity.BytesIn = NonNegative(report.BytesIn);
+        activity.BytesOut = NonNegative(report.BytesOut);
+        activity.RejectedFlows = EncodeRejectedFlows(report.RejectedFlows);
+        activity.ReportedAt = now;
+        activity.UpdatedAt = now;
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Latest counters each egress device reported about itself.</summary>
+    public async Task<IReadOnlyList<PeerMeshEgressActivityView>> ListEgressActivityAsync(
+        ManagementContext context, CancellationToken cancellationToken)
+    {
+        var rows = await _db.PeerMeshEgressActivities.AsNoTracking()
+            .Where(row => row.TenantId == context.TenantId)
+            .OrderBy(row => row.EgressClientName)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return rows.Select(row => new PeerMeshEgressActivityView(
+            row.EgressClientId,
+            row.EgressClientName,
+            // Resolved from the live control channel, so a node that stopped reporting shows as
+            // offline instead of frozen at its last counters.
+            _sessions.Find(row.EgressClientName) is not null,
+            row.Revision,
+            row.ActiveFlows,
+            row.TotalFlows,
+            DecodeRejectedFlows(row.RejectedFlows),
+            row.BytesIn,
+            row.BytesOut,
+            row.ReportedAt.ToString("O"))).ToList();
+    }
+
+    private static long NonNegative(long? value) => value is null || value < 0 ? 0 : value.Value;
+
+    /// <summary>
+    /// Keeps only codes this build defines. Without the filter a client could grow the stored map
+    /// with keys of its own invention.
+    /// </summary>
+    internal static string EncodeRejectedFlows(IReadOnlyDictionary<string, long>? reported)
+    {
+        if (reported is null || reported.Count == 0)
+        {
+            return "{}";
+        }
+        var filtered = new Dictionary<string, long>(reported.Count, StringComparer.Ordinal);
+        foreach (var entry in reported)
+        {
+            if (!PeerEgressCodes.IsKnown(entry.Key) || entry.Value < 0)
+            {
+                continue;
+            }
+            filtered[entry.Key] = entry.Value;
+        }
+        if (filtered.Count == 0)
+        {
+            return "{}";
+        }
+        var encoded = JsonSerializer.Serialize(filtered, EgressRuleJsonOptions);
+        // Cannot happen with known codes only; refusing beats storing a truncated map.
+        return Encoding.UTF8.GetByteCount(encoded) > PeerMeshEgressActivity.MaxRejectedFlowsBytes
+            ? "{}"
+            : encoded;
+    }
+
+    /// <summary>
+    /// Reads a stored refusal map. An unreadable row reports no refusals rather than breaking the
+    /// management view.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, long> DecodeRejectedFlows(string? raw)
+    {
+        var trimmed = raw?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return new Dictionary<string, long>();
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, long>>(trimmed, EgressRuleJsonOptions)
+                ?? new Dictionary<string, long>();
+        }
+        catch (JsonException)
+        {
+            return new Dictionary<string, long>();
+        }
+    }
+
+    /// <summary>
+    /// The tenant switch. Off by default: egress is opt-in for the tenant as well as per device.
+    /// </summary>
+    private async Task<bool> EgressEnabledForAsync(string tenantId, CancellationToken cancellationToken)
+    {
+        var row = await _db.PeerMeshEgressSwitches.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId, cancellationToken)
+            .ConfigureAwait(false);
+        return row?.Enabled == true;
+    }
+
+    /// <summary>Tenant-wide egress switch, separate from the per-device flag on each policy.</summary>
+    public async Task<PeerMeshEgressSwitchView> EgressSwitchStatusAsync(ManagementContext context,
+        CancellationToken cancellationToken)
+    {
+        var row = await _db.PeerMeshEgressSwitches.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false);
+        var enabledPolicies = await _db.PeerMeshEgressPolicies.AsNoTracking()
+            .CountAsync(x => x.TenantId == context.TenantId && x.Enabled, cancellationToken)
+            .ConfigureAwait(false);
+        var configured = row?.Enabled == true;
+        return new PeerMeshEgressSwitchView(
+            Enabled,
+            configured,
+            Enabled && configured,
+            PeerEgressProtocol.ProtocolVersion,
+            enabledPolicies,
+            row?.UpdatedAt.ToString("O"),
+            row?.UpdatedBy);
+    }
+
+    /// <summary>
+    /// Turns egress on or off for the whole tenant.
+    /// </summary>
+    /// <remarks>
+    /// Switching off leaves every per-device policy intact, so turning it back on restores what was
+    /// configured rather than making the operator rebuild it.
+    /// </remarks>
+    public async Task<PeerMeshEgressSwitchView> SetEgressSwitchAsync(ManagementContext context,
+        bool enabled, CancellationToken cancellationToken)
+    {
+        RequireEgressAdmin(context);
+        if (enabled && !Enabled)
+        {
+            throw new ArgumentException("部署端未启用 Peer Mesh，不能开启出口分流");
+        }
+        var row = await _db.PeerMeshEgressSwitches
+            .FirstOrDefaultAsync(x => x.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false);
+        if (row is null)
+        {
+            row = new PeerMeshEgressSwitch { TenantId = context.TenantId };
+            _db.PeerMeshEgressSwitches.Add(row);
+        }
+        row.Enabled = enabled;
+        row.UpdatedBy = context.Username;
+        row.UpdatedAt = DateTimeOffset.UtcNow;
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        // Turning the tenant off has to reach the peers now, like any other authorization change.
+        await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
+        return await EgressSwitchStatusAsync(context, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Returns every policy in the tenant as a management view.</summary>
@@ -253,7 +554,8 @@ public sealed partial class PeerMeshService
             .FirstOrDefaultAsync(row => row.TenantId == account.TenantId && row.EgressClientId == account.Id,
                 cancellationToken)
             .ConfigureAwait(false);
-        if (policy is not { Enabled: true } || !Enabled)
+        if (policy is not { Enabled: true } || !Enabled
+            || !await EgressEnabledForAsync(account.TenantId, cancellationToken).ConfigureAwait(false))
         {
             message.Enabled = false;
             message.AllowedConsumerClientIds = [];
@@ -289,7 +591,8 @@ public sealed partial class PeerMeshService
             Revision = _state.NextEgressRevision(),
             Egresses = entries,
         };
-        if (!Enabled)
+        if (!Enabled
+            || !await EgressEnabledForAsync(account.TenantId, cancellationToken).ConfigureAwait(false))
         {
             return message;
         }
@@ -509,3 +812,43 @@ public sealed record PeerMeshEgressPolicyView(
     [property: JsonPropertyName("idleTimeoutSeconds")] int IdleTimeoutSeconds,
     [property: JsonPropertyName("createdAt")] string CreatedAt,
     [property: JsonPropertyName("updatedAt")] string UpdatedAt);
+
+/// <summary>
+/// Management projection of one egress device latest self-report.
+/// </summary>
+/// <remarks>
+/// <c>online</c> is resolved from the live control channel rather than from the report, so a node
+/// that stopped reporting is shown as offline instead of frozen at its last counters.
+/// </remarks>
+public sealed record PeerMeshEgressActivityView(
+    [property: JsonPropertyName("egressClientId")] long EgressClientId,
+    [property: JsonPropertyName("egressClientName")] string EgressClientName,
+    [property: JsonPropertyName("online")] bool Online,
+    [property: JsonPropertyName("revision")] long Revision,
+    [property: JsonPropertyName("activeFlows")] long ActiveFlows,
+    [property: JsonPropertyName("totalFlows")] long TotalFlows,
+    [property: JsonPropertyName("rejectedFlows")] IReadOnlyDictionary<string, long> RejectedFlows,
+    [property: JsonPropertyName("bytesIn")] long BytesIn,
+    [property: JsonPropertyName("bytesOut")] long BytesOut,
+    [property: JsonPropertyName("reportedAt")] string ReportedAt);
+
+/// <summary>
+/// Management projection of the tenant-wide egress switch.
+/// </summary>
+/// <remarks>
+/// The three flags are reported separately so an operator can tell why egress is off: the
+/// deployment never enabled Peer Mesh, the tenant switch is down, or both are on and it is the
+/// per-device policies that grant nothing.
+/// </remarks>
+public sealed record PeerMeshEgressSwitchView(
+    [property: JsonPropertyName("deploymentEnabled")] bool DeploymentEnabled,
+    [property: JsonPropertyName("configuredEnabled")] bool ConfiguredEnabled,
+    [property: JsonPropertyName("effectiveEnabled")] bool EffectiveEnabled,
+    [property: JsonPropertyName("protocolVersion")] int ProtocolVersion,
+    [property: JsonPropertyName("enabledPolicyCount")] int EnabledPolicyCount,
+    [property: JsonPropertyName("updatedAt")] string? UpdatedAt,
+    [property: JsonPropertyName("updatedBy")] string? UpdatedBy);
+
+/// <summary>Body of the switch PUT.</summary>
+public sealed record PeerEgressSwitchMutation(
+    [property: JsonPropertyName("enabled")] bool? Enabled = null);

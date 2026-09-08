@@ -641,3 +641,28 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
   UNIQUE KEY uk_peer_egress_policy_client (tenant_id, egress_client_id),
   KEY idx_peer_egress_policy_enabled (tenant_id, enabled)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name VARCHAR(120) NOT NULL,
+  session_id BIGINT NOT NULL DEFAULT 0,
+  revision BIGINT NOT NULL DEFAULT 0,
+  active_flows BIGINT NOT NULL DEFAULT 0,
+  total_flows BIGINT NOT NULL DEFAULT 0,
+  rejected_flows VARCHAR(1024),
+  bytes_in BIGINT NOT NULL DEFAULT 0,
+  bytes_out BIGINT NOT NULL DEFAULT 0,
+  reported_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_peer_egress_activity_client (tenant_id, egress_client_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
+  tenant_id VARCHAR(80) NOT NULL PRIMARY KEY,
+  enabled TINYINT(1) NOT NULL DEFAULT 0,
+  updated_by VARCHAR(80),
+  updated_at VARCHAR(40) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

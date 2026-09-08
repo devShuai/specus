@@ -2,11 +2,14 @@ package peermesh
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/devShuai/specus/implementations/go/server/internal/peeregress"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
@@ -24,12 +27,25 @@ func newEgressTestService(t *testing.T) (*Service, *store.DB) {
 	return service, db
 }
 
+// The tenant switch is off by default, so every fixture that expects a policy to take effect has to
+// turn it on. That default is the point: egress is opt-in for the tenant as well as per device.
+func enableTenantEgress(t *testing.T, service *Service, tenantID string) {
+	t.Helper()
+	enabled := true
+	if _, err := service.SetEgressSwitch(context.Background(),
+		AccessContext{Username: "admin", TenantID: tenantID, Admin: true},
+		EgressSwitchMutation{Enabled: &enabled}); err != nil {
+		t.Fatalf("enable tenant egress: %v", err)
+	}
+}
+
 func capableClient() *EgressCapabilities {
 	return &EgressCapabilities{Version: 1, ConsumerCapable: true, EgressCapable: true}
 }
 
 func upsertTestPolicy(t *testing.T, service *Service, egressID int64, consumers []int64, enabled bool) EgressPolicyView {
 	t.Helper()
+	enableTenantEgress(t, service, "tenant-a")
 	scope := peeregress.ScopePublic
 	view, err := service.UpsertEgressPolicy(context.Background(),
 		AccessContext{Username: "alice", TenantID: "tenant-a", Admin: true},
@@ -388,5 +404,247 @@ func TestPushSkipsClientsThatAnnouncedNoEgressCapability(t *testing.T) {
 
 	if messages := egressMessages(t, consumerSession, ControlTypeEgressCatalog); len(messages) != 0 {
 		t.Errorf("pushed an egress payload to a client that cannot read it: %+v", messages)
+	}
+}
+
+// The server binds the reporter from the authenticated control connection, so a report carrying
+// routing or identity of its own is a protocol violation rather than something to sanitise.
+func TestEgressReportEnvelopeRejectsClientControlledRoutingAndIdentity(t *testing.T) {
+	valid := protocol.MessageRequest{Message: `{"type":"egress-report","revision":1,"activeFlows":3}`}
+	if err := validateEgressReportEnvelope(valid); err != nil {
+		t.Fatalf("valid envelope: %v", err)
+	}
+	targeted := valid
+	targeted.ToClientName = "peer-b"
+	if err := validateEgressReportEnvelope(targeted); err == nil {
+		t.Fatal("targeted egress-report was accepted")
+	}
+	for _, field := range []string{
+		"sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+		"targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey",
+		"sessionId", "token",
+	} {
+		request := valid
+		// An explicit null is a violation too: the field has to be absent.
+		request.Message = fmt.Sprintf(`{"type":"egress-report","revision":1,%q:null}`, field)
+		if err := validateEgressReportEnvelope(request); err == nil {
+			t.Errorf("field %s was accepted", field)
+		}
+	}
+	oversized := valid
+	oversized.Message = `{"type":"egress-report","padding":"` + strings.Repeat("x", MaxEgressReportBytes) + `"}`
+	if err := validateEgressReportEnvelope(oversized); err == nil {
+		t.Fatal("oversized egress-report was accepted")
+	}
+}
+
+// The rate table is keyed by client-driven session ids, so it needs a ceiling of its own.
+func TestEgressReportRateLimitBoundsBothTheWindowAndTheTable(t *testing.T) {
+	egressReportStampsMu.Lock()
+	egressReportStamps = map[int64][]int64{}
+	egressReportStampsMu.Unlock()
+
+	for i := 0; i < EgressReportRateLimit; i++ {
+		if err := enforceEgressReportRate(7001); err != nil {
+			t.Fatalf("report %d inside the window was refused: %v", i, err)
+		}
+	}
+	if err := enforceEgressReportRate(7001); err == nil {
+		t.Error("a session over the window limit was accepted")
+	}
+
+	// One slot is already taken above; fill the remainder.
+	for session := int64(2); session <= MaxEgressRateTableEntries; session++ {
+		if err := enforceEgressReportRate(100000 + session); err != nil {
+			t.Fatalf("session %d was refused while the table had room: %v", session, err)
+		}
+	}
+	if err := enforceEgressReportRate(999999); err == nil {
+		t.Error("a new session was tracked past the table ceiling")
+	}
+}
+
+// Refusals are aggregated by result code. A client that invents keys must not grow what is stored.
+func TestEgressRefusalCountersKeepOnlyKnownCodes(t *testing.T) {
+	encoded := EncodeEgressRejectedFlows(map[string]int64{
+		peeregress.CodeDestinationDenied: 4,
+		"EGRESS_MADE_UP":                 9,
+		peeregress.CodePortDenied:        1,
+	})
+	decoded := DecodeEgressRejectedFlows(encoded)
+	if decoded[peeregress.CodeDestinationDenied] != 4 || decoded[peeregress.CodePortDenied] != 1 {
+		t.Errorf("known codes did not round trip: %+v", decoded)
+	}
+	if _, present := decoded["EGRESS_MADE_UP"]; present {
+		t.Error("an invented code was stored")
+	}
+	if EncodeEgressRejectedFlows(map[string]int64{"EGRESS_MADE_UP": 9}) != "{}" {
+		t.Error("a map of only invented codes was stored")
+	}
+	// A negative counter is a client bug or an attempt to skew the view.
+	if EncodeEgressRejectedFlows(map[string]int64{peeregress.CodePortDenied: -3}) != "{}" {
+		t.Error("a negative counter was stored")
+	}
+	if len(DecodeEgressRejectedFlows("not json")) != 0 || len(DecodeEgressRejectedFlows("")) != 0 {
+		t.Error("an unreadable stored map must read as no refusals")
+	}
+}
+
+func TestEgressReportBindsIdentityAndKeepsTheNewestSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled: true, CIDR: "100.96.0.0/11", PublicAddress: "203.0.113.10",
+		StunTurnPort: 3478, SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+	egressReportStampsMu.Lock()
+	egressReportStamps = map[int64][]int64{}
+	egressReportStampsMu.Unlock()
+
+	egress := insertPeerClient(t, db, 1002, "tenant-a", "alice", "office-gateway")
+	insertPeerDevice(t, db, egress, "100.96.0.11", "egress-key")
+	insertEgressCapableSession(t, db, egress, 4201)
+
+	revision := int64(12)
+	report := ControlMessage{
+		Type: ControlTypeEgressReport, Revision: &revision,
+		ActiveFlows: int64Ptr(18), TotalFlows: int64Ptr(2140),
+		BytesIn: int64Ptr(10485760), BytesOut: int64Ptr(2097152),
+		RejectedFlows: map[string]int64{peeregress.CodeDestinationDenied: 4},
+	}
+	if err := service.handleEgressReport(ctx, egress, report, 4201); err != nil {
+		t.Fatalf("handle report: %v", err)
+	}
+
+	views, err := service.ListEgressActivity(ctx, AccessContext{TenantID: "tenant-a", Admin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || views[0].ActiveFlows != 18 || views[0].TotalFlows != 2140 {
+		t.Fatalf("activity did not record the report: %+v", views)
+	}
+	if views[0].RejectedFlows[peeregress.CodeDestinationDenied] != 4 {
+		t.Errorf("refusal counters missing: %+v", views[0].RejectedFlows)
+	}
+	// The device is not bound to the session registry, so it must read as offline rather than
+	// staying frozen at whatever it last reported.
+	if views[0].Online {
+		t.Error("a device with no live control channel was reported online")
+	}
+
+	stale := report
+	staleRevision := int64(5)
+	stale.Revision = &staleRevision
+	stale.ActiveFlows = int64Ptr(1)
+	if err := service.handleEgressReport(ctx, egress, stale, 4201); err != nil {
+		t.Fatalf("stale report: %v", err)
+	}
+	views, err = service.ListEgressActivity(ctx, AccessContext{TenantID: "tenant-a", Admin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views[0].ActiveFlows != 18 {
+		t.Errorf("an older snapshot overwrote a newer one: %+v", views[0])
+	}
+}
+
+// A session that belongs to someone else, or that never announced the capability, cannot report.
+func TestEgressReportRejectsAnUnboundOrIncapableSession(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := New(config.PeerMeshConfig{
+		Enabled: true, CIDR: "100.96.0.0/11", SessionTTLSeconds: 3600,
+	}, db, session.NewRegistry(), nil)
+	egressReportStampsMu.Lock()
+	egressReportStamps = map[int64][]int64{}
+	egressReportStampsMu.Unlock()
+
+	egress := insertPeerClient(t, db, 1002, "tenant-a", "alice", "office-gateway")
+	other := insertPeerClient(t, db, 1003, "tenant-a", "bob", "bob-laptop")
+	insertEgressCapableSession(t, db, egress, 4301)
+
+	// Another device's session id must not let a client report as this one.
+	if err := service.handleEgressReport(ctx, other, ControlMessage{Type: ControlTypeEgressReport}, 4301); err == nil {
+		t.Error("a session bound to another client was accepted")
+	}
+
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(ctx, store.ClientSession{
+		ID: 4302, TenantID: other.TenantID, ClientID: other.ID, ClientName: other.ClientName,
+		TokenHash: "no-egress-report", Status: "NETTY_ONLINE",
+		MachineFingerprint: "machine", OSUser: "user",
+		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleEgressReport(ctx, other, ControlMessage{Type: ControlTypeEgressReport}, 4302); err == nil {
+		t.Error("a client that announced no egress capability was allowed to report")
+	}
+}
+
+func int64Ptr(value int64) *int64 { return &value }
+
+// The tenant switch and the per-device flag are two separate gates; both must be on.
+func TestTenantSwitchGatesEveryPolicyWithoutErasingThem(t *testing.T) {
+	ctx := context.Background()
+	service, db := newEgressTestService(t)
+	consumer := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	egress := insertPeerClient(t, db, 1002, "tenant-a", "alice", "office-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.10", "consumer-key")
+	insertPeerDevice(t, db, egress, "100.96.0.11", "egress-key")
+
+	upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
+	admin := AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}
+
+	status, err := service.EgressSwitchStatus(ctx, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.ConfiguredEnabled || !status.EffectiveEnabled || status.EnabledPolicyCount != 1 {
+		t.Fatalf("switch status after enabling: %+v", status)
+	}
+
+	config, err := service.BuildEgressConfig(ctx, egress, capableClient())
+	if err != nil || config == nil || config.Enabled == nil || !*config.Enabled {
+		t.Fatalf("an enabled tenant must push an enabled config: %+v", config)
+	}
+
+	disabled := false
+	if _, err := service.SetEgressSwitch(ctx, admin, EgressSwitchMutation{Enabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	config, err = service.BuildEgressConfig(ctx, egress, capableClient())
+	if err != nil || config == nil || config.Enabled == nil || *config.Enabled {
+		t.Errorf("a disabled tenant must push a disabled config: %+v", config)
+	}
+	catalog, err := service.BuildEgressCatalog(ctx, consumer, capableClient())
+	if err != nil || catalog == nil || len(catalog.Egresses) != 0 {
+		t.Errorf("a disabled tenant must offer no egresses: %+v", catalog)
+	}
+
+	// The policies survive the switch, so turning it back on restores what was configured rather
+	// than making the operator rebuild it.
+	status, err = service.EgressSwitchStatus(ctx, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.EnabledPolicyCount != 1 {
+		t.Errorf("switching the tenant off erased policies: %+v", status)
+	}
+	views, err := service.ListEgressPolicies(ctx, admin)
+	if err != nil || len(views) != 1 || len(views[0].AllowedConsumerClientIDs) != 1 {
+		t.Errorf("stored policy did not survive the switch: %+v", views)
+	}
+}
+
+// A non-admin cannot flip the tenant switch, same as every other egress mutation.
+func TestOnlyAdminsCanFlipTheTenantSwitch(t *testing.T) {
+	service, _ := newEgressTestService(t)
+	enabled := true
+	if _, err := service.SetEgressSwitch(context.Background(),
+		AccessContext{Username: "someone", TenantID: "tenant-a"},
+		EgressSwitchMutation{Enabled: &enabled}); err == nil {
+		t.Error("a non-admin flipped the tenant switch")
 	}
 }

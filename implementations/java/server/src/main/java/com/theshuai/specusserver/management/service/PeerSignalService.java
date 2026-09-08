@@ -8,6 +8,7 @@ import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.session.Session;
 import com.theshuai.common.util.JsonUtil;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
@@ -26,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Service
 @Slf4j
@@ -64,6 +66,11 @@ public class PeerSignalService {
             pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
             return;
         }
+        if (PeerControlMessage.TYPE_EGRESS_REPORT.equals(signal.getType())) {
+            PeerEgressService.validateReportEnvelope(request.getMessage(), request.getToClientName());
+            peerEgressService.handleReport(source, signal, authenticatedEgressSessionId(source));
+            return;
+        }
         fillSource(signal, source);
 
         if (PeerControlMessage.TYPE_PATH_REPORT.equals(signal.getType())) {
@@ -86,6 +93,10 @@ public class PeerSignalService {
         }
         if (PeerControlMessage.TYPE_SERVICE_CATALOG.equals(signal.getType())) {
             throw new IllegalArgumentException("service-catalog is server-only");
+        }
+        if (PeerControlMessage.TYPE_EGRESS_CONFIG.equals(signal.getType())
+                || PeerControlMessage.TYPE_EGRESS_CATALOG.equals(signal.getType())) {
+            throw new IllegalArgumentException(signal.getType() + " is server-only");
         }
 
         if (!StringUtils.hasText(request.getToClientName())) {
@@ -304,6 +315,32 @@ public class PeerSignalService {
         }
     }
 
+    /**
+     * Binds the reporter to its authenticated control connection.
+     *
+     * <p>The session comes from the channel, is re-checked against the account and tenant, and must
+     * be the one currently online. Nothing here is read from the report body.
+     */
+    private long authenticatedEgressSessionId(ClientAccount source) {
+        Channel channel = SessionUtil.getChannel(source.getClientName());
+        if (channel == null) {
+            throw new IllegalArgumentException("egress session is required");
+        }
+        Long sessionId = channel.attr(ServerAttributes.CLIENT_SESSION_ID).get();
+        if (sessionId == null || sessionId <= 0) {
+            throw new IllegalArgumentException("egress session is required");
+        }
+        ClientSession session = clientSessionRepository.findById(sessionId)
+                .filter(row -> row.getClientId() == source.getId())
+                .filter(row -> Objects.equals(row.getTenantId(), source.getTenantId()))
+                .filter(row -> ClientAuthService.STATUS_NETTY_ONLINE.equals(row.getStatus()))
+                .orElseThrow(() -> new IllegalArgumentException("egress session is not current"));
+        if (session.getClientEgressVersion() < 1) {
+            throw new IllegalArgumentException("client did not announce egress capability");
+        }
+        return sessionId;
+    }
+
     private int clientEgressVersion(ClientAccount account) {
         return clientSessionRepository
                 .findByTenantIdAndClientIdInAndStatus(account.getTenantId(), List.of(account.getId()),
@@ -312,6 +349,12 @@ public class PeerSignalService {
                 .mapToInt(ClientSession::getClientEgressVersion)
                 .max()
                 .orElse(0);
+    }
+
+    /** Whether a client currently holds a logged-in control channel. */
+    public boolean isOnline(String clientName) {
+        Channel channel = SessionUtil.getChannel(clientName);
+        return channel != null && SessionUtil.hasLogin(channel);
     }
 
     public void pushConfig(ClientAccount account) {

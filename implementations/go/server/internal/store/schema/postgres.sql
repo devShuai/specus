@@ -669,3 +669,28 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
 );
 
 CREATE INDEX IF NOT EXISTS idx_peer_egress_policy_enabled ON peer_mesh_egress_policy (tenant_id, enabled);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
+  id BIGINT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name TEXT NOT NULL,
+  session_id BIGINT NOT NULL DEFAULT 0,
+  revision BIGINT NOT NULL DEFAULT 0,
+  active_flows BIGINT NOT NULL DEFAULT 0,
+  total_flows BIGINT NOT NULL DEFAULT 0,
+  rejected_flows TEXT,
+  bytes_in BIGINT NOT NULL DEFAULT 0,
+  bytes_out BIGINT NOT NULL DEFAULT 0,
+  reported_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
+  tenant_id TEXT NOT NULL PRIMARY KEY,
+  enabled BOOLEAN NOT NULL DEFAULT 0,
+  updated_by TEXT,
+  updated_at TEXT NOT NULL
+);

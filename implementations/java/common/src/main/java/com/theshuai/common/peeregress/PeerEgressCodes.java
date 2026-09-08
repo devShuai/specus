@@ -1,5 +1,7 @@
 package com.theshuai.common.peeregress;
 
+import java.util.Set;
+
 /**
  * Result codes defined by {@code protocol/spec/peer-egress.md}.
  *
@@ -40,6 +42,31 @@ public final class PeerEgressCodes {
     public static final String IPV6_UNSUPPORTED = "EGRESS_IPV6_UNSUPPORTED";
     public static final String FRAME_MALFORMED_CONTROL = "EGRESS_FRAME_MALFORMED_CONTROL";
     public static final String CONTROL_UNSUPPORTED = "EGRESS_CONTROL_UNSUPPORTED";
+
+    /**
+     * Every code this build defines.
+     *
+     * <p>Built from the constants above rather than repeated as literals, so a code cannot be
+     * listed here under a different spelling than the one implementations return.
+     */
+    private static final Set<String> KNOWN = Set.of(
+            ALLOWED,
+            HOP_NOT_ALLOWED, DISABLED, PEER_ACL_DENIED, CONSUMER_DENIED, FORBIDDEN_DESTINATION,
+            SCOPE_DENIED, DEST_DENIED, PROTOCOL_DENIED, PORT_DENIED, LIMIT_EXCEEDED,
+            RULE_DOMAIN_UNSUPPORTED, RULE_IPV6_UNSUPPORTED, RULE_MALFORMED, RULE_MISSING_TARGET,
+            RULE_MESH_OVERLAP, RULE_DEFAULT_ROUTE, RULE_PORT_UNSUPPORTED,
+            FRAME_BAD_MAGIC, FRAME_UNKNOWN_TYPE, FRAME_RESERVED_SET, FRAME_TRUNCATED,
+            FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED);
+
+    /**
+     * Reports whether a code is one this build defines.
+     *
+     * <p>Used to filter client-reported refusal counters: without it a client could grow the stored
+     * map with keys of its own invention.
+     */
+    public static boolean isKnown(String code) {
+        return code != null && KNOWN.contains(code);
+    }
 
     private PeerEgressCodes() {
     }

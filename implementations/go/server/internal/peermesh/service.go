@@ -937,6 +937,12 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		}
 		return s.handleServiceReport(ctx, *source, signal, publisherSessionID)
 	}
+	if signal.Type == ControlTypeEgressReport {
+		if err := validateEgressReportEnvelope(request); err != nil {
+			return err
+		}
+		return s.handleEgressReport(ctx, *source, signal, publisherSessionID)
+	}
 	if err := s.fillSource(ctx, &signal, *source); err != nil {
 		return err
 	}
@@ -958,6 +964,8 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		}
 	case TypeServiceCatalog:
 		return errors.New("service-catalog is server-only")
+	case ControlTypeEgressConfig, ControlTypeEgressCatalog:
+		return fmt.Errorf("%s is server-only", signal.Type)
 	}
 
 	targetName := strings.TrimSpace(request.ToClientName)
