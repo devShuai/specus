@@ -1,0 +1,460 @@
+{
+  "name": "peer-egress-authz-v1",
+  "version": 1,
+  "notes": [
+    "出口端在实际 connect() 前必须完整跑一遍本判定，即使服务端下发时已经取过交集。目录不可见与数据面不可达必须同时成立。",
+    "判定按固定顺序执行，这样各实现返回的错误码可以逐条比对，而不只是 allow/deny 一致。",
+    "强制拒绝清单不受任何宽泛公网规则影响。本文件的策略故意包含 0.0.0.0/0 的 tcp/443 规则，用来证明回环、云元数据等目标仍然被拒。",
+    "scope 分类：LAN 为 RFC1918 与 RFC6598 共享地址空间；其余可路由地址为 PUBLIC。"
+  ],
+  "evaluationOrder": [
+    "hop",
+    "enabled",
+    "peerAcl",
+    "consumer",
+    "forcedDeny",
+    "scope",
+    "destination",
+    "protocol",
+    "port",
+    "limits"
+  ],
+  "forcedDenyCidrs": [
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "100.96.0.0/11"
+  ],
+  "cloudMetadataCidrs": [
+    "169.254.169.254/32",
+    "100.100.100.200/32"
+  ],
+  "lanCidrs": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10"
+  ],
+  "additionalForcedDeny": [
+    "本部署的控制连接、STUN 与 TURN 端点地址",
+    "出口本机任何 TUN 或虚拟接口的网段（由 request.localInterfaceCidrs 表示）"
+  ],
+  "policy": {
+    "egressClientId": 2,
+    "enabled": true,
+    "allowedConsumerClientIds": [
+      1,
+      5
+    ],
+    "scope": "PUBLIC",
+    "destinationRules": [
+      {
+        "cidr": "203.0.113.0/24",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            80,
+            80
+          ],
+          [
+            443,
+            443
+          ]
+        ]
+      },
+      {
+        "cidr": "198.51.100.0/24",
+        "protocols": [
+          "udp"
+        ],
+        "portRanges": [
+          [
+            53,
+            53
+          ]
+        ]
+      },
+      {
+        "cidr": "0.0.0.0/0",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            443,
+            443
+          ]
+        ]
+      }
+    ],
+    "limits": {
+      "maxConcurrentFlows": 256,
+      "maxFlowsPerConsumer": 64,
+      "idleTimeoutSeconds": 60
+    }
+  },
+  "cases": [
+    {
+      "name": "tcp-203.0.113.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "允许：消费端在白名单内，目标、协议和端口都命中出口策略",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-22",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 22,
+        "protocol": "tcp"
+      },
+      "description": "端口不在允许区间",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "udp-203.0.113.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "udp"
+      },
+      "description": "协议不允许；地址命中但 UDP 未授权",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-consumer9",
+      "request": {
+        "consumerClientId": 9,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "消费设备不在出口的允许列表内",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_CONSUMER_DENIED"
+      }
+    },
+    {
+      "name": "udp-198.51.100.20-53",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "198.51.100.20",
+        "destinationPort": 53,
+        "protocol": "udp"
+      },
+      "description": "允许：UDP 规则命中",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-127.0.0.1-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "127.0.0.1",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "回环属于强制拒绝清单。注意策略里有 0.0.0.0/0 的 tcp/443 规则，强制清单仍然胜出",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-169.254.169.254-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "169.254.169.254",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "云元数据端点。同样被宽泛的 0.0.0.0/0 规则覆盖，但强制清单不受其影响",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-169.254.10.5-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "169.254.10.5",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "链路本地",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-224.0.0.1-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "224.0.0.1",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "组播",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-255.255.255.255-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "255.255.255.255",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "广播",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-100.96.0.7-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "100.96.0.7",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "Peer Mesh 虚拟网段，防止出口流量绕回组网自身",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-10.7.0.9-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "10.7.0.9",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "localInterfaceCidrs": [
+          "10.7.0.0/24"
+        ]
+      },
+      "description": "落在出口本机某个接口网段内。这是防回环规则的延伸；二期引入 fake-IP 后，出口本机的池段同样加入此清单",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-192.168.1.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.168.1.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "目标属于 LAN，但策略只授权 PUBLIC。公网访问与对端局域网访问分开授权，互不隐含",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "tcp-192.0.2.10-80",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 80,
+        "protocol": "tcp"
+      },
+      "description": "地址只被宽泛的 0.0.0.0/0 规则覆盖，而该规则仅开放 443，因此在端口一步被拒。判定按固定顺序执行，错误码必须是 PORT 而不是 DEST",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-hop",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "hop": true
+      },
+      "description": "已带 hop 标记，来自另一个出口；不支持多跳出口链",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_HOP_NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-at-limit",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "activeFlowsForConsumer": 64
+      },
+      "description": "单消费端并发上限已满",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_LIMIT_EXCEEDED"
+      }
+    }
+  ],
+  "policyVariantCases": [
+    {
+      "name": "egress-disabled",
+      "policyOverride": {
+        "enabled": false
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "出口总开关关闭，默认即为关闭状态",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DISABLED"
+      }
+    },
+    {
+      "name": "empty-destination-rules-deny-all",
+      "policyOverride": {
+        "destinationRules": []
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "destinationRules 为空即全拒绝；不存在「未配置即放行」",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "peer-acl-denies",
+      "peerAclAllows": false,
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "基础 Peer ACL 不允许时直接拒绝。allowed = 基础 Peer ACL ∩ 出口策略，基础组网授权不自动等于出口授权",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PEER_ACL_DENIED"
+      }
+    },
+    {
+      "name": "address-not-covered",
+      "policyOverride": {
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                80,
+                80
+              ],
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "cidr": "198.51.100.0/24",
+            "protocols": [
+              "udp"
+            ],
+            "portRanges": [
+              [
+                53,
+                53
+              ]
+            ]
+          }
+        ]
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "去掉宽泛的 0.0.0.0/0 规则后，地址不再被任何网段覆盖，在目标一步被拒",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "lan-scope-allows-private-target",
+      "policyOverride": {
+        "scope": "LAN",
+        "destinationRules": [
+          {
+            "cidr": "192.168.1.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.168.1.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "显式授予 LAN scope 后同一目标才被允许",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    }
+  ]
+}

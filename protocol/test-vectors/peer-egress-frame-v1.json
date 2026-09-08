@@ -1,0 +1,194 @@
+{
+  "name": "peer-egress-frame-v1",
+  "version": 1,
+  "magicAscii": "SPEG1",
+  "magicHex": "5350454731",
+  "headerBytes": 8,
+  "headerLayout": [
+    {
+      "field": "magic",
+      "bytes": 5,
+      "value": "ASCII SPEG1"
+    },
+    {
+      "field": "type",
+      "bytes": 1,
+      "value": "1=ip-packet, 2=control"
+    },
+    {
+      "field": "flags",
+      "bytes": 1,
+      "value": "bit0=hop, 其余保留必须为 0"
+    },
+    {
+      "field": "reserved",
+      "bytes": 1,
+      "value": "必须为 0"
+    }
+  ],
+  "notes": [
+    "SPEG1 是 SPM2 解密后的第三种明文类型，与裸 IPv4 packet 和 STMSG2 应用消息并列。",
+    "所有 frameHex 是 SPM2 密文解密后的明文，不含 SPM2 的 20 字节头和 16 字节 tag。",
+    "type=1 的 body 是完整 IPv4 packet；一期不接受 IPv6。",
+    "type=2 的 body 是 UTF-8 JSON object，键序按本文件 controlJson 给出的顺序，无空白。",
+    "控制消息只用于诊断与撤销，不承载业务数据；丢失不得影响数据面正确性。"
+  ],
+  "accept": [
+    {
+      "name": "ip-tcp-syn-outbound",
+      "direction": "consumer-to-egress",
+      "description": "消费端把命中出口规则的 TCP SYN 交给出口；源为消费端虚拟 IP，目标为受控目标",
+      "frameHex": "535045473101000045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "frameLength": 48,
+      "type": 1,
+      "flags": 0,
+      "innerPacketHex": "45000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "innerSourceIp": "100.96.0.1",
+      "innerDestinationIp": "203.0.113.200",
+      "innerProtocol": "tcp",
+      "innerSourcePort": 54321,
+      "innerDestinationPort": 443
+    },
+    {
+      "name": "ip-udp-outbound",
+      "direction": "consumer-to-egress",
+      "description": "UDP 数据报走同一条数据面；QUIC 作为 UDP 转发是透明的，不单独处理",
+      "frameHex": "53504547310100004500003312354000401199dc64600001c6336414c7380035001fc3727370656375732d6567726573732d7564702d70726f6265",
+      "frameLength": 59,
+      "type": 1,
+      "flags": 0,
+      "innerPacketHex": "4500003312354000401199dc64600001c6336414c7380035001fc3727370656375732d6567726573732d7564702d70726f6265",
+      "innerSourceIp": "100.96.0.1",
+      "innerDestinationIp": "198.51.100.20",
+      "innerProtocol": "udp",
+      "innerSourcePort": 51000,
+      "innerDestinationPort": 53
+    },
+    {
+      "name": "ip-tcp-synack-return",
+      "direction": "egress-to-consumer",
+      "description": "回程包源为真实目标、目标为消费端虚拟 IP；消费端必须能把它关联到本机发起的存活出口流",
+      "frameHex": "5350454731010000450000281236400040068770cb0071c86460000101bbd4310a0b0c0d000000025012ffff22a20000",
+      "frameLength": 48,
+      "type": 1,
+      "flags": 0,
+      "innerPacketHex": "450000281236400040068770cb0071c86460000101bbd4310a0b0c0d000000025012ffff22a20000",
+      "innerSourceIp": "203.0.113.200",
+      "innerDestinationIp": "100.96.0.1",
+      "innerProtocol": "tcp",
+      "innerSourcePort": 443,
+      "innerDestinationPort": 54321
+    },
+    {
+      "name": "control-flow-reject",
+      "direction": "egress-to-consumer",
+      "description": "拒绝原因仅用于诊断展示；应用侧以出口用户态栈生成的 RST 为准，控制消息丢失不影响正确性",
+      "frameHex": "53504547310200007b2274797065223a22666c6f772d72656a656374222c2270726f746f636f6c223a22746370222c22736f757263654970223a223130302e39362e302e31222c22736f75726365506f7274223a35343332312c2264657374696e6174696f6e4970223a223230332e302e3131332e39222c2264657374696e6174696f6e506f7274223a32322c22636f6465223a224547524553535f444553545f44454e494544227d",
+      "frameLength": 169,
+      "type": 2,
+      "flags": 0,
+      "controlJson": {
+        "type": "flow-reject",
+        "protocol": "tcp",
+        "sourceIp": "100.96.0.1",
+        "sourcePort": 54321,
+        "destinationIp": "203.0.113.9",
+        "destinationPort": 22,
+        "code": "EGRESS_DEST_DENIED"
+      },
+      "controlCanonicalUtf8Hex": "7b2274797065223a22666c6f772d72656a656374222c2270726f746f636f6c223a22746370222c22736f757263654970223a223130302e39362e302e31222c22736f75726365506f7274223a35343332312c2264657374696e6174696f6e4970223a223230332e302e3131332e39222c2264657374696e6174696f6e506f7274223a32322c22636f6465223a224547524553535f444553545f44454e494544227d"
+    },
+    {
+      "name": "control-flow-purge",
+      "direction": "consumer-to-egress",
+      "description": "规则从 allow 变为 deny 或不再匹配时，消费端要求出口关闭匹配目标的已建流",
+      "frameHex": "53504547310200007b2274797065223a22666c6f772d7075726765222c2264657374696e6174696f6e73223a5b223230332e302e3131332e302f3234222c223139382e35312e3130302e35302f3332225d2c22636f6465223a224547524553535f52554c455f5245564f4b4544227d",
+      "frameLength": 111,
+      "type": 2,
+      "flags": 0,
+      "controlJson": {
+        "type": "flow-purge",
+        "destinations": [
+          "203.0.113.0/24",
+          "198.51.100.50/32"
+        ],
+        "code": "EGRESS_RULE_REVOKED"
+      },
+      "controlCanonicalUtf8Hex": "7b2274797065223a22666c6f772d7075726765222c2264657374696e6174696f6e73223a5b223230332e302e3131332e302f3234222c223139382e35312e3130302e35302f3332225d2c22636f6465223a224547524553535f52554c455f5245564f4b4544227d"
+    }
+  ],
+  "reject": [
+    {
+      "name": "bad-magic",
+      "frameHex": "535045473001000045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "reason": "magic 必须为 ASCII SPEG1",
+      "code": "EGRESS_FRAME_BAD_MAGIC"
+    },
+    {
+      "name": "unknown-type",
+      "frameHex": "535045473103000045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "reason": "一期只定义 type 1 与 2；未知 type 丢弃，不猜测语义",
+      "code": "EGRESS_FRAME_UNKNOWN_TYPE"
+    },
+    {
+      "name": "reserved-byte-nonzero",
+      "frameHex": "535045473101000145000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "reason": "reserved 字节必须为 0，非 0 一律拒绝而不是忽略",
+      "code": "EGRESS_FRAME_RESERVED_SET"
+    },
+    {
+      "name": "reserved-flag-bits-set",
+      "frameHex": "535045473101020045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "reason": "flags 只定义 bit0 hop；其余位保留必须为 0",
+      "code": "EGRESS_FRAME_RESERVED_SET"
+    },
+    {
+      "name": "hop-flag-set",
+      "frameHex": "535045473101010045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb0000",
+      "reason": "已带 hop 标记的建流请求表示来自另一个出口；不支持多跳出口链",
+      "code": "EGRESS_HOP_NOT_ALLOWED"
+    },
+    {
+      "name": "truncated-header",
+      "frameHex": "53504547310100",
+      "reason": "帧短于 8 字节固定头",
+      "code": "EGRESS_FRAME_TRUNCATED"
+    },
+    {
+      "name": "empty-ip-body",
+      "frameHex": "5350454731010000",
+      "reason": "type=1 的 body 必须是完整 IPv4 packet",
+      "code": "EGRESS_FRAME_TRUNCATED"
+    },
+    {
+      "name": "ip-body-shorter-than-header",
+      "frameHex": "535045473101000045000028123440004006877264600001cb0071",
+      "reason": "IPv4 header 至少 20 字节",
+      "code": "EGRESS_FRAME_TRUNCATED"
+    },
+    {
+      "name": "ip-total-length-mismatch",
+      "frameHex": "535045473101000045000028123440004006877264600001cb0071c8d43101bb00000001000000005002ffff38cb000000",
+      "reason": "IPv4 totalLength 必须精确等于 body 长度，尾随字节拒绝",
+      "code": "EGRESS_FRAME_TRAILING_BYTES"
+    },
+    {
+      "name": "ipv6-packet-in-v1",
+      "frameHex": "535045473101000060000000000006400000000000000000000000000000000000000000000000000000000000000000",
+      "reason": "一期数据面只接受 IPv4；IPv6 明确拒绝而不是静默丢弃或回退本地",
+      "code": "EGRESS_IPV6_UNSUPPORTED"
+    },
+    {
+      "name": "control-not-json",
+      "frameHex": "53504547310200006e6f742d6a736f6e",
+      "reason": "type=2 的 body 必须是 UTF-8 JSON object",
+      "code": "EGRESS_FRAME_MALFORMED_CONTROL"
+    },
+    {
+      "name": "control-unknown-type",
+      "frameHex": "53504547310200007b2274797065223a226e616d652d62696e64227d",
+      "reason": "name-bind 为二期域名分流保留；一期收到必须拒绝，不得当作已实现",
+      "code": "EGRESS_CONTROL_UNSUPPORTED"
+    }
+  ]
+}

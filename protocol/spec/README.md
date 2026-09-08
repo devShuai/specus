@@ -13,6 +13,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [client-auth.md](client-auth.md) | 客户端启动 HTTP 登录、apiKey/secret 签名、运行时 token 和刷新机制 |
 | [http-route.md](http-route.md) | HTTP route 直转语义、WebSocket 隧道、Header 透传、响应改写和流量观测 |
 | [peer-mesh.md](peer-mesh.md) | Peer Mesh 私有组网、虚拟 IP、信令、标准 STUN/TURN 子集、加密数据帧和管理面 |
+| [peer-egress.md](peer-egress.md) | Peer 出口分流的规则语义、出口授权模型、`SPEG1` 数据面帧与出口信令 |
 | [public-transfer.md](public-transfer.md) | 免登录公共互传的 ICE 配置、发现信令、附件 REST、对象存储和滥用防护 |
 | [public-transfer-cluster.md](public-transfer-cluster.md) | 公共互传多实例 Redis presence、修订、共享限流、管理事件恢复与 STCE v2 内部 Pub/Sub 帧 |
 | [client-messages.md](client-messages.md) | 管理端与客户端消息 WebSocket、一次性 ticket、能力判断和服务端备用投递 |

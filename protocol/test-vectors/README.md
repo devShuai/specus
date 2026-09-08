@@ -31,6 +31,20 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 Java、Go、.NET、Android 使用相同字段和字节序；Java、Go、.NET 服务端同时用 SPM2 向量验证无需解密
 的 relay 授权头解析。
 
+## Peer 出口分流
+
+- `peer-egress-rules-v1.json`：消费端规则匹配语义，覆盖最长前缀优先、同前缀按顺序、未匹配即本地直连，
+  以及域名/IPv6/默认路由/端口维度等一期必须在配置校验阶段拒绝的条目。
+- `peer-egress-frame-v1.json`：`SPEG1` 帧的固定头、双向 IPv4 样例、控制消息 canonical JSON，
+  以及 bad magic、未知 type、保留位非零、截断、尾随字节、IPv6 与二期保留控制类型的拒绝样例。
+  所有 `frameHex` 是 SPM2 解密后的明文，不含 SPM2 的 20 字节头和 16 字节 tag。
+- `peer-egress-authz-v1.json`：出口端授权判定，含固定判定顺序与全部错误码。策略故意包含
+  `0.0.0.0/0` 条目，用来证明回环、云元数据、组播和 mesh 网段等强制拒绝目标不随宽泛规则放开。
+
+三份向量的语义定义见 [`protocol/spec/peer-egress.md`](../spec/peer-egress.md)。一期只支持 IPv4 的
+单地址与 CIDR 规则；实现读取向量时必须对 `configValidation` 和 `reject` 条目断言拒绝，
+「未实现所以跳过」不算通过。
+
 ## 应用与专用协议
 
 - `application-protocol-v2.json`：SWS2 WebSocket frame、STMSG2 文本消息、STCLIP2 富文本剪贴板、
