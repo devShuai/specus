@@ -264,6 +264,9 @@ class PeerServiceRuntimeTests {
 
     @Test
     void processAndSourceResourceBudgetsFailClosedAndRecover() throws Exception {
+        // Real bridge workers from the preceding tests release leases asynchronously.
+        // Wait for teardown, but still fail on a leak instead of resetting the shared budget.
+        waitUntil(() -> !PeerServiceResourceLimiter.hasActiveLeases());
         List<PeerServiceResourceLimiter.Lease> tcp = new ArrayList<>();
         for (int i = 0; i < PeerServiceDiscovery.MAX_TCP_CONNECTIONS_PER_SOURCE; i++) {
             PeerServiceResourceLimiter.Lease lease =

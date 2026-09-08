@@ -103,14 +103,12 @@ final class UiConfig {
                 :Files.createTempDirectory(path.getParent(),".specus-ui-save-");
         Path temp=dir.resolve("config");
         try {
-            if(!CliState.posix()) Files.getFileAttributeView(dir,AclFileAttributeView.class).setAcl(List.of(AclEntry.newBuilder()
-                    .setType(AclEntryType.ALLOW).setPrincipal(Files.getOwner(dir)).setPermissions(EnumSet.allOf(AclEntryPermission.class))
-                    .setFlags(AclEntryFlag.DIRECTORY_INHERIT,AclEntryFlag.FILE_INHERIT).build()));
-            CliState.checkPrivate(dir);
+            CliState.protectNew(dir,true);
             if(CliState.posix()) Files.createFile(temp,PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
             try(var out=java.nio.channels.FileChannel.open(temp,StandardOpenOption.CREATE,StandardOpenOption.WRITE)) {
                 var buffer=StandardCharsets.UTF_8.encode(text); while(buffer.hasRemaining()) out.write(buffer); out.force(true);
             }
+            CliState.protectNew(temp,false);
             checkRevision(read(path),revision);
             Files.move(temp,path,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
         } finally { Files.deleteIfExists(temp); Files.deleteIfExists(dir); }

@@ -19,6 +19,11 @@ final class PeerServiceResourceLimiter {
     private PeerServiceResourceLimiter() {
     }
 
+    static boolean hasActiveLeases() {
+        return TCP_GLOBAL.availablePermits() != PeerServiceDiscovery.MAX_TCP_CONNECTIONS_GLOBAL
+                || UDP_GLOBAL.availablePermits() != PeerServiceDiscovery.MAX_UDP_PEERS_GLOBAL;
+    }
+
     static Lease tryAcquireTcp(InetAddress source) {
         return tryAcquire(source, TCP_GLOBAL, TCP_SOURCES, PeerServiceDiscovery.MAX_TCP_CONNECTIONS_PER_SOURCE);
     }

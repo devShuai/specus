@@ -160,7 +160,11 @@ func TestUpdaterStagesWindowsReplacementAndLaunchesHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Installed || !result.RestartScheduled || launchedExecutable != executable {
+	wantExecutable, resolveErr := filepath.EvalSymlinks(executable)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	if !result.Installed || !result.RestartScheduled || launchedExecutable != wantExecutable {
 		t.Fatalf("deferred result=%+v launched=%q", result, launchedExecutable)
 	}
 	candidate, err := os.ReadFile(launchedCandidate)

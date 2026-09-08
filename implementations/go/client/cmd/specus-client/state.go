@@ -76,6 +76,9 @@ func publishState(config string, snapshot func() map[string]any) (func(), error)
 		if closeErr != nil {
 			return closeErr
 		}
+		if e = checkPrivate(name, true); e != nil {
+			return e
+		}
 		return os.Rename(name, path)
 	}
 	if err = write(); err != nil {

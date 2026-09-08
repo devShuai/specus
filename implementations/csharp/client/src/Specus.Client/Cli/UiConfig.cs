@@ -113,6 +113,7 @@ internal static class UiConfig
             var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
             if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
             using (var stream = new FileStream(temp, options)) { stream.Write(bytes); stream.Flush(true); }
+            CliState.ProtectNewFile(temp);
             CheckRevision(Read(path), revision); File.Move(temp, path, overwrite: true);
         }
         finally { if (File.Exists(temp)) File.Delete(temp); if (Directory.Exists(directory)) Directory.Delete(directory); }

@@ -68,6 +68,19 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         else if ((File.GetUnixFileMode(path) & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
             | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute)) != 0) throw new IOException("State must be owner-only; use chmod 700 for the directory, 600 for files");
     }
+    // Call only for a new file in our already-private directory. Elevated Windows
+    // tokens can otherwise assign Administrators as owner even with a private inherited DACL.
+    internal static void ProtectNewFile(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var owner = WindowsIdentity.GetCurrent().User!; var acl = new FileSecurity();
+            acl.SetOwner(owner); acl.SetAccessRuleProtection(true, false);
+            acl.AddAccessRule(new FileSystemAccessRule(owner, FileSystemRights.FullControl, AccessControlType.Allow));
+            new FileInfo(path).SetAccessControl(acl);
+        }
+        CheckPrivate(path);
+    }
     public void OnStatusChanged(SpecusClientStatusSnapshot snapshot)
     {
         lock (_gate) { _authenticated = snapshot.LoggedIn; _ready = snapshot.Phase == "RUNNING";
@@ -97,6 +110,7 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
             if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
             using (var file = new FileStream(temporary, options))
             using (var writer = new StreamWriter(file, new UTF8Encoding(false))) writer.Write(json);
+            ProtectNewFile(temporary);
             File.Move(temporary, _path, overwrite: true);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }

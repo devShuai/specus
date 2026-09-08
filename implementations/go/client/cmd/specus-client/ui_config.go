@@ -339,6 +339,9 @@ func uiWriteConfig(path, revision string, data []byte) error {
 	if err != nil || closeErr != nil {
 		return errors.New("配置写入失败，原文件未修改")
 	}
+	if err = checkPrivate(tmp, true); err != nil {
+		return errors.New("无法保护配置文件的所有者和权限，未保存")
+	}
 	_, current, err = uiReadConfig(path)
 	if err != nil {
 		return err

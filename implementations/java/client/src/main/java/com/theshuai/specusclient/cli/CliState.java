@@ -30,10 +30,7 @@ public final class CliState implements AutoCloseable {
             if (posix()) Files.createDirectory(root,PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
             else {
                 Files.createDirectory(root);
-                var view=Files.getFileAttributeView(root,AclFileAttributeView.class);
-                if(view==null) throw new IOException("Filesystem lacks private ACLs");
-                view.setAcl(List.of(AclEntry.newBuilder().setType(AclEntryType.ALLOW).setPrincipal(Files.getOwner(root))
-                        .setPermissions(EnumSet.allOf(AclEntryPermission.class)).setFlags(AclEntryFlag.DIRECTORY_INHERIT,AclEntryFlag.FILE_INHERIT).build()));
+                protectNew(root,true);
             }
         }
         checkPrivate(root);
@@ -66,6 +63,19 @@ public final class CliState implements AutoCloseable {
             for(var entry:view.getAcl()) if(entry.type()==AclEntryType.ALLOW&&!entry.principal().equals(me)) throw new IOException("State must be owner-only");
         }
     }
+    // Only freshly created objects in owned directories. Never repair/take ownership of existing state.
+    static void protectNew(Path path,boolean directory) throws IOException {
+        if(!posix()) {
+            var me=FileSystems.getDefault().getUserPrincipalLookupService().lookupPrincipalByName(System.getProperty("user.name"));
+            var view=Files.getFileAttributeView(path,AclFileAttributeView.class,LinkOption.NOFOLLOW_LINKS);
+            if(view==null)throw new IOException("Filesystem lacks private ACLs");
+            view.setOwner(me);
+            var entry=AclEntry.newBuilder().setType(AclEntryType.ALLOW).setPrincipal(me).setPermissions(EnumSet.allOf(AclEntryPermission.class));
+            if(directory)entry.setFlags(AclEntryFlag.DIRECTORY_INHERIT,AclEntryFlag.FILE_INHERIT);
+            view.setAcl(List.of(entry.build()));
+        }
+        checkPrivate(path);
+    }
     private synchronized void write() throws IOException {
         if(closed) return;
         var data=new LinkedHashMap<>(snapshot.get());
@@ -74,7 +84,7 @@ public final class CliState implements AutoCloseable {
         data.put("businessReadinessScope","control/data authenticated; target reachability not tested");
         Path temporary=posix() ? Files.createTempFile(root,".state-",".tmp",PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
                 : Files.createTempFile(root,".state-",".tmp");
-        try { Files.writeString(temporary,CliOutput.JSON.writeValueAsString(data));Files.move(temporary,file,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING); }
+        try { Files.writeString(temporary,CliOutput.JSON.writeValueAsString(data));protectNew(temporary,false);Files.move(temporary,file,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING); }
         finally {Files.deleteIfExists(temporary);}
     }
     @Override public void close() {
