@@ -9,6 +9,7 @@
 #include "github_release.h"
 #include "http_client.h"
 #include "json.h"
+#include "peer_egress.h"
 #include "login_rate_limiter.h"
 #include "media_capture.h"
 #include "object_storage.h"
@@ -2042,13 +2043,30 @@ static int build_database_client_auth_login_response(const char *database_path,
     (void)st_json_get_bool(body, "attachments", &message_attachments_capable);
     (void)st_json_get_bool(body, "mediaPreview", &message_media_preview_capable);
     (void)st_json_get_i64(body, "maxAttachmentBytes", &message_max_attachment_bytes);
-    (void)st_json_get_int(body, "version", &peer_service_discovery_version);
+    int client_egress_version = 0;
+    /*
+     * Scope the capability lookups to their own objects. clientPeerServiceCapabilities and
+     * clientEgressCapabilities both carry a "version" field, so a depth-first search of the whole
+     * body would return whichever the client happened to serialise first. Older payloads that put
+     * the peer capabilities somewhere else still fall back to the previous search.
+     */
+    char *environment_raw = st_json_get_top_level_raw(body, "environment");
+    char *peer_caps_raw = environment_raw == NULL
+        ? NULL : st_json_get_top_level_raw(environment_raw, "clientPeerServiceCapabilities");
+    char *egress_caps_raw = environment_raw == NULL
+        ? NULL : st_json_get_top_level_raw(environment_raw, "clientEgressCapabilities");
+    const char *peer_caps = peer_caps_raw == NULL ? body : peer_caps_raw;
+    if (egress_caps_raw != NULL) {
+        (void)st_json_get_int(egress_caps_raw, "version", &client_egress_version);
+    }
+    client_egress_version = st_egress_normalize_version(client_egress_version);
+    (void)st_json_get_int(peer_caps, "version", &peer_service_discovery_version);
     if (peer_service_discovery_version < 1) peer_service_discovery_version = 0;
     else if (peer_service_discovery_version > 2) peer_service_discovery_version = 2;
     char **peer_apps = NULL;
     size_t peer_app_count = 0U;
     if (peer_service_discovery_version > 0
-        && st_json_get_string_array(body, "applications", &peer_apps, &peer_app_count) == 0) {
+        && st_json_get_string_array(peer_caps, "applications", &peer_apps, &peer_app_count) == 0) {
         size_t offset = 0U;
         for (size_t i = 0; i < peer_app_count; ++i) {
             const char *app = peer_apps[i];
@@ -2072,6 +2090,9 @@ static int build_database_client_auth_login_response(const char *database_path,
         }
     }
     st_json_free_string_array(peer_apps, peer_app_count);
+    free(environment_raw);
+    free(peer_caps_raw);
+    free(egress_caps_raw);
     if (message_max_attachment_bytes < 0) {
         message_max_attachment_bytes = 0;
     }
@@ -2242,6 +2263,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.message_media_preview_capable = message_media_preview_capable;
     session.message_max_attachment_bytes = message_max_attachment_bytes;
     session.peer_service_discovery_version = peer_service_discovery_version;
+    session.client_egress_version = client_egress_version;
     snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
              "%s", peer_service_applications);
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", now_text);
@@ -4144,6 +4166,300 @@ static int append_peer_mesh_service_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_append_json_string(builder, service->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
+}
+
+static int admin_egress_id_listed(const char *csv, long long client_id)
+{
+    if (csv == NULL || *csv == '\0') return 0;
+    char copy[512];
+    snprintf(copy, sizeof(copy), "%s", csv);
+    char *save = NULL;
+    for (char *part = strtok_r(copy, ",", &save); part != NULL; part = strtok_r(NULL, ",", &save)) {
+        char *end = NULL;
+        long long value = strtoll(part, &end, 10);
+        if (end != part && *end == '\0' && value == client_id) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Egress authorization management.
+ *
+ * effectiveConsumerClientIds is the configured allowlist already intersected with the base Peer
+ * ACL, so an operator sees which devices the policy actually grants rather than which ones it
+ * names.
+ */
+static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
+                                               const char *database_path,
+                                               const st_storage_peer_mesh_egress_policy *policy)
+{
+    st_storage_client clients[512];
+    size_t client_count = 0U;
+    (void)st_storage_list_clients(database_path, clients, 512U, &client_count);
+
+    int rc = admin_sb_appendf(builder,
+        "{\"id\":%lld,\"egressClientId\":%lld,\"egressClientName\":",
+        policy->id, policy->egress_client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->egress_client_name);
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"enabled\":%s,\"scope\":",
+                                       policy->enabled ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->scope);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"allowedConsumerClientIds\":[");
+    if (rc == 0 && policy->allowed_consumer_client_ids[0] != '\0') {
+        char copy[sizeof(policy->allowed_consumer_client_ids)];
+        snprintf(copy, sizeof(copy), "%s", policy->allowed_consumer_client_ids);
+        char *save = NULL;
+        int first = 1;
+        for (char *part = strtok_r(copy, ",", &save); rc == 0 && part != NULL;
+             part = strtok_r(NULL, ",", &save)) {
+            char *end = NULL;
+            long long value = strtoll(part, &end, 10);
+            if (end == part || *end != '\0' || value <= 0) continue;
+            rc = admin_sb_appendf(builder, "%s%lld", first ? "" : ",", value);
+            first = 0;
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(builder, "],\"effectiveConsumerClientIds\":[");
+    if (rc == 0) {
+        const st_storage_client *egress = NULL;
+        for (size_t i = 0; i < client_count; ++i) {
+            if (clients[i].id == policy->egress_client_id) { egress = &clients[i]; break; }
+        }
+        int first = 1;
+        for (size_t i = 0; rc == 0 && egress != NULL && i < client_count; ++i) {
+            int allowed = 0;
+            if (clients[i].id == egress->id
+                || strcmp(clients[i].tenant_id, egress->tenant_id) != 0
+                || !policy->enabled
+                || !admin_egress_id_listed(policy->allowed_consumer_client_ids, clients[i].id)
+                || st_storage_can_peer(database_path, &clients[i], egress, &allowed) != 0
+                || !allowed) continue;
+            rc = admin_sb_appendf(builder, "%s%lld", first ? "" : ",", clients[i].id);
+            first = 0;
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(builder, "],\"destinationRules\":");
+    if (rc == 0) {
+        const char *stored = policy->destination_rules[0] == '\0' ? "[]" : policy->destination_rules;
+        rc = admin_sb_append(builder, stored);
+    }
+    if (rc == 0) rc = admin_sb_appendf(builder,
+        ",\"maxConcurrentFlows\":%d,\"maxFlowsPerConsumer\":%d,\"idleTimeoutSeconds\":%d,\"createdAt\":",
+        policy->max_concurrent_flows, policy->max_flows_per_consumer, policy->idle_timeout_seconds);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
+    return rc;
+}
+
+static int build_peer_mesh_egress_policies_response(const st_admin_context *context,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
+    st_storage_peer_mesh_egress_policy policies[128];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 0,
+                                                  policies, 128U, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy list failed\"}");
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = append_peer_mesh_egress_policy_view(&builder, database_path, &policies[i]);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+/* Serialises the destination allowlist for storage, rejecting anything the column cannot hold. */
+static int admin_encode_egress_destination_rules(const char *raw, char *out, size_t out_len)
+{
+    st_egress_destination_rule rules[ST_EGRESS_MAX_DESTINATION_RULES];
+    size_t rules_len = 0U;
+    if (raw == NULL || *raw == '\0') {
+        snprintf(out, out_len, "[]");
+        return 0;
+    }
+    if (st_egress_parse_destination_rules(raw, rules, ST_EGRESS_MAX_DESTINATION_RULES, &rules_len) != 0) {
+        return 1;
+    }
+    char *encoded = st_egress_encode_destination_rules(rules, rules_len);
+    if (encoded == NULL) return 1;
+    int rc = strlen(encoded) < out_len ? 0 : 1;
+    if (rc == 0) snprintf(out, out_len, "%s", encoded);
+    free(encoded);
+    return rc;
+}
+
+static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *context,
+                                                   const char *body,
+                                                   char *out,
+                                                   size_t out_len)
+{
+    if (!context->admin) {
+        return write_response(out, out_len, 403, "Forbidden",
+                              "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
+    }
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"database-backed egress policies are unavailable\"}");
+    }
+    long long egress_client_id = 0;
+    if (st_json_get_i64(body, "egressClientId", &egress_client_id) != 0 || egress_client_id <= 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"egressClientId is required\"}");
+    }
+    st_storage_client egress;
+    if (st_storage_get_client(database_path, egress_client_id, &egress) != 0
+        || strcmp(egress.tenant_id, context->tenant_id) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    }
+
+    st_storage_peer_mesh_egress_policy policy;
+    memset(&policy, 0, sizeof(policy));
+    int found = st_storage_find_peer_mesh_egress_policy_by_client(database_path, context->tenant_id,
+                                                                   egress_client_id, &policy);
+    if (found < 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy lookup failed\"}");
+    }
+    if (found != 0) {
+        memset(&policy, 0, sizeof(policy));
+        snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
+        snprintf(policy.destination_rules, sizeof(policy.destination_rules), "[]");
+        policy.max_concurrent_flows = 256;
+        policy.max_flows_per_consumer = 64;
+        policy.idle_timeout_seconds = 60;
+    }
+    snprintf(policy.tenant_id, sizeof(policy.tenant_id), "%s", context->tenant_id);
+    snprintf(policy.owner_username, sizeof(policy.owner_username), "%s", context->username);
+    policy.egress_client_id = egress.id;
+    snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "%s", egress.client_name);
+
+    int enabled = 0;
+    if (st_json_get_bool(body, "enabled", &enabled) == 0) policy.enabled = enabled;
+
+    char *scope = st_json_get_string(body, "scope");
+    if (scope != NULL) {
+        for (char *p = scope; *p != '\0'; ++p) *p = (char)toupper((unsigned char)*p);
+        if (strcmp(scope, ST_EGRESS_SCOPE_PUBLIC) != 0 && strcmp(scope, ST_EGRESS_SCOPE_LAN) != 0) {
+            free(scope);
+            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid scope\"}");
+        }
+        snprintf(policy.scope, sizeof(policy.scope), "%s", scope);
+        free(scope);
+    }
+
+    char **consumers = NULL;
+    size_t consumer_count = 0U;
+    if (st_json_get_raw_array(body, "allowedConsumerClientIds", &consumers, &consumer_count) == 0) {
+        if (consumer_count > ST_EGRESS_MAX_CONSUMERS) {
+            st_json_free_string_array(consumers, consumer_count);
+            return write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"at most 32 allowedConsumerClientIds\"}");
+        }
+        size_t offset = 0U;
+        policy.allowed_consumer_client_ids[0] = '\0';
+        for (size_t i = 0; i < consumer_count; ++i) {
+            char *end = NULL;
+            long long value = strtoll(consumers[i], &end, 10);
+            if (end == consumers[i] || *end != '\0' || value <= 0) continue;
+            int written = snprintf(policy.allowed_consumer_client_ids + offset,
+                                   sizeof(policy.allowed_consumer_client_ids) - offset,
+                                   "%s%lld", offset == 0U ? "" : ",", value);
+            if (written < 0
+                || (size_t)written >= sizeof(policy.allowed_consumer_client_ids) - offset) break;
+            offset += (size_t)written;
+        }
+        st_json_free_string_array(consumers, consumer_count);
+    }
+
+    char *rules_raw = st_json_get_top_level_raw(body, "destinationRules");
+    if (rules_raw != NULL) {
+        int rc = admin_encode_egress_destination_rules(rules_raw, policy.destination_rules,
+                                                       sizeof(policy.destination_rules));
+        free(rules_raw);
+        if (rc != 0) {
+            return write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"destinationRules exceed the storage limit\"}");
+        }
+    }
+
+    int value = 0;
+    if (st_json_get_int(body, "maxConcurrentFlows", &value) == 0) {
+        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
+                                              "{\"error\":\"maxConcurrentFlows must be positive\"}");
+        policy.max_concurrent_flows = value;
+    }
+    if (st_json_get_int(body, "maxFlowsPerConsumer", &value) == 0) {
+        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
+                                              "{\"error\":\"maxFlowsPerConsumer must be positive\"}");
+        policy.max_flows_per_consumer = value;
+    }
+    if (st_json_get_int(body, "idleTimeoutSeconds", &value) == 0) {
+        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
+                                              "{\"error\":\"idleTimeoutSeconds must be positive\"}");
+        policy.idle_timeout_seconds = value;
+    }
+
+    st_storage_peer_mesh_egress_policy saved;
+    if (st_storage_upsert_peer_mesh_egress_policy(database_path, &policy, &saved) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy save failed\"}");
+    }
+    /* Revoking or narrowing a grant has to take effect now, not at the next login. */
+    admin_notify_peer_mesh_refresh(saved.tenant_id);
+
+    st_admin_string_builder builder = {0};
+    int rc = append_peer_mesh_egress_policy_view(&builder, database_path, &saved);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy response failed\"}");
+    }
+    int len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return len;
+}
+
+static int handle_peer_mesh_egress_policy_delete(const st_admin_context *context,
+                                                 long long id,
+                                                 char *out,
+                                                 size_t out_len)
+{
+    if (!context->admin) {
+        return write_response(out, out_len, 403, "Forbidden",
+                              "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
+    }
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"database-backed egress policies are unavailable\"}");
+    }
+    st_storage_peer_mesh_egress_policy policy;
+    int found = st_storage_get_peer_mesh_egress_policy(database_path, id, context->tenant_id, &policy);
+    if (found != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"egress policy not found\"}");
+    }
+    if (st_storage_delete_peer_mesh_egress_policy(database_path, id, context->tenant_id) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"egress policy delete failed\"}");
+    }
+    admin_notify_peer_mesh_refresh(policy.tenant_id);
+    return write_response(out, out_len, 200, "OK", "{}");
 }
 
 static int build_peer_mesh_services_response(const st_admin_context *context, char *out, size_t out_len)
@@ -8213,6 +8529,16 @@ static int st_admin_build_response_internal(const char *method,
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services/import")) {
         return handle_peer_mesh_service_import(&context, body, out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
+        return build_peer_mesh_egress_policies_response(&context, out, out_len);
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
+        return handle_peer_mesh_egress_policy_mutation(&context, body, out, out_len);
+    }
+    if (strcmp(method, "DELETE")== 0
+        && admin_parse_path_id(path, "/api/admin/peer-mesh/egress/policies/", &path_id) == 0) {
+        return handle_peer_mesh_egress_policy_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-audit")) {
         return build_peer_mesh_service_audit_response(&context, out, out_len);

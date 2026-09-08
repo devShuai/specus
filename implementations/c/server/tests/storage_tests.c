@@ -1,5 +1,7 @@
 #include "storage.h"
 
+#include "peer_egress.h"
+
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,12 +117,106 @@ static int test_http_route_auth_migration(void)
     return 0;
 }
 
+/*
+ * Egress policy storage. The judgment layer itself is covered by the shared vectors in
+ * peer_egress_tests; what is checked here is that a policy survives a round trip and that a
+ * disabled one leaves the enabled-only listing that catalogue building reads.
+ */
+static int test_peer_mesh_egress_policy_round_trip(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-egress-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "storage init failed\n");
+        return 1;
+    }
+
+    int failures = 0;
+    st_storage_peer_mesh_egress_policy policy;
+    memset(&policy, 0, sizeof(policy));
+    snprintf(policy.tenant_id, sizeof(policy.tenant_id), "default");
+    snprintf(policy.owner_username, sizeof(policy.owner_username), "owner");
+    policy.egress_client_id = 2002;
+    snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "office-gateway");
+    policy.enabled = 1;
+    snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
+    snprintf(policy.allowed_consumer_client_ids, sizeof(policy.allowed_consumer_client_ids), "1001");
+    snprintf(policy.destination_rules, sizeof(policy.destination_rules),
+             "[{\"cidr\":\"203.0.113.0/24\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+    policy.max_concurrent_flows = 256;
+    policy.max_flows_per_consumer = 64;
+    policy.idle_timeout_seconds = 60;
+
+    st_storage_peer_mesh_egress_policy saved;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &policy, &saved) != 0) {
+        fprintf(stderr, "egress policy insert failed\n");
+        unlink(path);
+        return failures + 1;
+    }
+    if (saved.id <= 0 || saved.egress_client_id != 2002 || !saved.enabled
+        || strcmp(saved.scope, ST_EGRESS_SCOPE_PUBLIC) != 0
+        || strcmp(saved.destination_rules, policy.destination_rules) != 0
+        || saved.max_flows_per_consumer != 64) {
+        fprintf(stderr, "egress policy did not round trip\n");
+        failures++;
+    }
+
+    st_storage_peer_mesh_egress_policy found;
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "default", 2002, &found) != 0
+        || found.id != saved.id) {
+        fprintf(stderr, "egress policy lookup by client failed\n");
+        failures++;
+    }
+    /* A tenant that has never configured egress must read as absent rather than as an error. */
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "default", 4242, &found) != 1) {
+        fprintf(stderr, "a missing policy must read as absent\n");
+        failures++;
+    }
+
+    /*
+     * A disabled policy must disappear from the enabled-only listing, which is what catalogue
+     * building reads: switching the device off has to stop it being offered, not merely stop new
+     * flows at the far end.
+     */
+    saved.enabled = 0;
+    snprintf(saved.allowed_consumer_client_ids, sizeof(saved.allowed_consumer_client_ids), "1001,1002");
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &saved, NULL) != 0) {
+        fprintf(stderr, "egress policy update failed\n");
+        failures++;
+    }
+    st_storage_peer_mesh_egress_policy listed[8];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, listed, 8U, &count) != 0
+        || count != 0U) {
+        fprintf(stderr, "a disabled policy is still listed as enabled\n");
+        failures++;
+    }
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, listed, 8U, &count) != 0
+        || count != 1U
+        || strcmp(listed[0].allowed_consumer_client_ids, "1001,1002") != 0) {
+        fprintf(stderr, "the update did not persist\n");
+        failures++;
+    }
+
+    if (st_storage_delete_peer_mesh_egress_policy(path, saved.id, "default") != 0
+        || st_storage_get_peer_mesh_egress_policy(path, saved.id, "default", &found) != 1) {
+        fprintf(stderr, "egress policy delete failed\n");
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
         return 1;
     }
     if (test_http_route_auth_migration() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_egress_policy_round_trip() != 0) {
         return 1;
     }
     char path[256];
