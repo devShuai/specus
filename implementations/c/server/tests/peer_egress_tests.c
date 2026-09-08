@@ -674,6 +674,68 @@ static int run_storage_round_trip(void)
     return failures;
 }
 
+/*
+ * Boundary sweep shared by every runtime.
+ *
+ * The hand-written cases document intent; this exists to catch a runtime that agrees on the
+ * documented examples but diverges one address or one port away from a boundary. Every runtime runs
+ * the same sweep against the same policy, so a disagreement here is a disagreement about the rules
+ * rather than about the fixture.
+ */
+static int run_cross_language_sweep(const char *vector)
+{
+    st_egress_context context;
+    context_for(vector, &context);
+
+    char *policy_raw = st_json_get_top_level_raw(vector, "policy");
+    st_egress_policy policy;
+    if (policy_raw == NULL || load_policy(policy_raw, &policy) != 0) {
+        fprintf(stderr, "cross-language sweep policy did not load\n");
+        free(policy_raw);
+        return 1;
+    }
+    free(policy_raw);
+
+    char **cases = NULL;
+    size_t cases_len = 0U;
+    if (st_json_get_raw_array(vector, "crossLanguageCases", &cases, &cases_len) != 0
+        || cases_len < 100U) {
+        fprintf(stderr, "cross-language sweep carried only %zu cases\n", cases_len);
+        st_json_free_string_array(cases, cases_len);
+        return 1;
+    }
+    int failures = 0;
+    for (size_t i = 0U; i < cases_len; i++) {
+        char *name = st_json_get_string(cases[i], "name");
+        char *request_raw = st_json_get_top_level_raw(cases[i], "request");
+        char *expect_raw = st_json_get_top_level_raw(cases[i], "expect");
+        if (name == NULL || request_raw == NULL || expect_raw == NULL) {
+            fprintf(stderr, "cross-language case %zu is incomplete\n", i);
+            failures++;
+        } else {
+            st_egress_request request;
+            load_request(request_raw, &request);
+            char *expected = st_json_get_string(expect_raw, "code");
+            int expected_allowed = 0;
+            st_json_get_bool(expect_raw, "allowed", &expected_allowed);
+            st_egress_decision decision;
+            st_egress_authorize(&request, &policy, 1, &context, &decision);
+            failures += expect_code(name, decision.code, expected == NULL ? "" : expected);
+            if (decision.allowed != expected_allowed) {
+                fprintf(stderr, "%s: allowed = %d, want %d\n", name, decision.allowed,
+                        expected_allowed);
+                failures++;
+            }
+            free(expected);
+        }
+        free(name);
+        free(request_raw);
+        free(expect_raw);
+    }
+    st_json_free_string_array(cases, cases_len);
+    return failures;
+}
+
 int main(void)
 {
     char *authz = read_vector("peer-egress-authz-v1.json");
@@ -686,6 +748,7 @@ int main(void)
     int failures = 0;
     failures += run_authorization_cases(authz);
     failures += run_policy_variants(authz);
+    failures += run_cross_language_sweep(authz);
     failures += run_forced_deny_cases(authz);
     failures += run_rule_matching(rules);
     failures += run_rule_validation(rules);

@@ -120,6 +120,30 @@ public sealed class PeerEgressVectorTests
     }
 
     /// <summary>
+    /// Boundary sweep shared by every runtime.
+    /// </summary>
+    /// <remarks>
+    /// The hand-written cases document intent; this exists to catch a runtime that agrees on the
+    /// documented examples but diverges one address or one port away from a boundary. Every runtime
+    /// runs the same sweep against the same policy, so a disagreement here is a disagreement about
+    /// the rules rather than about the fixture.
+    /// </remarks>
+    [Fact]
+    public void CrossLanguageBoundarySweepMatchesSharedVector()
+    {
+        var vector = ReadVector<AuthzVector>("peer-egress-authz-v1.json");
+        Assert.True(vector.CrossLanguageCases.Count >= 100,
+            $"cross-language sweep carried only {vector.CrossLanguageCases.Count} cases");
+        var context = ContextFor(vector);
+        foreach (var testCase in vector.CrossLanguageCases)
+        {
+            var decision = PeerEgressAuthorization.Authorize(testCase.Request, vector.Policy, true, context);
+            Assert.Equal(testCase.Expect.Code, decision.Code);
+            Assert.Equal(testCase.Expect.Allowed, decision.Allowed);
+        }
+    }
+
+    /// <summary>
     /// The mesh network reaches the implementation through the deployment context rather than the
     /// static list, so it is lifted back out of the vector forced-deny set by its prefix length.
     /// </summary>
@@ -177,6 +201,9 @@ public sealed class PeerEgressVectorTests
 
         [JsonPropertyName("cases")]
         public IReadOnlyList<AuthzCase> Cases { get; init; } = [];
+
+        [JsonPropertyName("crossLanguageCases")]
+        public IReadOnlyList<AuthzCase> CrossLanguageCases { get; init; } = [];
 
         [JsonPropertyName("policyVariantCases")]
         public IReadOnlyList<PolicyVariantCase> PolicyVariantCases { get; init; } = [];

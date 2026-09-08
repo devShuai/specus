@@ -25,6 +25,14 @@ type authzVector struct {
 			Code    string `json:"code"`
 		} `json:"expect"`
 	} `json:"cases"`
+	CrossLanguageCases []struct {
+		Name    string  `json:"name"`
+		Request Request `json:"request"`
+		Expect  struct {
+			Allowed bool   `json:"allowed"`
+			Code    string `json:"code"`
+		} `json:"expect"`
+	} `json:"crossLanguageCases"`
 	PolicyVariantCases []struct {
 		Name           string `json:"name"`
 		PolicyOverride struct {
@@ -221,6 +229,25 @@ func TestRuleValidationMatchesSharedVector(t *testing.T) {
 	for _, testCase := range vector.ConfigValidation {
 		if code := ValidateRule(testCase.Rule, mesh); code != testCase.Code {
 			t.Errorf("%s: code = %s, want %s", testCase.Name, code, testCase.Code)
+		}
+	}
+}
+
+// The hand-written cases document intent; this sweep exists to catch a runtime that agrees on the
+// documented examples but diverges one address or one port away from a boundary. Every runtime runs
+// the same sweep against the same policy, so a disagreement here is a disagreement about the rules.
+func TestCrossLanguageBoundarySweepMatchesSharedVector(t *testing.T) {
+	var vector authzVector
+	readVector(t, "peer-egress-authz-v1.json", &vector)
+	if len(vector.CrossLanguageCases) < 100 {
+		t.Fatalf("cross-language sweep carried only %d cases", len(vector.CrossLanguageCases))
+	}
+	context := contextFor(vector)
+	for _, testCase := range vector.CrossLanguageCases {
+		decision := Authorize(testCase.Request, vector.Policy, true, context)
+		if decision.Code != testCase.Expect.Code || decision.Allowed != testCase.Expect.Allowed {
+			t.Errorf("%s: got %s/%v, want %s/%v", testCase.Name, decision.Code, decision.Allowed,
+				testCase.Expect.Code, testCase.Expect.Allowed)
 		}
 	}
 }

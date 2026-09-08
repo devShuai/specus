@@ -176,6 +176,12 @@ def evaluate(req, policy=POLICY, peer_acl_allows=True):
     if req["consumerClientId"] not in policy["allowedConsumerClientIds"]:
         return {"allowed": False, "code": "EGRESS_CONSUMER_DENIED"}
     dst = req["destinationIp"]
+    try:
+        # Strict on purpose, like every runtime: a leading-zero octet or a short address is refused
+        # rather than reinterpreted. ipaddress rejects both, so this mirrors them.
+        ipaddress.IPv4Address(dst)
+    except ipaddress.AddressValueError:
+        return {"allowed": False, "code": "EGRESS_DEST_DENIED"}
     if in_any(dst, FORCED_DENY) or in_any(dst, CLOUD_METADATA) or in_any(dst, req.get("localInterfaceCidrs", [])):
         return {"allowed": False, "code": "EGRESS_FORBIDDEN_DESTINATION"}
     if classify_scope(dst) != policy["scope"]:
@@ -195,6 +201,102 @@ def evaluate(req, policy=POLICY, peer_acl_allows=True):
     if req.get("activeFlowsTotal", 0) >= policy["limits"]["maxConcurrentFlows"]:
         return {"allowed": False, "code": "EGRESS_LIMIT_EXCEEDED"}
     return {"allowed": True, "code": "EGRESS_ALLOWED"}
+
+
+def build_cross_language_cases():
+    """Exhaustive boundary sweep, expectations computed by the reference evaluate() above.
+
+    The hand-written cases document intent; these exist to catch a runtime that agrees on the
+    documented examples but diverges one address or one port away from a boundary. Every case runs
+    against the same POLICY, so a disagreement between implementations is a disagreement about the
+    rules rather than about the fixture.
+    """
+    cases = []
+    seen = set()
+
+    def add(name, request):
+        req = dict(request)
+        req.setdefault("consumerClientId", 1)
+        req.setdefault("protocol", "tcp")
+        req.setdefault("destinationPort", 443)
+        key = json.dumps(req, sort_keys=True)
+        if key in seen:
+            return
+        seen.add(key)
+        cases.append({"name": name, "request": req, "expect": evaluate(req)})
+
+    def edges(cidr):
+        net = ipaddress.IPv4Network(cidr)
+        out = [net.network_address, net.broadcast_address]
+        if net.num_addresses > 2:
+            out.append(net.network_address + 1)
+            out.append(net.broadcast_address - 1)
+        if int(net.network_address) > 0:
+            out.append(net.network_address - 1)
+        if int(net.broadcast_address) < 0xFFFFFFFF:
+            out.append(net.broadcast_address + 1)
+        return [str(a) for a in out]
+
+    # Destination rule boundaries, each swept across both protocols the policy mentions.
+    for rule in POLICY["destinationRules"]:
+        for address in edges(rule["cidr"]):
+            for protocol in ("tcp", "udp"):
+                add(f"rule-{rule['cidr'].replace('/', '_')}-{address}-{protocol}",
+                    {"destinationIp": address, "protocol": protocol})
+
+    # Port boundaries: one below, both ends, one above, for every declared range.
+    for rule in POLICY["destinationRules"]:
+        address = str(ipaddress.IPv4Network(rule["cidr"]).network_address + 1)
+        for low, high in rule["portRanges"]:
+            for port in {low - 1, low, high, high + 1}:
+                if not 0 <= port <= 65535:
+                    continue
+                for protocol in ("tcp", "udp"):
+                    add(f"port-{rule['cidr'].replace('/', '_')}-{port}-{protocol}",
+                        {"destinationIp": address, "destinationPort": port, "protocol": protocol})
+
+    # Forced-deny and metadata ranges must lose to nothing, including the broad 0.0.0.0/0 rule.
+    for cidr in FORCED_DENY + CLOUD_METADATA:
+        for address in edges(cidr):
+            add(f"forced-{cidr.replace('/', '_')}-{address}", {"destinationIp": address})
+
+    # LAN ranges under a PUBLIC policy: scope is decided before any destination rule.
+    for cidr in LAN_RANGES:
+        for address in edges(cidr):
+            add(f"lan-{cidr.replace('/', '_')}-{address}", {"destinationIp": address})
+
+    # A protocol the policy never mentions.
+    for address in ("203.0.113.10", "198.51.100.20", "192.0.2.10"):
+        add(f"protocol-icmp-{address}", {"destinationIp": address, "protocol": "icmp"})
+
+    # Consumer allowlist membership, including the second permitted id.
+    for consumer in (0, 1, 2, 5, 9):
+        add(f"consumer-{consumer}", {"consumerClientId": consumer, "destinationIp": "203.0.113.10"})
+
+    # hop wins over everything, even an otherwise perfect request.
+    add("hop-over-an-allowed-request", {"destinationIp": "203.0.113.10", "hop": True})
+    add("hop-over-a-denied-request",
+        {"destinationIp": "127.0.0.1", "hop": True, "consumerClientId": 9})
+
+    # Limit boundaries: at the cap is refused, one below is not.
+    limits = POLICY["limits"]
+    for active in (limits["maxFlowsPerConsumer"] - 1, limits["maxFlowsPerConsumer"]):
+        add(f"per-consumer-flows-{active}",
+            {"destinationIp": "203.0.113.10", "activeFlowsForConsumer": active})
+    for total in (limits["maxConcurrentFlows"] - 1, limits["maxConcurrentFlows"]):
+        add(f"total-flows-{total}", {"destinationIp": "203.0.113.10", "activeFlowsTotal": total})
+
+    # A local interface range is a per-request extension of the forced-deny list.
+    add("local-interface-hit",
+        {"destinationIp": "203.0.113.10", "localInterfaceCidrs": ["203.0.113.0/24"]})
+    add("local-interface-miss",
+        {"destinationIp": "203.0.113.10", "localInterfaceCidrs": ["198.18.0.0/15"]})
+
+    # Malformed destinations are refused rather than parsed loosely.
+    for address in ("010.1.1.1", "1.2.3", "1.2.3.256", "", "2001:db8::1"):
+        add(f"malformed-{address or 'empty'}", {"destinationIp": address})
+
+    return cases
 
 
 AUTHZ_CASES = [
@@ -318,6 +420,8 @@ authz_vector = {
     "policyVariantCases": special_cases,
 }
 
+authz_vector["crossLanguageCases"] = build_cross_language_cases()
+
 for path, payload in [
     ("protocol/test-vectors/peer-egress-rules-v1.json", rules_vector),
     ("protocol/test-vectors/peer-egress-authz-v1.json", authz_vector),
@@ -328,6 +432,7 @@ for path, payload in [
 
 print("rule cases:", len(rule_cases), "config rejects:", len(CONFIG_REJECT))
 print("authz cases:", len(authz_cases), "policy variants:", len(special_cases))
+print("cross-language cases:", len(authz_vector["crossLanguageCases"]))
 allowed = sum(1 for c in authz_cases if c["expect"]["allowed"])
 print("authz allow/deny:", allowed, "/", len(authz_cases) - allowed)
 for c in authz_cases:

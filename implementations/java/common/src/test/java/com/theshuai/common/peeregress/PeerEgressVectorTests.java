@@ -41,6 +41,32 @@ class PeerEgressVectorTests {
         assertTrue(checked > 0, "authorization vector carried no cases");
     }
 
+    /**
+     * Boundary sweep shared by every runtime.
+     *
+     * <p>The hand-written cases document intent; this exists to catch a runtime that agrees on the
+     * documented examples but diverges one address or one port away from a boundary. Every runtime
+     * runs the same sweep against the same policy, so a disagreement here is a disagreement about
+     * the rules rather than about the fixture.
+     */
+    @Test
+    void crossLanguageBoundarySweepMatchesSharedVector() throws IOException {
+        JsonNode vector = readVector("peer-egress-authz-v1.json");
+        PeerEgressPolicy basePolicy = policyOf(vector.path("policy"));
+        PeerEgressAuthorization.Context context = contextOf(vector);
+        int checked = 0;
+        for (JsonNode node : vector.path("crossLanguageCases")) {
+            PeerEgressRequest request = requestOf(node.path("request"));
+            PeerEgressAuthorization.Decision decision =
+                    PeerEgressAuthorization.evaluate(request, basePolicy, true, context);
+            String name = node.path("name").asText();
+            assertEquals(node.path("expect").path("code").asText(), decision.code(), name);
+            assertEquals(node.path("expect").path("allowed").asBoolean(), decision.allowed(), name);
+            checked++;
+        }
+        assertTrue(checked >= 100, "cross-language sweep carried only " + checked + " cases");
+    }
+
     @Test
     void policyVariantsMatchSharedVector() throws IOException {
         JsonNode vector = readVector("peer-egress-authz-v1.json");
