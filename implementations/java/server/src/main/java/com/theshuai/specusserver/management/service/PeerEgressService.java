@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
+import com.theshuai.common.peeregress.PeerEgressProtocol;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.util.JsonUtil;
@@ -181,7 +182,16 @@ public class PeerEgressService {
      */
     @Transactional(readOnly = true)
     public PeerControlMessage buildEgressConfig(ClientAccount account, ClientEnvironmentInfo environment) {
-        if (account == null || !supportsEgress(environment)) {
+        return buildEgressConfig(account, environmentVersion(environment));
+    }
+
+    /**
+     * Builds the {@code egress-config} for a client whose announced version is already known, which
+     * is what the signal push path has: it starts from a stored session rather than a login payload.
+     */
+    @Transactional(readOnly = true)
+    public PeerControlMessage buildEgressConfig(ClientAccount account, int clientEgressVersion) {
+        if (account == null || clientEgressVersion < 1) {
             return null;
         }
         PeerControlMessage message = new PeerControlMessage();
@@ -213,7 +223,13 @@ public class PeerEgressService {
     /** Builds the {@code egress-catalog} pushed to a consumer device. */
     @Transactional(readOnly = true)
     public PeerControlMessage buildEgressCatalog(ClientAccount account, ClientEnvironmentInfo environment) {
-        if (account == null || !supportsEgress(environment)) {
+        return buildEgressCatalog(account, environmentVersion(environment));
+    }
+
+    /** Builds the {@code egress-catalog} for a client whose announced version is already known. */
+    @Transactional(readOnly = true)
+    public PeerControlMessage buildEgressCatalog(ClientAccount account, int clientEgressVersion) {
+        if (account == null || clientEgressVersion < 1) {
             return null;
         }
         PeerControlMessage message = new PeerControlMessage();
@@ -286,9 +302,14 @@ public class PeerEgressService {
     }
 
     static boolean supportsEgress(ClientEnvironmentInfo environment) {
-        return environment != null
-                && environment.getClientEgressCapabilities() != null
-                && environment.getClientEgressCapabilities().getVersion() >= 1;
+        return environmentVersion(environment) >= 1;
+    }
+
+    private static int environmentVersion(ClientEnvironmentInfo environment) {
+        if (environment == null || environment.getClientEgressCapabilities() == null) {
+            return 0;
+        }
+        return PeerEgressProtocol.normalizeVersion(environment.getClientEgressCapabilities().getVersion());
     }
 
     private boolean isDeviceEnabled(ClientAccount account) {

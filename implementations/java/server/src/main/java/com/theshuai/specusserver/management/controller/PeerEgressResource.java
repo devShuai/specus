@@ -1,8 +1,10 @@
 package com.theshuai.specusserver.management.controller;
 
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicyView;
+import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.PeerEgressService;
+import com.theshuai.specusserver.management.service.PeerSignalService;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -19,11 +21,14 @@ import java.util.List;
 @RequestMapping("/api/admin/peer-mesh/egress")
 public class PeerEgressResource {
     private final PeerEgressService peerEgressService;
+    private final PeerSignalService peerSignalService;
     private final ManagementContextResolver contextResolver;
 
     public PeerEgressResource(PeerEgressService peerEgressService,
+                              PeerSignalService peerSignalService,
                               ManagementContextResolver contextResolver) {
         this.peerEgressService = peerEgressService;
+        this.peerSignalService = peerSignalService;
         this.contextResolver = contextResolver;
     }
 
@@ -36,11 +41,17 @@ public class PeerEgressResource {
     @PostMapping("/policies")
     public PeerMeshEgressPolicyView upsert(@AuthenticationPrincipal Jwt jwt,
                                            @RequestBody PeerEgressService.PolicyMutation request) {
-        return peerEgressService.upsertPolicyView(contextResolver.resolve(jwt), request);
+        ManagementContext context = contextResolver.resolve(jwt);
+        PeerMeshEgressPolicyView view = peerEgressService.upsertPolicyView(context, request);
+        // Revoking or narrowing a grant has to take effect now, not at the peer next login.
+        peerSignalService.pushTenantEgress(context.tenant().tenantId());
+        return view;
     }
 
     @DeleteMapping("/policies/{id}")
     public void delete(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        peerEgressService.deletePolicy(contextResolver.resolve(jwt), id);
+        ManagementContext context = contextResolver.resolve(jwt);
+        peerEgressService.deletePolicy(context, id);
+        peerSignalService.pushTenantEgress(context.tenant().tenantId());
     }
 }

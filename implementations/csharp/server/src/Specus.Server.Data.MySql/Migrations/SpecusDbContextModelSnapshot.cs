@@ -369,6 +369,10 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("varchar(160)")
                         .HasColumnName("channel_id");
 
+                    b.Property<int>("ClientEgressVersion")
+                        .HasColumnType("int")
+                        .HasColumnName("client_egress_version");
+
                     b.Property<long>("ClientId")
                         .HasColumnType("bigint")
                         .HasColumnName("client_id");

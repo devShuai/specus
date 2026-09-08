@@ -34,6 +34,94 @@ public sealed partial class PeerMeshService
     public static bool EgressSupported(ClientEgressCapabilities? capabilities) =>
         capabilities is not null && capabilities.Version >= 1;
 
+    /// <summary>
+    /// Sends the current egress-config and egress-catalog to one device.
+    /// </summary>
+    /// <remarks>
+    /// A client that announced no egress capability at login gets nothing, so a runtime that would
+    /// not understand the payload never receives it.
+    /// </remarks>
+    public async Task PushEgressAsync(ClientAccount account, CancellationToken cancellationToken)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+        var session = _sessions.Find(account.ClientName);
+        if (session is null)
+        {
+            return;
+        }
+        var version = await ClientEgressVersionAsync(account, cancellationToken).ConfigureAwait(false);
+        if (version < 1)
+        {
+            return;
+        }
+        var capabilities = new ClientEgressCapabilities { Version = version };
+
+        var config = await BuildEgressConfigAsync(account, capabilities, cancellationToken).ConfigureAwait(false);
+        if (config is not null)
+        {
+            config.SourceClientId = account.Id;
+            config.SourceClientName = account.ClientName;
+            config.TargetClientId = account.Id;
+            config.TargetClientName = account.ClientName;
+            config.CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await SendSignalAsync(session, "server", account.ClientName, config, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var catalog = await BuildEgressCatalogAsync(account, capabilities, cancellationToken).ConfigureAwait(false);
+        if (catalog is not null)
+        {
+            catalog.SourceClientId = account.Id;
+            catalog.SourceClientName = account.ClientName;
+            catalog.TargetClientId = account.Id;
+            catalog.TargetClientName = account.ClientName;
+            catalog.CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await SendSignalAsync(session, "server", account.ClientName, catalog, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Refreshes every online device in the tenant after a policy change.
+    /// </summary>
+    /// <remarks>
+    /// A policy change moves two things at once: what the egress node itself will accept, and which
+    /// egresses its peers can see. Both sides are refreshed together so the catalogue never
+    /// advertises an egress that has already stopped accepting the viewer.
+    /// </remarks>
+    public async Task PushTenantEgressAsync(string tenantId, CancellationToken cancellationToken)
+    {
+        var accounts = await _db.ClientAccounts.AsNoTracking()
+            .Where(account => account.TenantId == tenantId)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var account in accounts)
+        {
+            await PushEgressAsync(account, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// The version the client announced on its live control-channel session, or 0 when it has none.
+    /// </summary>
+    /// <remarks>
+    /// The maximum is projected as nullable rather than defaulted: EF cannot translate
+    /// DefaultIfEmpty over a scalar projection, and Max over an empty set throws otherwise.
+    /// </remarks>
+    private async Task<int> ClientEgressVersionAsync(ClientAccount account, CancellationToken cancellationToken)
+    {
+        var version = await _db.ClientSessions.AsNoTracking()
+            .Where(row => row.TenantId == account.TenantId
+                && row.ClientId == account.Id
+                && row.Status == "NETTY_ONLINE")
+            .MaxAsync(row => (int?)row.ClientEgressVersion, cancellationToken)
+            .ConfigureAwait(false);
+        return version ?? 0;
+    }
+
     /// <summary>Returns every policy in the tenant as a management view.</summary>
     public async Task<IReadOnlyList<PeerMeshEgressPolicyView>> ListEgressPoliciesAsync(ManagementContext context,
         CancellationToken cancellationToken)
@@ -119,6 +207,8 @@ public sealed partial class PeerMeshService
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         Audit("egress-policy", context.TenantId, egress.Id, null, null, creating ? "created" : "updated");
+        // Revoking or narrowing a grant has to take effect now, not at the peer next login.
+        await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
         return await ToEgressViewAsync(policy, cancellationToken).ConfigureAwait(false);
     }
 
@@ -137,6 +227,7 @@ public sealed partial class PeerMeshService
         _db.PeerMeshEgressPolicies.Remove(policy);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         Audit("egress-policy", context.TenantId, policy.EgressClientId, null, null, "deleted");
+        await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

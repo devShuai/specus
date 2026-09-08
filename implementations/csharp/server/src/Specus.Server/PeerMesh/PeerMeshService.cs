@@ -486,6 +486,9 @@ public sealed partial class PeerMeshService
         {
             await PushRosterAsync(target, cancellationToken).ConfigureAwait(false);
         }
+        // A device coming online changes which egresses its peers see as reachable, so the
+        // whole tenant is refreshed rather than only the device that just logged in.
+        await PushTenantEgressAsync(account.TenantId, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<PeerMeshDeviceView>> ListDevicesAsync(ManagementContext context,

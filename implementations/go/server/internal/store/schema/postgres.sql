@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   message_max_attachment_bytes BIGINT NOT NULL DEFAULT 0,
   peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,
   peer_service_applications VARCHAR(160),
+  client_egress_version INTEGER NOT NULL DEFAULT 0,
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),

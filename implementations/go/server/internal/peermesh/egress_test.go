@@ -3,6 +3,7 @@ package peermesh
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/devShuai/specus/implementations/go/server/internal/peeregress"
@@ -264,5 +265,128 @@ func TestNonAdminCannotManageEgressPolicies(t *testing.T) {
 	if err := service.DeleteEgressPolicy(ctx,
 		AccessContext{Username: "alice", TenantID: "tenant-a", Admin: false}, 1); err == nil {
 		t.Error("a non-admin must not be able to delete an egress policy")
+	}
+}
+
+func insertEgressCapableSession(t *testing.T, db *store.DB, account store.ClientAccount, sessionID int64) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(context.Background(), store.ClientSession{
+		ID: sessionID, TenantID: account.TenantID, ClientID: account.ID,
+		ClientName: account.ClientName, TokenHash: "egress-push-test-" + account.ClientName,
+		Status: "NETTY_ONLINE", MachineFingerprint: "machine", OSUser: "user",
+		ClientEgressVersion: EgressProtocolVersion,
+		HTTPLoginAt:         now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func egressMessages(t *testing.T, recorded *recordingSession, messageType string) []ControlMessage {
+	t.Helper()
+	var out []ControlMessage
+	for _, message := range recorded.peerMessages(t) {
+		if message.Type == messageType {
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+// Revoking a grant has to reach the peers now, not at their next login. Building the payload is not
+// enough on its own: this is the acceptance condition the builders alone did not satisfy.
+func TestPolicyChangeReachesOnlineDevicesImmediately(t *testing.T) {
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled: true, CIDR: "100.96.0.0/11", PublicAddress: "203.0.113.10",
+		StunTurnPort: 3478, SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+
+	consumer := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	egress := insertPeerClient(t, db, 1002, "tenant-a", "alice", "office-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.10", "consumer-key")
+	insertPeerDevice(t, db, egress, "100.96.0.11", "egress-key")
+	insertEgressCapableSession(t, db, consumer, 4101)
+	insertEgressCapableSession(t, db, egress, 4102)
+
+	consumerSession := &recordingSession{name: consumer.ClientName}
+	egressSession := &recordingSession{name: egress.ClientName}
+	registry.Replace(consumerSession)
+	registry.Replace(egressSession)
+
+	upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
+
+	configs := egressMessages(t, egressSession, ControlTypeEgressConfig)
+	if len(configs) == 0 {
+		t.Fatal("granting access pushed no egress-config to the egress device")
+	}
+	granted := configs[len(configs)-1]
+	if granted.Enabled == nil || !*granted.Enabled ||
+		len(granted.AllowedConsumerClientIDs) != 1 ||
+		granted.AllowedConsumerClientIDs[0] != consumer.ID {
+		t.Errorf("egress-config did not name the consumer: %+v", granted)
+	}
+
+	catalogs := egressMessages(t, consumerSession, ControlTypeEgressCatalog)
+	if len(catalogs) == 0 {
+		t.Fatal("granting access pushed no egress-catalog to the consumer")
+	}
+	offered := catalogs[len(catalogs)-1]
+	if len(offered.Egresses) != 1 || offered.Egresses[0].ClientID != egress.ID {
+		t.Errorf("egress-catalog did not offer the egress: %+v", offered.Egresses)
+	}
+
+	consumerSession.packets = nil
+	egressSession.packets = nil
+	upsertTestPolicy(t, service, egress.ID, []int64{}, true)
+
+	configs = egressMessages(t, egressSession, ControlTypeEgressConfig)
+	if len(configs) == 0 {
+		t.Fatal("revoking access pushed no egress-config")
+	}
+	if revoked := configs[len(configs)-1]; len(revoked.AllowedConsumerClientIDs) != 0 {
+		t.Errorf("revoked policy still names consumers: %+v", revoked.AllowedConsumerClientIDs)
+	}
+	catalogs = egressMessages(t, consumerSession, ControlTypeEgressCatalog)
+	if len(catalogs) == 0 {
+		t.Fatal("revoking access pushed no egress-catalog")
+	}
+	if withdrawn := catalogs[len(catalogs)-1]; len(withdrawn.Egresses) != 0 {
+		t.Errorf("revoked egress is still catalogued: %+v", withdrawn.Egresses)
+	}
+}
+
+// A client that announced nothing at login must never be handed an egress payload, even when a
+// policy names it.
+func TestPushSkipsClientsThatAnnouncedNoEgressCapability(t *testing.T) {
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled: true, CIDR: "100.96.0.0/11", PublicAddress: "203.0.113.10",
+		StunTurnPort: 3478, SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+
+	consumer := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	egress := insertPeerClient(t, db, 1002, "tenant-a", "alice", "office-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.10", "consumer-key")
+	insertPeerDevice(t, db, egress, "100.96.0.11", "egress-key")
+	// Online, but the login carried no clientEgressCapabilities.
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(context.Background(), store.ClientSession{
+		ID: 4103, TenantID: consumer.TenantID, ClientID: consumer.ID,
+		ClientName: consumer.ClientName, TokenHash: "no-egress", Status: "NETTY_ONLINE",
+		MachineFingerprint: "machine", OSUser: "user",
+		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	consumerSession := &recordingSession{name: consumer.ClientName}
+	registry.Replace(consumerSession)
+
+	upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
+
+	if messages := egressMessages(t, consumerSession, ControlTypeEgressCatalog); len(messages) != 0 {
+		t.Errorf("pushed an egress payload to a client that cannot read it: %+v", messages)
 	}
 }

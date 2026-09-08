@@ -271,6 +271,12 @@ public class ClientAccountService {
         return clientAccountRepository.findByTenantIdOrderByIdDesc(tenant.tenantId());
     }
 
+    /** Tenant accounts for callers that hold only the tenant id, such as signal fan-out. */
+    @Transactional(readOnly = true)
+    public List<ClientAccount> listTenantAccounts(String tenantId) {
+        return clientAccountRepository.findByTenantIdOrderByIdDesc(tenantId);
+    }
+
     public ClientAccount findClientById(ManagementContext context, long id) {
         Optional<ClientAccount> account = context.isAdmin()
                 ? clientAccountRepository.findByIdAndTenantId(id, context.tenant().tenantId())

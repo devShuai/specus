@@ -96,6 +96,82 @@ func EgressSupported(capabilities *EgressCapabilities) bool {
 	return capabilities != nil && capabilities.Version >= 1
 }
 
+// EgressProtocolVersion is the split-routing version this server speaks.
+const EgressProtocolVersion = 1
+
+// NormalizeEgressVersion clamps a client-announced version to what this server understands.
+func NormalizeEgressVersion(version int) int {
+	if version < 1 {
+		return 0
+	}
+	if version > EgressProtocolVersion {
+		return EgressProtocolVersion
+	}
+	return version
+}
+
+// egressCapabilitiesFor reads what the client announced at login. A client with no online session,
+// or one that announced nothing, gets no egress payloads at all.
+func (s *Service) egressCapabilitiesFor(ctx context.Context, account store.ClientAccount) *EgressCapabilities {
+	online, err := s.db.GetOnlineClientSession(ctx, account.TenantID, account.ID, auth.StatusNettyOnline)
+	if err != nil || online == nil || online.ClientEgressVersion < 1 {
+		return nil
+	}
+	return &EgressCapabilities{Version: online.ClientEgressVersion}
+}
+
+// PushEgress sends the current egress-config and egress-catalog to one device.
+//
+// Called on login and after every policy mutation, so revoking a grant or switching an egress off
+// takes effect immediately rather than at the peer's next login.
+func (s *Service) PushEgress(ctx context.Context, account store.ClientAccount) {
+	bound, ok := s.sessions.Find(account.ClientName)
+	if !ok || bound == nil {
+		return
+	}
+	capabilities := s.egressCapabilitiesFor(ctx, account)
+	if !EgressSupported(capabilities) {
+		return
+	}
+	if config, err := s.BuildEgressConfig(ctx, account, capabilities); err != nil {
+		s.logger.Warn("build egress config failed", "client", account.ClientName, "err", err)
+	} else if config != nil {
+		config.SourceClientID = account.ID
+		config.SourceClientName = account.ClientName
+		config.TargetClientID = account.ID
+		config.TargetClientName = account.ClientName
+		config.CreatedAtMillis = time.Now().UnixMilli()
+		_ = s.sendSignal(bound, "server", account.ClientName, *config)
+	}
+	if catalog, err := s.BuildEgressCatalog(ctx, account, capabilities); err != nil {
+		s.logger.Warn("build egress catalog failed", "client", account.ClientName, "err", err)
+	} else if catalog != nil {
+		catalog.SourceClientID = account.ID
+		catalog.SourceClientName = account.ClientName
+		catalog.TargetClientID = account.ID
+		catalog.TargetClientName = account.ClientName
+		catalog.CreatedAtMillis = time.Now().UnixMilli()
+		_ = s.sendSignal(bound, "server", account.ClientName, *catalog)
+	}
+}
+
+// pushTenantEgress refreshes every online device in the tenant.
+//
+// A policy change moves two things at once: what the egress node itself will accept, and which
+// egresses its peers can see. Both sides are refreshed together so the catalogue never advertises
+// an egress that has already stopped accepting the viewer.
+func (s *Service) pushTenantEgress(ctx context.Context, tenantID string) {
+	clients, err := s.db.ListClients(ctx)
+	if err != nil {
+		return
+	}
+	for _, client := range clients {
+		if client.TenantID == tenantID {
+			s.PushEgress(ctx, client)
+		}
+	}
+}
+
 // ListEgressPolicies returns every policy in the tenant as a management view.
 func (s *Service) ListEgressPolicies(ctx context.Context, access AccessContext) ([]EgressPolicyView, error) {
 	rows, err := s.db.ListPeerMeshEgressPolicies(ctx, access.TenantID, false)
@@ -195,6 +271,7 @@ func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, 
 	if err != nil {
 		return EgressPolicyView{}, err
 	}
+	s.pushTenantEgress(ctx, access.TenantID)
 	return s.egressPolicyView(ctx, policy)
 }
 
@@ -210,7 +287,11 @@ func (s *Service) DeleteEgressPolicy(ctx context.Context, access AccessContext, 
 	if policy == nil {
 		return fmt.Errorf("egress policy not found: %d", id)
 	}
-	return s.db.DeletePeerMeshEgressPolicy(ctx, access.TenantID, id)
+	if err := s.db.DeletePeerMeshEgressPolicy(ctx, access.TenantID, id); err != nil {
+		return err
+	}
+	s.pushTenantEgress(ctx, access.TenantID)
+	return nil
 }
 
 // BuildEgressConfig produces the egress-config pushed to an egress device. It returns nil when the

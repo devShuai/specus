@@ -89,6 +89,13 @@ public class ClientSession {
     @Column(name = "peer_service_applications", length = 160)
     private String peerServiceApplications;
 
+    /**
+     * Peer egress split routing version the client announced at login. 0 or absent means it cannot
+     * take part, and the server must not push egress-config or egress-catalog to it.
+     */
+    @Column(name = "client_egress_version", nullable = false)
+    private int clientEgressVersion;
+
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;
 

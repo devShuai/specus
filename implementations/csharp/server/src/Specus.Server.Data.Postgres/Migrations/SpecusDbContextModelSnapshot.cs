@@ -372,6 +372,10 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(160)")
                         .HasColumnName("channel_id");
 
+                    b.Property<int>("ClientEgressVersion")
+                        .HasColumnType("integer")
+                        .HasColumnName("client_egress_version");
+
                     b.Property<long>("ClientId")
                         .HasColumnType("bigint")
                         .HasColumnName("client_id");

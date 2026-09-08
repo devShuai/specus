@@ -1063,6 +1063,9 @@ func (s *Service) PushOnLogin(ctx context.Context, account store.ClientAccount) 
 	for _, target := range s.rosterRefreshTargets(ctx, account) {
 		s.PushRoster(ctx, target)
 	}
+	// A device coming online changes which egresses its peers see as reachable, so the whole
+	// tenant is refreshed rather than only the device that just logged in.
+	s.pushTenantEgress(ctx, account.TenantID)
 }
 
 func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clientID int64, enabled bool) ([]SessionView, error) {

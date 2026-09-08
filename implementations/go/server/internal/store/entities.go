@@ -217,36 +217,39 @@ type ClientIdentity struct {
 
 // ClientSession mirrors specus_client_session.
 type ClientSession struct {
-	ID                         int64
-	TenantID                   string
-	CredentialID               int64
-	IdentityID                 int64
-	ClientID                   int64
-	ClientName                 string
-	TokenHash                  string
-	Status                     string
-	MachineFingerprint         string
-	OSUser                     string
-	Hostname                   *string
-	OSName                     *string
-	OSVersion                  *string
-	OSArch                     *string
-	ClientVersion              *string
-	JavaVersion                *string
-	LocalAddresses             *string
-	MessageSendCapable         bool
-	MessageReceiveCapable      bool
-	MessageAttachmentsCapable  bool
-	MessageMediaPreviewCapable bool
-	MessageMaxAttachmentBytes  int64
+	ID                          int64
+	TenantID                    string
+	CredentialID                int64
+	IdentityID                  int64
+	ClientID                    int64
+	ClientName                  string
+	TokenHash                   string
+	Status                      string
+	MachineFingerprint          string
+	OSUser                      string
+	Hostname                    *string
+	OSName                      *string
+	OSVersion                   *string
+	OSArch                      *string
+	ClientVersion               *string
+	JavaVersion                 *string
+	LocalAddresses              *string
+	MessageSendCapable          bool
+	MessageReceiveCapable       bool
+	MessageAttachmentsCapable   bool
+	MessageMediaPreviewCapable  bool
+	MessageMaxAttachmentBytes   int64
 	PeerServiceDiscoveryVersion int
 	PeerServiceApplications     string
-	HTTPLoginAt                time.Time
-	NettyConnectedAt           *time.Time
-	DisconnectedAt             *time.Time
-	ExpiresAt                  time.Time
-	ChannelID                  *string
-	RemoteAddress              *string
+	// ClientEgressVersion is the peer egress split routing version the client announced.
+	// 0 or absent means it cannot take part, and the server must not push egress payloads to it.
+	ClientEgressVersion int
+	HTTPLoginAt         time.Time
+	NettyConnectedAt    *time.Time
+	DisconnectedAt      *time.Time
+	ExpiresAt           time.Time
+	ChannelID           *string
+	RemoteAddress       *string
 }
 
 // PeerMeshDevice mirrors peer_mesh_device.
@@ -315,11 +318,11 @@ type PeerMeshSession struct {
 
 // PeerMeshServiceSharing is the tenant-level service-sharing toggle. Missing rows mean disabled.
 type PeerMeshServiceSharing struct {
-	TenantID           string
-	Enabled            bool
-	MdnsImportEnabled  bool
-	UpdatedBy          *string
-	UpdatedAt          time.Time
+	TenantID          string
+	Enabled           bool
+	MdnsImportEnabled bool
+	UpdatedBy         *string
+	UpdatedAt         time.Time
 }
 
 // PeerMeshSharedService is a persisted local service definition.

@@ -34,15 +34,18 @@ public class PeerSignalService {
     private final PeerMeshService peerMeshService;
     private final PeerServiceDiscoveryService peerServiceDiscoveryService;
     private final ClientSessionRepository clientSessionRepository;
+    private final PeerEgressService peerEgressService;
 
     public PeerSignalService(ClientAccountService clientAccountService,
                              PeerMeshService peerMeshService,
                              PeerServiceDiscoveryService peerServiceDiscoveryService,
-                             ClientSessionRepository clientSessionRepository) {
+                             ClientSessionRepository clientSessionRepository,
+                             PeerEgressService peerEgressService) {
         this.clientAccountService = clientAccountService;
         this.peerMeshService = peerMeshService;
         this.peerServiceDiscoveryService = peerServiceDiscoveryService;
         this.clientSessionRepository = clientSessionRepository;
+        this.peerEgressService = peerEgressService;
     }
 
     @Transactional
@@ -160,8 +163,10 @@ public class PeerSignalService {
         }
         pushConfig(account);
         pushCatalogs(peerServiceDiscoveryService.catalogsForRecipient(account));
+        pushEgress(account);
         for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
             pushRoster(target);
+            pushEgress(target);
         }
     }
 
@@ -243,6 +248,70 @@ public class PeerSignalService {
     @Scheduled(fixedDelay = 30_000)
     public void expirePeerServiceCatalogs() {
         pushCatalogs(peerServiceDiscoveryService.expireStale());
+    }
+
+    /**
+     * Sends the current {@code egress-config} and {@code egress-catalog} to one device.
+     *
+     * <p>A client that announced no egress capability at login gets nothing, so a runtime that would
+     * not understand the payload never receives it.
+     */
+    public void pushEgress(ClientAccount account) {
+        if (!peerMeshService.isEnabled() || account == null) {
+            return;
+        }
+        Channel channel = SessionUtil.getChannel(account.getClientName());
+        if (channel == null || !SessionUtil.hasLogin(channel)) {
+            return;
+        }
+        int version = clientEgressVersion(account);
+        if (version < 1) {
+            return;
+        }
+        PeerControlMessage config = peerEgressService.buildEgressConfig(account, version);
+        if (config != null) {
+            config.setSourceClientId(account.getId());
+            config.setSourceClientName(account.getClientName());
+            config.setTargetClientId(account.getId());
+            config.setTargetClientName(account.getClientName());
+            config.setCreatedAtMillis(System.currentTimeMillis());
+            sendSignal(channel, "server", account.getClientName(), config);
+        }
+        PeerControlMessage catalog = peerEgressService.buildEgressCatalog(account, version);
+        if (catalog != null) {
+            catalog.setSourceClientId(account.getId());
+            catalog.setSourceClientName(account.getClientName());
+            catalog.setTargetClientId(account.getId());
+            catalog.setTargetClientName(account.getClientName());
+            catalog.setCreatedAtMillis(System.currentTimeMillis());
+            sendSignal(channel, "server", account.getClientName(), catalog);
+        }
+    }
+
+    /**
+     * Refreshes every online device in the tenant after a policy change.
+     *
+     * <p>A policy change moves two things at once: what the egress node itself will accept, and
+     * which egresses its peers can see. Both sides are refreshed together so the catalogue never
+     * advertises an egress that has already stopped accepting the viewer.
+     */
+    public void pushTenantEgress(String tenantId) {
+        if (!StringUtils.hasText(tenantId)) {
+            return;
+        }
+        for (ClientAccount account : clientAccountService.listTenantAccounts(tenantId)) {
+            pushEgress(account);
+        }
+    }
+
+    private int clientEgressVersion(ClientAccount account) {
+        return clientSessionRepository
+                .findByTenantIdAndClientIdInAndStatus(account.getTenantId(), List.of(account.getId()),
+                        ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .mapToInt(ClientSession::getClientEgressVersion)
+                .max()
+                .orElse(0);
     }
 
     public void pushConfig(ClientAccount account) {

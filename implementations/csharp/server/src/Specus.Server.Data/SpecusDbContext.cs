@@ -194,6 +194,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.MessageMaxAttachmentBytes).HasColumnName("message_max_attachment_bytes").IsRequired();
             b.Property(x => x.PeerServiceDiscoveryVersion).HasColumnName("peer_service_discovery_version").IsRequired();
             b.Property(x => x.PeerServiceApplications).HasColumnName("peer_service_applications").HasMaxLength(160);
+            b.Property(x => x.ClientEgressVersion).HasColumnName("client_egress_version").IsRequired();
             b.Property(x => x.HttpLoginAt).HasColumnName("http_login_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.NettyConnectedAt).HasColumnName("netty_connected_at").HasMaxLength(40)
