@@ -22,6 +22,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/peeregress"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -418,6 +419,22 @@ type ControlMessage struct {
 	Services             []AdvertisedService `json:"services,omitempty"`
 	Stats                []ServiceStats      `json:"stats,omitempty"`
 	MdnsCandidates       []MdnsCandidate     `json:"mdnsCandidates,omitempty"`
+
+	// Peer egress split routing. Enabled and Revision above are reused by egress-config.
+	// Scope is PUBLIC or LAN; the two are authorised separately and neither implies the other.
+	Scope                    string  `json:"scope,omitempty"`
+	AllowedConsumerClientIDs []int64 `json:"allowedConsumerClientIds,omitempty"`
+	// DestinationRules empty denies everything; there is no unconfigured-therefore-open state.
+	DestinationRules []peeregress.DestinationRule `json:"destinationRules,omitempty"`
+	Limits           *peeregress.Limits           `json:"limits,omitempty"`
+	Egresses         []EgressCatalogEntry         `json:"egresses,omitempty"`
+	// egress-report counters, for the management view only. Carries no destination or request
+	// content; refusals are aggregated by result code, never per destination.
+	ActiveFlows   *int64           `json:"activeFlows,omitempty"`
+	TotalFlows    *int64           `json:"totalFlows,omitempty"`
+	RejectedFlows map[string]int64 `json:"rejectedFlows,omitempty"`
+	BytesIn       *int64           `json:"bytesIn,omitempty"`
+	BytesOut      *int64           `json:"bytesOut,omitempty"`
 }
 
 type DeviceMutation struct {

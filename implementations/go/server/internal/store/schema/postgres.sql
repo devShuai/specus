@@ -648,3 +648,23 @@ CREATE TABLE IF NOT EXISTS user_diagram_document (
 
 CREATE INDEX IF NOT EXISTS idx_user_diagram_owner ON user_diagram_document (tenant_id, owner_username);
 CREATE INDEX IF NOT EXISTS idx_user_diagram_updated ON user_diagram_document (updated_at);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
+  id BIGINT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(80) NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name VARCHAR(120) NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  scope VARCHAR(16) NOT NULL DEFAULT 'PUBLIC',
+  allowed_consumer_client_ids VARCHAR(512),
+  destination_rules VARCHAR(4096),
+  max_concurrent_flows INTEGER NOT NULL DEFAULT 256,
+  max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,
+  idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_egress_policy_enabled ON peer_mesh_egress_policy (tenant_id, enabled);

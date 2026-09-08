@@ -621,3 +621,22 @@ CREATE TABLE IF NOT EXISTS user_diagram_document (
   KEY idx_user_diagram_owner (tenant_id, owner_username),
   KEY idx_user_diagram_updated (updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(80) NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name VARCHAR(120) NOT NULL,
+  enabled TINYINT(1) NOT NULL DEFAULT 0,
+  scope VARCHAR(16) NOT NULL DEFAULT 'PUBLIC',
+  allowed_consumer_client_ids VARCHAR(512),
+  destination_rules VARCHAR(4096),
+  max_concurrent_flows INT NOT NULL DEFAULT 256,
+  max_flows_per_consumer INT NOT NULL DEFAULT 64,
+  idle_timeout_seconds INT NOT NULL DEFAULT 60,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_peer_egress_policy_client (tenant_id, egress_client_id),
+  KEY idx_peer_egress_policy_enabled (tenant_id, enabled)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
