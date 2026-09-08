@@ -501,7 +501,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 
 ## 公共互传与对象存储
 
-公共发现信令使用 `/ws/public-transfer/discovery`；附件使用 Aliyun OSS V4 签名，浏览器直接 PUT/GET 私有 OSS，业务服务只保存元数据。可选上传回调由 OSS 在 PUT 成功后签名通知服务端，客户端 complete 保留为 HEAD 兜底。下载申请返回只能消费一次的站内授权，首次访问并成功领取跳转时按附件大小扣除月用量，再 `302` 到 30 秒 OSS 地址；未访问不扣，再次访问返回 `410`。对象存储默认关闭，新 presign 在通过来源 IP/房间配额检查后返回 `409`，不会返回占位 URL。完整 payload、隔离和错误语义见 [public-transfer.md](protocol/spec/public-transfer.md)。
+公共发现信令使用 `/ws/public-transfer/discovery`；发现可见性按"同房间或同一公网出口"合并：同网设备互见互传，只用 WebRTC 直连与 TURN 中继，失败不降级到云端；跨网设备在直连/中继失败后，登录且明确授权的用户可回退 OSS 云端接力。附件使用 Aliyun OSS V4 签名，浏览器直接 PUT/GET 私有 OSS，业务服务只保存元数据。可选上传回调由 OSS 在 PUT 成功后签名通知服务端，客户端 complete 保留为 HEAD 兜底。下载申请返回只能消费一次的站内授权，首次访问并成功领取跳转时按附件大小扣除月用量，再 `302` 到 30 秒 OSS 地址；未访问不扣，再次访问返回 `410`。对象存储默认关闭，新 presign 在通过来源 IP/房间配额检查后返回 `409`，不会返回占位 URL。完整 payload、隔离和错误语义见 [public-transfer.md](protocol/spec/public-transfer.md)。
 
 | 配置 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -530,7 +530,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `specus.public-transfer.pairing-code-redeem-rate-limit-window-seconds` | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS` | `300` | 配对码兑换固定窗口秒数 |
 | `specus.public-transfer.cluster-enabled` | `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | 启用 Redis 多实例 presence、Pub/Sub、房间修订和共享限流 |
 | `specus.public-transfer.redis-uri` | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | 空 | 集群模式必填，例如 `redis://user:password@redis.internal:6379/0` |
-| `specus.public-transfer.redis-key-prefix` | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis key 与频道前缀；环境之间必须隔离 |
+| `specus.public-transfer.redis-key-prefix` | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis key 与频道前缀；环境之间必须隔离。合并可见域（`nets:` 索引与 net 维度 revision）与旧版本节点不兼容，升级时集群须全量同升，否则 bump 该前缀隔离新旧 keyspace |
 | `specus.public-transfer.presence-lease-seconds` | `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | discovery presence 租约 TTL |
 | `specus.public-transfer.presence-refresh-interval-ms` | `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | 租约刷新间隔，必须小于 TTL 一半 |
 | `specus.public-transfer.redis-command-timeout-ms` | `SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | `2000` | Redis 命令超时；故障时不回退本地状态 |

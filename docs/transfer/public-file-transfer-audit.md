@@ -7,6 +7,8 @@
 > 2026-07-20 额度策略更新：公开互传和管理消息附件共用登录账号额度；有效 OSS 存储上限为 1 GiB，按 UTC 自然月领取的下载流量上限为 1 GiB。上传完成会用 HEAD 或已验签 OSS callback 的实际大小复核；创建下载授权只预检额度，首次消费授权并领取 `302` 跳转时才按文件完整大小计费。
 >
 > 2026-07-20 下载授权更新：Java、Go、.NET 已统一升级 Aliyun OSS V4。下载申请只返回站内一次性授权，首次 GET 原子消费后跳转到默认 30 秒的 OSS 直达地址；重复访问同一站内链接返回 `410 Gone`。
+>
+> 2026-09-08 可见性与传输策略更新：发现可见性已由"按 `roomKey` 分组、跨房间互不可见"改为合并可见域——`sameGroup`（相同 `roomId` + 内部 `roomKey`）或 `sameNet`（同一公网出口地址，不要求 `roomId` 相同；空或 `unknown` 地址不成网）满足其一即可互见。roster 改为逐接收者构造，peer 条目新增 `sameRoom` 标记；定向 signal/relay 可跨 Token 房间到达同网目标（无目标广播仍限同组）；重复 `peerId` 查重放宽到合并可见域，房间人数上限仍按同组计数。Redis 集群新增 `nets:<netId>` 索引与 group/net 双 revision 计数器（roster revision 为两者之和）；新旧节点不得混部，须全量同升或 bump `RedisKeyPrefix`。传输策略按对端区分：同网设备仅尝试 WebRTC 直连与 TURN 中继，失败报错、不回退 OSS；跨网设备在直连/中继失败后，登录且已授权的用户可回退 OSS 云端接力。当前口径以 [公共互传协议](../../protocol/spec/public-transfer.md) 与 [多实例协调协议](../../protocol/spec/public-transfer-cluster.md) 为准；本文「结论摘要」与「机制强项」中"信令按 `roomKey` 分组、跨房间互不可见"的描述仅保留历史审计上下文。
 
 涉及的主要文件:
 
