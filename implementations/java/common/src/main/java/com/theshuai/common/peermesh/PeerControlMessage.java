@@ -2,9 +2,12 @@ package com.theshuai.common.peermesh;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
+import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
+import com.theshuai.common.peeregress.PeerEgressPolicy;
 import lombok.Data;
 
 import java.util.List;
+import java.util.Map;
 
 @Data
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -19,6 +22,9 @@ public class PeerControlMessage {
     public static final String TYPE_CLOSE = "close";
     public static final String TYPE_SERVICE_REPORT = "service-report";
     public static final String TYPE_SERVICE_CATALOG = "service-catalog";
+    public static final String TYPE_EGRESS_CONFIG = "egress-config";
+    public static final String TYPE_EGRESS_CATALOG = "egress-catalog";
+    public static final String TYPE_EGRESS_REPORT = "egress-report";
 
     private String type;
     private Long sessionId;
@@ -69,4 +75,23 @@ public class PeerControlMessage {
     private List<PeerAdvertisedService> services = List.of();
     private List<PeerServiceStats> stats = List.of();
     private List<PeerMdnsCandidate> mdnsCandidates = List.of();
+
+    // Peer egress split routing. `enabled` and `revision` above are reused by egress-config.
+    /** egress-config: PUBLIC or LAN. The two are authorised separately and neither implies the other. */
+    private String scope;
+    /** egress-config: devices permitted to use this egress. */
+    private List<Long> allowedConsumerClientIds;
+    /** egress-config: empty denies everything; there is no unconfigured-therefore-open state. */
+    private List<PeerEgressPolicy.PeerEgressDestinationRule> destinationRules;
+    /** egress-config: concurrency, per-consumer and idle limits that keep the node from acting as an open proxy. */
+    private PeerEgressPolicy.PeerEgressLimits limits;
+    /** egress-catalog: egress nodes currently available to this consumer. */
+    private List<PeerEgressCatalogEntry> egresses;
+    /** egress-report: counters for the management view only; carries no destination or request content. */
+    private Long activeFlows;
+    private Long totalFlows;
+    /** egress-report: refusals aggregated by result code, never per destination. */
+    private Map<String, Long> rejectedFlows;
+    private Long bytesIn;
+    private Long bytesOut;
 }
