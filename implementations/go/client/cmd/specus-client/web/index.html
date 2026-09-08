@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>specus · 本机连接工作台</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body>
+<section id="unlock" class="unlock">
+  <div class="brand">specus <span>LOCAL</span></div><h1>连接管理，从本机开始。</h1>
+  <p>这是 CLI 提供的本地页面。打开页面不会登录服务端，也不会启动隧道。</p>
+  <form id="unlock-form"><label for="code">终端中的一次性连接码</label><input id="code" type="password" autocomplete="off" required spellcheck="false"><button type="submit" class="primary">打开工作台</button></form>
+  <p class="muted">刷新后需重新授权。在管理终端按回车可生成新码；已运行的隧道不受页面刷新影响。没有终端输入时，请在方便断开连接时重新启动 ui。</p>
+  <p id="unlock-error" role="alert"></p>
+</section>
+<div id="workspace" class="workspace" hidden>
+  <aside><div class="brand">specus <span>LOCAL</span></div><p class="aside-caption">本机连接工作台</p>
+    <nav aria-label="工作台页面"><button data-view="overview" aria-current="page">连接与服务</button><button data-view="settings">连接设置<span id="dirty-dot" hidden> · 未保存</span></button></nav>
+    <div class="local-boundary"><span class="boundary-dot"></span><strong>仅本机访问</strong><p>关闭网页不停止隧道。<br>终端 Ctrl+C 退出管理，<br>并断开本页拥有的连接。</p><code id="implementation">Specus CLI</code></div>
+  </aside>
+  <main><header><div><p class="eyebrow">LOCAL CONNECTION / 本机管理</p><h1 id="page-title">连接与服务</h1></div><span class="local-tag">回环访问 · 会话授权</span></header>
+    <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+    <section id="overview" class="view">
+      <section class="connection-panel" aria-labelledby="connection-title"><div class="connection-top"><div><p class="eyebrow">当前连接</p><h2 id="connection-title">尚未连接</h2><p id="connection-detail">读取本机状态…</p></div><div class="actions"><button id="connect" class="primary">连接</button><button id="disconnect" disabled>断开</button><button id="restart" disabled>重新连接</button></div></div>
+        <ol class="phase-rail" aria-label="连接阶段"><li data-stage="0"><span></span>本机管理</li><li data-stage="1"><span></span>HTTP 登录</li><li data-stage="2"><span></span>控制认证</li><li data-stage="3"><span></span>通道就绪</li></ol>
+        <p class="scope-note">通道就绪不等于目标服务可达。本页不自动探测内网，也不自动检查或安装更新。</p>
+        <p id="pending" class="pending" hidden>磁盘配置与当前运行版本不同。重新连接后才应用已保存的配置。</p>
+      </section>
+      <section id="others-panel" class="panel" hidden><h2>其他实例 · 只读</h2><p>先从原终端停止同配置实例，才能在本页启动；本页不会接管或误停它们。</p><ul id="others"></ul></section>
+      <div class="catalog-grid"><section class="panel"><div class="section-heading"><h2>在线设备</h2><span id="peers-count" class="count">0</span></div><p class="muted">来自当前控制通道的设备目录</p><ul id="peers" class="catalog"></ul></section>
+      <section class="panel"><div class="section-heading"><h2>可访问服务</h2><span id="services-count" class="count">0</span></div><p class="muted">服务端下发，只读展示；未执行业务探测</p><ul id="services" class="catalog"></ul></section></div>
+    </section>
+    <section id="settings" class="view" hidden><section class="panel settings-panel"><div class="section-heading"><h2>让这台设备接入</h2><button id="reload" type="button">重新载入</button></div><p>从服务端管理后台「接入凭证」获取 API Key 和 Secret。先校验保存，再主动连接。</p>
+      <div class="config-path"><span>配置文件</span><code id="config-path"></code></div>
+      <form id="config-form" autocomplete="off"><label for="server">服务地址</label><input id="server" type="url" placeholder="https://your-server.example" required spellcheck="false">
+        <div class="form-grid"><div><label for="api-key">API Key</label><input id="api-key" type="password" autocomplete="off" spellcheck="false"><p id="key-hint" class="field-hint">填写接入凭据</p></div><div><label for="secret">Secret</label><input id="secret" type="password" autocomplete="new-password" spellcheck="false"><p id="secret-hint" class="field-hint">支持 env: / file: 引用</p></div></div>
+        <details><summary>高级设置与权限</summary><label for="device">虚拟网卡模式</label><select id="device"><option value="noop">仅转发与互传（noop，不创建网卡）</option><option value="auto">私有组网（auto，可能需要额外权限）</option></select><p class="muted">TLS、MTU、更新策略及其他字段暂由外部编辑器管理，保存时保留原内容。服务端下发的路由和权限不在本页修改。</p></details>
+        <p class="save-boundary">只保存本次改动；保留注释、未知字段及未修改的密钥引用。凭据留空表示保留，保存成功不代表已经连接或已应用。</p>
+        <div class="form-actions"><button id="validate" type="button">离线校验</button><button id="save" type="submit" class="primary">保存配置</button><span id="edit-state" class="muted">没有未保存修改</span></div>
+      </form></section></section>
+    <footer><span id="freshness">等待状态</span><span>管理页不替代服务端后台</span></footer>
+  </main>
+</div>
+</body></html>

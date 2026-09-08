@@ -14,6 +14,7 @@ const cliHelp = `Usage: specus-client [run] [options]
        specus-client config validate|show --config PATH [--json]
        specus-client status|peers|services --config PATH [--json]
        specus-client doctor --config PATH [--probe] [--json]
+       specus-client ui --config PATH [--no-open] [--port PORT]
 
 Options:
   -h, --help            Show help without loading configuration or connecting
@@ -25,6 +26,8 @@ Options:
   --json               Versioned JSON for one-shot commands; logs stay on stderr
   --probe              doctor only: 5-second server TCP probe; never authenticates
   --debug              Include diagnostic source locations and timestamps
+  --no-open            ui only: print the local address without opening a browser
+  --port PORT          ui only: loopback port, 0..65535 (default: automatic)
 
 Examples:
   specus-client --config "/path with spaces/client.jsonc"
@@ -44,6 +47,8 @@ type cliOptions struct {
 	helperArgs                          []string
 	json, probe, debug                  bool
 	loginTimeout                        int
+	noOpen                              bool
+	uiPort                              int
 }
 
 // Parse everything before any config read, update cleanup or network operation.
@@ -57,7 +62,7 @@ func parseCLI(args []string) (cliOptions, error) {
 		}
 		o.command = args[1]
 		args = args[2:]
-	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "doctor") {
+	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "doctor" || args[0] == "ui") {
 		o.command = args[0]
 		args = args[1:]
 	}
@@ -74,6 +79,8 @@ func parseCLI(args []string) (cliOptions, error) {
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.BoolVar(&o.probe, "probe", false, "")
 	fs.BoolVar(&o.debug, "debug", false, "")
+	fs.BoolVar(&o.noOpen, "no-open", false, "")
+	fs.IntVar(&o.uiPort, "port", 0, "")
 	fs.IntVar(&o.loginTimeout, "login-timeout", 60, "")
 	// Keep the existing verified Windows updater protocol, but hide it in public help.
 	fs.BoolVar(&o.helper, client.UpdateHelperFlagName, false, "")
@@ -91,6 +98,18 @@ func parseCLI(args []string) (cliOptions, error) {
 	}
 	if fs.NArg() != 0 {
 		return o, errors.New("unexpected command or argument; see --help")
+	}
+	uiFlag := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "port" || f.Name == "no-open" {
+			uiFlag = true
+		}
+	})
+	if (uiFlag && o.command != "ui") || o.uiPort < 0 || o.uiPort > 65535 {
+		return o, errors.New("--no-open and --port (0..65535) are only valid for ui")
+	}
+	if o.command == "ui" && (o.json || o.autoUpdate || o.noUpdate || o.debug) && !o.help && !o.version {
+		return o, errors.New("ui does not accept --json, --debug or update overrides; ui never starts an updater")
 	}
 	if o.parentPID != 0 || o.candidateHash != "" {
 		return o, errors.New("internal update options require the update helper")

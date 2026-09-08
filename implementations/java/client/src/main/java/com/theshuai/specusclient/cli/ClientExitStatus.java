@@ -14,6 +14,10 @@ public final class ClientExitStatus implements ApplicationListener<ContextClosed
     public void fail() { completion.complete(3); }
 
     public int await() { return completion.join(); }
+    public int awaitInterruptibly() throws InterruptedException {
+        try { return completion.get(); }
+        catch (java.util.concurrent.ExecutionException error) { return 1; }
+    }
 
     @Override
     public void onApplicationEvent(ContextClosedEvent event) { completion.complete(0); }

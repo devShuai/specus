@@ -29,6 +29,7 @@ if (options.Version)
 }
 var configPath = Path.GetFullPath(options.ConfigPath ?? "client.jsonc");
 if (options.Command is "status" or "peers" or "services") return CliState.Query(configPath, options);
+if (options.Command == "ui") return await LocalUi.RunAsync(options, configPath);
 SpecusClientConfig config;
 try
 {

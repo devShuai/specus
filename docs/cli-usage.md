@@ -2,6 +2,45 @@
 
 本页是 #39 的 Java / Go / .NET CLI 命令与验收契约。查询命令只读取本机现有 CLI 的私有状态，不隐式启动第二个客户端；桌面端和 Android 的图形交互属于 #40。
 
+## 本地网页管理（#41，Java / Go / .NET）
+
+三端 CLI 提供同一套可选的本机连接工作台，使用各自的连接核心和同一份离线页面资源。无需额外安装 Node、Go 或 ASP.NET Core；Java 仍需 Java 21，.NET 的运行时要求与原 CLI 包一致。
+
+```sh
+specus-client ui --config "/path with spaces/client.jsonc"
+specus-client ui --config ./client.jsonc --no-open
+specus-client ui --config ./client.jsonc --no-open --port 8765
+java -jar specus-client-exec.jar ui --config ./client.jsonc --no-open
+dotnet specus-client.dll ui --config ./client.jsonc --no-open
+```
+
+- 默认只监听 `127.0.0.1` 的随机可用端口，并尝试打开默认浏览器；`--no-open` 只输出地址和一次性连接码。固定端口范围为 1–65535，0 表示自动选择；端口冲突会失败，不改为公网监听。
+- 连接码 5 分钟内有效、使用一次即失效。自动打开时只放在 URL fragment，页面启动立即清除，不通过查询串发送；手动打开时输入终端连接码。页面会话凭证只保留在内存，最长 8 小时、最多 8 个会话；不写 cookie、localStorage 或 sessionStorage。
+- 刷新页面后需重新授权，但隧道不会断开。管理终端按回车生成新码；stdin 已关闭时无法生成新码，需要在可以断开连接时重新启动 `ui`。达到会话上限同样需要重启管理进程；本轮不承诺自动接管或无中断恢复管理会话。
+- 首次没有配置时可填写服务地址、API Key、Secret，离线校验、保存后再显式连接。初版可编辑基础凭据和 `noop` / `auto` 模式；TLS、MTU、更新策略及其他字段由外部编辑器管理。已有自定义网卡模式保留，不强制改写。
+- 读取配置不回显 API Key、Secret 或密钥引用；凭据留空表示保留。保存只替换指定字段，保留 JSONC 注释、未知字段及未修改引用，不新增备份副本。重复字段/已支持字段的非规范大小写、非普通文件、符号链接/重解析点、超过 1 MiB 的文件拒绝网页编辑，请在终端修正。
+- 保存使用文件内容版本校验及同卷临时文件替换，重复/外部修改返回冲突，不静默覆盖；新文件和替换后的文件使用仅当前用户可读写的权限。只读文件、校验失败和写入失败保留原配置。保存不会隐式应用到运行中连接，需用户选择“重新连接”。不支持配置写入时主动创建缺失父目录。
+- “连接 / 断开 / 重新连接”只操作本管理进程创建的对应语言运行时。发现其他 CLI 进程的同配置新鲜状态时只读展示并阻止额外连接；不假装既有状态快照具备控制能力，不会停止其他进程。三端 `ui` 共享同配置管理锁；该锁不能排他锁定不遵守管理锁的旧 `run` 进程，不要同时从另一终端启动相同配置。
+- 管理页本身不会登录、探测内网或启动更新器。关闭浏览器不停止隧道；终端 Ctrl+C 退出管理并断开其拥有的连接。每个配置只允许一个 `ui` 管理进程；崩溃留下的 `.specus-cli/*ui.lock` 包含 PID，先确认进程已退出再手工移除，不能对运行中的进程强行清锁。
+- HTTP / 控制认证 / 数据通道就绪分开呈现；设备与服务来自目录，不代表已探测目标。管理服务不可达时清除页面的在线标记，避免旧状态冒充当前状态。
+
+本地端点需要随机会话凭证，严格校验 Host/Origin；写操作还要求 JSON 与自定义请求头。静态资源嵌入二进制，无 CDN/Node 运行依赖。仅供同一用户的本机管理，不提供公网访问参数、任意文件读写、命令执行、远程接管或自启动安装。首批不提供日志浏览、主动诊断按钮和互传页面；完整安全边界及剩余范围见 [本地页面契约](architecture/cli-local-ui.md)。
+
+开发验证（浏览器回归需要 Python Playwright 和独立 Chrome）：
+
+```sh
+go build -o /tmp/specus-client ./cmd/specus-client # implementations/go/client 目录
+# 以下在仓库根目录执行；所有配置与服务均为隔离测试夹具
+python scripts/test-cli-ui.py --binary /tmp/specus-client
+python scripts/test-cli-ui.py --binary /path/specus-client --browser --output .tmp/ui41/screenshots
+python scripts/test-cli-ui.py --name java -- java -jar /absolute/specus-client-exec.jar
+python scripts/test-cli-ui.py --name dotnet -- dotnet /absolute/specus-client.dll
+```
+
+2026-09-08 三端接入验证：Go 全量三个包通过；Java 客户端 136 通过、1 项平台相关跳过；.NET 客户端 340 通过。Windows 真实进程与 Chrome 基础矩阵三端各 38 项，另测跨语言竞争锁与失败竞争者不删锁；Ubuntu WSL Linux 三端各 29 项（含 SIGINT 和锁清理）。Java/.NET 既有 CLI Windows 矩阵各 32 项通过。桌面和 360px 截图已检查。新增 `CLI local UI` CI 覆盖 Windows / Ubuntu × 三端的进程矩阵；尚未推送，因此不声称远程 CI 已通过。
+
+Windows 浏览器测试最后终止的是自建隔离进程，不把它算作 Windows 控制台 Ctrl+C 验收。Java 的 Unix SIGINT 允许 JVM 标准退出码 130（或正常返回 0），仍必须完成锁清理。macOS 真实浏览器、SSH 隧道、读屏及完整 #41 验收仍未完成。本记录不表示已经提交、推送或发版。
+
 ## 命令入口
 
 Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus-client-exec.jar`。下列参数加到对应入口之后。

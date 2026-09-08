@@ -18,7 +18,14 @@ public final class CliState implements AutoCloseable {
     private volatile Supplier<Map<String,Object>> snapshot = () -> new LinkedHashMap<>(Map.of(
             "phase","http-login","controlAuthenticated",false,"businessReady",false,"peers",List.of(),"services",List.of()));
     public CliState(Path config) throws IOException {
-        this.config=config.toAbsolutePath().normalize().toString(); root=root();
+        this.config=config.toAbsolutePath().normalize().toString(); root=ensureRoot();
+        file=root.resolve(prefix(this.config)+ProcessHandle.current().pid()+".json");
+        write();
+        publisher=Executors.newSingleThreadScheduledExecutor(r -> {var t=new Thread(r,"cli-state");t.setDaemon(true);return t;});
+        publisher.scheduleWithFixedDelay(() -> {try{write();}catch(Exception error){System.err.println("State publication failed; status will become stale.");publisher.shutdown();}},1,1,TimeUnit.SECONDS);
+    }
+    static Path ensureRoot() throws IOException {
+        Path root=root();
         if (!Files.exists(root,LinkOption.NOFOLLOW_LINKS)) {
             if (posix()) Files.createDirectory(root,PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
             else {
@@ -30,11 +37,9 @@ public final class CliState implements AutoCloseable {
             }
         }
         checkPrivate(root);
-        file=root.resolve(prefix(this.config)+ProcessHandle.current().pid()+".json");
-        write();
-        publisher=Executors.newSingleThreadScheduledExecutor(r -> {var t=new Thread(r,"cli-state");t.setDaemon(true);return t;});
-        publisher.scheduleWithFixedDelay(() -> {try{write();}catch(Exception error){System.err.println("State publication failed; status will become stale.");publisher.shutdown();}},1,1,TimeUnit.SECONDS);
+        return root;
     }
+    public Map<String,Object> snapshot() { return new LinkedHashMap<>(snapshot.get()); }
     public void observe(Supplier<Map<String,Object>> snapshot) { this.snapshot=snapshot; }
     public static Path root() {
         String override=System.getenv("SPECUS_CLI_STATE_DIR");

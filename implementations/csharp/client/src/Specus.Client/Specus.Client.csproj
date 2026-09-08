@@ -34,4 +34,8 @@
     </Content>
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="../../../../go/client/cmd/specus-client/web/*" LogicalName="local-ui.%(Filename)%(Extension)" />
+  </ItemGroup>
+
 </Project>

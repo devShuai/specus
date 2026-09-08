@@ -22,6 +22,11 @@ public static class SpecusClientConfigLoader
     {
         var path = ResolvePath(overridePath);
         var json = File.ReadAllText(path);
+        return Parse(json, path, warning);
+    }
+
+    public static SpecusClientConfig Parse(string json, string path, Action<string>? warning = null)
+    {
         var config = JsonSerializer.Deserialize<SpecusClientConfig>(json, JsonOptions)
             ?? throw new InvalidDataException($"Empty specus client config at {path}");
         config.Normalize();

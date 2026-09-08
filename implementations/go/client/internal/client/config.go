@@ -157,6 +157,12 @@ func LoadConfigWithDiagnostics(path string, warn func(string)) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
+	return ParseConfigWithDiagnostics(data, warn)
+}
+
+// ParseConfigWithDiagnostics shares offline validation with the optional local UI.
+// Secret references are checked but are never substituted into the returned configuration.
+func ParseConfigWithDiagnostics(data []byte, warn func(string)) (Config, error) {
 	var config Config
 	if err := unmarshalJSONC(data, &config); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)

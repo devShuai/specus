@@ -25,6 +25,13 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
     internal CliState(string config)
     {
         _config = config;
+        var root = EnsureRoot();
+        _path = Path.Combine(root, Prefix(config) + Environment.ProcessId + ".json");
+        Write();
+        _publisher = PublishAsync();
+    }
+    internal static string EnsureRoot()
+    {
         var root = Root;
         if (!Directory.Exists(root))
         {
@@ -40,9 +47,12 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
             else Directory.CreateDirectory(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         CheckPrivate(root);
-        _path = Path.Combine(root, Prefix(config) + Environment.ProcessId + ".json");
-        Write();
-        _publisher = PublishAsync();
+        return root;
+    }
+    internal Dictionary<string, object> Snapshot()
+    {
+        lock (_gate) return new() { ["phase"] = _phase, ["controlAuthenticated"] = _authenticated,
+            ["businessReady"] = _ready, ["peers"] = _authenticated ? _peers : [], ["services"] = _authenticated ? _services : [] };
     }
     internal static void CheckPrivate(string path)
     {

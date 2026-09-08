@@ -1,0 +1,92 @@
+name: CLI local UI
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cli-ui.yml'
+      - 'implementations/java/client/**'
+      - 'implementations/java/common/**'
+      - 'implementations/csharp/client/**'
+      - 'implementations/csharp/protocol/**'
+      - 'implementations/go/client/**'
+      - 'scripts/test-cli-*.py'
+      - 'pom.xml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cli-ui.yml'
+      - 'implementations/java/client/**'
+      - 'implementations/java/common/**'
+      - 'implementations/csharp/client/**'
+      - 'implementations/csharp/protocol/**'
+      - 'implementations/go/client/**'
+      - 'scripts/test-cli-*.py'
+      - 'pom.xml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-ui:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        runtime: [go, java, dotnet]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        if: matrix.runtime == 'java'
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/setup-dotnet@v4
+        if: matrix.runtime == 'dotnet'
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-go@v5
+        if: matrix.runtime == 'go'
+        with:
+          go-version-file: implementations/go/client/go.mod
+          cache-dependency-path: implementations/go/client/go.sum
+      - name: Build Go and test isolated processes
+        if: matrix.runtime == 'go'
+        run: |
+          $binary = Join-Path $env:RUNNER_TEMP 'specus-client.exe'
+          Push-Location implementations/go/client
+          go test ./... -count=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go build -o $binary ./cmd/specus-client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+          python scripts/test-cli-ui.py --name go --binary $binary
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test-cli-matrix.py --name go -- $binary
+      - name: Build Java and test isolated processes
+        if: matrix.runtime == 'java'
+        run: |
+          mvn -pl implementations/java/client -am package -q
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $jar = (Resolve-Path implementations/java/client/target/specus-client-exec.jar).Path
+          python scripts/test-cli-ui.py --name java -- java -jar $jar
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test-cli-matrix.py --name java -- java -jar $jar
+      - name: Build .NET and test isolated processes
+        if: matrix.runtime == 'dotnet'
+        run: |
+          dotnet test implementations/csharp/client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj -c Release -v minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $dll = (Resolve-Path implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll).Path
+          python scripts/test-cli-ui.py --name dotnet -- dotnet $dll
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test-cli-matrix.py --name dotnet -- dotnet $dll

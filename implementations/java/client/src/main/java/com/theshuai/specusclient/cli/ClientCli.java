@@ -23,6 +23,7 @@ public final class ClientCli {
                    java -jar specus-client-exec.jar config validate|show --config PATH [--json]
                    java -jar specus-client-exec.jar status|peers|services --config PATH [--json]
                    java -jar specus-client-exec.jar doctor --config PATH [--probe] [--json]
+                   java -jar specus-client-exec.jar ui --config PATH [--no-open] [--port PORT]
 
             Options:
               -h, --help            Show help without loading configuration or connecting
@@ -33,6 +34,8 @@ public final class ClientCli {
               --login-timeout SEC   Initial HTTP login budget, 1..3600 seconds (default: 60)
               --json               Versioned JSON for one-shot commands; logs stay on stderr
               --probe              doctor only: 5-second server TCP probe; never authenticates
+              --no-open            ui only: print local address without opening a browser
+              --port PORT          ui only: loopback port, 0..65535 (default: random)
 
             Example:
               java -jar specus-client-exec.jar --config "/path with spaces/client.jsonc"
@@ -43,7 +46,8 @@ public final class ClientCli {
             """;
 
     public record Options(Path config, String command, boolean help, boolean version,
-                          boolean noUpdate, boolean debug, int loginTimeoutSeconds, boolean json, boolean probe) { }
+                          boolean noUpdate, boolean debug, int loginTimeoutSeconds, boolean json, boolean probe,
+                          boolean noOpen, int uiPort) { }
 
     public static Options parse(String[] args) {
         Path config = Path.of("client.jsonc");
@@ -51,6 +55,8 @@ public final class ClientCli {
         boolean help = false, version = false, noUpdate = false, debug = false;
         int loginTimeoutSeconds = 60;
         boolean json = false, probe = false;
+        boolean noOpen = false, portSet = false;
+        int uiPort = 0;
         int i = 0;
         if (args.length > 0 && "run".equals(args[0])) i++;
         else if (args.length > 0 && "config".equals(args[0])) {
@@ -59,7 +65,7 @@ public final class ClientCli {
             command = args[1];
             i = 2;
         }
-        else if (args.length > 0 && java.util.Set.of("status", "peers", "services", "doctor").contains(args[0])) { command = args[0]; i = 1; }
+        else if (args.length > 0 && java.util.Set.of("ui", "status", "peers", "services", "doctor").contains(args[0])) { command = args[0]; i = 1; }
         for (; i < args.length; i++) {
             String arg = args[i];
             switch (arg) {
@@ -68,6 +74,11 @@ public final class ClientCli {
                 case "--debug" -> debug = true;
                 case "--json" -> json = true;
                 case "--probe" -> probe = true;
+                case "--no-open" -> noOpen = true;
+                case "--port" -> {
+                    if (++i >= args.length) throw new IllegalArgumentException("--port requires 0..65535");
+                    uiPort = port(args[i]); portSet = true;
+                }
                 case "--no-update", "--no-update-check" -> noUpdate = true;
                 case "--login-timeout" -> {
                     if (++i >= args.length) throw new IllegalArgumentException("--login-timeout requires seconds (1..3600)");
@@ -80,13 +91,22 @@ public final class ClientCli {
                 default -> {
                     if (arg.startsWith("--config=")) config = configPath(arg.substring("--config=".length()));
                     else if (arg.startsWith("--login-timeout=")) loginTimeoutSeconds = loginTimeout(arg.substring("--login-timeout=".length()));
+                    else if (arg.startsWith("--port=")) { uiPort = port(arg.substring(7)); portSet = true; }
                     else throw new IllegalArgumentException("Unknown command or option; run --help for usage");
                 }
             }
         }
         if (probe && !command.equals("doctor")) throw new IllegalArgumentException("--probe is only valid for doctor");
+        if ((noOpen || portSet) && !command.equals("ui")) throw new IllegalArgumentException("--no-open/--port are only valid for ui");
+        if (command.equals("ui") && (json || debug || noUpdate) && !help && !version) throw new IllegalArgumentException("ui does not accept --json/--debug/update options");
         if (json && command.equals("run") && !help && !version) throw new IllegalArgumentException("--json is for help/version/config/status/doctor/peers/services; use status --json to observe a running client");
-        return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe);
+        return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe, noOpen, uiPort);
+    }
+
+    private static int port(String value) {
+        try { int port = Integer.parseInt(value); if (port >= 0 && port <= 65535) return port; }
+        catch (NumberFormatException ignored) { }
+        throw new IllegalArgumentException("--port requires 0..65535");
     }
 
     private static int loginTimeout(String value) {
@@ -108,6 +128,10 @@ public final class ClientCli {
     }
 
     public static ClientStartupConfig load(Path path, Consumer<String> warning) throws IOException {
+        return parse(Files.readString(path), warning);
+    }
+
+    public static ClientStartupConfig parse(String text, Consumer<String> warning) throws IOException {
         var mapper = JsonMapper.builder()
                 .enable(JsonReadFeature.ALLOW_JAVA_COMMENTS, JsonReadFeature.ALLOW_YAML_COMMENTS,
                         JsonReadFeature.ALLOW_TRAILING_COMMA)
@@ -115,7 +139,7 @@ public final class ClientCli {
         ClientStartupConfig config;
         com.fasterxml.jackson.databind.JsonNode raw;
         try {
-            raw = mapper.readTree(Files.readString(path));
+            raw = mapper.readTree(text);
             if (raw == null || !raw.isObject()) throw new IOException("Configuration must be a JSON object");
             config = mapper.treeToValue(raw, ClientStartupConfig.class);
         } catch (JsonProcessingException error) {

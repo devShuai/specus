@@ -58,6 +58,13 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource><directory>src/main/resources</directory></resource>
+            <resource>
+                <directory>../../go/client/cmd/specus-client/web</directory>
+                <targetPath>local-ui</targetPath>
+            </resource>
+        </resources>
         <finalName>specus-client</finalName>
         <plugins>
             <plugin>

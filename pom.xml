@@ -32,7 +32,7 @@
             use the next patch snapshot; release builds override revision from the tag and clear
             changelist so every published module receives the same stable version.
         -->
-        <revision>1.2.5</revision>
+        <revision>1.2.6</revision>
         <changelist>-SNAPSHOT</changelist>
         <lombok.version>1.18.46</lombok.version>
         <!--

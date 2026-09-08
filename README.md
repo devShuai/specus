@@ -239,11 +239,24 @@ cd implementations/java/client
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
-Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不监听 HTTP 端口；同机运行服务端和客户端时不再需要为客户端覆盖 `server.port`。
+Java 客户端普通 `run` 模式使用 `WebApplicationType.NONE`，不启动 Spring Web，也不监听 HTTP 端口；同机运行服务端和客户端时不再需要为客户端覆盖 `server.port`。可选的 `ui` 模式会单独启动仅回环可访问的本地管理端口。
 
 Go / .NET CLI 客户端使用同一份配置结构。
 
 三端现支持独立的 `--help`、`--version`、`--config PATH` 及离线 `config validate`。使用方法、退出语义和验收边界见 [CLI 使用与验收矩阵](docs/cli-usage.md)。
+
+从 v1.2.6 起，需要浏览器配置时，三端可用 `ui`：
+
+```bash
+# Go / .NET 可执行包
+specus-client ui --config ./client.jsonc
+# Java 可执行 JAR
+java -jar specus-client-exec.jar ui --config ./client.jsonc
+# .NET 框架依赖包
+dotnet specus-client.dll ui --config ./client.jsonc
+```
+
+无需已有配置；页面可填写、离线校验和保存，再显式连接。无浏览器环境加 `--no-open`，使用终端输出的本机地址和一次性连接码。页面只监听 `127.0.0.1`，不自动登录或检查更新；关闭浏览器不停止隧道，终端 Ctrl+C 退出管理及其拥有的连接。凭据不回显、留空保留，复杂字段仍由外部编辑器管理。完整限制和验收记录见上述 CLI 文档。
 
 Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。其 control/data 通道支持登录响应驱动的 TLS，TCP 数据面使用 v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE`、严格半关闭、有界建连缓存与最近关闭流 tombstone；HTTP route 使用支持 request/response trailers、带 body 任意 method 和 early response 的 Netty 流。WebSocket route 按 Java 规则保留 continuation/FIN/RSV/close/ping/pong 语义；单个上游 data frame 可达 16 MiB，超过单个 NAT DATA 容量时规范化拆成连续的 SWS2 continuation envelopes，控制帧不拆分。配置非 `noop` 虚拟设备时 Android 会先申请 VPN 权限；只有服务端也开启 Peer Mesh 才会创建系统 VPN 接口。`noop` 不申请权限、不阻塞 TCP/HTTP，同时仍可运行 Peer Mesh 控制面和 UDP 探测。Peer Mesh 已接入 direct UDP、全 A/AAAA STUN、TURN relay、同 nonce burst、自适应端口预测、UPnP/NAT-PMP/PCP 显式映射、session 刷新、direct-stale fallback 以及链路/流量/设备上报；真实跨 NAT 真机矩阵仍需部署环境验收。
 

@@ -63,6 +63,7 @@ public class SpecusClientApplication {
         if (options.help()) { CliOutput.result(options.json(),"help",0,java.util.Map.of("help",ClientCli.HELP),ClientCli.HELP); return; }
         if (options.version()) { CliOutput.result(options.json(),"version",0,java.util.Map.of("version",currentVersion()),currentVersion()); return; }
         if (java.util.Set.of("status","peers","services").contains(options.command())) { System.exit(CliState.query(options)); return; }
+        if ("ui".equals(options.command())) { System.exit(com.theshuai.specusclient.cli.LocalUi.run(options, currentVersion())); return; }
         ClientStartupConfig loaded;
         try {
             loaded = ClientCli.load(options.config(), warning -> System.err.println("Warning: " + warning));
@@ -167,7 +168,7 @@ public class SpecusClientApplication {
         return CliOutput.result(options.json(),"doctor",0,data,"Doctor passed ("+scope+"); authentication, TLS and business readiness not tested.");
     }
 
-    private static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig, Duration timeout) {
+    public static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig, Duration timeout) {
         long attemptStarted = System.nanoTime();
         ClientEnvironmentInfo environment = collectEnvironment();
         ClientAuthLoginRequest loginRequest = new ClientAuthLoginRequest();

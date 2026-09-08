@@ -56,6 +56,9 @@ func runCLI(args []string) int {
 	if options.command == "status" || options.command == "peers" || options.command == "services" {
 		return queryState(options, path)
 	}
+	if options.command == "ui" {
+		return runLocalUI(options, path)
+	}
 	config, err := client.LoadConfigWithDiagnostics(path, func(warning string) {
 		fmt.Fprintln(os.Stderr, "Warning: "+warning)
 	})
