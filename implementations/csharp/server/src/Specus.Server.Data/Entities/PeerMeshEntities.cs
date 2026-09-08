@@ -95,3 +95,31 @@ public sealed class PeerMeshSharedService
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }
+
+/// <summary>
+/// Stored apart from <see cref="PeerMeshAcl"/> on purpose: mesh ACLs decide whether two devices may
+/// reach each other, this decides whether one may be used as a way out to the wider network.
+/// Effective permission is the intersection of the two.
+/// </summary>
+public sealed class PeerMeshEgressPolicy
+{
+    public long Id { get; set; }
+    public string TenantId { get; set; } = "default";
+    public string OwnerUsername { get; set; } = "admin";
+    public long EgressClientId { get; set; }
+    public string EgressClientName { get; set; } = string.Empty;
+    public bool Enabled { get; set; }
+    public string Scope { get; set; } = "PUBLIC";
+    public string AllowedConsumerClientIds { get; set; } = "";
+
+    /// <summary>
+    /// A canonical JSON array. Empty denies everything; there is no unconfigured-therefore-open
+    /// state.
+    /// </summary>
+    public string DestinationRules { get; set; } = "[]";
+    public int MaxConcurrentFlows { get; set; } = 256;
+    public int MaxFlowsPerConsumer { get; set; } = 64;
+    public int IdleTimeoutSeconds { get; set; } = 60;
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}

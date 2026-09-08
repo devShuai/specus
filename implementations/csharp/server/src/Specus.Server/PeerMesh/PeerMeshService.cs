@@ -9,6 +9,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Specus.Protocol;
 using Specus.Protocol.Packets;
+using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.ControlChannel;
@@ -40,6 +41,9 @@ public sealed partial class PeerMeshService
     private const string TypeClose = "close";
     internal const string TypeServiceReport = "service-report";
     internal const string TypeServiceCatalog = "service-catalog";
+    internal const string TypeEgressConfig = "egress-config";
+    internal const string TypeEgressCatalog = "egress-catalog";
+    internal const string TypeEgressReport = "egress-report";
     internal const int PeerServiceDiscoveryVersion = 2;
     private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
     private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations = new();
@@ -50,6 +54,7 @@ public sealed partial class PeerMeshService
     private readonly PeerMeshOptions _options;
     private readonly TurnCredentialService _turnCredentials;
     private readonly ILogger<PeerMeshService> _logger;
+    private readonly PeerMeshServiceState _state;
 
     public PeerMeshService(SpecusDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
         ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null,
@@ -61,6 +66,7 @@ public sealed partial class PeerMeshService
         _turnCredentials = turnCredentials ?? new TurnCredentialService(options);
         _logger = logger;
         state ??= new PeerMeshServiceState();
+        _state = state;
         _serviceCatalogs = state.ServiceCatalogs;
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
         _serviceReportRevisions = state.ServiceReportRevisions;
@@ -2244,4 +2250,54 @@ public sealed class PeerControlMessage
 
     [JsonPropertyName("mdnsCandidates")]
     public IReadOnlyList<PeerMdnsCandidate>? MdnsCandidates { get; set; }
+
+    // Peer egress split routing. Enabled and Revision above are reused by egress-config.
+
+    /// <summary>
+    /// egress-config: PUBLIC or LAN. The two are authorised separately and neither implies the
+    /// other.
+    /// </summary>
+    [JsonPropertyName("scope")]
+    public string? Scope { get; set; }
+
+    /// <summary>egress-config: devices permitted to use this egress.</summary>
+    [JsonPropertyName("allowedConsumerClientIds")]
+    public IReadOnlyList<long>? AllowedConsumerClientIds { get; set; }
+
+    /// <summary>
+    /// egress-config: empty denies everything; there is no unconfigured-therefore-open state.
+    /// </summary>
+    [JsonPropertyName("destinationRules")]
+    public IReadOnlyList<PeerEgressDestinationRule>? DestinationRules { get; set; }
+
+    /// <summary>
+    /// egress-config: concurrency, per-consumer and idle limits that keep the node from acting as
+    /// an open proxy.
+    /// </summary>
+    [JsonPropertyName("limits")]
+    public PeerEgressLimits? Limits { get; set; }
+
+    /// <summary>egress-catalog: egress nodes currently available to this consumer.</summary>
+    [JsonPropertyName("egresses")]
+    public IReadOnlyList<PeerEgressCatalogEntry>? Egresses { get; set; }
+
+    /// <summary>
+    /// egress-report: counters for the management view only; carries no destination or request
+    /// content.
+    /// </summary>
+    [JsonPropertyName("activeFlows")]
+    public long? ActiveFlows { get; set; }
+
+    [JsonPropertyName("totalFlows")]
+    public long? TotalFlows { get; set; }
+
+    /// <summary>egress-report: refusals aggregated by result code, never per destination.</summary>
+    [JsonPropertyName("rejectedFlows")]
+    public IReadOnlyDictionary<string, long>? RejectedFlows { get; set; }
+
+    [JsonPropertyName("bytesIn")]
+    public long? BytesIn { get; set; }
+
+    [JsonPropertyName("bytesOut")]
+    public long? BytesOut { get; set; }
 }

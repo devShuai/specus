@@ -26,6 +26,13 @@ public sealed class PeerMeshServiceState
 
     internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), SemaphoreSlim>
         ServiceCatalogMutationGates { get; } = new();
+
+    private long _egressRevisions;
+
+    /// <summary>
+    /// Bumped on every egress push so a client can ignore a snapshot it has already applied.
+    /// </summary>
+    internal long NextEgressRevision() => Interlocked.Increment(ref _egressRevisions);
 }
 
 internal sealed record PeerMeshServiceCatalogSnapshot(long Revision, string InstanceId,

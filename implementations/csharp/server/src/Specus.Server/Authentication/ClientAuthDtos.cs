@@ -56,6 +56,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientPeerServiceCapabilities")]
     public ClientPeerServiceCapabilities ClientPeerServiceCapabilities { get; set; } = new();
 
+    [JsonPropertyName("clientEgressCapabilities")]
+    public ClientEgressCapabilities ClientEgressCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -89,6 +92,34 @@ public sealed class ClientPeerServiceCapabilities
     [JsonPropertyName("applications")]
     public List<string> Applications { get; set; } = new();
 }
+
+/// <summary>
+/// Peer egress split routing.
+/// </summary>
+/// <remarks>
+/// Version 0 or absent means the client cannot take part, and the server must not push
+/// egress-config or egress-catalog to it. domainTarget and ipv6Target are tracked separately from
+/// the version so that a later release adding domain rules can coexist with clients that only
+/// understand address targets, instead of gating on the version number alone.
+/// </remarks>
+public sealed class ClientEgressCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("consumerCapable")]
+    public bool ConsumerCapable { get; set; }
+
+    [JsonPropertyName("egressCapable")]
+    public bool EgressCapable { get; set; }
+
+    [JsonPropertyName("domainTargetCapable")]
+    public bool DomainTargetCapable { get; set; }
+
+    [JsonPropertyName("ipv6TargetCapable")]
+    public bool Ipv6TargetCapable { get; set; }
+}
+
 
 public sealed class ClientAuthLoginResponse
 {

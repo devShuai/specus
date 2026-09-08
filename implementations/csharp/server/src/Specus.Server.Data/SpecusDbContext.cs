@@ -40,6 +40,7 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<PeerMeshSession> PeerMeshSessions => Set<PeerMeshSession>();
     public DbSet<PeerMeshServiceSharing> PeerMeshServiceSharings => Set<PeerMeshServiceSharing>();
     public DbSet<PeerMeshSharedService> PeerMeshSharedServices => Set<PeerMeshSharedService>();
+    public DbSet<PeerMeshEgressPolicy> PeerMeshEgressPolicies => Set<PeerMeshEgressPolicy>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
     public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
     public DbSet<TransferAttachmentDownloadUsage> TransferAttachmentDownloadUsages =>
@@ -726,6 +727,33 @@ public sealed class SpecusDbContext : DbContext
             b.HasIndex(x => new { x.TenantId, x.ClientId, x.ServiceId }).IsUnique()
                 .HasDatabaseName("uk_peer_shared_service_id");
             b.HasIndex(x => new { x.TenantId, x.ClientId }).HasDatabaseName("idx_peer_shared_service_tenant_client");
+        });
+
+        modelBuilder.Entity<PeerMeshEgressPolicy>(b =>
+        {
+            b.ToTable("peer_mesh_egress_policy");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.EgressClientId).HasColumnName("egress_client_id").IsRequired();
+            b.Property(x => x.EgressClientName).HasColumnName("egress_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(16).IsRequired();
+            b.Property(x => x.AllowedConsumerClientIds).HasColumnName("allowed_consumer_client_ids")
+                .HasMaxLength(512).IsRequired();
+            b.Property(x => x.DestinationRules).HasColumnName("destination_rules").HasMaxLength(4096)
+                .IsRequired();
+            b.Property(x => x.MaxConcurrentFlows).HasColumnName("max_concurrent_flows").IsRequired();
+            b.Property(x => x.MaxFlowsPerConsumer).HasColumnName("max_flows_per_consumer").IsRequired();
+            b.Property(x => x.IdleTimeoutSeconds).HasColumnName("idle_timeout_seconds").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.EgressClientId }).IsUnique()
+                .HasDatabaseName("uk_peer_egress_policy_client");
+            b.HasIndex(x => new { x.TenantId, x.Enabled }).HasDatabaseName("idx_peer_egress_policy_enabled");
         });
 
         modelBuilder.Entity<ConnectionStat>(b =>
