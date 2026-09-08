@@ -8,6 +8,8 @@
 > - A-8 表格排序：原标注"可选做"，未实现（四表已加分页）。
 > - SystemPanel 用户表/下载链接表分页：行数少，未加（其余四表已加分页）。
 > - 配套变更：生产 CSP（Go `securityHeaders` + OpenResty 两处）加入主题引导内联脚本 hash `sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=`；若 `index.html` 该脚本有任何字节改动，hash 需重新计算并同步 Java、Go、.NET 与 OpenResty。
+>
+> 2026-09-08 备注：传输页的"附近/远程"网络模式开关已整体移除，T-4 所针对的 `updateNetworkMode()` 不复存在；设备发现统一为单一列表（同公网出口设备带"自动发现"徽标），传输策略按对端网络区分。T-4、T-7 等条目中"切换网络模式""内网"的描述仅对应审查当时的界面。
 
 ## 0. 总体评价
 

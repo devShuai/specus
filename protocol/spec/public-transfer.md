@@ -14,7 +14,9 @@ MUST、SHOULD、MAY。
 
 ICE 配置、发现 WebSocket、WebRTC Direct 和 TURN 均无需管理 JWT。公开附件接口用于 OSS 数据面，必须同时提供
 有效的管理账号 Bearer JWT 和房间凭据；因此匿名用户只能使用 Direct/TURN，不得申请、完成或下载 OSS 附件。
-共享房间仍由高熵 `roomToken` 隔离，附近房间由可信反向代理提供的来源 IP 隔离。
+共享房间的附件与协作内容仍由高熵 `roomToken` 授权；发现可见性按合并可见域判定：同一分组（相同 `roomId` 与内部
+`roomKey`）的成员互见，同一公网出口地址（可信反向代理解析的来源 IP）的成员跨 `roomId`、跨 Token 房间互见，
+空或 `unknown` 地址不参与"同网"分组。
 
 ## 1. 公共 ICE 配置
 
@@ -117,7 +119,10 @@ Content-Type: application/json
 ```
 
 `roomId`、`peerId`、`displayName` 最大 120 个 Java UTF-16 code unit，`roomToken` 最大 512；值会 trim 并在
-surrogate pair 边界安全截断。服务端在签发阶段完成房间 Token、角色和来源地址校验，返回：
+surrogate pair 边界安全截断。请求可以携带可选 `discoverable` 布尔，缺省为 `true`；为 `false` 时该连接不注册共享
+presence、不出现在其他成员的 roster，也跳过重复 `peerId`、全局名称与房间容量检查，但仍接收 roster 并可发起信令。
+ticket 始终绑定解析出的 `publicAddress` 与内部 `roomKey`，跨端共库时各语言节点据此算出相同的分组与网络标识。
+服务端在签发阶段完成房间 Token、角色和来源地址校验，返回：
 
 ```json
 {"ticket":"random-base64url","expiresAt":"2026-07-21T00:00:45Z"}
@@ -158,19 +163,22 @@ roomToken 为空: roomKey = "public:" + publicAddress
 `VIEWER`，三者都通过相同 `persistentRoomId` 加入同一分组。已撤销或已过期的邀请必须返回 `403`，不能回退为新房间的
 房主。普通未知高熵 Token 首次使用时创建独立房间，相同房间名配不同 Token 仍彼此隔离；但未知的 `st-editor-` 或
 `st-viewer-` 前缀 Token 必须返回 `403`，防止被删除的邀请创建“影子房主”房间。
-未提供 Token 的参与者只有在 `roomId` 与来源地址都相同时才能互见。`sharedRoom` 表示是否使用 Token 房间。
+未提供 Token 的参与者只要来源地址相同即可互见，不再要求 `roomId` 相同。可见性统一按合并可见域判定：
+`sameGroup`（相同 `roomId` 与内部 `roomKey`）或 `sameNet`（双方来源地址均非空、非 `unknown` 且相等）满足其一即可互见、
+可定向收发信令与应用消息；`sameNet` 不看 `roomId` 与 `roomKey`，同一公网出口下的 Token 房间成员因此也会出现在
+附近设备的 roster 中。`sharedRoom` 表示是否使用 Token 房间。
 
 ### 2.3 加入、hello 与 roster
 
-同一分组（相同 `roomId` 和内部 `roomKey`）内的 `peerId` 必须唯一。新连接的 `peerId` 已被同组连接占用时，
+同一合并可见域内的 `peerId` 必须唯一。新连接的 `peerId` 已被同一分组或同一公网出口下其它分组的可见连接占用时，
 服务端先发送：
 
 ```json
 {"type":"error","error":"peer id is already connected"}
 ```
 
-随后以 WebSocket close code `1008` 关闭，不加入该连接，也不触发 roster 更新。该重复检查先于房间容量检查；不同分组
-可以复用相同 `peerId`。
+随后以 WebSocket close code `1008` 关闭，不加入该连接，也不触发 roster 更新。该重复检查先于房间容量检查；
+只有互不可见（不同分组且不同网）的连接才可以复用相同 `peerId`。
 
 每个分组最多允许 `max(1, max-discovery-peers-per-room)` 个连接，默认 `32`。房间已满时服务端先发送：
 
@@ -195,7 +203,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
 }
 ```
 
-随后向同组所有连接广播 `roster`。加入和正常离开都必须触发 roster 更新：
+随后按接收者逐个构造并推送 `roster`，覆盖该接收者的合并可见域（同一分组成员与同一公网出口成员）。加入和正常离开都必须触发相关接收者的 roster 更新：
 
 ```json
 {
@@ -212,13 +220,15 @@ roomToken 为空: roomKey = "public:" + publicAddress
       "publicAddress": "203.0.113.10",
       "sharedRoom": false,
       "roomRole": "EDITOR",
+      "sameRoom": true,
       "connectedAt": "2026-07-10T00:00:00Z"
     }
   ]
 }
 ```
 
-`peers` 按 `connectedAt` 升序排列。
+`peers` 按 `connectedAt` 升序排列。peer 条目的 `sameRoom` 表示该成员与接收者的内部 `roomKey` 是否相同；客户端据此区分
+可协作成员（白板与流程图只与显式加入共享空间的 `sameRoom=true` 成员同步）与仅可互传文件的同网设备。
 
 `displayName` 在所有当前在线公共互传连接中不区分大小写且全局唯一；客户端可通过
 `GET /api/public/transfer/name-availability?clientName=...&excludePeerId=...` 预检，但注册时的原子检查才是最终结果。
@@ -305,7 +315,7 @@ POST /api/public/transfer/rooms/pairing-codes/redeem
 }
 ```
 
-有非空 `targetPeerId` 时仅投递给同组目标；目标不存在时静默丢弃。未给目标时广播给同组其他连接，不回送来源连接。
+有非空 `targetPeerId` 时投递给来源合并可见域内的目标，跨 Token 房间、跨 `roomId` 的同网目标同样可达；目标不可见或不存在时静默丢弃。集群模式的定向路由规则见 [public-transfer-cluster.md](public-transfer-cluster.md)。未给目标时只广播给同组其他连接，不回送来源连接。
 无效 JSON 返回 `{"type":"error","error":"invalid message"}`，连接保持打开。
 
 #### 2.4.1 浏览器应用消息 STAP2
@@ -356,7 +366,8 @@ DataChannel 发送同一 messageId。
 
 同步白板使用 `messageType: "whiteboard"` 或 WebSocket `type: "whiteboard"`，payload 版本标记为 `STWB1`。
 当前定义的白板事件种类为 `stroke-start`、`stroke-points`、`stroke-end`、`remove-stroke`、`object-upsert`、
-`remove-object`、`clear` 和 `snapshot`。`object-upsert` 用于新增或更新文本框、矩形、椭圆、箭头与图片对象；对象坐标和尺寸
+`remove-object`、`clear` 和 `snapshot`。`stroke-start` 可携带可选 `brush` 字段，取值为 `pen`（钢笔）、`marker`（荧光笔）、
+`pencil`（铅笔）或 `brush`（毛笔）；缺省或缺失时按 `pen` 渲染，携带其它取值的 `stroke-start` 无法通过事件校验、必须整体忽略。`object-upsert` 用于新增或更新文本框、矩形、椭圆、箭头与图片对象；对象坐标和尺寸
 使用 `0..1` 的画布归一化值，接收端必须拒绝越界对象。`remove-object` 使用对象 ID 删除对应对象，重复接收应保持幂等。
 
 白板图片在发送前必须缩放并编码为 JPEG data URL，完整 `dataUrl` 不超过 `48 KiB` 个 UTF-16 code unit，为 WebSocket

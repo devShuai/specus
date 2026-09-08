@@ -36,7 +36,7 @@
 
 * `apps/admin-web/src/components/SyncedDiagram.tsx`:专业流程图编辑器、协作状态、评论、版本和导入导出入口。
 * `apps/admin-web/src/components/SyncedWhiteboard.tsx`:自由白板 / 专业流程图宿主与协作消息分发。
-* `apps/admin-web/src/pages/PublicTransferPage.tsx`:内网 / 外网房间、成员发现、角色与邀请管理。
+* `apps/admin-web/src/pages/PublicTransferPage.tsx`:附近（无 Token）与共享（Token）房间、成员发现、角色与邀请管理。
 * `apps/admin-web/src/lib/diagramDocument.ts`:`.stdg` 文档模型、Yjs 更新编码和输入校验。
 * `apps/admin-web/src/lib/diagramDrawio.ts`:draw.io 多页面导入导出。
 * `apps/admin-web/src/lib/diagramTextFormats.ts`:Mermaid / PlantUML 子集导入导出。
@@ -123,7 +123,7 @@ flowchart LR
 
 | 能力 | 状态 | 当前实现 |
 |---|---|---|
-| 自定义房间名和 Token | ✅ | 外网房间支持自定义，首次有效 Token 创建房间并成为 OWNER |
+| 自定义房间名和 Token | ✅ | 共享（Token）房间支持自定义，首次有效 Token 创建房间并成为 OWNER |
 | OWNER | ✅ | 可编辑、创建邀请、撤销邀请、创建 / 恢复 / 删除版本 |
 | EDITOR | ✅ | 可编辑、评论、创建 / 恢复版本，不能管理邀请或删除服务端版本 |
 | VIEWER | ✅ | 前端只读，WebSocket 服务端拒绝写消息，DataChannel 接收端也拒绝其写更新 |
@@ -140,11 +140,11 @@ flowchart LR
 | 能力 | 状态 | 当前实现 |
 |---|---|---|
 | 手动创建版本 | ✅ | OWNER / EDITOR 可命名并保存当前 Yjs 完整更新 |
-| 服务端版本列表 | ✅ | 外网 Token 房间从服务端读取元数据，按需加载快照 |
+| 服务端版本列表 | ✅ | 共享 Token 房间从服务端读取元数据，按需加载快照 |
 | 恢复版本 | ✅ | OWNER / EDITOR 可把历史快照恢复为当前协作状态 |
 | 删除版本 | ✅ | 只有 OWNER 可删除服务端版本 |
 | 数量与大小限制 | ✅ | 每房间最多 50 个服务端版本，单快照最大 3 MB |
-| 内网会话版本 | 🟡 | 无服务端房间时仅在本次浏览器会话保存最多 20 个版本 |
+| 无 Token 房间的会话版本 | 🟡 | 无服务端房间时仅在本次浏览器会话保存最多 20 个版本 |
 | 自动版本 | ⬜ | 尚无定时、里程碑或操作阈值自动版本 |
 | 恢复保护 | ⬜ | 恢复前不会自动创建“恢复前备份” |
 | 版本预览 / 差异 | ⬜ | 尚无缩略图、节点级 diff、重命名、说明、置顶和筛选 |
