@@ -255,6 +255,10 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 
 	handle, ok := flow.Handle.(*egressTCPFlow)
 	if !ok {
+		// The reservation exists but its connect has not returned, so there is no state machine
+		// to drive yet. Dropping is correct rather than merely tolerable: the consumer's own
+		// retransmission covers it, and answering now would mean answering for a socket that may
+		// still fail to open.
 		r.mu.Unlock()
 		return
 	}
@@ -272,11 +276,19 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 // a black hole would otherwise pass every limit check.
 func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSegment, now time.Time) {
 	r.mu.Lock()
-	flow, code := r.reserve(consumer, key, now)
+	flow, code, opened := r.reserve(consumer, key, now)
 	if code != egressCodeAllowed {
 		r.mu.Unlock()
 		r.refuse(consumer, key, code, now)
 		r.emitSegment(consumer, buildTCPReset(syn))
+		return
+	}
+	if !opened {
+		// A retransmitted SYN, or a second frame that raced this one. The reservation already
+		// exists, so dialling again would leave two sockets and two state machines on one entry
+		// with the loser leaked. Dropping is right: the consumer retransmits until the flow this
+		// call is opening answers.
+		r.mu.Unlock()
 		return
 	}
 	address := net.JoinHostPort(formatEgressAddress(key.remoteIP), strconv.Itoa(int(key.remotePort)))
@@ -404,10 +416,16 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 	r.mu.Lock()
 	flow, known := r.flows.lookup(key)
 	if !known {
-		reserved, code := r.reserve(consumer, key, now)
+		reserved, code, opened := r.reserve(consumer, key, now)
 		if code != egressCodeAllowed {
 			r.mu.Unlock()
 			r.refuse(consumer, key, code, now)
+			return
+		}
+		if !opened {
+			// Another datagram for the same four-tuple is already opening this session. Two
+			// sockets on one entry would leak the loser and split the session's replies.
+			r.mu.Unlock()
 			return
 		}
 		address := net.JoinHostPort(formatEgressAddress(key.remoteIP), strconv.Itoa(int(key.remotePort)))
@@ -439,6 +457,8 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 
 	handle, ok := flow.Handle.(*egressUDPFlow)
 	if !ok {
+		// The session is still connecting. Dropping one datagram is what UDP already promises,
+		// and holding it would mean buffering for a socket that may never open.
 		r.mu.Unlock()
 		return
 	}
@@ -522,9 +542,12 @@ func (r *egressRuntime) flowSnapshot() []*egressFlow {
 // reserve runs the judgment layer and, on approval, takes the quota slot. Called with the lock
 // held. The reservation exists before the socket does so that a slow or failing connect still
 // counts against the limits for its whole duration.
-func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time) (*egressFlow, string) {
+// The third result says whether this call is the one that created the entry. A second frame for the
+// same four-tuple arriving while the first is still connecting finds the reservation already there,
+// and must not dial again.
+func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time) (*egressFlow, string, bool) {
 	if r.closed || !r.enabled {
-		return nil, egressCodeDisabled
+		return nil, egressCodeDisabled, false
 	}
 	peerAllowed := true
 	if r.peerACLAllows != nil {
@@ -541,10 +564,10 @@ func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time
 		LocalInterfaceCIDRs:    r.localInterfaceCIDRs(),
 	}, r.policy, peerAllowed, r.context)
 	if !decision.Allowed {
-		return nil, decision.Code
+		return nil, decision.Code, false
 	}
-	flow, _ := r.flows.open(key, consumer, now)
-	return flow, egressCodeAllowed
+	flow, opened := r.flows.open(key, consumer, now)
+	return flow, egressCodeAllowed, opened
 }
 
 // refuse records a refusal and tells the consumer why. Called with no lock held.

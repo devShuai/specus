@@ -355,6 +355,49 @@ func TestEgressRuntimeChargesQuotaWhileConnectIsInFlight(t *testing.T) {
 	close(harness.gate)
 }
 
+// Two frames for the same four-tuple can both find no flow before either has reserved one. Only the
+// call that created the reservation may dial: two sockets on one entry would leak the loser and
+// leave two state machines answering for the same connection.
+func TestEgressRuntimeDialsOnceForOneFlow(t *testing.T) {
+	harness := newEgressHarness(t)
+	harness.mu.Lock()
+	harness.gate = make(chan struct{})
+	harness.mu.Unlock()
+
+	syn := egressSyn(t, "100.96.0.1", 40000, "203.0.113.10", 443)
+	key := egressFlowKey{
+		protocol:     ipv4ProtocolTCP,
+		consumerIP:   syn.SourceIP,
+		consumerPort: syn.SourcePort,
+		remoteIP:     syn.DestinationIP,
+		remotePort:   syn.DestinationPort,
+	}
+
+	go harness.runtime.openTCPFlow(7, key, syn, flowEpoch)
+	harness.waitFor("the first connect to start", func() bool { return harness.dialCount() == 1 })
+
+	// The racing second attempt, which the reservation must already have claimed. Run in its own
+	// goroutine: an implementation that dials again would block on the gate, and a hung test says
+	// far less than a counted one.
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		harness.runtime.openTCPFlow(7, key, syn, flowEpoch)
+	}()
+	select {
+	case <-settled:
+	case <-time.After(time.Second):
+		// Still inside the dialer, which is itself the failure the count below reports.
+	}
+	if harness.dialCount() != 1 {
+		t.Errorf("dialled %d times for one flow", harness.dialCount())
+	}
+	if harness.runtime.flows.size() != 1 {
+		t.Errorf("%d flows for one four-tuple", harness.runtime.flows.size())
+	}
+	close(harness.gate)
+}
+
 // A connect that fails is not a refusal. Reporting it as one would send an operator hunting for a
 // policy rule that never fired, and would inflate the refusal counts the server aggregates.
 func TestEgressRuntimeSeparatesAnUnreachableTargetFromARefusal(t *testing.T) {
