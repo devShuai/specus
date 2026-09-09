@@ -110,6 +110,50 @@ func (h *tcpHarness) expectOne(output tcpOutput, what string) tcpSegment {
 
 func (h *tcpHarness) advance(d time.Duration) { h.now = h.now.Add(d) }
 
+// The real socket can end before the consumer acknowledges the SYN-ACK. A FIN sent then would run
+// ahead of a sequence space the consumer has not accepted, so it is owed until the handshake
+// completes. Dropping it instead leaves the flow open until the idle timer collects it, with the
+// consumer waiting on a connection that is already over.
+func TestTCPDefersAFinRaisedDuringTheHandshake(t *testing.T) {
+	syn := tcpSegment{
+		SourceIP: testAddr(t, testConsumerIP), DestinationIP: testAddr(t, testEgressIP),
+		SourcePort: testConsumerPrt, DestinationPort: testTargetPort,
+		Seq: 1000, Flags: tcpFlagSYN, Window: 65535, MSS: 1200,
+	}
+	now := time.Unix(1_800_000_000, 0)
+	conn, output := acceptTCPSyn(syn, 5000, testPathMTU, testIdle, now)
+	synAck, ok := parseTCPSegment(output.Segments[0])
+	if !ok {
+		t.Fatal("the SYN-ACK did not parse")
+	}
+
+	if closed := conn.onAppClose(now); len(closed.Segments) != 0 {
+		t.Fatalf("a FIN was emitted before the handshake completed: %d segments", len(closed.Segments))
+	}
+	if conn.state != tcpStateSynReceived {
+		t.Fatalf("state = %s, want the handshake still pending", conn.state)
+	}
+
+	completed := conn.onSegment(tcpSegment{
+		SourceIP: syn.SourceIP, DestinationIP: syn.DestinationIP,
+		SourcePort: syn.SourcePort, DestinationPort: syn.DestinationPort,
+		Seq: syn.Seq + 1, Ack: synAck.Seq + 1, Flags: tcpFlagACK, Window: 65535,
+	}, now)
+
+	var sawFin bool
+	for _, packet := range completed.Segments {
+		if segment, parsed := parseTCPSegment(packet); parsed && segment.has(tcpFlagFIN) {
+			sawFin = true
+		}
+	}
+	if !sawFin {
+		t.Error("the owed FIN was never sent")
+	}
+	if conn.state != tcpStateFinWait1 {
+		t.Errorf("state = %s, want FIN_WAIT_1", conn.state)
+	}
+}
+
 // A full handshake, a byte each way, and an orderly close from the consumer side.
 func TestTCPFlowCompletesHandshakeDataAndClose(t *testing.T) {
 	h := newTCPHarness(t)

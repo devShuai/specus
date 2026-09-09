@@ -289,6 +289,14 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 			return output
 		}
 		c.state = tcpStateEstablished
+		if c.appClosed {
+			// The real socket ended while the handshake was still in flight. The FIN could not
+			// be sent then without running ahead of the sequence space, so it is owed now.
+			// Without this the flow sits open until the idle timer collects it, and the
+			// consumer waits on a connection that is already over.
+			c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
+			c.state = tcpStateFinWait1
+		}
 	}
 
 	c.acceptData(segment, now, &output)
@@ -520,6 +528,10 @@ func (c *tcpConn) onAppClose(now time.Time) tcpOutput {
 	case tcpStateCloseWait:
 		c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
 		c.state = tcpStateLastAck
+	case tcpStateSynReceived:
+		// Nothing to send yet: a FIN here would sit beyond a sequence space the consumer has not
+		// acknowledged. appClosed is already set, and onSegment sends the FIN the moment the
+		// handshake completes.
 	}
 	return output
 }
