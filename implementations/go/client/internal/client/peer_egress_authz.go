@@ -1,6 +1,9 @@
 package client
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // Egress-side authorization, as defined by protocol/spec/peer-egress.md.
 //
@@ -55,6 +58,20 @@ func parseEgressAddress(text string) (uint32, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+// formatEgressAddress is the inverse of parseEgressAddress. Rendering an address back to text is
+// what lets a live flow be handed to the judgment layer again after a policy change, since that
+// layer speaks the same dotted form the policy is written in.
+func formatEgressAddress(value uint32) string {
+	var out []byte
+	for shift := 24; shift >= 0; shift -= 8 {
+		if shift != 24 {
+			out = append(out, '.')
+		}
+		out = strconv.AppendUint(out, uint64(value>>uint(shift)&0xff), 10)
+	}
+	return string(out)
 }
 
 func parseEgressCIDR(text string) (egressCIDR, bool) {
@@ -272,6 +289,25 @@ func egressRuleAllowsProtocol(rule egressDestinationRule, protocol string) bool 
 		}
 	}
 	return false
+}
+
+// egressProtocolName maps an IPv4 protocol number to the name policies are written in.
+//
+// Anything else returns the empty string, which no destination rule can match, so an unsupported
+// protocol is refused with EGRESS_PROTOCOL_DENIED rather than defaulting to a name some rule might
+// allow. ICMP lands here deliberately: forwarding it needs a raw socket, which contradicts the
+// zero-privilege premise that lets an ordinary desktop act as an egress at all. Refusing beats
+// passing it through silently, for the same reason an unsupported rule is refused rather than
+// ignored.
+func egressProtocolName(protocol int) string {
+	switch protocol {
+	case ipv4ProtocolTCP:
+		return "tcp"
+	case ipv4ProtocolUDP:
+		return "udp"
+	default:
+		return ""
+	}
 }
 
 func egressRuleAllowsPort(rule egressDestinationRule, port int) bool {
