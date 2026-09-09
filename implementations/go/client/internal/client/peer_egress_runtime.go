@@ -73,7 +73,19 @@ type egressRuntime struct {
 
 	// peerACLAllows reports whether the mesh still authorises this consumer. It lives outside the
 	// policy because the mesh ACL and the egress policy are revoked independently.
+	//
+	// Usually nil, and that is correct rather than lax: a frame only reaches this plane over a
+	// session the mesh already authenticated, and withdrawal arrives as a revokeConsumer call
+	// rather than as something to poll. Polling would mean reaching for the mesh's lock from
+	// under this one.
 	peerACLAllows func(consumer int64) bool
+
+	// revision is the last accepted egress-config snapshot.
+	revision int64
+
+	// localInterfaces are the networks this host owns. Forwarding into one would loop back into
+	// this node's own capture path.
+	localInterfaces []string
 
 	flows      *egressFlowTable
 	rejections *egressRejectionLog
@@ -661,9 +673,40 @@ func (r *egressRuntime) emitFrame(consumer int64, frameType byte, body []byte) {
 }
 
 // localInterfaceCIDRs are the networks owned by this node's own tunnel and virtual interfaces.
-// Forwarding into one would loop back into this node's own capture path. Called with the lock held.
+// Called with the lock held.
 func (r *egressRuntime) localInterfaceCIDRs() []string {
-	return r.context.DeploymentDenyCIDRs
+	return r.localInterfaces
+}
+
+// setPathMTU records the budget a returning segment has to fit. Only ever lowered towards what the
+// path actually measured; a value below the IPv4 minimum is ignored rather than applied, since a
+// bad measurement should not be able to shrink every flow's segments to nothing.
+func (r *egressRuntime) setPathMTU(mtu int) {
+	if mtu < ipv4MinHeaderLen+tcpMinHeaderLen+tcpDefaultMSS {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pathMTU = mtu
+}
+
+func (r *egressRuntime) setLocalInterfaceCIDRs(networks []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.localInterfaces = networks
+}
+
+// acceptRevision applies the spec's monotonic guard: a snapshot at or below the last accepted one
+// is ignored, so a reordered or replayed push cannot walk the policy backwards. A revision of zero
+// is accepted, since a server that numbers nothing must still be able to configure the node.
+func (r *egressRuntime) acceptRevision(revision int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if revision != 0 && revision <= r.revision {
+		return false
+	}
+	r.revision = revision
+	return true
 }
 
 // newEgressISS picks an initial send sequence number.
