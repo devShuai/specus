@@ -145,6 +145,9 @@ type peerMeshClient struct {
 	messageHandler     func(ClientMessage)
 	turnAuth           turnAuthCredentials
 	services           *peerServiceRuntime
+	egress             *egressRuntime
+	egressQueue        chan peerEgressOutbound
+	egressDone         chan struct{}
 }
 
 type peerMeshPeer struct {
@@ -534,6 +537,10 @@ func (mesh *peerMeshClient) ensureServices() *peerServiceRuntime {
 }
 
 func (mesh *peerMeshClient) stop() {
+	// Outside the lock on purpose. The egress plane closes sockets under its own mutex, and the
+	// send loop takes the mesh mutex under that one, so taking the mesh mutex around a shutdown
+	// would invert the order.
+	mesh.shutdownEgress()
 	mesh.mu.Lock()
 	defer mesh.mu.Unlock()
 	mesh.stopLocked()
@@ -666,6 +673,8 @@ func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base Ru
 		mesh.closeSession(message)
 	case peerControlTypeServiceCatalog:
 		mesh.ensureServices().applyCatalog(message)
+	case peerControlTypeEgressConfig:
+		mesh.applyEgressControl(payload)
 	default:
 		mesh.logger.Printf("ignored peer-control message type=%q", message.Type)
 	}
@@ -1363,6 +1372,9 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 		return
 	}
 	if mesh.handlePeerAppMessage(frame, current, runtime) {
+		return
+	}
+	if mesh.handlePeerEgressFrame(frame, current) {
 		return
 	}
 	if !peerPacketMatchesAuthenticatedEndpoints(frame.Payload, current.PeerVirtualIP, runtime.PeerMesh.VirtualIP) {
@@ -2255,6 +2267,9 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 }
 
 func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
+	// The plane cannot ask the mesh whether a peer is still authorised without reaching for the
+	// mesh lock from under its own, so a closing session pushes the revocation instead.
+	defer mesh.revokeEgressConsumer(mesh.peerIDFromControl(message))
 	if message.SessionID == nil {
 		return
 	}
