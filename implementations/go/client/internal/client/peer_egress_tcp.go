@@ -67,6 +67,16 @@ const (
 	// outlive stragglers on the mesh path.
 	tcpTimeWaitDuration = 10 * time.Second
 
+	// Keepalive finds out whether a silent consumer is still there.
+	//
+	// A peer that vanished without closing holds a socket and a quota slot until the idle
+	// timeout collects it; probing learns the truth sooner. It deliberately does not extend the
+	// idle budget. That budget is a resource limit rather than a liveness question, so a flow
+	// that is genuinely alive but idle is still reclaimed on schedule.
+	tcpKeepaliveIdle     = 15 * time.Second
+	tcpKeepaliveInterval = 5 * time.Second
+	tcpKeepaliveProbes   = 3
+
 	// tcpMaxReassembly bounds out-of-order segments held per flow. A peer that sends a hole and
 	// then floods must not be able to grow this without bound.
 	tcpMaxReassembly = 32
@@ -143,6 +153,9 @@ type tcpConn struct {
 	lastActivity time.Time
 	closedAt     time.Time
 	idleTimeout  time.Duration
+
+	keepaliveProbes int
+	lastProbe       time.Time
 }
 
 // acceptTCPSyn opens a flow from the consumer's SYN and produces the SYN-ACK.
@@ -253,7 +266,14 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 	if c.state == tcpStateClosed {
 		return output
 	}
-	c.lastActivity = now
+	// Any segment proves the consumer is still there, so the probe run restarts. The idle clock
+	// is different: it measures data, not liveness. Letting a keepalive exchange refresh it would
+	// mean two stacks could hold a socket and a quota slot open indefinitely by pinging each
+	// other, which is exactly the resource the timeout exists to bound.
+	c.keepaliveProbes = 0
+	if segment.segmentLength() > 0 {
+		c.lastActivity = now
+	}
 
 	if segment.has(tcpFlagRST) {
 		// An in-window reset ends the flow. Out-of-window resets are ignored, which is what stops
@@ -297,6 +317,16 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 			c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
 			c.state = tcpStateFinWait1
 		}
+	}
+
+	// RFC 1122: a keepalive probe re-sends one byte of already acknowledged sequence space to
+	// force an acknowledgement. Without answering it, a healthy flow looks dead to the consumer
+	// and gets torn down from the far end. A normal bare ACK carries the sequence we already
+	// expect, so only one below it is a probe.
+	if len(segment.Payload) == 0 && !segment.has(tcpFlagFIN) && !segment.has(tcpFlagSYN) &&
+		seqLess(segment.Seq, c.rcvNxt) {
+		c.ack(&output, now)
+		return output
 	}
 
 	c.acceptData(segment, now, &output)
@@ -562,8 +592,12 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 	}
 	if c.idleTimeout > 0 && now.Sub(c.lastActivity) >= c.idleTimeout {
 		// An idle flow holds a socket and a quota slot on the egress; reclaim it rather than
-		// letting a forgotten consumer pin resources.
+		// letting a forgotten consumer pin resources. This is checked before the keepalive so a
+		// probe cannot hold a flow past the limit the policy set.
 		c.reset(&output)
+		return output
+	}
+	if c.keepalive(now, &output) {
 		return output
 	}
 
@@ -593,6 +627,34 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 		}
 	}
 	return output
+}
+
+// keepalive probes a silent flow and reports whether the flow ended because the consumer never
+// answered. Established flows only: in any closing state the peer already told us where it stands,
+// and the retransmission timer covers whatever is still outstanding.
+//
+// The probe carries the last byte of already acknowledged sequence space and no payload, which is
+// what RFC 1122 says forces an acknowledgement. It is built directly rather than through emit
+// because it occupies no new sequence space and must not enter the retransmission queue.
+func (c *tcpConn) keepalive(now time.Time, output *tcpOutput) bool {
+	if c.state != tcpStateEstablished || now.Sub(c.lastActivity) < tcpKeepaliveIdle {
+		return false
+	}
+	if c.keepaliveProbes >= tcpKeepaliveProbes {
+		c.reset(output)
+		return true
+	}
+	if !c.lastProbe.IsZero() && now.Sub(c.lastProbe) < tcpKeepaliveInterval {
+		return false
+	}
+	c.keepaliveProbes++
+	c.lastProbe = now
+	output.send(buildTCPSegment(tcpSegment{
+		SourceIP: c.localIP, DestinationIP: c.remoteIP,
+		SourcePort: c.localPort, DestinationPort: c.remotePort,
+		Seq: c.sndNxt - 1, Ack: c.rcvNxt, Flags: tcpFlagACK, Window: uint16(c.rcvWnd),
+	}))
+	return false
 }
 
 func (c *tcpConn) done() bool { return c.state == tcpStateClosed }

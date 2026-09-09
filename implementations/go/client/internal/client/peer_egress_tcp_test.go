@@ -154,6 +154,120 @@ func TestTCPDefersAFinRaisedDuringTheHandshake(t *testing.T) {
 	}
 }
 
+// A consumer that vanished without closing holds a socket and a quota slot until the idle timeout
+// collects it. Probing learns the truth sooner.
+func TestTCPProbesASilentFlowAndGivesUp(t *testing.T) {
+	h := newTCPHarness(t)
+	sndNxt := h.conn.sndNxt
+
+	h.advance(tcpKeepaliveIdle)
+	probe := h.expectOne(h.conn.onTick(h.now), "keepalive probe")
+	// RFC 1122: the probe re-sends the last byte of already acknowledged sequence space, which is
+	// what forces the peer to answer.
+	if probe.Seq != sndNxt-1 {
+		t.Errorf("probe seq = %d, want %d", probe.Seq, sndNxt-1)
+	}
+	if len(probe.Payload) != 0 || probe.has(tcpFlagFIN) || probe.has(tcpFlagSYN) {
+		t.Errorf("the probe was not empty: %+v", probe)
+	}
+	// It occupies no new sequence space, so it must not join the retransmission queue.
+	if len(h.conn.retransmit) != 0 {
+		t.Errorf("the probe was queued for retransmission: %d entries", len(h.conn.retransmit))
+	}
+	if h.conn.sndNxt != sndNxt {
+		t.Errorf("the probe advanced the send sequence to %d", h.conn.sndNxt)
+	}
+
+	for probes := 1; probes < tcpKeepaliveProbes; probes++ {
+		h.advance(tcpKeepaliveInterval)
+		if segments := h.parse(h.conn.onTick(h.now)); len(segments) != 1 {
+			t.Fatalf("probe %d produced %d segments", probes+1, len(segments))
+		}
+	}
+
+	h.advance(tcpKeepaliveInterval)
+	output := h.conn.onTick(h.now)
+	if !output.Reset || !output.Done {
+		t.Error("an unanswered probe run did not end the flow")
+	}
+	if h.conn.state != tcpStateClosed {
+		t.Errorf("state = %s", h.conn.state)
+	}
+}
+
+// An answered probe means the consumer is alive, so the run starts over rather than counting down
+// to a reset on a healthy flow.
+func TestTCPKeepaliveRestartsWhenTheConsumerAnswers(t *testing.T) {
+	h := newTCPHarness(t)
+
+	h.advance(tcpKeepaliveIdle)
+	h.expectOne(h.conn.onTick(h.now), "keepalive probe")
+	if h.conn.keepaliveProbes != 1 {
+		t.Fatalf("probes = %d", h.conn.keepaliveProbes)
+	}
+
+	// The consumer answers with a plain acknowledgement.
+	h.feed(tcpSegment{Seq: h.peerSeq, Ack: h.conn.sndNxt, Flags: tcpFlagACK})
+	if h.conn.keepaliveProbes != 0 {
+		t.Errorf("probes = %d after an answer, want the run restarted", h.conn.keepaliveProbes)
+	}
+
+	// And the flow survives well past the point an unanswered run would have killed it.
+	h.advance(tcpKeepaliveInterval * tcpKeepaliveProbes)
+	if output := h.conn.onTick(h.now); output.Reset {
+		t.Error("an answered flow was reset anyway")
+	}
+}
+
+// The idle timeout is a resource limit, not a liveness question, so a probe must not be able to
+// hold a flow past the ceiling the policy set.
+func TestTCPKeepaliveDoesNotOutlastTheIdleTimeout(t *testing.T) {
+	h := newTCPHarness(t)
+
+	// Keep answering probes so the flow stays demonstrably alive.
+	for elapsed := time.Duration(0); elapsed < testIdle; elapsed += tcpKeepaliveInterval {
+		h.advance(tcpKeepaliveInterval)
+		output := h.conn.onTick(h.now)
+		if output.Reset {
+			if elapsed+tcpKeepaliveInterval < testIdle {
+				t.Fatalf("the flow was reset after %s, before the idle timeout", elapsed)
+			}
+			return
+		}
+		for range h.parse(output) {
+			h.feed(tcpSegment{Seq: h.peerSeq, Ack: h.conn.sndNxt, Flags: tcpFlagACK})
+		}
+	}
+	t.Error("an answered flow outlived the idle timeout the policy set")
+}
+
+// Without answering the consumer's own probe, a healthy flow looks dead to the far end and gets
+// torn down from there.
+func TestTCPAnswersTheConsumersKeepalive(t *testing.T) {
+	h := newTCPHarness(t)
+
+	probe := h.expectOne(h.feed(tcpSegment{
+		Seq: h.peerSeq - 1, Ack: h.conn.sndNxt, Flags: tcpFlagACK,
+	}), "answer to the consumer keepalive")
+	if probe.Ack != h.peerSeq {
+		t.Errorf("answer ack = %d, want %d", probe.Ack, h.peerSeq)
+	}
+	if len(probe.Payload) != 0 {
+		t.Errorf("the answer carried %d payload bytes", len(probe.Payload))
+	}
+}
+
+// A plain acknowledgement carries the sequence we already expect. Answering it too would put two
+// stacks into an acknowledgement loop that never ends.
+func TestTCPDoesNotAnswerAPlainAck(t *testing.T) {
+	h := newTCPHarness(t)
+	if segments := h.parse(h.feed(tcpSegment{
+		Seq: h.peerSeq, Ack: h.conn.sndNxt, Flags: tcpFlagACK,
+	})); len(segments) != 0 {
+		t.Errorf("a plain ACK drew %d segments in reply", len(segments))
+	}
+}
+
 // A full handshake, a byte each way, and an orderly close from the consumer side.
 func TestTCPFlowCompletesHandshakeDataAndClose(t *testing.T) {
 	h := newTCPHarness(t)
