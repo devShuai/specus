@@ -20,6 +20,8 @@ typedef struct {
     long long message_max_attachment_bytes;
     int peer_service_discovery_version;
     char peer_service_applications[128];
+    /* Peer egress split routing; 0 or absent means the client cannot take part. */
+    int client_egress_version;
     char client_version[81];
     long long upload_bytes;
     long long download_bytes;
@@ -142,6 +144,8 @@ typedef struct {
     char expires_at[64];
     char channel_id[161];
     char remote_address[256];
+    /* Peer egress split routing; 0 or absent means the client cannot take part. */
+    int client_egress_version;
 } st_storage_client_session;
 
 typedef struct {
@@ -325,6 +329,68 @@ typedef struct {
     char service_id[65];
     char reason[256];
 } st_storage_peer_mesh_service_audit;
+
+/*
+ * Stored apart from st_storage_peer_mesh_acl on purpose: mesh ACLs decide whether two devices may
+ * reach each other, this decides whether one may be used as a way out to the wider network.
+ * Effective permission is the intersection of the two.
+ */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    char owner_username[128];
+    long long egress_client_id;
+    char egress_client_name[256];
+    int enabled;
+    char scope[16];
+    char allowed_consumer_client_ids[512];
+    /* Canonical JSON. Empty denies everything; there is no unconfigured-therefore-open state. */
+    char destination_rules[4097];
+    int max_concurrent_flows;
+    int max_flows_per_consumer;
+    int idle_timeout_seconds;
+    char created_at[64];
+    char updated_at[64];
+} st_storage_peer_mesh_egress_policy;
+
+/*
+ * Latest counters an egress device reported about itself. One row per device rather than an
+ * append-only log: the management view needs what the node is doing now, and history from a
+ * client-driven message would grow without bound. Counters carry no destination or request content.
+ */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    long long egress_client_id;
+    char egress_client_name[256];
+    /* Bound by the server from the authenticated control connection, not read from the body. */
+    long long session_id;
+    long long revision;
+    long long active_flows;
+    long long total_flows;
+    /* Refusals aggregated by result code, as canonical JSON. */
+    char rejected_flows[1025];
+    long long bytes_in;
+    long long bytes_out;
+    char reported_at[64];
+    char created_at[64];
+    char updated_at[64];
+} st_storage_peer_mesh_egress_activity;
+
+/*
+ * Tenant-wide egress switch. Separate from the per-device enabled flag on the policy, and both must
+ * be on for a device to act as an egress: the per-device flag says whether that device was chosen,
+ * this one lets an operator stop the tenant without losing which devices were configured.
+ */
+typedef struct {
+    char tenant_id[64];
+    int enabled;
+    char updated_by[128];
+    char updated_at[64];
+} st_storage_peer_mesh_egress_switch;
+
+
+
 
 typedef struct {
     long long id;
@@ -987,6 +1053,43 @@ int st_storage_upsert_peer_mesh_service(const char *path,
 int st_storage_delete_peer_mesh_service(const char *path,
                                         long long id,
                                         const char *tenant_id);
+int st_storage_list_peer_mesh_egress_policies(const char *path,
+                                              const char *tenant_id,
+                                              int enabled_only,
+                                              st_storage_peer_mesh_egress_policy *policies,
+                                              size_t max_policies,
+                                              size_t *policy_count);
+int st_storage_get_peer_mesh_egress_policy(const char *path,
+                                           long long id,
+                                           const char *tenant_id,
+                                           st_storage_peer_mesh_egress_policy *out_policy);
+int st_storage_find_peer_mesh_egress_policy_by_client(const char *path,
+                                                      const char *tenant_id,
+                                                      long long egress_client_id,
+                                                      st_storage_peer_mesh_egress_policy *out_policy);
+int st_storage_upsert_peer_mesh_egress_policy(const char *path,
+                                              const st_storage_peer_mesh_egress_policy *policy,
+                                              st_storage_peer_mesh_egress_policy *out_policy);
+int st_storage_delete_peer_mesh_egress_policy(const char *path,
+                                              long long id,
+                                              const char *tenant_id);
+int st_storage_list_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              st_storage_peer_mesh_egress_activity *rows,
+                                              size_t max_rows,
+                                              size_t *row_count);
+int st_storage_find_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              long long egress_client_id,
+                                              st_storage_peer_mesh_egress_activity *out_row);
+int st_storage_upsert_peer_mesh_egress_activity(const char *path,
+                                                const st_storage_peer_mesh_egress_activity *row);
+/* Returns 0 on a hit, 1 when the tenant has never set it, -1 on a storage failure. */
+int st_storage_get_peer_mesh_egress_switch(const char *path,
+                                           const char *tenant_id,
+                                           st_storage_peer_mesh_egress_switch *out_row);
+int st_storage_upsert_peer_mesh_egress_switch(const char *path,
+                                              const st_storage_peer_mesh_egress_switch *row);
 int st_storage_record_peer_mesh_service_audit(const char *path,
                                               const char *action,
                                               const char *tenant_id,

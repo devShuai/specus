@@ -1,5 +1,7 @@
 #include "storage.h"
 
+#include "peer_egress.h"
+
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,12 +117,201 @@ static int test_http_route_auth_migration(void)
     return 0;
 }
 
+/*
+ * Egress policy storage. The judgment layer itself is covered by the shared vectors in
+ * peer_egress_tests; what is checked here is that a policy survives a round trip and that a
+ * disabled one leaves the enabled-only listing that catalogue building reads.
+ */
+static int test_peer_mesh_egress_policy_round_trip(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-egress-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "storage init failed\n");
+        return 1;
+    }
+
+    int failures = 0;
+    st_storage_peer_mesh_egress_policy policy;
+    memset(&policy, 0, sizeof(policy));
+    snprintf(policy.tenant_id, sizeof(policy.tenant_id), "default");
+    snprintf(policy.owner_username, sizeof(policy.owner_username), "owner");
+    policy.egress_client_id = 2002;
+    snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "office-gateway");
+    policy.enabled = 1;
+    snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
+    snprintf(policy.allowed_consumer_client_ids, sizeof(policy.allowed_consumer_client_ids), "1001");
+    snprintf(policy.destination_rules, sizeof(policy.destination_rules),
+             "[{\"cidr\":\"203.0.113.0/24\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+    policy.max_concurrent_flows = 256;
+    policy.max_flows_per_consumer = 64;
+    policy.idle_timeout_seconds = 60;
+
+    st_storage_peer_mesh_egress_policy saved;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &policy, &saved) != 0) {
+        fprintf(stderr, "egress policy insert failed\n");
+        unlink(path);
+        return failures + 1;
+    }
+    if (saved.id <= 0 || saved.egress_client_id != 2002 || !saved.enabled
+        || strcmp(saved.scope, ST_EGRESS_SCOPE_PUBLIC) != 0
+        || strcmp(saved.destination_rules, policy.destination_rules) != 0
+        || saved.max_flows_per_consumer != 64) {
+        fprintf(stderr, "egress policy did not round trip\n");
+        failures++;
+    }
+
+    st_storage_peer_mesh_egress_policy found;
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "default", 2002, &found) != 0
+        || found.id != saved.id) {
+        fprintf(stderr, "egress policy lookup by client failed\n");
+        failures++;
+    }
+    /* A tenant that has never configured egress must read as absent rather than as an error. */
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "default", 4242, &found) != 1) {
+        fprintf(stderr, "a missing policy must read as absent\n");
+        failures++;
+    }
+
+    /*
+     * A disabled policy must disappear from the enabled-only listing, which is what catalogue
+     * building reads: switching the device off has to stop it being offered, not merely stop new
+     * flows at the far end.
+     */
+    saved.enabled = 0;
+    snprintf(saved.allowed_consumer_client_ids, sizeof(saved.allowed_consumer_client_ids), "1001,1002");
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &saved, NULL) != 0) {
+        fprintf(stderr, "egress policy update failed\n");
+        failures++;
+    }
+    st_storage_peer_mesh_egress_policy listed[8];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, listed, 8U, &count) != 0
+        || count != 0U) {
+        fprintf(stderr, "a disabled policy is still listed as enabled\n");
+        failures++;
+    }
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, listed, 8U, &count) != 0
+        || count != 1U
+        || strcmp(listed[0].allowed_consumer_client_ids, "1001,1002") != 0) {
+        fprintf(stderr, "the update did not persist\n");
+        failures++;
+    }
+
+    if (st_storage_delete_peer_mesh_egress_policy(path, saved.id, "default") != 0
+        || st_storage_get_peer_mesh_egress_policy(path, saved.id, "default", &found) != 1) {
+        fprintf(stderr, "egress policy delete failed\n");
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
+/*
+ * Egress activity storage. The report ingest itself lives in peer_mesh.c behind a control channel;
+ * what is checked here is that a snapshot round-trips and that the refusal map keeps its shape.
+ */
+static int test_peer_mesh_egress_activity_round_trip(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-egress-activity-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "storage init failed\n");
+        return 1;
+    }
+
+    int failures = 0;
+    st_storage_peer_mesh_egress_activity row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.tenant_id, sizeof(row.tenant_id), "default");
+    row.egress_client_id = 2002;
+    snprintf(row.egress_client_name, sizeof(row.egress_client_name), "office-gateway");
+    row.session_id = 4201;
+    row.revision = 12;
+    row.active_flows = 18;
+    row.total_flows = 2140;
+    row.bytes_in = 10485760;
+    row.bytes_out = 2097152;
+    snprintf(row.rejected_flows, sizeof(row.rejected_flows), "{\"EGRESS_DEST_DENIED\":4}");
+    snprintf(row.reported_at, sizeof(row.reported_at), "2026-09-08T12:00:00Z");
+
+    if (st_storage_upsert_peer_mesh_egress_activity(path, &row) != 0) {
+        fprintf(stderr, "egress activity insert failed\n");
+        unlink(path);
+        return failures + 1;
+    }
+
+    st_storage_peer_mesh_egress_activity found;
+    if (st_storage_find_peer_mesh_egress_activity(path, "default", 2002, &found) != 0
+        || found.active_flows != 18 || found.total_flows != 2140
+        || found.session_id != 4201 || found.revision != 12
+        || strcmp(found.rejected_flows, "{\"EGRESS_DEST_DENIED\":4}") != 0) {
+        fprintf(stderr, "egress activity did not round trip\n");
+        failures++;
+    }
+    /* A device that has never reported must read as absent rather than as an error. */
+    if (st_storage_find_peer_mesh_egress_activity(path, "default", 4242, &found) != 1) {
+        fprintf(stderr, "a missing activity row must read as absent\n");
+        failures++;
+    }
+
+    /* A second report replaces the row rather than accumulating history. */
+    row.revision = 13;
+    row.active_flows = 21;
+    if (st_storage_upsert_peer_mesh_egress_activity(path, &row) != 0) {
+        fprintf(stderr, "egress activity update failed\n");
+        failures++;
+    }
+    st_storage_peer_mesh_egress_activity rows[8];
+    size_t count = 0U;
+    if (st_storage_list_peer_mesh_egress_activity(path, "default", rows, 8U, &count) != 0
+        || count != 1U || rows[0].active_flows != 21 || rows[0].revision != 13) {
+        fprintf(stderr, "egress activity list mismatch: count=%zu\n", count);
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
+/* Refusal counters are aggregated by result code; anything else must not be storable. */
+static int test_peer_egress_known_codes(void)
+{
+    int failures = 0;
+    if (!st_egress_is_known_code(ST_EGRESS_CODE_DEST_DENIED)
+        || !st_egress_is_known_code(ST_EGRESS_CODE_PORT_DENIED)
+        || !st_egress_is_known_code(ST_EGRESS_CODE_ALLOWED)) {
+        fprintf(stderr, "a defined result code was not recognised\n");
+        failures++;
+    }
+    if (st_egress_is_known_code("EGRESS_MADE_UP") || st_egress_is_known_code("")
+        || st_egress_is_known_code(NULL)) {
+        fprintf(stderr, "an undefined result code was accepted\n");
+        failures++;
+    }
+    if (ST_EGRESS_ALL_CODES_LEN != 26U) {
+        fprintf(stderr, "expected 26 result codes, got %zu\n", ST_EGRESS_ALL_CODES_LEN);
+        failures++;
+    }
+    return failures;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
         return 1;
     }
     if (test_http_route_auth_migration() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_egress_policy_round_trip() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_egress_activity_round_trip() != 0) {
+        return 1;
+    }
+    if (test_peer_egress_known_codes() != 0) {
         return 1;
     }
     char path[256];

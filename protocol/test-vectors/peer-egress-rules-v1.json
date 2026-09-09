@@ -1,0 +1,233 @@
+{
+  "name": "peer-egress-rules-v1",
+  "version": 1,
+  "notes": [
+    "消费端规则只有目的地址一种匹配维度。消费端靠安装路由把流量引入 TUN，而路由只能按目的地址选择；端口和协议限制属于出口策略，在出口侧建流时执行。",
+    "优先级：前缀更长者优先；前缀长度相同时按用户配置顺序，先匹配者胜。",
+    "默认动作：未匹配即本地直连。这是路由表本身的结果——没有安装路由的目标根本不会进入 TUN，实现不得再加一条兜底放行分支。",
+    "规则变更对已建流：已建流不受影响，除非规则从 allow 变为 deny 或不再匹配，此时立即断开并向出口发送 flow-purge 控制消息。",
+    "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。"
+  ],
+  "meshCidr": "100.96.0.0/11",
+  "rules": [
+    {
+      "index": 0,
+      "match": "203.0.113.0/24",
+      "action": "direct"
+    },
+    {
+      "index": 1,
+      "match": "203.0.113.128/25",
+      "action": "egress",
+      "egressClientId": 2
+    },
+    {
+      "index": 2,
+      "match": "198.51.100.0/24",
+      "action": "egress",
+      "egressClientId": 3
+    },
+    {
+      "index": 3,
+      "match": "198.51.100.50/32",
+      "action": "block"
+    },
+    {
+      "index": 4,
+      "match": "192.0.2.0/24",
+      "action": "egress",
+      "egressClientId": 2
+    },
+    {
+      "index": 5,
+      "match": "192.0.2.0/24",
+      "action": "block"
+    }
+  ],
+  "cases": [
+    {
+      "name": "longest-prefix-beats-order",
+      "destination": "203.0.113.200",
+      "description": "更长前缀 /25 胜出，尽管 /24 规则排在前面",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 1,
+        "reason": "matched",
+        "egressClientId": 2
+      }
+    },
+    {
+      "name": "shorter-prefix-when-no-longer-match",
+      "destination": "203.0.113.10",
+      "description": "不在 /25 范围内，落到 /24 的 direct",
+      "expect": {
+        "action": "direct",
+        "matchedRuleIndex": 0,
+        "reason": "matched"
+      }
+    },
+    {
+      "name": "host-route-beats-covering-block",
+      "destination": "198.51.100.50",
+      "description": "/32 胜过覆盖它的 /24，与配置顺序无关",
+      "expect": {
+        "action": "block",
+        "matchedRuleIndex": 3,
+        "reason": "matched"
+      }
+    },
+    {
+      "name": "covering-rule-for-sibling-address",
+      "destination": "198.51.100.51",
+      "description": "同网段其它地址仍由 /24 决定",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 2,
+        "reason": "matched",
+        "egressClientId": 3
+      }
+    },
+    {
+      "name": "equal-prefix-first-wins",
+      "destination": "192.0.2.5",
+      "description": "前缀长度相同时先匹配者胜，后面的同前缀规则不生效",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 4,
+        "reason": "matched",
+        "egressClientId": 2
+      }
+    },
+    {
+      "name": "unmatched-falls-through-to-direct",
+      "destination": "8.8.8.8",
+      "description": "未匹配即本地直连；这是路由表本身的结果，不是兜底分支",
+      "expect": {
+        "action": "direct",
+        "matchedRuleIndex": null,
+        "reason": "default"
+      }
+    },
+    {
+      "name": "network-address-is-in-range",
+      "destination": "203.0.113.128",
+      "description": "网络地址属于该前缀，正常匹配",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 1,
+        "reason": "matched",
+        "egressClientId": 2
+      }
+    },
+    {
+      "name": "broadcast-address-is-in-range",
+      "destination": "203.0.113.255",
+      "description": "/24 的广播地址落在 /25 内，仍按最长前缀匹配",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 1,
+        "reason": "matched",
+        "egressClientId": 2
+      }
+    }
+  ],
+  "configValidation": [
+    {
+      "name": "exact-domain",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED",
+      "reason": "一期不支持域名规则。必须在配置校验阶段拒绝，不得忽略，更不得在启动时解析成静态 IP"
+    },
+    {
+      "name": "domain-suffix",
+      "rule": {
+        "match": "*.example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED",
+      "reason": "域名后缀同样属于二期范围"
+    },
+    {
+      "name": "ipv6-cidr",
+      "rule": {
+        "match": "2001:db8::/32",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
+      "reason": "一期数据面只有 IPv4；拒绝而不是静默忽略，否则会静默走本地形成泄漏"
+    },
+    {
+      "name": "ipv6-single",
+      "rule": {
+        "match": "2001:db8::1",
+        "action": "block"
+      },
+      "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
+      "reason": "同上"
+    },
+    {
+      "name": "malformed-prefix-length",
+      "rule": {
+        "match": "203.0.113.0/33",
+        "action": "block"
+      },
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "IPv4 前缀长度必须为 0..32"
+    },
+    {
+      "name": "host-bits-set",
+      "rule": {
+        "match": "203.0.113.1/24",
+        "action": "block"
+      },
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "主机位非零一律拒绝，不做隐式掩码归一化——各语言的归一化行为不一致，拒绝比兼容更安全"
+    },
+    {
+      "name": "egress-action-without-target",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress"
+      },
+      "code": "EGRESS_RULE_MISSING_TARGET",
+      "reason": "action=egress 必须指定 egressClientId"
+    },
+    {
+      "name": "overlaps-mesh-cidr",
+      "rule": {
+        "match": "100.96.0.0/11",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_MESH_OVERLAP",
+      "reason": "规则不得覆盖 Peer Mesh 虚拟网段，否则组网自身流量会被卷进出口"
+    },
+    {
+      "name": "default-route-not-allowed",
+      "rule": {
+        "match": "0.0.0.0/0",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_DEFAULT_ROUTE",
+      "reason": "一期不接管默认路由。抢默认路由会覆盖用户既有配置，且与「未匹配即本地直连」冲突"
+    },
+    {
+      "name": "port-on-consumer-rule",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2,
+        "port": 443
+      },
+      "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+      "reason": "消费端按路由分流，路由只能选目的地址。端口与协议限制只存在于出口策略，在建流时执行"
+    }
+  ]
+}

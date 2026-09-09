@@ -8,6 +8,7 @@ using Specus.Protocol.Packets;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
+using Specus.Protocol.PeerEgress;
 using Specus.Server.PeerMesh;
 
 namespace Specus.Server.Authentication;
@@ -476,6 +477,8 @@ public sealed class ClientAccountService
                 environment.ClientPeerServiceCapabilities.Version),
             PeerServiceApplications = PeerMeshService.EncodeApplications(
                 environment.ClientPeerServiceCapabilities.Applications),
+            ClientEgressVersion = PeerEgressProtocol.NormalizeVersion(
+                environment.ClientEgressCapabilities.Version),
             HttpLoginAt = DateTimeOffset.UtcNow,
             ExpiresAt = session.ExpiresAt,
         };

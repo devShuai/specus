@@ -198,6 +198,12 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/peer-mesh/acls", a.requireAuth(a.handlePeerMeshACLs))
 	mux.HandleFunc("POST /api/admin/peer-mesh/acls", a.requireAuth(a.handlePeerMeshCreateACL))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/acls/{id}", a.requireAuth(a.handlePeerMeshDeleteACL))
+	mux.HandleFunc("GET /api/admin/peer-mesh/egress/policies", a.requireAuth(a.handlePeerEgressPolicies))
+	mux.HandleFunc("GET /api/admin/peer-mesh/egress/activity", a.requireAuth(a.handlePeerEgressActivity))
+	mux.HandleFunc("GET /api/admin/peer-mesh/egress/switch", a.requireAuth(a.handlePeerEgressSwitch))
+	mux.HandleFunc("PUT /api/admin/peer-mesh/egress/switch", a.requireAuth(a.handlePeerEgressSetSwitch))
+	mux.HandleFunc("POST /api/admin/peer-mesh/egress/policies", a.requireAuth(a.handlePeerEgressUpsertPolicy))
+	mux.HandleFunc("DELETE /api/admin/peer-mesh/egress/policies/{id}", a.requireAuth(a.handlePeerEgressDeletePolicy))
 	mux.HandleFunc("GET /api/admin/peer-mesh/stats", a.requireAuth(a.handlePeerMeshStats))
 	mux.HandleFunc("GET /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshSessions))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions/{id}", a.requireAuth(a.handlePeerMeshCloseSession))
@@ -2208,6 +2214,110 @@ func (a *API) handlePeerMeshDeleteACL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.peerMesh.DeleteACL(r.Context(), a.peerAccess(principal), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handlePeerEgressPolicies(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	items, err := a.peerMesh.ListEgressPolicies(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// Tenant-wide egress switch. Separate from the per-device flag on each policy: both must be on for
+// a device to act as an egress, and switching this off stops the tenant without losing which devices
+// were configured.
+func (a *API) handlePeerEgressSwitch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	view, err := a.peerMesh.EgressSwitchStatus(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (a *API) handlePeerEgressSetSwitch(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	var req peermesh.EgressSwitchMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	view, err := a.peerMesh.SetEgressSwitch(r.Context(), a.peerAccess(principal), req)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// Latest counters each egress device reported about itself. Counters only: the report carries no
+// destination, domain or request content, and refusals arrive aggregated by result code.
+func (a *API) handlePeerEgressActivity(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	items, err := a.peerMesh.ListEgressActivity(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// Upsert by egressClientId; omitted fields keep their stored value.
+func (a *API) handlePeerEgressUpsertPolicy(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	var req peermesh.EgressPolicyMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	item, err := a.peerMesh.UpsertEgressPolicy(r.Context(), a.peerAccess(principal), req)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (a *API) handlePeerEgressDeletePolicy(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.peerMesh.DeleteEgressPolicy(r.Context(), a.peerAccess(principal), id); err != nil {
 		a.fail(w, err)
 		return
 	}

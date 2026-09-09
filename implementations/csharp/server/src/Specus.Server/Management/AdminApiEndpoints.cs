@@ -864,6 +864,46 @@ public static class AdminApiEndpoints
                     request.ClientId ?? throw new ArgumentException("clientId is required"),
                     request.Source, cancellationToken));
 
+        app.MapGet("/api/admin/peer-mesh/egress/policies",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListEgressPoliciesAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/egress/switch",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.EgressSwitchStatusAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapPut("/api/admin/peer-mesh/egress/switch",
+            (HttpContext context, PeerEgressSwitchMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.SetEgressSwitchAsync(ManagementContext.From(context, authOptions.Value),
+                    request.Enabled ?? false, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/egress/activity",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListEgressActivityAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapPost("/api/admin/peer-mesh/egress/policies",
+            (HttpContext context, PeerEgressPolicyMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.UpsertEgressPolicyAsync(ManagementContext.From(context, authOptions.Value), request,
+                    cancellationToken));
+
+        app.MapDelete("/api/admin/peer-mesh/egress/policies/{id:long}",
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteEgressPolicyAsync(ManagementContext.From(context, authOptions.Value), id,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Ok();
+            });
+
         app.MapGet("/api/admin/peer-mesh/service-audit",
             (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service) =>
                 Results.Ok(service.RecentAudits(ManagementContext.From(context, authOptions.Value))));

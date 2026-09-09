@@ -38,6 +38,7 @@ type clientEnvironmentInfo struct {
 	PeerPublicKey                 string                        `json:"peerPublicKey"`
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
+	ClientEgressCapabilities      clientEgressCapabilities      `json:"clientEgressCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
 	StartedAt                     string                        `json:"startedAt"`
 }
@@ -53,6 +54,18 @@ type clientMessageCapabilities struct {
 type clientPeerServiceCapabilities struct {
 	Version      int      `json:"version"`
 	Applications []string `json:"applications"`
+}
+
+// Peer egress split routing. Version 0 or absent means the client cannot take part, and the server
+// must not push egress-config or egress-catalog to it. domainTarget and ipv6Target are tracked
+// separately from the version so a later release adding domain rules can coexist with clients that
+// only understand address targets.
+type clientEgressCapabilities struct {
+	Version             int  `json:"version"`
+	ConsumerCapable     bool `json:"consumerCapable"`
+	EgressCapable       bool `json:"egressCapable"`
+	DomainTargetCapable bool `json:"domainTargetCapable"`
+	Ipv6TargetCapable   bool `json:"ipv6TargetCapable"`
 }
 
 type clientAuthLoginResponse struct {
@@ -184,6 +197,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		MessageMaxAttachmentBytes:   max64(0, request.Environment.ClientMessageCapabilities.MaxAttachmentBytes),
 		PeerServiceDiscoveryVersion: peermesh.NormalizePeerServiceVersion(request.Environment.ClientPeerServiceCapabilities.Version),
 		PeerServiceApplications:     peermesh.EncodePeerServiceApplications(request.Environment.ClientPeerServiceCapabilities.Applications),
+		ClientEgressVersion:         peermesh.NormalizeEgressVersion(request.Environment.ClientEgressCapabilities.Version),
 		HTTPLoginAt:                 now,
 		ExpiresAt:                   session.ExpiresAt,
 	}); err != nil {

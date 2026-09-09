@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   message_max_attachment_bytes BIGINT NOT NULL DEFAULT 0,
   peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,
   peer_service_applications VARCHAR(160),
+  client_egress_version INTEGER NOT NULL DEFAULT 0,
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),
@@ -648,3 +649,48 @@ CREATE TABLE IF NOT EXISTS user_diagram_document (
 
 CREATE INDEX IF NOT EXISTS idx_user_diagram_owner ON user_diagram_document (tenant_id, owner_username);
 CREATE INDEX IF NOT EXISTS idx_user_diagram_updated ON user_diagram_document (updated_at);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
+  id BIGINT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(80) NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name VARCHAR(120) NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  scope VARCHAR(16) NOT NULL DEFAULT 'PUBLIC',
+  allowed_consumer_client_ids VARCHAR(512),
+  destination_rules VARCHAR(4096),
+  max_concurrent_flows INTEGER NOT NULL DEFAULT 256,
+  max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,
+  idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_egress_policy_enabled ON peer_mesh_egress_policy (tenant_id, enabled);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
+  id BIGINT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  egress_client_id BIGINT NOT NULL,
+  egress_client_name TEXT NOT NULL,
+  session_id BIGINT NOT NULL DEFAULT 0,
+  revision BIGINT NOT NULL DEFAULT 0,
+  active_flows BIGINT NOT NULL DEFAULT 0,
+  total_flows BIGINT NOT NULL DEFAULT 0,
+  rejected_flows TEXT,
+  bytes_in BIGINT NOT NULL DEFAULT 0,
+  bytes_out BIGINT NOT NULL DEFAULT 0,
+  reported_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
+  tenant_id TEXT NOT NULL PRIMARY KEY,
+  enabled BOOLEAN NOT NULL DEFAULT 0,
+  updated_by TEXT,
+  updated_at TEXT NOT NULL
+);

@@ -5,6 +5,7 @@ import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
+import com.theshuai.common.peeregress.PeerEgressProtocol;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.specusserver.config.ClientAuthProperties;
@@ -465,6 +466,8 @@ public class ClientAuthService {
         session.setPeerServiceDiscoveryVersion(version);
         session.setPeerServiceApplications(PeerServiceDiscovery.encodeApplications(
                 version < 1 ? List.of() : discovery.getApplications()));
+        session.setClientEgressVersion(PeerEgressProtocol.normalizeVersion(
+                environment.getClientEgressCapabilities().getVersion()));
     }
 
     private List<ClientAuthLoginResponse.SpecusEndpoint> loadTcpMappings(ClientAccount account) {

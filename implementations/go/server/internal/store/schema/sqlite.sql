@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,
   peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,
   peer_service_applications TEXT,
+  client_egress_version INTEGER NOT NULL DEFAULT 0,
   http_login_at TEXT NOT NULL,
   netty_connected_at TEXT,
   disconnected_at TEXT,
@@ -648,3 +649,48 @@ CREATE TABLE IF NOT EXISTS user_diagram_document (
 
 CREATE INDEX IF NOT EXISTS idx_user_diagram_owner ON user_diagram_document (tenant_id, owner_username);
 CREATE INDEX IF NOT EXISTS idx_user_diagram_updated ON user_diagram_document (updated_at);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  owner_username TEXT NOT NULL,
+  egress_client_id INTEGER NOT NULL,
+  egress_client_name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  scope TEXT NOT NULL DEFAULT 'PUBLIC',
+  allowed_consumer_client_ids TEXT,
+  destination_rules TEXT,
+  max_concurrent_flows INTEGER NOT NULL DEFAULT 256,
+  max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,
+  idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_egress_policy_enabled ON peer_mesh_egress_policy (tenant_id, enabled);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  egress_client_id INTEGER NOT NULL,
+  egress_client_name TEXT NOT NULL,
+  session_id INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 0,
+  active_flows INTEGER NOT NULL DEFAULT 0,
+  total_flows INTEGER NOT NULL DEFAULT 0,
+  rejected_flows TEXT,
+  bytes_in INTEGER NOT NULL DEFAULT 0,
+  bytes_out INTEGER NOT NULL DEFAULT 0,
+  reported_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (tenant_id, egress_client_id)
+);
+
+CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
+  tenant_id TEXT NOT NULL PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_by TEXT,
+  updated_at TEXT NOT NULL
+);

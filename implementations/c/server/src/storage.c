@@ -203,7 +203,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         "first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "UNIQUE(credential_id, machine_fingerprint, os_user)"
-        ");"
+        ");");
+    if (rc == 0) {
+        rc = exec_sql(db,
         "CREATE TABLE IF NOT EXISTS specus_client_session ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
@@ -234,8 +236,10 @@ int st_storage_init(const char *path, int seed_demo_client)
         "disconnected_at TEXT,"
         "expires_at TEXT NOT NULL,"
         "channel_id TEXT,"
-        "remote_address TEXT"
+        "remote_address TEXT,"
+        "client_egress_version INTEGER NOT NULL DEFAULT 0"
         ");");
+    }
     if (rc == 0) {
         rc = exec_sql(db,
         "CREATE TABLE IF NOT EXISTS public_transfer_room ("
@@ -423,6 +427,31 @@ int st_storage_init(const char *path, int seed_demo_client)
         "ON peer_mesh_shared_service(tenant_id,client_id);"
         "CREATE INDEX IF NOT EXISTS idx_peer_service_audit_tenant_id "
         "ON peer_mesh_service_audit(tenant_id,id DESC);"
+        "CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,owner_username TEXT NOT NULL,"
+        "egress_client_id INTEGER NOT NULL,egress_client_name TEXT NOT NULL,"
+        "enabled INTEGER NOT NULL DEFAULT 0,scope TEXT NOT NULL DEFAULT 'PUBLIC',"
+        "allowed_consumer_client_ids TEXT,destination_rules TEXT,"
+        "max_concurrent_flows INTEGER NOT NULL DEFAULT 256,"
+        "max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,"
+        "idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE(tenant_id,egress_client_id));"
+        "CREATE INDEX IF NOT EXISTS idx_peer_egress_policy_enabled "
+        "ON peer_mesh_egress_policy(tenant_id,enabled);"
+        "CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,egress_client_id INTEGER NOT NULL,"
+        "egress_client_name TEXT NOT NULL,session_id INTEGER NOT NULL DEFAULT 0,"
+        "revision INTEGER NOT NULL DEFAULT 0,active_flows INTEGER NOT NULL DEFAULT 0,"
+        "total_flows INTEGER NOT NULL DEFAULT 0,rejected_flows TEXT,"
+        "bytes_in INTEGER NOT NULL DEFAULT 0,bytes_out INTEGER NOT NULL DEFAULT 0,"
+        "reported_at TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE(tenant_id,egress_client_id));"
+        "CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch ("
+        "tenant_id TEXT NOT NULL PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,"
+        "updated_by TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         );
     }
     if (rc == 0) {
@@ -660,6 +689,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "specus_client_session", "peer_service_applications", "TEXT");
     }
     if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_client_session", "client_egress_version", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
     if (rc == 0) {
@@ -848,6 +880,7 @@ static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
     }
     client->upload_bytes = sqlite3_column_int64(stmt, 16);
     client->download_bytes = sqlite3_column_int64(stmt, 17);
+    client->client_egress_version = sqlite3_column_int(stmt, 18);
     return 0;
 }
 
@@ -959,6 +992,7 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
     session->message_media_preview_capable = sqlite3_column_int(stmt, 20) != 0;
     session->message_max_attachment_bytes = sqlite3_column_int64(stmt, 21);
     session->peer_service_discovery_version = sqlite3_column_int(stmt, 22);
+    session->client_egress_version = sqlite3_column_int(stmt, 30);
     return 0;
 }
 
@@ -1324,7 +1358,8 @@ int st_storage_list_clients(const char *path,
         "COALESCE((SELECT peer_service_applications FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0) "
+        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account ORDER BY client_name",
         -1,
         &stmt,
@@ -1365,7 +1400,8 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
         "COALESCE((SELECT peer_service_applications FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0) "
+        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE rowid = ?",
         -1,
         &stmt,
@@ -1401,7 +1437,8 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
         "COALESCE((SELECT peer_service_applications FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0) "
+        "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE client_name = ?",
         -1,
         &stmt,
@@ -2697,7 +2734,7 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
-        "disconnected_at, expires_at, channel_id, remote_address "
+        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version "
         "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -2728,7 +2765,7 @@ int st_storage_create_client_session(const char *path,
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, peer_service_discovery_version, peer_service_applications, "
-        "http_login_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "http_login_at, expires_at, client_egress_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -2758,6 +2795,7 @@ int st_storage_create_client_session(const char *path,
         bind_nullable_text_limit(stmt, 23, session->peer_service_applications, 127);
         sqlite3_bind_text(stmt, 24, session->http_login_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 25, session->expires_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 26, session->client_egress_version);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -2787,7 +2825,7 @@ int st_storage_get_client_session_for_login(const char *path,
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
-        "disconnected_at, expires_at, channel_id, remote_address "
+        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version "
         "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,
@@ -6068,6 +6106,357 @@ int st_storage_delete_peer_mesh_service(const char *path,
         sqlite3_bind_int64(stmt, 1, id);
         sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : 1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+static const char *peer_mesh_egress_policy_select(void)
+{
+    return "SELECT id,tenant_id,owner_username,egress_client_id,egress_client_name,enabled,scope,"
+        "allowed_consumer_client_ids,destination_rules,max_concurrent_flows,max_flows_per_consumer,"
+        "idle_timeout_seconds,created_at,updated_at FROM peer_mesh_egress_policy";
+}
+
+static int scan_peer_mesh_egress_policy(sqlite3_stmt *stmt, st_storage_peer_mesh_egress_policy *policy)
+{
+    memset(policy, 0, sizeof(*policy));
+    policy->id = sqlite3_column_int64(stmt, 0);
+    policy->egress_client_id = sqlite3_column_int64(stmt, 3);
+    policy->enabled = sqlite3_column_int(stmt, 5) != 0;
+    policy->max_concurrent_flows = sqlite3_column_int(stmt, 9);
+    policy->max_flows_per_consumer = sqlite3_column_int(stmt, 10);
+    policy->idle_timeout_seconds = sqlite3_column_int(stmt, 11);
+    return copy_text_column(stmt, 1, policy->tenant_id, sizeof(policy->tenant_id)) == 0
+        && copy_text_column(stmt, 2, policy->owner_username, sizeof(policy->owner_username)) == 0
+        && copy_text_column(stmt, 4, policy->egress_client_name, sizeof(policy->egress_client_name)) == 0
+        && copy_text_column(stmt, 6, policy->scope, sizeof(policy->scope)) == 0
+        && copy_text_column(stmt, 7, policy->allowed_consumer_client_ids,
+                            sizeof(policy->allowed_consumer_client_ids)) == 0
+        && copy_text_column(stmt, 8, policy->destination_rules, sizeof(policy->destination_rules)) == 0
+        && copy_text_column(stmt, 12, policy->created_at, sizeof(policy->created_at)) == 0
+        && copy_text_column(stmt, 13, policy->updated_at, sizeof(policy->updated_at)) == 0 ? 0 : -1;
+}
+
+int st_storage_list_peer_mesh_egress_policies(const char *path,
+                                              const char *tenant_id,
+                                              int enabled_only,
+                                              st_storage_peer_mesh_egress_policy *policies,
+                                              size_t max_policies,
+                                              size_t *policy_count)
+{
+    if (policies == NULL || policy_count == NULL) return -1;
+    *policy_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    char sql[768];
+    int written = snprintf(sql, sizeof(sql), "%s WHERE tenant_id=?%s ORDER BY egress_client_name",
+        peer_mesh_egress_policy_select(), enabled_only ? " AND enabled=1" : "");
+    sqlite3_stmt *stmt = NULL;
+    int rc = written > 0 && (size_t)written < sizeof(sql)
+        ? sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (*policy_count >= max_policies
+                || scan_peer_mesh_egress_policy(stmt, &policies[*policy_count]) != 0) {
+                rc = SQLITE_ERROR;
+                break;
+            }
+            ++*policy_count;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* Returns 0 on a hit, 1 when the row is absent, -1 on a storage failure. */
+static int peer_mesh_egress_policy_lookup(const char *path,
+                                          const char *column,
+                                          long long key,
+                                          const char *tenant_id,
+                                          st_storage_peer_mesh_egress_policy *out_policy)
+{
+    if (out_policy == NULL || key <= 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    char sql[768];
+    int written = snprintf(sql, sizeof(sql), "%s WHERE tenant_id=? AND %s=?",
+        peer_mesh_egress_policy_select(), column);
+    sqlite3_stmt *stmt = NULL;
+    int rc = written > 0 && (size_t)written < sizeof(sql)
+        ? sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    int result = -1;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, key);
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) result = scan_peer_mesh_egress_policy(stmt, out_policy) == 0 ? 0 : -1;
+        else if (rc == SQLITE_DONE) result = 1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
+int st_storage_get_peer_mesh_egress_policy(const char *path,
+                                           long long id,
+                                           const char *tenant_id,
+                                           st_storage_peer_mesh_egress_policy *out_policy)
+{
+    return peer_mesh_egress_policy_lookup(path, "id", id, tenant_id, out_policy);
+}
+
+int st_storage_find_peer_mesh_egress_policy_by_client(const char *path,
+                                                      const char *tenant_id,
+                                                      long long egress_client_id,
+                                                      st_storage_peer_mesh_egress_policy *out_policy)
+{
+    return peer_mesh_egress_policy_lookup(path, "egress_client_id", egress_client_id, tenant_id, out_policy);
+}
+
+int st_storage_upsert_peer_mesh_egress_policy(const char *path,
+                                              const st_storage_peer_mesh_egress_policy *policy,
+                                              st_storage_peer_mesh_egress_policy *out_policy)
+{
+    if (policy == NULL || policy->egress_client_id <= 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = policy->id > 0
+        ? "UPDATE peer_mesh_egress_policy SET owner_username=?,egress_client_name=?,enabled=?,scope=?,"
+          "allowed_consumer_client_ids=?,destination_rules=?,max_concurrent_flows=?,"
+          "max_flows_per_consumer=?,idle_timeout_seconds=?,updated_at=CURRENT_TIMESTAMP "
+          "WHERE id=? AND tenant_id=?"
+        : "INSERT INTO peer_mesh_egress_policy(tenant_id,owner_username,egress_client_id,egress_client_name,"
+          "enabled,scope,allowed_consumer_client_ids,destination_rules,max_concurrent_flows,"
+          "max_flows_per_consumer,idle_timeout_seconds,created_at,updated_at) "
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK && policy->id > 0) {
+        sqlite3_bind_text(stmt, 1, normalize_owner_username(policy->owner_username), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, policy->egress_client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, policy->enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 4, policy->scope, -1, SQLITE_TRANSIENT);
+        bind_nullable_text_limit(stmt, 5, policy->allowed_consumer_client_ids, 511);
+        bind_nullable_text_limit(stmt, 6, policy->destination_rules, 4096);
+        sqlite3_bind_int(stmt, 7, policy->max_concurrent_flows);
+        sqlite3_bind_int(stmt, 8, policy->max_flows_per_consumer);
+        sqlite3_bind_int(stmt, 9, policy->idle_timeout_seconds);
+        sqlite3_bind_int64(stmt, 10, policy->id);
+        sqlite3_bind_text(stmt, 11, normalize_tenant_id(policy->tenant_id), -1, SQLITE_TRANSIENT);
+    } else if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(policy->tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(policy->owner_username), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, policy->egress_client_id);
+        sqlite3_bind_text(stmt, 4, policy->egress_client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 5, policy->enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 6, policy->scope, -1, SQLITE_TRANSIENT);
+        bind_nullable_text_limit(stmt, 7, policy->allowed_consumer_client_ids, 511);
+        bind_nullable_text_limit(stmt, 8, policy->destination_rules, 4096);
+        sqlite3_bind_int(stmt, 9, policy->max_concurrent_flows);
+        sqlite3_bind_int(stmt, 10, policy->max_flows_per_consumer);
+        sqlite3_bind_int(stmt, 11, policy->idle_timeout_seconds);
+    }
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    else rc = -1;
+    sqlite3_finalize(stmt);
+    long long id = policy->id > 0 ? policy->id : sqlite3_last_insert_rowid(db);
+    sqlite3_close(db);
+    return rc == 0 && out_policy != NULL
+        ? st_storage_get_peer_mesh_egress_policy(path, id, policy->tenant_id, out_policy) : rc;
+}
+
+int st_storage_delete_peer_mesh_egress_policy(const char *path,
+                                              long long id,
+                                              const char *tenant_id)
+{
+    sqlite3 *db = NULL;
+    if (id <= 0 || open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "DELETE FROM peer_mesh_egress_policy WHERE id=? AND tenant_id=?", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : 1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+static const char *peer_mesh_egress_activity_select(void)
+{
+    return "SELECT id,tenant_id,egress_client_id,egress_client_name,session_id,revision,active_flows,"
+        "total_flows,rejected_flows,bytes_in,bytes_out,reported_at,created_at,updated_at "
+        "FROM peer_mesh_egress_activity";
+}
+
+static int scan_peer_mesh_egress_activity(sqlite3_stmt *stmt, st_storage_peer_mesh_egress_activity *row)
+{
+    memset(row, 0, sizeof(*row));
+    row->id = sqlite3_column_int64(stmt, 0);
+    row->egress_client_id = sqlite3_column_int64(stmt, 2);
+    row->session_id = sqlite3_column_int64(stmt, 4);
+    row->revision = sqlite3_column_int64(stmt, 5);
+    row->active_flows = sqlite3_column_int64(stmt, 6);
+    row->total_flows = sqlite3_column_int64(stmt, 7);
+    row->bytes_in = sqlite3_column_int64(stmt, 9);
+    row->bytes_out = sqlite3_column_int64(stmt, 10);
+    return copy_text_column(stmt, 1, row->tenant_id, sizeof(row->tenant_id)) == 0
+        && copy_text_column(stmt, 3, row->egress_client_name, sizeof(row->egress_client_name)) == 0
+        && copy_text_column(stmt, 8, row->rejected_flows, sizeof(row->rejected_flows)) == 0
+        && copy_text_column(stmt, 11, row->reported_at, sizeof(row->reported_at)) == 0
+        && copy_text_column(stmt, 12, row->created_at, sizeof(row->created_at)) == 0
+        && copy_text_column(stmt, 13, row->updated_at, sizeof(row->updated_at)) == 0 ? 0 : -1;
+}
+
+int st_storage_list_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              st_storage_peer_mesh_egress_activity *rows,
+                                              size_t max_rows,
+                                              size_t *row_count)
+{
+    if (rows == NULL || row_count == NULL) return -1;
+    *row_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    char sql[768];
+    int written = snprintf(sql, sizeof(sql), "%s WHERE tenant_id=? ORDER BY egress_client_name",
+        peer_mesh_egress_activity_select());
+    sqlite3_stmt *stmt = NULL;
+    int rc = written > 0 && (size_t)written < sizeof(sql)
+        ? sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (*row_count >= max_rows
+                || scan_peer_mesh_egress_activity(stmt, &rows[*row_count]) != 0) {
+                rc = SQLITE_ERROR;
+                break;
+            }
+            ++*row_count;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* Returns 0 on a hit, 1 when the device has never reported, -1 on a storage failure. */
+int st_storage_find_peer_mesh_egress_activity(const char *path,
+                                              const char *tenant_id,
+                                              long long egress_client_id,
+                                              st_storage_peer_mesh_egress_activity *out_row)
+{
+    if (out_row == NULL || egress_client_id <= 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    char sql[768];
+    int written = snprintf(sql, sizeof(sql), "%s WHERE tenant_id=? AND egress_client_id=?",
+        peer_mesh_egress_activity_select());
+    sqlite3_stmt *stmt = NULL;
+    int rc = written > 0 && (size_t)written < sizeof(sql)
+        ? sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    int result = -1;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, egress_client_id);
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) result = scan_peer_mesh_egress_activity(stmt, out_row) == 0 ? 0 : -1;
+        else if (rc == SQLITE_DONE) result = 1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
+int st_storage_upsert_peer_mesh_egress_activity(const char *path,
+                                                const st_storage_peer_mesh_egress_activity *row)
+{
+    if (row == NULL || row->egress_client_id <= 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO peer_mesh_egress_activity(tenant_id,egress_client_id,egress_client_name,session_id,"
+        "revision,active_flows,total_flows,rejected_flows,bytes_in,bytes_out,reported_at,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(tenant_id,egress_client_id) DO UPDATE SET egress_client_name=excluded.egress_client_name,"
+        "session_id=excluded.session_id,revision=excluded.revision,active_flows=excluded.active_flows,"
+        "total_flows=excluded.total_flows,rejected_flows=excluded.rejected_flows,bytes_in=excluded.bytes_in,"
+        "bytes_out=excluded.bytes_out,reported_at=excluded.reported_at,updated_at=CURRENT_TIMESTAMP",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(row->tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, row->egress_client_id);
+        sqlite3_bind_text(stmt, 3, row->egress_client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, row->session_id);
+        sqlite3_bind_int64(stmt, 5, row->revision);
+        sqlite3_bind_int64(stmt, 6, row->active_flows);
+        sqlite3_bind_int64(stmt, 7, row->total_flows);
+        bind_nullable_text_limit(stmt, 8, row->rejected_flows, 1023);
+        sqlite3_bind_int64(stmt, 9, row->bytes_in);
+        sqlite3_bind_int64(stmt, 10, row->bytes_out);
+        sqlite3_bind_text(stmt, 11, row->reported_at, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_get_peer_mesh_egress_switch(const char *path,
+                                           const char *tenant_id,
+                                           st_storage_peer_mesh_egress_switch *out_row)
+{
+    if (out_row == NULL) return -1;
+    memset(out_row, 0, sizeof(*out_row));
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT tenant_id,enabled,updated_by,updated_at FROM peer_mesh_egress_switch WHERE tenant_id=?",
+        -1, &stmt, NULL);
+    int result = -1;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            out_row->enabled = sqlite3_column_int(stmt, 1) != 0;
+            result = copy_text_column(stmt, 0, out_row->tenant_id, sizeof(out_row->tenant_id)) == 0
+                && copy_text_column(stmt, 2, out_row->updated_by, sizeof(out_row->updated_by)) == 0
+                && copy_text_column(stmt, 3, out_row->updated_at, sizeof(out_row->updated_at)) == 0 ? 0 : -1;
+        } else if (rc == SQLITE_DONE) {
+            result = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
+int st_storage_upsert_peer_mesh_egress_switch(const char *path,
+                                              const st_storage_peer_mesh_egress_switch *row)
+{
+    if (row == NULL) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO peer_mesh_egress_switch(tenant_id,enabled,updated_by,updated_at) "
+        "VALUES(?,?,?,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(tenant_id) DO UPDATE SET enabled=excluded.enabled,"
+        "updated_by=excluded.updated_by,updated_at=CURRENT_TIMESTAMP",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(row->tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 2, row->enabled ? 1 : 0);
+        bind_nullable_text_limit(stmt, 3, row->updated_by, 127);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
     sqlite3_close(db);

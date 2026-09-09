@@ -60,6 +60,13 @@ public sealed class ClientSession
     public long MessageMaxAttachmentBytes { get; set; }
     public int PeerServiceDiscoveryVersion { get; set; }
     public string? PeerServiceApplications { get; set; }
+
+    /// <summary>
+    /// Peer egress split routing version the client announced at login. 0 or absent means it
+    /// cannot take part, and the server must not push egress-config or egress-catalog to it.
+    /// </summary>
+    public int ClientEgressVersion { get; set; }
+
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

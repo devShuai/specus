@@ -1,0 +1,2138 @@
+{
+  "name": "peer-egress-authz-v1",
+  "version": 1,
+  "notes": [
+    "出口端在实际 connect() 前必须完整跑一遍本判定，即使服务端下发时已经取过交集。目录不可见与数据面不可达必须同时成立。",
+    "判定按固定顺序执行，这样各实现返回的错误码可以逐条比对，而不只是 allow/deny 一致。",
+    "强制拒绝清单不受任何宽泛公网规则影响。本文件的策略故意包含 0.0.0.0/0 的 tcp/443 规则，用来证明回环、云元数据等目标仍然被拒。",
+    "scope 分类：LAN 为 RFC1918 与 RFC6598 共享地址空间；其余可路由地址为 PUBLIC。"
+  ],
+  "evaluationOrder": [
+    "hop",
+    "enabled",
+    "peerAcl",
+    "consumer",
+    "forcedDeny",
+    "scope",
+    "destination",
+    "protocol",
+    "port",
+    "limits"
+  ],
+  "forcedDenyCidrs": [
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "100.96.0.0/11"
+  ],
+  "cloudMetadataCidrs": [
+    "169.254.169.254/32",
+    "100.100.100.200/32"
+  ],
+  "lanCidrs": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10"
+  ],
+  "additionalForcedDeny": [
+    "本部署的控制连接、STUN 与 TURN 端点地址",
+    "出口本机任何 TUN 或虚拟接口的网段（由 request.localInterfaceCidrs 表示）"
+  ],
+  "policy": {
+    "egressClientId": 2,
+    "enabled": true,
+    "allowedConsumerClientIds": [
+      1,
+      5
+    ],
+    "scope": "PUBLIC",
+    "destinationRules": [
+      {
+        "cidr": "203.0.113.0/24",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            80,
+            80
+          ],
+          [
+            443,
+            443
+          ]
+        ]
+      },
+      {
+        "cidr": "198.51.100.0/24",
+        "protocols": [
+          "udp"
+        ],
+        "portRanges": [
+          [
+            53,
+            53
+          ]
+        ]
+      },
+      {
+        "cidr": "0.0.0.0/0",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            443,
+            443
+          ]
+        ]
+      }
+    ],
+    "limits": {
+      "maxConcurrentFlows": 256,
+      "maxFlowsPerConsumer": 64,
+      "idleTimeoutSeconds": 60
+    }
+  },
+  "cases": [
+    {
+      "name": "tcp-203.0.113.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "允许：消费端在白名单内，目标、协议和端口都命中出口策略",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-22",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 22,
+        "protocol": "tcp"
+      },
+      "description": "端口不在允许区间",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "udp-203.0.113.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "udp"
+      },
+      "description": "协议不允许；地址命中但 UDP 未授权",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-consumer9",
+      "request": {
+        "consumerClientId": 9,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "消费设备不在出口的允许列表内",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_CONSUMER_DENIED"
+      }
+    },
+    {
+      "name": "udp-198.51.100.20-53",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "198.51.100.20",
+        "destinationPort": 53,
+        "protocol": "udp"
+      },
+      "description": "允许：UDP 规则命中",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-127.0.0.1-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "127.0.0.1",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "回环属于强制拒绝清单。注意策略里有 0.0.0.0/0 的 tcp/443 规则，强制清单仍然胜出",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-169.254.169.254-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "169.254.169.254",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "云元数据端点。同样被宽泛的 0.0.0.0/0 规则覆盖，但强制清单不受其影响",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-169.254.10.5-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "169.254.10.5",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "链路本地",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-224.0.0.1-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "224.0.0.1",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "组播",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-255.255.255.255-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "255.255.255.255",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "广播",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-100.96.0.7-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "100.96.0.7",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "Peer Mesh 虚拟网段，防止出口流量绕回组网自身",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-10.7.0.9-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "10.7.0.9",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "localInterfaceCidrs": [
+          "10.7.0.0/24"
+        ]
+      },
+      "description": "落在出口本机某个接口网段内。这是防回环规则的延伸；二期引入 fake-IP 后，出口本机的池段同样加入此清单",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "tcp-192.168.1.10-443",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.168.1.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "目标属于 LAN，但策略只授权 PUBLIC。公网访问与对端局域网访问分开授权，互不隐含",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "tcp-192.0.2.10-80",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 80,
+        "protocol": "tcp"
+      },
+      "description": "地址只被宽泛的 0.0.0.0/0 规则覆盖，而该规则仅开放 443，因此在端口一步被拒。判定按固定顺序执行，错误码必须是 PORT 而不是 DEST",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-hop",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "hop": true
+      },
+      "description": "已带 hop 标记，来自另一个出口；不支持多跳出口链",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_HOP_NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "tcp-203.0.113.10-443-at-limit",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "activeFlowsForConsumer": 64
+      },
+      "description": "单消费端并发上限已满",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_LIMIT_EXCEEDED"
+      }
+    }
+  ],
+  "policyVariantCases": [
+    {
+      "name": "egress-disabled",
+      "policyOverride": {
+        "enabled": false
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "出口总开关关闭，默认即为关闭状态",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DISABLED"
+      }
+    },
+    {
+      "name": "empty-destination-rules-deny-all",
+      "policyOverride": {
+        "destinationRules": []
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "destinationRules 为空即全拒绝；不存在「未配置即放行」",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "peer-acl-denies",
+      "peerAclAllows": false,
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "基础 Peer ACL 不允许时直接拒绝。allowed = 基础 Peer ACL ∩ 出口策略，基础组网授权不自动等于出口授权",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PEER_ACL_DENIED"
+      }
+    },
+    {
+      "name": "address-not-covered",
+      "policyOverride": {
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                80,
+                80
+              ],
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "cidr": "198.51.100.0/24",
+            "protocols": [
+              "udp"
+            ],
+            "portRanges": [
+              [
+                53,
+                53
+              ]
+            ]
+          }
+        ]
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "去掉宽泛的 0.0.0.0/0 规则后，地址不再被任何网段覆盖，在目标一步被拒",
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "lan-scope-allows-private-target",
+      "policyOverride": {
+        "scope": "LAN",
+        "destinationRules": [
+          {
+            "cidr": "192.168.1.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.168.1.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "description": "显式授予 LAN scope 后同一目标才被允许",
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    }
+  ],
+  "crossLanguageCases": [
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.0-tcp",
+      "request": {
+        "destinationIp": "203.0.113.0",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.0-udp",
+      "request": {
+        "destinationIp": "203.0.113.0",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.255-tcp",
+      "request": {
+        "destinationIp": "203.0.113.255",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.255-udp",
+      "request": {
+        "destinationIp": "203.0.113.255",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.1-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.1-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.254-tcp",
+      "request": {
+        "destinationIp": "203.0.113.254",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.113.254-udp",
+      "request": {
+        "destinationIp": "203.0.113.254",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.112.255-tcp",
+      "request": {
+        "destinationIp": "203.0.112.255",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.112.255-udp",
+      "request": {
+        "destinationIp": "203.0.112.255",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.114.0-tcp",
+      "request": {
+        "destinationIp": "203.0.114.0",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-203.0.113.0_24-203.0.114.0-udp",
+      "request": {
+        "destinationIp": "203.0.114.0",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.0-tcp",
+      "request": {
+        "destinationIp": "198.51.100.0",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.0-udp",
+      "request": {
+        "destinationIp": "198.51.100.0",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.255-tcp",
+      "request": {
+        "destinationIp": "198.51.100.255",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.255-udp",
+      "request": {
+        "destinationIp": "198.51.100.255",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.1-tcp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.1-udp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.254-tcp",
+      "request": {
+        "destinationIp": "198.51.100.254",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.100.254-udp",
+      "request": {
+        "destinationIp": "198.51.100.254",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.99.255-tcp",
+      "request": {
+        "destinationIp": "198.51.99.255",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.99.255-udp",
+      "request": {
+        "destinationIp": "198.51.99.255",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.101.0-tcp",
+      "request": {
+        "destinationIp": "198.51.101.0",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "rule-198.51.100.0_24-198.51.101.0-udp",
+      "request": {
+        "destinationIp": "198.51.101.0",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-0.0.0.0-tcp",
+      "request": {
+        "destinationIp": "0.0.0.0",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-0.0.0.0-udp",
+      "request": {
+        "destinationIp": "0.0.0.0",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-255.255.255.255-tcp",
+      "request": {
+        "destinationIp": "255.255.255.255",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-255.255.255.255-udp",
+      "request": {
+        "destinationIp": "255.255.255.255",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-0.0.0.1-tcp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-0.0.0.1-udp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-255.255.255.254-tcp",
+      "request": {
+        "destinationIp": "255.255.255.254",
+        "protocol": "tcp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "rule-0.0.0.0_0-255.255.255.254-udp",
+      "request": {
+        "destinationIp": "255.255.255.254",
+        "protocol": "udp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-80-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 80,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-80-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 80,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-81-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 81,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-81-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 81,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-79-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 79,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-79-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 79,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-442-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 442,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-442-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 442,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-444-tcp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 444,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-203.0.113.0_24-444-udp",
+      "request": {
+        "destinationIp": "203.0.113.1",
+        "destinationPort": 444,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-52-tcp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 52,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-52-udp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 52,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-53-tcp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 53,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-53-udp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 53,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-54-tcp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 54,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-198.51.100.0_24-54-udp",
+      "request": {
+        "destinationIp": "198.51.100.1",
+        "destinationPort": 54,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PORT_DENIED"
+      }
+    },
+    {
+      "name": "port-0.0.0.0_0-442-tcp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "destinationPort": 442,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "port-0.0.0.0_0-442-udp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "destinationPort": 442,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "port-0.0.0.0_0-444-tcp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "destinationPort": 444,
+        "protocol": "tcp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "port-0.0.0.0_0-444-udp",
+      "request": {
+        "destinationIp": "0.0.0.1",
+        "destinationPort": 444,
+        "protocol": "udp",
+        "consumerClientId": 1
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-0.0.0.0_8-0.255.255.255",
+      "request": {
+        "destinationIp": "0.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-0.0.0.0_8-0.255.255.254",
+      "request": {
+        "destinationIp": "0.255.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-0.0.0.0_8-1.0.0.0",
+      "request": {
+        "destinationIp": "1.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-127.0.0.0",
+      "request": {
+        "destinationIp": "127.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-127.255.255.255",
+      "request": {
+        "destinationIp": "127.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-127.0.0.1",
+      "request": {
+        "destinationIp": "127.0.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-127.255.255.254",
+      "request": {
+        "destinationIp": "127.255.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-126.255.255.255",
+      "request": {
+        "destinationIp": "126.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-127.0.0.0_8-128.0.0.0",
+      "request": {
+        "destinationIp": "128.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.254.0.0",
+      "request": {
+        "destinationIp": "169.254.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.254.255.255",
+      "request": {
+        "destinationIp": "169.254.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.254.0.1",
+      "request": {
+        "destinationIp": "169.254.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.254.255.254",
+      "request": {
+        "destinationIp": "169.254.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.253.255.255",
+      "request": {
+        "destinationIp": "169.253.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-169.254.0.0_16-169.255.0.0",
+      "request": {
+        "destinationIp": "169.255.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-224.0.0.0",
+      "request": {
+        "destinationIp": "224.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-239.255.255.255",
+      "request": {
+        "destinationIp": "239.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-224.0.0.1",
+      "request": {
+        "destinationIp": "224.0.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-239.255.255.254",
+      "request": {
+        "destinationIp": "239.255.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-223.255.255.255",
+      "request": {
+        "destinationIp": "223.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-224.0.0.0_4-240.0.0.0",
+      "request": {
+        "destinationIp": "240.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-240.0.0.0_4-240.0.0.1",
+      "request": {
+        "destinationIp": "240.0.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.96.0.0",
+      "request": {
+        "destinationIp": "100.96.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.127.255.255",
+      "request": {
+        "destinationIp": "100.127.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.96.0.1",
+      "request": {
+        "destinationIp": "100.96.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.127.255.254",
+      "request": {
+        "destinationIp": "100.127.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.95.255.255",
+      "request": {
+        "destinationIp": "100.95.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "forced-100.96.0.0_11-100.128.0.0",
+      "request": {
+        "destinationIp": "100.128.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "forced-169.254.169.254_32-169.254.169.254",
+      "request": {
+        "destinationIp": "169.254.169.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.169.254_32-169.254.169.253",
+      "request": {
+        "destinationIp": "169.254.169.253",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-169.254.169.254_32-169.254.169.255",
+      "request": {
+        "destinationIp": "169.254.169.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.100.100.200_32-100.100.100.200",
+      "request": {
+        "destinationIp": "100.100.100.200",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.100.100.200_32-100.100.100.199",
+      "request": {
+        "destinationIp": "100.100.100.199",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "forced-100.100.100.200_32-100.100.100.201",
+      "request": {
+        "destinationIp": "100.100.100.201",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-10.0.0.0",
+      "request": {
+        "destinationIp": "10.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-10.255.255.255",
+      "request": {
+        "destinationIp": "10.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-10.0.0.1",
+      "request": {
+        "destinationIp": "10.0.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-10.255.255.254",
+      "request": {
+        "destinationIp": "10.255.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-9.255.255.255",
+      "request": {
+        "destinationIp": "9.255.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-10.0.0.0_8-11.0.0.0",
+      "request": {
+        "destinationIp": "11.0.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.16.0.0",
+      "request": {
+        "destinationIp": "172.16.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.31.255.255",
+      "request": {
+        "destinationIp": "172.31.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.16.0.1",
+      "request": {
+        "destinationIp": "172.16.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.31.255.254",
+      "request": {
+        "destinationIp": "172.31.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.15.255.255",
+      "request": {
+        "destinationIp": "172.15.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-172.16.0.0_12-172.32.0.0",
+      "request": {
+        "destinationIp": "172.32.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.168.0.0",
+      "request": {
+        "destinationIp": "192.168.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.168.255.255",
+      "request": {
+        "destinationIp": "192.168.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.168.0.1",
+      "request": {
+        "destinationIp": "192.168.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.168.255.254",
+      "request": {
+        "destinationIp": "192.168.255.254",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.167.255.255",
+      "request": {
+        "destinationIp": "192.167.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-192.168.0.0_16-192.169.0.0",
+      "request": {
+        "destinationIp": "192.169.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "lan-100.64.0.0_10-100.64.0.0",
+      "request": {
+        "destinationIp": "100.64.0.0",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-100.64.0.0_10-100.64.0.1",
+      "request": {
+        "destinationIp": "100.64.0.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "lan-100.64.0.0_10-100.63.255.255",
+      "request": {
+        "destinationIp": "100.63.255.255",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "protocol-icmp-203.0.113.10",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "protocol": "icmp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "protocol-icmp-198.51.100.20",
+      "request": {
+        "destinationIp": "198.51.100.20",
+        "protocol": "icmp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "protocol-icmp-192.0.2.10",
+      "request": {
+        "destinationIp": "192.0.2.10",
+        "protocol": "icmp",
+        "consumerClientId": 1,
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_PROTOCOL_DENIED"
+      }
+    },
+    {
+      "name": "consumer-0",
+      "request": {
+        "consumerClientId": 0,
+        "destinationIp": "203.0.113.10",
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_CONSUMER_DENIED"
+      }
+    },
+    {
+      "name": "consumer-1",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.10",
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "consumer-2",
+      "request": {
+        "consumerClientId": 2,
+        "destinationIp": "203.0.113.10",
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_CONSUMER_DENIED"
+      }
+    },
+    {
+      "name": "consumer-5",
+      "request": {
+        "consumerClientId": 5,
+        "destinationIp": "203.0.113.10",
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "consumer-9",
+      "request": {
+        "consumerClientId": 9,
+        "destinationIp": "203.0.113.10",
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_CONSUMER_DENIED"
+      }
+    },
+    {
+      "name": "hop-over-an-allowed-request",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "hop": true,
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_HOP_NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "hop-over-a-denied-request",
+      "request": {
+        "destinationIp": "127.0.0.1",
+        "hop": true,
+        "consumerClientId": 9,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_HOP_NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "per-consumer-flows-63",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "activeFlowsForConsumer": 63,
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "per-consumer-flows-64",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "activeFlowsForConsumer": 64,
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_LIMIT_EXCEEDED"
+      }
+    },
+    {
+      "name": "total-flows-255",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "activeFlowsTotal": 255,
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "total-flows-256",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "activeFlowsTotal": 256,
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_LIMIT_EXCEEDED"
+      }
+    },
+    {
+      "name": "local-interface-hit",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "localInterfaceCidrs": [
+          "203.0.113.0/24"
+        ],
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_FORBIDDEN_DESTINATION"
+      }
+    },
+    {
+      "name": "local-interface-miss",
+      "request": {
+        "destinationIp": "203.0.113.10",
+        "localInterfaceCidrs": [
+          "198.18.0.0/15"
+        ],
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": true,
+        "code": "EGRESS_ALLOWED"
+      }
+    },
+    {
+      "name": "malformed-010.1.1.1",
+      "request": {
+        "destinationIp": "010.1.1.1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "malformed-1.2.3",
+      "request": {
+        "destinationIp": "1.2.3",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "malformed-1.2.3.256",
+      "request": {
+        "destinationIp": "1.2.3.256",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "malformed-empty",
+      "request": {
+        "destinationIp": "",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    },
+    {
+      "name": "malformed-2001:db8::1",
+      "request": {
+        "destinationIp": "2001:db8::1",
+        "consumerClientId": 1,
+        "protocol": "tcp",
+        "destinationPort": 443
+      },
+      "expect": {
+        "allowed": false,
+        "code": "EGRESS_DEST_DENIED"
+      }
+    }
+  ]
+}

@@ -8,6 +8,7 @@ import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.session.Session;
 import com.theshuai.common.util.JsonUtil;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
@@ -26,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Service
 @Slf4j
@@ -34,15 +36,18 @@ public class PeerSignalService {
     private final PeerMeshService peerMeshService;
     private final PeerServiceDiscoveryService peerServiceDiscoveryService;
     private final ClientSessionRepository clientSessionRepository;
+    private final PeerEgressService peerEgressService;
 
     public PeerSignalService(ClientAccountService clientAccountService,
                              PeerMeshService peerMeshService,
                              PeerServiceDiscoveryService peerServiceDiscoveryService,
-                             ClientSessionRepository clientSessionRepository) {
+                             ClientSessionRepository clientSessionRepository,
+                             PeerEgressService peerEgressService) {
         this.clientAccountService = clientAccountService;
         this.peerMeshService = peerMeshService;
         this.peerServiceDiscoveryService = peerServiceDiscoveryService;
         this.clientSessionRepository = clientSessionRepository;
+        this.peerEgressService = peerEgressService;
     }
 
     @Transactional
@@ -59,6 +64,11 @@ public class PeerSignalService {
         if (PeerControlMessage.TYPE_SERVICE_REPORT.equals(signal.getType())) {
             validateServiceReportEnvelope(request);
             pushCatalogs(peerServiceDiscoveryService.handleReport(source, signal));
+            return;
+        }
+        if (PeerControlMessage.TYPE_EGRESS_REPORT.equals(signal.getType())) {
+            PeerEgressService.validateReportEnvelope(request.getMessage(), request.getToClientName());
+            peerEgressService.handleReport(source, signal, authenticatedEgressSessionId(source));
             return;
         }
         fillSource(signal, source);
@@ -83,6 +93,10 @@ public class PeerSignalService {
         }
         if (PeerControlMessage.TYPE_SERVICE_CATALOG.equals(signal.getType())) {
             throw new IllegalArgumentException("service-catalog is server-only");
+        }
+        if (PeerControlMessage.TYPE_EGRESS_CONFIG.equals(signal.getType())
+                || PeerControlMessage.TYPE_EGRESS_CATALOG.equals(signal.getType())) {
+            throw new IllegalArgumentException(signal.getType() + " is server-only");
         }
 
         if (!StringUtils.hasText(request.getToClientName())) {
@@ -160,8 +174,10 @@ public class PeerSignalService {
         }
         pushConfig(account);
         pushCatalogs(peerServiceDiscoveryService.catalogsForRecipient(account));
+        pushEgress(account);
         for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
             pushRoster(target);
+            pushEgress(target);
         }
     }
 
@@ -243,6 +259,102 @@ public class PeerSignalService {
     @Scheduled(fixedDelay = 30_000)
     public void expirePeerServiceCatalogs() {
         pushCatalogs(peerServiceDiscoveryService.expireStale());
+    }
+
+    /**
+     * Sends the current {@code egress-config} and {@code egress-catalog} to one device.
+     *
+     * <p>A client that announced no egress capability at login gets nothing, so a runtime that would
+     * not understand the payload never receives it.
+     */
+    public void pushEgress(ClientAccount account) {
+        if (!peerMeshService.isEnabled() || account == null) {
+            return;
+        }
+        Channel channel = SessionUtil.getChannel(account.getClientName());
+        if (channel == null || !SessionUtil.hasLogin(channel)) {
+            return;
+        }
+        int version = clientEgressVersion(account);
+        if (version < 1) {
+            return;
+        }
+        PeerControlMessage config = peerEgressService.buildEgressConfig(account, version);
+        if (config != null) {
+            config.setSourceClientId(account.getId());
+            config.setSourceClientName(account.getClientName());
+            config.setTargetClientId(account.getId());
+            config.setTargetClientName(account.getClientName());
+            config.setCreatedAtMillis(System.currentTimeMillis());
+            sendSignal(channel, "server", account.getClientName(), config);
+        }
+        PeerControlMessage catalog = peerEgressService.buildEgressCatalog(account, version);
+        if (catalog != null) {
+            catalog.setSourceClientId(account.getId());
+            catalog.setSourceClientName(account.getClientName());
+            catalog.setTargetClientId(account.getId());
+            catalog.setTargetClientName(account.getClientName());
+            catalog.setCreatedAtMillis(System.currentTimeMillis());
+            sendSignal(channel, "server", account.getClientName(), catalog);
+        }
+    }
+
+    /**
+     * Refreshes every online device in the tenant after a policy change.
+     *
+     * <p>A policy change moves two things at once: what the egress node itself will accept, and
+     * which egresses its peers can see. Both sides are refreshed together so the catalogue never
+     * advertises an egress that has already stopped accepting the viewer.
+     */
+    public void pushTenantEgress(String tenantId) {
+        if (!StringUtils.hasText(tenantId)) {
+            return;
+        }
+        for (ClientAccount account : clientAccountService.listTenantAccounts(tenantId)) {
+            pushEgress(account);
+        }
+    }
+
+    /**
+     * Binds the reporter to its authenticated control connection.
+     *
+     * <p>The session comes from the channel, is re-checked against the account and tenant, and must
+     * be the one currently online. Nothing here is read from the report body.
+     */
+    private long authenticatedEgressSessionId(ClientAccount source) {
+        Channel channel = SessionUtil.getChannel(source.getClientName());
+        if (channel == null) {
+            throw new IllegalArgumentException("egress session is required");
+        }
+        Long sessionId = channel.attr(ServerAttributes.CLIENT_SESSION_ID).get();
+        if (sessionId == null || sessionId <= 0) {
+            throw new IllegalArgumentException("egress session is required");
+        }
+        ClientSession session = clientSessionRepository.findById(sessionId)
+                .filter(row -> row.getClientId() == source.getId())
+                .filter(row -> Objects.equals(row.getTenantId(), source.getTenantId()))
+                .filter(row -> ClientAuthService.STATUS_NETTY_ONLINE.equals(row.getStatus()))
+                .orElseThrow(() -> new IllegalArgumentException("egress session is not current"));
+        if (session.getClientEgressVersion() < 1) {
+            throw new IllegalArgumentException("client did not announce egress capability");
+        }
+        return sessionId;
+    }
+
+    private int clientEgressVersion(ClientAccount account) {
+        return clientSessionRepository
+                .findByTenantIdAndClientIdInAndStatus(account.getTenantId(), List.of(account.getId()),
+                        ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .mapToInt(ClientSession::getClientEgressVersion)
+                .max()
+                .orElse(0);
+    }
+
+    /** Whether a client currently holds a logged-in control channel. */
+    public boolean isOnline(String clientName) {
+        Channel channel = SessionUtil.getChannel(clientName);
+        return channel != null && SessionUtil.hasLogin(channel);
     }
 
     public void pushConfig(ClientAccount account) {
