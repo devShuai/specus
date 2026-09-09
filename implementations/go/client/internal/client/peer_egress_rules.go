@@ -53,31 +53,26 @@ type egressRuleDecision struct {
 
 // validateEgressRule reports the code a rule is refused with, or the empty string if it is usable.
 //
-// The checks run in the fixed order protocol/spec/peer-egress.md now pins, so implementations agree
-// on which code a bad rule fails with and not merely that it fails. A rule can break several at
-// once, and no vector case exercises two together, so the spec had to state the order rather than
-// leave the vector to imply it.
+// The checks run in the fixed order protocol/spec/peer-egress.md pins, so implementations agree on
+// which code a bad rule fails with and not merely that it fails. A rule can break several at once
+// and no vector case exercises two together, so the order had to be stated rather than left for the
+// vector to imply. The match is the rule's subject: what it is, whether it is legal, whether it is
+// refused as a prefix, and only then the action and the fields it needs.
 func validateEgressRule(rule egressRule, meshCIDR string) string {
 	match := strings.TrimSpace(rule.Match)
 	if match == "" {
 		return egressCodeRuleMalformed
 	}
-	if looksLikeEgressDomainRule(match) {
-		return egressCodeRuleDomainUnsupported
-	}
+	// A colon is unambiguous, so IPv6 is settled before anything else is guessed at.
 	if strings.Contains(match, ":") {
 		return egressCodeRuleIPv6Unsupported
+	}
+	if looksLikeEgressDomainRule(match) {
+		return egressCodeRuleDomainUnsupported
 	}
 
 	cidr, ok := parseEgressRuleMatch(match)
 	if !ok {
-		return egressCodeRuleMalformed
-	}
-	// An undefined action is malformed for the same reason a bad prefix is: the rule cannot be
-	// read at all, so it is reported before the refusals that presume it could be.
-	switch rule.Action {
-	case egressActionEgress, egressActionDirect, egressActionBlock:
-	default:
 		return egressCodeRuleMalformed
 	}
 	if cidr.prefixLen == 0 {
@@ -93,6 +88,11 @@ func validateEgressRule(rule egressRule, meshCIDR string) string {
 		return egressCodeRulePortUnsupported
 	}
 
+	switch rule.Action {
+	case egressActionEgress, egressActionDirect, egressActionBlock:
+	default:
+		return egressCodeRuleMalformed
+	}
 	if rule.Action == egressActionEgress && rule.EgressClientID <= 0 {
 		return egressCodeRuleMissingTarget
 	}
@@ -112,8 +112,7 @@ func looksLikeEgressDomainRule(match string) bool {
 	for index := 0; index < len(match); index++ {
 		character := match[index]
 		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') {
-			// A hex digit here would belong to an IPv6 literal, which has its own code.
-			return !strings.Contains(match, ":")
+			return true
 		}
 	}
 	return false
