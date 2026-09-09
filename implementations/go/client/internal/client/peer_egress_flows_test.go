@@ -195,7 +195,7 @@ func TestFlowTableReauthorizeClosesFlowsThePolicyNoLongerAllows(t *testing.T) {
 
 	narrowed := testEgressPolicy("203.0.113.0/24")
 	reaped := table.reauthorize(narrowed, func(int64) bool { return true }, newEgressContext(), nil)
-	if len(reaped) != 1 || reaped[0].Key != dropped {
+	if len(reaped) != 1 || reaped[0].Flow.Key != dropped {
 		t.Fatalf("reauthorize reaped %d flows, want only the one outside the new rule", len(reaped))
 	}
 	if _, ok := table.lookup(kept); !ok {
@@ -211,8 +211,32 @@ func TestFlowTableReauthorizeHonoursTheConsumerACL(t *testing.T) {
 	policy := testEgressPolicy("203.0.113.0/24")
 	reaped := table.reauthorize(policy, func(consumer int64) bool { return consumer != 9 },
 		newEgressContext(), nil)
-	if len(reaped) != 1 || reaped[0].Consumer != 9 {
+	if len(reaped) != 1 || reaped[0].Flow.Consumer != 9 {
 		t.Fatalf("reauthorize reaped %d flows, want only the peer whose ACL was withdrawn", len(reaped))
+	}
+}
+
+// One policy push can close flows for different reasons at once. A single code for the batch would
+// tell a consumer its flow died of something that did not happen to it.
+func TestFlowTableReauthorizeReportsEachFlowsOwnReason(t *testing.T) {
+	table := newEgressFlowTable(time.Minute)
+	outsideRule := flowKey(t, ipv4ProtocolTCP, "100.96.0.1", 40000, "198.51.100.10", 443)
+	deniedConsumer := flowKey(t, ipv4ProtocolTCP, "100.96.0.2", 40000, "203.0.113.10", 443)
+	table.open(outsideRule, 7, flowEpoch)
+	table.open(deniedConsumer, 9, flowEpoch)
+
+	policy := testEgressPolicy("203.0.113.0/24")
+	policy.AllowedConsumerClientIDs = []int64{7}
+
+	reasons := make(map[egressFlowKey]string)
+	for _, entry := range table.reauthorize(policy, func(int64) bool { return true }, newEgressContext(), nil) {
+		reasons[entry.Flow.Key] = entry.Code
+	}
+	if reasons[outsideRule] != egressCodeDestinationDenied {
+		t.Errorf("flow outside the rule reported %q", reasons[outsideRule])
+	}
+	if reasons[deniedConsumer] != egressCodeConsumerDenied {
+		t.Errorf("flow of a removed consumer reported %q", reasons[deniedConsumer])
 	}
 }
 

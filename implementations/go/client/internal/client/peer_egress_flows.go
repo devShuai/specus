@@ -155,6 +155,14 @@ func (t *egressFlowTable) revokeConsumer(consumer int64) []*egressFlow {
 // An unparseable prefix is skipped rather than treated as matching everything. A malformed purge
 // should close nothing, not the whole table.
 func (t *egressFlowTable) purgeDestinations(destinations []string) []*egressFlow {
+	return t.purgeConsumerDestinations(0, destinations)
+}
+
+// purgeConsumerDestinations restricts the same purge to one consumer's flows. A flow-purge arrives
+// over a consumer's own session and speaks only for that consumer; applying it to everyone would
+// let any peer tear down every other peer's traffic with one message. A zero consumer means no
+// restriction, which is for local teardown rather than for anything that arrives on the wire.
+func (t *egressFlowTable) purgeConsumerDestinations(consumer int64, destinations []string) []*egressFlow {
 	prefixes := make([]egressCIDR, 0, len(destinations))
 	for _, text := range destinations {
 		if cidr, ok := parseEgressCIDR(text); ok {
@@ -165,6 +173,9 @@ func (t *egressFlowTable) purgeDestinations(destinations []string) []*egressFlow
 		return nil
 	}
 	return t.reap(func(flow *egressFlow) bool {
+		if consumer != 0 && flow.Consumer != consumer {
+			return false
+		}
 		for _, prefix := range prefixes {
 			if prefix.contains(flow.Key.remoteIP) {
 				return true
@@ -200,8 +211,9 @@ func (t *egressFlowTable) drain() []*egressFlow {
 // The limit fields are deliberately not re-checked here. Lowering a quota should stop the next
 // flow, not pick live ones to kill, and a limit breach is not a permission the flow lost.
 func (t *egressFlowTable) reauthorize(policy egressPolicy, peerACLAllows func(consumer int64) bool,
-	context egressContext, localInterfaceCIDRs []string) []*egressFlow {
-	return t.reap(func(flow *egressFlow) bool {
+	context egressContext, localInterfaceCIDRs []string) []egressRevocation {
+	codes := make(map[egressFlowKey]string)
+	reaped := t.reap(func(flow *egressFlow) bool {
 		allowed := true
 		if peerACLAllows != nil {
 			allowed = peerACLAllows(flow.Consumer)
@@ -213,8 +225,38 @@ func (t *egressFlowTable) reauthorize(policy egressPolicy, peerACLAllows func(co
 			Protocol:            flow.Key.protocolName(),
 			LocalInterfaceCIDRs: localInterfaceCIDRs,
 		}, policy, allowed, context)
-		return !decision.Allowed
+		if decision.Allowed {
+			return false
+		}
+		codes[flow.Key] = decision.Code
+		return true
 	})
+	revoked := make([]egressRevocation, 0, len(reaped))
+	for _, flow := range reaped {
+		revoked = append(revoked, egressRevocation{Flow: flow, Code: codes[flow.Key]})
+	}
+	return revoked
+}
+
+// egressRevocation pairs a closed flow with why it closed.
+//
+// Carried per flow rather than per batch because one policy push can close flows for different
+// reasons at once: a destination rule dropped for one, a consumer removed from the allow list for
+// another. Collapsing them onto a single code would put a reason in the consumer's flow-reject that
+// does not match what actually happened to that flow.
+type egressRevocation struct {
+	Flow *egressFlow
+	Code string
+}
+
+// egressRevocationsFor labels a batch that really does share one reason, such as a shutdown or an
+// ACL withdrawal. An empty code means the flow ended normally and owes the consumer no explanation.
+func egressRevocationsFor(flows []*egressFlow, code string) []egressRevocation {
+	revoked := make([]egressRevocation, 0, len(flows))
+	for _, flow := range flows {
+		revoked = append(revoked, egressRevocation{Flow: flow, Code: code})
+	}
+	return revoked
 }
 
 // reap removes and returns the flows a predicate selects, in a stable order.
