@@ -2,8 +2,11 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +23,11 @@ import (
 // queued rather than sent inline: sending inline would mean the plane's mutex is held while the
 // mesh's is taken, and the mesh already takes its mutex on paths that reach into the plane, which
 // is a cycle. Everything below either queues or is called with no mesh lock held.
+
+var (
+	errNoEgressSession = errors.New("no Peer Mesh session with the egress")
+	errNoEgressDevice  = errors.New("no virtual device to write to")
+)
 
 const (
 	peerControlTypeEgressConfig = "egress-config"
@@ -125,8 +133,14 @@ func (mesh *peerMeshClient) handlePeerEgressFrame(frame *peerDataFrame, session 
 		return false
 	}
 	mesh.mu.Lock()
-	runtime := mesh.egress
+	runtime, consumer := mesh.egress, mesh.egressConsumer
 	mesh.mu.Unlock()
+	// The consumer role is offered the frame first. A node can be both, and both roles receive
+	// type=1 frames; the consumer claims only what is addressed to its own virtual IP, so trying
+	// it first costs nothing and keeps a reply from being judged as an egress request.
+	if consumer != nil && consumer.handleInbound(frame.Payload, session.PeerID, time.Now()) {
+		return true
+	}
 	if runtime == nil {
 		// Nothing has enabled the egress on this node, so there is no policy to judge against,
 		// and building a plane on first contact would let any peer turn an unconfigured device
@@ -142,6 +156,214 @@ func (mesh *peerMeshClient) handlePeerEgressFrame(frame *peerDataFrame, session 
 		runtime.setPathMTU(session.PathMTU.effectiveMTU(mesh.config.PeerMeshMTU) - peerEgressFrameHeaderLen)
 	}
 	return runtime.handleFrame(session.PeerID, frame.Payload, time.Now())
+}
+
+// ensureEgressConsumer lazily builds the consumer side. Called with no mesh lock held.
+func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
+	mesh.mu.Lock()
+	if mesh.egressConsumer != nil {
+		consumer := mesh.egressConsumer
+		mesh.mu.Unlock()
+		return consumer
+	}
+	consumer := newEgressConsumer(mesh.logger,
+		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
+		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
+	mesh.egressConsumer = consumer
+	mesh.mu.Unlock()
+	return consumer
+}
+
+// sendEgressFrameToPeer carries one frame to the egress peer.
+//
+// Synchronous, unlike the egress role's own sender. It is called from the TUN read path with no
+// plane lock held, and the caller needs to know whether the packet left: a send that failed means
+// the rule's destination has to be blocked, not allowed out locally.
+func (mesh *peerMeshClient) sendEgressFrameToPeer(egress int64, frame []byte) error {
+	mesh.mu.Lock()
+	session := mesh.sessions[egress]
+	mesh.mu.Unlock()
+	if session == nil {
+		return errNoEgressSession
+	}
+	return mesh.sendEncryptedPayload(session, frame)
+}
+
+func (mesh *peerMeshClient) writeEgressPacketToDevice(packet []byte) error {
+	mesh.mu.Lock()
+	device := mesh.device
+	mesh.mu.Unlock()
+	if device == nil {
+		return errNoEgressDevice
+	}
+	return device.WritePacket(packet)
+}
+
+// handleEgressOutbound offers a packet read from the TUN to the consumer rules, and reports whether
+// the consumer claimed it.
+//
+// Sits at the top of the TUN read path, because a destination a rule claims is not a mesh peer and
+// the existing path would drop it as such: silently, and as though nothing had been configured.
+func (mesh *peerMeshClient) handleEgressOutbound(packet []byte) bool {
+	mesh.mu.Lock()
+	consumer := mesh.egressConsumer
+	mesh.mu.Unlock()
+	if consumer == nil {
+		return false
+	}
+	outcome := consumer.handleOutbound(packet, time.Now())
+	if outcome == egressOutcomeNotMine {
+		return false
+	}
+	if outcome != egressOutcomeForwarded && mesh.logger != nil {
+		// Logged without the destination: a per-destination record of what a user was blocked
+		// from reaching is their own browsing history.
+		mesh.logger.Printf("[peer-egress-consumer] packet not forwarded: %s", outcome)
+	}
+	return true
+}
+
+// syncEgressAvailability tells the consumer which egresses can take a flow, and delivers the purges
+// a peer going offline produces. Called with no mesh lock held.
+func (mesh *peerMeshClient) syncEgressAvailability(online map[int64]bool) {
+	mesh.mu.Lock()
+	consumer := mesh.egressConsumer
+	mesh.mu.Unlock()
+	if consumer == nil {
+		return
+	}
+	for egress, up := range online {
+		mesh.deliverEgressPurges(consumer.setEgressOnline(egress, up, time.Now()))
+	}
+}
+
+// deliverEgressPurges sends one flow-purge per affected egress.
+//
+// Best effort by design. The message is what closes the far side promptly, but the egress reclaims
+// the flow on its own idle timer regardless, so a purge that cannot be delivered delays cleanup
+// rather than losing it.
+func (mesh *peerMeshClient) deliverEgressPurges(purge map[int64][]string) {
+	for egress, destinations := range purge {
+		if len(destinations) == 0 {
+			continue
+		}
+		body, err := encodePeerEgressControl(peerEgressControl{
+			Type: peerEgressControlFlowPurge, Destinations: destinations, Code: egressCodeDisabled,
+		})
+		if err != nil {
+			continue
+		}
+		_ = mesh.sendEgressFrameToPeer(egress, encodePeerEgressFrame(peerEgressTypeControl, false, body))
+	}
+}
+
+// applyEgressRules installs the consumer's own rules and the routes they need.
+//
+// Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong all at
+// once, and refusing to apply any of it would leave a user with one typo sending everything out
+// locally, which is the failure this feature exists to prevent.
+func (mesh *peerMeshClient) applyEgressRules(rules []egressRule, runtime RuntimeConfig) {
+	consumer := mesh.ensureEgressConsumer()
+	meshCIDR := strings.TrimSpace(runtime.PeerMesh.CIDR)
+	if meshCIDR == "" {
+		meshCIDR = egressDefaultMeshCIDR
+	}
+	mesh.deliverEgressPurges(consumer.configure(rules, meshCIDR, runtime.PeerMesh.VirtualIP, time.Now()))
+
+	desired, refused := planEgressRoutes(rules, mesh.egressBypassAddresses(), meshCIDR)
+	for _, entry := range refused {
+		mesh.logger.Printf("[peer-egress-consumer] rule %d (%s) refused: %s", entry.Index, entry.Match, entry.Code)
+	}
+
+	installer := mesh.ensureEgressRouteInstaller()
+	if installer == nil {
+		return
+	}
+	result := installer.apply(desired)
+	for _, conflict := range result.Conflicts {
+		// Not preempted and not compared by metric. The operator is told which of their own
+		// routes is in the way, so they can decide rather than discover it later.
+		mesh.logger.Printf("[peer-egress-consumer] route %s not installed, already present: %s",
+			conflict.Route.CIDR, conflict.Existing)
+	}
+	if result.Err != nil {
+		mesh.logger.Printf("[peer-egress-consumer] route install failed: %v rolledBack=%v",
+			result.Err, result.RolledBack)
+	}
+	if len(result.Added) > 0 || len(result.Removed) > 0 {
+		mesh.logger.Printf("[peer-egress-consumer] routes added=%d removed=%d",
+			len(result.Added), len(result.Removed))
+	}
+}
+
+// ensureEgressRouteInstaller builds the installer and adopts any journal a previous run left.
+//
+// Adoption comes first so a process that was killed has its routes taken back rather than left for
+// a user to find and wonder about.
+func (mesh *peerMeshClient) ensureEgressRouteInstaller() *egressRouteInstaller {
+	mesh.mu.Lock()
+	if mesh.egressRoutes != nil {
+		installer := mesh.egressRoutes
+		mesh.mu.Unlock()
+		return installer
+	}
+	device := mesh.device
+	mesh.mu.Unlock()
+
+	tun := ""
+	if device != nil {
+		tun = device.Name()
+	}
+	journal := mesh.egressJournalPath
+	if journal == "" {
+		journal = egressRouteJournalPath()
+	}
+	installer := newEgressRouteInstaller(newEgressRouteCommanderForPlatform(tun), journal)
+	if err := installer.load(); err != nil {
+		mesh.logger.Printf("[peer-egress-consumer] route journal unusable, starting empty: %v", err)
+	}
+
+	mesh.mu.Lock()
+	mesh.egressRoutes = installer
+	mesh.mu.Unlock()
+	return installer
+}
+
+func egressRouteJournalPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".specus", "egress-routes.json")
+}
+
+// egressBypassAddresses are the addresses that must keep reaching the physical network: the control
+// connection, STUN and TURN, and every peer's own endpoint. Without them a rule broad enough to
+// cover one would route the tunnel's transport into the tunnel.
+func (mesh *peerMeshClient) egressBypassAddresses() []string {
+	bypass := make([]string, 0, 8)
+	for _, cidr := range mesh.deploymentDenyCIDRs() {
+		bypass = append(bypass, strings.TrimSuffix(cidr, "/32"))
+	}
+	mesh.mu.Lock()
+	for _, session := range mesh.sessions {
+		if session.RemoteEndpoint != nil && session.RemoteEndpoint.IP != nil {
+			bypass = append(bypass, session.RemoteEndpoint.IP.String())
+		}
+	}
+	mesh.mu.Unlock()
+	return bypass
+}
+
+// withdrawEgressRoutes takes back every route this feature installed. Called with no mesh lock held.
+func (mesh *peerMeshClient) withdrawEgressRoutes() {
+	mesh.mu.Lock()
+	installer := mesh.egressRoutes
+	mesh.egressRoutes = nil
+	mesh.mu.Unlock()
+	if installer != nil {
+		installer.withdrawAll()
+	}
 }
 
 // applyEgressControl installs a pushed egress-config.

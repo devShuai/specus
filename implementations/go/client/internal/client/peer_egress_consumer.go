@@ -242,36 +242,43 @@ func consumerFlowKeyFor(packet []byte, protocol int) (egressFlowKey, bool) {
 	}, true
 }
 
-// handleInbound takes one SPEG1 frame from an egress peer and writes the packet to the TUN.
+// handleInbound takes one SPEG1 frame addressed to this node as a consumer and writes the packet to
+// the TUN. It reports whether the frame was this node's to handle.
 //
-// Three checks, each closing a way the return path could be abused. The reply has to be addressed
-// to this node's own virtual IP, it has to come from an address a live flow of ours is talking to,
-// and that address must be outside the mesh. Without the second, a peer could inject a packet with
-// any source it liked; without the third, an egress could impersonate another mesh peer.
+// A node can be a consumer and an egress at once, and both roles receive type=1 frames, so the two
+// have to be told apart before either acts. A reply is addressed to this node's own virtual IP; a
+// frame for the egress role is addressed to the wider network. Control messages split by type:
+// flow-reject travels egress to consumer, flow-purge the other way. Anything not ours is left for
+// the egress runtime rather than counted as an abuse of the return path.
 func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.Time) bool {
 	if !looksLikePeerEgressFrame(frame) {
 		return false
 	}
 	parsed, code := parsePeerEgressFrame(frame)
 	if code != "" {
-		c.mu.Lock()
-		c.recordBlockedLocked("return-" + strings.ToLower(code))
-		c.mu.Unlock()
-		return true
+		// A frame nobody can read is not claimed. The egress runtime refuses it with its own
+		// code, which is the one an operator needs, and counting it here as well would report
+		// one malformed frame twice.
+		return false
 	}
 	if parsed.Type == peerEgressTypeControl {
+		control, decoded := decodePeerEgressControl(parsed.Body)
+		if !decoded || control.Type != peerEgressControlFlowReject {
+			return false
+		}
 		c.handleInboundControl(parsed, fromEgress, now)
 		return true
 	}
 	if parsed.Type != peerEgressTypeIPPacket {
-		return true
+		return false
 	}
 
 	c.mu.Lock()
-	if c.virtualIP != "" && parsed.Inner.DestinationIP != c.virtualIP {
-		c.recordBlockedLocked("return-wrong-destination")
+	if c.virtualIP == "" || parsed.Inner.DestinationIP != c.virtualIP {
+		// Not addressed to us as a consumer, so it belongs to the egress role if this node has
+		// one. Refusing it here would break a node that is both.
 		c.mu.Unlock()
-		return true
+		return false
 	}
 	source, parsedSource := parseEgressAddress(parsed.Inner.SourceIP)
 	if !parsedSource || egressContainedIn(source, []string{c.meshCIDR}) {
