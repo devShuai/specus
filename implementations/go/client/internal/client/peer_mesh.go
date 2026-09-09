@@ -148,6 +148,11 @@ type peerMeshClient struct {
 	egress             *egressRuntime
 	egressQueue        chan peerEgressOutbound
 	egressDone         chan struct{}
+	egressConsumer     *egressConsumer
+	egressRoutes       *egressRouteInstaller
+	// egressJournalPath overrides where the route journal lives. Empty means the real location
+	// beside the machine identity; tests set it so they never touch a user's own journal.
+	egressJournalPath string
 }
 
 type peerMeshPeer struct {
@@ -527,6 +532,9 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.requestRelayCandidates()
 	mesh.announceCandidates()
 	mesh.ensureServices().applyConfig(runtime.PeerMesh)
+	if len(mesh.config.PeerEgressRules) > 0 {
+		mesh.applyEgressRules(mesh.config.PeerEgressRules, runtime)
+	}
 }
 
 func (mesh *peerMeshClient) ensureServices() *peerServiceRuntime {
@@ -541,6 +549,10 @@ func (mesh *peerMeshClient) stop() {
 	// send loop takes the mesh mutex under that one, so taking the mesh mutex around a shutdown
 	// would invert the order.
 	mesh.shutdownEgress()
+	// Routes go too. Leaving them would send the destinations a rule claimed into a tunnel this
+	// process is no longer serving, which is a black hole rather than the local fallback the
+	// user would get with no route at all.
+	mesh.withdrawEgressRoutes()
 	mesh.mu.Lock()
 	defer mesh.mu.Unlock()
 	mesh.stopLocked()
@@ -1494,6 +1506,11 @@ func (mesh *peerMeshClient) markPathFromInboundCheck(session *peerMeshSession, r
 }
 
 func (mesh *peerMeshClient) handleVirtualPacket(packet []byte) {
+	// Consumer rules first. A destination a rule claims is not a mesh peer, so the path below
+	// would drop it as a non-peer target: silently, and as though nothing had been configured.
+	if mesh.handleEgressOutbound(packet) {
+		return
+	}
 	targetIP := peerPacketDestinationIPv4(packet)
 	if targetIP == "" {
 		return
@@ -2100,6 +2117,13 @@ func (mesh *peerMeshClient) mergeRoster(items []peerMeshPeer) {
 	mesh.mu.Unlock()
 	mesh.ensureServices().setRoster(hints)
 	mesh.ensureServices().setHasAuthorizedOnlinePeer(onlinePeer)
+	// An egress that just went offline has its flows closed now rather than at the next idle
+	// sweep: every packet they would carry in between is one a rule says must not go out locally.
+	availability := make(map[int64]bool, len(hints))
+	for id, hint := range hints {
+		availability[id] = hint.online
+	}
+	mesh.syncEgressAvailability(availability)
 	mesh.syncVirtualDeviceRoutes()
 }
 

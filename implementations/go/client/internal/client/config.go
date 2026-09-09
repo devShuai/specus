@@ -25,6 +25,10 @@ type Config struct {
 	UpdateCheckEnabled       *bool             `json:"updateCheckEnabled"`
 	AutoUpdate               bool              `json:"autoUpdate"`
 	UpdateCheckIntervalHours int               `json:"updateCheckIntervalHours"`
+	// PeerEgressRules route chosen destinations through an egress peer. Local configuration
+	// rather than a server push: the egress's own policy is what the server owns, and it is
+	// enforced again at the egress, so a consumer rule can only ask, never grant.
+	PeerEgressRules []egressRule `json:"peerEgressRules,omitempty"`
 }
 
 // UpdatesEnabled defaults to true so packaged clients participate without requiring a config
