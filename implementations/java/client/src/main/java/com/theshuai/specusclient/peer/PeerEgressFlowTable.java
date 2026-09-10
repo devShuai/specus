@@ -88,16 +88,38 @@ final class PeerEgressFlowTable {
     record Revocation(Flow flow, String code) {
     }
 
-    private final long idleTimeoutMs;
+    private long idleTimeoutMs;
     private final Map<Key, Flow> flows = new LinkedHashMap<>();
     private final Map<Long, Integer> perConsumer = new LinkedHashMap<>();
 
     PeerEgressFlowTable(long idleTimeoutMs) {
-        this.idleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
+        setIdleTimeoutMs(idleTimeoutMs);
+    }
+
+    /**
+     * Adopts the timeout a pushed policy names. Live flows keep their entries and are measured
+     * against the new value from the next expiry sweep, because a policy change is not a reason to
+     * close a flow that the policy still allows.
+     */
+    void setIdleTimeoutMs(long value) {
+        this.idleTimeoutMs = value > 0 ? value : DEFAULT_IDLE_TIMEOUT_MS;
     }
 
     int size() {
         return flows.size();
+    }
+
+    /** The timeout in force, which a pushed policy can change. */
+    long idleTimeoutMs() {
+        return idleTimeoutMs;
+    }
+
+    /**
+     * The live flows, for a caller that has to walk them. Returned as a copy so the caller can
+     * close entries while iterating.
+     */
+    List<Flow> live() {
+        return new ArrayList<>(flows.values());
     }
 
     /** Feeds the two limit checks in the judgment layer, so it excludes the flow being considered. */
