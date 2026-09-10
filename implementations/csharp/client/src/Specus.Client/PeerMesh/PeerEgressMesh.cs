@@ -7,11 +7,23 @@ namespace Specus.Client.PeerMesh;
 /// <summary>What the mesh client provides. Every member is called with no mesh lock held.</summary>
 internal interface IPeerEgressMeshHost
 {
-    /// <summary>Encrypts and sends one frame to a peer. False means it did not go.</summary>
-    bool SendToPeer(long peerId, byte[] frame);
+    /// <summary>
+    /// Whether a peer can be reached right now, without sending anything.
+    /// </summary>
+    /// <remarks>
+    /// Split out from the send because the consumer needs an answer synchronously: a packet its
+    /// rules claimed must be blocked rather than allowed out locally when the egress is gone, and
+    /// that decision cannot wait on a socket. The rest of the send is asynchronous and its outcome
+    /// changes nothing the consumer could act on -- a frame lost after this point is one TCP will
+    /// retransmit.
+    /// </remarks>
+    bool CanReach(long peerId);
+
+    /// <summary>Encrypts and sends one frame to a peer.</summary>
+    Task<bool> SendToPeerAsync(long peerId, byte[] frame);
 
     /// <summary>Writes one packet to the local virtual device.</summary>
-    void WriteToDevice(byte[] packet);
+    Task WriteToDeviceAsync(byte[] packet);
 
     /// <summary>The tunnel interface name, for the route commander.</summary>
     string TunName { get; }
@@ -67,6 +79,17 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
     private readonly BlockingCollection<(long Consumer, byte[] Frame)> _queue =
         new(new ConcurrentQueue<(long, byte[])>(), SendQueueDepth);
 
+    /// <summary>
+    /// Packets waiting to be written to the local device, on their own queue and their own loop.
+    /// </summary>
+    /// <remarks>
+    /// Separate from the send queue because a node can be both roles at once, and sharing one loop
+    /// would let an egress's outbound congestion stall the consumer's inbound delivery, which are
+    /// different directions serving different peers.
+    /// </remarks>
+    private readonly BlockingCollection<byte[]> _deviceQueue =
+        new(new ConcurrentQueue<byte[]>(), SendQueueDepth);
+
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _gate = new();
 
@@ -75,6 +98,7 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
     private PeerEgressRouteInstaller? _routes;
     private Thread? _sendLoop;
     private Thread? _tickLoop;
+    private Thread? _deviceLoop;
     private bool _closed;
 
     /// <summary>
@@ -105,38 +129,56 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
                 new PeerEgressSocketDialer(),
                 logger: logger);
             _runtime = built;
-            StartLoops(built);
+            EnsureLoops();
+            // The tick only exists for the egress role: retransmission and idle expiry belong to
+            // flows this node opened on somebody else's behalf.
+            _tickLoop ??= Start(() =>
+            {
+                while (!_stopping.IsCancellationRequested)
+                {
+                    if (_stopping.Token.WaitHandle.WaitOne(TickIntervalMs))
+                    {
+                        return;
+                    }
+                    built.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                }
+            });
             return built;
         }
     }
 
-    private void StartLoops(PeerEgressRuntime plane)
+    /// <summary>
+    /// Starts the two loops that carry queued work, whichever role needed them first.
+    /// </summary>
+    /// <remarks>
+    /// Both roles queue, so a node that is only a consumer needs these as much as one that is only
+    /// an egress. Called under the gate.
+    /// </remarks>
+    private void EnsureLoops()
     {
-        _sendLoop = Start(() =>
+        _sendLoop ??= Start(() =>
         {
             foreach (var outbound in _queue.GetConsumingEnumerable(_stopping.Token))
             {
-                if (!host.SendToPeer(outbound.Consumer, outbound.Frame))
+                // Blocking on the task is what this thread is for. It is not a pool thread, so
+                // waiting here costs nothing anyone else needs.
+                if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())
                 {
                     logger?.LogDebug("Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
                 }
             }
         });
-        _tickLoop = Start(() =>
+        _deviceLoop ??= Start(() =>
         {
-            while (!_stopping.IsCancellationRequested)
+            foreach (var packet in _deviceQueue.GetConsumingEnumerable(_stopping.Token))
             {
-                if (_stopping.Token.WaitHandle.WaitOne(TickIntervalMs))
-                {
-                    return;
-                }
-                plane.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                host.WriteToDeviceAsync(packet).GetAwaiter().GetResult();
             }
         });
     }
 
     /// <summary>
-    /// A dedicated thread, not the pool. Both loops block for the life of the node, and a pool
+    /// A dedicated thread, not the pool. These loops block for the life of the node, and a pool
     /// thread parked like that is one everything else on the process cannot have.
     /// </summary>
     private static Thread Start(Action work)
@@ -173,7 +215,15 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
         }
         lock (_gate)
         {
-            _consumer ??= new PeerEgressConsumer(host.SendToPeer, host.WriteToDevice, logger);
+            // The consumer asks whether the peer is reachable and then queues. It gets a true
+            // answer to the question it can act on -- whether the destination still has an egress
+            // -- without waiting on a socket, and a frame dropped by a full queue is one TCP
+            // retransmits, which is the same trade the egress role already makes.
+            EnsureLoops();
+            _consumer ??= new PeerEgressConsumer(
+                (peerId, frame) => host.CanReach(peerId) && _queue.TryAdd((peerId, frame)),
+                packet => _deviceQueue.TryAdd(packet),
+                logger);
             return _consumer;
         }
     }
@@ -397,7 +447,7 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
             }
             var body = PeerEgressFrame.EncodeControl(
                 PeerEgressFrame.Control.FlowPurge(destinations, PeerEgressCodes.Disabled));
-            host.SendToPeer(egress, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, body));
+            _queue.TryAdd((egress, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, body)));
         }
     }
 
@@ -448,6 +498,7 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
         _stopping.Cancel();
         _sendLoop?.Join(TimeSpan.FromSeconds(1));
         _tickLoop?.Join(TimeSpan.FromSeconds(1));
+        _deviceLoop?.Join(TimeSpan.FromSeconds(1));
         _stopping.Dispose();
     }
 

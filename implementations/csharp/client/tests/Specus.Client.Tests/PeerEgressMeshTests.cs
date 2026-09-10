@@ -23,6 +23,7 @@ public class PeerEgressMeshTests : IDisposable
     private readonly List<long> _sentTo = [];
     private readonly List<byte[]> _sentFrames = [];
     private readonly List<byte[]> _toDevice = [];
+    private volatile bool _reachable = true;
     private PeerEgressMesh? _mesh;
 
     public PeerEgressMeshTests() => Directory.CreateDirectory(_directory);
@@ -43,22 +44,25 @@ public class PeerEgressMeshTests : IDisposable
 
     private sealed class FakeHost(PeerEgressMeshTests owner, string directory) : IPeerEgressMeshHost
     {
-        public bool SendToPeer(long peerId, byte[] frame)
+        public bool CanReach(long peerId) => owner._reachable;
+
+        public Task<bool> SendToPeerAsync(long peerId, byte[] frame)
         {
             lock (owner._sentFrames)
             {
                 owner._sentTo.Add(peerId);
                 owner._sentFrames.Add((byte[])frame.Clone());
             }
-            return true;
+            return Task.FromResult(true);
         }
 
-        public void WriteToDevice(byte[] packet)
+        public Task WriteToDeviceAsync(byte[] packet)
         {
             lock (owner._toDevice)
             {
                 owner._toDevice.Add((byte[])packet.Clone());
             }
+            return Task.CompletedTask;
         }
 
         public string TunName => "specus0";
@@ -270,6 +274,24 @@ public class PeerEgressMeshTests : IDisposable
     }
 
     /// <summary>
+    /// An unreachable egress still claims the packet. Handing it back would send it out locally,
+    /// from the address the user arranged for it not to come from, which is worse than the
+    /// connection failing because it fails silently.
+    /// </summary>
+    [Fact]
+    public void OutboundTrafficIsStillClaimedWhenTheEgressCannotBeReached()
+    {
+        var wiring = NewMesh();
+        wiring.ApplyRules([Rule("203.0.113.0/24", PeerEgressRules.ActionEgress, 2)]);
+        wiring.SyncEgressAvailability(new Dictionary<long, bool> { [2] = true });
+        _reachable = false;
+
+        Assert.True(wiring.HandleOutbound(PacketTo("203.0.113.10")),
+            "an unreachable egress handed the packet back to the local stack");
+        Assert.True(Frames().Count == 0, "a frame was sent to an unreachable peer");
+    }
+
+    /// <summary>
     /// An egress going offline closes its flows and tells it to drop its side, so the user does not
     /// see a connection that is dead at one end and open at the other.
     /// </summary>
@@ -284,7 +306,9 @@ public class PeerEgressMeshTests : IDisposable
         ClearFrames();
         wiring.SyncEgressAvailability(new Dictionary<long, bool> { [2] = false });
 
-        Assert.True(Frames().Exists(raw =>
+        // The purge is queued like every other frame, so it arrives on the send loop rather than
+        // inline: waiting is the difference between testing the wiring and testing the scheduler.
+        WaitFor("the flow-purge to be sent", () => Frames().Exists(raw =>
         {
             var frame = PeerEgressFrame.Parse(raw);
             if (!frame.Accepted || frame.Type != PeerEgressFrame.TypeControl)
@@ -295,7 +319,7 @@ public class PeerEgressMeshTests : IDisposable
             return control is not null
                 && control.Type == PeerEgressFrame.ControlFlowPurge
                 && control.Destinations.Contains("203.0.113.10/32");
-        }), "no flow-purge reached the egress");
+        }));
     }
 
     /// <summary>Revocation reaches the plane even though the plane never asks the mesh anything.</summary>
