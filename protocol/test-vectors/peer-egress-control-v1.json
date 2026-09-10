@@ -10,6 +10,88 @@
     "revision 的单调守卫不在解码器里：它是运行时的状态，解码器对同一条消息必须每次给出相同结果。",
     "本文件的期望值出自 tools/protocol/generate_peer_egress_control_vectors.py 里的独立参考解码器，不是从任何一个实现录下来的。"
   ],
+  "deploymentEndpoints": {
+    "description": "本部署自身的端点，进入强制拒绝清单。只收字面 IPv4 地址：域名在策略期解析出的结果可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
+    "cases": [
+      {
+        "name": "all-four-literal",
+        "reason": "四个端点都是字面地址，全部进入强制拒绝清单",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5:8443",
+          "stunHost": "198.51.100.7:3478",
+          "turnHost": "198.51.100.8:3478",
+          "relayAddress": "192.0.2.9:3478"
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.7/32",
+          "198.51.100.8/32",
+          "192.0.2.9/32"
+        ]
+      },
+      {
+        "name": "hostnames-are-skipped",
+        "reason": "域名不解析。在策略期解析出的地址可能和实际 connect 用的不一样，那会让这条阻断看起来生效而实际上没有",
+        "input": {
+          "serverBaseUrl": "https://api.example.com",
+          "stunHost": "stun.example.com:3478",
+          "turnHost": "turn.example.com:3478",
+          "relayAddress": ""
+        },
+        "expect": []
+      },
+      {
+        "name": "ports-are-optional",
+        "reason": "不带端口的写法同样要认出来",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5",
+          "stunHost": "198.51.100.7",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.7/32"
+        ]
+      },
+      {
+        "name": "empty-configuration",
+        "reason": "什么都没配置就没有端点可拒绝，不是错误",
+        "input": {
+          "serverBaseUrl": "",
+          "stunHost": "",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": []
+      },
+      {
+        "name": "mixed-literal-and-name",
+        "reason": "字面地址进清单，域名跳过，两者不互相影响",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5:8443",
+          "stunHost": "stun.example.com:3478",
+          "turnHost": "198.51.100.8:3478",
+          "relayAddress": ""
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.8/32"
+        ]
+      },
+      {
+        "name": "ipv6-literal-is-skipped",
+        "reason": "一期数据面只有 IPv4，IPv6 端点没有可以拒绝的 IPv4 前缀",
+        "input": {
+          "serverBaseUrl": "https://[2001:db8::1]:8443",
+          "stunHost": "",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": []
+      }
+    ]
+  },
   "egressConfig": {
     "accept": [
       {

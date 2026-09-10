@@ -160,6 +160,94 @@ for name, text, reason in REJECT:
     assert decode(text) is None, name
     reject_cases.append({"name": name, "reason": reason, "message": text})
 
+# --------------------------------------------------------------------------
+# This deployment's own endpoints.
+#
+# The forced-deny list has to include the control connection, STUN, TURN and the relay, or a
+# consumer could reach the infrastructure through the egress it is only supposed to reach the
+# internet through. Three clients holding the same configuration must derive the same list: one that
+# missed an endpoint would forward to it while the others refused.
+# --------------------------------------------------------------------------
+
+
+def strip_port(host):
+    """Removes a :port suffix, leaving an IPv6 literal in brackets alone."""
+    host = (host or "").strip()
+    if host.startswith("["):
+        return host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def is_ipv4_literal(text):
+    parts = text.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit() or (len(part) > 1 and part[0] == "0") or int(part) > 255:
+            return False
+    return True
+
+
+def deny_cidrs(base_url, stun_host, turn_host, relay_address):
+    """The reference derivation: literal IPv4 endpoints only, each as a /32."""
+    hosts = []
+    url = (base_url or "").strip()
+    if "://" in url:
+        authority = url.split("://", 1)[1].split("/", 1)[0]
+        # Strip any userinfo, which is not part of the host.
+        hosts.append(authority.rsplit("@", 1)[-1])
+    for host in (stun_host, turn_host, relay_address):
+        hosts.append(host)
+
+    denied = []
+    for host in hosts:
+        # Only literal addresses. A hostname would have to be resolved here, and a resolution taken
+        # at policy time can differ from the one the connect uses, which would make the block look
+        # enforced when it is not.
+        candidate = strip_port(host)
+        if is_ipv4_literal(candidate):
+            denied.append(candidate + "/32")
+    return denied
+
+
+ENDPOINT_CASES = [
+    ("all-four-literal",
+     "https://203.0.113.5:8443", "198.51.100.7:3478", "198.51.100.8:3478", "192.0.2.9:3478",
+     "四个端点都是字面地址，全部进入强制拒绝清单"),
+    ("hostnames-are-skipped",
+     "https://api.example.com", "stun.example.com:3478", "turn.example.com:3478", "",
+     "域名不解析。在策略期解析出的地址可能和实际 connect 用的不一样，"
+     "那会让这条阻断看起来生效而实际上没有"),
+    ("ports-are-optional",
+     "https://203.0.113.5", "198.51.100.7", "", "",
+     "不带端口的写法同样要认出来"),
+    ("empty-configuration",
+     "", "", "", "",
+     "什么都没配置就没有端点可拒绝，不是错误"),
+    ("mixed-literal-and-name",
+     "https://203.0.113.5:8443", "stun.example.com:3478", "198.51.100.8:3478", "",
+     "字面地址进清单，域名跳过，两者不互相影响"),
+    ("ipv6-literal-is-skipped",
+     "https://[2001:db8::1]:8443", "", "", "",
+     "一期数据面只有 IPv4，IPv6 端点没有可以拒绝的 IPv4 前缀"),
+]
+
+endpoint_cases = []
+for name, base_url, stun_host, turn_host, relay, reason in ENDPOINT_CASES:
+    endpoint_cases.append({
+        "name": name,
+        "reason": reason,
+        "input": {
+            "serverBaseUrl": base_url,
+            "stunHost": stun_host,
+            "turnHost": turn_host,
+            "relayAddress": relay,
+        },
+        "expect": deny_cidrs(base_url, stun_host, turn_host, relay),
+    })
+
 vector = {
     "name": "peer-egress-control-v1",
     "version": 1,
@@ -177,6 +265,12 @@ vector = {
         "本文件的期望值出自 tools/protocol/generate_peer_egress_control_vectors.py 里的独立参考解码器，"
         "不是从任何一个实现录下来的。",
     ],
+    "deploymentEndpoints": {
+        "description": "本部署自身的端点，进入强制拒绝清单。只收字面 IPv4 地址：域名在策略期解析出的结果"
+                       "可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。"
+                       "三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
+        "cases": endpoint_cases,
+    },
     "egressConfig": {
         "accept": accept_cases,
         "reject": reject_cases,
@@ -193,7 +287,8 @@ vector = {
 out = VECTORS / "peer-egress-control-v1.json"
 out.write_text(json.dumps(vector, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print("wrote", out, out.stat().st_size, "bytes")
-print("egress-config accept:", len(accept_cases), "reject:", len(reject_cases))
+print("egress-config accept:", len(accept_cases), "reject:", len(reject_cases),
+      "deployment endpoints:", len(endpoint_cases))
 for case in accept_cases:
     print("  ", case["name"], "-> scope=", repr(case["expect"]["policy"]["scope"]),
           "revision=", case["expect"]["revision"])

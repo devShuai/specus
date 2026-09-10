@@ -42,6 +42,18 @@ type egressControlVector struct {
 			Message string `json:"message"`
 		} `json:"reject"`
 	} `json:"egressConfig"`
+	DeploymentEndpoints struct {
+		Cases []struct {
+			Name  string `json:"name"`
+			Input struct {
+				ServerBaseURL string `json:"serverBaseUrl"`
+				StunHost      string `json:"stunHost"`
+				TurnHost      string `json:"turnHost"`
+				RelayAddress  string `json:"relayAddress"`
+			} `json:"input"`
+			Expect []string `json:"expect"`
+		} `json:"cases"`
+	} `json:"deploymentEndpoints"`
 }
 
 func TestEgressConfigDecodeMatchesSharedVector(t *testing.T) {
@@ -93,6 +105,31 @@ func TestEgressConfigDecodeMatchesSharedVector(t *testing.T) {
 	for _, testCase := range vector.EgressConfig.Reject {
 		if _, _, ok := decodeEgressConfig([]byte(testCase.Message)); ok {
 			t.Errorf("%s: the message was accepted", testCase.Name)
+		}
+	}
+}
+
+// The forced-deny list has to include this deployment's own endpoints, or a consumer could reach the
+// infrastructure through the egress it is only supposed to reach the internet through. Three clients
+// holding the same configuration must derive the same list.
+func TestEgressDeploymentDenyCIDRsMatchSharedVector(t *testing.T) {
+	var vector egressControlVector
+	readEgressVector(t, "peer-egress-control-v1.json", &vector)
+	if len(vector.DeploymentEndpoints.Cases) == 0 {
+		t.Fatal("control vector carried no deployment endpoint cases")
+	}
+
+	for _, testCase := range vector.DeploymentEndpoints.Cases {
+		got := egressDeploymentDenyCIDRs(testCase.Input.ServerBaseURL, testCase.Input.StunHost,
+			testCase.Input.TurnHost, testCase.Input.RelayAddress)
+		if len(got) != len(testCase.Expect) {
+			t.Errorf("%s: derived %v, want %v", testCase.Name, got, testCase.Expect)
+			continue
+		}
+		for index, want := range testCase.Expect {
+			if got[index] != want {
+				t.Errorf("%s: entry %d = %q, want %q", testCase.Name, index, got[index], want)
+			}
 		}
 	}
 }

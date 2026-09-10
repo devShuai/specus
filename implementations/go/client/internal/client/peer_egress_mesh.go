@@ -458,6 +458,19 @@ func (mesh *peerMeshClient) deploymentDenyCIDRs() []string {
 	relay := mesh.relay
 	mesh.mu.Unlock()
 
+	relayAddress := ""
+	if relay != nil {
+		relayAddress = relay.Address
+	}
+	return egressDeploymentDenyCIDRs(baseURL, runtime.PeerMesh.StunHost,
+		runtime.PeerMesh.TurnHost, relayAddress)
+}
+
+// egressDeploymentDenyCIDRs turns this deployment's endpoints into the /32 prefixes the forced-deny
+// list needs. Pure, so the three clients can be held to the same derivation.
+//
+// Shared vector: protocol/test-vectors/peer-egress-control-v1.json.
+func egressDeploymentDenyCIDRs(baseURL, stunHost, turnHost, relayAddress string) []string {
 	denied := make([]string, 0, 4)
 	appendHost := func(host string) {
 		host = strings.TrimSpace(host)
@@ -477,11 +490,9 @@ func (mesh *peerMeshClient) deploymentDenyCIDRs() []string {
 	if parsed, err := url.Parse(strings.TrimSpace(baseURL)); err == nil {
 		appendHost(parsed.Host)
 	}
-	appendHost(runtime.PeerMesh.StunHost)
-	appendHost(runtime.PeerMesh.TurnHost)
-	if relay != nil {
-		appendHost(relay.Address)
-	}
+	appendHost(stunHost)
+	appendHost(turnHost)
+	appendHost(relayAddress)
 	return denied
 }
 
