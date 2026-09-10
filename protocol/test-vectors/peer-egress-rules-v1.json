@@ -6,7 +6,9 @@
     "优先级：前缀更长者优先；前缀长度相同时按用户配置顺序，先匹配者胜。",
     "默认动作：未匹配即本地直连。这是路由表本身的结果——没有安装路由的目标根本不会进入 TUN，实现不得再加一条兜底放行分支。",
     "规则变更对已建流：已建流不受影响，除非规则从 allow 变为 deny 或不再匹配，此时立即断开并向出口发送 flow-purge 控制消息。",
-    "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。"
+    "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。",
+    "校验失败的规则不参与匹配，实现必须在匹配前跳过它们。否则一条被拒的长前缀规则仍会压过合法的短前缀规则，运维读到的「已拒绝」与流量实际走向不符。",
+    "egressClientId 必须是正整数：缺失、0 与负数都返回 EGRESS_RULE_MISSING_TARGET。字段在场不等于字段有效。"
   ],
   "meshCidr": "100.96.0.0/11",
   "rules": [
@@ -42,6 +44,36 @@
       "index": 5,
       "match": "192.0.2.0/24",
       "action": "block"
+    },
+    {
+      "index": 6,
+      "match": "192.0.2.128/25",
+      "action": "block",
+      "port": 443
+    },
+    {
+      "index": 7,
+      "match": "172.16.0.0/16",
+      "action": "egress",
+      "egressClientId": 3
+    },
+    {
+      "index": 8,
+      "match": "172.16.5.0/24",
+      "action": "egress",
+      "egressClientId": 0
+    }
+  ],
+  "refusedRules": [
+    {
+      "index": 6,
+      "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+      "reason": "携带端口维度；消费端按路由分流，路由选不了端口"
+    },
+    {
+      "index": 8,
+      "code": "EGRESS_RULE_MISSING_TARGET",
+      "reason": "egressClientId 为 0，不是有效标识"
     }
   ],
   "cases": [
@@ -128,6 +160,28 @@
         "matchedRuleIndex": 1,
         "reason": "matched",
         "egressClientId": 2
+      }
+    },
+    {
+      "name": "refused-rule-does-not-steer-traffic",
+      "destination": "192.0.2.200",
+      "description": "覆盖它的 /25 因携带端口被拒，落回 /24；被拒的规则若仍参与匹配，运维看到「已拒绝」的规则依然在改变流量走向",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 4,
+        "reason": "matched",
+        "egressClientId": 2
+      }
+    },
+    {
+      "name": "refused-target-does-not-steer-traffic",
+      "destination": "172.16.5.10",
+      "description": "更长的 /24 因 egressClientId 为 0 被拒，落回 /16",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 7,
+        "reason": "matched",
+        "egressClientId": 3
       }
     }
   ],
@@ -299,6 +353,26 @@
       },
       "code": "EGRESS_RULE_MALFORMED",
       "reason": "前缀本身不合法时，后面的策略判断都建立在读不出的前缀上"
+    },
+    {
+      "name": "zero-egress-client-id",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 0
+      },
+      "code": "EGRESS_RULE_MISSING_TARGET",
+      "reason": "0 是本项目里「没有消费端」的哨兵值。接受它等于让规则过校验、路由照常安装，然后每个包都找不到出口对端——配置期能报出的错被推迟成运行期的黑洞"
+    },
+    {
+      "name": "negative-egress-client-id",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": -1
+      },
+      "code": "EGRESS_RULE_MISSING_TARGET",
+      "reason": "同上：标识必须是正整数，字段在场不等于字段有效"
     }
   ]
 }

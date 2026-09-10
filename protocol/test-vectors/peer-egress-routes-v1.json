@@ -1,0 +1,703 @@
+{
+  "name": "peer-egress-routes-v1",
+  "version": 1,
+  "notes": [
+    "只安装精确前缀，计划器不会自己造出 0.0.0.0/0 或它的两个 /1 半区。接管一切的工具没法被运行它的人推理，「未匹配即本地」也会在那一刻不再成立。",
+    "已知缺口：校验只拒绝 /0。运维手写 0.0.0.0/1 与 128.0.0.0/1 两条规则仍然可以覆盖全部地址，其中下半区目前只是因为覆盖 mesh 网段才被拒。设一个最小前缀长度属于策略决定，不在本次移植的范围内，见 planCases 里的 default-route-is-refused-but-its-halves-are-ordinary-prefixes。",
+    "旁路条目排在最前，安装也按此顺序：承载隧道的传输（控制连接、STUN 与 TURN、对端端点）先保持可达，再把流量指进隧道。",
+    "action=direct 不安装路由。流量靠「没有路由」留在本地，与未匹配流量是同一个机制，而不是两处需要彼此保持一致的行为。action=block 要安装：包必须先被捕获，数据面才谈得上丢弃它。",
+    "计划是纯函数：它只说应该存在哪些路由，执行与回滚由安装器负责。这样回滚、冲突拒绝与归属判定都能脱离真实路由表被测试。",
+    "origin 是运维会读到的字符串，因此也被固定：旁路为 bypass，规则为 rule: 加上规则里原样的 match。",
+    "被拒的规则逐条返回而不是静默跳过：运维写了一条而本功能忽略了它，他们没有任何途径发现这个泄漏。",
+    "bypass 列表来自运行期发现的对端与端点，不是用户配置，因此读不出的条目跳过即可；为它整体拒绝一份计划会因为一个失联对端而停掉全部分流。",
+    "本文件的期望值出自 tools/protocol/generate_peer_egress_route_vectors.py 里的独立参考实现，不是从任何一个实现录下来的：对上它意味着各自独立正确，而不是共享同一个错误。"
+  ],
+  "meshCidr": "100.96.0.0/11",
+  "planCases": [
+    {
+      "name": "egress-and-block-install-direct-does-not",
+      "description": "direct 不装路由：流量靠「没有路由」留在本地，与未匹配流量是同一个机制。block 要装，包必须先被捕获，数据面才谈得上丢弃它",
+      "rules": [
+        {
+          "match": "203.0.113.0/24",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "198.51.100.0/24",
+          "action": "direct"
+        },
+        {
+          "match": "192.0.2.0/24",
+          "action": "block"
+        }
+      ],
+      "bypass": [],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "192.0.2.0/24",
+            "kind": "tun",
+            "origin": "rule:192.0.2.0/24"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "default-route-is-refused-but-its-halves-are-ordinary-prefixes",
+      "description": "/0 被拒。0.0.0.0/1 被拒的原因是它覆盖了 mesh 网段，不是因为它太宽；128.0.0.0/1 是一条普通前缀，一期校验放行它。两条 /1 合起来等于接管一切，而校验只挡住 /0——这是记在案的已知缺口，不是这条用例写漏了",
+      "rules": [
+        {
+          "match": "0.0.0.0/0",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "0.0.0.0/1",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "128.0.0.0/1",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "128.0.0.0/1",
+            "kind": "tun",
+            "origin": "rule:128.0.0.0/1"
+          }
+        ],
+        "refused": [
+          {
+            "index": 0,
+            "match": "0.0.0.0/0",
+            "code": "EGRESS_RULE_DEFAULT_ROUTE"
+          },
+          {
+            "index": 1,
+            "match": "0.0.0.0/1",
+            "code": "EGRESS_RULE_MESH_OVERLAP"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bypass-comes-first",
+      "description": "旁路条目排在最前：先让承载隧道的传输保持可达，再把任何流量指进隧道",
+      "rules": [
+        {
+          "match": "10.0.0.0/8",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [
+        "203.0.113.7",
+        "198.51.100.9"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "198.51.100.9/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "10.0.0.0/8",
+            "kind": "tun",
+            "origin": "rule:10.0.0.0/8"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "bypass-inside-a-captured-prefix",
+      "description": "旁路地址落在某条规则的前缀内时仍要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
+      "rules": [
+        {
+          "match": "203.0.113.0/24",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [
+        "203.0.113.7"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "duplicate-prefixes-yield-one-route",
+      "description": "同一前缀的两条规则只需要一条路由；装两次会让撤销失去定论。旁路重复同理",
+      "rules": [
+        {
+          "match": "192.0.2.0/24",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "192.0.2.0/24",
+          "action": "block"
+        }
+      ],
+      "bypass": [
+        "203.0.113.7",
+        "203.0.113.7"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "192.0.2.0/24",
+            "kind": "tun",
+            "origin": "rule:192.0.2.0/24"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "bypass-outranks-a-rule-for-the-same-address",
+      "description": "旁路先入表，因此同地址的 /32 规则不会把它顶掉，origin 仍然是 bypass",
+      "rules": [
+        {
+          "match": "203.0.113.7/32",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [
+        "203.0.113.7"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "unreadable-bypass-entries-are-skipped",
+      "description": "旁路来自运行期发现的对端与端点，不是用户配置。读不出的条目跳过即可，整体拒绝会因为一个失联对端停掉全部分流",
+      "rules": [
+        {
+          "match": "10.0.0.0/8",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [
+        "not-an-address",
+        "203.0.113.7",
+        "",
+        "203.0.113.7:443"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "10.0.0.0/8",
+            "kind": "tun",
+            "origin": "rule:10.0.0.0/8"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "refused-rules-are-reported-and-install-nothing",
+      "description": "被拒的规则逐条返回而不是静默跳过：运维写了一条而本功能忽略了它，他们没有任何途径发现这个泄漏",
+      "rules": [
+        {
+          "match": "203.0.113.0/24",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "example.com",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "100.96.0.0/11",
+          "action": "block"
+        },
+        {
+          "match": "198.51.100.0/24",
+          "action": "egress"
+        },
+        {
+          "match": "192.0.2.0/24",
+          "action": "block",
+          "port": 443
+        }
+      ],
+      "bypass": [],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "refused": [
+          {
+            "index": 1,
+            "match": "example.com",
+            "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+          },
+          {
+            "index": 2,
+            "match": "100.96.0.0/11",
+            "code": "EGRESS_RULE_MESH_OVERLAP"
+          },
+          {
+            "index": 3,
+            "match": "198.51.100.0/24",
+            "code": "EGRESS_RULE_MISSING_TARGET"
+          },
+          {
+            "index": 4,
+            "match": "192.0.2.0/24",
+            "code": "EGRESS_RULE_PORT_UNSUPPORTED"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a-single-address-rule-becomes-a-host-route",
+      "description": "单地址等价于 /32，并按规范形式写回，避免同一条路由在两次运行里被写成两种样子",
+      "rules": [
+        {
+          "match": "203.0.113.7",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "tun",
+            "origin": "rule:203.0.113.7"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "empty-configuration-installs-nothing",
+      "description": "没有规则就没有路由。这不是边界情况，而是关掉分流之后应有的状态",
+      "rules": [],
+      "bypass": [],
+      "expect": {
+        "routes": [],
+        "refused": []
+      }
+    }
+  ],
+  "diffCases": [
+    {
+      "name": "first-apply-adds-everything",
+      "description": "当前集合为空：全部是新增，顺序仍然是旁路在前",
+      "current": [],
+      "desired": [
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        },
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "bypass",
+          "origin": "bypass"
+        }
+      ],
+      "expect": {
+        "remove": [],
+        "add": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "10.0.0.0/8",
+            "kind": "tun",
+            "origin": "rule:10.0.0.0/8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unchanged-plan-does-nothing",
+      "description": "重复下发同一份配置不应该动路由表",
+      "current": [
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "bypass",
+          "origin": "bypass"
+        },
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        }
+      ],
+      "desired": [
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "bypass",
+          "origin": "bypass"
+        },
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        }
+      ],
+      "expect": {
+        "remove": [],
+        "add": []
+      }
+    },
+    {
+      "name": "dropped-rule-is-withdrawn",
+      "description": "规则删掉后对应路由必须撤销，否则流量继续进隧道而配置里已经没有它",
+      "current": [
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        },
+        {
+          "cidr": "192.0.2.0/24",
+          "kind": "tun",
+          "origin": "rule:192.0.2.0/24"
+        }
+      ],
+      "desired": [
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        }
+      ],
+      "expect": {
+        "remove": [
+          {
+            "cidr": "192.0.2.0/24",
+            "kind": "tun",
+            "origin": "rule:192.0.2.0/24"
+          }
+        ],
+        "add": []
+      }
+    },
+    {
+      "name": "prefix-that-changed-kind-is-replaced",
+      "description": "同一前缀改变了种类：必须先撤旧的再装新的，否则平台要么拒绝重复条目，要么静默保留先看到的那条",
+      "current": [
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "tun",
+          "origin": "rule:203.0.113.7/32"
+        }
+      ],
+      "desired": [
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "bypass",
+          "origin": "bypass"
+        }
+      ],
+      "expect": {
+        "remove": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "tun",
+            "origin": "rule:203.0.113.7/32"
+          }
+        ],
+        "add": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          }
+        ]
+      }
+    },
+    {
+      "name": "withdrawals-and-additions-in-one-apply",
+      "description": "一次下发里既有撤销又有新增；两个列表各自排序，调用方先执行撤销",
+      "current": [
+        {
+          "cidr": "192.0.2.0/24",
+          "kind": "tun",
+          "origin": "rule:192.0.2.0/24"
+        },
+        {
+          "cidr": "198.51.100.0/24",
+          "kind": "tun",
+          "origin": "rule:198.51.100.0/24"
+        }
+      ],
+      "desired": [
+        {
+          "cidr": "203.0.113.7/32",
+          "kind": "bypass",
+          "origin": "bypass"
+        },
+        {
+          "cidr": "198.51.100.0/24",
+          "kind": "tun",
+          "origin": "rule:198.51.100.0/24"
+        },
+        {
+          "cidr": "10.0.0.0/8",
+          "kind": "tun",
+          "origin": "rule:10.0.0.0/8"
+        }
+      ],
+      "expect": {
+        "remove": [
+          {
+            "cidr": "192.0.2.0/24",
+            "kind": "tun",
+            "origin": "rule:192.0.2.0/24"
+          }
+        ],
+        "add": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "10.0.0.0/8",
+            "kind": "tun",
+            "origin": "rule:10.0.0.0/8"
+          }
+        ]
+      }
+    }
+  ],
+  "journal": {
+    "version": 1,
+    "description": "消费端安装记录的磁盘格式。三个实现必须能互相读懂：同一台机器上换实现之后，上一次装下的路由要被接管并撤销，而不是因为读不懂文件被留在表里。钉住的是「读得出、写回去还能读成同一份」，不是三端输出的字节完全一致——为没有任何读取方在意的空白差异而失败没有意义。",
+    "text": "{\n  \"version\": 1,\n  \"routes\": [\n    {\n      \"cidr\": \"198.51.100.7/32\",\n      \"kind\": \"bypass\",\n      \"origin\": \"bypass\"\n    },\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"tun\",\n      \"origin\": \"rule:203.0.113.0/24\"\n    }\n  ]\n}",
+    "routes": [
+      {
+        "cidr": "198.51.100.7/32",
+        "kind": "bypass",
+        "origin": "bypass"
+      },
+      {
+        "cidr": "203.0.113.0/24",
+        "kind": "tun",
+        "origin": "rule:203.0.113.0/24"
+      }
+    ],
+    "rejects": [
+      {
+        "name": "unknown-version",
+        "text": "{\n  \"version\": 2,\n  \"routes\": [\n    {\n      \"cidr\": \"198.51.100.7/32\",\n      \"kind\": \"bypass\",\n      \"origin\": \"bypass\"\n    },\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"tun\",\n      \"origin\": \"rule:203.0.113.0/24\"\n    }\n  ]\n}",
+        "reason": "另一个版本记录条目的方式可能不同，照它撤销就是在猜哪条前缀是自己装的"
+      },
+      {
+        "name": "unknown-kind",
+        "text": "{\n  \"version\": 1,\n  \"routes\": [\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"onlink\",\n      \"origin\": \"rule\"\n    }\n  ]\n}",
+        "reason": "读不懂的种类要拒绝而不是取默认值：猜错就会去撤销一条上次按另一种方式装下的前缀"
+      },
+      {
+        "name": "not-json",
+        "text": "this is not a journal",
+        "reason": "半个文件、被别的东西覆盖的文件，都从这里退出，而不是被当成空记录接受——空记录意味着上次装下的路由永远不会被撤销"
+      }
+    ]
+  },
+  "routeCommands": {
+    "description": "ip route 输出的解析。这两个解析器依赖的是没人控制的输出格式，三端各自照着 man page 写会得到三份不同的读法，而读错的代价是装一条指向空处的旁路。因此它们在三个实现里都不带平台守卫，在开发机与大部分 CI 上照常被覆盖。",
+    "routeGet": [
+      {
+        "name": "through-a-router",
+        "output": "1.2.3.4 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 1000 \n    cache \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "10.0.0.1",
+          "device": "eth0"
+        },
+        "reason": "常见形态：经网关送出"
+      },
+      {
+        "name": "directly-attached-carries-no-via",
+        "output": "10.0.0.5 dev eth0 src 10.0.0.5 uid 1000 \n    cache \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "",
+          "device": "eth0"
+        },
+        "reason": "同网段目标没有 via。把它当解析失败会导致本地网络上的地址一律无法旁路"
+      },
+      {
+        "name": "interface-name-with-a-dash",
+        "output": "198.51.100.7 via 192.168.1.1 dev wlp3s0-1 src 192.168.1.44 \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "192.168.1.1",
+          "device": "wlp3s0-1"
+        },
+        "reason": "接口名可以带连字符与数字，不能按纯字母切"
+      },
+      {
+        "name": "unreachable",
+        "output": "unreachable 203.0.113.9 dev lo src 127.0.0.1 uid 1000 \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "不可达是作为一条路由报出来的，不是错误。认不出它就会装一条指向空处的旁路"
+      },
+      {
+        "name": "prohibit",
+        "output": "prohibit 203.0.113.9 dev lo \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "同上"
+      },
+      {
+        "name": "blackhole",
+        "output": "blackhole 203.0.113.9 \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "同上"
+      },
+      {
+        "name": "empty-output",
+        "output": "",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "没有输出就是没有可用的下一跳"
+      },
+      {
+        "name": "blank-lines",
+        "output": "   \n\n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "只有空白同样不构成一条路由"
+      },
+      {
+        "name": "error-text-on-stdout",
+        "output": "RTNETLINK answers: Network is unreachable\n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "错误文本里没有 dev，不能被当成一行路由读进去"
+      }
+    ],
+    "showExact": [
+      {
+        "name": "an-existing-route",
+        "output": "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100 \n",
+        "expect": {
+          "present": true,
+          "description": "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100"
+        },
+        "reason": "原样报给运维：把别人的路由概括一遍，不如给他们那一行可以自己去看"
+      },
+      {
+        "name": "no-route-for-that-exact-prefix",
+        "output": "",
+        "expect": {
+          "present": false,
+          "description": ""
+        },
+        "reason": "空输出意味着这条精确前缀上没有路由，可以安装"
+      },
+      {
+        "name": "blank-lines-are-not-a-route",
+        "output": "\n  \n",
+        "expect": {
+          "present": false,
+          "description": ""
+        },
+        "reason": "同上"
+      }
+    ],
+    "tunnelDevice": {
+      "description": "重新下发时，规则的路由已经覆盖了旁路地址，再问系统「这个地址往哪送」得到的答案就是「经隧道」。照它安装等于把承载隧道的传输送进隧道自身，必须拒绝。",
+      "cases": [
+        {
+          "device": "specus0",
+          "tun": "specus0",
+          "expect": true
+        },
+        {
+          "device": " specus0 ",
+          "tun": "specus0",
+          "expect": true,
+          "reason": "两侧空白不能让这道检查失效"
+        },
+        {
+          "device": "eth0",
+          "tun": "specus0",
+          "expect": false
+        },
+        {
+          "device": "eth0",
+          "tun": "",
+          "expect": false,
+          "reason": "没有隧道名时不能匹配上任意接口"
+        }
+      ]
+    }
+  }
+}

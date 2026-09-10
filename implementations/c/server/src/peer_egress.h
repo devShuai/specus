@@ -146,10 +146,14 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
  * Longest prefix wins; when two rules share a prefix length the earlier one wins. An unmatched
  * destination resolves to direct. That is the routing table's own behaviour rather than a fallback
  * branch: a destination with no installed route never reaches the tunnel device in the first place.
+ *
+ * Rules that fail validation are skipped, which is why the mesh prefix is needed here: a rule the
+ * operator was told is refused must not go on deciding where traffic goes.
  */
 void st_egress_match_rules(const st_egress_rule *rules,
                            size_t rules_len,
                            const char *destination,
+                           const char *mesh_cidr,
                            st_egress_match *out);
 
 /* One entry of an egress policy allowlist. */

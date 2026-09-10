@@ -106,8 +106,12 @@ public static class PeerEgressRules
         {
             return PeerEgressCodes.RuleMalformed;
         }
-        if (action == ActionEgress && rule.EgressClientId is null)
+        if (action == ActionEgress && rule.EgressClientId is null or <= 0)
         {
+            // The field being present is not the same as it being usable. Zero is this project's
+            // sentinel for "no consumer", so accepting it would let the rule pass validation,
+            // install its route, and then fail to find a peer for every packet: a configuration
+            // error deferred into a runtime blackhole.
             return PeerEgressCodes.RuleMissingTarget;
         }
         return null;
@@ -121,8 +125,15 @@ public static class PeerEgressRules
     /// destination resolves to direct. That is the routing table's own behaviour rather than a
     /// fallback branch: a destination with no installed route never reaches the tunnel device in
     /// the first place.
+    ///
+    /// <para>Rules that fail validation are skipped, which is why the mesh prefix is needed here.
+    /// Skipped rather than left to the caller to pre-filter, so that one bad rule cannot change
+    /// what a good one decides no matter who assembled the list: a refused rule with a longer
+    /// prefix would otherwise go on outranking a legal one, and what the operator was told was
+    /// refused would not match where the traffic actually goes.</para>
     /// </remarks>
-    public static PeerEgressRuleMatch Match(IReadOnlyList<PeerEgressRule> rules, string? destination)
+    public static PeerEgressRuleMatch Match(
+        IReadOnlyList<PeerEgressRule> rules, string? destination, string? meshCidr)
     {
         if (rules.Count == 0 || !Ipv4Cidr.TryParseAddress(destination, out var address))
         {
@@ -133,6 +144,10 @@ public static class PeerEgressRules
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
+            if (Validate(rule, meshCidr) is not null)
+            {
+                continue;
+            }
             if (!Ipv4Cidr.TryParse(rule.Match, out var cidr) || !cidr.Contains(address))
             {
                 continue;

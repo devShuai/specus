@@ -415,6 +415,9 @@ static int run_rule_matching(const char *vector)
         st_json_free_string_array(cases, cases_len);
         return 1;
     }
+    char *mesh = st_json_get_string(vector, "meshCidr");
+    const char *mesh_cidr = mesh == NULL ? ST_EGRESS_DEFAULT_MESH_CIDR : mesh;
+
     int failures = 0;
     for (size_t i = 0U; i < cases_len; i++) {
         char *name = st_json_get_string(cases[i], "name");
@@ -425,7 +428,7 @@ static int run_rule_matching(const char *vector)
             failures++;
         } else {
             st_egress_match match;
-            st_egress_match_rules(rules, rules_len, destination, &match);
+            st_egress_match_rules(rules, rules_len, destination, mesh_cidr, &match);
             char *expected_action = st_json_get_string(expect_raw, "action");
             if (expected_action == NULL || strcmp(match.action, expected_action) != 0) {
                 fprintf(stderr, "%s: action = %s, want %s\n", name, match.action,
@@ -459,6 +462,7 @@ static int run_rule_matching(const char *vector)
         free(expect_raw);
     }
     st_json_free_string_array(cases, cases_len);
+    free(mesh);
     return failures;
 }
 
@@ -474,12 +478,51 @@ static int run_rule_validation(const char *vector)
         return 1;
     }
     int failures = 0;
+    /*
+     * The rule list carries refused rules on purpose, to prove the matcher skips them. Their codes
+     * are asserted rather than assumed: a runtime that read one of those rules as valid would
+     * otherwise pass the matching case for the wrong reason.
+     */
+    char *expected_rule_codes[ST_EGRESS_MAX_DESTINATION_RULES];
+    for (size_t i = 0U; i < rules_len; i++) {
+        expected_rule_codes[i] = NULL;
+    }
+    char **refused = NULL;
+    size_t refused_len = 0U;
+    if (st_json_get_raw_array(vector, "refusedRules", &refused, &refused_len) != 0) {
+        fprintf(stderr, "rules vector carried no refusedRules\n");
+        failures++;
+    }
+    for (size_t i = 0U; i < refused_len; i++) {
+        int index = 0;
+        char *code = st_json_get_string(refused[i], "code");
+        if (code == NULL || st_json_get_int(refused[i], "index", &index) != 0
+            || index < 0 || (size_t)index >= rules_len) {
+            fprintf(stderr, "refusedRules entry %zu is incomplete\n", i);
+            failures++;
+            free(code);
+            continue;
+        }
+        /* Owned, because the raw JSON array is freed before the codes are compared. */
+        free(expected_rule_codes[index]);
+        expected_rule_codes[index] = code;
+    }
+    st_json_free_string_array(refused, refused_len);
+
     for (size_t i = 0U; i < rules_len; i++) {
         const char *code = st_egress_validate_rule(&rules[i], mesh_cidr);
-        if (code != NULL) {
-            fprintf(stderr, "rule %s must pass validation, got %s\n", rules[i].match, code);
-            failures++;
+        const char *want = expected_rule_codes[i];
+        if (want == NULL) {
+            if (code != NULL) {
+                fprintf(stderr, "rule %s must pass validation, got %s\n", rules[i].match, code);
+                failures++;
+            }
+        } else {
+            failures += expect_code(rules[i].match, code, want);
         }
+    }
+    for (size_t i = 0U; i < rules_len; i++) {
+        free(expected_rule_codes[i]);
     }
 
     char **cases = NULL;

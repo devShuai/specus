@@ -71,7 +71,12 @@ public final class PeerEgressRules {
                 && !PeerEgressRule.ACTION_BLOCK.equals(action)) {
             return PeerEgressCodes.RULE_MALFORMED;
         }
-        if (PeerEgressRule.ACTION_EGRESS.equals(action) && rule.getEgressClientId() == null) {
+        if (PeerEgressRule.ACTION_EGRESS.equals(action)
+                && (rule.getEgressClientId() == null || rule.getEgressClientId() <= 0)) {
+            // The field being present is not the same as it being usable. Zero is this project's
+            // sentinel for "no consumer", so accepting it would let the rule pass validation,
+            // install its route, and then fail to find a peer for every packet: a configuration
+            // error deferred into a runtime blackhole.
             return PeerEgressCodes.RULE_MISSING_TARGET;
         }
         return null;
@@ -83,8 +88,14 @@ public final class PeerEgressRules {
      * <p>An unmatched destination resolves to {@code direct}. That is the routing table's own
      * behaviour rather than a fallback branch: a destination with no installed route never reaches
      * the tunnel device in the first place.
+     *
+     * <p>Rules that fail validation are skipped, which is why the mesh prefix is needed here.
+     * Skipped rather than left to the caller to pre-filter, so that one bad rule cannot change
+     * what a good one decides no matter who assembled the list: a refused rule with a longer
+     * prefix would otherwise go on outranking a legal one, and what the operator was told was
+     * refused would not match where the traffic actually goes.
      */
-    public static Match match(List<PeerEgressRule> rules, String destination) {
+    public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr) {
         Integer address = Ipv4Cidr.parseAddress(destination);
         if (address == null || rules == null || rules.isEmpty()) {
             return Match.unmatched();
@@ -94,7 +105,10 @@ public final class PeerEgressRules {
         int bestPrefix = -1;
         for (int index = 0; index < rules.size(); index++) {
             PeerEgressRule rule = rules.get(index);
-            Ipv4Cidr cidr = rule == null ? null : Ipv4Cidr.parse(rule.getMatch());
+            if (validate(rule, meshCidr) != null) {
+                continue;
+            }
+            Ipv4Cidr cidr = Ipv4Cidr.parse(rule.getMatch());
             if (cidr == null || !cidr.contains(address)) {
                 continue;
             }

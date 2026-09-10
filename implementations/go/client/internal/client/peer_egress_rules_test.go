@@ -12,7 +12,14 @@ type egressRulesVector struct {
 		Match          string `json:"match"`
 		Action         string `json:"action"`
 		EgressClientID int64  `json:"egressClientId"`
+		Port           int    `json:"port"`
 	} `json:"rules"`
+	// RefusedRules names the rules in the list above that must not pass validation. The list
+	// carries a few on purpose so the match cases can prove a refused rule steers nothing.
+	RefusedRules []struct {
+		Index int    `json:"index"`
+		Code  string `json:"code"`
+	} `json:"refusedRules"`
 	Cases []struct {
 		Name        string `json:"name"`
 		Destination string `json:"destination"`
@@ -50,7 +57,10 @@ func loadEgressRulesVector(t *testing.T) (egressRulesVector, []egressRule) {
 			t.Fatalf("rule %d declares index %d", position, entry.Index)
 		}
 		rules = append(rules, egressRule{
-			Match: entry.Match, Action: entry.Action, EgressClientID: entry.EgressClientID,
+			Match:          entry.Match,
+			Action:         entry.Action,
+			EgressClientID: entry.EgressClientID,
+			Port:           entry.Port,
 		})
 	}
 	return vector, rules
@@ -102,12 +112,22 @@ func TestEgressRuleValidationMatchesSharedVector(t *testing.T) {
 	}
 }
 
-// Every rule the vector configures has to survive validation, or the match cases above would be
-// asserting against rules the engine quietly skips.
-func TestEgressRulesFromTheVectorAllValidate(t *testing.T) {
+// The vector's rule list carries refused rules on purpose, to prove the matcher skips them. Their
+// codes are asserted rather than assumed: a runtime that read one of those rules as valid would
+// otherwise pass the matching case for the wrong reason.
+func TestEgressRulesFromTheVectorRefuseExactlyWhatItSays(t *testing.T) {
 	vector, rules := loadEgressRulesVector(t)
-	if refused := validateEgressRuleSet(rules, vector.MeshCIDR); len(refused) != 0 {
-		t.Errorf("the vector's own rules were refused: %+v", refused)
+	if len(vector.RefusedRules) == 0 {
+		t.Fatal("rules vector carried no refusedRules")
+	}
+	want := make(map[int]string, len(vector.RefusedRules))
+	for _, entry := range vector.RefusedRules {
+		want[entry.Index] = entry.Code
+	}
+	for index, rule := range rules {
+		if code := validateEgressRule(rule, vector.MeshCIDR); code != want[index] {
+			t.Errorf("rule %d (%q): code = %q, want %q", index, rule.Match, code, want[index])
+		}
 	}
 }
 
