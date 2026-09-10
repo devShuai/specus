@@ -122,7 +122,7 @@ public class PeerEgressRuntimeTests
                     }
                 },
                 this,
-                reader => Task.Run(reader),
+                reader => new Thread(() => reader()) { IsBackground = true }.Start(),
                 () => Epoch);
             Runtime.ApplyPolicy(Policy(destinations), PeerEgressContext.Default, Epoch);
         }
@@ -258,10 +258,20 @@ public class PeerEgressRuntimeTests
         }
     }
 
-    /// <summary>Polls a condition the reader tasks satisfy asynchronously.</summary>
+    /// <summary>Runs something that blocks, off the thread pool. Returns the thread so a test can join it.</summary>
+    private static Thread StartBlocking(Action work)
+    {
+        var thread = new Thread(() => work()) { IsBackground = true };
+        thread.Start();
+        return thread;
+    }
+
+    /// <summary>Polls a condition the reader threads satisfy asynchronously.</summary>
     private static void WaitFor(string what, Func<bool> condition)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(2);
+        // Generous on purpose. The condition is satisfied by another thread, and a deadline tight
+        // enough to fail on a loaded CI runner would report a scheduling delay as a defect.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
         while (DateTime.UtcNow < deadline)
         {
             if (condition())
@@ -379,7 +389,9 @@ public class PeerEgressRuntimeTests
             PeerEgressContext.Default, Epoch);
 
         harness.Gate = new ManualResetEventSlim(false);
-        _ = Task.Run(() => harness.Runtime.HandleFrame(7,
+        // A thread rather than a pool task: the call blocks on the gate for the whole test, and a
+        // pool thread parked like that is one the readers cannot have.
+        StartBlocking(() => harness.Runtime.HandleFrame(7,
             FrameFor(PeerEgressSegment.Build(Syn("100.96.0.1", 40000, "203.0.113.10", 443))), Epoch));
         WaitFor("the first connect to start", () => harness.DialCount == 1);
 
@@ -706,19 +718,19 @@ public class PeerEgressRuntimeTests
             PeerEgressSegment.Ipv4ProtocolTcp, opening.SourceIp, opening.SourcePort,
             opening.DestinationIp, opening.DestinationPort);
 
-        var first = Task.Run(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
+        var first = StartBlocking(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
         WaitFor("the first connect to start", () => harness.DialCount == 1);
 
         // The racing second attempt, which the reservation must already have claimed. Run on its own
         // task: an implementation that dials again would block on the gate, and a hung test says far
         // less than a counted one.
-        var second = Task.Run(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
-        second.Wait(TimeSpan.FromSeconds(1));
+        var second = StartBlocking(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
+        second.Join(TimeSpan.FromSeconds(1));
 
         Assert.True(harness.DialCount == 1, "dialled more than once for one flow");
         Assert.True(harness.Runtime.FlowCount == 1, "more than one flow for one four-tuple");
 
         harness.Gate.Set();
-        first.Wait(TimeSpan.FromSeconds(2));
+        first.Join(TimeSpan.FromSeconds(2));
     }
 }

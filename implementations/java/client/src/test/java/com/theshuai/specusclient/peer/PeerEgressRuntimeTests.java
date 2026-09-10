@@ -261,12 +261,21 @@ class PeerEgressRuntimeTests {
 
     /** Polls a condition the reader threads satisfy asynchronously. */
     private static void waitFor(String what, BooleanSupplier condition) {
-        long deadline = System.nanoTime() + 2_000_000_000L;
+        // Generous on purpose, and a sleep rather than a spin. The condition is satisfied by
+        // another thread, so busy-waiting would compete with the very reader being waited on, and a
+        // deadline tight enough to fail on a loaded CI runner would report a scheduling delay as a
+        // defect.
+        long deadline = System.nanoTime() + 10_000_000_000L;
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
                 return;
             }
-            Thread.onSpinWait();
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                fail("interrupted while waiting for " + what);
+            }
         }
         fail("timed out waiting for " + what);
     }

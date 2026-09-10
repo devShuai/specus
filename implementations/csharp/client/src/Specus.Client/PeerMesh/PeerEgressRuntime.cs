@@ -117,7 +117,11 @@ internal sealed class PeerEgressRuntime
     {
         _send = send;
         _dialer = dialer;
-        _executor = executor ?? (reader => Task.Run(reader));
+        // A dedicated background thread per reader, not the thread pool. Each loop blocks on a
+        // socket read for the life of its flow, and pool threads are a shared, slowly-growing
+        // resource: a node carrying a few dozen flows would starve everything else on the pool,
+        // including the work that would have closed those very flows.
+        _executor = executor ?? (reader => new Thread(() => reader()) { IsBackground = true }.Start());
         _clock = clock ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         _logger = logger;
     }
