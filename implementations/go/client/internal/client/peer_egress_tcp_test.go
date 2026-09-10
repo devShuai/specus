@@ -268,6 +268,33 @@ func TestTCPDoesNotAnswerAPlainAck(t *testing.T) {
 	}
 }
 
+// The header's window field is sixteen bits and this version has no window scaling, so a receive
+// window of 65536 goes on the wire as zero. A zero window is not a large window: it is the signal
+// that tells the peer to stop sending and wait to be probed, so the mistake stalls every flow
+// rather than making one slow.
+func TestTCPAdvertisesAUsableWindow(t *testing.T) {
+	if tcpReceiveWindow > 0xffff {
+		t.Fatalf("tcpReceiveWindow = %d does not fit the header field", tcpReceiveWindow)
+	}
+	h := newTCPHarness(t)
+
+	reply := h.expectOne(h.conn.onAppData([]byte("payload"), h.now), "data segment")
+	if reply.Window == 0 {
+		t.Error("a data segment advertised a zero window")
+	}
+	ack := h.expectOne(h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5001, Flags: tcpFlagACK,
+		Payload: []byte("request")}), "ACK")
+	if ack.Window == 0 {
+		t.Error("an acknowledgement advertised a zero window")
+	}
+	if tcpAdvertisedWindow(1<<16) != 0xffff {
+		t.Error("an oversized window was truncated rather than clamped")
+	}
+	if tcpAdvertisedWindow(1234) != 1234 {
+		t.Error("a window inside the field was altered")
+	}
+}
+
 // A full handshake, a byte each way, and an orderly close from the consumer side.
 func TestTCPFlowCompletesHandshakeDataAndClose(t *testing.T) {
 	h := newTCPHarness(t)

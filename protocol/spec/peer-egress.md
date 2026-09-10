@@ -62,15 +62,17 @@
 
 配置校验顺序固定，实现必须按此顺序返回第一个命中的错误码。一条规则可能同时违反多项，顺序不固定则各语言会对同一条规则报出不同的码，而共享向量目前没有同时违反两项的用例，无法靠它兜住：
 
-1. `EGRESS_RULE_DOMAIN_UNSUPPORTED` —— match 是域名或域名后缀
-2. `EGRESS_RULE_IPV6_UNSUPPORTED` —— match 是 IPv6 地址或前缀
-3. `EGRESS_RULE_MALFORMED` —— 不是合法的 IPv4 地址或前缀，前缀长度越界，主机位非零，或 action 未定义
-4. `EGRESS_RULE_DEFAULT_ROUTE` —— 前缀长度为 0
-5. `EGRESS_RULE_MESH_OVERLAP` —— 与 Peer Mesh 网段任一方向重叠
-6. `EGRESS_RULE_PORT_UNSUPPORTED` —— 携带端口维度
-7. `EGRESS_RULE_MISSING_TARGET` —— `action=egress` 缺少 `egressClientId`
+1. `EGRESS_RULE_MALFORMED` —— `match` 为空
+2. `EGRESS_RULE_IPV6_UNSUPPORTED` —— `match` 含冒号
+3. `EGRESS_RULE_DOMAIN_UNSUPPORTED` —— `match` 是域名或域名后缀
+4. `EGRESS_RULE_MALFORMED` —— 不是合法的 IPv4 地址或前缀，前缀长度越界，或主机位非零
+5. `EGRESS_RULE_DEFAULT_ROUTE` —— 前缀长度为 0
+6. `EGRESS_RULE_MESH_OVERLAP` —— 与 Peer Mesh 网段任一方向重叠
+7. `EGRESS_RULE_PORT_UNSUPPORTED` —— 携带端口维度
+8. `EGRESS_RULE_MALFORMED` —— `action` 不是 `egress` / `direct` / `block`
+9. `EGRESS_RULE_MISSING_TARGET` —— `action=egress` 缺少 `egressClientId`
 
-先判断 match 是什么，再判断它是否合法，然后是作为前缀被策略拒绝的两种，最后才是字段与维度。这样运维拿到的第一个码指向的是最外层的问题。
+`match` 是规则的主体：先判断它是什么、是否合法、作为前缀是否被策略拒绝，最后才轮到 `action` 与它需要的字段。冒号是无歧义的信号，所以 IPv6 排在域名之前。
 
 规则变更对已建立连接：已建流不受影响，除非规则从 `egress` 变为 `direct` / `block` 或不再匹配。此时消费端立即断开该流，并向出口发送 `flow-purge` 控制消息关闭对端侧的对应连接。
 

@@ -53,7 +53,11 @@ const (
 	// tcpReceiveWindow is the window we advertise. Phase one runs a conservative fixed window
 	// rather than a full congestion controller; the ceiling plus the existing RTT and path-MTU
 	// observations are what bound throughput. protocol/spec/peer-egress.md records this limit.
-	tcpReceiveWindow = 64 * 1024
+	//
+	// 65535 and not 64 KiB: the header field is sixteen bits and there is no window scaling in
+	// this version, so a 65536 would go on the wire as a zero window and tell every consumer to
+	// stop sending.
+	tcpReceiveWindow = 65535
 
 	tcpInitialRTO = 1 * time.Second
 	tcpMinRTO     = 200 * time.Millisecond
@@ -206,6 +210,17 @@ func (c *tcpConn) advertisedMSS(pathMTU int) int {
 	return mss
 }
 
+// tcpAdvertisedWindow renders the receive window into the sixteen bits the header has.
+//
+// Clamped rather than truncated. A window of 65536 wraps to zero, and a zero window is not a large
+// window: it is the signal that tells the peer to stop sending entirely and wait to be probed.
+func tcpAdvertisedWindow(window uint32) uint16 {
+	if window > 0xffff {
+		return 0xffff
+	}
+	return uint16(window)
+}
+
 // emit renders one segment, queues it for retransmission when it occupies sequence space, and
 // advances SND.NXT.
 func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.Time, mss int) {
@@ -217,7 +232,7 @@ func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.
 		Seq:             c.sndNxt,
 		Ack:             c.rcvNxt,
 		Flags:           flags,
-		Window:          uint16(c.rcvWnd),
+		Window:          tcpAdvertisedWindow(c.rcvWnd),
 		MSS:             mss,
 		Payload:         payload,
 	}
@@ -617,7 +632,7 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 			SourceIP: c.localIP, DestinationIP: c.remoteIP,
 			SourcePort: c.localPort, DestinationPort: c.remotePort,
 			Seq: entry.seq, Ack: c.rcvNxt, Flags: entry.flags,
-			Window: uint16(c.rcvWnd), Payload: entry.payload,
+			Window: tcpAdvertisedWindow(c.rcvWnd), Payload: entry.payload,
 		}))
 		// Exponential backoff, capped. Doing this per entry keeps one lost segment from resetting
 		// the estimator for the whole flow.
@@ -652,7 +667,7 @@ func (c *tcpConn) keepalive(now time.Time, output *tcpOutput) bool {
 	output.send(buildTCPSegment(tcpSegment{
 		SourceIP: c.localIP, DestinationIP: c.remoteIP,
 		SourcePort: c.localPort, DestinationPort: c.remotePort,
-		Seq: c.sndNxt - 1, Ack: c.rcvNxt, Flags: tcpFlagACK, Window: uint16(c.rcvWnd),
+		Seq: c.sndNxt - 1, Ack: c.rcvNxt, Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd),
 	}))
 	return false
 }

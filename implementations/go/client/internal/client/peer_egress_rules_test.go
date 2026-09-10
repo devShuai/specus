@@ -145,15 +145,21 @@ func TestEgressRuleValidationOrderIsFixed(t *testing.T) {
 		rule egressRule
 		want string
 	}{
+		{"a colon settles IPv6 before anything is guessed at", egressRule{
+			Match: "*.example.com:443", Action: egressActionEgress, EgressClientID: 2},
+			egressCodeRuleIPv6Unsupported},
 		{"domain outranks port", egressRule{
 			Match: "*.example.com", Action: egressActionEgress, EgressClientID: 2, Port: 443},
 			egressCodeRuleDomainUnsupported},
 		{"IPv6 outranks missing target", egressRule{
 			Match: "2001:db8::/32", Action: egressActionEgress},
 			egressCodeRuleIPv6Unsupported},
-		{"an unreadable action outranks the default route", egressRule{
+		{"the default route outranks an unreadable action", egressRule{
 			Match: "0.0.0.0/0", Action: "forward"},
-			egressCodeRuleMalformed},
+			egressCodeRuleDefaultRoute},
+		{"port outranks an unreadable action", egressRule{
+			Match: "203.0.113.0/24", Action: "forward", Port: 443},
+			egressCodeRulePortUnsupported},
 		{"the default route outranks mesh overlap", egressRule{
 			Match: "0.0.0.0/0", Action: egressActionEgress, EgressClientID: 2},
 			egressCodeRuleDefaultRoute},

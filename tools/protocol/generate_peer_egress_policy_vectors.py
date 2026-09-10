@@ -109,6 +109,29 @@ CONFIG_REJECT = [
     {"name": "port-on-consumer-rule", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2, "port": 443},
      "code": "EGRESS_RULE_PORT_UNSUPPORTED",
      "reason": "消费端按路由分流，路由只能选目的地址。端口与协议限制只存在于出口策略，在建流时执行"},
+    # 同时违反多项的用例。规范固定了校验顺序，但在补这几条之前向量里没有任何一条规则同时踩两个坑，
+    # 于是各语言可以各返回一个码而向量抓不到——这正是四端实现最容易漂开的地方。
+    {"name": "ipv6-outranks-domain", "rule": {"match": "*.example.com:443", "action": "egress", "egressClientId": 2},
+     "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
+     "reason": "冒号是无歧义信号，先于域名判断，否则带冒号的通配串在各实现里会被归成不同类"},
+    {"name": "domain-outranks-port", "rule": {"match": "*.example.com", "action": "egress", "egressClientId": 2, "port": 443},
+     "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED",
+     "reason": "先判断 match 是什么，再判断它带了什么维度"},
+    {"name": "default-route-outranks-unreadable-action", "rule": {"match": "0.0.0.0/0", "action": "forward"},
+     "code": "EGRESS_RULE_DEFAULT_ROUTE",
+     "reason": "match 是规则主体，作为前缀被拒的两种排在 action 之前"},
+    {"name": "mesh-overlap-outranks-port", "rule": {"match": "100.96.0.0/11", "action": "egress", "egressClientId": 2, "port": 443},
+     "code": "EGRESS_RULE_MESH_OVERLAP",
+     "reason": "同上，覆盖 mesh 网段比携带端口更靠前"},
+    {"name": "port-outranks-unreadable-action", "rule": {"match": "203.0.113.0/24", "action": "forward", "port": 443},
+     "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+     "reason": "端口维度先于 action 判定，与三个先落地的实现一致"},
+    {"name": "unreadable-action-outranks-missing-target", "rule": {"match": "203.0.113.0/24", "action": "forward"},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "action 读不懂时不再追问它缺什么字段"},
+    {"name": "host-bits-outrank-everything-after", "rule": {"match": "203.0.113.1/24", "action": "egress", "egressClientId": 2, "port": 443},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "前缀本身不合法时，后面的策略判断都建立在读不出的前缀上"},
 ]
 
 rules_vector = {
