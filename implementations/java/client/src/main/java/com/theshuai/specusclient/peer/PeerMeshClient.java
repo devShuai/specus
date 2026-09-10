@@ -7,6 +7,8 @@ import com.theshuai.common.peermesh.PeerCrypto;
 import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
+import com.theshuai.common.peeregress.PeerEgressConfigMessage;
+import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.stun.StunMessage;
 import com.theshuai.common.stun.TurnChannelData;
 import com.theshuai.common.util.JsonUtil;
@@ -53,6 +55,10 @@ import java.util.concurrent.atomic.AtomicLong;
 @Slf4j
 public class PeerMeshClient implements AutoCloseable {
     private volatile PeerIndex peerIndex = PeerIndex.empty();
+    /** The egress data plane and its three joins with this client. */
+    private final PeerEgressMesh egress = new PeerEgressMesh(new EgressHost());
+    /** This deployment's control endpoint, for the egress forced-deny list. */
+    private volatile String controlEndpoint = "";
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessionsById = new ConcurrentHashMap<>();
     private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
@@ -323,6 +329,10 @@ public class PeerMeshClient implements AutoCloseable {
             updateRoster(root.path("peers"));
             return;
         }
+        if (PeerEgressConfigMessage.TYPE.equals(type)) {
+            egress.applyEgressConfig(message);
+            return;
+        }
         PeerControlMessage control = JsonUtil.stringToObject(message, PeerControlMessage.class);
         if (control == null) {
             log.warn("Peer mesh 信令解析失败");
@@ -439,6 +449,9 @@ public class PeerMeshClient implements AutoCloseable {
     @Override
     public void close() {
         serviceRuntime.close();
+        // Routes first, so traffic stops being captured before the plane stops answering for it.
+        egress.withdrawRoutes();
+        egress.close();
         running = false;
         runtimeConfigKey = "";
         peerIndex = PeerIndex.empty();
@@ -787,6 +800,9 @@ public class PeerMeshClient implements AutoCloseable {
         PeerSession removed = sessions.remove(peerId);
         if (removed != null) {
             sessionsById.remove(removed.sessionId(), removed);
+            // Delivered as an event rather than polled: asking the mesh whether a peer is still
+            // authorised would mean taking this lock from under the plane's own.
+            egress.revokeConsumer(peerId);
         }
         return removed;
     }
@@ -795,6 +811,7 @@ public class PeerMeshClient implements AutoCloseable {
         boolean removed = sessions.remove(peerId, expected);
         if (removed) {
             sessionsById.remove(expected.sessionId(), expected);
+            egress.revokeConsumer(peerId);
         }
         return removed;
     }
@@ -2472,6 +2489,12 @@ public class PeerMeshClient implements AutoCloseable {
             handlePeerAppMessage(frame, session);
             return;
         }
+        // Before the bare IPv4 endpoint check below: a payload carrying the SPEG1 magic is
+        // addressed to the egress path and must be refused with its own code rather than dropped
+        // here as an unrecognised mesh packet.
+        if (egress.handleInboundFrame(session.peerId(), frame.plaintext())) {
+            return;
+        }
 
         PeerInfo authenticatedPeer = peerIndex.byId().get(session.peerId());
         ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
@@ -3306,6 +3329,16 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private boolean sendVirtualPacket(byte[] ipv4Packet, int offset, int length) {
+        // Offered to the consumer rules first. A destination a rule claims is not a mesh peer, and
+        // the path below would drop it as one: silently, and as though nothing had been configured.
+        if (ipv4Packet != null && length > 0) {
+            byte[] whole = offset == 0 && length == ipv4Packet.length
+                    ? ipv4Packet
+                    : Arrays.copyOfRange(ipv4Packet, offset, offset + length);
+            if (egress.handleOutbound(whole)) {
+                return true;
+            }
+        }
         Integer targetVirtualIpv4 = PeerIpPacket.destinationIpv4Int(ipv4Packet, offset, length);
         if (targetVirtualIpv4 == null) {
             log.trace("Peer mesh 忽略非 IPv4 或无效 IP 包");
@@ -4094,6 +4127,90 @@ public class PeerMeshClient implements AutoCloseable {
                 }
             }
             return new PeerIndex(byId, Map.copyOf(byVirtualIpv4));
+        }
+    }
+
+    /**
+     * Tells the egress side about this deployment's control endpoint and this node's own consumer
+     * rules.
+     *
+     * <p>Separate from the constructor because both come from the client's own configuration rather
+     * than from the mesh config the server pushes, and because the rules can change without the
+     * mesh being rebuilt.
+     */
+    public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules) {
+        controlEndpoint = StringUtils.hasText(controlHost)
+                ? controlHost.trim() + (controlPort > 0 ? ":" + controlPort : "")
+                : "";
+        egress.applyRules(rules == null ? List.of() : rules);
+    }
+
+    /** What the egress plane needs from this client. Every method is called with no lock held. */
+    private final class EgressHost implements PeerEgressMesh.Host {
+        @Override
+        public boolean sendToPeer(long peerId, byte[] frame) {
+            PeerInfo peer = peerIndex.byId().get(peerId);
+            if (peer == null || !StringUtils.hasText(peer.virtualIp())) {
+                return false;
+            }
+            return sendEncryptedPayload(peer.virtualIp(), frame);
+        }
+
+        @Override
+        public void writeToDevice(byte[] packet) {
+            PeerVirtualDevice device = virtualDevice;
+            if (device == null || device instanceof NoopPeerVirtualDevice) {
+                return;
+            }
+            synchronized (tunWriteLock) {
+                device.writePacket(packet);
+            }
+        }
+
+        @Override
+        public String tunName() {
+            PeerVirtualDevice device = virtualDevice;
+            return device == null ? virtualDeviceOptions.tunName() : device.name();
+        }
+
+        @Override
+        public String meshCidr() {
+            ClientAuthLoginResponse.PeerMeshConfig current = config;
+            return current == null ? "" : current.getCidr();
+        }
+
+        @Override
+        public String virtualIp() {
+            ClientAuthLoginResponse.PeerMeshConfig current = config;
+            return current == null ? "" : current.getVirtualIp();
+        }
+
+        @Override
+        public List<String> deploymentDenyCidrs() {
+            ClientAuthLoginResponse.PeerMeshConfig current = config;
+            String stun = current == null ? "" : current.getStunHost();
+            String turn = current == null ? "" : current.getTurnHost();
+            // The control endpoint arrives as a host and port rather than a URL, so it is handed to
+            // the same slot a base URL would fill; both are parsed as an authority.
+            return PeerEgressEndpoints.deploymentDenyCidrs("", stun, turn, controlEndpoint);
+        }
+
+        @Override
+        public List<String> peerEndpointAddresses() {
+            List<String> addresses = new ArrayList<>();
+            for (PeerSession session : sessions.values()) {
+                InetSocketAddress endpoint = session.remoteEndpoint;
+                if (endpoint != null && endpoint.getAddress() != null) {
+                    addresses.add(endpoint.getAddress().getHostAddress());
+                }
+            }
+            return addresses;
+        }
+
+        @Override
+        public Integer pathMtuForPeer(long peerId) {
+            PeerSession session = sessions.get(peerId);
+            return session == null ? null : session.pathMtu.effectiveMtu(virtualDeviceOptions.mtu());
         }
     }
 

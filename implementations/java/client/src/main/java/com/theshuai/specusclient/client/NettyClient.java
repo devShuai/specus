@@ -134,6 +134,10 @@ public class NettyClient {
                     specusBean.getPeerMeshMtu(), peerOptions.mtu());
         }
         this.peerMeshClient = new PeerMeshClient(specusBean.getPeerMesh(), this::sendPeerControl, peerOptions);
+        // The control endpoint and the consumer's own rules come from local configuration rather
+        // than from the mesh config the server pushes, so they arrive separately.
+        this.peerMeshClient.configureEgress(specusBean.getRemoteAddress(), specusBean.getRemotePort(),
+                specusBean.getPeerEgressRules());
     }
 
     public void start() {
