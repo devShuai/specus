@@ -80,6 +80,18 @@ final class PeerEgressMesh implements AutoCloseable {
     }
 
     private final Host host;
+    /**
+     * How the egress role opens its real sockets. Injected so this class can be driven without a
+     * network: with the real dialer a test that pushes a policy and sends a SYN spends the whole
+     * connect timeout reaching an address nobody routes.
+     */
+    private final PeerEgressRuntime.Dialer dialer;
+    /**
+     * How the consumer role changes the routing table, or null to build the platform's own.
+     * Injected for the same reason the dialer is: a test that applies rules must not run
+     * {@code ip route} on the machine it is running on.
+     */
+    private final PeerEgressRouteInstaller.Commander commander;
     private final BlockingQueue<Outbound> queue = new ArrayBlockingQueue<>(SEND_QUEUE_DEPTH);
     private final AtomicBoolean closed = new AtomicBoolean();
     private Thread sendLoop;
@@ -90,7 +102,14 @@ final class PeerEgressMesh implements AutoCloseable {
     private volatile PeerEgressRouteInstaller routes;
 
     PeerEgressMesh(Host host) {
+        this(host, new PeerEgressSocketDialer(), null);
+    }
+
+    PeerEgressMesh(Host host, PeerEgressRuntime.Dialer dialer,
+            PeerEgressRouteInstaller.Commander commander) {
         this.host = host;
+        this.dialer = dialer;
+        this.commander = commander;
     }
 
     /**
@@ -110,7 +129,7 @@ final class PeerEgressMesh implements AutoCloseable {
             }
             PeerEgressRuntime built = new PeerEgressRuntime(
                     (consumerId, frame) -> queue.offer(new Outbound(consumerId, frame)),
-                    new PeerEgressSocketDialer());
+                    dialer);
             runtime = built;
             startLoops(built);
             return built;
@@ -310,7 +329,10 @@ final class PeerEgressMesh implements AutoCloseable {
                     ? Path.of(System.getProperty("user.home", "."), ".specus", "egress-routes.json")
                     : host.routeJournalPath();
             PeerEgressRouteInstaller installer = new PeerEgressRouteInstaller(
-                    LinuxPeerEgressRouteCommander.forPlatform(host.tunName()), journal);
+                    commander == null
+                            ? LinuxPeerEgressRouteCommander.forPlatform(host.tunName())
+                            : commander,
+                    journal);
             try {
                 installer.load();
             } catch (Exception unusable) {

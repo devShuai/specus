@@ -61,7 +61,21 @@ internal interface IPeerEgressMeshHost
 /// mesh's is taken, and the mesh already takes its lock on paths that reach into the plane, which
 /// is a cycle. Everything here either queues or is called with no mesh lock held.</para>
 /// </remarks>
-internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger = null) : IDisposable
+/// <param name="dialer">
+/// How the egress role opens its real sockets. Injected so this class can be driven without a
+/// network: with the real dialer a test that pushes a policy and sends a SYN spends the whole
+/// connect timeout reaching an address nobody routes.
+/// </param>
+/// <param name="commander">
+/// How the consumer role changes the routing table, or null to build the platform's own. Injected
+/// for the same reason the dialer is: a test that applies rules must not run <c>ip route</c> on the
+/// machine it is running on.
+/// </param>
+internal sealed class PeerEgressMesh(
+    IPeerEgressMeshHost host,
+    ILogger? logger = null,
+    IPeerEgressDialer? dialer = null,
+    IPeerEgressRouteCommander? commander = null) : IDisposable
 {
     /// <summary>
     /// Bounds frames waiting to be encrypted and sent. A full queue drops, which is safe here in a
@@ -126,7 +140,7 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
                     // TryAdd rather than Add: a full queue drops, it never blocks the plane.
                     _queue.TryAdd((consumer, frame));
                 },
-                new PeerEgressSocketDialer(),
+                dialer ?? new PeerEgressSocketDialer(),
                 logger: logger);
             _runtime = built;
             EnsureLoops();
@@ -396,7 +410,7 @@ internal sealed class PeerEgressMesh(IPeerEgressMeshHost host, ILogger? logger =
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".specus", "egress-routes.json");
             var installer = new PeerEgressRouteInstaller(
-                LinuxPeerEgressRouteCommander.ForPlatform(host.TunName), journal);
+                commander ?? LinuxPeerEgressRouteCommander.ForPlatform(host.TunName), journal);
             try
             {
                 installer.Load();

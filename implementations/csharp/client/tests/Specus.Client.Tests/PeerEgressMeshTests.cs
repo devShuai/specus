@@ -82,8 +82,52 @@ public class PeerEgressMeshTests : IDisposable
 
     private PeerEgressMesh NewMesh()
     {
-        _mesh = new PeerEgressMesh(new FakeHost(this, _directory));
+        _mesh = new PeerEgressMesh(new FakeHost(this, _directory),
+            dialer: new FakeDialer(), commander: new FakeCommander());
         return _mesh;
+    }
+
+    /// <summary>A routing table that accepts everything and touches nothing on this machine.</summary>
+    private sealed class FakeCommander : IPeerEgressRouteCommander
+    {
+        public PeerEgressRouteConflictCheck Conflict(PeerEgressRoute route) =>
+            PeerEgressRouteConflictCheck.None;
+
+        public void Install(PeerEgressRoute route)
+        {
+        }
+
+        public void Remove(PeerEgressRoute route)
+        {
+        }
+    }
+
+    /// <summary>
+    /// A socket that never fails and never reads. With the real dialer these cases would each spend
+    /// the whole connect timeout reaching an address nobody routes, which is a test of the network
+    /// rather than of the wiring.
+    /// </summary>
+    private sealed class FakeDialer : IPeerEgressDialer
+    {
+        public IPeerEgressSocket Dial(string protocol, string host, int port, long timeoutMs) =>
+            new IdleSocket();
+
+        private sealed class IdleSocket : IPeerEgressSocket
+        {
+            private readonly ManualResetEventSlim _closed = new(false);
+
+            public int Read(byte[] buffer)
+            {
+                _closed.Wait();
+                return -1;
+            }
+
+            public void Write(byte[] data)
+            {
+            }
+
+            public void Dispose() => _closed.Set();
+        }
     }
 
     private List<byte[]> Frames()

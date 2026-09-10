@@ -98,8 +98,58 @@ class PeerEgressMeshTests {
     }
 
     private PeerEgressMesh newMesh() {
-        mesh = new PeerEgressMesh(new FakeHost());
+        mesh = new PeerEgressMesh(new FakeHost(), new FakeDialer(), new FakeCommander());
         return mesh;
+    }
+
+    /** A routing table that accepts everything and touches nothing on this machine. */
+    private static final class FakeCommander implements PeerEgressRouteInstaller.Commander {
+        @Override
+        public PeerEgressRouteInstaller.Conflict conflict(PeerEgressRoutePlanner.Route route) {
+            return PeerEgressRouteInstaller.Conflict.none();
+        }
+
+        @Override
+        public void install(PeerEgressRoutePlanner.Route route) {
+        }
+
+        @Override
+        public void remove(PeerEgressRoutePlanner.Route route) {
+        }
+    }
+
+    /**
+     * A socket that never fails and never reads. With the real dialer these cases would each spend
+     * the whole connect timeout reaching an address nobody routes, which is a test of the network
+     * rather than of the wiring.
+     */
+    private static final class FakeDialer implements PeerEgressRuntime.Dialer {
+        @Override
+        public PeerEgressRuntime.Socket dial(String protocol, String host, int port, long timeoutMs) {
+            return new PeerEgressRuntime.Socket() {
+                private final java.util.concurrent.CountDownLatch closed =
+                        new java.util.concurrent.CountDownLatch(1);
+
+                @Override
+                public int read(byte[] buffer) {
+                    try {
+                        closed.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return -1;
+                }
+
+                @Override
+                public void write(byte[] data) {
+                }
+
+                @Override
+                public void close() {
+                    closed.countDown();
+                }
+            };
+        }
     }
 
     private synchronized List<byte[]> frames() {
