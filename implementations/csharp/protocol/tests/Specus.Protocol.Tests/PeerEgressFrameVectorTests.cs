@@ -144,4 +144,63 @@ public class PeerEgressFrameVectorTests
         Assert.False(PeerEgressFrame.LooksLikeFrame([]));
         Assert.False(PeerEgressFrame.LooksLikeFrame([0x45, 0x00, 0x00, 0x28]));
     }
+
+    /// <summary>
+    /// Control messages have to encode to the same bytes everywhere.
+    /// </summary>
+    /// <remarks>
+    /// The vector carries the canonical body for each one, and until this test existed nothing
+    /// checked it in any runtime: the claim that two implementations produce byte-identical frames
+    /// rested on three separate readings of the same field order. Key order is not something a JSON
+    /// library owes anyone, so it is asserted rather than assumed.
+    /// </remarks>
+    [Fact]
+    public void ControlEncodingMatchesSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-frame-v1.json");
+        var checkedCases = 0;
+        foreach (var testCase in vector.RootElement.GetProperty("accept").EnumerateArray())
+        {
+            if (!testCase.TryGetProperty("controlJson", out var json))
+            {
+                continue;
+            }
+            var canonical = Text(testCase, "controlCanonicalUtf8Hex");
+            if (canonical.Length == 0)
+            {
+                continue;
+            }
+            checkedCases++;
+            var name = Text(testCase, "name");
+
+            var destinations = new List<string>();
+            if (json.TryGetProperty("destinations", out var list) && list.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in list.EnumerateArray())
+                {
+                    destinations.Add(entry.GetString() ?? string.Empty);
+                }
+            }
+            var control = new PeerEgressFrame.Control(
+                Text(json, "type"), Text(json, "protocol"), Text(json, "sourceIp"),
+                Number(json, "sourcePort"), Text(json, "destinationIp"),
+                Number(json, "destinationPort"), destinations, Text(json, "code"));
+
+            var body = PeerEgressFrame.EncodeControl(control);
+            Assert.True(canonical == HexOf(body), $"{name}: canonical body was {HexOf(body)}");
+
+            // And the whole frame, so the header the body travels in is pinned too.
+            var frame = PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, body);
+            Assert.True(Text(testCase, "frameHex") == HexOf(frame), $"{name}: frame");
+
+            var decoded = PeerEgressFrame.DecodeControl(body);
+            Assert.True(decoded is not null, $"{name}: the canonical body did not decode");
+            Assert.Equal(control.Type, decoded!.Type);
+            Assert.Equal(control.Code, decoded.Code);
+            Assert.Equal(control.DestinationIp, decoded.DestinationIp);
+            Assert.Equal(control.DestinationPort, decoded.DestinationPort);
+            Assert.Equal(control.Destinations, decoded.Destinations);
+        }
+        Assert.True(checkedCases > 0, "frame vector carried no control cases");
+    }
 }

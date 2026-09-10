@@ -189,6 +189,137 @@ public static class PeerEgressFrame
     }
 
     /// <summary>Builds a frame. hop is set only when this node forwards as a consumer of another egress.</summary>
+    /// <summary>
+    /// One control message body.
+    /// </summary>
+    /// <remarks>
+    /// Fields not carried by a given message type stay empty or zero and are left out of the
+    /// encoding, which is what makes the canonical bytes short enough to compare by eye.
+    /// </remarks>
+    public sealed record Control(
+        string Type,
+        string Protocol,
+        string SourceIp,
+        int SourcePort,
+        string DestinationIp,
+        int DestinationPort,
+        IReadOnlyList<string> Destinations,
+        string Code)
+    {
+        /// <summary>A flow-reject: the reason one flow was refused, for the consumer to display.</summary>
+        public static Control FlowReject(
+            string protocol, string sourceIp, int sourcePort,
+            string destinationIp, int destinationPort, string code) =>
+            new(ControlFlowReject, protocol, sourceIp, sourcePort, destinationIp, destinationPort, [], code);
+
+        /// <summary>A flow-purge: the destinations whose established flows the egress should close.</summary>
+        public static Control FlowPurge(IReadOnlyList<string>? destinations, string code) =>
+            new(ControlFlowPurge, string.Empty, string.Empty, 0, string.Empty, 0,
+                destinations ?? [], code);
+    }
+
+    /// <summary>
+    /// Serialises a control message in the key order the spec fixes, so two implementations produce
+    /// byte-identical frames for the same message.
+    /// </summary>
+    /// <remarks>
+    /// Assembled rather than handed to a serialiser's property ordering, because that ordering is a
+    /// property of the library rather than of the protocol, and the shared vector pins these exact
+    /// bytes. Values still go through the encoder: a code or a destination arrives from the wire.
+    /// </remarks>
+    public static byte[] EncodeControl(Control control)
+    {
+        var text = new StringBuilder(96).Append('{');
+        AppendString(text, "type", control.Type, first: true);
+        AppendString(text, "protocol", control.Protocol, first: false);
+        AppendString(text, "sourceIp", control.SourceIp, first: false);
+        AppendNumber(text, "sourcePort", control.SourcePort);
+        AppendString(text, "destinationIp", control.DestinationIp, first: false);
+        AppendNumber(text, "destinationPort", control.DestinationPort);
+        if (control.Destinations.Count > 0)
+        {
+            text.Append(",\"destinations\":[");
+            for (var index = 0; index < control.Destinations.Count; index++)
+            {
+                if (index > 0)
+                {
+                    text.Append(',');
+                }
+                text.Append(JsonSerializer.Serialize(control.Destinations[index]));
+            }
+            text.Append(']');
+        }
+        AppendString(text, "code", control.Code, first: false);
+        return Encoding.UTF8.GetBytes(text.Append('}').ToString());
+    }
+
+    private static void AppendString(StringBuilder text, string name, string? value, bool first)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+        if (!first)
+        {
+            text.Append(',');
+        }
+        text.Append('"').Append(name).Append("\":").Append(JsonSerializer.Serialize(value));
+    }
+
+    private static void AppendNumber(StringBuilder text, string name, int value)
+    {
+        if (value == 0)
+        {
+            return;
+        }
+        text.Append(",\"").Append(name).Append("\":").Append(value);
+    }
+
+    /// <summary>Reads a control body, returning null when it cannot be parsed.</summary>
+    public static Control? DecodeControl(ReadOnlySpan<byte> body)
+    {
+        if (body.Length == 0)
+        {
+            return null;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(body.ToArray());
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+            var destinations = new List<string>();
+            if (root.TryGetProperty("destinations", out var list) && list.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in list.EnumerateArray())
+                {
+                    destinations.Add(entry.GetString() ?? string.Empty);
+                }
+            }
+            return new Control(
+                Text(root, "type"), Text(root, "protocol"), Text(root, "sourceIp"),
+                Number(root, "sourcePort"), Text(root, "destinationIp"),
+                Number(root, "destinationPort"), destinations, Text(root, "code"));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string Text(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? string.Empty
+            : string.Empty;
+
+    private static int Number(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number
+            && value.TryGetInt32(out var parsed)
+            ? parsed
+            : 0;
+
     public static byte[] Encode(int type, bool hop, ReadOnlySpan<byte> body)
     {
         var frame = new byte[HeaderBytes + body.Length];

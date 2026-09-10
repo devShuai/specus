@@ -2,6 +2,7 @@ package com.theshuai.common.peeregress;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,7 +11,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -138,5 +141,54 @@ class PeerEgressFrameVectorTests {
         assertFalse(PeerEgressFrame.looksLikeFrame(null));
         assertFalse(PeerEgressFrame.looksLikeFrame(new byte[0]));
         assertFalse(PeerEgressFrame.looksLikeFrame(new byte[] {0x45, 0x00, 0x00, 0x28}));
+    }
+
+    /**
+     * Control messages have to encode to the same bytes everywhere.
+     *
+     * <p>The vector carries the canonical body for each one, and until this test existed nothing
+     * checked it in any runtime: the claim that two implementations produce byte-identical frames
+     * rested on three separate readings of the same field order. Key order is not something a JSON
+     * library owes anyone, so it is asserted rather than assumed.
+     */
+    @Test
+    void controlEncodingMatchesSharedVector() throws IOException {
+        JsonNode vector = readVector("peer-egress-frame-v1.json");
+        int checked = 0;
+        for (JsonNode testCase : vector.get("accept")) {
+            JsonNode json = testCase.get("controlJson");
+            String canonical = testCase.path("controlCanonicalUtf8Hex").asText("");
+            if (json == null || canonical.isEmpty()) {
+                continue;
+            }
+            checked++;
+            String name = testCase.get("name").asText();
+
+            List<String> destinations = new ArrayList<>();
+            for (JsonNode entry : json.path("destinations")) {
+                destinations.add(entry.asText());
+            }
+            PeerEgressFrame.Control control = new PeerEgressFrame.Control(
+                    json.path("type").asText(""),
+                    json.path("protocol").asText(""),
+                    json.path("sourceIp").asText(""),
+                    json.path("sourcePort").asInt(0),
+                    json.path("destinationIp").asText(""),
+                    json.path("destinationPort").asInt(0),
+                    destinations,
+                    json.path("code").asText(""));
+
+            byte[] body = PeerEgressFrame.encodeControl(control);
+            assertEquals(canonical, HEX.formatHex(body), name + ": canonical body");
+
+            // And the whole frame, so the header the body travels in is pinned too.
+            byte[] frame = PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false, body);
+            assertEquals(testCase.get("frameHex").asText(), HEX.formatHex(frame), name + ": frame");
+
+            PeerEgressFrame.Control decoded = PeerEgressFrame.decodeControl(body);
+            assertNotNull(decoded, name + ": the canonical body did not decode");
+            assertEquals(control, decoded, name + ": round trip");
+        }
+        assertTrue(checked > 0, "frame vector carried no control cases");
     }
 }

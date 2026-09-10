@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/binary"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -139,19 +140,23 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) map[int64][]strin
 	}
 	_ = now
 	for egress := range purge {
-		purge[egress] = dedupeSortedStrings(purge[egress])
+		purge[egress] = sortedUniqueStrings(purge[egress])
 	}
 	return purge
 }
 
-func dedupeSortedStrings(values []string) []string {
-	seen := map[string]struct{}{}
+// sortedUniqueStrings orders the destinations and drops repeats.
+//
+// Sorted because the flows they came from live in a map, so without it the same rule change would
+// produce the destinations in a different order every run: an operator comparing two flow-purge
+// messages, or a test reading one, could not tell a real difference from map iteration.
+func sortedUniqueStrings(values []string) []string {
+	sort.Strings(values)
 	out := values[:0]
-	for _, value := range values {
-		if _, duplicate := seen[value]; duplicate {
+	for index, value := range values {
+		if index > 0 && value == values[index-1] {
 			continue
 		}
-		seen[value] = struct{}{}
 		out = append(out, value)
 	}
 	return out

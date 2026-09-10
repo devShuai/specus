@@ -1,9 +1,13 @@
 package com.theshuai.common.peeregress;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * The {@code SPEG1} frame.
@@ -186,6 +190,120 @@ public final class PeerEgressFrame {
         // Includes name-bind, which phase two defines. Refusing keeps a phase-one egress from
         // looking like it honours domain rules it does not implement.
         return PeerEgressCodes.CONTROL_UNSUPPORTED;
+    }
+
+    /**
+     * One control message body.
+     *
+     * <p>Fields not carried by a given message type stay empty or zero and are left out of the
+     * encoding, which is what makes the canonical bytes short enough to compare by eye.
+     */
+    public record Control(
+            String type,
+            String protocol,
+            String sourceIp,
+            int sourcePort,
+            String destinationIp,
+            int destinationPort,
+            List<String> destinations,
+            String code) {
+
+        /** A flow-reject: the reason one flow was refused, for the consumer to display. */
+        public static Control flowReject(String protocol, String sourceIp, int sourcePort,
+                String destinationIp, int destinationPort, String code) {
+            return new Control(CONTROL_FLOW_REJECT, protocol, sourceIp, sourcePort,
+                    destinationIp, destinationPort, List.of(), code);
+        }
+
+        /** A flow-purge: the destinations whose established flows the egress should close. */
+        public static Control flowPurge(List<String> destinations, String code) {
+            return new Control(CONTROL_FLOW_PURGE, "", "", 0, "", 0,
+                    destinations == null ? List.of() : List.copyOf(destinations), code);
+        }
+    }
+
+    /**
+     * Serialises a control message in the key order the spec fixes, so two implementations produce
+     * byte-identical frames for the same message.
+     *
+     * <p>Assembled rather than handed to a serialiser's field ordering, because that ordering is a
+     * property of the library rather than of the protocol, and the shared vector pins these exact
+     * bytes. Values still go through the encoder: a code or a destination arrives from the wire.
+     */
+    public static byte[] encodeControl(Control control) {
+        StringBuilder text = new StringBuilder(96).append('{');
+        appendString(text, "type", control.type(), true);
+        appendString(text, "protocol", control.protocol(), false);
+        appendString(text, "sourceIp", control.sourceIp(), false);
+        appendNumber(text, "sourcePort", control.sourcePort());
+        appendString(text, "destinationIp", control.destinationIp(), false);
+        appendNumber(text, "destinationPort", control.destinationPort());
+        if (control.destinations() != null && !control.destinations().isEmpty()) {
+            text.append(",\"destinations\":[");
+            for (int index = 0; index < control.destinations().size(); index++) {
+                if (index > 0) {
+                    text.append(',');
+                }
+                text.append(quote(control.destinations().get(index)));
+            }
+            text.append(']');
+        }
+        appendString(text, "code", control.code(), false);
+        return text.append('}').toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static void appendString(StringBuilder text, String name, String value, boolean first) {
+        if (value == null || value.isEmpty()) {
+            return;
+        }
+        if (!first) {
+            text.append(',');
+        }
+        text.append('"').append(name).append("\":").append(quote(value));
+    }
+
+    private static void appendNumber(StringBuilder text, String name, int value) {
+        if (value == 0) {
+            return;
+        }
+        text.append(",\"").append(name).append("\":").append(value);
+    }
+
+    private static String quote(String value) {
+        try {
+            return MAPPER.writeValueAsString(value);
+        } catch (JsonProcessingException impossible) {
+            // Jackson cannot fail on a String; rethrowing keeps the signature honest anyway.
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    /** Reads a control body, returning null when it cannot be parsed. */
+    public static Control decodeControl(byte[] body) {
+        if (body == null || body.length == 0) {
+            return null;
+        }
+        try {
+            JsonNode node = MAPPER.readTree(body);
+            if (!node.isObject()) {
+                return null;
+            }
+            List<String> destinations = new ArrayList<>();
+            for (JsonNode entry : node.path("destinations")) {
+                destinations.add(entry.asText());
+            }
+            return new Control(
+                    node.path("type").asText(""),
+                    node.path("protocol").asText(""),
+                    node.path("sourceIp").asText(""),
+                    node.path("sourcePort").asInt(0),
+                    node.path("destinationIp").asText(""),
+                    node.path("destinationPort").asInt(0),
+                    List.copyOf(destinations),
+                    node.path("code").asText(""));
+        } catch (IOException unreadable) {
+            return null;
+        }
     }
 
     /** Builds a frame. hop is set only when this node forwards as a consumer of another egress. */
