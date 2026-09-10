@@ -48,6 +48,17 @@ type egressFrameVector struct {
 		InnerProtocol        string `json:"innerProtocol"`
 		InnerSourcePort      int    `json:"innerSourcePort"`
 		InnerDestinationPort int    `json:"innerDestinationPort"`
+		ControlJSON          *struct {
+			Type            string   `json:"type"`
+			Protocol        string   `json:"protocol"`
+			SourceIP        string   `json:"sourceIp"`
+			SourcePort      int      `json:"sourcePort"`
+			DestinationIP   string   `json:"destinationIp"`
+			DestinationPort int      `json:"destinationPort"`
+			Destinations    []string `json:"destinations"`
+			Code            string   `json:"code"`
+		} `json:"controlJson"`
+		ControlCanonicalUTF8Hex string `json:"controlCanonicalUtf8Hex"`
 	} `json:"accept"`
 	Reject []struct {
 		Name     string `json:"name"`
@@ -229,5 +240,64 @@ func TestEgressCrossLanguageSweepMatchesSharedVector(t *testing.T) {
 			t.Errorf("%s: got %s/%v, want %s/%v", testCase.Name, decision.Code, decision.Allowed,
 				testCase.Expect.Code, testCase.Expect.Allowed)
 		}
+	}
+}
+
+// Control messages have to encode to the same bytes everywhere.
+//
+// The vector carries the canonical body for each one, and until this test existed nothing checked
+// it in any runtime -- the claim that two implementations produce byte-identical frames rested on
+// three separate readings of the same field order. Key order is not something a JSON library owes
+// anyone, so it is asserted rather than assumed.
+func TestEgressControlEncodingMatchesSharedVector(t *testing.T) {
+	var vector egressFrameVector
+	readEgressVector(t, "peer-egress-frame-v1.json", &vector)
+
+	checked := 0
+	for _, testCase := range vector.Accept {
+		if testCase.ControlJSON == nil || testCase.ControlCanonicalUTF8Hex == "" {
+			continue
+		}
+		checked++
+		control := peerEgressControl{
+			Type:            testCase.ControlJSON.Type,
+			Protocol:        testCase.ControlJSON.Protocol,
+			SourceIP:        testCase.ControlJSON.SourceIP,
+			SourcePort:      testCase.ControlJSON.SourcePort,
+			DestinationIP:   testCase.ControlJSON.DestinationIP,
+			DestinationPort: testCase.ControlJSON.DestinationPort,
+			Destinations:    testCase.ControlJSON.Destinations,
+			Code:            testCase.ControlJSON.Code,
+		}
+		body, err := encodePeerEgressControl(control)
+		if err != nil {
+			t.Errorf("%s: encode: %v", testCase.Name, err)
+			continue
+		}
+		if got := hex.EncodeToString(body); got != testCase.ControlCanonicalUTF8Hex {
+			t.Errorf("%s: canonical body = %s, want %s", testCase.Name, got,
+				testCase.ControlCanonicalUTF8Hex)
+			continue
+		}
+
+		// And the whole frame, so the header the body travels in is pinned too.
+		frame := encodePeerEgressFrame(peerEgressTypeControl, false, body)
+		if got := hex.EncodeToString(frame); got != testCase.FrameHex {
+			t.Errorf("%s: frame = %s, want %s", testCase.Name, got, testCase.FrameHex)
+		}
+
+		decoded, ok := decodePeerEgressControl(body)
+		if !ok {
+			t.Errorf("%s: the canonical body did not decode", testCase.Name)
+			continue
+		}
+		if decoded.Type != control.Type || decoded.Code != control.Code ||
+			decoded.DestinationIP != control.DestinationIP ||
+			decoded.DestinationPort != control.DestinationPort {
+			t.Errorf("%s: decoded = %+v, want %+v", testCase.Name, decoded, control)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("frame vector carried no control cases")
 	}
 }
