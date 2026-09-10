@@ -325,7 +325,14 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
         && strcmp(action, ST_EGRESS_ACTION_BLOCK) != 0) {
         return ST_EGRESS_CODE_RULE_MALFORMED;
     }
-    if (strcmp(action, ST_EGRESS_ACTION_EGRESS) == 0 && !rule->has_egress_client_id) {
+    if (strcmp(action, ST_EGRESS_ACTION_EGRESS) == 0
+        && (!rule->has_egress_client_id || rule->egress_client_id <= 0)) {
+        /*
+         * The field being present is not the same as it being usable. Zero is this project's
+         * sentinel for "no consumer", so accepting it would let the rule pass validation, install
+         * its route, and then fail to find a peer for every packet: a configuration error
+         * deferred into a runtime blackhole.
+         */
         return ST_EGRESS_CODE_RULE_MISSING_TARGET;
     }
     return NULL;
@@ -334,6 +341,7 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
 void st_egress_match_rules(const st_egress_rule *rules,
                            size_t rules_len,
                            const char *destination,
+                           const char *mesh_cidr,
                            st_egress_match *out)
 {
     if (out == NULL) {
@@ -350,6 +358,14 @@ void st_egress_match_rules(const st_egress_rule *rules,
     }
     int best_prefix = -1;
     for (size_t index = 0U; index < rules_len; index++) {
+        /*
+         * A refused rule steers nothing. Skipped here rather than left to the caller to
+         * pre-filter, so one bad rule cannot change what a good one decides no matter who
+         * assembled the list.
+         */
+        if (st_egress_validate_rule(&rules[index], mesh_cidr) != NULL) {
+            continue;
+        }
         st_egress_cidr cidr;
         if (st_egress_parse_cidr(rules[index].match, &cidr) != 0
             || !st_egress_cidr_contains(&cidr, address)) {

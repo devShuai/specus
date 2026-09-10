@@ -24,13 +24,66 @@ RULES = [
     {"index": 3, "match": "198.51.100.50/32", "action": "block"},
     {"index": 4, "match": "192.0.2.0/24", "action": "egress", "egressClientId": 2},
     {"index": 5, "match": "192.0.2.0/24", "action": "block"},
+    # Rules that fail validation, kept in the list on purpose. A rule the operator has been told
+    # is refused must not go on steering traffic, and both of these carry a prefix long enough to
+    # beat a valid rule if a matcher only parsed `match`. Appended so indices 0..5 stay stable.
+    {"index": 6, "match": "192.0.2.128/25", "action": "block", "port": 443},
+    {"index": 7, "match": "172.16.0.0/16", "action": "egress", "egressClientId": 3},
+    {"index": 8, "match": "172.16.5.0/24", "action": "egress", "egressClientId": 0},
 ]
+
+MESH_NETWORK = ipaddress.IPv4Network("100.96.0.0/11")
+
+# Which of RULES are refused, and with which code. Published in the vector so a runtime asserts
+# the premise of the two skip cases instead of trusting a comment: a runtime that read rule 6 as
+# valid would fail here rather than quietly passing the match case for the wrong reason.
+REFUSED_RULES = [
+    {"index": 6, "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+     "reason": "携带端口维度；消费端按路由分流，路由选不了端口"},
+    {"index": 8, "code": "EGRESS_RULE_MISSING_TARGET",
+     "reason": "egressClientId 为 0，不是有效标识"},
+]
+
+
+def validate_rule(rule):
+    """The fixed validation order from protocol/spec/peer-egress.md.
+
+    Here so the codes in CONFIG_REJECT are checked against a reference rather than only
+    against each other, and so match_rule can skip what it refuses.
+    """
+    match = (rule.get("match") or "").strip()
+    if not match:
+        return "EGRESS_RULE_MALFORMED"
+    if ":" in match:
+        return "EGRESS_RULE_IPV6_UNSUPPORTED"
+    if match.startswith("*") or any(c.isalpha() for c in match):
+        return "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+    try:
+        # strict by default, so host bits are a refusal rather than something to normalise
+        network = ipaddress.IPv4Network(match)
+    except ValueError:
+        return "EGRESS_RULE_MALFORMED"
+    if network.prefixlen == 0:
+        return "EGRESS_RULE_DEFAULT_ROUTE"
+    if network.overlaps(MESH_NETWORK):
+        return "EGRESS_RULE_MESH_OVERLAP"
+    if rule.get("port") is not None:
+        return "EGRESS_RULE_PORT_UNSUPPORTED"
+    if rule.get("action") not in ("egress", "direct", "block"):
+        return "EGRESS_RULE_MALFORMED"
+    if rule["action"] == "egress" and int(rule.get("egressClientId") or 0) <= 0:
+        return "EGRESS_RULE_MISSING_TARGET"
+    return None
 
 
 def match_rule(destination):
     addr = ipaddress.IPv4Address(destination)
     best = None
     for rule in RULES:
+        if validate_rule(rule) is not None:
+            # Skipped here rather than left to the caller to pre-filter, so that one bad rule
+            # cannot change what a good one decides no matter who assembled the list.
+            continue
         net = ipaddress.IPv4Network(rule["match"])
         if addr not in net:
             continue
@@ -66,6 +119,10 @@ RULE_CASES = [
      "网络地址属于该前缀，正常匹配"),
     ("broadcast-address-is-in-range", "203.0.113.255",
      "/24 的广播地址落在 /25 内，仍按最长前缀匹配"),
+    ("refused-rule-does-not-steer-traffic", "192.0.2.200",
+     "覆盖它的 /25 因携带端口被拒，落回 /24；被拒的规则若仍参与匹配，运维看到「已拒绝」的规则依然在改变流量走向"),
+    ("refused-target-does-not-steer-traffic", "172.16.5.10",
+     "更长的 /24 因 egressClientId 为 0 被拒，落回 /16"),
 ]
 
 rule_cases = []
@@ -132,7 +189,23 @@ CONFIG_REJECT = [
     {"name": "host-bits-outrank-everything-after", "rule": {"match": "203.0.113.1/24", "action": "egress", "egressClientId": 2, "port": 443},
      "code": "EGRESS_RULE_MALFORMED",
      "reason": "前缀本身不合法时，后面的策略判断都建立在读不出的前缀上"},
+    {"name": "zero-egress-client-id", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 0},
+     "code": "EGRESS_RULE_MISSING_TARGET",
+     "reason": "0 是本项目里「没有消费端」的哨兵值。接受它等于让规则过校验、路由照常安装，然后每个包都找不到出口对端——配置期能报出的错被推迟成运行期的黑洞"},
+    {"name": "negative-egress-client-id", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": -1},
+     "code": "EGRESS_RULE_MISSING_TARGET",
+     "reason": "同上：标识必须是正整数，字段在场不等于字段有效"},
 ]
+
+# The hand-written codes above and the reference must agree. Without this the reference could
+# drift from the cases it is supposed to be checking, and the file would still look consistent.
+for case in CONFIG_REJECT:
+    produced = validate_rule(case["rule"])
+    assert produced == case["code"], f"{case['name']}: reference says {produced}, case says {case['code']}"
+
+expected_refusals = {entry["index"]: entry["code"] for entry in REFUSED_RULES}
+for rule in RULES:
+    assert validate_rule(rule) == expected_refusals.get(rule["index"]), f"rule {rule['index']}"
 
 rules_vector = {
     "name": "peer-egress-rules-v1",
@@ -143,9 +216,12 @@ rules_vector = {
         "默认动作：未匹配即本地直连。这是路由表本身的结果——没有安装路由的目标根本不会进入 TUN，实现不得再加一条兜底放行分支。",
         "规则变更对已建流：已建流不受影响，除非规则从 allow 变为 deny 或不再匹配，此时立即断开并向出口发送 flow-purge 控制消息。",
         "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。",
+        "校验失败的规则不参与匹配，实现必须在匹配前跳过它们。否则一条被拒的长前缀规则仍会压过合法的短前缀规则，运维读到的「已拒绝」与流量实际走向不符。",
+        "egressClientId 必须是正整数：缺失、0 与负数都返回 EGRESS_RULE_MISSING_TARGET。字段在场不等于字段有效。",
     ],
     "meshCidr": "100.96.0.0/11",
     "rules": RULES,
+    "refusedRules": REFUSED_RULES,
     "cases": rule_cases,
     "configValidation": CONFIG_REJECT,
 }
@@ -453,7 +529,8 @@ for path, payload in [
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("wrote", out, out.stat().st_size, "bytes")
 
-print("rule cases:", len(rule_cases), "config rejects:", len(CONFIG_REJECT))
+print("rule cases:", len(rule_cases), "config rejects:", len(CONFIG_REJECT),
+      "refused rules:", len(REFUSED_RULES))
 print("authz cases:", len(authz_cases), "policy variants:", len(special_cases))
 print("cross-language cases:", len(authz_vector["crossLanguageCases"]))
 allowed = sum(1 for c in authz_cases if c["expect"]["allowed"])

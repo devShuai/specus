@@ -89,15 +89,35 @@ for case in frame["reject"]:
         failures.append(f"{case['name']}: frameHex is not valid hex")
 
 # ---- rules vector -------------------------------------------------------
-def match(destination, rule_list):
+# The rule list carries refused rules on purpose, and a refused rule steers nothing. The skip set
+# is read from the file rather than re-derived here, so this stays an independent check of the
+# cases rather than a second copy of the generator's validator.
+REFUSED_INDEXES = {entry["index"] for entry in rules["refusedRules"]}
+check(bool(REFUSED_INDEXES), "rules: refusedRules must not be empty")
+for entry in rules["refusedRules"]:
+    check(0 <= entry["index"] < len(rules["rules"]),
+          f"rules: refusedRules names rule {entry['index']}, which does not exist")
+
+
+def match(destination, rule_list, skip=REFUSED_INDEXES):
     addr = ipaddress.IPv4Address(destination)
     best = None
     for rule in rule_list:
+        if rule["index"] in skip:
+            continue
         net = ipaddress.IPv4Network(rule["match"])
         if addr in net and (best is None or net.prefixlen > ipaddress.IPv4Network(best["match"]).prefixlen):
             best = rule
     return best
 
+
+# A refused rule that no case would have picked proves nothing, and the two cases that do pick one
+# could be weakened later without anything noticing. So the skip has to be load-bearing here.
+check(any(
+    (unfiltered := match(case["destination"], rules["rules"], skip=set())) is not None
+    and unfiltered["index"] in REFUSED_INDEXES
+    for case in rules["cases"]
+), "rules: no case would have matched a refused rule, so the skip is untested")
 
 for case in rules["cases"]:
     best = match(case["destination"], rules["rules"])
@@ -125,6 +145,8 @@ for case in frame["reject"]:
     used.add(case["code"])
 for case in rules["configValidation"]:
     used.add(case["code"])
+for entry in rules["refusedRules"]:
+    used.add(entry["code"])
 for case in authz["cases"] + authz["policyVariantCases"]:
     used.add(case["expect"]["code"])
 
@@ -141,7 +163,8 @@ check(order.index("forcedDeny") < order.index("destination"),
       "authz: a broad destination rule must never be able to pre-empt the forced-deny list")
 
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
-print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}")
+print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
+      f" refusedRules={len(rules['refusedRules'])}")
 print(f"authz cases={len(authz['cases'])} variants={len(authz['policyVariantCases'])}")
 print(f"error codes: {len(table_codes)} documented, {len(used)} exercised")
 

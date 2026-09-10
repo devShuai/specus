@@ -86,9 +86,10 @@ public sealed class PeerEgressVectorTests
     {
         var vector = ReadVector<RulesVector>("peer-egress-rules-v1.json");
         Assert.NotEmpty(vector.Rules);
+        var mesh = string.IsNullOrWhiteSpace(vector.MeshCidr) ? PeerEgressRules.DefaultMeshCidr : vector.MeshCidr;
         foreach (var testCase in vector.Cases)
         {
-            var match = PeerEgressRules.Match(vector.Rules, testCase.Destination);
+            var match = PeerEgressRules.Match(vector.Rules, testCase.Destination, mesh);
             Assert.Equal(testCase.Expect.Action, match.Action);
             if (testCase.Expect.MatchedRuleIndex is null)
             {
@@ -108,9 +109,15 @@ public sealed class PeerEgressVectorTests
     {
         var vector = ReadVector<RulesVector>("peer-egress-rules-v1.json");
         var mesh = string.IsNullOrWhiteSpace(vector.MeshCidr) ? PeerEgressRules.DefaultMeshCidr : vector.MeshCidr;
-        foreach (var rule in vector.Rules)
+
+        // The rule list carries refused rules on purpose, to prove the matcher skips them. Their
+        // codes are asserted rather than assumed: a runtime that read one of those rules as valid
+        // would otherwise pass the matching case for the wrong reason.
+        Assert.NotEmpty(vector.RefusedRules);
+        var refused = vector.RefusedRules.ToDictionary(entry => entry.Index, entry => entry.Code);
+        for (var index = 0; index < vector.Rules.Count; index++)
         {
-            Assert.Null(PeerEgressRules.Validate(rule, mesh));
+            Assert.Equal(refused.GetValueOrDefault(index), PeerEgressRules.Validate(vector.Rules[index], mesh));
         }
         Assert.NotEmpty(vector.ConfigValidation);
         foreach (var testCase in vector.ConfigValidation)
@@ -264,6 +271,18 @@ public sealed class PeerEgressVectorTests
 
         [JsonPropertyName("configValidation")]
         public IReadOnlyList<ValidationCase> ConfigValidation { get; init; } = [];
+
+        [JsonPropertyName("refusedRules")]
+        public IReadOnlyList<RefusedRule> RefusedRules { get; init; } = [];
+    }
+
+    private sealed record RefusedRule
+    {
+        [JsonPropertyName("index")]
+        public int Index { get; init; }
+
+        [JsonPropertyName("code")]
+        public string Code { get; init; } = string.Empty;
     }
 
     private sealed record RuleCase

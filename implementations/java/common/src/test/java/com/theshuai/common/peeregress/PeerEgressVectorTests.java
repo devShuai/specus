@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -140,10 +142,12 @@ class PeerEgressVectorTests {
             rules.add(JsonUtil.stringToObject(node.toString(), PeerEgressRule.class));
         }
         assertFalse(rules.isEmpty(), "rules vector carried no rules");
+        String meshCidr = vector.path("meshCidr").asText(PeerEgressRules.DEFAULT_MESH_CIDR);
 
         for (JsonNode node : vector.path("cases")) {
             String name = node.path("name").asText();
-            PeerEgressRules.Match match = PeerEgressRules.match(rules, node.path("destination").asText());
+            PeerEgressRules.Match match =
+                    PeerEgressRules.match(rules, node.path("destination").asText(), meshCidr);
             JsonNode expect = node.path("expect");
             assertEquals(expect.path("action").asText(), match.action(), name);
             if (expect.path("matchedRuleIndex").isNull()) {
@@ -163,10 +167,21 @@ class PeerEgressVectorTests {
         JsonNode vector = readVector("peer-egress-rules-v1.json");
         String meshCidr = vector.path("meshCidr").asText(PeerEgressRules.DEFAULT_MESH_CIDR);
 
+        // The rule list carries refused rules on purpose, to prove the matcher skips them. Their
+        // codes are asserted rather than assumed: a runtime that read one of those rules as valid
+        // would otherwise pass the matching case for the wrong reason.
+        Map<Integer, String> refused = new HashMap<>();
+        for (JsonNode node : vector.path("refusedRules")) {
+            refused.put(node.path("index").asInt(), node.path("code").asText());
+        }
+        assertFalse(refused.isEmpty(), "rules vector carried no refusedRules");
+
+        int index = 0;
         for (JsonNode node : vector.path("rules")) {
             PeerEgressRule rule = JsonUtil.stringToObject(node.toString(), PeerEgressRule.class);
-            assertNull(PeerEgressRules.validate(rule, meshCidr),
-                    "rule " + node.path("match").asText() + " must pass validation");
+            assertEquals(refused.get(index), PeerEgressRules.validate(rule, meshCidr),
+                    "rule " + node.path("match").asText());
+            index++;
         }
 
         int checked = 0;

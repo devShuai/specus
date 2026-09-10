@@ -48,7 +48,7 @@
 
 | `action` | 说明 |
 | --- | --- |
-| `egress` | 经 `egressClientId` 指定的出口设备访问。缺少该字段返回 `EGRESS_RULE_MISSING_TARGET` |
+| `egress` | 经 `egressClientId` 指定的出口设备访问。该字段缺失或不是正整数返回 `EGRESS_RULE_MISSING_TARGET` |
 | `direct` | 本地直连 |
 | `block` | 阻断 |
 
@@ -59,6 +59,7 @@
 - **单地址**等价于 `/32`。
 - **主机位非零**（如 `203.0.113.1/24`）一律拒绝，返回 `EGRESS_RULE_MALFORMED`。不做隐式掩码归一化：各语言的归一化行为不一致，拒绝比兼容更安全。
 - 规则**不得覆盖 Peer Mesh 虚拟网段**，返回 `EGRESS_RULE_MESH_OVERLAP`，否则组网自身流量会被卷进出口。
+- **校验失败的规则不参与匹配**。匹配前必须先跳过它们，不能只依赖调用方预先过滤。一条被拒的长前缀规则若仍参与匹配，会压过合法的短前缀规则，运维读到的「已拒绝」与流量实际走向不符。
 
 配置校验顺序固定，实现必须按此顺序返回第一个命中的错误码。一条规则可能同时违反多项，顺序不固定则各语言会对同一条规则报出不同的码，而共享向量目前没有同时违反两项的用例，无法靠它兜住：
 
@@ -70,7 +71,9 @@
 6. `EGRESS_RULE_MESH_OVERLAP` —— 与 Peer Mesh 网段任一方向重叠
 7. `EGRESS_RULE_PORT_UNSUPPORTED` —— 携带端口维度
 8. `EGRESS_RULE_MALFORMED` —— `action` 不是 `egress` / `direct` / `block`
-9. `EGRESS_RULE_MISSING_TARGET` —— `action=egress` 缺少 `egressClientId`
+9. `EGRESS_RULE_MISSING_TARGET` —— `action=egress` 而 `egressClientId` 缺失、为 `0` 或为负
+
+`egressClientId` 必须是正整数，字段在场不等于字段有效：`0` 是本项目里「没有消费端」的哨兵值，接受它等于让规则过校验、路由照常安装，然后每个包都找不到出口对端——一个配置期就能报出的错被推迟成运行期的黑洞。
 
 `match` 是规则的主体：先判断它是什么、是否合法、作为前缀是否被策略拒绝，最后才轮到 `action` 与它需要的字段。冒号是无歧义的信号，所以 IPv6 排在域名之前。
 
