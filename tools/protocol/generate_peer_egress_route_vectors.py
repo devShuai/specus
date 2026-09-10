@@ -279,6 +279,48 @@ for case in DIFF_CASES:
         "expect": {"remove": remove, "add": add},
     })
 
+# The journal is the on-disk record of what the consumer installed, and it is a contract between
+# the three of them: a user who switches implementations on one machine has to have their routes
+# adopted and withdrawn rather than left behind by a reader that did not recognise the file.
+#
+# What is pinned is that each runtime can read this text and produces something that reads back the
+# same, not that all three emit identical bytes. Demanding identical whitespace would fail over
+# formatting that no reader cares about.
+JOURNAL_ROUTES = [
+    {"cidr": "198.51.100.7/32", "kind": "bypass", "origin": "bypass"},
+    {"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24"},
+]
+
+journal = {
+    "version": 1,
+    "description": "消费端安装记录的磁盘格式。三个实现必须能互相读懂：同一台机器上换实现之后，"
+                   "上一次装下的路由要被接管并撤销，而不是因为读不懂文件被留在表里。"
+                   "钉住的是「读得出、写回去还能读成同一份」，不是三端输出的字节完全一致——"
+                   "为没有任何读取方在意的空白差异而失败没有意义。",
+    "text": json.dumps({"version": 1, "routes": JOURNAL_ROUTES}, indent=2, ensure_ascii=False),
+    "routes": JOURNAL_ROUTES,
+    "rejects": [
+        {
+            "name": "unknown-version",
+            "text": json.dumps({"version": 2, "routes": JOURNAL_ROUTES}, indent=2, ensure_ascii=False),
+            "reason": "另一个版本记录条目的方式可能不同，照它撤销就是在猜哪条前缀是自己装的",
+        },
+        {
+            "name": "unknown-kind",
+            "text": json.dumps(
+                {"version": 1, "routes": [{"cidr": "203.0.113.0/24", "kind": "onlink", "origin": "rule"}]},
+                indent=2, ensure_ascii=False),
+            "reason": "读不懂的种类要拒绝而不是取默认值：猜错就会去撤销一条上次按另一种方式装下的前缀",
+        },
+        {
+            "name": "not-json",
+            "text": "this is not a journal",
+            "reason": "半个文件、被别的东西覆盖的文件，都从这里退出，而不是被当成空记录接受——"
+                      "空记录意味着上次装下的路由永远不会被撤销",
+        },
+    ],
+}
+
 vector = {
     "name": "peer-egress-routes-v1",
     "version": 1,
@@ -304,12 +346,14 @@ vector = {
     "meshCidr": MESH_CIDR,
     "planCases": plan_cases,
     "diffCases": diff_cases,
+    "journal": journal,
 }
 
 out = VECTORS / "peer-egress-routes-v1.json"
 out.write_text(json.dumps(vector, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print("wrote", out, out.stat().st_size, "bytes")
-print("plan cases:", len(plan_cases), "diff cases:", len(diff_cases))
+print("plan cases:", len(plan_cases), "diff cases:", len(diff_cases),
+      "journal rejects:", len(journal["rejects"]))
 for case in plan_cases:
     print("  ", case["name"], "->", len(case["expect"]["routes"]), "routes",
           len(case["expect"]["refused"]), "refused")

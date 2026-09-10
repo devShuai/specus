@@ -1,6 +1,9 @@
 package client
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // Binds the route planner to protocol/test-vectors/peer-egress-routes-v1.json.
 //
@@ -38,6 +41,15 @@ type egressRoutesVector struct {
 			Add    []egressRouteVectorEntry `json:"add"`
 		} `json:"expect"`
 	} `json:"diffCases"`
+	Journal struct {
+		Text    string                   `json:"text"`
+		Routes  []egressRouteVectorEntry `json:"routes"`
+		Rejects []struct {
+			Name   string `json:"name"`
+			Text   string `json:"text"`
+			Reason string `json:"reason"`
+		} `json:"rejects"`
+	} `json:"journal"`
 }
 
 // egressRouteVectorEntry is the vector's spelling of a route. Kept separate from egressRoute
@@ -123,5 +135,73 @@ func TestEgressRouteDiffMatchesSharedVector(t *testing.T) {
 		remove, add := diffEgressRoutes(current, desired)
 		compareEgressRoutes(t, testCase.Name+"/remove", remove, testCase.Expect.Remove)
 		compareEgressRoutes(t, testCase.Name+"/add", add, testCase.Expect.Add)
+	}
+}
+
+// The journal's on-disk shape is a contract with the other two consumers.
+//
+// A user who switches from this client to the Java or .NET one on the same machine has to have
+// these routes adopted and withdrawn, not left behind by a reader that did not recognise the file.
+// Asserted against the shared text rather than by round-tripping through this package, because a
+// round trip agrees with whatever this package happens to write.
+func TestEgressRouteJournalMatchesSharedVector(t *testing.T) {
+	var vector egressRoutesVector
+	readEgressVector(t, "peer-egress-routes-v1.json", &vector)
+	if vector.Journal.Text == "" || len(vector.Journal.Routes) == 0 {
+		t.Fatal("routes vector carried no journal")
+	}
+
+	written := journalPath(t)
+	installer := newEgressRouteInstaller(newFakeRouteCommander(), written)
+	desired := make([]egressRoute, 0, len(vector.Journal.Routes))
+	for _, entry := range vector.Journal.Routes {
+		desired = append(desired, entry.route(t))
+	}
+	if result := installer.apply(desired); result.Err != nil {
+		t.Fatalf("apply failed: %v", result.Err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	if string(raw) != vector.Journal.Text {
+		t.Errorf("journal written as:\n%s\nwant:\n%s", raw, vector.Journal.Text)
+	}
+
+	// And the other direction: the shared text has to be readable, or a journal another runtime
+	// wrote would be adopted as nothing and its routes left in the table forever.
+	adopted := journalPath(t)
+	if err := os.WriteFile(adopted, []byte(vector.Journal.Text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader := newEgressRouteInstaller(newFakeRouteCommander(), adopted)
+	if err := reader.load(); err != nil {
+		t.Fatalf("load the shared journal: %v", err)
+	}
+	compareEgressRoutes(t, "journal", reader.installed, vector.Journal.Routes)
+}
+
+// Every refusal leaves the installed set empty. Adopting a journal that could not be read would
+// mean withdrawing prefixes by guess, and treating it as empty would mean the routes it describes
+// are never taken back at all -- so the only safe answer is to fail and say so.
+func TestEgressRouteJournalRejectsMatchSharedVector(t *testing.T) {
+	var vector egressRoutesVector
+	readEgressVector(t, "peer-egress-routes-v1.json", &vector)
+	if len(vector.Journal.Rejects) == 0 {
+		t.Fatal("routes vector carried no journal rejects")
+	}
+
+	for _, reject := range vector.Journal.Rejects {
+		path := journalPath(t)
+		if err := os.WriteFile(path, []byte(reject.Text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		installer := newEgressRouteInstaller(newFakeRouteCommander(), path)
+		if err := installer.load(); err == nil {
+			t.Errorf("%s: the journal was accepted", reject.Name)
+		}
+		if len(installer.installed) != 0 {
+			t.Errorf("%s: routes were adopted from a journal that could not be read", reject.Name)
+		}
 	}
 }

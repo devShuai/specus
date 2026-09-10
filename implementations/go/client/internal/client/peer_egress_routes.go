@@ -1,6 +1,8 @@
 package client
 
 import (
+	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,13 +45,45 @@ func (k egressRouteKind) String() string {
 	return "tun"
 }
 
+// The kind travels as a name rather than as this package's integer.
+//
+// The journal is a file an operator may end up reading on a machine whose routing is in a state
+// they did not expect, and it has to mean the same thing to the Java and .NET consumers, which do
+// not share this enum. A number would make both of those worse for nothing.
+func (k egressRouteKind) MarshalJSON() ([]byte, error) {
+	return json.Marshal(k.String())
+}
+
+// An unrecognised name is an error rather than a default. Guessing would mean withdrawing a prefix
+// the previous run may have installed as the other kind, and the whole point of the journal is not
+// to act on routes by guess.
+func (k *egressRouteKind) UnmarshalJSON(raw []byte) error {
+	var name string
+	if err := json.Unmarshal(raw, &name); err != nil {
+		return err
+	}
+	switch name {
+	case "bypass":
+		*k = egressRouteBypass
+	case "tun":
+		*k = egressRouteToTun
+	default:
+		return fmt.Errorf("unknown egress route kind %q", name)
+	}
+	return nil
+}
+
 // egressRoute is one entry this feature wants to own.
+//
+// The field names are the journal's on-disk names, shared with the Java and .NET consumers: a user
+// who switches implementations on one machine has to have their routes adopted and withdrawn
+// rather than left behind by a reader that did not recognise the file.
 type egressRoute struct {
 	// CIDR is normalised, so the same route is never described two ways.
-	CIDR string
-	Kind egressRouteKind
+	CIDR string          `json:"cidr"`
+	Kind egressRouteKind `json:"kind"`
 	// Origin says what asked for this route, for the conflict message an operator reads.
-	Origin string
+	Origin string `json:"origin"`
 }
 
 func (r egressRoute) key() string { return r.CIDR }

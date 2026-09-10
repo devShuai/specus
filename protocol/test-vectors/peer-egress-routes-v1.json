@@ -526,5 +526,39 @@
         ]
       }
     }
-  ]
+  ],
+  "journal": {
+    "version": 1,
+    "description": "消费端安装记录的磁盘格式。三个实现必须能互相读懂：同一台机器上换实现之后，上一次装下的路由要被接管并撤销，而不是因为读不懂文件被留在表里。钉住的是「读得出、写回去还能读成同一份」，不是三端输出的字节完全一致——为没有任何读取方在意的空白差异而失败没有意义。",
+    "text": "{\n  \"version\": 1,\n  \"routes\": [\n    {\n      \"cidr\": \"198.51.100.7/32\",\n      \"kind\": \"bypass\",\n      \"origin\": \"bypass\"\n    },\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"tun\",\n      \"origin\": \"rule:203.0.113.0/24\"\n    }\n  ]\n}",
+    "routes": [
+      {
+        "cidr": "198.51.100.7/32",
+        "kind": "bypass",
+        "origin": "bypass"
+      },
+      {
+        "cidr": "203.0.113.0/24",
+        "kind": "tun",
+        "origin": "rule:203.0.113.0/24"
+      }
+    ],
+    "rejects": [
+      {
+        "name": "unknown-version",
+        "text": "{\n  \"version\": 2,\n  \"routes\": [\n    {\n      \"cidr\": \"198.51.100.7/32\",\n      \"kind\": \"bypass\",\n      \"origin\": \"bypass\"\n    },\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"tun\",\n      \"origin\": \"rule:203.0.113.0/24\"\n    }\n  ]\n}",
+        "reason": "另一个版本记录条目的方式可能不同，照它撤销就是在猜哪条前缀是自己装的"
+      },
+      {
+        "name": "unknown-kind",
+        "text": "{\n  \"version\": 1,\n  \"routes\": [\n    {\n      \"cidr\": \"203.0.113.0/24\",\n      \"kind\": \"onlink\",\n      \"origin\": \"rule\"\n    }\n  ]\n}",
+        "reason": "读不懂的种类要拒绝而不是取默认值：猜错就会去撤销一条上次按另一种方式装下的前缀"
+      },
+      {
+        "name": "not-json",
+        "text": "this is not a journal",
+        "reason": "半个文件、被别的东西覆盖的文件，都从这里退出，而不是被当成空记录接受——空记录意味着上次装下的路由永远不会被撤销"
+      }
+    ]
+  }
 }
