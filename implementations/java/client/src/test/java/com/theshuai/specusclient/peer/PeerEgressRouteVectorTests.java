@@ -2,6 +2,9 @@ package com.theshuai.specusclient.peer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -105,5 +108,49 @@ class PeerEgressRouteVectorTests {
             assertRoutes(name + "/remove", difference.remove(), node.path("expect").path("remove"));
             assertRoutes(name + "/add", difference.add(), node.path("expect").path("add"));
         }
+    }
+
+    /**
+     * The parsers read output formats nobody controls, which makes them the part most likely to be
+     * wrong. Each runtime writing its own fixtures from its own reading of the man page is how
+     * three readings of one format come about, so all three read these.
+     */
+    @Test
+    void routeCommandParsingMatchesTheSharedVector() throws IOException {
+        JsonNode commands = readVector("peer-egress-routes-v1.json").path("routeCommands");
+        assertFalse(commands.path("routeGet").isEmpty(), "routes vector carried no routeGet cases");
+
+        for (JsonNode node : commands.path("routeGet")) {
+            String name = node.path("name").asText();
+            PeerEgressRouteCommands.Hop hop =
+                    PeerEgressRouteCommands.parseRouteGet(node.path("output").asText());
+            JsonNode expect = node.path("expect");
+            if (!expect.path("parsed").asBoolean()) {
+                assertNull(hop, name);
+                continue;
+            }
+            assertNotNull(hop, name);
+            assertEquals(expect.path("gateway").asText(), hop.gateway(), name);
+            assertEquals(expect.path("device").asText(), hop.device(), name);
+        }
+
+        assertFalse(commands.path("showExact").isEmpty(), "routes vector carried no showExact cases");
+        for (JsonNode node : commands.path("showExact")) {
+            String name = node.path("name").asText();
+            PeerEgressRouteCommands.ExistingRoute existing =
+                    PeerEgressRouteCommands.parseShowExact(node.path("output").asText());
+            assertEquals(node.path("expect").path("present").asBoolean(), existing.present(), name);
+            assertEquals(node.path("expect").path("description").asText(), existing.description(), name);
+        }
+
+        for (JsonNode node : commands.path("tunnelDevice").path("cases")) {
+            boolean got = PeerEgressRouteCommands.hopIsDevice(
+                    new PeerEgressRouteCommands.Hop("", node.path("device").asText()),
+                    node.path("tun").asText());
+            String label = node.path("device").asText() + " against " + node.path("tun").asText();
+            assertEquals(node.path("expect").asBoolean(), got, label);
+        }
+        assertTrue(commands.path("tunnelDevice").path("cases").size() > 0,
+                "routes vector carried no tunnelDevice cases");
     }
 }

@@ -50,6 +50,32 @@ type egressRoutesVector struct {
 			Reason string `json:"reason"`
 		} `json:"rejects"`
 	} `json:"journal"`
+	RouteCommands struct {
+		RouteGet []struct {
+			Name   string `json:"name"`
+			Output string `json:"output"`
+			Expect struct {
+				Parsed  bool   `json:"parsed"`
+				Gateway string `json:"gateway"`
+				Device  string `json:"device"`
+			} `json:"expect"`
+		} `json:"routeGet"`
+		ShowExact []struct {
+			Name   string `json:"name"`
+			Output string `json:"output"`
+			Expect struct {
+				Present     bool   `json:"present"`
+				Description string `json:"description"`
+			} `json:"expect"`
+		} `json:"showExact"`
+		TunnelDevice struct {
+			Cases []struct {
+				Device string `json:"device"`
+				Tun    string `json:"tun"`
+				Expect bool   `json:"expect"`
+			} `json:"cases"`
+		} `json:"tunnelDevice"`
+	} `json:"routeCommands"`
 }
 
 // egressRouteVectorEntry is the vector's spelling of a route. Kept separate from egressRoute
@@ -202,6 +228,51 @@ func TestEgressRouteJournalRejectsMatchSharedVector(t *testing.T) {
 		}
 		if len(installer.installed) != 0 {
 			t.Errorf("%s: routes were adopted from a journal that could not be read", reject.Name)
+		}
+	}
+}
+
+// Reading what the platform's routing tools say.
+//
+// These parsers depend on output formats nobody controls, which makes them the part most likely to
+// be wrong, and each runtime writing its own fixtures from its own reading of the man page is how
+// three readings of one format come about. Deliberately not behind a build tag, so they are covered
+// on the machines where development and most of CI actually happen.
+func TestEgressRouteCommandParsingMatchesSharedVector(t *testing.T) {
+	var vector egressRoutesVector
+	readEgressVector(t, "peer-egress-routes-v1.json", &vector)
+	if len(vector.RouteCommands.RouteGet) == 0 || len(vector.RouteCommands.ShowExact) == 0 {
+		t.Fatal("routes vector carried no route command cases")
+	}
+
+	for _, testCase := range vector.RouteCommands.RouteGet {
+		hop, ok := parseIPRouteGet(testCase.Output)
+		if ok != testCase.Expect.Parsed {
+			t.Errorf("%s: parsed = %v, want %v", testCase.Name, ok, testCase.Expect.Parsed)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if hop.Gateway != testCase.Expect.Gateway || hop.Device != testCase.Expect.Device {
+			t.Errorf("%s: gateway=%q device=%q, want %q/%q", testCase.Name,
+				hop.Gateway, hop.Device, testCase.Expect.Gateway, testCase.Expect.Device)
+		}
+	}
+
+	for _, testCase := range vector.RouteCommands.ShowExact {
+		present, description := parseIPRouteShowExact(testCase.Output)
+		if present != testCase.Expect.Present || description != testCase.Expect.Description {
+			t.Errorf("%s: present=%v description=%q, want %v/%q", testCase.Name,
+				present, description, testCase.Expect.Present, testCase.Expect.Description)
+		}
+	}
+
+	for _, testCase := range vector.RouteCommands.TunnelDevice.Cases {
+		got := egressRouteHopIsDevice(egressRouteHop{Device: testCase.Device}, testCase.Tun)
+		if got != testCase.Expect {
+			t.Errorf("device %q against tun %q = %v, want %v",
+				testCase.Device, testCase.Tun, got, testCase.Expect)
 		}
 	}
 }

@@ -560,5 +560,144 @@
         "reason": "半个文件、被别的东西覆盖的文件，都从这里退出，而不是被当成空记录接受——空记录意味着上次装下的路由永远不会被撤销"
       }
     ]
+  },
+  "routeCommands": {
+    "description": "ip route 输出的解析。这两个解析器依赖的是没人控制的输出格式，三端各自照着 man page 写会得到三份不同的读法，而读错的代价是装一条指向空处的旁路。因此它们在三个实现里都不带平台守卫，在开发机与大部分 CI 上照常被覆盖。",
+    "routeGet": [
+      {
+        "name": "through-a-router",
+        "output": "1.2.3.4 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 1000 \n    cache \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "10.0.0.1",
+          "device": "eth0"
+        },
+        "reason": "常见形态：经网关送出"
+      },
+      {
+        "name": "directly-attached-carries-no-via",
+        "output": "10.0.0.5 dev eth0 src 10.0.0.5 uid 1000 \n    cache \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "",
+          "device": "eth0"
+        },
+        "reason": "同网段目标没有 via。把它当解析失败会导致本地网络上的地址一律无法旁路"
+      },
+      {
+        "name": "interface-name-with-a-dash",
+        "output": "198.51.100.7 via 192.168.1.1 dev wlp3s0-1 src 192.168.1.44 \n",
+        "expect": {
+          "parsed": true,
+          "gateway": "192.168.1.1",
+          "device": "wlp3s0-1"
+        },
+        "reason": "接口名可以带连字符与数字，不能按纯字母切"
+      },
+      {
+        "name": "unreachable",
+        "output": "unreachable 203.0.113.9 dev lo src 127.0.0.1 uid 1000 \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "不可达是作为一条路由报出来的，不是错误。认不出它就会装一条指向空处的旁路"
+      },
+      {
+        "name": "prohibit",
+        "output": "prohibit 203.0.113.9 dev lo \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "同上"
+      },
+      {
+        "name": "blackhole",
+        "output": "blackhole 203.0.113.9 \n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "同上"
+      },
+      {
+        "name": "empty-output",
+        "output": "",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "没有输出就是没有可用的下一跳"
+      },
+      {
+        "name": "blank-lines",
+        "output": "   \n\n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "只有空白同样不构成一条路由"
+      },
+      {
+        "name": "error-text-on-stdout",
+        "output": "RTNETLINK answers: Network is unreachable\n",
+        "expect": {
+          "parsed": false
+        },
+        "reason": "错误文本里没有 dev，不能被当成一行路由读进去"
+      }
+    ],
+    "showExact": [
+      {
+        "name": "an-existing-route",
+        "output": "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100 \n",
+        "expect": {
+          "present": true,
+          "description": "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100"
+        },
+        "reason": "原样报给运维：把别人的路由概括一遍，不如给他们那一行可以自己去看"
+      },
+      {
+        "name": "no-route-for-that-exact-prefix",
+        "output": "",
+        "expect": {
+          "present": false,
+          "description": ""
+        },
+        "reason": "空输出意味着这条精确前缀上没有路由，可以安装"
+      },
+      {
+        "name": "blank-lines-are-not-a-route",
+        "output": "\n  \n",
+        "expect": {
+          "present": false,
+          "description": ""
+        },
+        "reason": "同上"
+      }
+    ],
+    "tunnelDevice": {
+      "description": "重新下发时，规则的路由已经覆盖了旁路地址，再问系统「这个地址往哪送」得到的答案就是「经隧道」。照它安装等于把承载隧道的传输送进隧道自身，必须拒绝。",
+      "cases": [
+        {
+          "device": "specus0",
+          "tun": "specus0",
+          "expect": true
+        },
+        {
+          "device": " specus0 ",
+          "tun": "specus0",
+          "expect": true,
+          "reason": "两侧空白不能让这道检查失效"
+        },
+        {
+          "device": "eth0",
+          "tun": "specus0",
+          "expect": false
+        },
+        {
+          "device": "eth0",
+          "tun": "",
+          "expect": false,
+          "reason": "没有隧道名时不能匹配上任意接口"
+        }
+      ]
+    }
   }
 }

@@ -116,4 +116,54 @@ public class PeerEgressRouteVectorTests
             AssertRoutes($"{name}/add", difference.Add, testCase.GetProperty("expect").GetProperty("add"));
         }
     }
+
+    /// <summary>
+    /// The parsers read output formats nobody controls, which makes them the part most likely to be
+    /// wrong. Each runtime writing its own fixtures from its own reading of the man page is how
+    /// three readings of one format come about, so all three read these.
+    /// </summary>
+    [Fact]
+    public void RouteCommandParsingMatchesTheSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-routes-v1.json");
+        var commands = vector.RootElement.GetProperty("routeCommands");
+
+        var routeGet = commands.GetProperty("routeGet");
+        Assert.True(routeGet.GetArrayLength() > 0, "routes vector carried no routeGet cases");
+        foreach (var testCase in routeGet.EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString()!;
+            var hop = PeerEgressRouteCommands.ParseRouteGet(testCase.GetProperty("output").GetString());
+            var expect = testCase.GetProperty("expect");
+            if (!expect.GetProperty("parsed").GetBoolean())
+            {
+                Assert.True(hop is null, name);
+                continue;
+            }
+            Assert.True(hop is not null, name);
+            Assert.Equal(expect.GetProperty("gateway").GetString(), hop!.Value.Gateway);
+            Assert.Equal(expect.GetProperty("device").GetString(), hop.Value.Device);
+        }
+
+        var showExact = commands.GetProperty("showExact");
+        Assert.True(showExact.GetArrayLength() > 0, "routes vector carried no showExact cases");
+        foreach (var testCase in showExact.EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString()!;
+            var existing = PeerEgressRouteCommands.ParseShowExact(testCase.GetProperty("output").GetString());
+            Assert.True(testCase.GetProperty("expect").GetProperty("present").GetBoolean() == existing.Present, name);
+            Assert.Equal(testCase.GetProperty("expect").GetProperty("description").GetString(), existing.Description);
+        }
+
+        var tunnelDevice = commands.GetProperty("tunnelDevice").GetProperty("cases");
+        Assert.True(tunnelDevice.GetArrayLength() > 0, "routes vector carried no tunnelDevice cases");
+        foreach (var testCase in tunnelDevice.EnumerateArray())
+        {
+            var got = PeerEgressRouteCommands.HopIsDevice(
+                new PeerEgressRouteHop(string.Empty, testCase.GetProperty("device").GetString()!),
+                testCase.GetProperty("tun").GetString());
+            Assert.True(testCase.GetProperty("expect").GetBoolean() == got,
+                $"{testCase.GetProperty("device").GetString()} against {testCase.GetProperty("tun").GetString()}");
+        }
+    }
 }

@@ -321,6 +321,79 @@ journal = {
     ],
 }
 
+
+# Reading what the platform's routing tools say.
+#
+# These parsers depend on output formats nobody controls, which makes them the part most likely to
+# be wrong, and each runtime would otherwise write its own fixtures from its own reading of the man
+# page. Kept free of any platform guard on all three sides on purpose, so they are covered on the
+# machines where development and most of CI actually happen rather than only on Linux.
+NL = chr(10)
+
+ROUTE_GET = [
+    ("through-a-router",
+     "1.2.3.4 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 1000 " + NL + "    cache " + NL,
+     {"parsed": True, "gateway": "10.0.0.1", "device": "eth0"},
+     "常见形态：经网关送出"),
+    ("directly-attached-carries-no-via",
+     "10.0.0.5 dev eth0 src 10.0.0.5 uid 1000 " + NL + "    cache " + NL,
+     {"parsed": True, "gateway": "", "device": "eth0"},
+     "同网段目标没有 via。把它当解析失败会导致本地网络上的地址一律无法旁路"),
+    ("interface-name-with-a-dash",
+     "198.51.100.7 via 192.168.1.1 dev wlp3s0-1 src 192.168.1.44 " + NL,
+     {"parsed": True, "gateway": "192.168.1.1", "device": "wlp3s0-1"},
+     "接口名可以带连字符与数字，不能按纯字母切"),
+    ("unreachable",
+     "unreachable 203.0.113.9 dev lo src 127.0.0.1 uid 1000 " + NL,
+     {"parsed": False},
+     "不可达是作为一条路由报出来的，不是错误。认不出它就会装一条指向空处的旁路"),
+    ("prohibit", "prohibit 203.0.113.9 dev lo " + NL, {"parsed": False}, "同上"),
+    ("blackhole", "blackhole 203.0.113.9 " + NL, {"parsed": False}, "同上"),
+    ("empty-output", "", {"parsed": False}, "没有输出就是没有可用的下一跳"),
+    ("blank-lines", "   " + NL + NL, {"parsed": False}, "只有空白同样不构成一条路由"),
+    ("error-text-on-stdout",
+     "RTNETLINK answers: Network is unreachable" + NL,
+     {"parsed": False},
+     "错误文本里没有 dev，不能被当成一行路由读进去"),
+]
+
+SHOW_EXACT = [
+    ("an-existing-route",
+     "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100 " + NL,
+     {"present": True, "description": "192.0.2.0/24 via 10.0.0.1 dev eth0 metric 100"},
+     "原样报给运维：把别人的路由概括一遍，不如给他们那一行可以自己去看"),
+    ("no-route-for-that-exact-prefix", "", {"present": False, "description": ""},
+     "空输出意味着这条精确前缀上没有路由，可以安装"),
+    ("blank-lines-are-not-a-route", NL + "  " + NL, {"present": False, "description": ""},
+     "同上"),
+]
+
+route_commands = {
+    "description": "ip route 输出的解析。这两个解析器依赖的是没人控制的输出格式，"
+                   "三端各自照着 man page 写会得到三份不同的读法，而读错的代价是装一条指向空处的旁路。"
+                   "因此它们在三个实现里都不带平台守卫，在开发机与大部分 CI 上照常被覆盖。",
+    "routeGet": [
+        {"name": name, "output": output, "expect": expect, "reason": reason}
+        for name, output, expect, reason in ROUTE_GET
+    ],
+    "showExact": [
+        {"name": name, "output": output, "expect": expect, "reason": reason}
+        for name, output, expect, reason in SHOW_EXACT
+    ],
+    "tunnelDevice": {
+        "description": "重新下发时，规则的路由已经覆盖了旁路地址，再问系统「这个地址往哪送」"
+                       "得到的答案就是「经隧道」。照它安装等于把承载隧道的传输送进隧道自身，必须拒绝。",
+        "cases": [
+            {"device": "specus0", "tun": "specus0", "expect": True},
+            {"device": " specus0 ", "tun": "specus0", "expect": True,
+             "reason": "两侧空白不能让这道检查失效"},
+            {"device": "eth0", "tun": "specus0", "expect": False},
+            {"device": "eth0", "tun": "", "expect": False,
+             "reason": "没有隧道名时不能匹配上任意接口"},
+        ],
+    },
+}
+
 vector = {
     "name": "peer-egress-routes-v1",
     "version": 1,
@@ -347,13 +420,15 @@ vector = {
     "planCases": plan_cases,
     "diffCases": diff_cases,
     "journal": journal,
+    "routeCommands": route_commands,
 }
 
 out = VECTORS / "peer-egress-routes-v1.json"
 out.write_text(json.dumps(vector, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print("wrote", out, out.stat().st_size, "bytes")
 print("plan cases:", len(plan_cases), "diff cases:", len(diff_cases),
-      "journal rejects:", len(journal["rejects"]))
+      "journal rejects:", len(journal["rejects"]),
+      "route-get:", len(ROUTE_GET), "show-exact:", len(SHOW_EXACT))
 for case in plan_cases:
     print("  ", case["name"], "->", len(case["expect"]["routes"]), "routes",
           len(case["expect"]["refused"]), "refused")
