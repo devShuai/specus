@@ -78,12 +78,22 @@ internal sealed class PeerEgressFlowTable
     /// </remarks>
     internal sealed record Revocation(Flow Flow, string? Code);
 
-    private readonly long _idleTimeoutMs;
+    private long _idleTimeoutMs;
     private readonly Dictionary<Key, Flow> _flows = [];
     private readonly Dictionary<long, int> _perConsumer = [];
 
-    public PeerEgressFlowTable(long idleTimeoutMs) =>
-        _idleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : DefaultIdleTimeoutMs;
+    public PeerEgressFlowTable(long idleTimeoutMs) => IdleTimeoutMs = idleTimeoutMs;
+
+    /// <summary>
+    /// The timeout a pushed policy names. Live flows keep their entries and are measured against a
+    /// new value from the next expiry sweep, because a policy change is not a reason to close a
+    /// flow that the policy still allows.
+    /// </summary>
+    public long IdleTimeoutMs
+    {
+        get => _idleTimeoutMs;
+        set => _idleTimeoutMs = value > 0 ? value : DefaultIdleTimeoutMs;
+    }
 
     public int Count => _flows.Count;
 
@@ -91,6 +101,12 @@ internal sealed class PeerEgressFlowTable
     public int CountFor(long consumer) => _perConsumer.GetValueOrDefault(consumer, 0);
 
     public Flow? Lookup(Key key) => _flows.GetValueOrDefault(key);
+
+    /// <summary>
+    /// The live flows, for a caller that has to walk them. Returned as a copy so the caller can
+    /// close entries while iterating.
+    /// </summary>
+    public List<Flow> Live() => [.. _flows.Values];
 
     /// <summary>
     /// Records activity. Idle expiry is measured from the last packet in either direction, so a
