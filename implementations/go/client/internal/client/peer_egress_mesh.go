@@ -371,27 +371,50 @@ func (mesh *peerMeshClient) withdrawEgressRoutes() {
 // The revision guard is the spec's: a snapshot at or below the last accepted one is ignored, so a
 // reordered or replayed push cannot walk the policy backwards. Called with no mesh lock held.
 func (mesh *peerMeshClient) applyEgressControl(payload string) {
-	var message egressConfigMessage
-	if err := json.Unmarshal([]byte(payload), &message); err != nil {
-		mesh.logger.Printf("decode egress-config failed: %v", err)
+	policy, revision, ok := decodeEgressConfig([]byte(payload))
+	if !ok {
+		mesh.logger.Printf("decode egress-config failed")
 		return
 	}
 	runtime := mesh.ensureEgress()
-	if !runtime.acceptRevision(message.Revision) {
+	if !runtime.acceptRevision(revision) {
 		return
 	}
 	context := newEgressContext()
 	context.DeploymentDenyCIDRs = mesh.deploymentDenyCIDRs()
 	runtime.setLocalInterfaceCIDRs(localInterfaceCIDRs())
-	runtime.applyPolicy(egressPolicy{
-		Enabled:                  message.Enabled,
+	runtime.applyPolicy(policy, context, time.Now())
+	mesh.logger.Printf("[peer-egress] policy applied enabled=%v revision=%d rules=%d",
+		policy.Enabled, revision, len(policy.DestinationRules))
+}
+
+// decodeEgressConfig reads an egress-config push into the policy a client enforces.
+//
+// Refuses anything that is not this message: a type naming something else, a payload that is not an
+// object, or text that is not JSON. Reading a catalogue as a policy would install one.
+//
+// The revision guard is deliberately not here. It is the runtime's state, and this function has to
+// give the same answer for the same message every time it is called.
+//
+// Shared vector: protocol/test-vectors/peer-egress-control-v1.json.
+func decodeEgressConfig(payload []byte) (egressPolicy, int64, bool) {
+	var message egressConfigMessage
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return egressPolicy{}, 0, false
+	}
+	if message.Type != peerControlTypeEgressConfig {
+		return egressPolicy{}, 0, false
+	}
+	return egressPolicy{
+		Enabled: message.Enabled,
+		// Trimmed and uppercased before it is stored. The judgment layer compares this for
+		// equality against a scope it computes itself, so a push saying "public" would be
+		// refused by an implementation that kept the raw string.
 		Scope:                    strings.ToUpper(strings.TrimSpace(message.Scope)),
 		AllowedConsumerClientIDs: message.AllowedConsumerClientIDs,
 		DestinationRules:         message.DestinationRules,
 		Limits:                   message.Limits,
-	}, context, time.Now())
-	mesh.logger.Printf("[peer-egress] policy applied enabled=%v revision=%d rules=%d",
-		message.Enabled, message.Revision, len(message.DestinationRules))
+	}, message.Revision, true
 }
 
 // revokeEgressConsumer closes a peer's flows when its session ends. The plane cannot poll for this:

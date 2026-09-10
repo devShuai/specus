@@ -218,6 +218,16 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 `revision` 在同一控制 session 内单调递增，小于或等于上次接受值的快照幂等忽略。`enabled` 转为 `false` 时出口必须立即停止接受新流并关闭全部已建流。
 
+客户端读取这条消息时：
+
+- `type` 不是 `egress-config` 的消息**不属于**这个解码器。把目录当成策略读会给节点装上一份它没有收到过的策略。
+- `scope` 在存下来之前**去空白并转大写**。判定层拿自己算出的 `PUBLIC` 或 `LAN` 做相等比较，一条写着小写 `public` 的推送在不归一化的实现里会被判成不匹配，整条策略静默失效。
+- `scope` **缺失即拒绝**，不得回落到 `PUBLIC`。把缺失的授权字段默认成许可值就是「未配置即放行」，这一点对 `destinationRules` 已经写明，`scope` 没有理由例外。
+- `limits` 缺失时三个字段都为 `0`，由使用方按自己的默认值兜底；解码器不替它编造数值。关闭出口的推送不带 `limits`，这是服务端逐字发出的形状。
+- **不认识的键一律忽略。** 服务端已经会带上 `createdAtMillis`，日后还会带别的；旧客户端拒绝整条消息等于一次协议升级就让所有旧设备停止接受配置。
+
+固定向量：`protocol/test-vectors/peer-egress-control-v1.json`。
+
 ### `egress-catalog`
 
 服务端下发给消费设备，列出当前可用的出口及其能力。

@@ -42,6 +42,7 @@ def verifies(data):
 frame = json.loads((VECTORS / "peer-egress-frame-v1.json").read_text(encoding="utf-8"))
 rules = json.loads((VECTORS / "peer-egress-rules-v1.json").read_text(encoding="utf-8"))
 authz = json.loads((VECTORS / "peer-egress-authz-v1.json").read_text(encoding="utf-8"))
+control = json.loads((VECTORS / "peer-egress-control-v1.json").read_text(encoding="utf-8"))
 
 # ---- frame vector -------------------------------------------------------
 for case in frame["accept"]:
@@ -136,6 +137,49 @@ for rule in rules["rules"]:
     check(not net.overlaps(ipaddress.IPv4Network(rules["meshCidr"])),
           f"rules: {rule['match']} overlaps the mesh CIDR")
 
+# ---- control vector -----------------------------------------------------
+# Checked without re-implementing the decoder: what matters is that the cases still exercise the
+# two things a JSON library would otherwise decide on the protocol's behalf.
+egress_config = control["egressConfig"]
+check(bool(egress_config["accept"]) and bool(egress_config["reject"]),
+      "control: egressConfig needs both accept and reject cases")
+
+normalised = False
+absent_scope = False
+for case in egress_config["accept"]:
+    name = case["name"]
+    message = json.loads(case["message"])
+    check(message.get("type") == "egress-config",
+          f"control/{name}: an accept case must carry type egress-config")
+    decoded_scope = case["expect"]["policy"]["scope"]
+    check(decoded_scope in ("", "PUBLIC", "LAN"),
+          f"control/{name}: decoded scope {decoded_scope!r} is not one the judgment layer compares against")
+    check(decoded_scope == decoded_scope.strip().upper(),
+          f"control/{name}: decoded scope is not normalised")
+    raw_scope = message.get("scope")
+    if raw_scope is None:
+        absent_scope = True
+        check(decoded_scope == "",
+              f"control/{name}: an absent scope must decode to empty, never to the permissive value")
+    elif raw_scope != decoded_scope:
+        normalised = True
+    check(case["expect"]["revision"] == message.get("revision", 0),
+          f"control/{name}: revision must be carried through unchanged")
+
+# Without these the two behaviours could be dropped from the decoders and every case would still
+# pass, because no case would depend on them.
+check(normalised, "control: no accept case has a scope that needs normalising")
+check(absent_scope, "control: no accept case omits scope, so the deny default is untested")
+
+for case in egress_config["reject"]:
+    name = case["name"]
+    try:
+        message = json.loads(case["message"])
+    except ValueError:
+        continue
+    check(not isinstance(message, dict) or message.get("type") != "egress-config",
+          f"control/{name}: a reject case must not be a well-formed egress-config")
+
 # ---- error code coverage ------------------------------------------------
 spec_text = SPEC.read_text(encoding="utf-8")
 table_codes = set(re.findall(r"^\| `(EGRESS_[A-Z0-9_]+)` \|", spec_text, re.MULTILINE))
@@ -166,6 +210,7 @@ print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
 print(f"authz cases={len(authz['cases'])} variants={len(authz['policyVariantCases'])}")
+print(f"control egressConfig accept={len(egress_config['accept'])} reject={len(egress_config['reject'])}")
 print(f"error codes: {len(table_codes)} documented, {len(used)} exercised")
 
 if failures:

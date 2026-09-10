@@ -40,8 +40,13 @@ public sealed record PeerEgressPolicy
     [JsonPropertyName("allowedConsumerClientIds")]
     public IReadOnlyList<long> AllowedConsumerClientIds { get; init; } = [];
 
+    /// <remarks>
+    /// No default. Scope is an authorization dimension, so a policy that never names one must deny
+    /// rather than fall back to the permissive value: <c>PUBLIC</c> would let a policy assembled
+    /// without a scope reach the whole internet.
+    /// </remarks>
     [JsonPropertyName("scope")]
-    public string Scope { get; init; } = PeerEgressAuthorization.ScopePublic;
+    public string Scope { get; init; } = string.Empty;
 
     [JsonPropertyName("destinationRules")]
     public IReadOnlyList<PeerEgressDestinationRule> DestinationRules { get; init; } = [];
