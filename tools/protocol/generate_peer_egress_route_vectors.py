@@ -1,0 +1,315 @@
+"""Generate peer-egress-routes-v1.json.
+
+The consumer turns its rule list into the set of routes it wants to own, and three runtimes have
+to arrive at the same set: a Java consumer that installed a different prefix than the Go one for
+the same configuration would send different traffic through the tunnel while reporting the same
+rules.
+
+The expectations here come from a reference planner written in this file rather than recorded from
+any implementation, so agreement with it is independent agreement rather than a shared mistake.
+The rule validator below is a second statement of the order in protocol/spec/peer-egress.md; it is
+checked against every case in peer-egress-rules-v1.json before anything is written, so the two
+cannot drift apart quietly.
+"""
+import ipaddress
+import json
+from pathlib import Path
+
+VECTORS = Path("protocol/test-vectors")
+MESH_CIDR = "100.96.0.0/11"
+
+
+def validate_rule(rule, mesh_cidr=MESH_CIDR):
+    """Returns the failing code, or None. The fixed order from the spec."""
+    match = (rule.get("match") or "").strip()
+    if not match:
+        return "EGRESS_RULE_MALFORMED"
+    if ":" in match:
+        return "EGRESS_RULE_IPV6_UNSUPPORTED"
+    if match.startswith("*") or any(c.isalpha() for c in match):
+        return "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+    try:
+        network = ipaddress.IPv4Network(match)
+    except ValueError:
+        return "EGRESS_RULE_MALFORMED"
+    if network.prefixlen == 0:
+        return "EGRESS_RULE_DEFAULT_ROUTE"
+    if network.overlaps(ipaddress.IPv4Network(mesh_cidr)):
+        return "EGRESS_RULE_MESH_OVERLAP"
+    if rule.get("port") is not None:
+        return "EGRESS_RULE_PORT_UNSUPPORTED"
+    if rule.get("action") not in ("egress", "direct", "block"):
+        return "EGRESS_RULE_MALFORMED"
+    if rule["action"] == "egress" and int(rule.get("egressClientId") or 0) <= 0:
+        return "EGRESS_RULE_MISSING_TARGET"
+    return None
+
+
+# This validator and the one in generate_peer_egress_policy_vectors.py are separate statements of
+# the same order. Checking it against the shared vector is what keeps them from drifting apart.
+_rules_vector = json.loads((VECTORS / "peer-egress-rules-v1.json").read_text(encoding="utf-8"))
+for _case in _rules_vector["configValidation"]:
+    _produced = validate_rule(_case["rule"], _rules_vector["meshCidr"])
+    assert _produced == _case["code"], _case["name"] + ": route generator says " + str(_produced)
+
+
+def sort_key(route):
+    # Bypass first, so the addresses that keep the tunnel's own transport working are installed
+    # before anything is pointed into the tunnel. Then by prefix, for a deterministic journal.
+    network = ipaddress.IPv4Network(route["cidr"])
+    return (0 if route["kind"] == "bypass" else 1, int(network.network_address), network.prefixlen)
+
+
+def plan(rules, bypass, mesh_cidr=MESH_CIDR):
+    """The reference planner: which routes a rule set and a bypass set need."""
+    refused = []
+    for index, rule in enumerate(rules):
+        code = validate_rule(rule, mesh_cidr)
+        if code is not None:
+            refused.append({"index": index, "match": rule.get("match", ""), "code": code})
+    skip = {entry["index"] for entry in refused}
+
+    seen = set()
+    routes = []
+    # Bypass first, so a rule naming the same prefix cannot displace one of these.
+    for endpoint in bypass:
+        try:
+            address = ipaddress.IPv4Address((endpoint or "").strip())
+        except ValueError:
+            continue
+        cidr = str(address) + "/32"
+        if cidr in seen:
+            continue
+        seen.add(cidr)
+        routes.append({"cidr": cidr, "kind": "bypass", "origin": "bypass"})
+
+    for index, rule in enumerate(rules):
+        if index in skip:
+            continue
+        # A direct rule installs nothing: traffic stays local by having no route, the same
+        # mechanism that makes unmatched traffic local. A block rule does install one, because
+        # the packet has to be captured before the data plane can drop it.
+        if rule.get("action") not in ("egress", "block"):
+            continue
+        network = ipaddress.IPv4Network((rule.get("match") or "").strip())
+        cidr = str(network)
+        if cidr in seen:
+            # Two rules over one prefix need one route; the engine decides between them per
+            # packet, and installing the prefix twice would make removal ambiguous.
+            continue
+        seen.add(cidr)
+        routes.append({"cidr": cidr, "kind": "tun", "origin": "rule:" + rule["match"]})
+
+    routes.sort(key=sort_key)
+    return routes, refused
+
+
+def diff(current, desired):
+    """Withdrawals first, so a prefix that changed kind loses its old entry before the new one."""
+    desired_by_cidr = {route["cidr"]: route for route in desired}
+    current_by_cidr = {route["cidr"]: route for route in current}
+    remove = [route for route in current
+              if route["cidr"] not in desired_by_cidr
+              or desired_by_cidr[route["cidr"]]["kind"] != route["kind"]]
+    add = [route for route in desired
+           if route["cidr"] not in current_by_cidr
+           or current_by_cidr[route["cidr"]]["kind"] != route["kind"]]
+    remove.sort(key=sort_key)
+    add.sort(key=sort_key)
+    return remove, add
+
+
+PLAN_CASES = [
+    {
+        "name": "egress-and-block-install-direct-does-not",
+        "description": "direct 不装路由：流量靠「没有路由」留在本地，与未匹配流量是同一个机制。"
+                       "block 要装，包必须先被捕获，数据面才谈得上丢弃它",
+        "rules": [
+            {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+            {"match": "198.51.100.0/24", "action": "direct"},
+            {"match": "192.0.2.0/24", "action": "block"},
+        ],
+        "bypass": [],
+    },
+    {
+        "name": "default-route-is-refused-but-its-halves-are-ordinary-prefixes",
+        "description": "/0 被拒。0.0.0.0/1 被拒的原因是它覆盖了 mesh 网段，不是因为它太宽；"
+                       "128.0.0.0/1 是一条普通前缀，一期校验放行它。两条 /1 合起来等于接管一切，"
+                       "而校验只挡住 /0——这是记在案的已知缺口，不是这条用例写漏了",
+        "rules": [
+            {"match": "0.0.0.0/0", "action": "egress", "egressClientId": 2},
+            {"match": "0.0.0.0/1", "action": "egress", "egressClientId": 2},
+            {"match": "128.0.0.0/1", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": [],
+    },
+    {
+        "name": "bypass-comes-first",
+        "description": "旁路条目排在最前：先让承载隧道的传输保持可达，再把任何流量指进隧道",
+        "rules": [
+            {"match": "10.0.0.0/8", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["203.0.113.7", "198.51.100.9"],
+    },
+    {
+        "name": "bypass-inside-a-captured-prefix",
+        "description": "旁路地址落在某条规则的前缀内时仍要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
+        "rules": [
+            {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["203.0.113.7"],
+    },
+    {
+        "name": "duplicate-prefixes-yield-one-route",
+        "description": "同一前缀的两条规则只需要一条路由；装两次会让撤销失去定论。旁路重复同理",
+        "rules": [
+            {"match": "192.0.2.0/24", "action": "egress", "egressClientId": 2},
+            {"match": "192.0.2.0/24", "action": "block"},
+        ],
+        "bypass": ["203.0.113.7", "203.0.113.7"],
+    },
+    {
+        "name": "bypass-outranks-a-rule-for-the-same-address",
+        "description": "旁路先入表，因此同地址的 /32 规则不会把它顶掉，origin 仍然是 bypass",
+        "rules": [
+            {"match": "203.0.113.7/32", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["203.0.113.7"],
+    },
+    {
+        "name": "unreadable-bypass-entries-are-skipped",
+        "description": "旁路来自运行期发现的对端与端点，不是用户配置。读不出的条目跳过即可，"
+                       "整体拒绝会因为一个失联对端停掉全部分流",
+        "rules": [
+            {"match": "10.0.0.0/8", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["not-an-address", "203.0.113.7", "", "203.0.113.7:443"],
+    },
+    {
+        "name": "refused-rules-are-reported-and-install-nothing",
+        "description": "被拒的规则逐条返回而不是静默跳过：运维写了一条而本功能忽略了它，"
+                       "他们没有任何途径发现这个泄漏",
+        "rules": [
+            {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+            {"match": "example.com", "action": "egress", "egressClientId": 2},
+            {"match": "100.96.0.0/11", "action": "block"},
+            {"match": "198.51.100.0/24", "action": "egress"},
+            {"match": "192.0.2.0/24", "action": "block", "port": 443},
+        ],
+        "bypass": [],
+    },
+    {
+        "name": "a-single-address-rule-becomes-a-host-route",
+        "description": "单地址等价于 /32，并按规范形式写回，避免同一条路由在两次运行里被写成两种样子",
+        "rules": [
+            {"match": "203.0.113.7", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": [],
+    },
+    {
+        "name": "empty-configuration-installs-nothing",
+        "description": "没有规则就没有路由。这不是边界情况，而是关掉分流之后应有的状态",
+        "rules": [],
+        "bypass": [],
+    },
+]
+
+plan_cases = []
+for case in PLAN_CASES:
+    routes, refused = plan(case["rules"], case["bypass"])
+    plan_cases.append({
+        "name": case["name"],
+        "description": case["description"],
+        "rules": case["rules"],
+        "bypass": case["bypass"],
+        "expect": {"routes": routes, "refused": refused},
+    })
+
+
+def tun(cidr):
+    return {"cidr": cidr, "kind": "tun", "origin": "rule:" + cidr}
+
+
+def bypass_route(cidr):
+    return {"cidr": cidr, "kind": "bypass", "origin": "bypass"}
+
+
+DIFF_CASES = [
+    {
+        "name": "first-apply-adds-everything",
+        "description": "当前集合为空：全部是新增，顺序仍然是旁路在前",
+        "current": [],
+        "desired": [tun("10.0.0.0/8"), bypass_route("203.0.113.7/32")],
+    },
+    {
+        "name": "unchanged-plan-does-nothing",
+        "description": "重复下发同一份配置不应该动路由表",
+        "current": [bypass_route("203.0.113.7/32"), tun("10.0.0.0/8")],
+        "desired": [bypass_route("203.0.113.7/32"), tun("10.0.0.0/8")],
+    },
+    {
+        "name": "dropped-rule-is-withdrawn",
+        "description": "规则删掉后对应路由必须撤销，否则流量继续进隧道而配置里已经没有它",
+        "current": [tun("10.0.0.0/8"), tun("192.0.2.0/24")],
+        "desired": [tun("10.0.0.0/8")],
+    },
+    {
+        "name": "prefix-that-changed-kind-is-replaced",
+        "description": "同一前缀改变了种类：必须先撤旧的再装新的，否则平台要么拒绝重复条目，"
+                       "要么静默保留先看到的那条",
+        "current": [tun("203.0.113.7/32")],
+        "desired": [bypass_route("203.0.113.7/32")],
+    },
+    {
+        "name": "withdrawals-and-additions-in-one-apply",
+        "description": "一次下发里既有撤销又有新增；两个列表各自排序，调用方先执行撤销",
+        "current": [tun("192.0.2.0/24"), tun("198.51.100.0/24")],
+        "desired": [bypass_route("203.0.113.7/32"), tun("198.51.100.0/24"), tun("10.0.0.0/8")],
+    },
+]
+
+diff_cases = []
+for case in DIFF_CASES:
+    remove, add = diff(case["current"], case["desired"])
+    diff_cases.append({
+        "name": case["name"],
+        "description": case["description"],
+        "current": case["current"],
+        "desired": case["desired"],
+        "expect": {"remove": remove, "add": add},
+    })
+
+vector = {
+    "name": "peer-egress-routes-v1",
+    "version": 1,
+    "notes": [
+        "只安装精确前缀，计划器不会自己造出 0.0.0.0/0 或它的两个 /1 半区。接管一切的工具没法被运行它的人"
+        "推理，「未匹配即本地」也会在那一刻不再成立。",
+        "已知缺口：校验只拒绝 /0。运维手写 0.0.0.0/1 与 128.0.0.0/1 两条规则仍然可以覆盖全部地址，"
+        "其中下半区目前只是因为覆盖 mesh 网段才被拒。设一个最小前缀长度属于策略决定，"
+        "不在本次移植的范围内，见 planCases 里的 default-route-is-refused-but-its-halves-are-ordinary-prefixes。",
+        "旁路条目排在最前，安装也按此顺序：承载隧道的传输（控制连接、STUN 与 TURN、对端端点）先保持可达，"
+        "再把流量指进隧道。",
+        "action=direct 不安装路由。流量靠「没有路由」留在本地，与未匹配流量是同一个机制，"
+        "而不是两处需要彼此保持一致的行为。action=block 要安装：包必须先被捕获，数据面才谈得上丢弃它。",
+        "计划是纯函数：它只说应该存在哪些路由，执行与回滚由安装器负责。这样回滚、冲突拒绝与归属判定"
+        "都能脱离真实路由表被测试。",
+        "origin 是运维会读到的字符串，因此也被固定：旁路为 bypass，规则为 rule: 加上规则里原样的 match。",
+        "被拒的规则逐条返回而不是静默跳过：运维写了一条而本功能忽略了它，他们没有任何途径发现这个泄漏。",
+        "bypass 列表来自运行期发现的对端与端点，不是用户配置，因此读不出的条目跳过即可；"
+        "为它整体拒绝一份计划会因为一个失联对端而停掉全部分流。",
+        "本文件的期望值出自 tools/protocol/generate_peer_egress_route_vectors.py 里的独立参考实现，"
+        "不是从任何一个实现录下来的：对上它意味着各自独立正确，而不是共享同一个错误。",
+    ],
+    "meshCidr": MESH_CIDR,
+    "planCases": plan_cases,
+    "diffCases": diff_cases,
+}
+
+out = VECTORS / "peer-egress-routes-v1.json"
+out.write_text(json.dumps(vector, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print("wrote", out, out.stat().st_size, "bytes")
+print("plan cases:", len(plan_cases), "diff cases:", len(diff_cases))
+for case in plan_cases:
+    print("  ", case["name"], "->", len(case["expect"]["routes"]), "routes",
+          len(case["expect"]["refused"]), "refused")

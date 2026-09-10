@@ -8,10 +8,15 @@ import (
 
 // Turning consumer rules into routes.
 //
-// Only exact prefixes are installed. The default route is never taken, and neither is the
-// `0.0.0.0/1` plus `128.0.0.0/1` pair that covers it while pretending not to. A tool that captures
-// everything cannot be reasoned about by the person running it, and "unmatched traffic stays local"
-// stops being true the moment something covers all of it.
+// Only exact prefixes are installed, and the planner invents none of its own: no default route,
+// and no `0.0.0.0/1` plus `128.0.0.0/1` pair standing in for one. A tool that captures everything
+// cannot be reasoned about by the person running it, and "unmatched traffic stays local" stops
+// being true the moment something covers all of it.
+//
+// Validation refuses only `/0`, though. An operator who writes those two halves by hand still gets
+// near-total capture, and the lower one is refused today only because it happens to contain the
+// mesh. Closing that means picking a minimum prefix length, which is a policy decision rather than
+// something to settle while porting.
 //
 // The planner is pure. It says which routes should exist; the installer performs the difference and
 // can undo it. Splitting them is what lets rollback, conflict refusal and ownership be tested
