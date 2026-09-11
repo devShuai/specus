@@ -46,6 +46,7 @@ rules = json.loads((VECTORS / "peer-egress-rules-v1.json").read_text(encoding="u
 authz = json.loads((VECTORS / "peer-egress-authz-v1.json").read_text(encoding="utf-8"))
 control = json.loads((VECTORS / "peer-egress-control-v1.json").read_text(encoding="utf-8"))
 windows = json.loads((VECTORS / "peer-egress-windows-routes-v1.json").read_text(encoding="utf-8"))
+macos = json.loads((VECTORS / "peer-egress-macos-routes-v1.json").read_text(encoding="utf-8"))
 
 # ---- frame vector -------------------------------------------------------
 for case in frame["accept"]:
@@ -311,6 +312,133 @@ for case in scripts["rejectedArguments"]:
             check(case["value"] not in values,
                   f"windows: {case['name']} is both refused and used in {accepted['name']}")
 
+# ---- macos route vector -------------------------------------------------
+#
+# The rules below are the ones that stop this section decaying into something that passes without
+# pinning anything. Each of them corresponds to a capture that changed the design.
+
+macos_sampled = [case for case in macos["routeGet"] + macos["commandResults"]
+                 if case.get("sampled")]
+check(len(macos_sampled) >= 20,
+      f"macos: only {len(macos_sampled)} sampled cases left, want at least 20")
+check(all(case.get("sampled") for case in macos["commandResults"]),
+      "macos: a command result stopped being sampled output, so it is now somebody's guess")
+
+# `route` exits 0 when it fails. Without a case like this, an implementation could read the exit
+# status and pass the whole file.
+check(any(case["exit"] == 0 and case["expect"]["failure"] for case in macos["commandResults"]),
+      "macos: no failure exits 0, so nothing stops an implementation trusting the exit status")
+check(any(case["exit"] == 0 and not case["expect"]["failure"]
+          for case in macos["commandResults"]),
+      "macos: no success exits 0 either, so the exit status carries information after all")
+# And the permission failure has to be the one with nothing on stdout, which is what forces stderr
+# to be read at all.
+denied = [case for case in macos["commandResults"]
+          if case["expect"]["failure"] == "permission-denied"]
+check(denied, "macos: no permission failure left")
+check(any(not case["stdout"].strip() and case["stderr"].strip() for case in denied),
+      "macos: the permission failure now says something on stdout, so reading stderr is untested")
+check({case["expect"]["failure"] for case in macos["commandResults"]}
+      >= {"permission-denied", "failed", ""},
+      "macos: the command results do not cover all three classifications")
+check(any(case["expect"]["failure"] == "" and "not in table" in case["stdout"]
+          for case in macos["commandResults"]),
+      "macos: nothing pins a removal of something already gone counting as success")
+
+# The malformed prefix that `route` accepts, and what it actually installed.
+malformed = macos["malformedPrefix"]
+check(malformed.get("sampled"), "macos: the malformed-prefix evidence is no longer sampled")
+check(malformed["exit"] == 0,
+      "macos: the malformed add now fails, so the argument check is not the only defence")
+check(malformed["installedPrefix"] not in malformed["stdout"],
+      "macos: the output names the prefix it installed after all, so the evidence is stale")
+check(malformed["installedPrefix"] in malformed["tableAfter"].replace("128.0/1", "128.0.0.0/1")
+      or "128.0/1" in malformed["tableAfter"],
+      "macos: the table no longer shows what the malformed add installed")
+refused_values = {case["value"] for case in macos["commands"]["rejectedArguments"]}
+check("203.0.113.0/33" in refused_values,
+      "macos: the argument that installs half the internet is no longer refused")
+check(any(value.startswith("010.") for value in refused_values),
+      "macos: a leading zero is no longer refused, and inet_aton reads it as octal")
+
+# The kernel-generated filter has to change an answer rather than only a count.
+presence = {(case["prefix"], case["table"]): case["expect"] for case in
+            macos["conflictFromTable"]["cases"]}
+broadcast = presence.get(("192.168.64.255/32", "netstat-rn-inet-after"))
+check(broadcast is not None and not broadcast["present"],
+      "macos: nothing pins kernel-generated entries being left out of the conflict answer")
+check(any(case["expect"]["present"] and "(+" in case["expect"]["existing"]
+          for case in macos["conflictFromTable"]["cases"]),
+      "macos: no conflict case reports a route count")
+exact = presence.get(("0.0.0.0/1", "netstat-rn-inet-after"))
+check(exact is not None and not exact["present"],
+      "macos: nothing pins the prefix comparison being exact rather than longest-prefix")
+
+# The IPv6 section has default routes of its own. The gate is what keeps them out.
+both = presence.get(("0.0.0.0/0", "netstat-rn-after"))
+check(both is not None and both["present"] and "(+" not in both["existing"],
+      "macos: nothing pins the IPv6 section being left out of the table")
+check("Internet6:" in macos["bothFamilies"]["stdout"],
+      "macos: the two-family fixture no longer carries an IPv6 section to leave out")
+check(macos["bothFamilies"]["expect"]["prefixes"] == macos["table"]["expect"]["prefixes"],
+      "macos: the two-family table is expected to read differently than the IPv4-only one")
+
+# Normalisation has to be exercised on both the abbreviated and the masked side.
+normalise = {case["input"]: case["expect"] for case in macos["normalisePrefix"]["cases"]}
+check(normalise.get("default") == "0.0.0.0/0", "macos: the default route no longer normalises")
+check(normalise.get("203.0.113") == "203.0.113.0/24",
+      "macos: nothing pins the implied prefix length")
+check(normalise.get("100.64/10") == "100.64.0.0/10",
+      "macos: nothing pins a destination with both an abbreviation and a length")
+check(normalise.get("10.1.2.3/8") == "10.0.0.0/8",
+      "macos: nothing pins the address being masked by its length")
+check(any(value == "" and key.strip() and ":" in key for key in normalise
+          for value in [normalise[key]]),
+      "macos: no IPv6 destination is rejected, so the family check is untested")
+
+# The commands themselves, not just their output.
+commands = macos["commands"]
+check(commands["showTable"] == ["netstat", "-rn", "-f", "inet"],
+      "macos: the table query changed shape")
+for entry in commands["installInterface"]:
+    check(entry["argv"][:4] == ["route", "-n", "add", "-net"],
+          f"macos: install {entry['prefix']} no longer adds a net")
+    check("-interface" in entry["argv"],
+          f"macos: install {entry['prefix']} no longer names an interface")
+for entry in commands["remove"]:
+    check(entry["argv"] == ["route", "-n", "delete", "-net", entry["prefix"]],
+          f"macos: remove {entry['prefix']} changed shape")
+    check("-ifscope" not in entry["argv"],
+          f"macos: remove {entry['prefix']} scopes the withdrawal, which would leave ours behind")
+for group in ("findRoute", "installInterface", "installGateway", "remove"):
+    for entry in commands[group]:
+        check("-n" in entry["argv"],
+              f"macos: {group} lost -n, so a name lookup can hold the process")
+
+# Nothing a validator refuses may appear as an accepted argument.
+#
+# Compared against the values an entry declares rather than against its whole argv, because some of
+# the refused values are option names: `-net` is refused as a prefix precisely because `route` would
+# read it as the option it also is.
+for case in commands["rejectedArguments"]:
+    for group in ("findRoute", "installInterface", "installGateway", "remove"):
+        for accepted in commands[group]:
+            values = {accepted.get(field)
+                      for field in ("prefix", "interface", "gateway", "address")}
+            check(case["value"] not in values,
+                  f"macos: {case['value']!r} is both refused and used in {group}")
+
+# And the two measurements that justify design decisions rather than describing behaviour.
+check(macos["timings"]["cache"] is False,
+      "macos: the vector now expects a cached table, which the measurement does not support")
+check(macos["timings"]["netstatMedianMs"] < 100,
+      "macos: the table read is no longer cheap, so not caching needs rethinking")
+check(macos["localisation"]["identical"] is True and macos["localisation"].get("sampled"),
+      "macos: the evidence that the output is not localised is gone")
+check(macos["tunNeedsAddress"]["withoutAddress"]["stderr"].strip()
+      and not macos["tunNeedsAddress"]["withAddress"]["stderr"].strip(),
+      "macos: the evidence that a TUN needs an address before a route can point at it is gone")
+
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
@@ -323,6 +451,11 @@ print(f"windows scripts show={len(scripts['showRoutes'])} find={len(scripts['fin
       f" install={len(scripts['installRoute'])} remove={len(scripts['removeRoute'])}"
       f" interface={len(scripts['interfaceIndex'])}"
       f" refused={len(scripts['rejectedArguments'])}")
+print(f"macos routes get={len(macos['routeGet'])} normalise={len(macos['normalisePrefix']['cases'])}"
+      f" conflict={len(macos['conflictFromTable']['cases'])}"
+      f" results={len(macos['commandResults'])}"
+      f" refused={len(macos['commands']['rejectedArguments'])}"
+      f" sampled={len(macos_sampled)}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")
