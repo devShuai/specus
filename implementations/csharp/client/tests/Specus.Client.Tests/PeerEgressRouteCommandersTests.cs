@@ -4,13 +4,13 @@ using Specus.Client.PeerMesh;
 namespace Specus.Client.Tests;
 
 /// <summary>
-/// Which routing table this process ends up talking to, and what the Windows one refuses before it
-/// talks to anything.
+/// Which routing table this process ends up talking to, and what the Windows and macOS ones refuse
+/// before they talk to anything.
 /// </summary>
 /// <remarks>
-/// These assertions are worth more than they look because CI runs the suite on both ubuntu and
-/// windows: the two branches of the platform choice are each exercised for real, on the platform
-/// they claim, rather than both being asserted from one machine's point of view.
+/// These assertions are worth more than they look because CI runs the suite on ubuntu, windows and
+/// macOS: every branch of the platform choice is exercised for real, on the platform it claims,
+/// rather than all three being asserted from one machine's point of view.
 /// </remarks>
 public class PeerEgressRouteCommandersTests
 {
@@ -26,10 +26,14 @@ public class PeerEgressRouteCommandersTests
         {
             Assert.IsType<WindowsPeerEgressRouteCommander>(commander);
         }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            Assert.IsType<MacosPeerEgressRouteCommander>(commander);
+        }
         else
         {
-            // macOS and anything else: refusing beats installing nothing while reporting that the
-            // rules were applied, which would send every destination out locally.
+            // Anything else: refusing beats installing nothing while reporting that the rules were
+            // applied, which would send every destination out locally.
             Assert.IsType<UnsupportedPeerEgressRouteCommander>(commander);
         }
     }
@@ -114,6 +118,80 @@ public class PeerEgressRouteCommandersTests
         // query cannot run. Both answers are the same, which is what this is asserting.
         Assert.False(conflict.Present);
         Assert.Equal("", conflict.Existing);
+    }
+
+    /// <summary>
+    /// The macOS commander refuses an argument the builders would refuse, before starting a
+    /// process.
+    /// </summary>
+    /// <remarks>
+    /// Runs on every platform: the check happens in shared code, ahead of anything that needs
+    /// <c>route</c> to exist. The prefix that matters is 203.0.113.0/33 -- <c>route</c> accepts it,
+    /// prints a success line naming 203.0.113.0, exits 0, and installs 128.0/1, which is half the
+    /// IPv4 address space pointed at the gateway. Only the routing table says so, so this check is
+    /// not defence in depth on this platform; it is the defence.
+    /// </remarks>
+    [Fact]
+    public void TheMacosCommanderRefusesAMalformedPrefixBeforeRunningAnything()
+    {
+        var commander = new MacosPeerEgressRouteCommander("utun3");
+        foreach (var cidr in new[] { "203.0.113.0/33", "203.0.113.0", "203.0.113.256/24",
+            "010.0.113.0/24", "-net", "" })
+        {
+            var route = new PeerEgressRoute(cidr, PeerEgressRouteKind.Tun, $"rule:{cidr}");
+            Assert.Contains(Refusal,
+                Assert.Throws<ArgumentException>(() => commander.Install(route)).Message);
+            Assert.Contains(Refusal,
+                Assert.Throws<ArgumentException>(() => commander.Remove(route)).Message);
+        }
+    }
+
+    /// <summary>On macOS, a prefix that is certainly taken is reported as taken.</summary>
+    /// <remarks>
+    /// Goes all the way to the operating system: it runs netstat, reads the whole table, normalises
+    /// the destination column and finds the default route. Any machine with working networking has
+    /// one, CI runners included; if this fails on a machine that has one, the reading is wrong
+    /// rather than the assumption.
+    /// </remarks>
+    [Fact]
+    public void OnMacosTheDefaultRouteIsFoundAsAConflict()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return;
+        }
+        var commander = new MacosPeerEgressRouteCommander("utun3");
+        var conflict = commander.Conflict(
+            new PeerEgressRoute("0.0.0.0/0", PeerEgressRouteKind.Tun, "rule:0.0.0.0/0"));
+        Assert.True(conflict.Present, "the default route was not reported as a conflict");
+        Assert.StartsWith("0.0.0.0/0 ", conflict.Existing);
+        Assert.Contains("netif ", conflict.Existing);
+    }
+
+    /// <summary>
+    /// On macOS, an install that cannot work reports that rather than reporting success.
+    /// </summary>
+    /// <remarks>
+    /// The most useful thing here that needs no privileges, and the one the Windows side has no
+    /// equivalent of. <c>route</c> answers a non-root caller with "must be root to alter routing
+    /// table" on stderr, exit 77, and nothing at all on stdout -- so this exercises the real
+    /// binary, the real streams and the real classification, and it is the one case where a
+    /// classifier that read only stdout would call the failure a success.
+    /// </remarks>
+    [Fact]
+    public void OnMacosAnInstallWithoutRootFailsRatherThanReportingSuccess()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || Environment.UserName == "root")
+        {
+            return;
+        }
+        var commander = new MacosPeerEgressRouteCommander("lo0");
+        var route = new PeerEgressRoute("203.0.113.0/24", PeerEgressRouteKind.Tun,
+            "rule:203.0.113.0/24");
+        var failure = Assert.Throws<InvalidOperationException>(() => commander.Install(route));
+        Assert.Contains("needs root", failure.Message);
+        // And the route is not there, which is the claim the error is making.
+        Assert.False(commander.Conflict(route).Present, "203.0.113.0/24 was installed anyway");
     }
 
     /// <summary>On Windows, a prefix that is certainly taken is reported as taken.</summary>
