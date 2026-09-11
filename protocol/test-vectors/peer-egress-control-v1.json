@@ -1,0 +1,282 @@
+{
+  "name": "peer-egress-control-v1",
+  "version": 1,
+  "notes": [
+    "egress-config 由三个服务端实现产生、由三个客户端读取，所以「客户端从中读出什么」是一份契约。最容易漂开的不是字段名，而是 JSON 库替协议做的决定：缺失字段变成什么，以及值在比较之前有没有被归一化。",
+    "scope 在比较之前必须去空白并转大写。判定层拿自己算出的 PUBLIC 或 LAN 去做相等比较，一条写着小写 public 的推送在不归一化的实现里会被判成不匹配，于是整条策略静默失效。",
+    "scope 缺失必须落到拒绝。把缺失的授权字段默认成许可值就是「未配置即放行」，而本功能对 destinationRules 已经明确写了不接受这一条，scope 没有理由例外。",
+    "limits 缺失时三个字段都为 0，由使用方按自己的默认值兜底；解码器不替它编造数值。",
+    "不认识的键一律忽略。服务端会带上 createdAtMillis，未来还会带别的，旧客户端拒绝整条消息等于一次协议升级就让所有旧设备停止接受配置。",
+    "revision 的单调守卫不在解码器里：它是运行时的状态，解码器对同一条消息必须每次给出相同结果。",
+    "本文件的期望值出自 tools/protocol/generate_peer_egress_control_vectors.py 里的独立参考解码器，不是从任何一个实现录下来的。"
+  ],
+  "deploymentEndpoints": {
+    "description": "本部署自身的端点，进入强制拒绝清单。只收字面 IPv4 地址：域名在策略期解析出的结果可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
+    "cases": [
+      {
+        "name": "all-four-literal",
+        "reason": "四个端点都是字面地址，全部进入强制拒绝清单",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5:8443",
+          "stunHost": "198.51.100.7:3478",
+          "turnHost": "198.51.100.8:3478",
+          "relayAddress": "192.0.2.9:3478"
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.7/32",
+          "198.51.100.8/32",
+          "192.0.2.9/32"
+        ]
+      },
+      {
+        "name": "hostnames-are-skipped",
+        "reason": "域名不解析。在策略期解析出的地址可能和实际 connect 用的不一样，那会让这条阻断看起来生效而实际上没有",
+        "input": {
+          "serverBaseUrl": "https://api.example.com",
+          "stunHost": "stun.example.com:3478",
+          "turnHost": "turn.example.com:3478",
+          "relayAddress": ""
+        },
+        "expect": []
+      },
+      {
+        "name": "ports-are-optional",
+        "reason": "不带端口的写法同样要认出来",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5",
+          "stunHost": "198.51.100.7",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.7/32"
+        ]
+      },
+      {
+        "name": "empty-configuration",
+        "reason": "什么都没配置就没有端点可拒绝，不是错误",
+        "input": {
+          "serverBaseUrl": "",
+          "stunHost": "",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": []
+      },
+      {
+        "name": "mixed-literal-and-name",
+        "reason": "字面地址进清单，域名跳过，两者不互相影响",
+        "input": {
+          "serverBaseUrl": "https://203.0.113.5:8443",
+          "stunHost": "stun.example.com:3478",
+          "turnHost": "198.51.100.8:3478",
+          "relayAddress": ""
+        },
+        "expect": [
+          "203.0.113.5/32",
+          "198.51.100.8/32"
+        ]
+      },
+      {
+        "name": "ipv6-literal-is-skipped",
+        "reason": "一期数据面只有 IPv4，IPv6 端点没有可以拒绝的 IPv4 前缀",
+        "input": {
+          "serverBaseUrl": "https://[2001:db8::1]:8443",
+          "stunHost": "",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": []
+      }
+    ]
+  },
+  "egressConfig": {
+    "accept": [
+      {
+        "name": "full-push",
+        "reason": "规范里的例子，字段齐全",
+        "message": "{\"type\": \"egress-config\", \"enabled\": true, \"revision\": 7, \"scope\": \"PUBLIC\", \"allowedConsumerClientIds\": [1, 5], \"destinationRules\": [{\"cidr\": \"203.0.113.0/24\", \"protocols\": [\"tcp\"], \"portRanges\": [[80, 80], [443, 443]]}], \"limits\": {\"maxConcurrentFlows\": 256, \"maxFlowsPerConsumer\": 64, \"idleTimeoutSeconds\": 60}}",
+        "expect": {
+          "revision": 7,
+          "policy": {
+            "enabled": true,
+            "scope": "PUBLIC",
+            "allowedConsumerClientIds": [
+              1,
+              5
+            ],
+            "destinationRules": [
+              {
+                "cidr": "203.0.113.0/24",
+                "protocols": [
+                  "tcp"
+                ],
+                "portRanges": [
+                  [
+                    80,
+                    80
+                  ],
+                  [
+                    443,
+                    443
+                  ]
+                ]
+              }
+            ],
+            "limits": {
+              "maxConcurrentFlows": 256,
+              "maxFlowsPerConsumer": 64,
+              "idleTimeoutSeconds": 60
+            }
+          }
+        }
+      },
+      {
+        "name": "disabled-carries-neither-scope-nor-limits",
+        "reason": "C server 关闭出口时逐字发出的形状。缺失的 limits 不能让解码失败，也不能变成一份看起来配置过的策略",
+        "message": "{\"type\": \"egress-config\", \"revision\": 8, \"enabled\": false, \"allowedConsumerClientIds\": [], \"destinationRules\": []}",
+        "expect": {
+          "revision": 8,
+          "policy": {
+            "enabled": false,
+            "scope": "",
+            "allowedConsumerClientIds": [],
+            "destinationRules": [],
+            "limits": {
+              "maxConcurrentFlows": 0,
+              "maxFlowsPerConsumer": 0,
+              "idleTimeoutSeconds": 0
+            }
+          }
+        }
+      },
+      {
+        "name": "scope-is-uppercased",
+        "reason": "判定层拿自己算出的 scope 去做相等比较，所以小写的推送必须先归一化，否则会被判成不匹配",
+        "message": "{\"type\": \"egress-config\", \"enabled\": true, \"revision\": 9, \"scope\": \"public\", \"allowedConsumerClientIds\": [1], \"destinationRules\": [], \"limits\": {\"maxConcurrentFlows\": 8, \"maxFlowsPerConsumer\": 4, \"idleTimeoutSeconds\": 30}}",
+        "expect": {
+          "revision": 9,
+          "policy": {
+            "enabled": true,
+            "scope": "PUBLIC",
+            "allowedConsumerClientIds": [
+              1
+            ],
+            "destinationRules": [],
+            "limits": {
+              "maxConcurrentFlows": 8,
+              "maxFlowsPerConsumer": 4,
+              "idleTimeoutSeconds": 30
+            }
+          }
+        }
+      },
+      {
+        "name": "scope-is-trimmed",
+        "reason": "同上，两侧空白同样要去掉",
+        "message": "{\"type\": \"egress-config\", \"enabled\": true, \"revision\": 10, \"scope\": \"  LAN  \", \"allowedConsumerClientIds\": [1], \"destinationRules\": [], \"limits\": {\"maxConcurrentFlows\": 8, \"maxFlowsPerConsumer\": 4, \"idleTimeoutSeconds\": 30}}",
+        "expect": {
+          "revision": 10,
+          "policy": {
+            "enabled": true,
+            "scope": "LAN",
+            "allowedConsumerClientIds": [
+              1
+            ],
+            "destinationRules": [],
+            "limits": {
+              "maxConcurrentFlows": 8,
+              "maxFlowsPerConsumer": 4,
+              "idleTimeoutSeconds": 30
+            }
+          }
+        }
+      },
+      {
+        "name": "enabled-without-scope-denies",
+        "reason": "scope 是授权维度，缺省必须落到拒绝而不是 PUBLIC。把缺失的授权字段默认成许可值，正是「未配置即放行」——本功能明确不接受这一条",
+        "message": "{\"type\": \"egress-config\", \"enabled\": true, \"revision\": 11, \"allowedConsumerClientIds\": [1], \"destinationRules\": [{\"cidr\": \"203.0.113.0/24\", \"protocols\": [\"tcp\"], \"portRanges\": [[443, 443]]}], \"limits\": {\"maxConcurrentFlows\": 8, \"maxFlowsPerConsumer\": 4, \"idleTimeoutSeconds\": 30}}",
+        "expect": {
+          "revision": 11,
+          "policy": {
+            "enabled": true,
+            "scope": "",
+            "allowedConsumerClientIds": [
+              1
+            ],
+            "destinationRules": [
+              {
+                "cidr": "203.0.113.0/24",
+                "protocols": [
+                  "tcp"
+                ],
+                "portRanges": [
+                  [
+                    443,
+                    443
+                  ]
+                ]
+              }
+            ],
+            "limits": {
+              "maxConcurrentFlows": 8,
+              "maxFlowsPerConsumer": 4,
+              "idleTimeoutSeconds": 30
+            }
+          }
+        }
+      },
+      {
+        "name": "unknown-fields-are-ignored",
+        "reason": "服务端会带上 createdAtMillis 等字段。旧客户端必须忽略不认识的键，而不是拒绝整条消息",
+        "message": "{\"type\": \"egress-config\", \"enabled\": true, \"revision\": 12, \"scope\": \"PUBLIC\", \"allowedConsumerClientIds\": [1], \"destinationRules\": [], \"limits\": {\"maxConcurrentFlows\": 8, \"maxFlowsPerConsumer\": 4, \"idleTimeoutSeconds\": 30}, \"createdAtMillis\": 1800000000000, \"somethingFromALaterVersion\": {\"nested\": true}}",
+        "expect": {
+          "revision": 12,
+          "policy": {
+            "enabled": true,
+            "scope": "PUBLIC",
+            "allowedConsumerClientIds": [
+              1
+            ],
+            "destinationRules": [],
+            "limits": {
+              "maxConcurrentFlows": 8,
+              "maxFlowsPerConsumer": 4,
+              "idleTimeoutSeconds": 30
+            }
+          }
+        }
+      }
+    ],
+    "reject": [
+      {
+        "name": "wrong-type",
+        "reason": "类型不对的消息不属于这个解码器。当成 egress-config 读会把一份目录当成策略装上去",
+        "message": "{\"type\": \"egress-catalog\", \"revision\": 1}"
+      },
+      {
+        "name": "no-type",
+        "reason": "没有 type 就没法判断这是什么，不能猜",
+        "message": "{\"enabled\": true, \"revision\": 1}"
+      },
+      {
+        "name": "not-json",
+        "reason": "半条消息、被截断的消息，都从这里退出",
+        "message": "{ this is not json"
+      },
+      {
+        "name": "not-an-object",
+        "reason": "JSON 合法但不是对象，同样不是一条控制消息",
+        "message": "[1, 2, 3]"
+      }
+    ],
+    "limitDefaults": {
+      "maxConcurrentFlows": 256,
+      "maxFlowsPerConsumer": 64,
+      "idleTimeoutSeconds": 60,
+      "description": "limits 缺失或为 0 时使用方各自的兜底值。解码器只报告 0，由运行时决定 0 代表「用默认」还是「无限制」。"
+    }
+  }
+}

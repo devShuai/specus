@@ -27,7 +27,12 @@ public class PeerEgressPolicy {
 
     private List<Long> allowedConsumerClientIds = List.of();
 
-    private String scope = SCOPE_PUBLIC;
+    /**
+     * No default. Scope is an authorization dimension, so a policy that never names one must deny
+     * rather than fall back to the permissive value: {@code PUBLIC} would let a policy assembled
+     * without a scope reach the whole internet.
+     */
+    private String scope = "";
 
     /** Empty means deny everything. There is no "unconfigured therefore open" state. */
     private List<PeerEgressDestinationRule> destinationRules = List.of();

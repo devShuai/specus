@@ -10,6 +10,7 @@ using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.Runtime;
 using Specus.Protocol;
+using Specus.Protocol.PeerEgress;
 using Specus.Protocol.Packets;
 
 namespace Specus.Client.PeerMesh;
@@ -160,6 +161,95 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _observer = observer;
         _portMappingService = new NatPortMappingService(logger);
         _serviceRuntime = new PeerServiceRuntime(SendServiceReport, logger);
+        _egress = new PeerEgressMesh(new EgressHost(this), logger);
+        if (config.PeerEgressRules.Count > 0)
+        {
+            // Only when there is something to apply. Building the consumer starts the threads that
+            // carry its work, and a node with no rules has none.
+            _egress.ApplyRules(config.PeerEgressRules);
+        }
+    }
+
+    /// <summary>The egress data plane and its three joins with this client.</summary>
+    private readonly PeerEgressMesh _egress;
+
+    /// <summary>What the egress plane needs from this client.</summary>
+    private sealed class EgressHost(PeerMeshClient owner) : IPeerEgressMeshHost
+    {
+        public bool CanReach(long peerId)
+        {
+            lock (owner._sync)
+            {
+                return owner._sessions.ContainsKey(peerId);
+            }
+        }
+
+        public async Task<bool> SendToPeerAsync(long peerId, byte[] frame) =>
+            await owner.SendEncryptedPayloadAsync(peerId, frame).ConfigureAwait(false);
+
+        public async Task WriteToDeviceAsync(byte[] packet)
+        {
+            IPeerVirtualDevice? device;
+            lock (owner._sync)
+            {
+                device = owner._device;
+            }
+            if (device is null or NoopPeerVirtualDevice)
+            {
+                return;
+            }
+            try
+            {
+                await device.WritePacketAsync(packet, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+            {
+                owner._logger.LogWarning(ex, "Peer Mesh egress device write failed");
+            }
+        }
+
+        public string TunName
+        {
+            get
+            {
+                lock (owner._sync)
+                {
+                    return owner._device?.Name ?? owner._config.PeerMeshTunName;
+                }
+            }
+        }
+
+        public string MeshCidr => owner.Runtime()?.PeerMesh.Cidr ?? "";
+
+        public string VirtualIp => owner.Runtime()?.PeerMesh.VirtualIp ?? "";
+
+        public IReadOnlyList<string> DeploymentDenyCidrs()
+        {
+            var mesh = owner.Runtime()?.PeerMesh;
+            return PeerEgressEndpoints.DeploymentDenyCidrs(
+                owner._config.ServerBaseUrl, mesh?.StunHost, mesh?.TurnHost, relayAddress: null);
+        }
+
+        public IReadOnlyList<string> PeerEndpointAddresses()
+        {
+            lock (owner._sync)
+            {
+                return [.. owner._sessions.Values
+                    .Select(session => session.RemoteEndpoint?.Address.ToString())
+                    .Where(address => !string.IsNullOrEmpty(address))
+                    .Select(address => address!)];
+            }
+        }
+
+        public int? PathMtuForPeer(long peerId)
+        {
+            lock (owner._sync)
+            {
+                return owner._sessions.TryGetValue(peerId, out var session)
+                    ? session.PathMtu?.EffectiveMtu(owner._config.PeerMeshMtu)
+                    : null;
+            }
+        }
     }
 
     internal Task? ReceiveTask
@@ -537,6 +627,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     MergeRoster(message.Peers);
                     await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
                     await AnnounceCandidatesAsync().ConfigureAwait(false);
+                    break;
+                case PeerEgressConfigMessage.Type:
+                    // The raw payload rather than the parsed control message: the egress fields are
+                    // this feature's own and do not belong on the mesh's signalling type.
+                    _egress.ApplyEgressConfig(payload);
                     break;
                 case TypeSessionGrant:
                     MergeSession(message);
@@ -1495,6 +1590,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private async ValueTask HandleVirtualPacketAsync(byte[] packet)
     {
+        // Offered to the consumer rules first. A destination a rule claims is not a mesh peer, and
+        // the path below would drop it as one: silently, and as though nothing had been configured.
+        if (_egress.HandleOutbound(packet))
+        {
+            return;
+        }
         var target = PeerIpPacket.DestinationIPv4(packet);
         if (string.IsNullOrWhiteSpace(target))
         {
@@ -2031,6 +2132,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
+        // Before the authenticated-endpoint check below: a payload carrying the SPEG1 magic is
+        // addressed to the egress path and must be refused with its own code rather than dropped
+        // here as an unrecognised mesh packet.
+        if (_egress.HandleInboundFrame(session.PeerId, frame.Payload))
+        {
+            return;
+        }
         if (ready is null || !PeerIpPacket.MatchesAuthenticatedEndpoints(
                 frame.Payload, ready.PeerVirtualIp, runtime.PeerMesh.VirtualIp))
         {
@@ -2334,6 +2442,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _sessions.Remove(peerId);
         _sessionsById.Remove(session.Id);
         session.DisposeTrafficCodecs();
+        // Delivered as an event rather than polled: asking the mesh whether a peer is still
+        // authorised would mean taking this lock from under the plane's own.
+        _egress.RevokeConsumer(peerId);
         return null;
     }
 
@@ -4583,6 +4694,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
+        // Routes first, so traffic stops being captured before the plane stops answering for it.
+        _egress.WithdrawRoutes();
+        _egress.Dispose();
         _serviceRuntime.Dispose();
     }
 

@@ -40,6 +40,14 @@ public sealed class SpecusClientConfig
     [JsonPropertyName("peerMeshMtu")]
     public int PeerMeshMtu { get; set; } = DefaultPeerMeshMtu;
 
+    /// <summary>
+    /// Route chosen destinations through an egress peer. Local configuration, unlike the egress
+    /// policy, which the server owns and pushes: a consumer decides for itself what leaves through
+    /// somebody else's connection.
+    /// </summary>
+    [JsonPropertyName("peerEgressRules")]
+    public IReadOnlyList<Specus.Protocol.PeerEgress.PeerEgressRule> PeerEgressRules { get; set; } = [];
+
     [JsonPropertyName("updateCheckEnabled")]
     public bool UpdateEnabled { get; set; } = true;
 
