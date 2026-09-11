@@ -320,6 +320,60 @@ def quote(value):
     return "'" + value + "'"
 
 
+def quote_name(value):
+    """Wraps an interface name, escaping the one character that needs it.
+
+    Unlike the addresses, this cannot be whitelisted: the TUN adapter's name comes from operator
+    configuration and may legitimately contain spaces and non-ASCII characters. So here the escape
+    is the defence rather than unreachable code, and it protects a value that really can carry a
+    quote. PowerShell's single-quoted strings escape a quote by doubling it.
+    """
+    return "'" + (value or "").replace("'", "''") + "'"
+
+
+def interface_index_script(name):
+    """Resolves an adapter name to its index.
+
+    Selects the index and nothing else, and that is a requirement rather than a convenience. The
+    child process writes stdout in the console code page -- 936 on the sampling machine, not UTF-8 --
+    and in GBK the low byte of a double-byte character can be 0x5C. Echoing a Chinese adapter name
+    back into the JSON can therefore emit a bare backslash and break the document. Indexes,
+    prefixes, next hops and metrics are all ASCII, so a script that selects only those is readable
+    whatever the code page is.
+    """
+    return ("ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name {} "
+            "-ErrorAction SilentlyContinue|Select-Object InterfaceIndex)").format(quote_name(name))
+
+
+def show_all_routes_script():
+    """Reads the whole table in one query.
+
+    The conflict check asks about one prefix at a time, but the answers all come from here: 29
+    routes came back in 419 ms on the sampling machine, which is cheaper than one query per prefix
+    and leaves the checking to happen in memory.
+    """
+    return ("ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 "
+            "-ErrorAction SilentlyContinue|Select-Object "
+            "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)")
+
+
+def parse_interface_index(output):
+    """Reference reading of the adapter-index script. Returns the index or None."""
+    try:
+        parsed = json.loads(output)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("InterfaceIndex")
+        if isinstance(index, int) and index > 0:
+            return index
+    return None
+
+
 def valid_prefix(value):
     parts = (value or "").split("/")
     if len(parts) != 2 or not parts[1].isdigit() or not 0 <= int(parts[1]) <= 32:
@@ -415,6 +469,42 @@ REJECTED_ARGUMENTS = [
     {"name": "ipv6-address", "value": "2001:db8::1", "kind": "address"},
 ]
 
+INTERFACE_INDEX_SCRIPTS = [
+    {"name": "a-plain-name", "adapter": "specus0"},
+    {"name": "a-name-with-spaces", "adapter": "Specus Tunnel",
+     "reason": "Wintun 适配器名来自配置，空格是合法的"},
+    {"name": "a-name-with-a-quote", "adapter": "it's",
+     "reason": "单引号必须变成两个。地址那边用白名单没有转义，"
+               "因为白名单里没有引号；接口名不能白名单成数字，所以这里转义是真的防线"},
+    {"name": "a-localised-name", "adapter": "以太网",
+     "reason": "采样机上默认网卡就叫这个。名字进得去，但脚本只 Select 索引，"
+               "所以出来的 JSON 是纯 ASCII"},
+]
+
+INTERFACE_INDEX_PARSE = [
+    {"name": "found", "output": '[{"InterfaceIndex":3}]', "sampled": True,
+     "reason": "采样：按本地化名字查到默认网卡"},
+    {"name": "no-such-adapter", "output": "[]", "sampled": True,
+     "reason": "采样：查不到时是空数组，不是报错"},
+    {"name": "zero-index", "output": '[{"InterfaceIndex":0}]',
+     "reason": "0 不是接口"},
+    {"name": "not-json", "output": "Get-NetAdapter : \r\n"},
+]
+
+for case in INTERFACE_INDEX_SCRIPTS:
+    case["expect"] = interface_index_script(case["adapter"])
+for case in INTERFACE_INDEX_PARSE:
+    index = parse_interface_index(case["output"])
+    case["expect"] = {"found": index is not None}
+    if index is not None:
+        case["expect"]["interfaceIndex"] = index
+
+# The escape has to actually fire somewhere, or it is the unreachable kind this file argues against.
+assert any("''" in case["expect"] for case in INTERFACE_INDEX_SCRIPTS), "no name needs escaping"
+# And no script may leak a name into its output, whatever the console code page is.
+for case in INTERFACE_INDEX_SCRIPTS:
+    assert "Select-Object InterfaceIndex)" in case["expect"], case["name"]
+
 for case in SHOW_SCRIPTS:
     case["expect"] = show_routes_script(case["prefixes"])
 for case in FIND_SCRIPTS:
@@ -472,6 +562,7 @@ assert any(c["expect"]["failure"] == "" and "errorId" in c["output"]
            and "NotFound" in c["output"] for c in COMMAND_ERRORS)
 assert any("(+" in c["expect"]["description"] for c in ROUTE_SHOW), "no case reports a route count"
 assert sum(1 for c in ROUTE_FIND + ROUTE_SHOW + COMMAND_ERRORS if c.get("sampled")) >= 10
+assert sum(1 for c in INTERFACE_INDEX_PARSE if c.get("sampled")) >= 2
 
 vector = {
     "name": "peer-egress-windows-routes-v1",
@@ -519,6 +610,17 @@ vector = {
         "installRoute": INSTALL_SCRIPTS,
         "removeRoute": REMOVE_SCRIPTS,
         "rejectedArguments": REJECTED_ARGUMENTS,
+        "interfaceIndex": INTERFACE_INDEX_SCRIPTS,
+        "showAllRoutes": show_all_routes_script(),
+    },
+    "interfaceIndexParse": INTERFACE_INDEX_PARSE,
+    "outputEncoding": {
+        "description":
+            "子进程的 stdout 用控制台代码页写出，采样机上是 936 而不是 UTF-8。"
+            "GBK 双字节字符的低字节可能是 0x5C，也就是反斜杠——把一个中文适配器名回显进 JSON "
+            "就可能吐出一个裸反斜杠，整份文档就坏了。因此脚本一律不 Select 任何名字字段："
+            "索引、前缀、下一跳、跃点数都是 ASCII，无论代码页是什么都读得出来。这是要求，不是巧合。",
+        "consoleCodePage": 936,
     },
 }
 

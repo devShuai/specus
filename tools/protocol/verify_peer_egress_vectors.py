@@ -269,6 +269,48 @@ for case in windows["routeShow"]:
           f"windows: show case {case['name']} miscounts the routes on the prefix")
 
 
+# ---- windows scripts ----------------------------------------------------
+scripts = windows["scripts"]
+check(scripts["showAllRoutes"].endswith(
+          "Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"),
+      "windows: the whole-table query selects fields beyond the four that are ASCII")
+check(windows["outputEncoding"]["consoleCodePage"] != 0,
+      "windows: the sampled console code page is gone, and with it the reason for the rule below")
+
+# No script may select a name. The child process writes stdout in the console code page -- 936 on
+# the sampling machine -- and in GBK the low byte of a character can be 0x5C, so a Chinese adapter
+# name echoed into the JSON can emit a bare backslash and break the document.
+for case in scripts["interfaceIndex"]:
+    check(case["expect"].endswith("Select-Object InterfaceIndex)"),
+          f"windows: interface script {case['name']} selects more than the index")
+for group in ("showRoutes", "findRoutes"):
+    for case in scripts[group]:
+        check("Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)" in case["expect"],
+              f"windows: query script {case['name']} selects fields beyond the ASCII four")
+
+# The adapter name is the one argument that cannot be whitelisted, so it is the one place the quote
+# escape has to fire. A case list without it would let an implementation drop the escaping.
+check(any("''" in case["expect"] for case in scripts["interfaceIndex"]),
+      "windows: no interface name in the vector needs its quote escaped")
+
+# Every install and remove has to name the store explicitly. ActiveStore is what keeps these routes
+# from outliving a reboot, and a script that left the default in place would install persistent ones.
+for group in ("installRoute", "removeRoute"):
+    for case in scripts[group]:
+        check("-PolicyStore ActiveStore" in case["expect"],
+              f"windows: {group} case {case['name']} does not pin the policy store")
+for case in scripts["removeRoute"]:
+    check("-Confirm:$false" in case["expect"],
+          f"windows: remove case {case['name']} would wait for a confirmation nobody can give")
+
+# Nothing that a validator would refuse may appear as an accepted script argument.
+for case in scripts["rejectedArguments"]:
+    for group in ("showRoutes", "findRoutes"):
+        for accepted in scripts[group]:
+            values = accepted.get("prefixes") or accepted.get("addresses") or []
+            check(case["value"] not in values,
+                  f"windows: {case['name']} is both refused and used in {accepted['name']}")
+
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
@@ -277,6 +319,10 @@ print(f"control egressConfig accept={len(egress_config['accept'])} reject={len(e
 print(f"error codes: {len(table_codes)} documented, {len(used)} exercised")
 print(f"windows routes find={len(windows['routeFind'])} show={len(windows['routeShow'])}"
       f" errors={len(windows['commandErrors'])} sampled={len(sampled)}")
+print(f"windows scripts show={len(scripts['showRoutes'])} find={len(scripts['findRoutes'])}"
+      f" install={len(scripts['installRoute'])} remove={len(scripts['removeRoute'])}"
+      f" interface={len(scripts['interfaceIndex'])}"
+      f" refused={len(scripts['rejectedArguments'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")

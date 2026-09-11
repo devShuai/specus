@@ -188,6 +188,65 @@ internal static class PeerEgressWindowsRouteCommands
         }
     }
 
+    /// <summary>Wraps an interface name, escaping the one character that needs it.</summary>
+    /// <remarks>
+    /// Unlike the addresses, this cannot be whitelisted: the TUN adapter's name comes from operator
+    /// configuration and may legitimately contain spaces and non-ASCII characters. So here the
+    /// escape is the defence rather than unreachable code, and it protects a value that really can
+    /// carry a quote. PowerShell's single-quoted strings escape a quote by doubling it.
+    /// </remarks>
+    public static string QuoteName(string? value) =>
+        "'" + (value ?? "").Replace("'", "''") + "'";
+
+    /// <summary>Resolves an adapter name to its index.</summary>
+    /// <remarks>
+    /// Selects the index and nothing else, and that is a requirement rather than a convenience. The
+    /// child process writes stdout in the console code page -- 936 on the machine this was sampled
+    /// on, not UTF-8 -- and in GBK the low byte of a double-byte character can be 0x5C. Echoing a
+    /// Chinese adapter name back into the JSON can therefore emit a bare backslash and break the
+    /// document. Indexes, prefixes, next hops and metrics are all ASCII, so a script that selects
+    /// only those is readable whatever the code page is.
+    /// </remarks>
+    public static string InterfaceIndexScript(string? name) =>
+        "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name " + QuoteName(name)
+        + " -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)";
+
+    /// <summary>Reads the whole table in one query.</summary>
+    /// <remarks>
+    /// The conflict check asks about one prefix at a time, but the answers can all come from here:
+    /// 29 routes came back in 419 ms on the sampling machine, cheaper than one query per prefix and
+    /// leaving the checking to happen in memory.
+    /// </remarks>
+    public static string ShowAllRoutesScript() =>
+        "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 "
+        + "-ErrorAction SilentlyContinue|Select-Object "
+        + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)";
+
+    /// <summary>
+    /// Reads the adapter-index script's JSON, returning 0 when there is no usable index.
+    /// </summary>
+    /// <remarks>
+    /// An adapter that is not there comes back as an empty array rather than an error, so the
+    /// absence has to be recognised here: installing against index zero would ask the system to
+    /// route through nothing.
+    /// </remarks>
+    public static int ParseInterfaceIndex(string? output)
+    {
+        using var decoded = DecodeRoutes(output);
+        if (decoded is null)
+        {
+            return 0;
+        }
+        foreach (var route in decoded.RootElement.EnumerateArray())
+        {
+            if (IntOf(route, "InterfaceIndex") is { } index && index > 0)
+            {
+                return index;
+            }
+        }
+        return 0;
+    }
+
     /// <summary>Asks about every prefix in one process.</summary>
     /// <remarks>
     /// One line of JSON per prefix, in the order given. Batched because a PowerShell process costs

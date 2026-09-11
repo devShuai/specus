@@ -165,6 +165,46 @@ class PeerEgressWindowsRouteVectorTests {
     }
 
     /**
+     * The adapter name is the one argument that cannot be whitelisted -- it comes from
+     * configuration and may legitimately hold spaces and non-ASCII characters -- so it is the one
+     * place the escape is load-bearing rather than unreachable.
+     */
+    @Test
+    void windowsInterfaceLookupMatchesTheSharedVector() throws IOException {
+        JsonNode vector = readVector("peer-egress-windows-routes-v1.json");
+        JsonNode scripts = vector.path("scripts");
+        assertTrue(scripts.path("interfaceIndex").size() > 0, "vector carried no interface cases");
+
+        for (JsonNode testCase : scripts.path("interfaceIndex")) {
+            assertEquals(testCase.path("expect").asText(),
+                    PeerEgressWindowsRouteCommands.interfaceIndexScript(
+                            testCase.path("adapter").asText()),
+                    testCase.path("name").asText());
+            // Nothing a script selects may be anything but ASCII. The child process writes stdout
+            // in the console code page, and in GBK the low byte of a character can be a backslash:
+            // a name echoed back into the JSON can break the document.
+            assertTrue(testCase.path("expect").asText().endsWith("Select-Object InterfaceIndex)"),
+                    testCase.path("name").asText() + " selects more than the index");
+        }
+        assertEquals(scripts.path("showAllRoutes").asText(),
+                PeerEgressWindowsRouteCommands.showAllRoutesScript());
+
+        for (JsonNode testCase : vector.path("interfaceIndexParse")) {
+            String name = testCase.path("name").asText();
+            int index = PeerEgressWindowsRouteCommands.parseInterfaceIndex(
+                    testCase.path("output").asText());
+            JsonNode expect = testCase.path("expect");
+            if (!expect.path("found").asBoolean()) {
+                assertEquals(0, index, name);
+                continue;
+            }
+            assertEquals(expect.path("interfaceIndex").asInt(), index, name);
+        }
+        assertTrue(vector.path("outputEncoding").path("consoleCodePage").asInt() > 0,
+                "vector lost the sampled console code page");
+    }
+
+    /**
      * The sampled cases are why this vector is worth more than a set of invented strings, so losing
      * them should fail rather than quietly leave a file of guesses behind.
      */

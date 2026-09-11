@@ -151,6 +151,46 @@ public class PeerEgressWindowsRouteVectorTests
         [.. array.EnumerateArray().Select(entry => entry.GetString()!)];
 
     /// <summary>
+    /// The adapter name is the one argument that cannot be whitelisted -- it comes from
+    /// configuration and may legitimately hold spaces and non-ASCII characters -- so it is the one
+    /// place the escape is load-bearing rather than unreachable.
+    /// </summary>
+    [Fact]
+    public void WindowsInterfaceLookupMatchesTheSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-windows-routes-v1.json");
+        var root = vector.RootElement;
+        var scripts = root.GetProperty("scripts");
+        Assert.True(scripts.GetProperty("interfaceIndex").GetArrayLength() > 0,
+            "vector carried no interface cases");
+
+        foreach (var testCase in scripts.GetProperty("interfaceIndex").EnumerateArray())
+        {
+            var expected = testCase.GetProperty("expect").GetString()!;
+            Assert.Equal(expected, PeerEgressWindowsRouteCommands.InterfaceIndexScript(
+                testCase.GetProperty("adapter").GetString()));
+            // Nothing a script selects may be anything but ASCII. The child process writes stdout
+            // in the console code page, and in GBK the low byte of a character can be a backslash:
+            // a name echoed back into the JSON can break the document.
+            Assert.EndsWith("Select-Object InterfaceIndex)", expected);
+        }
+        Assert.Equal(scripts.GetProperty("showAllRoutes").GetString(),
+            PeerEgressWindowsRouteCommands.ShowAllRoutesScript());
+
+        foreach (var testCase in root.GetProperty("interfaceIndexParse").EnumerateArray())
+        {
+            var index = PeerEgressWindowsRouteCommands.ParseInterfaceIndex(
+                testCase.GetProperty("output").GetString());
+            var expect = testCase.GetProperty("expect");
+            Assert.Equal(expect.GetProperty("found").GetBoolean()
+                ? expect.GetProperty("interfaceIndex").GetInt32()
+                : 0, index);
+        }
+        Assert.True(root.GetProperty("outputEncoding").GetProperty("consoleCodePage").GetInt32() > 0,
+            "vector lost the sampled console code page");
+    }
+
+    /// <summary>
     /// The sampled cases are why this vector is worth more than a set of invented strings, so
     /// losing them should fail rather than quietly leave a file of guesses behind.
     /// </summary>

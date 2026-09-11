@@ -1,6 +1,9 @@
 package client
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Binds the Windows route parsers to protocol/test-vectors/peer-egress-windows-routes-v1.json.
 //
@@ -70,7 +73,68 @@ type egressWindowsRoutesVector struct {
 			Value string `json:"value"`
 			Kind  string `json:"kind"`
 		} `json:"rejectedArguments"`
+		InterfaceIndex []struct {
+			Name    string `json:"name"`
+			Adapter string `json:"adapter"`
+			Expect  string `json:"expect"`
+		} `json:"interfaceIndex"`
+		ShowAllRoutes string `json:"showAllRoutes"`
 	} `json:"scripts"`
+	InterfaceIndexParse []struct {
+		Name    string `json:"name"`
+		Output  string `json:"output"`
+		Sampled bool   `json:"sampled"`
+		Expect  struct {
+			Found          bool `json:"found"`
+			InterfaceIndex int  `json:"interfaceIndex"`
+		} `json:"expect"`
+	} `json:"interfaceIndexParse"`
+	OutputEncoding struct {
+		ConsoleCodePage int `json:"consoleCodePage"`
+	} `json:"outputEncoding"`
+}
+
+// The adapter name is the one argument that cannot be whitelisted -- it comes from configuration
+// and may legitimately hold spaces and non-ASCII characters -- so it is the one place the escape is
+// load-bearing rather than unreachable.
+func TestWindowsInterfaceLookupMatchesSharedVector(t *testing.T) {
+	var vector egressWindowsRoutesVector
+	readEgressVector(t, "peer-egress-windows-routes-v1.json", &vector)
+	if len(vector.Scripts.InterfaceIndex) == 0 || len(vector.InterfaceIndexParse) == 0 {
+		t.Fatal("windows routes vector carried no interface cases")
+	}
+
+	for _, testCase := range vector.Scripts.InterfaceIndex {
+		if got := windowsInterfaceIndexScript(testCase.Adapter); got != testCase.Expect {
+			t.Errorf("%s: script mismatch\n got %q\nwant %q", testCase.Name, got, testCase.Expect)
+		}
+	}
+	if got := windowsShowAllRoutesScript(); got != vector.Scripts.ShowAllRoutes {
+		t.Errorf("show-all script mismatch\n got %q\nwant %q", got, vector.Scripts.ShowAllRoutes)
+	}
+
+	for _, testCase := range vector.InterfaceIndexParse {
+		index, ok := parseWindowsInterfaceIndex(testCase.Output)
+		if ok != testCase.Expect.Found {
+			t.Errorf("%s: found = %v, want %v", testCase.Name, ok, testCase.Expect.Found)
+			continue
+		}
+		if ok && index != testCase.Expect.InterfaceIndex {
+			t.Errorf("%s: index = %d, want %d", testCase.Name, index, testCase.Expect.InterfaceIndex)
+		}
+	}
+
+	// Nothing a script selects may be anything but ASCII. The child process writes stdout in the
+	// console code page, and in GBK the low byte of a character can be a backslash: a name echoed
+	// back into the JSON can break the document.
+	for _, testCase := range vector.Scripts.InterfaceIndex {
+		if !strings.HasSuffix(testCase.Expect, "Select-Object InterfaceIndex)") {
+			t.Errorf("%s: script selects more than the index", testCase.Name)
+		}
+	}
+	if vector.OutputEncoding.ConsoleCodePage == 0 {
+		t.Error("vector lost the sampled console code page")
+	}
 }
 
 // The scripts are asserted as text, not only by what comes back from running them. Three runtimes

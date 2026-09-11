@@ -152,6 +152,24 @@ func parseWindowsCommandFailure(output string) string {
 	return windowsRouteFailureOther
 }
 
+// parseWindowsInterfaceIndex reads the adapter-index script's JSON.
+//
+// An adapter that is not there comes back as an empty array rather than an error, so the absence
+// has to be recognised here: installing against index zero would ask the system to route through
+// nothing.
+func parseWindowsInterfaceIndex(output string) (int, bool) {
+	routes, ok := decodeWindowsNetRoutes(output)
+	if !ok {
+		return 0, false
+	}
+	for _, route := range routes {
+		if route.InterfaceIndex > 0 {
+			return route.InterfaceIndex, true
+		}
+	}
+	return 0, false
+}
+
 // describeWindowsRoute writes one line an operator can match against their own Get-NetRoute output.
 func describeWindowsRoute(route windowsNetRoute) string {
 	via := "on-link"

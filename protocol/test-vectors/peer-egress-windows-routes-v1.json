@@ -358,6 +358,72 @@
         "value": "2001:db8::1",
         "kind": "address"
       }
-    ]
+    ],
+    "interfaceIndex": [
+      {
+        "name": "a-plain-name",
+        "adapter": "specus0",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'specus0' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-name-with-spaces",
+        "adapter": "Specus Tunnel",
+        "reason": "Wintun 适配器名来自配置，空格是合法的",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'Specus Tunnel' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-name-with-a-quote",
+        "adapter": "it's",
+        "reason": "单引号必须变成两个。地址那边用白名单没有转义，因为白名单里没有引号；接口名不能白名单成数字，所以这里转义是真的防线",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'it''s' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-localised-name",
+        "adapter": "以太网",
+        "reason": "采样机上默认网卡就叫这个。名字进得去，但脚本只 Select 索引，所以出来的 JSON 是纯 ASCII",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name '以太网' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      }
+    ],
+    "showAllRoutes": "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"
+  },
+  "interfaceIndexParse": [
+    {
+      "name": "found",
+      "output": "[{\"InterfaceIndex\":3}]",
+      "sampled": true,
+      "reason": "采样：按本地化名字查到默认网卡",
+      "expect": {
+        "found": true,
+        "interfaceIndex": 3
+      }
+    },
+    {
+      "name": "no-such-adapter",
+      "output": "[]",
+      "sampled": true,
+      "reason": "采样：查不到时是空数组，不是报错",
+      "expect": {
+        "found": false
+      }
+    },
+    {
+      "name": "zero-index",
+      "output": "[{\"InterfaceIndex\":0}]",
+      "reason": "0 不是接口",
+      "expect": {
+        "found": false
+      }
+    },
+    {
+      "name": "not-json",
+      "output": "Get-NetAdapter : \r\n",
+      "expect": {
+        "found": false
+      }
+    }
+  ],
+  "outputEncoding": {
+    "description": "子进程的 stdout 用控制台代码页写出，采样机上是 936 而不是 UTF-8。GBK 双字节字符的低字节可能是 0x5C，也就是反斜杠——把一个中文适配器名回显进 JSON 就可能吐出一个裸反斜杠，整份文档就坏了。因此脚本一律不 Select 任何名字字段：索引、前缀、下一跳、跃点数都是 ASCII，无论代码页是什么都读得出来。这是要求，不是巧合。",
+    "consoleCodePage": 936
   }
 }

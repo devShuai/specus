@@ -144,6 +144,40 @@ func windowsRemoveRouteScript(cidr string) (string, error) {
 		"ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}", nil
 }
 
+// quoteWindowsName wraps an interface name, escaping the one character that needs it.
+//
+// Unlike the addresses, this cannot be whitelisted: the TUN adapter's name comes from operator
+// configuration and may legitimately contain spaces and non-ASCII characters. So here the escape is
+// the defence rather than unreachable code, and it protects a value that really can carry a quote.
+// PowerShell's single-quoted strings escape a quote by doubling it.
+func quoteWindowsName(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// windowsInterfaceIndexScript resolves an adapter name to its index.
+//
+// Selects the index and nothing else, and that is a requirement rather than a convenience. The
+// child process writes stdout in the console code page -- 936 on the machine this was sampled on,
+// not UTF-8 -- and in GBK the low byte of a double-byte character can be 0x5C. Echoing a Chinese
+// adapter name back into the JSON can therefore emit a bare backslash and break the document.
+// Indexes, prefixes, next hops and metrics are all ASCII, so a script that selects only those is
+// readable whatever the code page is.
+func windowsInterfaceIndexScript(name string) string {
+	return "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name " + quoteWindowsName(name) +
+		" -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+}
+
+// windowsShowAllRoutesScript reads the whole table in one query.
+//
+// The conflict check asks about one prefix at a time, but the answers can all come from here: 29
+// routes came back in 419 ms on the sampling machine, cheaper than one query per prefix and leaving
+// the checking to happen in memory.
+func windowsShowAllRoutesScript() string {
+	return "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 " +
+		"-ErrorAction SilentlyContinue|Select-Object " +
+		"InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"
+}
+
 // splitWindowsScriptLines cuts a batched query's output into one entry per input.
 //
 // Every query writes exactly one compressed JSON line, including an empty result, so the lines line

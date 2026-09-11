@@ -172,6 +172,67 @@ public final class PeerEgressWindowsRouteCommands {
     }
 
     /**
+     * Wraps an interface name, escaping the one character that needs it.
+     *
+     * <p>Unlike the addresses, this cannot be whitelisted: the TUN adapter's name comes from
+     * operator configuration and may legitimately contain spaces and non-ASCII characters. So here
+     * the escape is the defence rather than unreachable code, and it protects a value that really
+     * can carry a quote. PowerShell's single-quoted strings escape a quote by doubling it.
+     */
+    public static String quoteName(String value) {
+        return "'" + (value == null ? "" : value.replace("'", "''")) + "'";
+    }
+
+    /**
+     * Resolves an adapter name to its index.
+     *
+     * <p>Selects the index and nothing else, and that is a requirement rather than a convenience.
+     * The child process writes stdout in the console code page -- 936 on the machine this was
+     * sampled on, not UTF-8 -- and in GBK the low byte of a double-byte character can be 0x5C.
+     * Echoing a Chinese adapter name back into the JSON can therefore emit a bare backslash and
+     * break the document. Indexes, prefixes, next hops and metrics are all ASCII, so a script that
+     * selects only those is readable whatever the code page is.
+     */
+    public static String interfaceIndexScript(String name) {
+        return "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name " + quoteName(name)
+                + " -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)";
+    }
+
+    /**
+     * Reads the whole table in one query.
+     *
+     * <p>The conflict check asks about one prefix at a time, but the answers can all come from
+     * here: 29 routes came back in 419 ms on the sampling machine, cheaper than one query per
+     * prefix and leaving the checking to happen in memory.
+     */
+    public static String showAllRoutesScript() {
+        return "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 "
+                + "-ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)";
+    }
+
+    /**
+     * Reads the adapter-index script's JSON, returning 0 when there is no usable index.
+     *
+     * <p>An adapter that is not there comes back as an empty array rather than an error, so the
+     * absence has to be recognised here: installing against index zero would ask the system to
+     * route through nothing.
+     */
+    public static int parseInterfaceIndex(String output) {
+        JsonNode decoded = decodeRoutes(output);
+        if (decoded == null) {
+            return 0;
+        }
+        for (JsonNode route : decoded) {
+            int index = route.path("InterfaceIndex").asInt(0);
+            if (index > 0) {
+                return index;
+            }
+        }
+        return 0;
+    }
+
+    /**
      * Asks about every prefix in one process.
      *
      * <p>One line of JSON per prefix, in the order given. Batched because a PowerShell process costs
