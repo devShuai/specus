@@ -7,6 +7,8 @@ Reads the shipped files fresh (no shared code with the generator) and asserts:
   * declared innerSourceIp / innerDestinationIp match the actual packet
   * every error code used in a vector is documented in the spec table
   * every error code in the spec table is exercised by at least one vector
+  * the Windows route fixtures still carry their sampled cases, and each parser behaviour
+    they pin is needed by at least one of them
 """
 import json
 import re
@@ -43,6 +45,7 @@ frame = json.loads((VECTORS / "peer-egress-frame-v1.json").read_text(encoding="u
 rules = json.loads((VECTORS / "peer-egress-rules-v1.json").read_text(encoding="utf-8"))
 authz = json.loads((VECTORS / "peer-egress-authz-v1.json").read_text(encoding="utf-8"))
 control = json.loads((VECTORS / "peer-egress-control-v1.json").read_text(encoding="utf-8"))
+windows = json.loads((VECTORS / "peer-egress-windows-routes-v1.json").read_text(encoding="utf-8"))
 
 # ---- frame vector -------------------------------------------------------
 for case in frame["accept"]:
@@ -206,12 +209,120 @@ check(order[:5] == ["hop", "enabled", "peerAcl", "consumer", "forcedDeny"],
 check(order.index("forcedDeny") < order.index("destination"),
       "authz: a broad destination rule must never be able to pre-empt the forced-deny list")
 
+# ---- windows route vector ----------------------------------------------
+# The point of this file is that its fixtures came off a real Windows machine. A version of it
+# rewritten into plausible-looking strings would still pass every implementation's tests, so the
+# sampled count is asserted here rather than left to whoever edits it next.
+sampled = [case for section in ("routeFind", "routeShow", "commandErrors")
+           for case in windows[section] if case.get("sampled")]
+check(len(sampled) >= 10, f"windows: only {len(sampled)} sampled cases left, want at least 10")
+
+on_link = windows["onLinkNextHop"]
+check(on_link == "0.0.0.0", f"windows: unexpected on-link next hop {on_link!r}")
+
+# Each of the three readings has to be load-bearing in at least one case, or an implementation
+# could drop it and still pass every case in the file.
+check(any(case["expect"].get("parsed") and case["expect"]["gateway"] == "" and on_link in case["output"]
+          for case in windows["routeFind"]),
+      "windows: no find case needs the on-link next hop rewritten to an empty gateway")
+check(any(case["expect"].get("parsed") and isinstance(json.loads(case["output"])[0].get("DestinationPrefix"), type(None))
+          for case in windows["routeFind"] if case["output"].lstrip().startswith("[{")),
+      "windows: no find case has the route behind a leading object, so picking it out is untested")
+check(any("(+" in case["expect"]["description"] for case in windows["routeShow"]),
+      "windows: no show case carries more than one route, so the count is untested")
+check({case["expect"]["failure"] for case in windows["commandErrors"]} >= {"permission-denied", "failed", ""},
+      "windows: the error cases do not cover all three classifications")
+# An error id that is still not a failure. Without one, treating every non-empty errorId as a
+# failure would pass the whole file -- and that reading turns every post-reboot cleanup into noise.
+check(any(case["expect"]["failure"] == "" and "errorId" in case["output"]
+          for case in windows["commandErrors"]),
+      "windows: no error case carries an id that is not a failure")
+
+# An empty gateway means on-link everywhere in this feature. A vector that expected the literal
+# 0.0.0.0 back would be asking implementations to install a route pointing at nothing.
+for case in windows["routeFind"]:
+    check(case["expect"].get("gateway") != on_link,
+          f"windows: find case {case['name']} expects the on-link sentinel as a gateway")
+
+# Recompute each show description from the output rather than trusting the generator: the string is
+# what an operator reads before deciding whether to clear a prefix, and a wrong prefix in it sends
+# them after the wrong route.
+for case in windows["routeShow"]:
+    routes = []
+    try:
+        decoded = json.loads(case["output"])
+        if isinstance(decoded, list):
+            routes = [entry for entry in decoded
+                      if isinstance(entry, dict) and isinstance(entry.get("DestinationPrefix"), str)
+                      and entry["DestinationPrefix"].strip()]
+    except ValueError:
+        routes = []
+    check(case["expect"]["present"] == bool(routes),
+          f"windows: show case {case['name']} disagrees with its own output about a route existing")
+    if not routes:
+        check(case["expect"]["description"] == "",
+              f"windows: show case {case['name']} describes a route it says is absent")
+        continue
+    check(case["expect"]["description"].startswith(routes[0]["DestinationPrefix"].strip() + " "),
+          f"windows: show case {case['name']} describes a prefix other than the one in its output")
+    check(("(+{} more)".format(len(routes) - 1) in case["expect"]["description"]) == (len(routes) > 1),
+          f"windows: show case {case['name']} miscounts the routes on the prefix")
+
+
+# ---- windows scripts ----------------------------------------------------
+scripts = windows["scripts"]
+check(scripts["showAllRoutes"].endswith(
+          "Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"),
+      "windows: the whole-table query selects fields beyond the four that are ASCII")
+check(windows["outputEncoding"]["consoleCodePage"] != 0,
+      "windows: the sampled console code page is gone, and with it the reason for the rule below")
+
+# No script may select a name. The child process writes stdout in the console code page -- 936 on
+# the sampling machine -- and in GBK the low byte of a character can be 0x5C, so a Chinese adapter
+# name echoed into the JSON can emit a bare backslash and break the document.
+for case in scripts["interfaceIndex"]:
+    check(case["expect"].endswith("Select-Object InterfaceIndex)"),
+          f"windows: interface script {case['name']} selects more than the index")
+for group in ("showRoutes", "findRoutes"):
+    for case in scripts[group]:
+        check("Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)" in case["expect"],
+              f"windows: query script {case['name']} selects fields beyond the ASCII four")
+
+# The adapter name is the one argument that cannot be whitelisted, so it is the one place the quote
+# escape has to fire. A case list without it would let an implementation drop the escaping.
+check(any("''" in case["expect"] for case in scripts["interfaceIndex"]),
+      "windows: no interface name in the vector needs its quote escaped")
+
+# Every install and remove has to name the store explicitly. ActiveStore is what keeps these routes
+# from outliving a reboot, and a script that left the default in place would install persistent ones.
+for group in ("installRoute", "removeRoute"):
+    for case in scripts[group]:
+        check("-PolicyStore ActiveStore" in case["expect"],
+              f"windows: {group} case {case['name']} does not pin the policy store")
+for case in scripts["removeRoute"]:
+    check("-Confirm:$false" in case["expect"],
+          f"windows: remove case {case['name']} would wait for a confirmation nobody can give")
+
+# Nothing that a validator would refuse may appear as an accepted script argument.
+for case in scripts["rejectedArguments"]:
+    for group in ("showRoutes", "findRoutes"):
+        for accepted in scripts[group]:
+            values = accepted.get("prefixes") or accepted.get("addresses") or []
+            check(case["value"] not in values,
+                  f"windows: {case['name']} is both refused and used in {accepted['name']}")
+
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
 print(f"authz cases={len(authz['cases'])} variants={len(authz['policyVariantCases'])}")
 print(f"control egressConfig accept={len(egress_config['accept'])} reject={len(egress_config['reject'])}")
 print(f"error codes: {len(table_codes)} documented, {len(used)} exercised")
+print(f"windows routes find={len(windows['routeFind'])} show={len(windows['routeShow'])}"
+      f" errors={len(windows['commandErrors'])} sampled={len(sampled)}")
+print(f"windows scripts show={len(scripts['showRoutes'])} find={len(scripts['findRoutes'])}"
+      f" install={len(scripts['installRoute'])} remove={len(scripts['removeRoute'])}"
+      f" interface={len(scripts['interfaceIndex'])}"
+      f" refused={len(scripts['rejectedArguments'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")

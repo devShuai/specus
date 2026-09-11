@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -17,10 +16,7 @@ import java.util.concurrent.TimeUnit;
  * {@code ip route add} failing on an existing prefix is the backstop: replacing would mean quietly
  * winning an argument with the user's own routing, which phase one does not do.
  *
- * <p>Windows and macOS takeover is P5. Until then {@link #forPlatform} hands back a commander that
- * refuses rather than one that silently does nothing: a consumer that installed no routes would
- * send every destination out locally while reporting that its rules were applied, which is the leak
- * this whole feature exists to prevent.
+ * <p>Choosing between this and the Windows table lives in {@link PeerEgressRouteCommanders}.
  */
 public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInstaller.Commander {
 
@@ -40,33 +36,6 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
 
     public LinuxPeerEgressRouteCommander(String tun) {
         this.tun = tun;
-    }
-
-    /** The commander for the platform this process is running on. */
-    public static PeerEgressRouteInstaller.Commander forPlatform(String tun) {
-        String name = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        if (name.contains("linux")) {
-            return new LinuxPeerEgressRouteCommander(tun);
-        }
-        return new UnsupportedPeerEgressRouteCommander();
-    }
-
-    /** Route takeover is Linux-only in phase one; see the class comment. */
-    static final class UnsupportedPeerEgressRouteCommander implements PeerEgressRouteInstaller.Commander {
-        @Override
-        public PeerEgressRouteInstaller.Conflict conflict(Route route) {
-            return PeerEgressRouteInstaller.Conflict.none();
-        }
-
-        @Override
-        public void install(Route route) throws IOException {
-            throw new IOException("egress route takeover is not implemented on this platform");
-        }
-
-        @Override
-        public void remove(Route route) throws IOException {
-            throw new IOException("egress route takeover is not implemented on this platform");
-        }
     }
 
     @Override

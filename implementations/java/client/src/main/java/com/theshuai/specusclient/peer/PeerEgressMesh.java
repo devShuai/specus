@@ -330,7 +330,7 @@ final class PeerEgressMesh implements AutoCloseable {
                     : host.routeJournalPath();
             PeerEgressRouteInstaller installer = new PeerEgressRouteInstaller(
                     commander == null
-                            ? LinuxPeerEgressRouteCommander.forPlatform(host.tunName())
+                            ? PeerEgressRouteCommanders.forPlatform(host.tunName())
                             : commander,
                     journal);
             try {
