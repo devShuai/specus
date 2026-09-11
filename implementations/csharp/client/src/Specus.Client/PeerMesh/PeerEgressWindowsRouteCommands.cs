@@ -62,6 +62,12 @@ internal static class PeerEgressWindowsRouteCommands
     public const string FailureNone = "";
 
     /// <summary>
+    /// What a removal reports when the prefix is not in the table. Not a failure: the outcome the
+    /// caller asked for already holds.
+    /// </summary>
+    private const string ErrorNotFound = "CmdletizationQuery_NotFound";
+
+    /// <summary>
     /// Reads the JSON from the find-route script, returning null when there is no usable hop.
     /// </summary>
     /// <remarks>
@@ -132,8 +138,14 @@ internal static class PeerEgressWindowsRouteCommands
 
     /// <summary>Classifies a routing command that did not succeed.</summary>
     /// <remarks>
-    /// Keyed on the numeric Windows error inside FullyQualifiedErrorId, never on the message: the
-    /// message is localised, while the id is built from the error number and is not.
+    /// Keyed on the id inside FullyQualifiedErrorId, never on the message: the message is
+    /// localised, while the id is built from the error number and the cmdlet name and is not.
+    ///
+    /// <para>A removal that found no such prefix is not a failure: the route is not in the table,
+    /// which is what the caller asked for. That matters more here than on Linux, because these
+    /// routes go into ActiveStore and do not survive a reboot -- so the first cleanup after every
+    /// restart walks a journal of prefixes that are all already gone, and reporting each one would
+    /// bury the failures that are real.</para>
     /// </remarks>
     public static string ParseCommandFailure(string? output)
     {
@@ -166,10 +178,175 @@ internal static class PeerEgressWindowsRouteCommands
             {
                 return FailureNone;
             }
-            return errorId.Contains("Windows System Error 5", StringComparison.Ordinal)
-                ? FailurePermissionDenied
+            if (errorId.Contains("Windows System Error 5", StringComparison.Ordinal))
+            {
+                return FailurePermissionDenied;
+            }
+            return errorId.Contains(ErrorNotFound, StringComparison.Ordinal)
+                ? FailureNone
                 : FailureOther;
         }
+    }
+
+    /// <summary>Asks about every prefix in one process.</summary>
+    /// <remarks>
+    /// One line of JSON per prefix, in the order given. Batched because a PowerShell process costs
+    /// about 175 ms to start and the first NetTCPIP cmdlet another 380 ms, after which queries in
+    /// the same process are nearly free: twenty prefixes asked one at a time would take eleven
+    /// seconds.
+    /// </remarks>
+    /// <exception cref="ArgumentException">a prefix is not a plain dotted-quad CIDR.</exception>
+    public static string ShowRoutesScript(IReadOnlyList<string> prefixes) =>
+        $"foreach($p in @({QuoteAll(prefixes, prefixes: true)})){{ConvertTo-Json -Compress "
+        + "-InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 "
+        + "-ErrorAction SilentlyContinue|Select-Object "
+        + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0";
+
+    /// <summary>Resolves every bypass address in one process.</summary>
+    /// <exception cref="ArgumentException">an address is not a plain dotted quad.</exception>
+    public static string FindRoutesScript(IReadOnlyList<string> addresses) =>
+        $"foreach($a in @({QuoteAll(addresses, prefixes: false)})){{ConvertTo-Json -Compress "
+        + "-InputObject @(Find-NetRoute -RemoteIPAddress $a "
+        + "-ErrorAction SilentlyContinue|Select-Object "
+        + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0";
+
+    /// <summary>Adds one route.</summary>
+    /// <remarks>
+    /// ActiveStore rather than PersistentStore: these routes do not survive a reboot, which is what
+    /// this feature wants and what matches <c>ip route add</c> on Linux. A persistent route is the
+    /// one that really does get left behind, still in the table after a restart that the journal no
+    /// longer describes.
+    ///
+    /// <para>An empty gateway leaves <c>-NextHop</c> off, which Windows reads as on-link. Passing
+    /// 0.0.0.0 explicitly says the same thing at greater length.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// the prefix, gateway or interface index is not usable.
+    /// </exception>
+    public static string InstallRouteScript(string cidr, int interfaceIndex, string? gateway)
+    {
+        if (interfaceIndex <= 0)
+        {
+            throw new ArgumentException(
+                $"refusing to build a route command for interface {interfaceIndex}",
+                nameof(interfaceIndex));
+        }
+        var hop = string.IsNullOrEmpty(gateway)
+            ? ""
+            : " -NextHop " + Quote(gateway, prefix: false);
+        return $"try{{New-NetRoute -DestinationPrefix {Quote(cidr, prefix: true)}{hop}"
+            + $" -InterfaceIndex {interfaceIndex}"
+            + " -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json "
+            + "-Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+    }
+
+    /// <summary>Withdraws one route.</summary>
+    /// <remarks>
+    /// <c>-Confirm:$false</c> because Remove-NetRoute asks otherwise, and a non-interactive process
+    /// has nobody to ask.
+    /// </remarks>
+    /// <exception cref="ArgumentException">the prefix is not a plain dotted-quad CIDR.</exception>
+    public static string RemoveRouteScript(string cidr) =>
+        $"try{{Remove-NetRoute -DestinationPrefix {Quote(cidr, prefix: true)}"
+        + " -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{"
+        + "ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+
+    /// <summary>Cuts a batched query's output into one entry per input.</summary>
+    /// <remarks>
+    /// Every query writes exactly one compressed JSON line, including an empty result, so the lines
+    /// line up with the prefixes that were asked about.
+    /// </remarks>
+    public static List<string> SplitScriptLines(string? output)
+    {
+        var lines = new List<string>();
+        if (output is null)
+        {
+            return lines;
+        }
+        foreach (var line in output.Replace("\r\n", "\n").Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length > 0)
+            {
+                lines.Add(trimmed);
+            }
+        }
+        return lines;
+    }
+
+    /// <summary>Accepts a dotted-quad CIDR and nothing else.</summary>
+    public static bool ValidPrefix(string? value)
+    {
+        var slash = value?.IndexOf('/') ?? -1;
+        if (value is null || slash < 0)
+        {
+            return false;
+        }
+        var length = value[(slash + 1)..];
+        if (length.Length is 0 or > 2 || !DigitsOnly(length) || int.Parse(length) > 32)
+        {
+            return false;
+        }
+        return ValidAddress(value[..slash]);
+    }
+
+    /// <summary>Accepts a dotted-quad IPv4 address and nothing else.</summary>
+    public static bool ValidAddress(string? value)
+    {
+        if (value is null)
+        {
+            return false;
+        }
+        var octets = value.Split('.');
+        if (octets.Length != 4)
+        {
+            return false;
+        }
+        foreach (var octet in octets)
+        {
+            if (octet.Length is 0 or > 3 || !DigitsOnly(octet) || int.Parse(octet) > 255)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool DigitsOnly(string value)
+    {
+        foreach (var character in value)
+        {
+            if (character is < '0' or > '9')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static string QuoteAll(IReadOnlyList<string> values, bool prefixes) =>
+        string.Join(",", values.Select(value => Quote(value, prefixes)));
+
+    /// <summary>Wraps a validated argument.</summary>
+    /// <remarks>
+    /// No escaping, deliberately. The allowed character set has no quote in it, so an escape step
+    /// here would be unreachable code that reads like a second line of defence -- and a defence
+    /// that cannot fire is worse than none, because it invites the first one to be relaxed.
+    ///
+    /// <para>The prefix comes from operator configuration and the bypass addresses from runtime
+    /// discovery. On Linux they reach <c>ip</c> as argv entries that no shell ever sees; here they
+    /// are concatenated into one command string, and this whitelist is what keeps that from being a
+    /// command injection.</para>
+    /// </remarks>
+    private static string Quote(string? value, bool prefix)
+    {
+        var valid = prefix ? ValidPrefix(value) : ValidAddress(value);
+        if (!valid)
+        {
+            throw new ArgumentException(
+                "refusing to build a route command from this argument", nameof(value));
+        }
+        return "'" + value + "'";
     }
 
     /// <summary>One line an operator can match against their own Get-NetRoute output.</summary>

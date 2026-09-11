@@ -104,11 +104,16 @@ def parse_route_show(output):
 def parse_command_failure(output):
     """Reference classification of a failed routing command.
 
-    Returns "permission-denied", "failed", or "" when nothing failed.
+    Returns "permission-denied", "failed", or "" when nothing went wrong worth reporting.
 
-    Keyed on the numeric Windows error inside FullyQualifiedErrorId, never on the message. The
-    message is localised -- "Access is denied." on the sampling machine, a translation elsewhere --
-    while the id is constructed from the error number and is not.
+    Keyed on the id inside FullyQualifiedErrorId, never on the message. The message is localised --
+    "Access is denied." on the sampling machine, a translation elsewhere -- while the id is
+    constructed from the error number and the cmdlet name, and is not.
+
+    A removal that found no such prefix counts as nothing going wrong: the route is not in the table,
+    which is the outcome the caller asked for. That matters more here than it would on Linux, because
+    the routes are installed into ActiveStore and do not survive a reboot -- so the first cleanup
+    after every restart walks a journal of prefixes that are all already gone.
     """
     try:
         parsed = json.loads(output)
@@ -121,6 +126,8 @@ def parse_command_failure(output):
         return ""
     if "Windows System Error 5" in error_id:
         return "permission-denied"
+    if "CmdletizationQuery_NotFound" in error_id:
+        return ""
     return "failed"
 
 
@@ -264,6 +271,14 @@ COMMAND_ERRORS = [
                   "后者在中文系统上是「拒绝访问」",
     },
     {
+        "name": "removing-a-route-that-is-already-gone",
+        "output": '{"errorId":"CmdletizationQuery_NotFound_DestinationPrefix,Remove-NetRoute"}',
+        "sampled": True,
+        "reason": "采样：删一条表里没有的前缀。这不是失败，要的结果已经成立。"
+                  "路由装在 ActiveStore 里不跨重启，所以每次重启后的第一次清理"
+                  "走过的整本安装记录都是这个状态——报成失败会让真正的失败淹在噪音里",
+    },
+    {
         "name": "another-windows-error",
         "output": '{"errorId":"Windows System Error 87,New-NetRoute"}',
         "reason": "别的系统错误不能被当成权限问题，否则会让运维去提权解决一个不是权限的问题",
@@ -290,6 +305,145 @@ COMMAND_ERRORS = [
     },
 ]
 
+# ------------------------------------------------------------------- scripts ----
+# The scripts are pinned too, not just what comes back from them. Three runtimes each embedding
+# their own PowerShell string is exactly how two of them end up querying a different store than the
+# third, and nothing about the parsed output would show it.
+
+def quote(value):
+    """Wraps a validated argument for PowerShell.
+
+    No escaping, deliberately. The allowed character set below has no quote in it, so an escape
+    step here would be unreachable code that reads like a second line of defence -- and a defence
+    that cannot fire is worse than none, because it invites the first one to be relaxed.
+    """
+    return "'" + value + "'"
+
+
+def valid_prefix(value):
+    parts = (value or "").split("/")
+    if len(parts) != 2 or not parts[1].isdigit() or not 0 <= int(parts[1]) <= 32:
+        return False
+    return valid_address(parts[0])
+
+
+def valid_address(value):
+    octets = (value or "").split(".")
+    if len(octets) != 4:
+        return False
+    return all(o.isdigit() and len(o) <= 3 and 0 <= int(o) <= 255 for o in octets)
+
+
+def show_routes_script(prefixes):
+    listed = ",".join(quote(p) for p in prefixes)
+    return ("foreach($p in @({})){{ConvertTo-Json -Compress -InputObject @(Get-NetRoute "
+            "-DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object "
+            "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}}\nexit 0").format(listed)
+
+
+def find_routes_script(addresses):
+    listed = ",".join(quote(a) for a in addresses)
+    return ("foreach($a in @({})){{ConvertTo-Json -Compress -InputObject @(Find-NetRoute "
+            "-RemoteIPAddress $a -ErrorAction SilentlyContinue|Select-Object "
+            "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}}\nexit 0").format(listed)
+
+
+def install_route_script(cidr, interface_index, gateway):
+    hop = " -NextHop {}".format(quote(gateway)) if gateway else ""
+    return ("try{{New-NetRoute -DestinationPrefix {}{} -InterfaceIndex {} -PolicyStore ActiveStore "
+            "-ErrorAction Stop|Out-Null}}catch{{ConvertTo-Json -Compress -InputObject "
+            "@{{errorId=$_.FullyQualifiedErrorId}};exit 1}}").format(
+                quote(cidr), hop, interface_index)
+
+
+def remove_route_script(cidr):
+    return ("try{{Remove-NetRoute -DestinationPrefix {} -Confirm:$false -PolicyStore ActiveStore "
+            "-ErrorAction Stop|Out-Null}}catch{{ConvertTo-Json -Compress -InputObject "
+            "@{{errorId=$_.FullyQualifiedErrorId}};exit 1}}").format(quote(cidr))
+
+
+SHOW_SCRIPTS = [
+    {"name": "one-prefix", "prefixes": ["203.0.113.0/24"],
+     "reason": "一条也走同样的批量形状，不为单条开一条路径"},
+    {"name": "three-prefixes", "prefixes": ["203.0.113.0/24", "198.51.100.7/32", "0.0.0.0/0"],
+     "reason": "一个进程问完所有前缀。逐条起进程在这台采样机上是每条 559 ms，"
+               "同一进程内第五条才 564 ms"},
+    {"name": "no-prefixes", "prefixes": [],
+     "reason": "空列表仍是合法脚本，输出零行；调用方不需要为它特判"},
+]
+
+FIND_SCRIPTS = [
+    {"name": "one-address", "addresses": ["8.8.8.8"]},
+    {"name": "two-addresses", "addresses": ["8.8.8.8", "192.168.1.50"]},
+]
+
+INSTALL_SCRIPTS = [
+    {"name": "through-a-gateway", "cidr": "203.0.113.0/24", "interfaceIndex": 3,
+     "gateway": "192.168.1.111",
+     "reason": "旁路：钉在解析出来的物理接口与网关上"},
+    {"name": "on-link", "cidr": "203.0.113.0/24", "interfaceIndex": 9, "gateway": "",
+     "reason": "规则路由进 TUN，以及直连网段的旁路。不带 -NextHop 时 Windows 按直连处理，"
+               "写 -NextHop '0.0.0.0' 是同一件事的更啰嗦写法"},
+]
+
+REMOVE_SCRIPTS = [
+    {"name": "a-prefix", "cidr": "203.0.113.0/24"},
+]
+
+# Arguments that must be refused before a script is built at all.
+#
+# The prefix comes from operator configuration and the bypass addresses from runtime discovery, and
+# on Linux they are passed to `ip` as argv entries where no shell ever sees them. Here they are
+# concatenated into one command string, so refusing anything outside digits, dots and a slash is
+# what keeps that from being a command injection.
+REJECTED_ARGUMENTS = [
+    {"name": "quote-and-a-second-command",
+     "value": "10.0.0.0/8';Remove-NetRoute -DestinationPrefix '0.0.0.0/0",
+     "kind": "prefix",
+     "reason": "拼进命令字符串的注入。Linux 侧参数是 argv 条目，从来没有 shell 看见它们"},
+    {"name": "subexpression",
+     "value": "$(Get-NetRoute)",
+     "kind": "prefix",
+     "reason": "PowerShell 的子表达式"},
+    {"name": "no-prefix-length", "value": "10.0.0.0", "kind": "prefix"},
+    {"name": "prefix-length-too-long", "value": "10.0.0.0/33", "kind": "prefix"},
+    {"name": "octet-out-of-range", "value": "10.0.0.256/24", "kind": "prefix"},
+    {"name": "not-an-address", "value": "example.com/24", "kind": "prefix"},
+    {"name": "empty", "value": "", "kind": "prefix"},
+    {"name": "address-with-a-prefix-length", "value": "10.0.0.1/32", "kind": "address"},
+    {"name": "address-with-a-quote", "value": "10.0.0.1'", "kind": "address"},
+    {"name": "ipv6-address", "value": "2001:db8::1", "kind": "address"},
+]
+
+for case in SHOW_SCRIPTS:
+    case["expect"] = show_routes_script(case["prefixes"])
+for case in FIND_SCRIPTS:
+    case["expect"] = find_routes_script(case["addresses"])
+for case in INSTALL_SCRIPTS:
+    case["expect"] = install_route_script(
+        case["cidr"], case["interfaceIndex"], case["gateway"])
+for case in REMOVE_SCRIPTS:
+    case["expect"] = remove_route_script(case["cidr"])
+
+for case in REJECTED_ARGUMENTS:
+    accepted = valid_prefix(case["value"]) if case["kind"] == "prefix" \
+        else valid_address(case["value"])
+    assert not accepted, "rejected argument {} was accepted by the reference".format(case["name"])
+
+# Anything that reaches a script has to be something the validator would accept, or the vector is
+# asserting a script that the implementations are required to refuse to build.
+for case in SHOW_SCRIPTS:
+    assert all(valid_prefix(p) for p in case["prefixes"]), case["name"]
+for case in FIND_SCRIPTS:
+    assert all(valid_address(a) for a in case["addresses"]), case["name"]
+for case in INSTALL_SCRIPTS:
+    assert valid_prefix(case["cidr"]), case["name"]
+    assert not case["gateway"] or valid_address(case["gateway"]), case["name"]
+
+assert any("';" in case["value"] for case in REJECTED_ARGUMENTS), "no injection case left"
+assert any(not case["gateway"] for case in INSTALL_SCRIPTS), "no on-link install case"
+assert any(case["gateway"] for case in INSTALL_SCRIPTS), "no gateway install case"
+
 for case in ROUTE_FIND:
     hop = parse_route_find(case["output"])
     case["expect"] = {"parsed": hop is not None}
@@ -312,8 +466,12 @@ assert any(c["expect"].get("parsed") and json.loads(c["output"])[0].get("Destina
            for c in ROUTE_FIND if c["output"].startswith("[{")), "no case needs the route picked out"
 assert any(c["expect"]["failure"] == "permission-denied" for c in COMMAND_ERRORS)
 assert any(c["expect"]["failure"] == "failed" for c in COMMAND_ERRORS)
+# A case that carries an error id and is still not a failure. Without one, an implementation could
+# treat every non-empty errorId as a failure and pass the whole file.
+assert any(c["expect"]["failure"] == "" and "errorId" in c["output"]
+           and "NotFound" in c["output"] for c in COMMAND_ERRORS)
 assert any("(+" in c["expect"]["description"] for c in ROUTE_SHOW), "no case reports a route count"
-assert sum(1 for c in ROUTE_FIND + ROUTE_SHOW + COMMAND_ERRORS if c.get("sampled")) >= 9
+assert sum(1 for c in ROUTE_FIND + ROUTE_SHOW + COMMAND_ERRORS if c.get("sampled")) >= 10
 
 vector = {
     "name": "peer-egress-windows-routes-v1",
@@ -339,6 +497,29 @@ vector = {
     "routeFind": ROUTE_FIND,
     "routeShow": ROUTE_SHOW,
     "commandErrors": COMMAND_ERRORS,
+    "scripts": {
+        "description":
+            "发出去的 PowerShell 也钉住，不只是收回来的输出。三端各自嵌一份脚本字符串，"
+            "正是其中两端查了 ActiveStore 而第三端查了 PersistentStore 的方式，"
+            "而解析出来的结果看不出任何差别。",
+        "notes": [
+            "查询走一个进程批量做完，每条前缀输出一行 JSON，行序即入参序。"
+            "采样机上起一个进程 175 ms，第一次调 NetTCPIP cmdlet 再加约 380 ms，"
+            "之后同进程内几乎免费：一次查询 559 ms，五次 564 ms。",
+            "PolicyStore 用 ActiveStore 而不是 PersistentStore：ActiveStore 的路由不跨重启存在。"
+            "本功能要的正是这个——真正会留下残留的是持久化路由，而崩溃后重启时它还在表里，"
+            "安装记录却可能已经对不上了。",
+            "Remove-NetRoute 默认会问确认，必须带 -Confirm:$false，否则在非交互进程里挂住。",
+            "install 不带 -NextHop 即直连，与写 -NextHop '0.0.0.0' 等价，取前者。",
+            "失败在 PowerShell 里就被 catch 成 {errorId} 的 JSON。退出码不可依赖，"
+            "读的是 stdout。",
+        ],
+        "showRoutes": SHOW_SCRIPTS,
+        "findRoutes": FIND_SCRIPTS,
+        "installRoute": INSTALL_SCRIPTS,
+        "removeRoute": REMOVE_SCRIPTS,
+        "rejectedArguments": REJECTED_ARGUMENTS,
+    },
 }
 
 out = VECTORS / "peer-egress-windows-routes-v1.json"

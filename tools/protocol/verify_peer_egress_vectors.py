@@ -215,7 +215,7 @@ check(order.index("forcedDeny") < order.index("destination"),
 # sampled count is asserted here rather than left to whoever edits it next.
 sampled = [case for section in ("routeFind", "routeShow", "commandErrors")
            for case in windows[section] if case.get("sampled")]
-check(len(sampled) >= 9, f"windows: only {len(sampled)} sampled cases left, want at least 9")
+check(len(sampled) >= 10, f"windows: only {len(sampled)} sampled cases left, want at least 10")
 
 on_link = windows["onLinkNextHop"]
 check(on_link == "0.0.0.0", f"windows: unexpected on-link next hop {on_link!r}")
@@ -232,6 +232,11 @@ check(any("(+" in case["expect"]["description"] for case in windows["routeShow"]
       "windows: no show case carries more than one route, so the count is untested")
 check({case["expect"]["failure"] for case in windows["commandErrors"]} >= {"permission-denied", "failed", ""},
       "windows: the error cases do not cover all three classifications")
+# An error id that is still not a failure. Without one, treating every non-empty errorId as a
+# failure would pass the whole file -- and that reading turns every post-reboot cleanup into noise.
+check(any(case["expect"]["failure"] == "" and "errorId" in case["output"]
+          for case in windows["commandErrors"]),
+      "windows: no error case carries an id that is not a failure")
 
 # An empty gateway means on-link everywhere in this feature. A vector that expected the literal
 # 0.0.0.0 back would be asking implementations to install a route pointing at nothing.

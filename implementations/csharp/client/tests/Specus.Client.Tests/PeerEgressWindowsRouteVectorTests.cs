@@ -82,6 +82,75 @@ public class PeerEgressWindowsRouteVectorTests
     }
 
     /// <summary>
+    /// The scripts are asserted as text, not only by what comes back from running them. Three
+    /// runtimes each embedding their own PowerShell string is how two of them end up writing to a
+    /// different policy store than the third, with nothing in the parsed output to show it.
+    /// </summary>
+    [Fact]
+    public void WindowsRouteScriptsMatchTheSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-windows-routes-v1.json");
+        var scripts = vector.RootElement.GetProperty("scripts");
+        Assert.True(scripts.GetProperty("showRoutes").GetArrayLength() > 0,
+            "vector carried no script cases");
+
+        foreach (var testCase in scripts.GetProperty("showRoutes").EnumerateArray())
+        {
+            Assert.Equal(testCase.GetProperty("expect").GetString(),
+                PeerEgressWindowsRouteCommands.ShowRoutesScript(
+                    StringsOf(testCase.GetProperty("prefixes"))));
+        }
+        foreach (var testCase in scripts.GetProperty("findRoutes").EnumerateArray())
+        {
+            Assert.Equal(testCase.GetProperty("expect").GetString(),
+                PeerEgressWindowsRouteCommands.FindRoutesScript(
+                    StringsOf(testCase.GetProperty("addresses"))));
+        }
+        foreach (var testCase in scripts.GetProperty("installRoute").EnumerateArray())
+        {
+            Assert.Equal(testCase.GetProperty("expect").GetString(),
+                PeerEgressWindowsRouteCommands.InstallRouteScript(
+                    testCase.GetProperty("cidr").GetString()!,
+                    testCase.GetProperty("interfaceIndex").GetInt32(),
+                    testCase.GetProperty("gateway").GetString()));
+        }
+        foreach (var testCase in scripts.GetProperty("removeRoute").EnumerateArray())
+        {
+            Assert.Equal(testCase.GetProperty("expect").GetString(),
+                PeerEgressWindowsRouteCommands.RemoveRouteScript(
+                    testCase.GetProperty("cidr").GetString()!));
+        }
+
+        // The arguments that must never reach a script. They arrive inside one command string
+        // rather than as argv entries, so a quote in a prefix is a second command.
+        foreach (var testCase in scripts.GetProperty("rejectedArguments").EnumerateArray())
+        {
+            var value = testCase.GetProperty("value").GetString()!;
+            var prefix = testCase.GetProperty("kind").GetString() == "prefix";
+            Assert.Throws<ArgumentException>(() => prefix
+                ? PeerEgressWindowsRouteCommands.ShowRoutesScript([value])
+                : PeerEgressWindowsRouteCommands.FindRoutesScript([value]));
+        }
+    }
+
+    /// <summary>
+    /// A batched query writes one line per input, including an empty result, which is what lets the
+    /// lines be matched back to the prefixes that were asked about.
+    /// </summary>
+    [Fact]
+    public void ScriptLinesSurviveBothLineEndings()
+    {
+        var lines = PeerEgressWindowsRouteCommands.SplitScriptLines(
+            "[]\r\n[{\"InterfaceIndex\":3}]\r\n");
+        Assert.Equal(2, lines.Count);
+        Assert.Equal("[]", lines[0]);
+        Assert.Empty(PeerEgressWindowsRouteCommands.SplitScriptLines("\n\n"));
+    }
+
+    private static List<string> StringsOf(JsonElement array) =>
+        [.. array.EnumerateArray().Select(entry => entry.GetString()!)];
+
+    /// <summary>
     /// The sampled cases are why this vector is worth more than a set of invented strings, so
     /// losing them should fail rather than quietly leave a file of guesses behind.
     /// </summary>
@@ -100,6 +169,6 @@ public class PeerEgressWindowsRouteVectorTests
                 }
             }
         }
-        Assert.True(sampled >= 9, $"vector carries {sampled} sampled cases, want at least 9");
+        Assert.True(sampled >= 10, $"vector carries {sampled} sampled cases, want at least 10");
     }
 }

@@ -37,6 +37,10 @@ const (
 	windowsRouteFailureOther  = "failed"
 )
 
+// windowsRouteErrorNotFound is what a removal reports when the prefix is not in the table. Not a
+// failure: the outcome the caller asked for already holds.
+const windowsRouteErrorNotFound = "CmdletizationQuery_NotFound"
+
 // windowsEgressRouteHop is where a bypass address has to be sent to stay off the tunnel.
 //
 // Carries the interface index, not the interface name: names are localised -- the default adapter
@@ -115,8 +119,14 @@ func parseWindowsRouteShow(output string) (bool, string) {
 
 // parseWindowsCommandFailure classifies a routing command that did not succeed.
 //
-// Keyed on the numeric Windows error inside FullyQualifiedErrorId, never on the message: the
-// message is localised, while the id is built from the error number and is not.
+// Keyed on the id inside FullyQualifiedErrorId, never on the message: the message is localised,
+// while the id is built from the error number and the cmdlet name and is not.
+//
+// A removal that found no such prefix is not a failure: the route is not in the table, which is
+// what the caller asked for. That matters more here than on Linux, because these routes go into
+// ActiveStore and do not survive a reboot -- so the first cleanup after every restart walks a
+// journal of prefixes that are all already gone, and reporting each one would bury the failures
+// that are real.
 func parseWindowsCommandFailure(output string) string {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
@@ -135,6 +145,9 @@ func parseWindowsCommandFailure(output string) string {
 	}
 	if strings.Contains(failure.ErrorID, "Windows System Error 5") {
 		return windowsRouteFailureDenied
+	}
+	if strings.Contains(failure.ErrorID, windowsRouteErrorNotFound) {
+		return ""
 	}
 	return windowsRouteFailureOther
 }

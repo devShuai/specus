@@ -179,6 +179,15 @@
       }
     },
     {
+      "name": "removing-a-route-that-is-already-gone",
+      "output": "{\"errorId\":\"CmdletizationQuery_NotFound_DestinationPrefix,Remove-NetRoute\"}",
+      "sampled": true,
+      "reason": "采样：删一条表里没有的前缀。这不是失败，要的结果已经成立。路由装在 ActiveStore 里不跨重启，所以每次重启后的第一次清理走过的整本安装记录都是这个状态——报成失败会让真正的失败淹在噪音里",
+      "expect": {
+        "failure": ""
+      }
+    },
+    {
       "name": "another-windows-error",
       "output": "{\"errorId\":\"Windows System Error 87,New-NetRoute\"}",
       "reason": "别的系统错误不能被当成权限问题，否则会让运维去提权解决一个不是权限的问题",
@@ -218,5 +227,137 @@
         "failure": "failed"
       }
     }
-  ]
+  ],
+  "scripts": {
+    "description": "发出去的 PowerShell 也钉住，不只是收回来的输出。三端各自嵌一份脚本字符串，正是其中两端查了 ActiveStore 而第三端查了 PersistentStore 的方式，而解析出来的结果看不出任何差别。",
+    "notes": [
+      "查询走一个进程批量做完，每条前缀输出一行 JSON，行序即入参序。采样机上起一个进程 175 ms，第一次调 NetTCPIP cmdlet 再加约 380 ms，之后同进程内几乎免费：一次查询 559 ms，五次 564 ms。",
+      "PolicyStore 用 ActiveStore 而不是 PersistentStore：ActiveStore 的路由不跨重启存在。本功能要的正是这个——真正会留下残留的是持久化路由，而崩溃后重启时它还在表里，安装记录却可能已经对不上了。",
+      "Remove-NetRoute 默认会问确认，必须带 -Confirm:$false，否则在非交互进程里挂住。",
+      "install 不带 -NextHop 即直连，与写 -NextHop '0.0.0.0' 等价，取前者。",
+      "失败在 PowerShell 里就被 catch 成 {errorId} 的 JSON。退出码不可依赖，读的是 stdout。"
+    ],
+    "showRoutes": [
+      {
+        "name": "one-prefix",
+        "prefixes": [
+          "203.0.113.0/24"
+        ],
+        "reason": "一条也走同样的批量形状，不为单条开一条路径",
+        "expect": "foreach($p in @('203.0.113.0/24')){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "three-prefixes",
+        "prefixes": [
+          "203.0.113.0/24",
+          "198.51.100.7/32",
+          "0.0.0.0/0"
+        ],
+        "reason": "一个进程问完所有前缀。逐条起进程在这台采样机上是每条 559 ms，同一进程内第五条才 564 ms",
+        "expect": "foreach($p in @('203.0.113.0/24','198.51.100.7/32','0.0.0.0/0')){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "no-prefixes",
+        "prefixes": [],
+        "reason": "空列表仍是合法脚本，输出零行；调用方不需要为它特判",
+        "expect": "foreach($p in @()){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      }
+    ],
+    "findRoutes": [
+      {
+        "name": "one-address",
+        "addresses": [
+          "8.8.8.8"
+        ],
+        "expect": "foreach($a in @('8.8.8.8')){ConvertTo-Json -Compress -InputObject @(Find-NetRoute -RemoteIPAddress $a -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "two-addresses",
+        "addresses": [
+          "8.8.8.8",
+          "192.168.1.50"
+        ],
+        "expect": "foreach($a in @('8.8.8.8','192.168.1.50')){ConvertTo-Json -Compress -InputObject @(Find-NetRoute -RemoteIPAddress $a -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      }
+    ],
+    "installRoute": [
+      {
+        "name": "through-a-gateway",
+        "cidr": "203.0.113.0/24",
+        "interfaceIndex": 3,
+        "gateway": "192.168.1.111",
+        "reason": "旁路：钉在解析出来的物理接口与网关上",
+        "expect": "try{New-NetRoute -DestinationPrefix '203.0.113.0/24' -NextHop '192.168.1.111' -InterfaceIndex 3 -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      },
+      {
+        "name": "on-link",
+        "cidr": "203.0.113.0/24",
+        "interfaceIndex": 9,
+        "gateway": "",
+        "reason": "规则路由进 TUN，以及直连网段的旁路。不带 -NextHop 时 Windows 按直连处理，写 -NextHop '0.0.0.0' 是同一件事的更啰嗦写法",
+        "expect": "try{New-NetRoute -DestinationPrefix '203.0.113.0/24' -InterfaceIndex 9 -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      }
+    ],
+    "removeRoute": [
+      {
+        "name": "a-prefix",
+        "cidr": "203.0.113.0/24",
+        "expect": "try{Remove-NetRoute -DestinationPrefix '203.0.113.0/24' -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      }
+    ],
+    "rejectedArguments": [
+      {
+        "name": "quote-and-a-second-command",
+        "value": "10.0.0.0/8';Remove-NetRoute -DestinationPrefix '0.0.0.0/0",
+        "kind": "prefix",
+        "reason": "拼进命令字符串的注入。Linux 侧参数是 argv 条目，从来没有 shell 看见它们"
+      },
+      {
+        "name": "subexpression",
+        "value": "$(Get-NetRoute)",
+        "kind": "prefix",
+        "reason": "PowerShell 的子表达式"
+      },
+      {
+        "name": "no-prefix-length",
+        "value": "10.0.0.0",
+        "kind": "prefix"
+      },
+      {
+        "name": "prefix-length-too-long",
+        "value": "10.0.0.0/33",
+        "kind": "prefix"
+      },
+      {
+        "name": "octet-out-of-range",
+        "value": "10.0.0.256/24",
+        "kind": "prefix"
+      },
+      {
+        "name": "not-an-address",
+        "value": "example.com/24",
+        "kind": "prefix"
+      },
+      {
+        "name": "empty",
+        "value": "",
+        "kind": "prefix"
+      },
+      {
+        "name": "address-with-a-prefix-length",
+        "value": "10.0.0.1/32",
+        "kind": "address"
+      },
+      {
+        "name": "address-with-a-quote",
+        "value": "10.0.0.1'",
+        "kind": "address"
+      },
+      {
+        "name": "ipv6-address",
+        "value": "2001:db8::1",
+        "kind": "address"
+      }
+    ]
+  }
 }

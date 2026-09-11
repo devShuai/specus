@@ -3,6 +3,7 @@ package com.theshuai.specusclient.peer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,6 +11,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -87,6 +90,81 @@ class PeerEgressWindowsRouteVectorTests {
     }
 
     /**
+     * The scripts are asserted as text, not only by what comes back from running them. Three
+     * runtimes each embedding their own PowerShell string is how two of them end up writing to a
+     * different policy store than the third, with nothing in the parsed output to show it.
+     */
+    @Test
+    void windowsRouteScriptsMatchTheSharedVector() throws IOException {
+        JsonNode scripts = readVector("peer-egress-windows-routes-v1.json").path("scripts");
+        assertTrue(scripts.path("showRoutes").size() > 0, "vector carried no script cases");
+
+        for (JsonNode testCase : scripts.path("showRoutes")) {
+            assertEquals(testCase.path("expect").asText(),
+                    PeerEgressWindowsRouteCommands.showRoutesScript(
+                            stringsOf(testCase.path("prefixes"))),
+                    testCase.path("name").asText());
+        }
+        for (JsonNode testCase : scripts.path("findRoutes")) {
+            assertEquals(testCase.path("expect").asText(),
+                    PeerEgressWindowsRouteCommands.findRoutesScript(
+                            stringsOf(testCase.path("addresses"))),
+                    testCase.path("name").asText());
+        }
+        for (JsonNode testCase : scripts.path("installRoute")) {
+            assertEquals(testCase.path("expect").asText(),
+                    PeerEgressWindowsRouteCommands.installRouteScript(
+                            testCase.path("cidr").asText(),
+                            testCase.path("interfaceIndex").asInt(),
+                            testCase.path("gateway").asText()),
+                    testCase.path("name").asText());
+        }
+        for (JsonNode testCase : scripts.path("removeRoute")) {
+            assertEquals(testCase.path("expect").asText(),
+                    PeerEgressWindowsRouteCommands.removeRouteScript(testCase.path("cidr").asText()),
+                    testCase.path("name").asText());
+        }
+
+        // The arguments that must never reach a script. They arrive inside one command string
+        // rather than as argv entries, so a quote in a prefix is a second command.
+        for (JsonNode testCase : scripts.path("rejectedArguments")) {
+            String name = testCase.path("name").asText();
+            String value = testCase.path("value").asText();
+            boolean prefix = "prefix".equals(testCase.path("kind").asText());
+            assertThrows(IllegalArgumentException.class,
+                    () -> {
+                        if (prefix) {
+                            PeerEgressWindowsRouteCommands.showRoutesScript(List.of(value));
+                        } else {
+                            PeerEgressWindowsRouteCommands.findRoutesScript(List.of(value));
+                        }
+                    },
+                    name + " was accepted into a script");
+        }
+    }
+
+    /**
+     * A batched query writes one line per input, including an empty result, which is what lets the
+     * lines be matched back to the prefixes that were asked about.
+     */
+    @Test
+    void scriptLinesSurviveBothLineEndings() {
+        List<String> lines = PeerEgressWindowsRouteCommands.splitScriptLines(
+                "[]\r\n[{\"InterfaceIndex\":3}]\r\n");
+        assertEquals(2, lines.size(), "CRLF output");
+        assertEquals("[]", lines.get(0));
+        assertEquals(0, PeerEgressWindowsRouteCommands.splitScriptLines("\n\n").size());
+    }
+
+    private static List<String> stringsOf(JsonNode array) {
+        List<String> values = new ArrayList<>();
+        for (JsonNode entry : array) {
+            values.add(entry.asText());
+        }
+        return values;
+    }
+
+    /**
      * The sampled cases are why this vector is worth more than a set of invented strings, so losing
      * them should fail rather than quietly leave a file of guesses behind.
      */
@@ -101,6 +179,6 @@ class PeerEgressWindowsRouteVectorTests {
                 }
             }
         }
-        assertTrue(sampled >= 9, "vector carries " + sampled + " sampled cases, want at least 9");
+        assertTrue(sampled >= 10, "vector carries " + sampled + " sampled cases, want at least 10");
     }
 }

@@ -2,6 +2,8 @@ package com.theshuai.specusclient.peer;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Reading what Windows says about its routing table.
@@ -45,6 +47,12 @@ public final class PeerEgressWindowsRouteCommands {
 
     /** Nothing failed. */
     public static final String FAILURE_NONE = "";
+
+    /**
+     * What a removal reports when the prefix is not in the table. Not a failure: the outcome the
+     * caller asked for already holds.
+     */
+    private static final String ERROR_NOT_FOUND = "CmdletizationQuery_NotFound";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -128,8 +136,14 @@ public final class PeerEgressWindowsRouteCommands {
     /**
      * Classifies a routing command that did not succeed.
      *
-     * <p>Keyed on the numeric Windows error inside FullyQualifiedErrorId, never on the message: the
-     * message is localised, while the id is built from the error number and is not.
+     * <p>Keyed on the id inside FullyQualifiedErrorId, never on the message: the message is
+     * localised, while the id is built from the error number and the cmdlet name and is not.
+     *
+     * <p>A removal that found no such prefix is not a failure: the route is not in the table, which
+     * is what the caller asked for. That matters more here than on Linux, because these routes go
+     * into ActiveStore and do not survive a reboot -- so the first cleanup after every restart walks
+     * a journal of prefixes that are all already gone, and reporting each one would bury the
+     * failures that are real.
      */
     public static String parseCommandFailure(String output) {
         String trimmed = output == null ? "" : output.trim();
@@ -151,7 +165,173 @@ public final class PeerEgressWindowsRouteCommands {
         if (errorId.isEmpty()) {
             return FAILURE_NONE;
         }
-        return errorId.contains("Windows System Error 5") ? FAILURE_PERMISSION_DENIED : FAILURE_OTHER;
+        if (errorId.contains("Windows System Error 5")) {
+            return FAILURE_PERMISSION_DENIED;
+        }
+        return errorId.contains(ERROR_NOT_FOUND) ? FAILURE_NONE : FAILURE_OTHER;
+    }
+
+    /**
+     * Asks about every prefix in one process.
+     *
+     * <p>One line of JSON per prefix, in the order given. Batched because a PowerShell process costs
+     * about 175 ms to start and the first NetTCPIP cmdlet another 380 ms, after which queries in the
+     * same process are nearly free: twenty prefixes asked one at a time would take eleven seconds.
+     *
+     * @throws IllegalArgumentException if any prefix is not a plain dotted-quad CIDR
+     */
+    public static String showRoutesScript(List<String> prefixes) {
+        return "foreach($p in @(" + quoteAll(prefixes, true) + ")){ConvertTo-Json -Compress "
+                + "-InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 "
+                + "-ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0";
+    }
+
+    /**
+     * Resolves every bypass address in one process.
+     *
+     * @throws IllegalArgumentException if any address is not a plain dotted quad
+     */
+    public static String findRoutesScript(List<String> addresses) {
+        return "foreach($a in @(" + quoteAll(addresses, false) + ")){ConvertTo-Json -Compress "
+                + "-InputObject @(Find-NetRoute -RemoteIPAddress $a "
+                + "-ErrorAction SilentlyContinue|Select-Object "
+                + "InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0";
+    }
+
+    /**
+     * Adds one route.
+     *
+     * <p>ActiveStore rather than PersistentStore: these routes do not survive a reboot, which is
+     * what this feature wants and what matches {@code ip route add} on Linux. A persistent route is
+     * the one that really does get left behind, still in the table after a restart that the journal
+     * no longer describes.
+     *
+     * <p>An empty gateway leaves {@code -NextHop} off, which Windows reads as on-link. Passing
+     * 0.0.0.0 explicitly says the same thing at greater length.
+     *
+     * @throws IllegalArgumentException if the prefix, gateway or interface index is not usable
+     */
+    public static String installRouteScript(String cidr, int interfaceIndex, String gateway) {
+        if (interfaceIndex <= 0) {
+            throw new IllegalArgumentException("refusing to build a route command for interface "
+                    + interfaceIndex);
+        }
+        String hop = gateway == null || gateway.isEmpty()
+                ? "" : " -NextHop " + quote(gateway, false);
+        return "try{New-NetRoute -DestinationPrefix " + quote(cidr, true) + hop
+                + " -InterfaceIndex " + interfaceIndex
+                + " -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json "
+                + "-Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}";
+    }
+
+    /**
+     * Withdraws one route.
+     *
+     * <p>{@code -Confirm:$false} because Remove-NetRoute asks otherwise, and a non-interactive
+     * process has nobody to ask.
+     *
+     * @throws IllegalArgumentException if the prefix is not a plain dotted-quad CIDR
+     */
+    public static String removeRouteScript(String cidr) {
+        return "try{Remove-NetRoute -DestinationPrefix " + quote(cidr, true)
+                + " -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{"
+                + "ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};"
+                + "exit 1}";
+    }
+
+    /**
+     * Cuts a batched query's output into one entry per input.
+     *
+     * <p>Every query writes exactly one compressed JSON line, including an empty result, so the
+     * lines line up with the prefixes that were asked about.
+     */
+    public static List<String> splitScriptLines(String output) {
+        List<String> lines = new ArrayList<>();
+        if (output == null) {
+            return lines;
+        }
+        for (String line : output.replace("\r\n", "\n").split("\n", -1)) {
+            String trimmed = line.trim();
+            if (!trimmed.isEmpty()) {
+                lines.add(trimmed);
+            }
+        }
+        return lines;
+    }
+
+    /** Accepts a dotted-quad CIDR and nothing else. */
+    public static boolean validPrefix(String value) {
+        int slash = value == null ? -1 : value.indexOf('/');
+        if (slash < 0) {
+            return false;
+        }
+        String length = value.substring(slash + 1);
+        if (length.isEmpty() || length.length() > 2 || !digitsOnly(length)
+                || Integer.parseInt(length) > 32) {
+            return false;
+        }
+        return validAddress(value.substring(0, slash));
+    }
+
+    /** Accepts a dotted-quad IPv4 address and nothing else. */
+    public static boolean validAddress(String value) {
+        if (value == null) {
+            return false;
+        }
+        String[] octets = value.split("\\.", -1);
+        if (octets.length != 4) {
+            return false;
+        }
+        for (String octet : octets) {
+            if (octet.isEmpty() || octet.length() > 3 || !digitsOnly(octet)
+                    || Integer.parseInt(octet) > 255) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean digitsOnly(String value) {
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character < '0' || character > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String quoteAll(List<String> values, boolean prefixes) {
+        StringBuilder joined = new StringBuilder();
+        for (String value : values) {
+            if (joined.length() > 0) {
+                joined.append(',');
+            }
+            joined.append(quote(value, prefixes));
+        }
+        return joined.toString();
+    }
+
+    /**
+     * Wraps a validated argument.
+     *
+     * <p>No escaping, deliberately. The allowed character set has no quote in it, so an escape step
+     * here would be unreachable code that reads like a second line of defence -- and a defence that
+     * cannot fire is worse than none, because it invites the first one to be relaxed.
+     *
+     * <p>The prefix comes from operator configuration and the bypass addresses from runtime
+     * discovery. On Linux they reach {@code ip} as argv entries that no shell ever sees; here they
+     * are concatenated into one command string, and this whitelist is what keeps that from being a
+     * command injection.
+     */
+    private static String quote(String value, boolean prefix) {
+        boolean valid = prefix ? validPrefix(value) : validAddress(value);
+        if (!valid) {
+            throw new IllegalArgumentException(
+                    "refusing to build a route command from this argument");
+        }
+        return "'" + value + "'";
     }
 
     /** One line an operator can match against their own Get-NetRoute output. */
