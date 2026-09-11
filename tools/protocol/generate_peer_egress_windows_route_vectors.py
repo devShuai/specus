@@ -75,22 +75,21 @@ def describe_route(entry):
     return line
 
 
-def parse_route_show(output):
-    """Reference reading of the show-route script's JSON.
-
-    Returns (present, description). Unparseable output reports no conflict, matching Linux: being
-    unable to ask is not evidence of an empty table, and the install itself still refuses an
-    existing prefix.
-    """
+def decode_routes(output):
+    """Every entry in the output that actually carries a prefix."""
     try:
         parsed = json.loads(output)
     except (ValueError, TypeError):
-        return False, ""
+        return []
     if not isinstance(parsed, list):
-        return False, ""
-    routes = [e for e in parsed
-              if isinstance(e, dict) and isinstance(e.get("DestinationPrefix"), str)
-              and e["DestinationPrefix"].strip()]
+        return []
+    return [e for e in parsed
+            if isinstance(e, dict) and isinstance(e.get("DestinationPrefix"), str)
+            and e["DestinationPrefix"].strip()]
+
+
+def describe_routes(routes):
+    """Turns a set of routes on one prefix into (present, description)."""
     if not routes:
         return False, ""
     description = describe_route(routes[0])
@@ -99,6 +98,29 @@ def parse_route_show(output):
         # not going to be enough.
         description += " (+{} more)".format(len(routes) - 1)
     return True, description
+
+
+def parse_route_show(output):
+    """Reference reading of the show-route script's JSON.
+
+    Returns (present, description). Unparseable output reports no conflict, matching Linux: being
+    unable to ask is not evidence of an empty table, and the install itself still refuses an
+    existing prefix.
+    """
+    return describe_routes(decode_routes(output))
+
+
+def conflict_from_table(output, prefix):
+    """The same answer, taken out of one read of the whole table.
+
+    Exact string match on the prefix, not a longest-prefix lookup. The question the conflict check
+    asks is "does anything already own this exact prefix", not "can this address be routed" -- under
+    a default route the second question is always yes, and treating that as a conflict would refuse
+    every rule on any machine that has one.
+    """
+    wanted = (prefix or "").strip()
+    return describe_routes([route for route in decode_routes(output)
+                            if route["DestinationPrefix"].strip() == wanted])
 
 
 def parse_command_failure(output):
@@ -156,6 +178,42 @@ SAMPLED_FIND_ON_LINK = (
     '[{"InterfaceIndex":3,"DestinationPrefix":null,"NextHop":null,"RouteMetric":null'
     ',"InterfaceMetric":null},{"InterfaceIndex":3,"DestinationPrefix":"192.168.1.0/24"'
     ',"NextHop":"0.0.0.0","RouteMetric":256,"InterfaceMetric":20}]')
+# One read of the whole routing table, as the conflict check sees it: 29 routes in 419 ms.
+# Pure ASCII, because the query selects only the four fields that always are -- see the
+# outputEncoding note in the vector.
+SAMPLED_TABLE = (
+    '[{"InterfaceIndex":44,"DestinationPrefix":"255.255.255.255/32","NextHop":"0.0.0.0","RouteMetric"'
+    ':256},{"InterfaceIndex":14,"DestinationPrefix":"255.255.255.255/32","NextHop":"0.0.0.0","RouteMe'
+    'tric":256},{"InterfaceIndex":17,"DestinationPrefix":"255.255.255.255/32","NextHop":"0.0.0.0","Ro'
+    'uteMetric":256},{"InterfaceIndex":15,"DestinationPrefix":"255.255.255.255/32","NextHop":"0.0.0.0'
+    '","RouteMetric":256},{"InterfaceIndex":9,"DestinationPrefix":"255.255.255.255/32","NextHop":"0.0'
+    '.0.0","RouteMetric":256},{"InterfaceIndex":33,"DestinationPrefix":"255.255.255.255/32","NextHop"'
+    ':"0.0.0.0","RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"255.255.255.255/32","Next'
+    'Hop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":1,"DestinationPrefix":"255.255.255.255/32","'
+    'NextHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":44,"DestinationPrefix":"224.0.0.0/4","Ne'
+    'xtHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":14,"DestinationPrefix":"224.0.0.0/4","Next'
+    'Hop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":17,"DestinationPrefix":"224.0.0.0/4","NextHo'
+    'p":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":15,"DestinationPrefix":"224.0.0.0/4","NextHop"'
+    ':"0.0.0.0","RouteMetric":256},{"InterfaceIndex":9,"DestinationPrefix":"224.0.0.0/4","NextHop":"0'
+    '.0.0.0","RouteMetric":256},{"InterfaceIndex":33,"DestinationPrefix":"224.0.0.0/4","NextHop":"0.0'
+    '.0.0","RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"224.0.0.0/4","NextHop":"0.0.0.'
+    '0","RouteMetric":256},{"InterfaceIndex":1,"DestinationPrefix":"224.0.0.0/4","NextHop":"0.0.0.0",'
+    '"RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"192.168.1.255/32","NextHop":"0.0.0.0'
+    '","RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"192.168.1.110/32","NextHop":"0.0.0'
+    '.0","RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"192.168.1.0/24","NextHop":"0.0.0'
+    '.0","RouteMetric":256},{"InterfaceIndex":33,"DestinationPrefix":"172.21.143.255/32","NextHop":"0'
+    '.0.0.0","RouteMetric":256},{"InterfaceIndex":33,"DestinationPrefix":"172.21.128.1/32","NextHop":'
+    '"0.0.0.0","RouteMetric":256},{"InterfaceIndex":33,"DestinationPrefix":"172.21.128.0/20","NextHop'
+    '":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":44,"DestinationPrefix":"172.18.255.255/32","Nex'
+    'tHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":44,"DestinationPrefix":"172.18.240.1/32","N'
+    'extHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":44,"DestinationPrefix":"172.18.240.0/20",'
+    '"NextHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":1,"DestinationPrefix":"127.255.255.255/'
+    '32","NextHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":1,"DestinationPrefix":"127.0.0.1/32'
+    '","NextHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":1,"DestinationPrefix":"127.0.0.0/8","'
+    'NextHop":"0.0.0.0","RouteMetric":256},{"InterfaceIndex":3,"DestinationPrefix":"0.0.0.0/0","NextH'
+    'op":"192.168.1.111","RouteMetric":256}]'
+)
+
 SAMPLED_DENIED = '{"errorId":"Windows System Error 5,New-NetRoute"}'
 
 ROUTE_FIND = [
@@ -469,6 +527,34 @@ REJECTED_ARGUMENTS = [
     {"name": "ipv6-address", "value": "2001:db8::1", "kind": "address"},
 ]
 
+CONFLICT_FROM_TABLE = [
+    {"name": "the-default-route", "prefix": "0.0.0.0/0"},
+    {"name": "a-prefix-on-four-interfaces", "prefix": "224.0.0.0/4",
+     "reason": "同一前缀四个接口各一条。条数要报出来，否则运维以为删掉一条就腾出了这个前缀"},
+    {"name": "a-free-prefix", "prefix": "203.0.113.0/24",
+     "reason": "表里没有，可以安装"},
+    {"name": "whitespace-around-the-prefix", "prefix": " 0.0.0.0/0 ",
+     "reason": "两侧空白不能让这道检查失效"},
+    {"name": "the-same-network-a-different-length", "prefix": "0.0.0.0/1",
+     "reason": "精确前缀比较，不是最长前缀查找。冲突检查问的是「这条精确前缀上有没有别人的路由」，"
+               "不是「这个地址能不能被路由」——有默认路由时后者永远是能，"
+               "把它当冲突会在任何一台有默认路由的机器上拒绝掉每一条规则"},
+    {"name": "an-empty-prefix", "prefix": ""},
+]
+
+for case in CONFLICT_FROM_TABLE:
+    present, description = conflict_from_table(SAMPLED_TABLE, case["prefix"])
+    case["expect"] = {"present": present, "description": description}
+
+# The exact-match reading has to be load-bearing: a case list where every queried prefix is in the
+# table would pass against an implementation that did a longest-prefix lookup instead.
+assert any(not c["expect"]["present"] for c in CONFLICT_FROM_TABLE), "no absent prefix"
+assert any(c["prefix"].strip() == "0.0.0.0/1" and not c["expect"]["present"]
+           for c in CONFLICT_FROM_TABLE), "nothing distinguishes exact from longest-prefix"
+assert any("(+" in c["expect"]["description"] for c in CONFLICT_FROM_TABLE), "no multi-route prefix"
+assert any(c["prefix"] != c["prefix"].strip() and c["expect"]["present"]
+           for c in CONFLICT_FROM_TABLE), "no case needs the prefix trimmed"
+
 INTERFACE_INDEX_SCRIPTS = [
     {"name": "a-plain-name", "adapter": "specus0"},
     {"name": "a-name-with-spaces", "adapter": "Specus Tunnel",
@@ -614,6 +700,20 @@ vector = {
         "showAllRoutes": show_all_routes_script(),
     },
     "interfaceIndexParse": INTERFACE_INDEX_PARSE,
+    "conflictFromTable": {
+        "description":
+            "冲突检查从一次整表读取里回答，而不是每条前缀起一个进程。table 是真机抓下来的"
+            "整张 IPv4 路由表，29 条，419 ms。",
+        "notes": [
+            "前缀是精确字符串比较，不是最长前缀查找。问的是「这条精确前缀上有没有别人的路由」，"
+            "不是「这个地址能不能被路由」——有默认路由时后者永远是能。",
+            "整表读取只取四个永远是 ASCII 的字段，所以这份 fixture 是纯 ASCII，"
+            "与控制台代码页无关。",
+        ],
+        "table": SAMPLED_TABLE,
+        "sampled": True,
+        "cases": CONFLICT_FROM_TABLE,
+    },
     "outputEncoding": {
         "description":
             "子进程的 stdout 用控制台代码页写出，采样机上是 936 而不是 UTF-8。"

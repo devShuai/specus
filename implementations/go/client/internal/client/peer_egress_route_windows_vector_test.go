@@ -92,6 +92,46 @@ type egressWindowsRoutesVector struct {
 	OutputEncoding struct {
 		ConsoleCodePage int `json:"consoleCodePage"`
 	} `json:"outputEncoding"`
+	ConflictFromTable struct {
+		Table string `json:"table"`
+		Cases []struct {
+			Name   string `json:"name"`
+			Prefix string `json:"prefix"`
+			Expect struct {
+				Present     bool   `json:"present"`
+				Description string `json:"description"`
+			} `json:"expect"`
+		} `json:"cases"`
+	} `json:"conflictFromTable"`
+}
+
+// The conflict check answers out of one read of the whole table rather than a process per prefix.
+// The reading that matters is that the prefix is compared exactly: under a default route, asking
+// whether an address can be routed is always yes, and taking that for a conflict would refuse every
+// rule on any machine that has one.
+func TestWindowsConflictFromTableMatchesSharedVector(t *testing.T) {
+	var vector egressWindowsRoutesVector
+	readEgressVector(t, "peer-egress-windows-routes-v1.json", &vector)
+	table := vector.ConflictFromTable.Table
+	if table == "" || len(vector.ConflictFromTable.Cases) == 0 {
+		t.Fatal("windows routes vector carried no table cases")
+	}
+
+	for _, testCase := range vector.ConflictFromTable.Cases {
+		present, description := windowsConflictFromTable(table, testCase.Prefix)
+		if present != testCase.Expect.Present || description != testCase.Expect.Description {
+			t.Errorf("%s: present=%v description=%q, want %v/%q", testCase.Name,
+				present, description, testCase.Expect.Present, testCase.Expect.Description)
+		}
+	}
+
+	// The sampled table is the point of this section, and it has to stay readable whatever the
+	// console code page is, which is only true while the query selects no name.
+	for index := 0; index < len(table); index++ {
+		if table[index] > 0x7F {
+			t.Fatalf("sampled table carries a non-ASCII byte at %d", index)
+		}
+	}
 }
 
 // The adapter name is the one argument that cannot be whitelisted -- it comes from configuration

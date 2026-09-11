@@ -100,9 +100,31 @@ func parseWindowsRouteFind(output string) (windowsEgressRouteHop, bool) {
 // Unparseable output reports no conflict, matching the Linux reading: being unable to ask is not
 // evidence of an empty table, and the install still refuses a prefix that already exists.
 func parseWindowsRouteShow(output string) (bool, string) {
+	return describeWindowsRoutes(windowsRoutesWithPrefix(output))
+}
+
+// windowsConflictFromTable answers the same question out of one read of the whole table.
+//
+// Exact string match on the prefix, not a longest-prefix lookup. What the conflict check asks is
+// whether anything already owns this exact prefix, not whether the address can be routed -- under a
+// default route the second question is always yes, and treating that as a conflict would refuse
+// every rule on any machine that has one.
+func windowsConflictFromTable(table string, prefix string) (bool, string) {
+	wanted := strings.TrimSpace(prefix)
+	var matching []windowsNetRoute
+	for _, route := range windowsRoutesWithPrefix(table) {
+		if windowsRoutePrefix(route) == wanted {
+			matching = append(matching, route)
+		}
+	}
+	return describeWindowsRoutes(matching)
+}
+
+// windowsRoutesWithPrefix keeps every entry that actually carries a prefix.
+func windowsRoutesWithPrefix(output string) []windowsNetRoute {
 	decoded, ok := decodeWindowsNetRoutes(output)
 	if !ok {
-		return false, ""
+		return nil
 	}
 	var routes []windowsNetRoute
 	for _, route := range decoded {
@@ -110,6 +132,11 @@ func parseWindowsRouteShow(output string) (bool, string) {
 			routes = append(routes, route)
 		}
 	}
+	return routes
+}
+
+// describeWindowsRoutes turns the routes on one prefix into a presence and a description.
+func describeWindowsRoutes(routes []windowsNetRoute) (bool, string) {
 	if len(routes) == 0 {
 		return false, ""
 	}

@@ -108,30 +108,55 @@ internal static class PeerEgressWindowsRouteCommands
     public static PeerEgressExistingRoute ParseRouteShow(string? output)
     {
         using var decoded = DecodeRoutes(output);
+        return DescribeRoutes(RoutesWithPrefix(decoded));
+    }
+
+    /// <summary>Answers the same question out of one read of the whole table.</summary>
+    /// <remarks>
+    /// Exact string match on the prefix, not a longest-prefix lookup. What the conflict check asks
+    /// is whether anything already owns this exact prefix, not whether the address can be routed --
+    /// under a default route the second question is always yes, and treating that as a conflict
+    /// would refuse every rule on any machine that has one.
+    /// </remarks>
+    public static PeerEgressExistingRoute ConflictFromTable(string? table, string? prefix)
+    {
+        var wanted = (prefix ?? "").Trim();
+        using var decoded = DecodeRoutes(table);
+        return DescribeRoutes(
+            [.. RoutesWithPrefix(decoded).Where(route => PrefixOf(route) == wanted)]);
+    }
+
+    /// <summary>Every entry in the document that actually carries a prefix.</summary>
+    private static List<JsonElement> RoutesWithPrefix(JsonDocument? decoded)
+    {
+        var routes = new List<JsonElement>();
         if (decoded is null)
         {
-            return new PeerEgressExistingRoute(false, "");
+            return routes;
         }
-        string? description = null;
-        var count = 0;
         foreach (var route in decoded.RootElement.EnumerateArray())
         {
-            if (PrefixOf(route).Length == 0)
+            if (PrefixOf(route).Length > 0)
             {
-                continue;
+                routes.Add(route);
             }
-            description ??= Describe(route);
-            count++;
         }
-        if (description is null)
+        return routes;
+    }
+
+    /// <summary>Turns the routes on one prefix into a presence and a description.</summary>
+    private static PeerEgressExistingRoute DescribeRoutes(List<JsonElement> routes)
+    {
+        if (routes.Count == 0)
         {
             return new PeerEgressExistingRoute(false, "");
         }
-        if (count > 1)
+        var description = Describe(routes[0]);
+        if (routes.Count > 1)
         {
             // The count matters to whoever has to clear the prefix: one removal is not going to be
             // enough, and finding that out by retrying is a worse way to learn it.
-            description += $" (+{count - 1} more)";
+            description += $" (+{routes.Count - 1} more)";
         }
         return new PeerEgressExistingRoute(true, description);
     }

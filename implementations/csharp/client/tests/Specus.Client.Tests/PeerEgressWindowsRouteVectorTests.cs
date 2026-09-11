@@ -191,6 +191,35 @@ public class PeerEgressWindowsRouteVectorTests
     }
 
     /// <summary>
+    /// The conflict check answers out of one read of the whole table rather than a process per
+    /// prefix. The reading that matters is that the prefix is compared exactly: under a default
+    /// route, asking whether an address can be routed is always yes, and taking that for a conflict
+    /// would refuse every rule on any machine that has one.
+    /// </summary>
+    [Fact]
+    public void WindowsConflictFromTableMatchesTheSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-windows-routes-v1.json");
+        var section = vector.RootElement.GetProperty("conflictFromTable");
+        var table = section.GetProperty("table").GetString()!;
+        Assert.True(table.Length > 0 && section.GetProperty("cases").GetArrayLength() > 0,
+            "vector carried no table cases");
+
+        foreach (var testCase in section.GetProperty("cases").EnumerateArray())
+        {
+            var existing = PeerEgressWindowsRouteCommands.ConflictFromTable(
+                table, testCase.GetProperty("prefix").GetString());
+            var expect = testCase.GetProperty("expect");
+            Assert.Equal(expect.GetProperty("present").GetBoolean(), existing.Present);
+            Assert.Equal(expect.GetProperty("description").GetString(), existing.Description);
+        }
+
+        // The sampled table has to stay readable whatever the console code page is, which is only
+        // true while the query selects no name.
+        Assert.DoesNotContain(table, character => character > 0x7F);
+    }
+
+    /// <summary>
     /// The sampled cases are why this vector is worth more than a set of invented strings, so
     /// losing them should fail rather than quietly leave a file of guesses behind.
     /// </summary>

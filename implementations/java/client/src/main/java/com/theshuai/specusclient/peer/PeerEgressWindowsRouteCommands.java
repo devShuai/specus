@@ -106,29 +106,53 @@ public final class PeerEgressWindowsRouteCommands {
      * not evidence of an empty table, and the install still refuses a prefix that already exists.
      */
     public static PeerEgressRouteCommands.ExistingRoute parseRouteShow(String output) {
+        return describeRoutes(routesWithPrefix(output));
+    }
+
+    /**
+     * Answers the same question out of one read of the whole table.
+     *
+     * <p>Exact string match on the prefix, not a longest-prefix lookup. What the conflict check
+     * asks is whether anything already owns this exact prefix, not whether the address can be
+     * routed -- under a default route the second question is always yes, and treating that as a
+     * conflict would refuse every rule on any machine that has one.
+     */
+    public static PeerEgressRouteCommands.ExistingRoute conflictFromTable(String table, String prefix) {
+        String wanted = prefix == null ? "" : prefix.trim();
+        List<JsonNode> matching = new ArrayList<>();
+        for (JsonNode route : routesWithPrefix(table)) {
+            if (prefixOf(route).equals(wanted)) {
+                matching.add(route);
+            }
+        }
+        return describeRoutes(matching);
+    }
+
+    /** Every entry in the output that actually carries a prefix. */
+    private static List<JsonNode> routesWithPrefix(String output) {
+        List<JsonNode> routes = new ArrayList<>();
         JsonNode decoded = decodeRoutes(output);
         if (decoded == null) {
-            return new PeerEgressRouteCommands.ExistingRoute(false, "");
+            return routes;
         }
-        JsonNode first = null;
-        int count = 0;
         for (JsonNode route : decoded) {
-            if (prefixOf(route).isEmpty()) {
-                continue;
+            if (!prefixOf(route).isEmpty()) {
+                routes.add(route);
             }
-            if (first == null) {
-                first = route;
-            }
-            count++;
         }
-        if (first == null) {
+        return routes;
+    }
+
+    /** Turns the routes on one prefix into a presence and a description. */
+    private static PeerEgressRouteCommands.ExistingRoute describeRoutes(List<JsonNode> routes) {
+        if (routes.isEmpty()) {
             return new PeerEgressRouteCommands.ExistingRoute(false, "");
         }
-        String description = describe(first);
-        if (count > 1) {
+        String description = describe(routes.get(0));
+        if (routes.size() > 1) {
             // The count matters to whoever has to clear the prefix: one removal is not going to be
             // enough, and finding that out by retrying is a worse way to learn it.
-            description += " (+" + (count - 1) + " more)";
+            description += " (+" + (routes.size() - 1) + " more)";
         }
         return new PeerEgressRouteCommands.ExistingRoute(true, description);
     }

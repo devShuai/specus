@@ -422,6 +422,69 @@
       }
     }
   ],
+  "conflictFromTable": {
+    "description": "冲突检查从一次整表读取里回答，而不是每条前缀起一个进程。table 是真机抓下来的整张 IPv4 路由表，29 条，419 ms。",
+    "notes": [
+      "前缀是精确字符串比较，不是最长前缀查找。问的是「这条精确前缀上有没有别人的路由」，不是「这个地址能不能被路由」——有默认路由时后者永远是能。",
+      "整表读取只取四个永远是 ASCII 的字段，所以这份 fixture 是纯 ASCII，与控制台代码页无关。"
+    ],
+    "table": "[{\"InterfaceIndex\":44,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":14,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":17,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":15,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":9,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":14,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":17,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":15,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":9,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.110/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.0/24\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.143.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.128.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.128.0/20\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.240.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.240.0/20\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.0/8\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.1.111\",\"RouteMetric\":256}]",
+    "sampled": true,
+    "cases": [
+      {
+        "name": "the-default-route",
+        "prefix": "0.0.0.0/0",
+        "expect": {
+          "present": true,
+          "description": "0.0.0.0/0 nexthop 192.168.1.111 ifIndex 3 metric 256"
+        }
+      },
+      {
+        "name": "a-prefix-on-four-interfaces",
+        "prefix": "224.0.0.0/4",
+        "reason": "同一前缀四个接口各一条。条数要报出来，否则运维以为删掉一条就腾出了这个前缀",
+        "expect": {
+          "present": true,
+          "description": "224.0.0.0/4 on-link ifIndex 44 metric 256 (+7 more)"
+        }
+      },
+      {
+        "name": "a-free-prefix",
+        "prefix": "203.0.113.0/24",
+        "reason": "表里没有，可以安装",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      },
+      {
+        "name": "whitespace-around-the-prefix",
+        "prefix": " 0.0.0.0/0 ",
+        "reason": "两侧空白不能让这道检查失效",
+        "expect": {
+          "present": true,
+          "description": "0.0.0.0/0 nexthop 192.168.1.111 ifIndex 3 metric 256"
+        }
+      },
+      {
+        "name": "the-same-network-a-different-length",
+        "prefix": "0.0.0.0/1",
+        "reason": "精确前缀比较，不是最长前缀查找。冲突检查问的是「这条精确前缀上有没有别人的路由」，不是「这个地址能不能被路由」——有默认路由时后者永远是能，把它当冲突会在任何一台有默认路由的机器上拒绝掉每一条规则",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      },
+      {
+        "name": "an-empty-prefix",
+        "prefix": "",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      }
+    ]
+  },
   "outputEncoding": {
     "description": "子进程的 stdout 用控制台代码页写出，采样机上是 936 而不是 UTF-8。GBK 双字节字符的低字节可能是 0x5C，也就是反斜杠——把一个中文适配器名回显进 JSON 就可能吐出一个裸反斜杠，整份文档就坏了。因此脚本一律不 Select 任何名字字段：索引、前缀、下一跳、跃点数都是 ASCII，无论代码页是什么都读得出来。这是要求，不是巧合。",
     "consoleCodePage": 936

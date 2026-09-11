@@ -205,6 +205,38 @@ class PeerEgressWindowsRouteVectorTests {
     }
 
     /**
+     * The conflict check answers out of one read of the whole table rather than a process per
+     * prefix. The reading that matters is that the prefix is compared exactly: under a default
+     * route, asking whether an address can be routed is always yes, and taking that for a conflict
+     * would refuse every rule on any machine that has one.
+     */
+    @Test
+    void windowsConflictFromTableMatchesTheSharedVector() throws IOException {
+        JsonNode section = readVector("peer-egress-windows-routes-v1.json").path("conflictFromTable");
+        String table = section.path("table").asText();
+        assertTrue(!table.isEmpty() && section.path("cases").size() > 0,
+                "vector carried no table cases");
+
+        for (JsonNode testCase : section.path("cases")) {
+            String name = testCase.path("name").asText();
+            PeerEgressRouteCommands.ExistingRoute existing =
+                    PeerEgressWindowsRouteCommands.conflictFromTable(
+                            table, testCase.path("prefix").asText());
+            JsonNode expect = testCase.path("expect");
+            assertEquals(expect.path("present").asBoolean(), existing.present(), name + " present");
+            assertEquals(expect.path("description").asText(), existing.description(),
+                    name + " description");
+        }
+
+        // The sampled table has to stay readable whatever the console code page is, which is only
+        // true while the query selects no name.
+        for (int index = 0; index < table.length(); index++) {
+            assertTrue(table.charAt(index) <= 0x7F,
+                    "sampled table carries a non-ASCII character at " + index);
+        }
+    }
+
+    /**
      * The sampled cases are why this vector is worth more than a set of invented strings, so losing
      * them should fail rather than quietly leave a file of guesses behind.
      */
