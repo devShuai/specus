@@ -7,6 +7,8 @@ Reads the shipped files fresh (no shared code with the generator) and asserts:
   * declared innerSourceIp / innerDestinationIp match the actual packet
   * every error code used in a vector is documented in the spec table
   * every error code in the spec table is exercised by at least one vector
+  * the Windows route fixtures still carry their sampled cases, and each parser behaviour
+    they pin is needed by at least one of them
 """
 import json
 import re
@@ -43,6 +45,7 @@ frame = json.loads((VECTORS / "peer-egress-frame-v1.json").read_text(encoding="u
 rules = json.loads((VECTORS / "peer-egress-rules-v1.json").read_text(encoding="utf-8"))
 authz = json.loads((VECTORS / "peer-egress-authz-v1.json").read_text(encoding="utf-8"))
 control = json.loads((VECTORS / "peer-egress-control-v1.json").read_text(encoding="utf-8"))
+windows = json.loads((VECTORS / "peer-egress-windows-routes-v1.json").read_text(encoding="utf-8"))
 
 # ---- frame vector -------------------------------------------------------
 for case in frame["accept"]:
@@ -206,12 +209,69 @@ check(order[:5] == ["hop", "enabled", "peerAcl", "consumer", "forcedDeny"],
 check(order.index("forcedDeny") < order.index("destination"),
       "authz: a broad destination rule must never be able to pre-empt the forced-deny list")
 
+# ---- windows route vector ----------------------------------------------
+# The point of this file is that its fixtures came off a real Windows machine. A version of it
+# rewritten into plausible-looking strings would still pass every implementation's tests, so the
+# sampled count is asserted here rather than left to whoever edits it next.
+sampled = [case for section in ("routeFind", "routeShow", "commandErrors")
+           for case in windows[section] if case.get("sampled")]
+check(len(sampled) >= 9, f"windows: only {len(sampled)} sampled cases left, want at least 9")
+
+on_link = windows["onLinkNextHop"]
+check(on_link == "0.0.0.0", f"windows: unexpected on-link next hop {on_link!r}")
+
+# Each of the three readings has to be load-bearing in at least one case, or an implementation
+# could drop it and still pass every case in the file.
+check(any(case["expect"].get("parsed") and case["expect"]["gateway"] == "" and on_link in case["output"]
+          for case in windows["routeFind"]),
+      "windows: no find case needs the on-link next hop rewritten to an empty gateway")
+check(any(case["expect"].get("parsed") and isinstance(json.loads(case["output"])[0].get("DestinationPrefix"), type(None))
+          for case in windows["routeFind"] if case["output"].lstrip().startswith("[{")),
+      "windows: no find case has the route behind a leading object, so picking it out is untested")
+check(any("(+" in case["expect"]["description"] for case in windows["routeShow"]),
+      "windows: no show case carries more than one route, so the count is untested")
+check({case["expect"]["failure"] for case in windows["commandErrors"]} >= {"permission-denied", "failed", ""},
+      "windows: the error cases do not cover all three classifications")
+
+# An empty gateway means on-link everywhere in this feature. A vector that expected the literal
+# 0.0.0.0 back would be asking implementations to install a route pointing at nothing.
+for case in windows["routeFind"]:
+    check(case["expect"].get("gateway") != on_link,
+          f"windows: find case {case['name']} expects the on-link sentinel as a gateway")
+
+# Recompute each show description from the output rather than trusting the generator: the string is
+# what an operator reads before deciding whether to clear a prefix, and a wrong prefix in it sends
+# them after the wrong route.
+for case in windows["routeShow"]:
+    routes = []
+    try:
+        decoded = json.loads(case["output"])
+        if isinstance(decoded, list):
+            routes = [entry for entry in decoded
+                      if isinstance(entry, dict) and isinstance(entry.get("DestinationPrefix"), str)
+                      and entry["DestinationPrefix"].strip()]
+    except ValueError:
+        routes = []
+    check(case["expect"]["present"] == bool(routes),
+          f"windows: show case {case['name']} disagrees with its own output about a route existing")
+    if not routes:
+        check(case["expect"]["description"] == "",
+              f"windows: show case {case['name']} describes a route it says is absent")
+        continue
+    check(case["expect"]["description"].startswith(routes[0]["DestinationPrefix"].strip() + " "),
+          f"windows: show case {case['name']} describes a prefix other than the one in its output")
+    check(("(+{} more)".format(len(routes) - 1) in case["expect"]["description"]) == (len(routes) > 1),
+          f"windows: show case {case['name']} miscounts the routes on the prefix")
+
+
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
 print(f"authz cases={len(authz['cases'])} variants={len(authz['policyVariantCases'])}")
 print(f"control egressConfig accept={len(egress_config['accept'])} reject={len(egress_config['reject'])}")
 print(f"error codes: {len(table_codes)} documented, {len(used)} exercised")
+print(f"windows routes find={len(windows['routeFind'])} show={len(windows['routeShow'])}"
+      f" errors={len(windows['commandErrors'])} sampled={len(sampled)}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")

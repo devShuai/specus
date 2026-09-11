@@ -130,9 +130,35 @@
 
 ### 平台
 
-一期只实现 Linux（`ip route`）。其它平台的接管留给 P5，在那之前必须**返回失败而不是静默什么都不做**：装不上任何路由却报告规则已生效的消费端，会把每个目标都送去本地直连，正是本功能要防的泄漏。
+未实现接管的平台必须**返回失败而不是静默什么都不做**：装不上任何路由却报告规则已生效的消费端，会把每个目标都送去本地直连，正是本功能要防的泄漏。
 
-固定向量：`protocol/test-vectors/peer-egress-routes-v1.json`，含计划、差异、安装记录与 `ip route` 输出解析。
+#### Linux
+
+`ip route`。输出不带翻译，因此可以直接解析文本。
+
+#### Windows
+
+路由表通过 **PowerShell 的 `Get-NetRoute` / `Find-NetRoute` / `New-NetRoute` / `Remove-NetRoute`** 读写，**不解析 `netsh` 与 `route print`**：它们的输出是本地化的。同一条 `netsh interface ipv4 show route` 在同一台机器上，一个控制台代码页下打印英文表头，另一个下打印中文表头（`发布  类型  跃点数  前缀  索引  网关/接口名称`）。照英文表头写的解析器在中文机器上一条路由都读不出来，而「读不出路由」恰好等于「没有冲突，装吧」——失败方向是覆盖掉运维自己的路由。
+
+调用 `powershell.exe`（Windows PowerShell 5.1）而不是 `pwsh`：前者随系统存在，后者不一定装。
+
+PowerShell 那一层**只把对象转成 JSON，不做判断**。挑哪个对象、缺失的下一跳是什么意思、失败是不是权限问题，全部在解析器里，由共享向量钉住三端；写进 PowerShell 字符串里的过滤逻辑是三份各自嵌的片段，没有任何测试覆盖得到。据此固定下来的读法：
+
+- **序列化用 `ConvertTo-Json -InputObject @(...)`，不用管道。** 管道给单个对象时输出的是 JSON 对象而不是单元素数组，而「只有一条路由」正是最常见的情况——只测过多条的解析器会在生产上读不出东西。
+- **`Find-NetRoute` 返回两个对象**：先是它会使用的源地址，然后才是路由。只有后者带 `DestinationPrefix`，靠这个把它挑出来。取 `[0]` 会拿到接口索引却没有下一跳，等于把一条经网关的路由读成直连。
+- **直连在 Windows 上写作 `NextHop = 0.0.0.0`**，Linux 是省略 `via`。两者都归一成空网关，安装器不需要知道是哪个平台回答的。照 `0.0.0.0` 原样安装会装出一条指向空处的路由。
+- **`InterfaceIndex` 为 0 的条目跳过**，继续找下一条。0 不是接口。
+- **只用接口索引，不用接口名**：接口名是本地化的（中文系统上默认网卡叫「以太网」），索引是数字。
+- **权限不足认 `FullyQualifiedErrorId` 里的错误号 5**（`Windows System Error 5`），不认消息文本：消息在中文系统上是「拒绝访问」。这一类失败要明确告诉运维需要提权，重试到天亮也不会成功。
+- 查不到前缀时 `Get-NetRoute` 是**报错**而不是输出空，因此查询带 `-ErrorAction SilentlyContinue`，把它压成空数组。
+
+**每次进程启动约 175 ms，第一次调用 NetTCPIP cmdlet 再加约 380 ms，之后同一进程内的查询几乎免费**（实测：一次查询 559 ms，五次 564 ms）。因此平台查询要在一个进程里批量做完，逐条调用会让二十条规则花掉十一秒。Linux 的 `ip` 是毫秒级，没有这个约束。
+
+#### macOS
+
+未实现。
+
+固定向量：`protocol/test-vectors/peer-egress-routes-v1.json`（计划、差异、安装记录与 `ip route` 输出解析）、`protocol/test-vectors/peer-egress-windows-routes-v1.json`（Windows 三个解析器）。后者标了 `sampled` 的用例是真机抓下来的原样输出，机器为 Windows 11 26200、Windows PowerShell 5.1.26100.9444、系统区域 zh-CN。
 
 ## 出口授权模型
 
