@@ -11,6 +11,11 @@ import (
 // Kept free of build tags for the same reason the Linux parsers are: they depend on output nobody
 // controls, and a Windows-only file would go untested on the machines where most of CI runs.
 //
+// Which is why this file is not called peer_egress_route_parse_windows.go. A _windows.go suffix is
+// itself a build constraint, so that name would have compiled the parsers out everywhere but
+// Windows while the test that exercises them kept compiling -- and the developer machine here is
+// Windows, so only Linux CI would have said so.
+//
 // The table is read through PowerShell rather than netsh or route print, because those two are
 // localised. The same `netsh interface ipv4 show route` prints English column headers under one
 // console code page and Chinese ones under another on the very same machine. A parser written

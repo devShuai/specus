@@ -12,7 +12,9 @@ import (
 // Three runtimes each embedding their own string is exactly how two of them end up writing to a
 // different policy store than the third, and nothing about the parsed output would show it.
 //
-// No platform guard, same as the parsers: the text is worth testing everywhere.
+// No platform guard, same as the parsers: the text is worth testing everywhere -- which is also
+// why the file is not named with a _windows.go suffix, since that suffix is a build constraint on
+// its own and would have excluded exactly the code the shared vector exists to pin.
 
 // errEgressRouteArgument is returned for anything that would have to be escaped to be safe.
 var errEgressRouteArgument = errors.New("refusing to build a route command from this argument")
