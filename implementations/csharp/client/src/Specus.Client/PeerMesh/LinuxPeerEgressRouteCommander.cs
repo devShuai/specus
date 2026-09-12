@@ -11,10 +11,8 @@ namespace Specus.Client.PeerMesh;
 /// <c>ip route add</c> failing on an existing prefix is the backstop: replacing would mean quietly
 /// winning an argument with the user's own routing, which phase one does not do.
 ///
-/// <para>Windows and macOS takeover is P5. Until then <see cref="ForPlatform"/> hands back a
-/// commander that refuses rather than one that silently does nothing: a consumer that installed no
-/// routes would send every destination out locally while reporting that its rules were applied,
-/// which is the leak this whole feature exists to prevent.</para>
+/// <para>Choosing between this and the Windows table lives in
+/// <see cref="PeerEgressRouteCommanders"/>.</para>
 /// </remarks>
 internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRouteCommander
 {
@@ -30,12 +28,6 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
     /// tunnel", and installing that would route the tunnel's own transport into the tunnel.
     /// </remarks>
     private readonly Dictionary<string, PeerEgressRouteHop> _hops = [];
-
-    /// <summary>The commander for the platform this process is running on.</summary>
-    public static IPeerEgressRouteCommander ForPlatform(string? tun) =>
-        RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-            ? new LinuxPeerEgressRouteCommander(tun)
-            : new UnsupportedPeerEgressRouteCommander();
 
     public PeerEgressRouteConflictCheck Conflict(PeerEgressRoute route)
     {
@@ -127,7 +119,16 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
     }
 }
 
-/// <summary>Route takeover is Linux-only in phase one; see <see cref="LinuxPeerEgressRouteCommander"/>.</summary>
+/// <summary>
+/// The platforms without route takeover.
+/// </summary>
+/// <remarks>
+/// Linux, Windows and macOS all have it now, so what is left is whatever else this runs on.
+///
+/// <para>Refusing rather than doing nothing: a consumer that silently installed no routes would send
+/// every destination out locally while reporting that its rules were applied, which is the leak
+/// this whole feature exists to prevent.</para>
+/// </remarks>
 internal sealed class UnsupportedPeerEgressRouteCommander : IPeerEgressRouteCommander
 {
     private const string Message = "egress route takeover is not implemented on this platform";

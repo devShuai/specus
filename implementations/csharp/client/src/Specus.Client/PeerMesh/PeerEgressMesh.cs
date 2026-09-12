@@ -410,7 +410,7 @@ internal sealed class PeerEgressMesh(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".specus", "egress-routes.json");
             var installer = new PeerEgressRouteInstaller(
-                commander ?? LinuxPeerEgressRouteCommander.ForPlatform(host.TunName), journal);
+                commander ?? PeerEgressRouteCommanders.ForPlatform(host.TunName), journal);
             try
             {
                 installer.Load();

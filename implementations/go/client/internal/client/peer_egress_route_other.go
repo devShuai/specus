@@ -1,14 +1,16 @@
-//go:build !linux
+//go:build !linux && !windows && !darwin
 
 package client
 
 import "errors"
 
-// Route takeover is Linux-only in phase one.
+// Route takeover on the platforms that do not have it.
+//
+// Linux, Windows and macOS all have it now, so what is left is whatever else this ever builds for.
 //
 // Refusing rather than doing nothing: a consumer that silently installed no routes would send every
 // destination out locally while reporting that its rules were applied, which is the leak this whole
-// feature exists to prevent. Windows and macOS takeover is P5.
+// feature exists to prevent.
 type unsupportedEgressRouteCommander struct{}
 
 var errEgressRoutesUnsupported = errors.New("egress route takeover is not implemented on this platform")

@@ -1,0 +1,121 @@
+name: Peer egress macOS routes
+
+# Route takeover on macOS, on a real macOS machine.
+#
+# Its own workflow rather than another leg of the CLI matrix, and scoped to the route tests rather
+# than to whole suites. macOS is a platform nothing in CI ran on before this, so widening an
+# existing job would have brought along everything else that has never run there; what this needs
+# to prove is narrow and worth proving on its own.
+#
+# The last step is the part the Windows side cannot have: GitHub's macOS runners give passwordless
+# sudo, so the install, verify and withdraw cycle runs against the real routing table instead of
+# only against fixtures. It installs a prefix reserved for documentation, pointed at the loopback,
+# and withdraws it in the same test.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/peer-egress-macos.yml'
+      - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
+      - 'tools/protocol/generate_peer_egress_macos_route_vectors.py'
+      - 'tools/protocol/verify_peer_egress_vectors.py'
+      - 'implementations/go/client/internal/client/peer_egress_route_*'
+      - 'implementations/java/client/src/main/java/com/theshuai/specusclient/peer/**'
+      - 'implementations/java/client/src/test/java/com/theshuai/specusclient/peer/**'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/**'
+      - 'implementations/csharp/client/tests/Specus.Client.Tests/PeerEgress*'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/peer-egress-macos.yml'
+      - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
+      - 'implementations/go/client/internal/client/peer_egress_route_*'
+      - 'implementations/java/client/src/main/java/com/theshuai/specusclient/peer/**'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  routes:
+    name: Route takeover (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/client/go.mod
+          cache-dependency-path: implementations/go/client/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The vector says what all three implementations have to agree on, and this regenerates it
+      # from the reference implementation to check the shipped file is what the reference produces.
+      - name: Vectors
+        run: |
+          python tools/protocol/generate_peer_egress_macos_route_vectors.py
+          git diff --exit-code protocol/test-vectors/peer-egress-macos-routes-v1.json
+          python tools/protocol/verify_peer_egress_vectors.py
+
+      - name: Go
+        working-directory: implementations/go/client
+        run: go test ./internal/client -run 'TestMacos' -count=1 -v
+
+      - name: Java
+        run: >
+          mvn -B -ntp -pl implementations/java/client -am test
+          -Dtest='PeerEgressMacosRouteVectorTests,PeerEgressRouteCommandersTests'
+          -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: .NET
+        run: >
+          dotnet test implementations/csharp/client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj
+          -c Release -v minimal
+          --filter "FullyQualifiedName~PeerEgressMacosRouteVectorTests|FullyQualifiedName~PeerEgressRouteCommandersTests"
+
+      # And the routing table itself. Compiled first and then run under sudo, rather than running
+      # the whole suite elevated, so nothing else in this job leaves root-owned files behind in a
+      # build cache.
+      #
+      # The output is then searched for the two tests that mutate, because they skip themselves
+      # when the variable is absent and a skipped test leaves this step green. A run that was asked
+      # to exercise the install path and silently did not is worth less than no run.
+      - name: Install and withdraw a real route
+        working-directory: implementations/go/client
+        run: |
+          # Without this the pipe below would return tee's status and a failing test would leave
+          # the step green. The default shell here is `bash -e`, which does not set it.
+          set -o pipefail
+          go test -c -o "$RUNNER_TEMP/client.test" ./internal/client
+          cd "$GITHUB_WORKSPACE"
+          sudo -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
+            -test.run 'TestMacosCommander' -test.v | tee "$RUNNER_TEMP/mutation.log"
+          for name in InstallsAndWithdrawsARealRoute InstallsABypassThroughTheRealNextHop; do
+            if ! grep -q "^--- PASS: TestMacosCommander$name" "$RUNNER_TEMP/mutation.log"; then
+              echo "TestMacosCommander$name did not run against the real routing table"
+              exit 1
+            fi
+          done
+
+      # Nothing this job installed may still be there. The runner is thrown away either way, so
+      # this is about the code rather than the machine: a cycle that leaves its prefix behind is a
+      # withdrawal that did not work.
+      - name: No residue
+        if: always()
+        run: |
+          netstat -rn -f inet
+          if netstat -rn -f inet | grep -E '^(203\.0\.113|198\.51\.100)'; then
+            echo "a test route was left in the table"
+            exit 1
+          fi

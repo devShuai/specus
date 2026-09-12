@@ -1,0 +1,492 @@
+{
+  "name": "peer-egress-windows-routes-v1",
+  "version": 1,
+  "notes": [
+    "Windows 侧读路由表的三个解析器。标了 sampled 的 output 是真机抓下来的原样输出，机器为 Windows 11 26200、Windows PowerShell 5.1.26100.9444、系统区域 zh-CN。",
+    "不解析 netsh 与 route print：它们的输出是本地化的。同一条 netsh interface ipv4 show route 在采样机上，一个控制台代码页下打印英文表头，另一个下打印中文表头。照英文表头写的解析器在中文机器上一条路由都读不出来，而「读不出路由」恰好等于「没有冲突，装吧」——失败方向是覆盖掉运维自己的路由。Linux 的 ip route 不带翻译，所以那边解析文本是安全的，这边不是。",
+    "PowerShell 那层只把对象转成 JSON，不做判断。挑哪个对象、缺失的下一跳是什么意思、失败是不是权限问题，全部在解析器里，由本向量钉住三端。写进 PowerShell 字符串里的过滤逻辑是三份各自嵌的片段，没有任何测试覆盖得到。",
+    "权限失败认 FullyQualifiedErrorId 里的错误号 5，不认消息文本：消息在中文系统上是「拒绝访问」。",
+    "Windows 用 0.0.0.0 表示直连，Linux 用「没有 via」。两者都归一成空网关，安装器不需要知道是哪个平台回答的。",
+    "hop 里带的是接口索引不是接口名：接口名是本地化的（采样机上默认网卡叫「以太网」），索引是数字。",
+    "本文件的期望值出自 tools/protocol/generate_peer_egress_windows_route_vectors.py 里的独立参考解析器，不是从任何一个实现录下来的。"
+  ],
+  "onLinkNextHop": "0.0.0.0",
+  "routeFind": [
+    {
+      "name": "through-a-router",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":null,\"NextHop\":null,\"RouteMetric\":null,\"InterfaceMetric\":null},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.1.111\",\"RouteMetric\":256,\"InterfaceMetric\":20}]",
+      "sampled": true,
+      "reason": "采样：8.8.8.8 经默认网关。第一个对象是源地址而不是路由，取 [0] 会拿到接口号却没有下一跳",
+      "expect": {
+        "parsed": true,
+        "gateway": "192.168.1.111",
+        "interfaceIndex": 3
+      }
+    },
+    {
+      "name": "on-link",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":null,\"NextHop\":null,\"RouteMetric\":null,\"InterfaceMetric\":null},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.0/24\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":20}]",
+      "sampled": true,
+      "reason": "采样：同网段目标。Windows 用 0.0.0.0 表示直连，Linux 是省略 via；两者都归一成空网关，否则会装出一条指向 0.0.0.0 的路由",
+      "expect": {
+        "parsed": true,
+        "gateway": "",
+        "interfaceIndex": 3
+      }
+    },
+    {
+      "name": "loopback",
+      "output": "[{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":75}]",
+      "sampled": true,
+      "reason": "采样：回环接口索引为 1，同样是直连",
+      "expect": {
+        "parsed": true,
+        "gateway": "",
+        "interfaceIndex": 1
+      }
+    },
+    {
+      "name": "address-object-only",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":null,\"NextHop\":null,\"RouteMetric\":null,\"InterfaceMetric\":null}]",
+      "reason": "只有源地址没有路由：查不到路由时必须判为失败，而不是拿着接口号去装",
+      "expect": {
+        "parsed": false
+      }
+    },
+    {
+      "name": "empty-array",
+      "output": "[]",
+      "reason": "没有任何对象",
+      "expect": {
+        "parsed": false
+      }
+    },
+    {
+      "name": "not-json",
+      "output": "New-NetRoute : 拒绝访问。\r\n",
+      "reason": "cmdlet 直接报错而不是输出 JSON。注意这段消息是中文的——这正是不解析人类可读输出的理由",
+      "expect": {
+        "parsed": false
+      }
+    },
+    {
+      "name": "null-next-hop",
+      "output": "[{\"InterfaceIndex\":7,\"DestinationPrefix\":\"10.0.0.0/8\",\"NextHop\":null,\"RouteMetric\":256,\"InterfaceMetric\":25}]",
+      "reason": "有前缀但下一跳为 null：按直连处理，与 Linux 缺 via 的读法一致",
+      "expect": {
+        "parsed": true,
+        "gateway": "",
+        "interfaceIndex": 7
+      }
+    },
+    {
+      "name": "zero-interface-index",
+      "output": "[{\"InterfaceIndex\":0,\"DestinationPrefix\":\"10.0.0.0/8\",\"NextHop\":\"10.0.0.1\",\"RouteMetric\":256,\"InterfaceMetric\":25}]",
+      "reason": "0 不是接口索引。照它安装等于让系统往不存在的接口送",
+      "expect": {
+        "parsed": false
+      }
+    },
+    {
+      "name": "first-usable-wins",
+      "output": "[{\"InterfaceIndex\":0,\"DestinationPrefix\":\"10.0.0.0/8\",\"NextHop\":\"10.0.0.1\",\"RouteMetric\":256,\"InterfaceMetric\":25},{\"InterfaceIndex\":9,\"DestinationPrefix\":\"10.0.0.0/8\",\"NextHop\":\"10.0.0.9\",\"RouteMetric\":256,\"InterfaceMetric\":25}]",
+      "reason": "跳过不可用的条目继续找，而不是在第一条上放弃",
+      "expect": {
+        "parsed": true,
+        "gateway": "10.0.0.9",
+        "interfaceIndex": 9
+      }
+    }
+  ],
+  "routeShow": [
+    {
+      "name": "an-existing-route",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.1.111\",\"RouteMetric\":256,\"InterfaceMetric\":20}]",
+      "sampled": true,
+      "reason": "采样：默认路由。描述给运维原样核对用",
+      "expect": {
+        "present": true,
+        "description": "0.0.0.0/0 nexthop 192.168.1.111 ifIndex 3 metric 256"
+      }
+    },
+    {
+      "name": "an-on-link-route",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.0/24\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":20}]",
+      "sampled": true,
+      "reason": "采样：直连网段在描述里写 on-link，不写 nexthop 0.0.0.0",
+      "expect": {
+        "present": true,
+        "description": "192.168.1.0/24 on-link ifIndex 3 metric 256"
+      }
+    },
+    {
+      "name": "a-loopback-route",
+      "output": "[{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":75}]",
+      "sampled": true,
+      "reason": "采样：回环",
+      "expect": {
+        "present": true,
+        "description": "127.0.0.1/32 on-link ifIndex 1 metric 256"
+      }
+    },
+    {
+      "name": "the-same-prefix-on-four-interfaces",
+      "output": "[{\"InterfaceIndex\":44,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":5000},{\"InterfaceIndex\":14,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":25},{\"InterfaceIndex\":17,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":25},{\"InterfaceIndex\":15,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256,\"InterfaceMetric\":25}]",
+      "sampled": true,
+      "reason": "采样：多播前缀每个接口一条。条数要报出来，否则运维以为删掉一条就腾出了这个前缀",
+      "expect": {
+        "present": true,
+        "description": "224.0.0.0/4 on-link ifIndex 44 metric 256 (+3 more)"
+      }
+    },
+    {
+      "name": "no-route",
+      "output": "[]",
+      "sampled": true,
+      "reason": "采样：Get-NetRoute 查不到前缀时是报错而不是输出空，所以脚本用 -ErrorAction SilentlyContinue 把它压成空数组",
+      "expect": {
+        "present": false,
+        "description": ""
+      }
+    },
+    {
+      "name": "not-json",
+      "output": "Get-NetRoute : 无法识别参数\r\n",
+      "reason": "问不出来不等于表是空的，但也不报冲突：安装本身仍会拒绝已存在的前缀，失败方向是安全的",
+      "expect": {
+        "present": false,
+        "description": ""
+      }
+    },
+    {
+      "name": "route-without-prefix",
+      "output": "[{\"InterfaceIndex\":3,\"DestinationPrefix\":null,\"NextHop\":\"192.168.1.111\",\"RouteMetric\":256,\"InterfaceMetric\":20}]",
+      "reason": "没有前缀的条目不算冲突",
+      "expect": {
+        "present": false,
+        "description": ""
+      }
+    }
+  ],
+  "commandErrors": [
+    {
+      "name": "access-denied",
+      "output": "{\"errorId\":\"Windows System Error 5,New-NetRoute\"}",
+      "sampled": true,
+      "reason": "采样：非管理员执行 New-NetRoute。认错误号 5 而不是认「Access is denied」，后者在中文系统上是「拒绝访问」",
+      "expect": {
+        "failure": "permission-denied"
+      }
+    },
+    {
+      "name": "removing-a-route-that-is-already-gone",
+      "output": "{\"errorId\":\"CmdletizationQuery_NotFound_DestinationPrefix,Remove-NetRoute\"}",
+      "sampled": true,
+      "reason": "采样：删一条表里没有的前缀。这不是失败，要的结果已经成立。路由装在 ActiveStore 里不跨重启，所以每次重启后的第一次清理走过的整本安装记录都是这个状态——报成失败会让真正的失败淹在噪音里",
+      "expect": {
+        "failure": ""
+      }
+    },
+    {
+      "name": "another-windows-error",
+      "output": "{\"errorId\":\"Windows System Error 87,New-NetRoute\"}",
+      "reason": "别的系统错误不能被当成权限问题，否则会让运维去提权解决一个不是权限的问题",
+      "expect": {
+        "failure": "failed"
+      }
+    },
+    {
+      "name": "a-cmdlet-error",
+      "output": "{\"errorId\":\"InvalidParameter,New-NetRoute\"}",
+      "reason": "不带错误号的失败",
+      "expect": {
+        "failure": "failed"
+      }
+    },
+    {
+      "name": "empty-error-id",
+      "output": "{\"errorId\":\"\"}",
+      "reason": "空的错误 id 不算失败",
+      "expect": {
+        "failure": ""
+      }
+    },
+    {
+      "name": "success",
+      "output": "",
+      "reason": "命令成功时脚本什么都不输出",
+      "expect": {
+        "failure": ""
+      }
+    },
+    {
+      "name": "unparseable-output",
+      "output": "something went wrong\r\n",
+      "reason": "输出不是 JSON 但也不是空：失败，只是分不出原因",
+      "expect": {
+        "failure": "failed"
+      }
+    }
+  ],
+  "scripts": {
+    "description": "发出去的 PowerShell 也钉住，不只是收回来的输出。三端各自嵌一份脚本字符串，正是其中两端查了 ActiveStore 而第三端查了 PersistentStore 的方式，而解析出来的结果看不出任何差别。",
+    "notes": [
+      "查询走一个进程批量做完，每条前缀输出一行 JSON，行序即入参序。采样机上起一个进程 175 ms，第一次调 NetTCPIP cmdlet 再加约 380 ms，之后同进程内几乎免费：一次查询 559 ms，五次 564 ms。",
+      "PolicyStore 用 ActiveStore 而不是 PersistentStore：ActiveStore 的路由不跨重启存在。本功能要的正是这个——真正会留下残留的是持久化路由，而崩溃后重启时它还在表里，安装记录却可能已经对不上了。",
+      "Remove-NetRoute 默认会问确认，必须带 -Confirm:$false，否则在非交互进程里挂住。",
+      "install 不带 -NextHop 即直连，与写 -NextHop '0.0.0.0' 等价，取前者。",
+      "失败在 PowerShell 里就被 catch 成 {errorId} 的 JSON。退出码不可依赖，读的是 stdout。"
+    ],
+    "showRoutes": [
+      {
+        "name": "one-prefix",
+        "prefixes": [
+          "203.0.113.0/24"
+        ],
+        "reason": "一条也走同样的批量形状，不为单条开一条路径",
+        "expect": "foreach($p in @('203.0.113.0/24')){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "three-prefixes",
+        "prefixes": [
+          "203.0.113.0/24",
+          "198.51.100.7/32",
+          "0.0.0.0/0"
+        ],
+        "reason": "一个进程问完所有前缀。逐条起进程在这台采样机上是每条 559 ms，同一进程内第五条才 564 ms",
+        "expect": "foreach($p in @('203.0.113.0/24','198.51.100.7/32','0.0.0.0/0')){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "no-prefixes",
+        "prefixes": [],
+        "reason": "空列表仍是合法脚本，输出零行；调用方不需要为它特判",
+        "expect": "foreach($p in @()){ConvertTo-Json -Compress -InputObject @(Get-NetRoute -DestinationPrefix $p -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      }
+    ],
+    "findRoutes": [
+      {
+        "name": "one-address",
+        "addresses": [
+          "8.8.8.8"
+        ],
+        "expect": "foreach($a in @('8.8.8.8')){ConvertTo-Json -Compress -InputObject @(Find-NetRoute -RemoteIPAddress $a -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      },
+      {
+        "name": "two-addresses",
+        "addresses": [
+          "8.8.8.8",
+          "192.168.1.50"
+        ],
+        "expect": "foreach($a in @('8.8.8.8','192.168.1.50')){ConvertTo-Json -Compress -InputObject @(Find-NetRoute -RemoteIPAddress $a -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)}\nexit 0"
+      }
+    ],
+    "installRoute": [
+      {
+        "name": "through-a-gateway",
+        "cidr": "203.0.113.0/24",
+        "interfaceIndex": 3,
+        "gateway": "192.168.1.111",
+        "reason": "旁路：钉在解析出来的物理接口与网关上",
+        "expect": "try{New-NetRoute -DestinationPrefix '203.0.113.0/24' -NextHop '192.168.1.111' -InterfaceIndex 3 -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      },
+      {
+        "name": "on-link",
+        "cidr": "203.0.113.0/24",
+        "interfaceIndex": 9,
+        "gateway": "",
+        "reason": "规则路由进 TUN，以及直连网段的旁路。不带 -NextHop 时 Windows 按直连处理，写 -NextHop '0.0.0.0' 是同一件事的更啰嗦写法",
+        "expect": "try{New-NetRoute -DestinationPrefix '203.0.113.0/24' -InterfaceIndex 9 -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      }
+    ],
+    "removeRoute": [
+      {
+        "name": "a-prefix",
+        "cidr": "203.0.113.0/24",
+        "expect": "try{Remove-NetRoute -DestinationPrefix '203.0.113.0/24' -Confirm:$false -PolicyStore ActiveStore -ErrorAction Stop|Out-Null}catch{ConvertTo-Json -Compress -InputObject @{errorId=$_.FullyQualifiedErrorId};exit 1}"
+      }
+    ],
+    "rejectedArguments": [
+      {
+        "name": "quote-and-a-second-command",
+        "value": "10.0.0.0/8';Remove-NetRoute -DestinationPrefix '0.0.0.0/0",
+        "kind": "prefix",
+        "reason": "拼进命令字符串的注入。Linux 侧参数是 argv 条目，从来没有 shell 看见它们"
+      },
+      {
+        "name": "subexpression",
+        "value": "$(Get-NetRoute)",
+        "kind": "prefix",
+        "reason": "PowerShell 的子表达式"
+      },
+      {
+        "name": "no-prefix-length",
+        "value": "10.0.0.0",
+        "kind": "prefix"
+      },
+      {
+        "name": "prefix-length-too-long",
+        "value": "10.0.0.0/33",
+        "kind": "prefix"
+      },
+      {
+        "name": "octet-out-of-range",
+        "value": "10.0.0.256/24",
+        "kind": "prefix"
+      },
+      {
+        "name": "not-an-address",
+        "value": "example.com/24",
+        "kind": "prefix"
+      },
+      {
+        "name": "empty",
+        "value": "",
+        "kind": "prefix"
+      },
+      {
+        "name": "address-with-a-prefix-length",
+        "value": "10.0.0.1/32",
+        "kind": "address"
+      },
+      {
+        "name": "address-with-a-quote",
+        "value": "10.0.0.1'",
+        "kind": "address"
+      },
+      {
+        "name": "ipv6-address",
+        "value": "2001:db8::1",
+        "kind": "address"
+      }
+    ],
+    "interfaceIndex": [
+      {
+        "name": "a-plain-name",
+        "adapter": "specus0",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'specus0' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-name-with-spaces",
+        "adapter": "Specus Tunnel",
+        "reason": "Wintun 适配器名来自配置，空格是合法的",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'Specus Tunnel' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-name-with-a-quote",
+        "adapter": "it's",
+        "reason": "单引号必须变成两个。地址那边用白名单没有转义，因为白名单里没有引号；接口名不能白名单成数字，所以这里转义是真的防线",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name 'it''s' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      },
+      {
+        "name": "a-localised-name",
+        "adapter": "以太网",
+        "reason": "采样机上默认网卡就叫这个。名字进得去，但脚本只 Select 索引，所以出来的 JSON 是纯 ASCII",
+        "expect": "ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Name '以太网' -ErrorAction SilentlyContinue|Select-Object InterfaceIndex)"
+      }
+    ],
+    "showAllRoutes": "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue|Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric)"
+  },
+  "interfaceIndexParse": [
+    {
+      "name": "found",
+      "output": "[{\"InterfaceIndex\":3}]",
+      "sampled": true,
+      "reason": "采样：按本地化名字查到默认网卡",
+      "expect": {
+        "found": true,
+        "interfaceIndex": 3
+      }
+    },
+    {
+      "name": "no-such-adapter",
+      "output": "[]",
+      "sampled": true,
+      "reason": "采样：查不到时是空数组，不是报错",
+      "expect": {
+        "found": false
+      }
+    },
+    {
+      "name": "zero-index",
+      "output": "[{\"InterfaceIndex\":0}]",
+      "reason": "0 不是接口",
+      "expect": {
+        "found": false
+      }
+    },
+    {
+      "name": "not-json",
+      "output": "Get-NetAdapter : \r\n",
+      "expect": {
+        "found": false
+      }
+    }
+  ],
+  "conflictFromTable": {
+    "description": "冲突检查从一次整表读取里回答，而不是每条前缀起一个进程。table 是真机抓下来的整张 IPv4 路由表，29 条，419 ms。",
+    "notes": [
+      "前缀是精确字符串比较，不是最长前缀查找。问的是「这条精确前缀上有没有别人的路由」，不是「这个地址能不能被路由」——有默认路由时后者永远是能。",
+      "整表读取只取四个永远是 ASCII 的字段，所以这份 fixture 是纯 ASCII，与控制台代码页无关。"
+    ],
+    "table": "[{\"InterfaceIndex\":44,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":14,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":17,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":15,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":9,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"255.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":14,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":17,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":15,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":9,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"224.0.0.0/4\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.110/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"192.168.1.0/24\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.143.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.128.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":33,\"DestinationPrefix\":\"172.21.128.0/20\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.240.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":44,\"DestinationPrefix\":\"172.18.240.0/20\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.255.255.255/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.1/32\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":1,\"DestinationPrefix\":\"127.0.0.0/8\",\"NextHop\":\"0.0.0.0\",\"RouteMetric\":256},{\"InterfaceIndex\":3,\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.1.111\",\"RouteMetric\":256}]",
+    "sampled": true,
+    "cases": [
+      {
+        "name": "the-default-route",
+        "prefix": "0.0.0.0/0",
+        "expect": {
+          "present": true,
+          "description": "0.0.0.0/0 nexthop 192.168.1.111 ifIndex 3 metric 256"
+        }
+      },
+      {
+        "name": "a-prefix-on-four-interfaces",
+        "prefix": "224.0.0.0/4",
+        "reason": "同一前缀四个接口各一条。条数要报出来，否则运维以为删掉一条就腾出了这个前缀",
+        "expect": {
+          "present": true,
+          "description": "224.0.0.0/4 on-link ifIndex 44 metric 256 (+7 more)"
+        }
+      },
+      {
+        "name": "a-free-prefix",
+        "prefix": "203.0.113.0/24",
+        "reason": "表里没有，可以安装",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      },
+      {
+        "name": "whitespace-around-the-prefix",
+        "prefix": " 0.0.0.0/0 ",
+        "reason": "两侧空白不能让这道检查失效",
+        "expect": {
+          "present": true,
+          "description": "0.0.0.0/0 nexthop 192.168.1.111 ifIndex 3 metric 256"
+        }
+      },
+      {
+        "name": "the-same-network-a-different-length",
+        "prefix": "0.0.0.0/1",
+        "reason": "精确前缀比较，不是最长前缀查找。冲突检查问的是「这条精确前缀上有没有别人的路由」，不是「这个地址能不能被路由」——有默认路由时后者永远是能，把它当冲突会在任何一台有默认路由的机器上拒绝掉每一条规则",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      },
+      {
+        "name": "an-empty-prefix",
+        "prefix": "",
+        "expect": {
+          "present": false,
+          "description": ""
+        }
+      }
+    ]
+  },
+  "outputEncoding": {
+    "description": "子进程的 stdout 用控制台代码页写出，采样机上是 936 而不是 UTF-8。GBK 双字节字符的低字节可能是 0x5C，也就是反斜杠——把一个中文适配器名回显进 JSON 就可能吐出一个裸反斜杠，整份文档就坏了。因此脚本一律不 Select 任何名字字段：索引、前缀、下一跳、跃点数都是 ASCII，无论代码页是什么都读得出来。这是要求，不是巧合。",
+    "consoleCodePage": 936
+  }
+}
