@@ -101,6 +101,19 @@ final class PeerEgressConsumer {
     }
 
     /**
+     * What an operator can read, for the status surface.
+     *
+     * <p>No lock here, for the same reason nothing else in this class has one: the caller
+     * serialises access. Copies of the collections, because the caller is a diagnostic reader and
+     * this consumer goes on mutating its own.
+     */
+    PeerEgressStatus.ConsumerSnapshot statusSnapshot() {
+        return new PeerEgressStatus.ConsumerSnapshot(List.copyOf(rules), meshCidr,
+                new java.util.LinkedHashMap<>(online), flows.size(),
+                new java.util.TreeMap<>(blocked));
+    }
+
+    /**
      * Installs a rule set and closes the flows it invalidates.
      *
      * <p>Established flows survive a rule change unless their rule stopped saying egress or stopped

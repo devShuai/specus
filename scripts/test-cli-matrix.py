@@ -248,9 +248,27 @@ class Matrix:
                     self.checks += 1
                     control.data_delay = 0
                     count = http.logins
-                    for command in ("status", "peers", "services"):
+                    for command in ("status", "peers", "services", "egress"):
                         self.run([command] + cfg)
                         self.run([command] + cfg, machine=False)
+                    # The egress section is a cross-runtime contract: whichever client wrote the
+                    # state file, any of the three CLIs reads it, so the shape is checked here
+                    # rather than only in each runtime's own tests.
+                    egress = self.run(["egress"] + cfg)["data"]["instances"][0]["egress"]
+                    for half in ("consumer", "egress"):
+                        assert isinstance(egress.get(half), dict), f"egress.{half} missing"
+                        assert isinstance(egress[half].get("active"), bool),                             f"egress.{half}.active is not a boolean"
+                    consumer = egress["consumer"]
+                    for field, kind in (("rules", list), ("routes", list), ("peers", list),
+                                        ("blocked", dict)):
+                        assert isinstance(consumer.get(field), kind),                             f"egress.consumer.{field} is not a {kind.__name__}"
+                    assert isinstance(egress["egress"].get("refused"), dict),                         "egress.egress.refused is not an object"
+                    # Nothing here may carry a credential. The section is configuration and
+                    # counters; a runtime that started projecting a token into it would pass its
+                    # own tests and fail this one.
+                    rendered = json.dumps(egress)
+                    for secret in (SECRET, TOKEN):
+                        assert secret not in rendered, "the egress section leaked a credential"
                     assert http.logins == count == 1, "query created another login instance"
                     if os.name == "nt":
                         self.run(["status", "--config", str(self.config).upper()])

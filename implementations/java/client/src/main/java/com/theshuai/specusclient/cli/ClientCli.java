@@ -21,7 +21,7 @@ public final class ClientCli {
     public static final String HELP = """
             Usage: java -jar specus-client-exec.jar [run] [options]
                    java -jar specus-client-exec.jar config validate|show --config PATH [--json]
-                   java -jar specus-client-exec.jar status|peers|services --config PATH [--json]
+                   java -jar specus-client-exec.jar status|peers|services|egress --config PATH [--json]
                    java -jar specus-client-exec.jar doctor --config PATH [--probe] [--json]
                    java -jar specus-client-exec.jar ui --config PATH [--no-open] [--port PORT]
 
@@ -36,6 +36,10 @@ public final class ClientCli {
               --probe              doctor only: 5-second server TCP probe; never authenticates
               --no-open            ui only: print local address without opening a browser
               --port PORT          ui only: loopback port, 0..65535 (default: random)
+
+            The egress command reports which of this node's egress rules are actually in force,
+            which routes were installed, and which were refused because something already owned
+            the prefix.
 
             Example:
               java -jar specus-client-exec.jar --config "/path with spaces/client.jsonc"
@@ -65,7 +69,7 @@ public final class ClientCli {
             command = args[1];
             i = 2;
         }
-        else if (args.length > 0 && java.util.Set.of("ui", "status", "peers", "services", "doctor").contains(args[0])) { command = args[0]; i = 1; }
+        else if (args.length > 0 && java.util.Set.of("ui", "status", "peers", "services", "egress", "doctor").contains(args[0])) { command = args[0]; i = 1; }
         for (; i < args.length; i++) {
             String arg = args[i];
             switch (arg) {
@@ -99,7 +103,7 @@ public final class ClientCli {
         if (probe && !command.equals("doctor")) throw new IllegalArgumentException("--probe is only valid for doctor");
         if ((noOpen || portSet) && !command.equals("ui")) throw new IllegalArgumentException("--no-open/--port are only valid for ui");
         if (command.equals("ui") && (json || debug || noUpdate) && !help && !version) throw new IllegalArgumentException("ui does not accept --json/--debug/update options");
-        if (json && command.equals("run") && !help && !version) throw new IllegalArgumentException("--json is for help/version/config/status/doctor/peers/services; use status --json to observe a running client");
+        if (json && command.equals("run") && !help && !version) throw new IllegalArgumentException("--json is for help/version/config/status/doctor/peers/services/egress; use status --json to observe a running client");
         return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe, noOpen, uiPort);
     }
 

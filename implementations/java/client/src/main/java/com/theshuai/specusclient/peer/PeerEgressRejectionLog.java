@@ -60,6 +60,16 @@ final class PeerEgressRejectionLog {
     }
 
     private Map<String, Long> counts = new LinkedHashMap<>();
+
+    /**
+     * The same tally for the status surface, which nothing resets.
+     *
+     * <p>Separate from {@link #counts} on purpose. That one belongs to the periodic report and is
+     * drained so consecutive reports describe consecutive intervals; a status reading it would
+     * answer "since whenever the last report went out", which is not a question anybody asked and
+     * changes meaning the day the report is wired up. Two counters cost a map.
+     */
+    private final Map<String, Long> cumulative = new LinkedHashMap<>();
     private final Map<Key, Bucket> recent = new LinkedHashMap<>();
     private long total;
     private boolean limited;
@@ -88,6 +98,7 @@ final class PeerEgressRejectionLog {
      */
     Decision record(long consumer, String code, long nowMs) {
         counts.merge(code, 1L, Long::sum);
+        cumulative.merge(code, 1L, Long::sum);
         total++;
 
         Key key = new Key(consumer, code);
@@ -141,6 +152,12 @@ final class PeerEgressRejectionLog {
      * reports describe consecutive intervals rather than a running sum the server has to
      * difference.
      */
+    /** The per-code totals since this runtime started. A copy; this log goes on counting. */
+    Map<String, Long> cumulativeCounts() {
+        return new LinkedHashMap<>(cumulative);
+    }
+
+    /** Drains the report's tally. The cumulative one above is deliberately left alone. */
     Map<String, Long> drainCounts() {
         if (counts.isEmpty()) {
             return Map.of();

@@ -17,6 +17,16 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
     private string _phase = "http-login";
     private bool _authenticated, _ready;
     private object[] _peers = [], _services = [];
+
+    /// <summary>
+    /// Where the egress section comes from, set once the mesh exists.
+    /// </summary>
+    /// <remarks>
+    /// Pulled at write time rather than pushed on change, unlike peers and services. Half of that
+    /// section is live -- flow counts and refusal tallies -- and a pushed copy would be as old as
+    /// the last mesh event, which on a quiet node is arbitrarily old.
+    /// </remarks>
+    internal Func<Dictionary<string, object?>>? EgressSource { get; set; }
     internal static string Root => Path.GetFullPath(Environment.GetEnvironmentVariable("SPECUS_CLI_STATE_DIR")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".specus-cli"));
     internal static string Prefix(string config) => "dotnet-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
@@ -52,8 +62,34 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
     internal Dictionary<string, object> Snapshot()
     {
         lock (_gate) return new() { ["phase"] = _phase, ["controlAuthenticated"] = _authenticated,
-            ["businessReady"] = _ready, ["peers"] = _authenticated ? _peers : [], ["services"] = _authenticated ? _services : [] };
+            ["businessReady"] = _ready, ["peers"] = _authenticated ? _peers : [], ["services"] = _authenticated ? _services : [],
+            ["egress"] = Egress() };
     }
+    /// <summary>
+    /// The egress section, or an empty object before the mesh exists.
+    /// </summary>
+    /// <remarks>
+    /// Reported whether or not control is authenticated, unlike peers and services. Those describe
+    /// what the server told us and are withheld until it has spoken; this describes this node's own
+    /// configuration and its own routing table, which are facts about this machine either way.
+    /// Withholding them would hide a rule that is not in force exactly when an operator is trying
+    /// to find out why nothing works.
+    ///
+    /// <para>A source that throws must not take the state file with it: a status that stopped being
+    /// published would cost an operator the peers and services sections too.</para>
+    /// </remarks>
+    private Dictionary<string, object?> Egress()
+    {
+        try
+        {
+            return EgressSource?.Invoke() ?? [];
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return new Dictionary<string, object?> { ["error"] = error.Message };
+        }
+    }
+
     internal static void CheckPrivate(string path)
     {
         if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) throw new IOException("State must not be a link/reparse point");
@@ -102,7 +138,8 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         lock (_gate) json = JsonSerializer.Serialize(new { schemaVersion = 1, configPath = _config, pid = Environment.ProcessId,
             processRunning = true, updatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), phase = _phase,
             controlAuthenticated = _authenticated, businessReady = _ready,
-            businessReadinessScope = "control/data authenticated; target reachability not tested", peers = _authenticated ? _peers : [], services = _authenticated ? _services : [] }, CliOutput.JsonOptions);
+            businessReadinessScope = "control/data authenticated; target reachability not tested", peers = _authenticated ? _peers : [], services = _authenticated ? _services : [],
+            egress = Egress() }, CliOutput.JsonOptions);
         var temporary = Path.Combine(Root, ".state-" + Guid.NewGuid().ToString("N"));
         try
         {

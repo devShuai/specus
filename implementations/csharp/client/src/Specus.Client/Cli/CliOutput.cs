@@ -35,6 +35,16 @@ internal static class CliOutput
         {
             text.AppendLine($"PID {row.GetProperty("pid")} | {row.GetProperty("phase").GetString()}");
             if (command == "status") text.AppendLine($"  control authenticated: {row.GetProperty("controlAuthenticated")} | forwarding ready: {row.GetProperty("businessReady")} (targets not probed)");
+            else if (command == "egress")
+            {
+                // Its own branch because the egress section is an object rather than a list, and
+                // because what a person needs from it is the problems rather than an item per entry.
+                foreach (var line in EgressView.Lines(
+                    row.TryGetProperty("egress", out var section) ? section : null))
+                {
+                    text.AppendLine(line);
+                }
+            }
             else
             {
                 var items = row.GetProperty(command);

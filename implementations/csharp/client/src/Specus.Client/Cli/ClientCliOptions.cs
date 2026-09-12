@@ -7,7 +7,7 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
     internal const string HelpText = """
         Usage: specus-client [run] [options]
                specus-client config validate|show --config PATH [--json]
-               specus-client status|peers|services --config PATH [--json]
+               specus-client status|peers|services|egress --config PATH [--json]
                specus-client doctor --config PATH [--probe] [--json]
                specus-client ui --config PATH [--no-open] [--port PORT]
 
@@ -51,7 +51,7 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
             command = args[1];
             i = 2;
         }
-        else if (args.FirstOrDefault() is "ui" or "status" or "peers" or "services" or "doctor") { command = args[0]; i = 1; }
+        else if (args.FirstOrDefault() is "ui" or "status" or "peers" or "services" or "egress" or "doctor") { command = args[0]; i = 1; }
         for (; i < args.Length; i++)
         {
             var arg = args[i];
@@ -93,7 +93,7 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
         if ((noOpen || portSet) && command != "ui") throw new ArgumentException("--no-open/--port are only valid for ui");
         if (command == "ui" && (json || debug || autoUpdate || noUpdate) && !help && !version) throw new ArgumentException("ui does not accept --json/--debug/update options");
         _ = Path.GetFullPath(path ?? "client.jsonc");
-        if (json && command == "run" && !help && !version) throw new ArgumentException("--json is for help/version/config/status/doctor/peers/services; use status --json to observe a running client");
+        if (json && command == "run" && !help && !version) throw new ArgumentException("--json is for help/version/config/status/doctor/peers/services/egress; use status --json to observe a running client");
         return new(path, command, help, version, autoUpdate, noUpdate, debug, json, probe, loginTimeout, noOpen, uiPort);
     }
 

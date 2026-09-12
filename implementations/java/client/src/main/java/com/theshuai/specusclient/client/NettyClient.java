@@ -86,6 +86,12 @@ public class NettyClient {
                 "publisher",s.publisherClientName(),"name",s.service().getName(),"application",s.service().getApplication(),
                 "accessTarget",com.theshuai.specusclient.cli.CliOutput.safeUrl(s.accessTarget()),"available",s.openable())).toList());
         if(!authenticated) { data.put("peers",java.util.List.of());data.put("services",java.util.List.of()); }
+        // Reported whether or not control is authenticated, unlike peers and services. Those
+        // describe what the mesh told us and are withheld until it has spoken; this describes this
+        // node's own configuration and its own routing table, which are facts about this machine
+        // either way. Withholding them would hide a rule that is not in force exactly when an
+        // operator is trying to find out why nothing works.
+        data.put("egress",peerMeshClient.egressStatus());
         return data;
     }
     private final AtomicReference<Channel> dataChannel = new AtomicReference<>();

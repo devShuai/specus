@@ -73,6 +73,16 @@ internal sealed class PeerEgressConsumer(
     /// them the egress would hold the socket until its own idle timer, and the user would see a
     /// connection that is dead at one end and open at the other.
     /// </remarks>
+    /// <summary>What an operator can read, for the status surface.</summary>
+    /// <remarks>
+    /// No lock here, for the same reason nothing else in this class has one: the caller serialises
+    /// access. Copies of the collections, because the caller is a diagnostic reader and this
+    /// consumer goes on mutating its own.
+    /// </remarks>
+    public PeerEgressConsumerStatus StatusSnapshot() => new(
+        _rules.ToList(), _meshCidr, new Dictionary<long, bool>(_online), _flows.Count,
+        new Dictionary<string, long>(_blocked));
+
     public IReadOnlyDictionary<long, IReadOnlyList<string>> Configure(
         IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs)
     {

@@ -173,6 +173,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     /// <summary>The egress data plane and its three joins with this client.</summary>
     private readonly PeerEgressMesh _egress;
 
+    /// <summary>The egress section of the diagnostic snapshot. See <see cref="PeerEgressStatus"/>.</summary>
+    internal Dictionary<string, object?> EgressStatus() => _egress.Status();
+
     /// <summary>What the egress plane needs from this client.</summary>
     private sealed class EgressHost(PeerMeshClient owner) : IPeerEgressMeshHost
     {
