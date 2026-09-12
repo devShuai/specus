@@ -24,6 +24,10 @@ internal static class PeerEgressRouteCommanders
         {
             return new WindowsPeerEgressRouteCommander(tun);
         }
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return new MacosPeerEgressRouteCommander(tun);
+        }
         return new UnsupportedPeerEgressRouteCommander();
     }
 }

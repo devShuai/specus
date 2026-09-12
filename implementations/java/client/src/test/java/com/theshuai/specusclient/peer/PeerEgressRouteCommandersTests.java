@@ -12,12 +12,12 @@ import java.util.Locale;
 import org.junit.jupiter.api.Test;
 
 /**
- * Which routing table this process ends up talking to, and what the Windows one refuses before it
- * talks to anything.
+ * Which routing table this process ends up talking to, and what the Windows and macOS ones refuse
+ * before they talk to anything.
  *
- * <p>These assertions are worth more than they look because CI runs the suite on both ubuntu and
- * windows: the two branches of the platform choice are each exercised for real, on the platform
- * they claim, rather than both being asserted from one machine's point of view.
+ * <p>These assertions are worth more than they look because CI runs the suite on ubuntu, windows
+ * and macOS: every branch of the platform choice is exercised for real, on the platform it claims,
+ * rather than all three being asserted from one machine's point of view.
  */
 class PeerEgressRouteCommandersTests {
 
@@ -34,12 +34,90 @@ class PeerEgressRouteCommandersTests {
             assertInstanceOf(LinuxPeerEgressRouteCommander.class, commander);
         } else if (name.contains("win")) {
             assertInstanceOf(WindowsPeerEgressRouteCommander.class, commander);
+        } else if (name.contains("mac") || name.contains("darwin")) {
+            assertInstanceOf(MacosPeerEgressRouteCommander.class, commander);
         } else {
-            // macOS and anything else: refusing beats installing nothing while reporting that
-            // the rules were applied, which would send every destination out locally.
+            // Anything else: refusing beats installing nothing while reporting that the rules
+            // were applied, which would send every destination out locally.
             assertInstanceOf(PeerEgressRouteCommanders.UnsupportedPeerEgressRouteCommander.class,
                     commander);
         }
+    }
+
+    /**
+     * The macOS commander refuses an argument the builders would refuse, before starting a process.
+     *
+     * <p>Runs on every platform: the check happens in shared code, ahead of anything that needs
+     * {@code route} to exist. The prefix that matters is 203.0.113.0/33 -- {@code route} accepts
+     * it, prints a success line naming 203.0.113.0, exits 0, and installs 128.0/1, which is half
+     * the IPv4 address space pointed at the gateway. Only the routing table says so, so this check
+     * is not defence in depth on this platform; it is the defence.
+     */
+    @Test
+    void theMacosCommanderRefusesAMalformedPrefixBeforeRunningAnything() {
+        var commander = new MacosPeerEgressRouteCommander("utun3");
+        for (String cidr : new String[] {"203.0.113.0/33", "203.0.113.0", "203.0.113.256/24",
+                "010.0.113.0/24", "-net", ""}) {
+            Route route = new Route(cidr, Kind.TUN, "rule:" + cidr);
+            assertTrue(assertThrows(IllegalArgumentException.class,
+                    () -> commander.install(route), cidr).getMessage().contains(REFUSAL),
+                    cidr + " install");
+            assertTrue(assertThrows(IllegalArgumentException.class,
+                    () -> commander.remove(route), cidr).getMessage().contains(REFUSAL),
+                    cidr + " remove");
+        }
+    }
+
+    /**
+     * On macOS, a prefix that is certainly taken is reported as taken.
+     *
+     * <p>Goes all the way to the operating system: it runs netstat, reads the whole table,
+     * normalises the destination column and finds the default route. Any machine with working
+     * networking has one, CI runners included; if this fails on a machine that has one, the reading
+     * is wrong rather than the assumption.
+     */
+    @Test
+    void onMacosTheDefaultRouteIsFoundAsAConflict() {
+        if (!isMacos()) {
+            return;
+        }
+        var commander = new MacosPeerEgressRouteCommander("utun3");
+        PeerEgressRouteInstaller.Conflict conflict = commander.conflict(
+                new Route("0.0.0.0/0", Kind.TUN, "rule:0.0.0.0/0"));
+        assertTrue(conflict.present(), "the default route was not reported as a conflict");
+        assertTrue(conflict.existing().startsWith("0.0.0.0/0 "),
+                "conflict describes " + conflict.existing() + " rather than the default route");
+        assertTrue(conflict.existing().contains("netif "),
+                "conflict description carries no interface: " + conflict.existing());
+    }
+
+    /**
+     * On macOS, an install that cannot work reports that rather than reporting success.
+     *
+     * <p>The most useful thing here that needs no privileges, and the one the Windows side has no
+     * equivalent of. {@code route} answers a non-root caller with "must be root to alter routing
+     * table" on stderr, exit 77, and nothing at all on stdout -- so this exercises the real binary,
+     * the real streams and the real classification, and it is the one case where a classifier that
+     * read only stdout would call the failure a success.
+     */
+    @Test
+    void onMacosAnInstallWithoutRootFailsRatherThanReportingSuccess() {
+        if (!isMacos() || "root".equals(System.getProperty("user.name", ""))) {
+            return;
+        }
+        var commander = new MacosPeerEgressRouteCommander("lo0");
+        Route route = new Route("203.0.113.0/24", Kind.TUN, "rule:203.0.113.0/24");
+        IOException failure = assertThrows(IOException.class, () -> commander.install(route));
+        assertTrue(failure.getMessage().contains("needs root"),
+                "install failed without naming the missing privilege: " + failure.getMessage());
+        // And the route is not there, which is the claim the error is making.
+        assertTrue(!commander.conflict(route).present(),
+                "203.0.113.0/24 was installed anyway");
+    }
+
+    private static boolean isMacos() {
+        String name = operatingSystem();
+        return name.contains("mac") || name.contains("darwin");
     }
 
     @Test

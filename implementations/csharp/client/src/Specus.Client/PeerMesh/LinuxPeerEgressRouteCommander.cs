@@ -120,12 +120,14 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
 }
 
 /// <summary>
-/// The platforms without route takeover: macOS, and anything else this runs on.
+/// The platforms without route takeover.
 /// </summary>
 /// <remarks>
-/// Refusing rather than doing nothing: a consumer that silently installed no routes would send
+/// Linux, Windows and macOS all have it now, so what is left is whatever else this runs on.
+///
+/// <para>Refusing rather than doing nothing: a consumer that silently installed no routes would send
 /// every destination out locally while reporting that its rules were applied, which is the leak
-/// this whole feature exists to prevent.
+/// this whole feature exists to prevent.</para>
 /// </remarks>
 internal sealed class UnsupportedPeerEgressRouteCommander : IPeerEgressRouteCommander
 {

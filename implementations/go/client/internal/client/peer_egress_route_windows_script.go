@@ -16,7 +16,11 @@ import (
 // why the file is not named with a _windows.go suffix, since that suffix is a build constraint on
 // its own and would have excluded exactly the code the shared vector exists to pin.
 
-// errEgressRouteArgument is returned for anything that would have to be escaped to be safe.
+// errEgressRouteArgument is returned for an argument no amount of quoting makes safe to use.
+//
+// Shared with the macOS builders, which refuse different things for different reasons: there is
+// no shell in an argv array, so what they are guarding against is a value that reads as an option
+// or as a prefix `route` interprets differently than we do.
 var errEgressRouteArgument = errors.New("refusing to build a route command from this argument")
 
 // quoteWindowsArgument wraps a validated argument.
