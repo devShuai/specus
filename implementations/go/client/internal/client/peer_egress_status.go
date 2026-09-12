@@ -78,16 +78,12 @@ type runtimeStatusSnapshot struct {
 func (r *egressRuntime) statusSnapshot() runtimeStatusSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	refused := make(map[string]int64, len(r.rejections.counts))
-	for code, count := range r.rejections.counts {
-		refused[code] = count
-	}
 	return runtimeStatusSnapshot{
 		Enabled:  r.enabled && !r.closed,
 		Revision: r.revision,
 		Flows:    r.flows.size(),
 		Stats:    r.stats,
-		Refused:  refused,
+		Refused:  r.rejections.cumulativeCounts(),
 	}
 }
 

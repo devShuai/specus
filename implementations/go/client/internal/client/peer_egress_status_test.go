@@ -197,6 +197,31 @@ func TestEgressStatusCountsRefusalsByCode(t *testing.T) {
 	}
 }
 
+// The refusal counts the status reports survive the report draining its own.
+//
+// Without this an implementation could read the report's map and pass every other case here, and
+// the status would quietly start answering "since the last report went out" the day the periodic
+// egress-report is wired up. Nothing calls drainCounts in production yet, which is exactly why the
+// coupling would go unnoticed.
+func TestEgressStatusRefusalsSurviveTheReportDrainingItsOwnCounts(t *testing.T) {
+	mesh := newEgressMeshHarness(t)
+	defer mesh.shutdownEgress()
+	runtime := mesh.ensureEgress()
+	runtime.mu.Lock()
+	runtime.rejections.record(5, egressCodeDestinationDenied, time.Now())
+	drained := runtime.rejections.drainCounts()
+	runtime.mu.Unlock()
+	if drained[egressCodeDestinationDenied] != 1 {
+		t.Fatalf("the report drained %#v, so this test is not exercising the drain", drained)
+	}
+
+	egress := mapSection(t, mesh.egressStatusJSON(), "egress")
+	refused, _ := egress["refused"].(map[string]int64)
+	if refused[egressCodeDestinationDenied] != 1 {
+		t.Errorf("refused = %#v; the status lost the refusal to the report's drain", refused)
+	}
+}
+
 func mapSection(t *testing.T, status map[string]any, key string) map[string]any {
 	t.Helper()
 	section, ok := status[key].(map[string]any)
