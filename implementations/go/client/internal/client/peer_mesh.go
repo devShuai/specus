@@ -150,6 +150,10 @@ type peerMeshClient struct {
 	egressDone         chan struct{}
 	egressConsumer     *egressConsumer
 	egressRoutes       *egressRouteInstaller
+	// egressApplied is what the last route apply left behind that cannot be recomputed later:
+	// which prefixes were refused because somebody else already owned them, and whether the
+	// whole plan had to be rolled back. Guarded by mu.
+	egressApplied egressApplyOutcome
 	// egressJournalPath overrides where the route journal lives. Empty means the real location
 	// beside the machine identity; tests set it so they never touch a user's own journal.
 	egressJournalPath string

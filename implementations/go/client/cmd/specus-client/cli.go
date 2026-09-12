@@ -12,7 +12,7 @@ import (
 
 const cliHelp = `Usage: specus-client [run] [options]
        specus-client config validate|show --config PATH [--json]
-       specus-client status|peers|services --config PATH [--json]
+       specus-client status|peers|services|egress --config PATH [--json]
        specus-client doctor --config PATH [--probe] [--json]
        specus-client ui --config PATH [--no-open] [--port PORT]
 
@@ -28,6 +28,9 @@ Options:
   --debug              Include diagnostic source locations and timestamps
   --no-open            ui only: print the local address without opening a browser
   --port PORT          ui only: loopback port, 0..65535 (default: automatic)
+
+The egress command reports which of this node's egress rules are actually in force, which
+routes were installed, and which were refused because something already owned the prefix.
 
 Examples:
   specus-client --config "/path with spaces/client.jsonc"
@@ -62,7 +65,7 @@ func parseCLI(args []string) (cliOptions, error) {
 		}
 		o.command = args[1]
 		args = args[2:]
-	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "doctor" || args[0] == "ui") {
+	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "egress" || args[0] == "doctor" || args[0] == "ui") {
 		o.command = args[0]
 		args = args[1:]
 	}

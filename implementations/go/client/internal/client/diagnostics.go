@@ -43,5 +43,11 @@ func (c *Client) DiagnosticSnapshot() map[string]any {
 		peers = []map[string]any{}
 		services = []map[string]any{}
 	}
-	return map[string]any{"phase": phase, "controlAuthenticated": control, "businessReady": ready, "businessReadinessScope": "control/data authenticated; target reachability not tested", "peers": peers, "services": services}
+	// The egress section is reported whether or not control is authenticated, unlike peers and
+	// services. Those describe what the mesh told us and are withheld until the mesh has spoken;
+	// the egress section describes this node's own configuration and its own routing table, which
+	// are facts about this machine either way. Withholding them would hide a rule that is not in
+	// force exactly when an operator is trying to find out why nothing works.
+	egress := c.peerMesh.egressStatusJSON()
+	return map[string]any{"phase": phase, "controlAuthenticated": control, "businessReady": ready, "businessReadinessScope": "control/data authenticated; target reachability not tested", "peers": peers, "services": services, "egress": egress}
 }
