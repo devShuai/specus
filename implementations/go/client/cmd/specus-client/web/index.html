@@ -24,6 +24,12 @@
       <section id="others-panel" class="panel" hidden><h2>其他实例 · 只读</h2><p>先从原终端停止同配置实例，才能在本页启动；本页不会接管或误停它们。</p><ul id="others"></ul></section>
       <div class="catalog-grid"><section class="panel"><div class="section-heading"><h2>在线设备</h2><span id="peers-count" class="count">0</span></div><p class="muted">来自当前控制通道的设备目录</p><ul id="peers" class="catalog"></ul></section>
       <section class="panel"><div class="section-heading"><h2>可访问服务</h2><span id="services-count" class="count">0</span></div><p class="muted">服务端下发，只读展示；未执行业务探测</p><ul id="services" class="catalog"></ul></section></div>
+      <section class="panel egress-panel" aria-labelledby="egress-title"><div class="section-heading"><h2 id="egress-title">出口分流</h2><span id="egress-problems" class="count">—</span></div>
+        <p id="egress-summary" class="muted">连接后显示本机分流规则是否生效。</p>
+        <ul id="egress-issues" class="catalog issues" aria-label="分流问题"></ul>
+        <p id="egress-role" class="egress-role"></p>
+        <p class="scope-note">只列出没有生效的部分，其余只计数。规则是否生效每次按本机校验重算；路由是否已安装来自上次下发时的系统路由表。</p>
+      </section>
     </section>
     <section id="settings" class="view" hidden><section class="panel settings-panel"><div class="section-heading"><h2>让这台设备接入</h2><button id="reload" type="button">重新载入</button></div><p>从服务端管理后台「接入凭证」获取 API Key 和 Secret。先校验保存，再主动连接。</p>
       <div class="config-path"><span>配置文件</span><code id="config-path"></code></div>

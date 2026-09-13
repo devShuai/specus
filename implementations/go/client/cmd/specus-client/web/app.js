@@ -69,7 +69,46 @@ function renderState(data) {
   $("others-panel").hidden = !others.length; $("others").replaceChildren(); for (const other of others) text($("others"), "li", "PID " + other.pid + " · " + other.phase + " · 不支持网页控制");
   catalog("peers", state.peers || [], state.controlAuthenticated ? "目录中暂无设备。" : "连接后显示设备；当前没有有效目录。", (li, item) => { text(li, "strong", item.clientName); text(li, "p", (item.virtualIp || "无虚拟地址") + " · " + (item.online ? "在线" : "离线")); });
   catalog("services", state.services || [], state.controlAuthenticated ? "尚未收到可访问服务，请检查服务端发布配置。" : "连接后显示服务，不主动扫描内网。", (li, item) => { text(li, "strong", item.name); text(li, "p", item.publisher + " · " + item.application + " · " + (item.available ? "目录允许访问，未探测" : "目录不可用")); text(li, "code", item.accessTarget); const button = text(li, "button", "复制访问地址"); button.disabled = !item.accessTarget; button.addEventListener("click", async () => { try { await navigator.clipboard.writeText(item.accessTarget); notice("已复制访问地址，未执行连通性探测。"); } catch { notice("浏览器未允许复制，请选择地址手动复制。"); } }); });
+  renderEgress(state);
   $("freshness").textContent = "本机状态更新于 " + new Date().toLocaleTimeString();
 }
-async function poll() { clearTimeout(timer); if (!token) return; try { lastState = await api("/api/status"); renderState(lastState); } catch (error) { lastState = null; notice(error.message); $("connection-title").textContent = "状态不可用"; $("connection-detail").textContent = "无法确认当前连接，请恢复管理服务后重试。"; $("freshness").textContent = "状态更新失败 · 旧状态不可作为当前在线证明"; document.querySelectorAll("[data-stage]").forEach(li => li.classList.remove("reached")); for (const id of ["peers", "services"]) catalog(id, [], "目录状态已过期，恢复连接后重新获取。", () => {}); document.querySelectorAll(".actions button").forEach(b => b.disabled = true); } if (token) timer = setTimeout(poll, 3000); }
+// Why a rule is not in force, in the words an operator configuring it needs. The code itself is
+// always shown next to this, because it is what the CLI and the logs print and what someone
+// searching for the problem will have in hand.
+const egressRuleReasons = {EGRESS_RULE_DEFAULT_ROUTE: "一期不接管默认路由", EGRESS_RULE_MESH_OVERLAP: "与组网虚拟网段重叠", EGRESS_RULE_MALFORMED: "规则格式不正确（含主机位非零）", EGRESS_RULE_MISSING_TARGET: "没有指定出口设备", EGRESS_RULE_DOMAIN_UNSUPPORTED: "一期不支持域名规则", EGRESS_RULE_IPV6_UNSUPPORTED: "一期不支持 IPv6 规则", EGRESS_RULE_PORT_UNSUPPORTED: "消费端规则不支持端口字段"};
+// Field readers that tolerate state written by another runtime: a wrong type reads as absent, so a
+// page never throws on a field somebody spelled differently.
+const list = value => Array.isArray(value) ? value.filter(item => item && typeof item === "object") : [];
+const count = value => typeof value === "number" && isFinite(value) ? value : 0;
+const counters = value => value && typeof value === "object" && !Array.isArray(value) ? Object.entries(value).filter(([, n]) => count(n) !== 0).sort(([a], [b]) => a < b ? -1 : 1).map(([name, n]) => name + "=" + n).join("，") : "";
+function issue(parent, title, detail, code, ok = false) { const li = document.createElement("li"); if (ok) li.className = "ok"; text(li, "strong", title); text(li, "p", detail); if (code) text(li, "code", code); parent.append(li); }
+// The egress section, following the same rule as the CLI: print what is not working and count the
+// rest. A rule that is configured but not in force, a route that was wanted and not installed, and
+// an egress device a rule names that is offline are the three ways this feature does nothing while
+// everything else looks healthy, so those are listed one by one and nothing that works is.
+function renderEgress(state) {
+  const section = state.egress && typeof state.egress === "object" ? state.egress : null, issues = $("egress-issues"), badge = $("egress-problems");
+  issues.replaceChildren(); badge.removeAttribute("data-problems");
+  if (!section) { badge.textContent = "—"; $("egress-summary").textContent = state.processRunning ? "当前运行版本没有提供分流状态。" : "连接后显示本机分流规则是否生效；未连接时不读取路由表。"; $("egress-role").textContent = ""; return; }
+  const consumer = section.consumer && typeof section.consumer === "object" ? section.consumer : {}, egress = section.egress && typeof section.egress === "object" ? section.egress : {};
+  let problems = 0;
+  if (consumer.active !== true) {
+    $("egress-summary").textContent = "未配置分流规则：所有流量照常从本机出去。";
+  } else {
+    const rules = list(consumer.rules), routes = list(consumer.routes), peers = list(consumer.peers);
+    const refused = rules.filter(rule => rule.inForce !== true), missing = routes.filter(route => route.installed !== true), offline = peers.filter(peer => peer.online !== true);
+    $("egress-summary").textContent = rules.length + " 条规则，" + refused.length + " 条未生效 · " + routes.length + " 条路由，" + missing.length + " 条未安装 · " + count(consumer.flows) + " 个流 · " + peers.length + " 个出口设备，" + offline.length + " 个离线";
+    for (const rule of refused) issue(issues, "规则 #" + count(rule.index) + "「" + (rule.match || "—") + "」未生效", (egressRuleReasons[rule.code] || "规则被拒绝") + "；这条规则现在不引导任何流量。", rule.code);
+    for (const route of missing) issue(issues, "路由 " + (route.cidr || "—") + " 未安装", "该前缀已被本功能之外的路由占用，本该进隧道的流量正从物理网卡出去：" + (route.conflict || "—"), route.origin);
+    for (const peer of offline) issue(issues, "出口设备 " + count(peer.clientId) + " 离线", "指向它的规则已经生效，但流量没有出口可发，会被丢弃而不是改走本机。");
+    if (typeof consumer.routeError === "string" && consumer.routeError) issue(issues, "路由下发失败", consumer.routeError + (consumer.rolledBack === true ? "（本次下发已整体回滚）" : ""));
+    problems = refused.length + missing.length + offline.length + (consumer.routeError ? 1 : 0);
+    if (!problems) issue(issues, "规则均已生效", "路由均已安装，指向的出口设备均在线。", "", true);
+    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "因规则而没有放行的流量，按原因分别计数。", blocked, !problems);
+  }
+  badge.textContent = problems ? problems + " 个问题" : "正常"; if (problems) badge.dataset.problems = String(problems);
+  const refusedByEgress = counters(egress.refused);
+  $("egress-role").textContent = egress.active === true ? "本机正在作为出口 · " + count(egress.flows) + " 个流 · 累计 " + count(egress.totalFlows) + " 个" + (refusedByEgress ? " · 拒绝：" + refusedByEgress : "") : "本机未作为出口（尚无策略启用）";
+}
+async function poll() { clearTimeout(timer); if (!token) return; try { lastState = await api("/api/status"); renderState(lastState); } catch (error) { lastState = null; notice(error.message); $("connection-title").textContent = "状态不可用"; $("connection-detail").textContent = "无法确认当前连接，请恢复管理服务后重试。"; $("freshness").textContent = "状态更新失败 · 旧状态不可作为当前在线证明"; document.querySelectorAll("[data-stage]").forEach(li => li.classList.remove("reached")); for (const id of ["peers", "services"]) catalog(id, [], "目录状态已过期，恢复连接后重新获取。", () => {}); $("egress-issues").replaceChildren(); $("egress-problems").textContent = "—"; $("egress-problems").removeAttribute("data-problems"); $("egress-summary").textContent = "分流状态已过期，不能作为规则仍然生效的证明。"; $("egress-role").textContent = ""; document.querySelectorAll(".actions button").forEach(b => b.disabled = true); } if (token) timer = setTimeout(poll, 3000); }
 if (bootstrap) unlock(bootstrap);
