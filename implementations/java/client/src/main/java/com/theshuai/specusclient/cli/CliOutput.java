@@ -39,6 +39,11 @@ public final class CliOutput {
             text.append("PID ").append(row.path("pid").asLong()).append(" | ").append(row.path("phase").asText()).append('\n');
             if(command.equals("status")) text.append("  control authenticated: ").append(row.path("controlAuthenticated"))
                     .append(" | forwarding ready: ").append(row.path("businessReady")).append(" (targets not probed)\n");
+            else if(command.equals("egress")) {
+                // Its own branch because the egress section is an object rather than a list, and
+                // because what a person needs from it is the problems rather than an item per entry.
+                for(String line:EgressView.lines(row.path("egress"))) text.append(line).append('\n');
+            }
             else {
                 if(row.path(command).isEmpty()) text.append("  No entries. Check status for channel readiness.\n");
                 for(var item:row.path(command)) {

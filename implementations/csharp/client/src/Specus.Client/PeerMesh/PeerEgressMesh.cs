@@ -110,6 +110,12 @@ internal sealed class PeerEgressMesh(
     private PeerEgressRuntime? _runtime;
     private PeerEgressConsumer? _consumer;
     private PeerEgressRouteInstaller? _routes;
+
+    /// <summary>
+    /// What the last route apply left behind that cannot be recomputed: which prefixes were
+    /// refused because somebody else already owned them, and whether the plan was rolled back.
+    /// </summary>
+    private volatile PeerEgressApplyOutcome _applied = PeerEgressApplyOutcome.None;
     private Thread? _sendLoop;
     private Thread? _tickLoop;
     private Thread? _deviceLoop;
@@ -351,6 +357,28 @@ internal sealed class PeerEgressMesh(
     /// at once, and refusing to apply any of it would leave a user with one typo sending everything
     /// out locally, which is the failure this feature exists to prevent.
     /// </remarks>
+    /// <summary>The egress section of the diagnostic snapshot.</summary>
+    /// <remarks>
+    /// The consumer's half is read under this mesh's gate because the consumer has no lock of its
+    /// own; the runtime's half takes the runtime's own lock.
+    /// </remarks>
+    public Dictionary<string, object?> Status()
+    {
+        var consumerRole = _consumer;
+        var installer = _routes;
+        var plane = _runtime;
+        PeerEgressConsumerStatus? consumerStatus = null;
+        if (consumerRole is not null)
+        {
+            lock (_gate)
+            {
+                consumerStatus = consumerRole.StatusSnapshot();
+            }
+        }
+        return PeerEgressStatus.Section(consumerStatus,
+            installer?.Installed ?? [], _applied, plane?.StatusSnapshot());
+    }
+
     public void ApplyRules(IReadOnlyList<PeerEgressRule> rules)
     {
         var consumerRole = EnsureConsumer();
@@ -367,6 +395,13 @@ internal sealed class PeerEgressMesh(
 
         var installer = EnsureRouteInstaller();
         var result = installer.Apply(plan.Routes);
+        // Remembered before it is logged. A conflict is the one part of this outcome nothing can
+        // recompute -- the answer came from the platform's routing table at this moment -- and
+        // writing it only to the log is what left an operator with no way to see that a rule they
+        // wrote is not in force.
+        _applied = new PeerEgressApplyOutcome(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            result.Conflicts.ToList(), result.Error?.Message ?? string.Empty, result.RolledBack,
+            true);
         foreach (var conflict in result.Conflicts)
         {
             // Not preempted and not compared by metric. The operator is told which of their own

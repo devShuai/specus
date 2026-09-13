@@ -226,6 +226,14 @@ func (installer *egressRouteInstaller) forget(route egressRoute) {
 
 // owns reports whether a prefix is one of ours, which is what keeps a conflict check from treating
 // this feature's own route as somebody else's.
+// installedRoutes is what this feature currently believes it owns, for the status surface.
+//
+// A copy, because the caller is a diagnostic reader and the installer goes on mutating its own
+// slice. Returned in journal order, which is the order they were installed.
+func (installer *egressRouteInstaller) installedRoutes() []egressRoute {
+	return append([]egressRoute(nil), installer.installed...)
+}
+
 func (installer *egressRouteInstaller) owns(cidr string) bool {
 	for _, route := range installer.installed {
 		if route.CIDR == cidr {

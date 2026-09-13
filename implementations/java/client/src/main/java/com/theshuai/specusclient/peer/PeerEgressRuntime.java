@@ -157,6 +157,22 @@ final class PeerEgressRuntime {
         }
     }
 
+    /**
+     * What an operator can read about this node serving as an egress.
+     *
+     * <p>The refusal counts come from the cumulative tally rather than the one the periodic report
+     * drains, so the numbers do not start shrinking on their own the day that report is wired up.
+     */
+    PeerEgressStatus.RuntimeSnapshot statusSnapshot() {
+        lock.lock();
+        try {
+            return new PeerEgressStatus.RuntimeSnapshot(enabled, revision, flows.size(),
+                    new Stats(totalFlows, bytesIn, bytesOut), rejections.cumulativeCounts());
+        } finally {
+            lock.unlock();
+        }
+    }
+
     int flowCount() {
         lock.lock();
         try {

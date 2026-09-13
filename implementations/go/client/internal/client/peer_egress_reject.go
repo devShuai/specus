@@ -40,7 +40,14 @@ type egressRejectionBucket struct {
 }
 
 type egressRejectionLog struct {
-	counts  map[string]int64
+	counts map[string]int64
+	// cumulative is the same tally for the status surface, and nothing resets it.
+	//
+	// Separate from counts on purpose. counts belongs to the periodic report and is drained so
+	// that consecutive reports describe consecutive intervals; a status reading that same map
+	// would answer "since whenever the last report went out", which is not a question anybody
+	// asked and changes meaning the day the report is wired up. Two counters cost a map.
+	cumulative map[string]int64
 	recent  map[egressRejectionKey]*egressRejectionBucket
 	total   int64
 	limited bool
@@ -48,8 +55,9 @@ type egressRejectionLog struct {
 
 func newEgressRejectionLog() *egressRejectionLog {
 	return &egressRejectionLog{
-		counts: make(map[string]int64),
-		recent: make(map[egressRejectionKey]*egressRejectionBucket),
+		counts:     make(map[string]int64),
+		cumulative: make(map[string]int64),
+		recent:     make(map[egressRejectionKey]*egressRejectionBucket),
 	}
 }
 
@@ -61,6 +69,7 @@ func newEgressRejectionLog() *egressRejectionLog {
 // no report, since it would look like the refusals stopped.
 func (l *egressRejectionLog) record(consumer int64, code string, now time.Time) (bool, int64) {
 	l.counts[code]++
+	l.cumulative[code]++
 	l.total++
 
 	key := egressRejectionKey{consumer: consumer, code: code}
@@ -103,8 +112,20 @@ func (l *egressRejectionLog) sweep(now time.Time) {
 	}
 }
 
+// cumulativeCounts returns the per-code totals since this runtime started, for the status surface.
+//
+// A copy, because the caller is a diagnostic reader and this log goes on counting.
+func (l *egressRejectionLog) cumulativeCounts() map[string]int64 {
+	counts := make(map[string]int64, len(l.cumulative))
+	for code, count := range l.cumulative {
+		counts[code] = count
+	}
+	return counts
+}
+
 // drainCounts returns the per-code totals for one egress-report and resets them, so consecutive
 // reports describe consecutive intervals rather than a running sum the server has to difference.
+// The cumulative tally above is deliberately not reset here.
 func (l *egressRejectionLog) drainCounts() map[string]int64 {
 	if len(l.counts) == 0 {
 		return nil

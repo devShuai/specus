@@ -390,6 +390,11 @@ public class PeerMeshClient implements AutoCloseable {
         return serviceRuntime;
     }
 
+    /** The egress section of the diagnostic snapshot. See {@link PeerEgressStatus}. */
+    public java.util.Map<String,Object> egressStatus() {
+        return egress.status();
+    }
+
     public java.util.List<java.util.Map<String,Object>> diagnosticPeers() {
         return peerIndex.byId().values().stream().map(p -> {
             java.util.Map<String,Object> view=new java.util.LinkedHashMap<>();

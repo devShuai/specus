@@ -67,6 +67,13 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _observer = observer;
         _connectionFactory = new ControlConnectionFactory(config);
         _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>(), observer);
+        // The status surface reads the egress section straight from the mesh rather than waiting
+        // to be pushed one, because half that section is live. Set here because this is where the
+        // mesh comes into existence and the observer is already in hand.
+        if (observer is Cli.CliState state)
+        {
+            state.EgressSource = _peerMesh.EgressStatus;
+        }
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<SpecusControlClient>();
     }

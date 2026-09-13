@@ -56,6 +56,15 @@ internal sealed class PeerEgressRejectionLog
     }
 
     private Dictionary<string, long> _counts = [];
+
+    /// <summary>The same tally for the status surface, which nothing resets.</summary>
+    /// <remarks>
+    /// Separate from <c>_counts</c> on purpose. That one belongs to the periodic report and is
+    /// drained so consecutive reports describe consecutive intervals; a status reading it would
+    /// answer "since whenever the last report went out", which is not a question anybody asked and
+    /// changes meaning the day the report is wired up. Two counters cost a dictionary.
+    /// </remarks>
+    private readonly Dictionary<string, long> _cumulative = [];
     private readonly Dictionary<Key, Bucket> _recent = [];
 
     /// <summary>How many refusals the current interval has seen, across every code.</summary>
@@ -78,6 +87,7 @@ internal sealed class PeerEgressRejectionLog
     public Decision Record(long consumer, string code, long nowMs)
     {
         _counts[code] = _counts.GetValueOrDefault(code) + 1;
+        _cumulative[code] = _cumulative.GetValueOrDefault(code) + 1;
         Total++;
 
         var key = new Key(consumer, code);
@@ -139,6 +149,11 @@ internal sealed class PeerEgressRejectionLog
     /// reports describe consecutive intervals rather than a running sum the server has to
     /// difference.
     /// </summary>
+    /// <summary>The per-code totals since this runtime started. A copy; this log goes on counting.</summary>
+    public IReadOnlyDictionary<string, long> CumulativeCounts() =>
+        new Dictionary<string, long>(_cumulative);
+
+    /// <summary>Drains the report's tally. The cumulative one above is deliberately left alone.</summary>
     public IReadOnlyDictionary<string, long> DrainCounts()
     {
         if (_counts.Count == 0)

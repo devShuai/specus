@@ -53,7 +53,8 @@ func runCLI(args []string) int {
 		fmt.Fprint(os.Stderr, printCLIError(err))
 		return 2
 	}
-	if options.command == "status" || options.command == "peers" || options.command == "services" {
+	if options.command == "status" || options.command == "peers" || options.command == "services" ||
+		options.command == "egress" {
 		return queryState(options, path)
 	}
 	if options.command == "ui" {

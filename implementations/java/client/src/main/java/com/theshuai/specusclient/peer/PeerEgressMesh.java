@@ -101,6 +101,12 @@ final class PeerEgressMesh implements AutoCloseable {
     private volatile PeerEgressConsumer consumer;
     private volatile PeerEgressRouteInstaller routes;
 
+    /**
+     * What the last route apply left behind that cannot be recomputed: which prefixes were refused
+     * because somebody else already owned them, and whether the plan had to be rolled back.
+     */
+    private volatile PeerEgressStatus.ApplyOutcome applied = PeerEgressStatus.ApplyOutcome.none();
+
     PeerEgressMesh(Host host) {
         this(host, new PeerEgressSocketDialer(), null);
     }
@@ -279,6 +285,27 @@ final class PeerEgressMesh implements AutoCloseable {
      * all at once, and refusing to apply any of it would leave a user with one typo sending
      * everything out locally, which is the failure this feature exists to prevent.
      */
+    /**
+     * The egress section of the diagnostic snapshot.
+     *
+     * <p>The consumer's half is read under this monitor because the consumer has no lock of its
+     * own; the runtime's half takes the runtime's own lock.
+     */
+    public Map<String, Object> status() {
+        PeerEgressConsumer consumerRole = consumer;
+        PeerEgressRouteInstaller installer = routes;
+        PeerEgressRuntime plane = runtime;
+        PeerEgressStatus.ConsumerSnapshot consumerSnapshot = null;
+        if (consumerRole != null) {
+            synchronized (this) {
+                consumerSnapshot = consumerRole.statusSnapshot();
+            }
+        }
+        return PeerEgressStatus.section(consumerSnapshot,
+                installer == null ? List.of() : installer.installed(), applied,
+                plane == null ? null : plane.statusSnapshot());
+    }
+
     void applyRules(List<PeerEgressRule> rules) {
         PeerEgressConsumer consumerRole = ensureConsumer();
         String meshCidr = meshCidrOrDefault();
@@ -294,6 +321,14 @@ final class PeerEgressMesh implements AutoCloseable {
 
         PeerEgressRouteInstaller installer = ensureRouteInstaller();
         PeerEgressRouteInstaller.ApplyResult result = installer.apply(plan.routes());
+        // Remembered before it is logged. A conflict is the one part of this outcome nothing can
+        // recompute -- the answer came from the platform's routing table at this moment -- and
+        // writing it only to the log is what left an operator with no way to see that a rule they
+        // wrote is not in force.
+        applied = new PeerEgressStatus.ApplyOutcome(System.currentTimeMillis(),
+                List.copyOf(result.conflicts()),
+                result.error() == null ? "" : String.valueOf(result.error().getMessage()),
+                result.rolledBack(), true);
         for (PeerEgressRouteInstaller.RouteConflict conflict : result.conflicts()) {
             // Not preempted and not compared by metric. The operator is told which of their own
             // routes is in the way, so they can decide rather than discover it later.

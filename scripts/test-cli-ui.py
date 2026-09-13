@@ -145,9 +145,19 @@ def run(command, name, browser_enabled, output, peers=()):
                 assert not request("/api/status", token=token)["runtime"]["businessReady"]
                 wait_for(lambda: request("/api/status", token=token)["runtime"]["businessReady"])
                 assert auth.logins == 1 and auth.updates == 0
+                # The page's egress panel reads this section, and the page is one file all three
+                # runtimes serve, so every runtime has to put it there. Checked through the UI's own
+                # status route rather than the CLI's state file: the two are wired separately, and
+                # .NET in particular pulls the section through a delegate that only the running
+                # client sets.
+                egress = request("/api/status", token=token)["runtime"].get("egress")
+                assert isinstance(egress, dict), "the UI status carries no egress section"
+                for half in ("consumer", "egress"):
+                    assert isinstance(egress.get(half), dict) and isinstance(egress[half].get("active"), bool),                         f"the UI status egress.{half} is malformed"
+                assert b"renderEgress" in wire("GET", "/app.js") and b"egress-panel" in wire("GET", "/"),                     "the served page predates the egress panel"
                 request("/api/connection", dict(action="stop", revision=saved["revision"]), token)
                 assert not request("/api/status", token=token)["runtime"]["processRunning"]
-                checks += 4
+                checks += 6
 
                 # Rejection and a cancelled in-flight HTTP login must leave management alive.
                 auth.status = 403

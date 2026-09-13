@@ -160,6 +160,12 @@ func queryState(options cliOptions, config string) int {
 		lines = append(lines, fmt.Sprintf("PID %.0f | %v", row["pid"], row["phase"]))
 		if options.command == "status" {
 			lines = append(lines, fmt.Sprintf("  control authenticated: %v | forwarding ready: %v (targets not probed)", row["controlAuthenticated"], row["businessReady"]))
+		} else if options.command == "egress" {
+			// Its own branch because the egress section is an object rather than a list,
+			// and because what a person needs from it is the problems rather than an
+			// item per entry.
+			section, _ := row["egress"].(map[string]any)
+			lines = append(lines, egressLines(section)...)
 		} else {
 			items, _ := row[options.command].([]any)
 			if len(items) == 0 {

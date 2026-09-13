@@ -280,6 +280,22 @@ func (mesh *peerMeshClient) applyEgressRules(rules []egressRule, runtime Runtime
 		return
 	}
 	result := installer.apply(desired)
+	// Remembered before it is logged. A conflict is the one part of this outcome nothing can
+	// recompute -- the answer came from the platform's routing table at this moment -- and
+	// writing it only to the log is what left an operator with no way to see that a rule they
+	// wrote is not in force.
+	outcome := egressApplyOutcome{
+		At:         time.Now(),
+		Conflicts:  append([]egressRouteConflict(nil), result.Conflicts...),
+		RolledBack: result.RolledBack,
+		Applied:    true,
+	}
+	if result.Err != nil {
+		outcome.Err = result.Err.Error()
+	}
+	mesh.mu.Lock()
+	mesh.egressApplied = outcome
+	mesh.mu.Unlock()
 	for _, conflict := range result.Conflicts {
 		// Not preempted and not compared by metric. The operator is told which of their own
 		// routes is in the way, so they can decide rather than discover it later.
