@@ -41,3 +41,37 @@ func TestConfigDiagnosticsAcceptsCaseInsensitiveKeysAndEscapesNames(t *testing.T
 		t.Fatalf("unexpected warnings: %q", warnings)
 	}
 }
+
+// A configuration that uses peerEgressRules is not told the field is unknown, and each rule that will
+// not be in force is named by index and code without its match.
+//
+// The unknown-field half is the one that was wrong: the field is omitempty, so it was missing from
+// the list of known fields and every such configuration was told its rules were ignored.
+func TestConfigWarningsKnowEgressRulesAndNameTheOnesNotInForce(t *testing.T) {
+	data := []byte(`{"peerEgressRules":[
+		{"match":"203.0.113.0/24","action":"egress","egressClientId":42},
+		{"match":"0.0.0.0/0","action":"egress","egressClientId":42},
+		{"match":"example.com","action":"egress","egressClientId":42}]}`)
+	var config Config
+	if err := unmarshalJSONC(data, &config); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var warnings []string
+	configWarnings(data, config, func(w string) { warnings = append(warnings, w) })
+
+	joined := strings.Join(warnings, " | ")
+	if strings.Contains(joined, "Unknown configuration field") {
+		t.Errorf("peerEgressRules was reported as unknown: %q", joined)
+	}
+	for _, want := range []string{
+		"peerEgressRules[1] is not in force: " + egressCodeRuleDefaultRoute,
+		"peerEgressRules[2] is not in force: " + egressCodeRuleDomainUnsupported,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing warning %q in %q", want, joined)
+		}
+	}
+	if strings.Contains(joined, "peerEgressRules[0]") || strings.Contains(joined, "example.com") {
+		t.Errorf("a usable rule was named or a match was printed: %q", joined)
+	}
+}

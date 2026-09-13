@@ -142,6 +142,38 @@ class Matrix:
         self.config.write_text(json.dumps(dict(serverBaseUrl=url, apiKey="CLI_TEST_KEY_MUST_NOT_LEAK",
             secret="env:CLI_TEST_SECRET", peerMeshMtu=9999, updateCheckIntervalHours=9999)), encoding="utf-8")
 
+    def egress_rule_warnings(self, url):
+        # A rule that will not be in force has to be named before anything connects, in the same
+        # words by every runtime, as a warning rather than a failure, and without printing the
+        # rule's match: configuration warnings do not print configuration values.
+        rules = [
+            dict(match="203.0.113.0/24", action="egress", egressClientId=42),
+            dict(match="0.0.0.0/0", action="egress", egressClientId=42),
+            dict(match="example.com", action="egress", egressClientId=42),
+            dict(match="2001:db8::/32", action="egress", egressClientId=42),
+            dict(match="100.96.0.0/12", action="egress", egressClientId=42),
+            dict(match="198.51.100.0/24", action="egress"),
+        ]
+        path = self.directory / "egress rules.jsonc"
+        path.write_text(json.dumps(dict(serverBaseUrl=url, apiKey="CLI_TEST_KEY_MUST_NOT_LEAK",
+            secret="env:CLI_TEST_SECRET", peerEgressRules=rules)), encoding="utf-8")
+        result = subprocess.run(self.command + ["config", "validate", "--config", str(path)], cwd=self.directory,
+                                env=self.env, capture_output=True, timeout=20)
+        err = result.stderr.decode("utf-8", "replace")
+        assert result.returncode == 0, ("a refused egress rule failed the whole configuration", err)
+        expected = ["peerEgressRules[1] is not in force: EGRESS_RULE_DEFAULT_ROUTE",
+                    "peerEgressRules[2] is not in force: EGRESS_RULE_DOMAIN_UNSUPPORTED",
+                    "peerEgressRules[3] is not in force: EGRESS_RULE_IPV6_UNSUPPORTED",
+                    "peerEgressRules[4] is not in force: EGRESS_RULE_MESH_OVERLAP",
+                    "peerEgressRules[5] is not in force: EGRESS_RULE_MISSING_TARGET"]
+        for line in expected:
+            assert line in err, ("missing egress rule warning", line, err)
+        assert "peerEgressRules[0]" not in err, ("a usable rule was warned about", err)
+        assert "Unknown configuration field" not in err, ("peerEgressRules treated as unknown", err)
+        for match in ("example.com", "2001:db8", "100.96.0.0/12"):
+            assert match not in err, ("a configuration value was printed in a warning", match)
+        self.checks += 1
+
     def run(self, args, code=0, machine=True):
         command = self.command + args + (["--json"] if machine else [])
         result = subprocess.run(command, cwd=self.directory, env=self.env, capture_output=True, timeout=20)
@@ -257,6 +289,7 @@ class Matrix:
                 self.fixture("http://127.0.0.1:" + str(http.server_port))
                 cfg = ["--config", str(self.config)]
                 self.run(["config", "validate"] + cfg)
+                self.egress_rule_warnings("http://127.0.0.1:" + str(http.server_port))
                 shown = self.run(["config", "show"] + cfg)["data"]["config"]
                 assert shown["apiKey"] == shown["secret"] == "<redacted>"
                 assert shown["peerMeshMtu"] == 1280 and shown["updateCheckIntervalHours"] == 168
