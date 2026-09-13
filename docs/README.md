@@ -14,6 +14,8 @@
 ## peer-mesh/ — 私有组网与 NAT 打洞
 
 * [peer-mesh-implementation.md](peer-mesh/peer-mesh-implementation.md) — peer mesh 实现全貌、部署开关与验收步骤。
+* [peer-egress-usage.md](peer-mesh/peer-egress-usage.md) — 出口分流使用说明：服务端启用出口、消费端写规则、用 `egress` 命令与本地管理页确认生效、排查表与一期限制。
+* [peer-egress-split-routing-plan.md](peer-mesh/peer-egress-split-routing-plan.md) — 出口分流设计方案与推演过程；实际行为以协议规范为准。
 * [peer-mesh-mobile-plan.md](peer-mesh/peer-mesh-mobile-plan.md) — Android/iOS 目标方案与当前 Android 实现偏差说明。
 * [peer-mesh-java-client-audit-fixes.md](peer-mesh/peer-mesh-java-client-audit-fixes.md) — Java 客户端打洞审计与修复记录(2026-07),含成功率观测方法。
 * [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞历史调研（基线 `57f1a67`）。

@@ -23,6 +23,7 @@ dotnet specus-client.dll ui --config ./client.jsonc --no-open
 - “连接 / 断开 / 重新连接”只操作本管理进程创建的对应语言运行时。发现其他 CLI 进程的同配置新鲜状态时只读展示并阻止额外连接；不假装既有状态快照具备控制能力，不会停止其他进程。三端 `ui` 共享同配置管理锁；该锁不能排他锁定不遵守管理锁的旧 `run` 进程，不要同时从另一终端启动相同配置。
 - 管理页本身不会登录、探测内网或启动更新器。关闭浏览器不停止隧道；终端 Ctrl+C 退出管理并断开其拥有的连接。每个配置只允许一个 `ui` 管理进程；崩溃留下的 `.specus-cli/*ui.lock` 包含 PID，先确认进程已退出再手工移除，不能对运行中的进程强行清锁。
 - HTTP / 控制认证 / 数据通道就绪分开呈现；设备与服务来自目录，不代表已探测目标。管理服务不可达时清除页面的在线标记，避免旧状态冒充当前状态。
+- 「连接与服务」页的**出口分流**面板显示与 `egress` 命令相同的内容：逐条列出没生效的规则、没装上的路由、离线的出口设备和路由下发错误，其余只计数；本机是否正作为出口及其拒绝计数。管理服务不可达时面板清空并注明已过期。面板只读，规则在配置文件里修改。未连接时不读取路由表。
 
 本地端点需要随机会话凭证，严格校验 Host/Origin；写操作还要求 JSON 与自定义请求头。静态资源嵌入二进制，无 CDN/Node 运行依赖。仅供同一用户的本机管理，不提供公网访问参数、任意文件读写、命令执行、远程接管或自启动安装。首批不提供日志浏览、主动诊断按钮和互传页面；完整安全边界及剩余范围见 [本地页面契约](architecture/cli-local-ui.md)。
 
@@ -56,6 +57,7 @@ Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus
 | 运行状态 | `status --config PATH` | 列出同一配置的本实现所有活跃 CLI 实例和连接阶段；不读取配置内容 |
 | 在线设备 | `peers --config PATH` | 已连接控制通道收到的 Peer 名称、虚拟 IP 和在线状态；不扫描网络 |
 | 访问地址 | `services --config PATH` | 已收到的远端 Peer 服务目录、访问地址与可用标记；不枚举尚未发布的后台配置 |
+| 出口分流 | `egress --config PATH` | 本机出口分流状态：哪些规则在生效、哪些路由装上了、哪些被拒及原因、出口设备是否在线、本机是否正作为出口。只读，不连接服务端 |
 | 离线排错 | `doctor --config PATH` | 检查配置与密钥引用，不联网 |
 | 主动排错 | `doctor --probe --config PATH` | 最多 5 秒的服务端 DNS/TCP 探测；不发送登录、不校验 TLS、不探测转发目标 |
 | 机器输出 | 上述单次命令加 `--json` | stdout 只有一个版本化 JSON 文档，日志/警告仍写 stderr；帮助/版本也支持 |
@@ -83,6 +85,7 @@ java -jar specus-client-exec.jar --config "/etc/specus/client.jsonc"
 - 未知字段继续兼容性忽略，但提示字段名称；包括 `controlTls` 等当前实现支持的嵌套对象。
 - 明确配置的 `peerMeshMtu` 或 `updateCheckIntervalHours` 被修正时，提示最终数值。默认 MTU 1280、范围 576–1280；默认更新间隔 24 小时、范围 1–168 小时。
 - Go 不使用 `openUpdatePage`；.NET 不使用 `upstreamTls` / `openUpdatePage`，出现时提示跨端差异。Java 接受 `autoUpdate: true`，但明确提示仅通知、不自动安装。
+- `peerEgressRules` 中不会生效的规则逐条提示 `peerEgressRules[<序号>] is not in force: <错误码>`，三端逐字一致；不打印规则内容，也不导致校验失败——运行时同样跳过被拒的规则、其余照常生效。重叠检查按默认组网网段 `100.96.0.0/11`，与服务端自定义网段的重叠要连上后才发现。
 - 警告不打印配置值或解析后的密钥。`config show` 将 apiKey、secret（包括引用文本）整体替换为 `<redacted>`，删除 serverBaseUrl 的用户名、密码、查询串和片段；不修改源配置。`controlTls.enabled: null` 表示登录后再按服务端 TLS 标记解析，不代表已确认禁用 TLS。
 
 ## 首次 HTTP 登录与重连
@@ -117,6 +120,8 @@ Go 的首次更新检查与隧道并行，Go/.NET 自动检查发现更新时只
 目录及文件必须为当前用户私有：Unix 目录 0700、文件 0600；Windows 限制 ACL 为当前用户。读取拒绝符号链接/reparse point 和宽权限路径；权限检查失败不会退回公共 HTTP 监听。Go Windows 用系统 PowerShell 的 .NET ACL API，不依赖用户 profile 或安全模块自动加载。状态写入临时文件后原子替换；不包含凭据、令牌、密钥、候选连接凭据或消息正文。
 
 每秒发布一次，超过 5 秒、PID 已退出、路径/格式版本不匹配的记录不作为在线状态。正常退出删除自己的状态文件；崩溃遗留文件被忽略。单文件限制 1 MiB，同一配置最多检查 256 个文件；长期大量崩溃造成超限时，可停止实例后清理该配置的遗留状态文件。
+
+`egress.data.instances[].egress` 是出口分流状态，形状由 [peer-egress.md 的状态查询](../protocol/spec/peer-egress.md#状态查询) 定义：`consumer.rules[].inForce` 与 `code` 说明每条规则是否生效，`consumer.routes[].installed` 与 `conflict` 说明路由是否装上、被谁占用，`consumer.blocked` 与 `egress.refused` 按原因计数。这一段不随控制通道认证状态隐藏，因为它描述的是本机配置与本机路由表。人类可读输出只逐条列出有问题的部分。使用与排查见 [出口分流使用说明](peer-mesh/peer-egress-usage.md)。
 
 `status.data.instances` 区分 `processRunning`、`phase`、`controlAuthenticated`、`businessReady`。这里 businessReady **仅表示控制/专用数据通道就绪，可以受理转发**，不是远端目标服务可达证明；`businessReadinessScope` 明确标明未探测目标。peers/services 返回 `catalogAvailable`，控制通道断开时不再把缓存列表作为当前在线目录输出。services 的 available 表示目录允许访问，不代表已经执行 HTTP/业务健康检查。
 

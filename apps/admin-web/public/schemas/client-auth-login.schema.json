@@ -104,6 +104,39 @@
         }
       }
     },
+    "ClientEgressCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Peer 出口分流能力。服务端只向 version >= 1 的会话下发 egress-config 与 egress-catalog。",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "出口分流协议版本，当前为 1。0 或缺省表示不支持出口。"
+        },
+        "consumerCapable": {
+          "type": "boolean",
+          "default": false,
+          "description": "本平台能否接管路由、作为消费端。"
+        },
+        "egressCapable": {
+          "type": "boolean",
+          "default": false,
+          "description": "能否作为出口。"
+        },
+        "domainTargetCapable": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否支持域名目标。一期为 false。"
+        },
+        "ipv6TargetCapable": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否支持 IPv6 目标。一期为 false。"
+        }
+      }
+    },
     "ClientEnvironmentInfo": {
       "type": "object",
       "additionalProperties": false,
@@ -149,6 +182,10 @@
         "clientPeerServiceCapabilities": {
           "$ref": "#/$defs/ClientPeerServiceCapabilities",
           "description": "客户端 Peer 本地服务发现能力；缺省时 version=0 且 applications 为空。"
+        },
+        "clientEgressCapabilities": {
+          "$ref": "#/$defs/ClientEgressCapabilities",
+          "description": "客户端 Peer 出口分流能力；缺省时按 version=0 处理，服务端不会下发出口策略。"
         },
         "localAddresses": {
           "type": "array",

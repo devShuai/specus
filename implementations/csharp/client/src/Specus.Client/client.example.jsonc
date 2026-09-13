@@ -14,6 +14,12 @@
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,
+  // Send chosen destinations through another device. Needs a virtual NIC (peerMeshDevice other
+  // than "noop") and administrator/root. See docs/peer-mesh/peer-egress-usage.md.
+  // "peerEgressRules": [
+  //   {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+  //   {"match": "198.51.100.0/24", "action": "block"}
+  // ],
   // 启动时检查一次，此后默认每 24 小时检查。autoUpdate=false 时会先询问。
   "updateCheckEnabled": true,
   "autoUpdate": false,

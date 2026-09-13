@@ -210,9 +210,7 @@ public class SpecusClientApplication {
         specusBean.setSpecusConfigList(toSpecusConfigs(response.getSpecusConfigList()));
         specusBean.setHttpSpecusConfigList(toHttpSpecusConfigs(response.getHttpSpecusConfigList()));
         specusBean.setPeerMesh(response.getPeerMesh());
-        specusBean.setPeerMeshDevice(startupConfig.getPeerMeshDevice());
-        specusBean.setPeerMeshTunName(startupConfig.getPeerMeshTunName());
-        specusBean.setPeerMeshMtu(startupConfig.getPeerMeshMtu());
+        copyLocalSettings(startupConfig, specusBean);
         specusBean.setAuthRefresher(() -> loginAndBuildSpecus(startupConfig));
         log.info("客户端 HTTP 登录成功: clientName={}, session={}, specus={}:{}, tcp={}, http={}, peerMesh={}, peerMeshDevice={}, peerMeshMtu={}, maxOnlineInstances={}",
                 specusBean.getClientName(),
@@ -282,7 +280,22 @@ public class SpecusClientApplication {
         }
     }
 
-    private static ClientEnvironmentInfo collectEnvironment() {
+    /**
+     * The settings that come from the local configuration rather than from the login response.
+     *
+     * <p>Separate so that what reaches the running client from the file can be tested without a
+     * server. The egress rules are the reason: they were read by the other two clients and dropped
+     * here, and nothing between the file and the mesh was covered.
+     */
+    static void copyLocalSettings(ClientStartupConfig startupConfig, SpecusBean specusBean) {
+        specusBean.setPeerMeshDevice(startupConfig.getPeerMeshDevice());
+        specusBean.setPeerMeshTunName(startupConfig.getPeerMeshTunName());
+        specusBean.setPeerMeshMtu(startupConfig.getPeerMeshMtu());
+        specusBean.setPeerEgressRules(startupConfig.getPeerEgressRules() == null
+                ? java.util.List.of() : java.util.List.copyOf(startupConfig.getPeerEgressRules()));
+    }
+
+    static ClientEnvironmentInfo collectEnvironment() {
         ClientEnvironmentInfo info = new ClientEnvironmentInfo();
         info.setMachineFingerprint(machineFingerprint());
         info.setHostname(hostname());
@@ -300,6 +313,20 @@ public class SpecusClientApplication {
         discovery.setVersion(PeerServiceDiscovery.PROTOCOL_VERSION);
         discovery.setApplications(new ArrayList<>(PeerServiceDiscovery.APPLICATIONS));
         info.setClientPeerServiceCapabilities(discovery);
+        // Every server gates egress-config and egress-catalog on version being at least 1, and the
+        // default here is 0: until this was set no server ever pushed a policy to this client, so it
+        // could not be made an egress however the policy was configured.
+        ClientEnvironmentInfo.ClientEgressCapabilities egress =
+                new ClientEnvironmentInfo.ClientEgressCapabilities();
+        egress.setVersion(com.theshuai.common.peeregress.PeerEgressProtocol.PROTOCOL_VERSION);
+        egress.setConsumerCapable(
+                com.theshuai.specusclient.peer.PeerEgressRouteCommanders.takeoverSupported());
+        // An egress needs nothing but ordinary sockets.
+        egress.setEgressCapable(true);
+        // Phase one carries address targets only.
+        egress.setDomainTargetCapable(false);
+        egress.setIpv6TargetCapable(false);
+        info.setClientEgressCapabilities(egress);
         return info;
     }
 

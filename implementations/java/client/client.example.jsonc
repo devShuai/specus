@@ -15,6 +15,12 @@
   "peerMeshDevice": "noop",
   "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,
+  // Send chosen destinations through another device. Needs a virtual NIC (peerMeshDevice other
+  // than "noop") and administrator/root. See docs/peer-mesh/peer-egress-usage.md.
+  // "peerEgressRules": [
+  //   {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+  //   {"match": "198.51.100.0/24", "action": "block"}
+  // ],
   // Phase one only checks and opens the download guide; it never replaces the running jar.
   "updateCheckEnabled": true,
   // Shared-schema compatibility only: Java phase one never self-replaces, even when true.

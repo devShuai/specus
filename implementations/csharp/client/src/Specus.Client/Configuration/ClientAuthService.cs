@@ -253,6 +253,15 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientPeerServiceCapabilities")]
     public ClientPeerServiceCapabilities ClientPeerServiceCapabilities { get; set; } = new();
 
+    /// <summary>What this build can do in peer egress split routing.</summary>
+    /// <remarks>
+    /// Every server gates egress-config and egress-catalog on <c>version</c> being at least 1, and
+    /// until this was sent none of them ever pushed either: no device running this client could be
+    /// made an egress in a real deployment, however its policy was set.
+    /// </remarks>
+    [JsonPropertyName("clientEgressCapabilities")]
+    public ClientEgressCapabilities ClientEgressCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -280,6 +289,7 @@ public sealed class ClientEnvironmentInfo
                 Version = PeerServiceDiscovery.ProtocolVersion,
                 Applications = [.. PeerServiceDiscovery.Applications],
             },
+            ClientEgressCapabilities = ClientEgressCapabilities.Current(),
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -402,6 +412,37 @@ public sealed class ClientMessageCapabilities
         Attachments = Attachments,
         MediaPreview = MediaPreview,
         MaxAttachmentBytes = MaxAttachmentBytes,
+    };
+}
+
+public sealed class ClientEgressCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("consumerCapable")]
+    public bool ConsumerCapable { get; set; }
+
+    [JsonPropertyName("egressCapable")]
+    public bool EgressCapable { get; set; }
+
+    /// <summary>Phase one carries address targets only.</summary>
+    [JsonPropertyName("domainTargetCapable")]
+    public bool DomainTargetCapable { get; set; }
+
+    [JsonPropertyName("ipv6TargetCapable")]
+    public bool Ipv6TargetCapable { get; set; }
+
+    /// <summary>What this build announces.</summary>
+    /// <remarks>
+    /// A consumer has to take over routes, which only the platforms with a route commander can do;
+    /// an egress needs nothing but ordinary sockets, so every build can be one.
+    /// </remarks>
+    public static ClientEgressCapabilities Current() => new()
+    {
+        Version = Specus.Protocol.PeerEgress.PeerEgressProtocol.ProtocolVersion,
+        ConsumerCapable = Specus.Client.PeerMesh.PeerEgressRouteCommanders.TakeoverSupported(),
+        EgressCapable = true,
     };
 }
 

@@ -19,6 +19,29 @@ internal static class ConfigDiagnostics
             if (actual is not null && (!property.Value.TryGetInt32(out var input) || input != actual))
                 warning($"{property.Name} normalized to {actual}");
         }
+        EgressRules(effective, warning);
+    }
+
+    /// <summary>Names every egress rule that will not be in force, before anything connects.</summary>
+    /// <remarks>
+    /// A warning rather than a failure, matching the runtime: a refused rule is skipped and the rest
+    /// take effect. The index and the code are printed and the match is not, since configuration
+    /// warnings do not print configuration values. Checked against the default mesh network, because
+    /// the real one arrives from the server at login.
+    /// </remarks>
+    private static void EgressRules(SpecusClientConfig effective, Action<string> warning)
+    {
+        var rules = effective.PeerEgressRules ?? [];
+        for (var index = 0; index < rules.Count; index++)
+        {
+            var rule = rules[index];
+            var code = rule is null
+                ? Specus.Protocol.PeerEgress.PeerEgressCodes.RuleMalformed
+                : Specus.Protocol.PeerEgress.PeerEgressRules.Validate(rule,
+                    Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr);
+            if (code is not null)
+                warning($"peerEgressRules[{index}] is not in force: {code}");
+        }
     }
 
     private static void Unknown(JsonElement raw, JsonElement shape, string prefix, Action<string> warning)

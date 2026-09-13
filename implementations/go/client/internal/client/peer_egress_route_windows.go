@@ -61,6 +61,10 @@ type windowsEgressRouteCommander struct {
 	hops map[string]windowsEgressRouteHop
 }
 
+// egressRouteTakeoverSupported is whether this build can be an egress consumer, announced at login.
+// Declared next to the commander it describes, so the two cannot disagree about the platform.
+const egressRouteTakeoverSupported = true
+
 func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 	return &windowsEgressRouteCommander{tun: tun, hops: map[string]windowsEgressRouteHop{}}
 }

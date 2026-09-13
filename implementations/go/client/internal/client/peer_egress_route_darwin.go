@@ -40,6 +40,10 @@ type macosEgressRouteCommander struct {
 	hops map[string]egressRouteHop
 }
 
+// egressRouteTakeoverSupported is whether this build can be an egress consumer, announced at login.
+// Declared next to the commander it describes, so the two cannot disagree about the platform.
+const egressRouteTakeoverSupported = true
+
 func newEgressRouteCommanderForPlatform(tun string) egressRouteCommander {
 	return &macosEgressRouteCommander{tun: tun, hops: map[string]egressRouteHop{}}
 }
