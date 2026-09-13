@@ -73,8 +73,31 @@ class Http(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def read_body(self):
+        # .NET's PostAsJsonAsync streams the body with chunked transfer encoding and no
+        # Content-Length. Reading by length alone yields an empty body for that client, which went
+        # unnoticed only because the body used to be thrown away.
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            chunks = []
+            while True:
+                size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", 16)
+                if size == 0:
+                    # Trailers, if any, end at an empty line.
+                    while self.rfile.readline().strip():
+                        pass
+                    return b"".join(chunks)
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline()
+        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = self.read_body()
+        self.server.post_paths = getattr(self.server, "post_paths", []) + [self.path]
+        if self.path.endswith("/auth/login"):
+            try:
+                self.server.last_login = json.loads(body)
+            except ValueError:
+                self.server.last_login = None
         self.server.logins += 1
         status = self.server.status
         if self.server.recover and self.server.logins > 1:
@@ -245,6 +268,15 @@ class Matrix:
                 with self.start() as process:
                     self.wait_ready(process)
                     assert self.saw_control_only, "status conflated control authentication with forwarding readiness"
+                    # Every server gates egress-config on this, so a client that does not send it can
+                    # never be made an egress. Checked on the real login the real binary sent: the
+                    # unit tests assert each runtime's own serialiser, this asserts what arrives.
+                    capabilities = ((getattr(http, "last_login", None) or {}).get("environment") or {}).get("clientEgressCapabilities")
+                    assert isinstance(capabilities, dict),                         f"login announced no clientEgressCapabilities (POST paths seen: {getattr(http, 'post_paths', [])}, "                         f"environment keys: {sorted(((getattr(http, 'last_login', None) or {}).get('environment') or {}).keys())})"
+                    assert isinstance(capabilities.get("version"), int) and capabilities["version"] >= 1,                         f"login announced egress version {capabilities.get('version')!r}; servers skip egress-config below 1"
+                    assert capabilities.get("egressCapable") is True, "login did not announce egressCapable"
+                    assert capabilities.get("domainTargetCapable") is False and capabilities.get("ipv6TargetCapable") is False,                         "phase one must not announce domain or IPv6 targets"
+                    self.checks += 1
                     self.checks += 1
                     control.data_delay = 0
                     count = http.logins

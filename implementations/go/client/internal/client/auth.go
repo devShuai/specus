@@ -42,6 +42,7 @@ type clientEnvironmentInfo struct {
 	PeerPublicKey                 string                        `json:"peerPublicKey"`
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
+	ClientEgressCapabilities      clientEgressCapabilities      `json:"clientEgressCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
 	StartedAt                     string                        `json:"startedAt"`
 }
@@ -57,6 +58,37 @@ type clientMessageCapabilities struct {
 type clientPeerServiceCapabilities struct {
 	Version      int      `json:"version"`
 	Applications []string `json:"applications"`
+}
+
+// clientEgressCapabilities is what this build can do in peer egress split routing.
+//
+// Every server gates egress-config and egress-catalog on version being at least 1, and until this
+// was sent none of them ever pushed either: no device could be made an egress in a real deployment,
+// however its policy was set, and the data plane was reachable only from tests that fed it a policy
+// directly. The field is "version", which is what all four servers read.
+type clientEgressCapabilities struct {
+	Version         int  `json:"version"`
+	ConsumerCapable bool `json:"consumerCapable"`
+	EgressCapable   bool `json:"egressCapable"`
+	// Phase one carries address targets only. Announced separately from the version so a later
+	// release with domain or IPv6 targets can coexist with this one.
+	DomainTargetCapable bool `json:"domainTargetCapable"`
+	IPv6TargetCapable   bool `json:"ipv6TargetCapable"`
+}
+
+// egressProtocolVersion is the split-routing version this client speaks.
+const egressProtocolVersion = 1
+
+// currentEgressCapabilities describes this build.
+//
+// A consumer needs to take over routes, which only the platforms with a route commander can do; an
+// egress needs nothing but ordinary sockets, so every build can be one.
+func currentEgressCapabilities() clientEgressCapabilities {
+	return clientEgressCapabilities{
+		Version:         egressProtocolVersion,
+		ConsumerCapable: egressRouteTakeoverSupported,
+		EgressCapable:   true,
+	}
 }
 
 var authHTTPClient = &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -181,8 +213,9 @@ func collectEnvironment() clientEnvironmentInfo {
 			Version:      2,
 			Applications: []string{"http", "https", "ssh", "tcp", "udp"},
 		},
-		LocalAddresses: localAddresses(),
-		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		ClientEgressCapabilities: currentEgressCapabilities(),
+		LocalAddresses:           localAddresses(),
+		StartedAt:                time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }
 

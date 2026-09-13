@@ -20,6 +20,17 @@ public final class PeerEgressRouteCommanders {
     private PeerEgressRouteCommanders() {
     }
 
+    /**
+     * Whether this platform can take over routes, and so whether this client can be an egress
+     * consumer. Announced at login; answers the same question {@link #forPlatform} answers by
+     * choosing a commander, from the same property, so the two cannot disagree.
+     */
+    public static boolean takeoverSupported() {
+        String name = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        return name.contains("linux") || name.contains("win") || name.contains("mac")
+                || name.contains("darwin");
+    }
+
     /** The commander for the platform this process is running on. */
     public static PeerEgressRouteInstaller.Commander forPlatform(String tun) {
         String name = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);

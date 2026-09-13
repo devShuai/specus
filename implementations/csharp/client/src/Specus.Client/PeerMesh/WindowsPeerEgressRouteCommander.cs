@@ -13,6 +13,19 @@ namespace Specus.Client.PeerMesh;
 /// </remarks>
 internal static class PeerEgressRouteCommanders
 {
+    /// <summary>
+    /// Whether this platform can take over routes, and so whether this client can be an egress
+    /// consumer. Announced at login.
+    /// </summary>
+    /// <remarks>
+    /// The same three checks <see cref="ForPlatform"/> makes when it picks a commander, so the
+    /// announcement and the behaviour cannot disagree about the platform.
+    /// </remarks>
+    public static bool TakeoverSupported() =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+        || RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        || RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+
     /// <summary>The commander for the platform this process is running on.</summary>
     public static IPeerEgressRouteCommander ForPlatform(string? tun)
     {

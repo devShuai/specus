@@ -15,6 +15,10 @@ type unsupportedEgressRouteCommander struct{}
 
 var errEgressRoutesUnsupported = errors.New("egress route takeover is not implemented on this platform")
 
+// egressRouteTakeoverSupported is whether this build can be an egress consumer, announced at login.
+// Declared next to the commander it describes, so the two cannot disagree about the platform.
+const egressRouteTakeoverSupported = false
+
 func newEgressRouteCommanderForPlatform(_ string) egressRouteCommander {
 	return unsupportedEgressRouteCommander{}
 }
