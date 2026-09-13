@@ -54,6 +54,55 @@
       "default": true,
       "description": "Java 桌面客户端发现更新时是否尝试打开下载页；无桌面环境时仍记录清晰提示。"
     },
+    "peerEgressRules": {
+      "type": "array",
+      "default": [],
+      "description": "出口分流规则，有序。非空即启用消费端，没有单独的总开关；需要创建虚拟网卡（peerMeshDevice 不能是 noop）。被拒的规则不生效、其余照常生效，config validate 会逐条提示。见 docs/peer-mesh/peer-egress-usage.md。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "match",
+          "action"
+        ],
+        "properties": {
+          "match": {
+            "type": "string",
+            "minLength": 1,
+            "description": "IPv4 地址或 CIDR，主机位必须为零。域名与 IPv6 在一期被拒绝（EGRESS_RULE_DOMAIN_UNSUPPORTED / EGRESS_RULE_IPV6_UNSUPPORTED），0.0.0.0/0 被拒绝（EGRESS_RULE_DEFAULT_ROUTE）。"
+          },
+          "action": {
+            "enum": [
+              "egress",
+              "direct",
+              "block"
+            ],
+            "description": "egress 经出口设备访问；direct 本地直连，不安装路由；block 阻断。"
+          },
+          "egressClientId": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "action=egress 时必填，出口设备的客户端 ID。缺失、0 或负数返回 EGRESS_RULE_MISSING_TARGET。"
+          },
+          "port": {
+            "type": "integer",
+            "description": "只为让携带它的配置得到明确错误码而保留：消费端规则不支持端口维度，出现即返回 EGRESS_RULE_PORT_UNSUPPORTED。端口限制在出口策略里配置。"
+          }
+        },
+        "if": {
+          "properties": {
+            "action": {
+              "const": "egress"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "egressClientId"
+          ]
+        }
+      }
+    },
     "controlTls": {
       "type": "object",
       "additionalProperties": false,

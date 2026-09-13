@@ -104,7 +104,7 @@ function renderEgress(state) {
     if (typeof consumer.routeError === "string" && consumer.routeError) issue(issues, "路由下发失败", consumer.routeError + (consumer.rolledBack === true ? "（本次下发已整体回滚）" : ""));
     problems = refused.length + missing.length + offline.length + (consumer.routeError ? 1 : 0);
     if (!problems) issue(issues, "规则均已生效", "路由均已安装，指向的出口设备均在线。", "", true);
-    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "因规则而没有放行的流量，按原因分别计数。", blocked, !problems);
+    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝。", blocked, !problems);
   }
   badge.textContent = problems ? problems + " 个问题" : "正常"; if (problems) badge.dataset.problems = String(problems);
   const refusedByEgress = counters(egress.refused);

@@ -196,6 +196,7 @@ Java `specus-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`mac-utun`、`macos-utun`、`darwin-utun`、`utun`、`auto` |
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `specus0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
+| `peerEgressRules` | 出口分流规则，默认空（不启用）。按 IPv4 地址或网段把流量经指定对端设备访问，见 [出口分流使用说明](docs/peer-mesh/peer-egress-usage.md) |
 
 > 完整示例见 `implementations/java/client/client.example.jsonc`、`implementations/go/client/client.example.jsonc`、`implementations/csharp/client/src/Specus.Client/client.example.jsonc` 和 `implementations/android/client/client.example.jsonc`。
 
@@ -496,6 +497,8 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 公网安全组 / 防火墙需要放行 `3478/udp`、`3479/udp` 和 relay 分配端口范围（默认 `49152-65535/udp`）。完整 RFC 5780 模式要在 A1、A2 两个公网 IP 上同时放行两个 STUN 端口；TURN 仍只在 A1:P1 处理。独立部署说明见 [`deploy/stun-server/systemd`](deploy/stun-server/systemd/README.md)。如果不希望开放完整高端口范围，可以把 `relay-min-port` / `relay-max-port` 收窄到可控区间，并同步开放该区间。
 
 客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Java / Go / .NET 客户端均支持 `utun` 接入 macOS utun，其中 Java 可使用 `mac-utun` / `utun`，`auto` 会按系统选择；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
+
+**出口分流**建立在 Peer Mesh 之上：消费端在 `peerEgressRules` 里按 IPv4 地址或网段指定哪些目标经哪台对端设备访问，出口由服务端租户开关与设备出口策略授权。一期只支持 IPv4 地址与网段规则，不支持域名、IPv6 与 ICMP，不改 DNS 与任何持久系统配置。用 `specus-client egress` 或本地管理页确认规则是否生效。使用与限制见 [出口分流使用说明](docs/peer-mesh/peer-egress-usage.md)，线协议见 [peer-egress.md](protocol/spec/peer-egress.md)。
 
 管理后台的「私有组网」页面展示设备虚拟 IP、在线状态、虚拟网卡状态、NAT 类型、候选 Endpoint、链路和活跃会话，并支持启停设备、配置 ACL、分页查看会话、清理活跃会话和链路。路径统计同时展示 NAT 行为探测设备数、完整分类率，以及映射行为、过滤行为和探测方式分布。公开的浏览器 NAT 检测页会调用 `/api/public/peer-mesh/stun-config` 获取自建 STUN，再结合配置的公共 STUN 进行 WebRTC 探测。
 

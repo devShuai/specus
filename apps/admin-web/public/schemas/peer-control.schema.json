@@ -33,9 +33,278 @@
     },
     {
       "$ref": "#/$defs/ServiceCatalog"
+    },
+    {
+      "$ref": "#/$defs/EgressConfig"
+    },
+    {
+      "$ref": "#/$defs/EgressCatalog"
+    },
+    {
+      "$ref": "#/$defs/EgressReport"
     }
   ],
   "$defs": {
+    "EgressDestinationRule": {
+      "type": "object",
+      "required": [
+        "cidr"
+      ],
+      "properties": {
+        "cidr": {
+          "type": "string",
+          "description": "允许的目标 IPv4 网段。"
+        },
+        "protocols": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          }
+        },
+        "portRanges": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          },
+          "description": "闭区间 [起, 止]。"
+        }
+      }
+    },
+    "EgressConfig": {
+      "description": "服务端 → 出口设备。开关或策略变更后立即下发。revision 在同一控制 session 内单调递增，不大于上次接受值的快照被忽略。不认识的键一律忽略。",
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "revision",
+            "enabled"
+          ],
+          "properties": {
+            "type": {
+              "const": "egress-config"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "转为 false 时出口立即停止接受新流并关闭全部已建流。"
+            },
+            "scope": {
+              "type": "string",
+              "description": "PUBLIC 或 LAN，客户端读取时去空白并转大写。缺失时消息仍被接受，但判定一律拒绝，不回落到 PUBLIC；关闭出口的推送不带 scope。"
+            },
+            "allowedConsumerClientIds": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/LongId"
+              }
+            },
+            "destinationRules": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EgressDestinationRule"
+              },
+              "description": "空 = 全部拒绝，不存在「未配置即放行」。"
+            },
+            "limits": {
+              "type": "object",
+              "description": "关闭出口的推送不带 limits；缺失时三个字段按 0 处理，由使用方兜底。",
+              "properties": {
+                "maxConcurrentFlows": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "maxFlowsPerConsumer": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "idleTimeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EgressCatalog": {
+      "description": "服务端 → 消费设备，列出可用出口及其能力，不含出口的目标白名单。只能由服务端发出。当前三个客户端都不处理这条消息。",
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "revision",
+            "egresses"
+          ],
+          "properties": {
+            "type": {
+              "const": "egress-catalog"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "egresses": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "clientId"
+                ],
+                "properties": {
+                  "clientId": {
+                    "$ref": "#/$defs/LongId"
+                  },
+                  "clientName": {
+                    "type": "string"
+                  },
+                  "online": {
+                    "type": "boolean"
+                  },
+                  "scope": {
+                    "type": "string",
+                    "description": "PUBLIC 或 LAN。客户端读取时去空白并转大写。"
+                  },
+                  "protocols": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "tcp",
+                        "udp"
+                      ]
+                    }
+                  },
+                  "domainTargetCapable": {
+                    "type": "boolean"
+                  },
+                  "ipv6TargetCapable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EgressReport": {
+      "description": "出口设备 → 服务端，仅用于管理端展示；不含目标地址、域名或请求内容。服务端从已认证连接绑定上报者身份，客户端必须省略全部 sourceClient*、targetClient*、sessionId 与 token 字段。当前三个客户端都不发送这条消息。",
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "revision"
+          ],
+          "properties": {
+            "type": {
+              "const": "egress-report"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "activeFlows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "totalFlows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rejectedFlows": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "description": "按错误码聚合的拒绝计数。"
+            },
+            "bytesIn": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytesOut": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "sourceClientId"
+                ]
+              },
+              {
+                "required": [
+                  "sourceClientName"
+                ]
+              },
+              {
+                "required": [
+                  "sourceVirtualIp"
+                ]
+              },
+              {
+                "required": [
+                  "sourcePublicKey"
+                ]
+              },
+              {
+                "required": [
+                  "targetClientId"
+                ]
+              },
+              {
+                "required": [
+                  "targetClientName"
+                ]
+              },
+              {
+                "required": [
+                  "targetVirtualIp"
+                ]
+              },
+              {
+                "required": [
+                  "sessionId"
+                ]
+              },
+              {
+                "required": [
+                  "token"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
     "LongId": {
       "type": "integer",
       "minimum": 1

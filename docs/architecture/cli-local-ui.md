@@ -30,6 +30,8 @@ Java HTTP 适配器复用现有 Netty HTTP 编解码、聚合及超时处理；.
 
 应用返回类别：400 格式/超限/未知操作、401 未授权或过期、403 来源/Host 不符、404 路径不存在、405 方法不符、409 配置冲突/实例或运行时控制冲突、415 非 JSON 写请求、422 配置或文件校验失败、429 页面会话上限。传输层可在进入 JSON API 前以 413 拒绝过大请求（Java），或关闭超时/超额连接；前端也必须处理非 JSON/连接失败。错误不包含 HTTP 登录响应体、原始 JSON 解析片段或凭据值。
 
+`runtime.egress` 是出口分流状态，与 CLI `egress` 命令同一形状（见 [peer-egress.md 状态查询](../../protocol/spec/peer-egress.md#状态查询)）；未连接时缺省，页面据此显示「连接后显示」，而不是读取路由表。三端 UI 路由都必须带上它，`scripts/test-cli-ui.py` 对三端逐一检查两半都在。
+
 `runtime.processRunning` 表示本页拥有的连接循环，不是 HTTP 管理进程是否活着；`businessReady` 只表示控制/数据通道就绪，不是目标可达。`runningRevision` 与磁盘 revision 用于提示待应用修改。其他进程仅给出 PID/phase/readiness 与 `readOnly:true`；没有控制通道时不提供接管按钮。
 
 ## 安全约束和已知边界
