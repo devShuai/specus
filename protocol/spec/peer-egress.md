@@ -273,6 +273,34 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 固定向量：`protocol/test-vectors/peer-egress-authz-v1.json`。
 
+## 出站 socket
+
+出口替消费端连接目标用的是普通 socket。这台设备若同时是消费端，本机隧道为它自己的规则装的路由会覆盖一部分目标；socket 跟着这些路由走，转发流量就回到 mesh 里，而不是从本机出去。强制拒绝清单挡的是「目标落在本机虚拟接口网段」，挡不住「目标是公网地址、本机路由表却把它指进隧道」。
+
+所以出站 socket 在 connect 之前绑定到**假如没有隧道的路由、系统本来会选的那个接口**：
+
+| 平台 | 做法 |
+| --- | --- |
+| Windows | `IP_UNICAST_IF`（`IPPROTO_IP`，31）。值为接口索引的**网络字节序**，传主机序时 setsockopt 直接报错；读回时却是主机序 |
+| macOS | `IP_BOUND_IF`（`IPPROTO_IP`，25）。值为接口索引的主机序 |
+| Linux | 不绑定接口。Go 与 .NET 给 socket 打 `SO_MARK 0x5350`，由运维添加策略路由，见[对系统的改动](#对系统的改动)；Java 不打，见当前限制 |
+
+这两个选项都不需要提权，也都由协议栈强制执行：绑到一个没有路由通往目标的接口上，connect 直接失败（Windows 报 `WSAENETUNREACH`），不会换个接口出去。
+
+**接口按目标逐个选。** 统一绑到默认路由所在的接口，会让经第二块网卡或另一个 VPN 才能到达的目标全部不通。选法：
+
+1. 候选是 IPv4 路由表里的全部路由，去掉本机 TUN 接口上的路由（按接口精确比较：`utun30` 不是 `utun3`），再去掉系统不会给未绑定 socket 使用的路由——Windows 上所在接口未连接的路由、所在接口设置了 `DisableDefaultRoutes` 的 `0.0.0.0/0`、接口表里找不到其接口的路由；macOS 上带 `I` 标志（限定作用域）的路由。
+2. 取包含目标的最长前缀；等长时取度量小的，Windows 的度量是路由度量加接口度量，macOS 一律为 0；再相同取表里靠前的。
+3. 没有候选时**拒绝建流**，不退回不绑定：不绑定的 socket 正是会跟着隧道路由走的那个。TCP 流给消费端回 RST，UDP 会话直接不建，日志记为 `connect failed ... no route outside the tunnel`。
+
+没有 TUN 的节点（虚拟网卡为 `noop`）没有路由要去掉，按同样的规则选出来的就是系统自己的选择。TUN 名在系统里找不到对应接口时同样视为没有路由要去掉：不存在的接口上不会有路由。
+
+**读表。** Windows 每次 connect 用 `GetIpForwardTable2` 与 `GetIpInterfaceTable` 原生读取，不经 PowerShell：一次 `Get-NetRoute` 要 419 ms，这两个调用是微秒级，不需要缓存，切网之后下一次 connect 就能看到。macOS 读 `netstat -rn -f inet`，与路由接管同一套读取与归一，25 ms 一次，结果保留 2 秒：隧道自己的路由本来就不参与选择，缓存能错过的只有物理网络的变化，而错过的后果是 connect 失败，不是泄漏。
+
+**Java 的前提。** JDK 不提供这两个选项，也不暴露 socket 句柄。Java 客户端经 `sun.nio.ch.SelChImpl.getFDVal()` 取句柄，再用 JNA 调 setsockopt，这要求 JVM 带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`。发布的 jar 在清单里声明了 `Add-Exports`，`java -jar` 启动时自动生效，Spring Boot 嵌套加载的类同样适用；以其他方式启动又缺这个选项时，Windows 与 macOS 上的每次出口建流都会被拒绝，日志写明缺的是哪个选项。
+
+固定向量：`protocol/test-vectors/peer-egress-socket-binding-v1.json`，覆盖接口选择、Windows 两张表的二进制布局、macOS 的候选路由与两个选项的编码。Windows 表布局按 SDK 结构体用 ctypes 生成，偏移在 Windows 11 26200 上与 `Get-NetRoute`、`Get-NetIPInterface` 逐行比对过，三端测试在每次 Windows CI 上重做这一比对。三端另有真实 socket 测试：连 127.0.0.1 时读回绑定的是回环接口；把回环接口当作隧道时拒绝建流；给绑定器一张声称 `127.0.0.0/8` 在物理接口上的表时连接失败。最后一条在不设选项时会通过，所以它证明的是选项真的起了作用。Windows 部分在 CLI 矩阵的 windows runner 上运行，macOS 部分在 `peer-egress-macos.yml` 的 macOS runner 上运行。
+
 ## 能力协商
 
 登录 `environment.clientEgressCapabilities`：
@@ -567,6 +595,7 @@ hop 标记由出口设备在**自己作为消费端**转发流量时置位。出
 | 运行期路由表 | 会添加：规则需要的前缀与旁路条目。Windows 写入 ActiveStore，Linux 用 `ip route add`，macOS 用 `route add`，三者都不跨重启存在。正常退出时撤回；崩溃后，下次应用规则时按安装记录接管——仍需要的保留，不再需要的撤回。Go 与 .NET 规则被全部删掉时不会应用规则，残留也就不会被撤回，见当前限制 |
 | 防火墙、NAT、`ip_forward` 等内核参数 | 不改。出口用用户态栈终结连接、用普通 socket 连目标，不做内核转发 |
 | Linux 策略路由规则 | 不装。Go 与 .NET 出口给出站 socket 打 `SO_MARK 0x5350`，但把这个标记接到物理接口的 `ip rule` 由运维按需自己添加；没有这条规则时，只要隧道没有接管默认路由，行为照常 |
+| 出站 socket 的接口绑定（Windows、macOS） | 不改系统配置。`IP_UNICAST_IF` 与 `IP_BOUND_IF` 是单个 socket 的选项，随 socket 关闭消失，见[出站 socket](#出站-socket) |
 | 本机文件 | 路由安装记录 `~/.specus/egress-routes.json` 与 CLI 状态文件，均在当前用户目录下 |
 
 ## 当前限制
@@ -586,4 +615,5 @@ hop 标记由出口设备在**自己作为消费端**转发流量时置位。出
 - **Java 客户端应用规则的时机与另外两端不同。** Java 在构造 Peer Mesh 客户端时应用一次规则，此时还没有任何对端会话，所以对端端点的旁路条目是空的；控制连接端点也不在 Java 的旁路列表里；之后会话建立时不会重新应用。「旁路条目排在最前」这条保护在 Java 上因此没有生效：一条前缀覆盖了控制端点或对端端点的规则，可能把承载隧道的流量送进隧道。Java 规则为空时也会走一遍安装器，状态里消费端显示为已启用、0 条规则。
 - **出口侧没有速率限制。** 并发流数、每消费端流数与空闲超时有上限，字节速率没有。
 - **消费端桌面图形界面没有出口分流页面。** 状态可以通过 `specus-client egress` 与本地管理页查看。
-- **Java 出口端不能给出站 socket 打标记。** Go 与 .NET 在 Linux 上用 `SO_MARK`（`0x5350`）让策略路由把转发流量固定在物理接口上；JDK 既不暴露 socket 的文件描述符也没有这个选项，不走 JNI 或 FFM 就做不到。Java 出口端靠强制拒绝清单挡住回环——本机 TUN 与虚拟接口网段在 connect 前就被拒绝——但那挡的是回环，不是路由：如果这台机器的隧道抢走了默认路由，Java 出口会把转发流量送进隧道而不是物理接口。一期不接管默认路由，所以这个状态不会由本功能自己造成，但运维用别的方式抢了默认路由就会看到。
+- **Java 出口端在 Linux 上不给出站 socket 打标记。** Go 与 .NET 在 Linux 上用 `SO_MARK`（`0x5350`）让策略路由把转发流量固定在物理接口上。Java 在 Windows 与 macOS 上已经能拿到 socket 句柄来绑定接口（见[出站 socket](#出站-socket)），同一个句柄在 Linux 上也能打标记，但这一步没有做，单独跟进。在那之前，Java 出口端在 Linux 上靠强制拒绝清单挡住回环——本机 TUN 与虚拟接口网段在 connect 前就被拒绝——但那挡的是回环，不是路由：如果这台机器的隧道抢走了默认路由，Java 出口会把转发流量送进隧道而不是物理接口。一期不接管默认路由，所以这个状态不会由本功能自己造成，但运维用别的方式抢了默认路由就会看到。
+- **Java 客户端不经 `java -jar` 启动时需要自己带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`**，否则 Windows 与 macOS 上的出口建流全部被拒绝。jar 清单里的声明只对 `java -jar` 生效。
