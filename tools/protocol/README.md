@@ -8,6 +8,7 @@ IPv4 与传输层校验和手算容易出错，而向量一旦写错，四端实
 ```bash
 python tools/protocol/generate_peer_egress_frame_vectors.py
 python tools/protocol/generate_peer_egress_policy_vectors.py
+python tools/protocol/generate_peer_egress_socket_binding_vectors.py
 python tools/protocol/verify_peer_egress_vectors.py
 ```
 
@@ -15,6 +16,7 @@ python tools/protocol/verify_peer_egress_vectors.py
 | --- | --- |
 | `generate_peer_egress_frame_vectors.py` | `protocol/test-vectors/peer-egress-frame-v1.json` |
 | `generate_peer_egress_policy_vectors.py` | `protocol/test-vectors/peer-egress-rules-v1.json`、`peer-egress-authz-v1.json` |
+| `generate_peer_egress_socket_binding_vectors.py` | `protocol/test-vectors/peer-egress-socket-binding-v1.json`（出口 socket 的接口选择；读取 macOS 路由向量里的真机样本） |
 | `verify_peer_egress_vectors.py` | 无产物；校验失败时退出码非零 |
 
 两个生成器各自带一份参考实现（规则匹配器、授权判定器），写文件前会用它断言每条期望，
