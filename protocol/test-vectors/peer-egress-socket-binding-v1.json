@@ -6,7 +6,10 @@
     "An empty tunnel name leaves nothing out. A node without a TUN device has no tunnel routes to avoid.",
     "windows: metric is the route's metric plus its interface's metric; usable is the interface having an IPv4 row that is connected, and not a 0.0.0.0/0 route on an interface with DisableDefaultRoutes. interface is the decimal interface index.",
     "windows tables: a ULONG count, padding to offset 8, then fixed-size rows. Rows whose family is not AF_INET are skipped, as are forward rows with a prefix length over 32. A forward prefix is masked by its length. A buffer shorter than the count claims is refused whole.",
-    "macos: candidates are the rows of `netstat -rn -f inet` as the route vector normalises them; interface is the Netif column, metric is 0, and usable is the Flags column not containing I."
+    "macos: candidates are the rows of `netstat -rn -f inet` as the route vector normalises them; interface is the Netif column, metric is 0, and usable is the Flags column not containing I.",
+    "gateway: the route's next hop as an IPv4 address, or empty for on-link. Windows writes on-link as 0.0.0.0. On macOS the Gateway column is a gateway only on a route whose Flags contain G; otherwise it holds link#N, a MAC address, an interface name, or the address of a loopback or point-to-point peer, none of which is a hop.",
+    "linux: candidates are the lines of `ip -4 route show table main`. A leading blackhole, unreachable, prohibit or throw leads nowhere: the route stays a candidate with an empty interface. local, broadcast, anycast, multicast and nat lines are not read. A multipath route takes its first indented nexthop; one whose next hops cannot be read is not usable. dead is not usable; linkdown is. metric defaults to 0.",
+    "hops: the same choice as select, with owned prefixes also left out; a chosen route with an empty interface means no hop. Used for a bypass route when the platform's own query answers with the tunnel."
   ],
   "select": {
     "cases": [
@@ -17,6 +20,7 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           }
@@ -34,12 +38,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "42",
+            "gateway": "",
             "metric": 5,
             "usable": true
           }
@@ -57,12 +63,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "42",
+            "gateway": "",
             "metric": 5,
             "usable": true
           }
@@ -80,18 +88,21 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           },
           {
             "prefix": "10.0.0.0/8",
             "interface": "7",
+            "gateway": "",
             "metric": 30,
             "usable": true
           },
           {
             "prefix": "10.1.0.0/16",
             "interface": "42",
+            "gateway": "",
             "metric": 5,
             "usable": true
           }
@@ -109,12 +120,14 @@
           {
             "prefix": "10.0.0.0/8",
             "interface": "7",
+            "gateway": "",
             "metric": 5,
             "usable": true
           },
           {
             "prefix": "10.1.0.0/16",
             "interface": "3",
+            "gateway": "",
             "metric": 9000,
             "usable": true
           }
@@ -132,12 +145,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "15",
+            "gateway": "",
             "metric": 291,
             "usable": true
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           }
@@ -155,12 +170,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "15",
+            "gateway": "",
             "metric": 276,
             "usable": true
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           }
@@ -178,12 +195,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "15",
+            "gateway": "",
             "metric": 1,
             "usable": false
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           }
@@ -201,6 +220,7 @@
           {
             "prefix": "203.0.113.0/24",
             "interface": "42",
+            "gateway": "",
             "metric": 5,
             "usable": true
           }
@@ -217,6 +237,7 @@
           {
             "prefix": "10.0.0.0/8",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           }
@@ -233,12 +254,14 @@
           {
             "prefix": "203.0.113.0/24",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "15",
+            "gateway": "",
             "metric": 20,
             "usable": true
           }
@@ -255,12 +278,14 @@
           {
             "prefix": "203.0.113.0/24",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "15",
+            "gateway": "",
             "metric": 20,
             "usable": true
           }
@@ -278,12 +303,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "utun30",
+            "gateway": "",
             "metric": 0,
             "usable": true
           }
@@ -300,12 +327,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           },
           {
             "prefix": "198.51.100.7/32",
             "interface": "7",
+            "gateway": "",
             "metric": 20,
             "usable": true
           }
@@ -323,12 +352,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 20,
             "usable": true
           },
           {
             "prefix": "127.0.0.0/8",
             "interface": "1",
+            "gateway": "",
             "metric": 331,
             "usable": true
           }
@@ -346,12 +377,14 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "42",
+            "gateway": "",
             "metric": 5,
             "usable": true
           },
           {
             "prefix": "0.0.0.0/0",
             "interface": "3",
+            "gateway": "",
             "metric": 276,
             "usable": true
           }
@@ -373,6 +406,8 @@
         "prefixFamily": 12,
         "prefixAddress": 16,
         "prefixLength": 40,
+        "nextHopFamily": 44,
+        "nextHopAddress": 48,
         "metric": 84
       },
       "interfaceRow": {
@@ -395,56 +430,67 @@
             {
               "interfaceIndex": 3,
               "prefix": "0.0.0.0/0",
+              "nextHop": "192.168.1.1",
               "metric": 0
             },
             {
               "interfaceIndex": 1,
               "prefix": "127.0.0.0/8",
+              "nextHop": "0.0.0.0",
               "metric": 256
             },
             {
               "interfaceIndex": 1,
               "prefix": "127.0.0.1/32",
+              "nextHop": "0.0.0.0",
               "metric": 256
             },
             {
               "interfaceIndex": 3,
               "prefix": "192.168.1.0/24",
+              "nextHop": "0.0.0.0",
               "metric": 256
             },
             {
               "interfaceIndex": 42,
               "prefix": "203.0.113.0/24",
+              "nextHop": "0.0.0.0",
               "metric": 5
             },
             {
               "interfaceIndex": 42,
               "prefix": "100.96.0.0/11",
+              "nextHop": "0.0.0.0",
               "metric": 5
             },
             {
               "interfaceIndex": 15,
               "prefix": "0.0.0.0/0",
+              "nextHop": "192.168.2.1",
               "metric": 0
             },
             {
               "interfaceIndex": 9,
               "prefix": "0.0.0.0/0",
+              "nextHop": "10.9.0.1",
               "metric": 0
             },
             {
               "interfaceIndex": 9,
               "prefix": "172.16.0.0/12",
+              "nextHop": "10.9.0.1",
               "metric": 0
             },
             {
               "interfaceIndex": 7,
               "prefix": "10.0.0.0/8",
+              "nextHop": "0.0.0.0",
               "metric": 1
             },
             {
               "interfaceIndex": 99,
               "prefix": "192.0.2.0/24",
+              "nextHop": "0.0.0.0",
               "metric": 1
             }
           ]
@@ -539,66 +585,77 @@
         {
           "prefix": "0.0.0.0/0",
           "interface": "3",
+          "gateway": "192.168.1.1",
           "metric": 20,
           "usable": true
         },
         {
           "prefix": "127.0.0.0/8",
           "interface": "1",
+          "gateway": "",
           "metric": 331,
           "usable": true
         },
         {
           "prefix": "127.0.0.1/32",
           "interface": "1",
+          "gateway": "",
           "metric": 331,
           "usable": true
         },
         {
           "prefix": "192.168.1.0/24",
           "interface": "3",
+          "gateway": "",
           "metric": 276,
           "usable": true
         },
         {
           "prefix": "203.0.113.0/24",
           "interface": "42",
+          "gateway": "",
           "metric": 10,
           "usable": true
         },
         {
           "prefix": "100.96.0.0/11",
           "interface": "42",
+          "gateway": "",
           "metric": 10,
           "usable": true
         },
         {
           "prefix": "0.0.0.0/0",
           "interface": "15",
+          "gateway": "192.168.2.1",
           "metric": 25,
           "usable": false
         },
         {
           "prefix": "0.0.0.0/0",
           "interface": "9",
+          "gateway": "10.9.0.1",
           "metric": 1,
           "usable": false
         },
         {
           "prefix": "172.16.0.0/12",
           "interface": "9",
+          "gateway": "10.9.0.1",
           "metric": 1,
           "usable": true
         },
         {
           "prefix": "10.0.0.0/8",
           "interface": "7",
+          "gateway": "",
           "metric": 51,
           "usable": true
         },
         {
           "prefix": "192.0.2.0/24",
           "interface": "99",
+          "gateway": "",
           "metric": 1,
           "usable": false
         }
@@ -680,120 +737,140 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "100.64.0.0/10",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.0/8",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.1/32",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "169.254.0.0/16",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.0.2.1/32",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.0.2.2/32",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.0.2.128/25",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.0/24",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "192.168.64.3/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "198.18.0.0/15",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "198.51.100.0/26",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "198.51.100.128/25",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "224.0.0.0/4",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "224.0.0.251/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "255.255.255.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           }
@@ -805,96 +882,112 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.0/8",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.1/32",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "128.0.0.0/1",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "169.254.0.0/16",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.0/24",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "192.168.64.7/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "224.0.0.0/4",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "224.0.0.251/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "255.255.255.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           }
@@ -906,90 +999,105 @@
           {
             "prefix": "0.0.0.0/0",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "10.255.0.2/32",
             "interface": "utun3",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.0/8",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "127.0.0.1/32",
             "interface": "lo0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "128.0.0.0/1",
             "interface": "en0",
+            "gateway": "192.168.64.1",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "169.254.0.0/16",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.0/24",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.1/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "192.168.64.7/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "192.168.64.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "203.0.113.0/24",
             "interface": "utun3",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "224.0.0.0/4",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           },
           {
             "prefix": "224.0.0.251/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": false
           },
           {
             "prefix": "255.255.255.255/32",
             "interface": "en0",
+            "gateway": "",
             "metric": 0,
             "usable": true
           }
@@ -1079,6 +1187,711 @@
         "destination": "127.0.0.1",
         "expect": {
           "interface": "lo0"
+        }
+      }
+    ]
+  },
+  "linux": {
+    "provenance": {
+      "provenance-uname": "Linux ShuaiWin 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux\n",
+      "provenance-iproute2": "ip utility, iproute2-6.1.0, libbpf 1.3.0\n"
+    },
+    "captures": {
+      "show-host": {
+        "setup": null,
+        "argv": [
+          "ip",
+          "-4",
+          "route",
+          "show",
+          "table",
+          "main"
+        ],
+        "exit": 0,
+        "stdout": "default via 172.18.240.1 dev eth0 proto kernel \n172.18.240.0/20 dev eth0 proto kernel scope link src 172.18.245.210 \n",
+        "stderr": ""
+      },
+      "show-rich": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 metric 100",
+          "ip route add default via 10.9.0.1 dev eth1 metric 600",
+          "ip route add 203.0.113.0/24 dev specus0",
+          "ip route add 198.51.100.7 via 192.168.64.1 dev eth0",
+          "ip route add blackhole 192.0.2.0/24",
+          "ip route add unreachable 192.0.2.128/25",
+          "ip route add prohibit 192.0.2.64/26",
+          "ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1",
+          "ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50",
+          "ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20",
+          "ip route add 10.20.0.0/16 dev eth1 scope link"
+        ],
+        "argv": [
+          "ip",
+          "-4",
+          "route",
+          "show",
+          "table",
+          "main"
+        ],
+        "exit": 0,
+        "stdout": "default via 192.168.64.1 dev eth0 metric 100 \ndefault via 10.9.0.1 dev eth1 metric 600 \n10.9.0.0/24 dev eth1 proto kernel scope link src 10.9.0.2 \n10.20.0.0/16 dev eth1 scope link \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 linkdown \n172.16.0.0/12 \n\tnexthop via 192.168.64.1 dev eth0 weight 1 \n\tnexthop via 10.9.0.1 dev eth1 weight 1 \nblackhole 192.0.2.0/24 \nprohibit 192.0.2.64/26 \nunreachable 192.0.2.128/25 \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20 \n198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50 \n198.51.100.7 via 192.168.64.1 dev eth0 \n203.0.113.0/24 dev specus0 scope link linkdown \n",
+        "stderr": ""
+      },
+      "get-covered-rich": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 metric 100",
+          "ip route add default via 10.9.0.1 dev eth1 metric 600",
+          "ip route add 203.0.113.0/24 dev specus0",
+          "ip route add 198.51.100.7 via 192.168.64.1 dev eth0",
+          "ip route add blackhole 192.0.2.0/24",
+          "ip route add unreachable 192.0.2.128/25",
+          "ip route add prohibit 192.0.2.64/26",
+          "ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1",
+          "ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50",
+          "ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20",
+          "ip route add 10.20.0.0/16 dev eth1 scope link"
+        ],
+        "argv": [
+          "ip",
+          "route",
+          "get",
+          "203.0.113.9"
+        ],
+        "exit": 0,
+        "stdout": "203.0.113.9 dev specus0 src 100.96.0.5 uid 0 \n    cache \n",
+        "stderr": ""
+      },
+      "get-host-rich": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 metric 100",
+          "ip route add default via 10.9.0.1 dev eth1 metric 600",
+          "ip route add 203.0.113.0/24 dev specus0",
+          "ip route add 198.51.100.7 via 192.168.64.1 dev eth0",
+          "ip route add blackhole 192.0.2.0/24",
+          "ip route add unreachable 192.0.2.128/25",
+          "ip route add prohibit 192.0.2.64/26",
+          "ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1",
+          "ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50",
+          "ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20",
+          "ip route add 10.20.0.0/16 dev eth1 scope link"
+        ],
+        "argv": [
+          "ip",
+          "route",
+          "get",
+          "198.51.100.7"
+        ],
+        "exit": 0,
+        "stdout": "198.51.100.7 via 192.168.64.1 dev eth0 src 192.168.64.7 uid 0 \n    cache \n",
+        "stderr": ""
+      },
+      "get-blackhole-rich": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 metric 100",
+          "ip route add default via 10.9.0.1 dev eth1 metric 600",
+          "ip route add 203.0.113.0/24 dev specus0",
+          "ip route add 198.51.100.7 via 192.168.64.1 dev eth0",
+          "ip route add blackhole 192.0.2.0/24",
+          "ip route add unreachable 192.0.2.128/25",
+          "ip route add prohibit 192.0.2.64/26",
+          "ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1",
+          "ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50",
+          "ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20",
+          "ip route add 10.20.0.0/16 dev eth1 scope link"
+        ],
+        "argv": [
+          "ip",
+          "route",
+          "get",
+          "192.0.2.9"
+        ],
+        "exit": 2,
+        "stdout": "",
+        "stderr": "RTNETLINK answers: Invalid argument\n"
+      },
+      "show-tun-halves": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100",
+          "ip route add 0.0.0.0/1 dev specus0",
+          "ip route add 128.0.0.0/1 dev specus0"
+        ],
+        "argv": [
+          "ip",
+          "-4",
+          "route",
+          "show",
+          "table",
+          "main"
+        ],
+        "exit": 0,
+        "stdout": "0.0.0.0/1 dev specus0 scope link linkdown \ndefault via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100 \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 \n128.0.0.0/1 dev specus0 scope link linkdown \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n",
+        "stderr": ""
+      },
+      "get-covered-tun-halves": {
+        "setup": [
+          "set -e",
+          "ip link set lo up",
+          "ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0",
+          "ip tuntap add dev specus0 mode tun",
+          "ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0",
+          "ip route add default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100",
+          "ip route add 0.0.0.0/1 dev specus0",
+          "ip route add 128.0.0.0/1 dev specus0"
+        ],
+        "argv": [
+          "ip",
+          "route",
+          "get",
+          "203.0.113.9"
+        ],
+        "exit": 0,
+        "stdout": "203.0.113.9 dev specus0 src 100.96.0.5 uid 0 \n    cache \n",
+        "stderr": ""
+      }
+    },
+    "tables": {
+      "show-host": "default via 172.18.240.1 dev eth0 proto kernel \n172.18.240.0/20 dev eth0 proto kernel scope link src 172.18.245.210 \n",
+      "show-rich": "default via 192.168.64.1 dev eth0 metric 100 \ndefault via 10.9.0.1 dev eth1 metric 600 \n10.9.0.0/24 dev eth1 proto kernel scope link src 10.9.0.2 \n10.20.0.0/16 dev eth1 scope link \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 linkdown \n172.16.0.0/12 \n\tnexthop via 192.168.64.1 dev eth0 weight 1 \n\tnexthop via 10.9.0.1 dev eth1 weight 1 \nblackhole 192.0.2.0/24 \nprohibit 192.0.2.64/26 \nunreachable 192.0.2.128/25 \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20 \n198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50 \n198.51.100.7 via 192.168.64.1 dev eth0 \n203.0.113.0/24 dev specus0 scope link linkdown \n",
+      "show-tun-halves": "0.0.0.0/1 dev specus0 scope link linkdown \ndefault via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100 \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 \n128.0.0.0/1 dev specus0 scope link linkdown \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n"
+    },
+    "routes": [
+      {
+        "table": "show-host",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "eth0",
+            "gateway": "172.18.240.1",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "172.18.240.0/20",
+            "interface": "eth0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      },
+      {
+        "table": "show-rich",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 100,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "eth1",
+            "gateway": "10.9.0.1",
+            "metric": 600,
+            "usable": true
+          },
+          {
+            "prefix": "10.9.0.0/24",
+            "interface": "eth1",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "10.20.0.0/16",
+            "interface": "eth1",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "100.96.0.0/11",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "172.16.0.0/12",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.0/24",
+            "interface": "",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.64/26",
+            "interface": "",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.128/25",
+            "interface": "",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.0/24",
+            "interface": "eth0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "198.18.0.0/15",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "198.18.0.0/15",
+            "interface": "eth1",
+            "gateway": "10.9.0.1",
+            "metric": 50,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.7/32",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      },
+      {
+        "table": "show-tun-halves",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/1",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 100,
+            "usable": true
+          },
+          {
+            "prefix": "100.96.0.0/11",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "128.0.0.0/1",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.0/24",
+            "interface": "eth0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      }
+    ]
+  },
+  "hops": {
+    "cases": [
+      {
+        "name": "linux-covered-address-goes-out-the-physical-default",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "203.0.113.9",
+        "note": "What `ip route get 203.0.113.9` could not answer: in the same namespace it said dev specus0. Of the two default routes the lower metric wins.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-without-the-tunnel-left-out-the-tunnel-would-win",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "",
+        "destination": "203.0.113.9",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "specus0",
+            "gateway": ""
+          }
+        }
+      },
+      {
+        "name": "linux-host-route",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "198.51.100.7",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-on-link-network",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "10.20.3.4",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth1",
+            "gateway": ""
+          }
+        }
+      },
+      {
+        "name": "linux-lower-metric-wins-between-equal-prefixes",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "198.18.1.1",
+        "note": "Printed metric 20 first, but the metric decides, not the order.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-multipath-takes-its-first-next-hop",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "172.16.5.5",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-blackhole-leads-nowhere",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "192.0.2.9",
+        "note": "The default routes cover it too. The table deliberately does not reach it, so no bypass is pinned through them.",
+        "owned": [],
+        "expect": {
+          "hop": null
+        }
+      },
+      {
+        "name": "linux-prohibit-leads-nowhere",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "192.0.2.70",
+        "owned": [],
+        "expect": {
+          "hop": null
+        }
+      },
+      {
+        "name": "linux-unreachable-leads-nowhere",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "192.0.2.200",
+        "owned": [],
+        "expect": {
+          "hop": null
+        }
+      },
+      {
+        "name": "linux-mesh-network-is-left-out",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "destination": "100.96.0.9",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-halves-over-the-default",
+        "platform": "linux",
+        "table": "show-tun-halves",
+        "tunnel": "specus0",
+        "destination": "203.0.113.9",
+        "note": "Two /1 routes into the tunnel cover everything; the /0 behind them is still there.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "linux-real-host-table",
+        "platform": "linux",
+        "table": "show-host",
+        "tunnel": "specus0",
+        "destination": "1.1.1.1",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "eth0",
+            "gateway": "172.18.240.1"
+          }
+        }
+      },
+      {
+        "name": "macos-covered-address-goes-out-en0",
+        "platform": "macos",
+        "table": "tunRoute",
+        "tunnel": "utun3",
+        "destination": "203.0.113.9",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "en0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "macos-on-link-network-has-no-gateway",
+        "platform": "macos",
+        "table": "tunRoute",
+        "tunnel": "utun3",
+        "destination": "192.168.64.20",
+        "note": "The Gateway column says link#7, which is not a hop.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "en0",
+            "gateway": ""
+          }
+        }
+      },
+      {
+        "name": "macos-interface-route-has-no-gateway",
+        "platform": "macos",
+        "table": "table",
+        "tunnel": "utun3",
+        "destination": "198.51.100.200",
+        "note": "The Gateway column names lo0, which is not a hop either.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "lo0",
+            "gateway": ""
+          }
+        }
+      },
+      {
+        "name": "macos-scoped-duplicates-leave-the-unscoped-gateway",
+        "platform": "macos",
+        "table": "duplicates",
+        "tunnel": "lo0",
+        "destination": "203.0.113.9",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "en0",
+            "gateway": "192.168.64.1"
+          }
+        }
+      },
+      {
+        "name": "windows-covered-address-goes-out-the-default-gateway",
+        "platform": "windows",
+        "table": "typical",
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "3",
+            "gateway": "192.168.1.1"
+          }
+        }
+      },
+      {
+        "name": "windows-on-link-network-has-no-gateway",
+        "platform": "windows",
+        "table": "typical",
+        "tunnel": "42",
+        "destination": "192.168.1.50",
+        "note": "Windows writes on-link as a next hop of 0.0.0.0.",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "3",
+            "gateway": ""
+          }
+        }
+      },
+      {
+        "name": "windows-vpn-route-keeps-its-gateway",
+        "platform": "windows",
+        "table": "typical",
+        "tunnel": "42",
+        "destination": "172.16.5.5",
+        "owned": [],
+        "expect": {
+          "hop": {
+            "interface": "9",
+            "gateway": "10.9.0.1"
+          }
+        }
+      },
+      {
+        "name": "owned-bypass-is-left-out",
+        "platform": "inline",
+        "tunnel": "42",
+        "destination": "198.51.100.7",
+        "owned": [
+          "198.51.100.7/32"
+        ],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "gateway": "192.168.1.1",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.7/32",
+            "interface": "3",
+            "gateway": "192.168.2.1",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "note": "A bypass this feature installed earlier still names the gateway it was resolved to. Resolving again has to look past it, or a network change would keep the old hop.",
+        "expect": {
+          "hop": {
+            "interface": "3",
+            "gateway": "192.168.1.1"
+          }
+        }
+      },
+      {
+        "name": "owned-bypass-would-otherwise-win",
+        "platform": "inline",
+        "tunnel": "42",
+        "destination": "198.51.100.7",
+        "owned": [],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "gateway": "192.168.1.1",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.7/32",
+            "interface": "3",
+            "gateway": "192.168.2.1",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "expect": {
+          "hop": {
+            "interface": "3",
+            "gateway": "192.168.2.1"
+          }
+        }
+      },
+      {
+        "name": "only-the-tunnel-leads-there",
+        "platform": "inline",
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "owned": [],
+        "routes": [
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "42",
+            "gateway": "",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "expect": {
+          "hop": null
         }
       }
     ]

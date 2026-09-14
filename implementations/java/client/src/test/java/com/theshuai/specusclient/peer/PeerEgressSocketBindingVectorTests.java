@@ -3,6 +3,7 @@ package com.theshuai.specusclient.peer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -46,8 +47,8 @@ class PeerEgressSocketBindingVectorTests {
         List<PeerEgressSocketBinding.Route> routes = new ArrayList<>();
         for (JsonNode route : array) {
             routes.add(new PeerEgressSocketBinding.Route(route.path("prefix").asText(),
-                    route.path("interface").asText(), route.path("metric").asLong(),
-                    route.path("usable").asBoolean()));
+                    route.path("interface").asText(), route.path("gateway").asText(""),
+                    route.path("metric").asLong(), route.path("usable").asBoolean()));
         }
         return routes;
     }
@@ -87,7 +88,7 @@ class PeerEgressSocketBindingVectorTests {
             List<PeerEgressSocketBinding.WindowsForwardRow> expected = new ArrayList<>();
             for (JsonNode row : table.path("expect").path("rows")) {
                 expected.add(new PeerEgressSocketBinding.WindowsForwardRow(row.path("interfaceIndex").asLong(),
-                        row.path("prefix").asText(), row.path("metric").asLong()));
+                        row.path("prefix").asText(), row.path("nextHop").asText(), row.path("metric").asLong()));
             }
             assertEquals(expected, rows, "forward " + name);
             forwardByName.put(name, rows);
@@ -137,6 +138,102 @@ class PeerEgressSocketBindingVectorTests {
             assertChoice("macos " + testCase.path("name").asText(),
                     byTable.get(testCase.path("table").asText()), testCase);
         }
+    }
+
+    @Test
+    void linuxTablesMatchTheSharedVector() throws IOException {
+        JsonNode linux = vector().path("linux");
+        assertTrue(linux.path("routes").size() > 0, "no Linux tables");
+        for (JsonNode entry : linux.path("routes")) {
+            String table = entry.path("table").asText();
+            assertEquals(routes(entry.path("expect")),
+                    PeerEgressRouteCommands.parseRouteTable(linux.path("tables").path(table).asText()),
+                    "linux routes " + table);
+        }
+        // The captures that justify reading the table at all: `ip route get` answering with the tunnel.
+        linux.path("captures").fields().forEachRemaining(capture -> {
+            if (capture.getKey().startsWith("get-covered")) {
+                PeerEgressRouteCommands.Hop hop =
+                        PeerEgressRouteCommands.parseRouteGet(capture.getValue().path("stdout").asText());
+                assertTrue(PeerEgressRouteCommands.hopIsDevice(hop, "specus0"),
+                        capture.getKey() + " parsed as " + hop);
+            }
+        });
+    }
+
+    @Test
+    void bypassHopsMatchTheSharedVector() throws IOException {
+        JsonNode root = vector();
+        Map<String, Map<String, List<PeerEgressSocketBinding.Route>>> tables = new HashMap<>();
+        tables.put("linux", new HashMap<>());
+        tables.put("macos", new HashMap<>());
+        tables.put("windows", new HashMap<>());
+        root.path("linux").path("tables").fields().forEachRemaining(table -> tables.get("linux")
+                .put(table.getKey(), PeerEgressRouteCommands.parseRouteTable(table.getValue().asText())));
+        root.path("macos").path("tables").fields().forEachRemaining(table -> tables.get("macos")
+                .put(table.getKey(), PeerEgressSocketBinding.macosRoutes(table.getValue().asText())));
+        JsonNode windows = root.path("windows");
+        List<PeerEgressSocketBinding.WindowsForwardRow> forward = null;
+        List<PeerEgressSocketBinding.WindowsInterfaceRow> interfaces = null;
+        for (JsonNode table : windows.path("forwardTables")) {
+            if (table.path("name").asText().equals(windows.path("routes").path("forward").asText())) {
+                forward = PeerEgressSocketBinding.parseWindowsForwardTable(
+                        HexFormat.of().parseHex(table.path("hex").asText()));
+            }
+        }
+        for (JsonNode table : windows.path("interfaceTables")) {
+            if (table.path("name").asText().equals(windows.path("routes").path("interfaces").asText())) {
+                interfaces = PeerEgressSocketBinding.parseWindowsInterfaceTable(
+                        HexFormat.of().parseHex(table.path("hex").asText()));
+            }
+        }
+        assertNotNull(forward);
+        assertNotNull(interfaces);
+        tables.get("windows").put("typical", PeerEgressSocketBinding.windowsRoutes(forward, interfaces));
+
+        JsonNode cases = root.path("hops").path("cases");
+        assertTrue(cases.size() > 0, "no hop cases");
+        for (JsonNode testCase : cases) {
+            String name = testCase.path("name").asText();
+            String platform = testCase.path("platform").asText();
+            List<PeerEgressSocketBinding.Route> routes = "inline".equals(platform)
+                    ? routes(testCase.path("routes"))
+                    : tables.get(platform).get(testCase.path("table").asText());
+            List<String> owned = new ArrayList<>();
+            testCase.path("owned").forEach(prefix -> owned.add(prefix.asText()));
+            PeerEgressSocketBinding.Route hop = PeerEgressSocketBinding.selectBypassHop(routes,
+                    testCase.path("tunnel").asText(), owned, testCase.path("destination").asText());
+            JsonNode expected = testCase.path("expect").path("hop");
+            if (expected.isNull()) {
+                assertNull(hop, name + ": want no hop");
+            } else {
+                assertNotNull(hop, name + ": no hop");
+                assertEquals(expected.path("interface").asText(), hop.iface(), name + " interface");
+                assertEquals(expected.path("gateway").asText(), hop.gateway(), name + " gateway");
+            }
+        }
+    }
+
+    /**
+     * The fallback a commander takes when its query answers with the tunnel: the table with the
+     * tunnel left out, and a refusal that says why when nothing else leads there.
+     */
+    @Test
+    void theHopFromTheTableLeavesTheTunnelOut() throws IOException {
+        List<PeerEgressSocketBinding.Route> routes = PeerEgressRouteCommands.parseRouteTable(
+                vector().path("linux").path("tables").path("show-rich").asText());
+
+        PeerEgressSocketBinding.Route hop =
+                PeerEgressSocketBinding.bypassHopFromTable("203.0.113.9", "specus0", () -> routes);
+        assertEquals("eth0", hop.iface());
+        assertEquals("192.168.64.1", hop.gateway());
+        assertThrows(PeerEgressSocketBinder.NoPhysicalRouteException.class,
+                () -> PeerEgressSocketBinding.bypassHopFromTable("192.0.2.9", "specus0", () -> routes));
+        IOException unreadable = assertThrows(IOException.class,
+                () -> PeerEgressSocketBinding.bypassHopFromTable("203.0.113.9", "specus0", () -> {
+                    throw new IOException("ip: not found");
+                }));
+        assertTrue(unreadable.getMessage().contains("ip: not found"), unreadable.getMessage());
     }
 
     @Test

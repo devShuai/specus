@@ -26,6 +26,8 @@ const (
 	windowsForwardPrefixFamily   = 12
 	windowsForwardPrefixAddress  = 16
 	windowsForwardPrefixLength   = 40
+	windowsForwardNextHopFamily  = 44
+	windowsForwardNextHopAddress = 48
 	windowsForwardMetric         = 84
 
 	windowsInterfaceRowSize              = 168
@@ -44,7 +46,9 @@ const (
 type windowsForwardRow struct {
 	InterfaceIndex uint32
 	Prefix         string
-	Metric         uint32
+	// NextHop is the address as written, 0.0.0.0 for on-link, or empty when it is not IPv4.
+	NextHop string
+	Metric  uint32
 }
 
 type windowsInterfaceRow struct {
@@ -90,9 +94,14 @@ func parseWindowsForwardTable(raw []byte) ([]windowsForwardRow, bool) {
 			continue
 		}
 		address := netip.AddrFrom4([4]byte(row[windowsForwardPrefixAddress : windowsForwardPrefixAddress+4]))
+		nextHop := ""
+		if binary.LittleEndian.Uint16(row[windowsForwardNextHopFamily:]) == windowsAddressFamilyIPv4 {
+			nextHop = netip.AddrFrom4([4]byte(row[windowsForwardNextHopAddress : windowsForwardNextHopAddress+4])).String()
+		}
 		parsed = append(parsed, windowsForwardRow{
 			InterfaceIndex: binary.LittleEndian.Uint32(row[windowsForwardInterfaceIndex:]),
 			Prefix:         netip.PrefixFrom(address, length).Masked().String(),
+			NextHop:        nextHop,
 			Metric:         binary.LittleEndian.Uint32(row[windowsForwardMetric:]),
 		})
 	}
@@ -137,6 +146,9 @@ func windowsBindRoutes(forward []windowsForwardRow, interfaces []windowsInterfac
 			Prefix:    row.Prefix,
 			Interface: strconv.FormatUint(uint64(row.InterfaceIndex), 10),
 			Metric:    int64(row.Metric),
+		}
+		if row.NextHop != windowsOnLinkNextHop {
+			route.Gateway = row.NextHop
 		}
 		if iface, ok := byIndex[row.InterfaceIndex]; ok {
 			route.Metric += int64(iface.Metric)

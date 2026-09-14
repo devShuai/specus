@@ -115,9 +115,14 @@ func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
 			return fmt.Errorf("no route to %s to bypass through", address)
 		}
 		if egressRouteHopIsDevice(resolved, c.tun) {
-			// Pinning it to the tunnel would send the transport through the thing it
-			// carries.
-			return fmt.Errorf("bypass for %s already resolves to the tunnel", address)
+			// A rule's route covers the address, so the query can only see the tunnel. Pinning
+			// the bypass there would send the transport through the thing it carries; the
+			// table, read with the tunnel left out, says where it went before.
+			fallback, err := egressBypassHopFromTable(address, c.tun, c.readTable)
+			if err != nil {
+				return err
+			}
+			resolved = egressRouteHop{Gateway: fallback.Gateway, Device: fallback.Interface}
 		}
 		c.hops[address] = resolved
 		hop = resolved
@@ -127,6 +132,15 @@ func (c *macosEgressRouteCommander) installBypass(route egressRoute) error {
 		return fmt.Errorf("install bypass %s: %w", route.CIDR, err)
 	}
 	return c.apply(args, "install bypass "+route.CIDR)
+}
+
+// readTable reads the whole table for a bypass hop `route -n get` could not give.
+func (c *macosEgressRouteCommander) readTable() ([]egressBindRoute, error) {
+	stdout, stderr, err := c.run(macosShowTableArgs())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr))
+	}
+	return macosBindRoutes(stdout), nil
 }
 
 // bypassArgs picks the form of the add, which depends on whether the address is on-link.

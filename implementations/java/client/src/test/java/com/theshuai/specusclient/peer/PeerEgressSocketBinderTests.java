@@ -199,7 +199,7 @@ class PeerEgressSocketBinderTests {
         assertNotNull(physical, "no default route outside loopback; this test needs working networking");
 
         PeerEgressSocketBinder lying = PeerEgressSocketBinder.forPlatform(() -> "");
-        lying.routes = () -> List.of(new PeerEgressSocketBinding.Route("127.0.0.0/8", physical, 0, true));
+        lying.routes = () -> List.of(new PeerEgressSocketBinding.Route("127.0.0.0/8", physical, "", 0, true));
         try (ServerSocket server = new ServerSocket()) {
             server.bind(new InetSocketAddress("127.0.0.1", 0));
             IOException failure = assertThrows(IOException.class,

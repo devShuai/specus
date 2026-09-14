@@ -115,9 +115,12 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
                     $"no route to {address} to bypass through");
             if (PeerEgressRouteCommands.HopIsDevice(resolved, tun))
             {
-                // Pinning it to the tunnel would send the transport through the thing it carries.
-                throw new InvalidOperationException(
-                    $"bypass for {address} already resolves to the tunnel");
+                // A rule's route covers the address, so the query can only see the tunnel. Pinning
+                // the bypass there would send the transport through the thing it carries; the table,
+                // read with the tunnel left out, says where it went before.
+                var fallback = PeerEgressSocketBinding.BypassHopFromTable(address, tun,
+                    () => PeerEgressSocketBinding.MacosRoutes(Run(PeerEgressMacosRouteCommands.ShowTableArgs()).Stdout));
+                resolved = new PeerEgressRouteHop(fallback.Gateway, fallback.Interface);
             }
             _hops[address] = resolved;
             hop = resolved;

@@ -158,6 +158,7 @@ PID 12345 | ready
 | 规则写了但流量照常走本机 | `egress` 里的 `NOT IN FORCE` | 规则被拒，按错误码修正。也检查 `peerMeshDevice` 是否还是默认的 `noop` |
 | 规则生效但流量仍走本机 | `egress` 里的 `NOT INSTALLED` | 该前缀已被本功能之外的路由占用。本功能不抢占，删掉或调整那条路由后重新连接 |
 | `route install failed`，Windows 带 `needs administrator rights`、macOS 带 `needs root`、Linux 带 `Operation not permitted` | `egress` 里的 `route install failed` | 消费端没有改路由表的权限。以管理员或 root 运行，Linux 也可授予 `CAP_NET_ADMIN` |
+| `route install failed` 带 `no route outside the tunnel` | `egress` 里的 `route install failed` | 某条规则覆盖了控制服务器、STUN/TURN 或某个对端的地址，而除了隧道之外路由表里没有能到达它的路由（或者到它的路由是黑洞）。这条旁路没装上，经过它的连接会走进隧道。检查规则前缀是否写得过宽，或者本机的路由表 |
 | 命中规则的目标不通，状态里出口离线 | `egress peer N: offline`，拦截计数 `egress-unavailable` | 出口设备不在线、服务端未打开租户开关或出口策略、或这台消费端不在允许列表里。出口设备上 `egress` 显示 `not serving` 说明它没收到策略 |
 | 出口在线但特定目标不通 | 拦截计数 `rejected-egress_dest_denied` 等；出口上的 `refused` | 出口策略拒绝了这个目标，检查 `destinationRules`、`scope`、协议与端口 |
 | ping 不通但 TCP 正常 | 拦截计数 `unsupported-protocol` | 一期不转发 ICMP，符合预期 |

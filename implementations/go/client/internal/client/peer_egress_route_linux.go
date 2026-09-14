@@ -70,8 +70,14 @@ func (c *linuxEgressRouteCommander) installBypass(route egressRoute) error {
 			return fmt.Errorf("no route to %s to bypass through", address)
 		}
 		if egressRouteHopIsDevice(resolved, c.tun) {
-			// Pinning it to the tunnel would send the transport through the thing it carries.
-			return fmt.Errorf("bypass for %s already resolves to the tunnel", address)
+			// A rule's route covers the address, so the query can only see the tunnel. Pinning
+			// the bypass there would send the transport through the thing it carries; the main
+			// table, read with the tunnel left out, says where it went before.
+			fallback, err := egressBypassHopFromTable(address, c.tun, readLinuxMainTable)
+			if err != nil {
+				return err
+			}
+			resolved = egressRouteHop{Gateway: fallback.Gateway, Device: fallback.Interface}
 		}
 		c.hops[address] = resolved
 		hop = resolved
@@ -80,6 +86,19 @@ func (c *linuxEgressRouteCommander) installBypass(route egressRoute) error {
 		return runCommand("ip", "route", "add", route.CIDR, "dev", hop.Device)
 	}
 	return runCommand("ip", "route", "add", route.CIDR, "via", hop.Gateway, "dev", hop.Device)
+}
+
+// readLinuxMainTable reads the main table for a bypass hop.
+//
+// Only the main table. The query this stands in for followed policy routing; the reading does not,
+// so on a machine whose own rules would have sent the address elsewhere -- another VPN's table
+// behind a suppress_prefixlength rule -- the fallback answers with the main table's route instead.
+func readLinuxMainTable() ([]egressBindRoute, error) {
+	output, err := runCommandOutput(linuxShowMainTableArgs()...)
+	if err != nil {
+		return nil, err
+	}
+	return parseIPRouteTable(output), nil
 }
 
 func (c *linuxEgressRouteCommander) Remove(route egressRoute) error {

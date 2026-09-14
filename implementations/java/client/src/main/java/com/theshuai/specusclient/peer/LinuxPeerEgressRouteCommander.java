@@ -78,8 +78,14 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
                 throw new IOException("no route to " + address + " to bypass through");
             }
             if (PeerEgressRouteCommands.hopIsDevice(hop, tun)) {
-                // Pinning it to the tunnel would send the transport through the thing it carries.
-                throw new IOException("bypass for " + address + " already resolves to the tunnel");
+                // A rule's route covers the address, so the query can only see the tunnel. Pinning
+                // the bypass there would send the transport through the thing it carries; the main
+                // table, read with the tunnel left out, says where it went before. Only the main
+                // table: the query followed policy routing and this reading does not.
+                PeerEgressSocketBinding.Route fallback = PeerEgressSocketBinding.bypassHopFromTable(address, tun,
+                        () -> PeerEgressRouteCommands.parseRouteTable(
+                                runForOutput(PeerEgressRouteCommands.showMainTableArgs())));
+                hop = new PeerEgressRouteCommands.Hop(fallback.gateway(), fallback.iface());
             }
             hops.put(address, hop);
         }

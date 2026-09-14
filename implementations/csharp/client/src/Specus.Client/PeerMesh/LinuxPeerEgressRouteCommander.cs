@@ -74,12 +74,17 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
             {
                 throw new InvalidOperationException($"no route to {address} to bypass through");
             }
-            if (PeerEgressRouteCommands.HopIsDevice(resolved.Value, tun))
-            {
-                // Pinning it to the tunnel would send the transport through the thing it carries.
-                throw new InvalidOperationException($"bypass for {address} already resolves to the tunnel");
-            }
             hop = resolved.Value;
+            if (PeerEgressRouteCommands.HopIsDevice(hop, tun))
+            {
+                // A rule's route covers the address, so the query can only see the tunnel. Pinning
+                // the bypass there would send the transport through the thing it carries; the main
+                // table, read with the tunnel left out, says where it went before. Only the main
+                // table: the query followed policy routing and this reading does not.
+                var fallback = PeerEgressSocketBinding.BypassHopFromTable(address, tun,
+                    () => PeerEgressRouteCommands.ParseRouteTable(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs())));
+                hop = new PeerEgressRouteHop(fallback.Gateway, fallback.Interface);
+            }
             _hops[address] = hop;
         }
         RunForOutput("ip", hop.Gateway.Length == 0

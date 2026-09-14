@@ -34,6 +34,7 @@ public class PeerEgressSocketBindingVectorTests
         array.EnumerateArray().Select(route => new PeerEgressBindRoute(
             route.GetProperty("prefix").GetString()!,
             route.GetProperty("interface").GetString()!,
+            route.TryGetProperty("gateway", out var gateway) ? gateway.GetString()! : "",
             route.GetProperty("metric").GetInt64(),
             route.GetProperty("usable").GetBoolean())).ToList();
 
@@ -83,7 +84,8 @@ public class PeerEgressSocketBindingVectorTests
             }
             var expected = table.GetProperty("expect").GetProperty("rows").EnumerateArray()
                 .Select(row => new PeerEgressWindowsForwardRow(row.GetProperty("interfaceIndex").GetInt64(),
-                    row.GetProperty("prefix").GetString()!, row.GetProperty("metric").GetInt64()))
+                    row.GetProperty("prefix").GetString()!, row.GetProperty("nextHop").GetString()!,
+                    row.GetProperty("metric").GetInt64()))
                 .ToList();
             Assert.Equal(expected, rows);
             forwardByName[name] = rows;
@@ -138,6 +140,102 @@ public class PeerEgressSocketBindingVectorTests
             AssertChoice("macos " + testCase.GetProperty("name").GetString(),
                 byTable[testCase.GetProperty("table").GetString()!], testCase);
         }
+    }
+
+    [Fact]
+    public void LinuxTablesMatchTheSharedVector()
+    {
+        using var vector = Vector();
+        var linux = vector.RootElement.GetProperty("linux");
+        Assert.True(linux.GetProperty("routes").GetArrayLength() > 0, "no Linux tables");
+        foreach (var entry in linux.GetProperty("routes").EnumerateArray())
+        {
+            var table = entry.GetProperty("table").GetString()!;
+            Assert.Equal(Routes(entry.GetProperty("expect")),
+                PeerEgressRouteCommands.ParseRouteTable(linux.GetProperty("tables").GetProperty(table).GetString()));
+        }
+        // The captures that justify reading the table at all: `ip route get` answering with the tunnel.
+        foreach (var capture in linux.GetProperty("captures").EnumerateObject())
+        {
+            if (!capture.Name.StartsWith("get-covered", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var hop = PeerEgressRouteCommands.ParseRouteGet(capture.Value.GetProperty("stdout").GetString());
+            Assert.True(hop is { } parsed && PeerEgressRouteCommands.HopIsDevice(parsed, "specus0"),
+                $"{capture.Name} parsed as {hop}");
+        }
+    }
+
+    [Fact]
+    public void BypassHopsMatchTheSharedVector()
+    {
+        using var vector = Vector();
+        var root = vector.RootElement;
+        var tables = new Dictionary<string, Dictionary<string, List<PeerEgressBindRoute>>>
+        {
+            ["linux"] = root.GetProperty("linux").GetProperty("tables").EnumerateObject()
+                .ToDictionary(table => table.Name, table => PeerEgressRouteCommands.ParseRouteTable(table.Value.GetString())),
+            ["macos"] = root.GetProperty("macos").GetProperty("tables").EnumerateObject()
+                .ToDictionary(table => table.Name, table => PeerEgressSocketBinding.MacosRoutes(table.Value.GetString())),
+        };
+        var windows = root.GetProperty("windows");
+        var forward = windows.GetProperty("forwardTables").EnumerateArray()
+            .Where(table => table.GetProperty("name").GetString() == windows.GetProperty("routes").GetProperty("forward").GetString())
+            .Select(table => PeerEgressSocketBinding.ParseWindowsForwardTable(Convert.FromHexString(table.GetProperty("hex").GetString()!)))
+            .Single();
+        var interfaces = windows.GetProperty("interfaceTables").EnumerateArray()
+            .Where(table => table.GetProperty("name").GetString() == windows.GetProperty("routes").GetProperty("interfaces").GetString())
+            .Select(table => PeerEgressSocketBinding.ParseWindowsInterfaceTable(Convert.FromHexString(table.GetProperty("hex").GetString()!)))
+            .Single();
+        tables["windows"] = new() { ["typical"] = PeerEgressSocketBinding.WindowsRoutes(forward!, interfaces!) };
+
+        var cases = root.GetProperty("hops").GetProperty("cases");
+        Assert.True(cases.GetArrayLength() > 0, "no hop cases");
+        foreach (var testCase in cases.EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString();
+            var platform = testCase.GetProperty("platform").GetString()!;
+            var routes = platform == "inline"
+                ? Routes(testCase.GetProperty("routes"))
+                : tables[platform][testCase.GetProperty("table").GetString()!];
+            var owned = testCase.GetProperty("owned").EnumerateArray().Select(prefix => prefix.GetString()!).ToList();
+            var hop = PeerEgressSocketBinding.SelectBypassHop(routes, testCase.GetProperty("tunnel").GetString(),
+                owned, testCase.GetProperty("destination").GetString()!);
+            var expected = testCase.GetProperty("expect").GetProperty("hop");
+            if (expected.ValueKind == JsonValueKind.Null)
+            {
+                Assert.True(hop is null, $"{name}: chose {hop}, want no hop");
+            }
+            else
+            {
+                Assert.True(hop is { } chosen
+                        && chosen.Interface == expected.GetProperty("interface").GetString()
+                        && chosen.Gateway == expected.GetProperty("gateway").GetString(),
+                    $"{name}: chose {hop}, want {expected}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The fallback a commander takes when its query answers with the tunnel: the table with the
+    /// tunnel left out, and a refusal that says why when nothing else leads there.
+    /// </summary>
+    [Fact]
+    public void TheHopFromTheTableLeavesTheTunnelOut()
+    {
+        using var vector = Vector();
+        var routes = PeerEgressRouteCommands.ParseRouteTable(
+            vector.RootElement.GetProperty("linux").GetProperty("tables").GetProperty("show-rich").GetString());
+
+        var hop = PeerEgressSocketBinding.BypassHopFromTable("203.0.113.9", "specus0", () => routes);
+        Assert.Equal("eth0", hop.Interface);
+        Assert.Equal("192.168.64.1", hop.Gateway);
+        Assert.Throws<PeerEgressNoPhysicalRouteException>(
+            () => PeerEgressSocketBinding.BypassHopFromTable("192.0.2.9", "specus0", () => routes));
+        var unreadable = Assert.Throws<IOException>(() => PeerEgressSocketBinding.BypassHopFromTable(
+            "203.0.113.9", "specus0", () => throw new InvalidOperationException("ip: not found")));
+        Assert.Contains("ip: not found", unreadable.Message);
     }
 
     [Fact]

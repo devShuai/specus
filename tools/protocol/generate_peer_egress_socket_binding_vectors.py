@@ -37,10 +37,21 @@ nor is a default route on an interface that has DisableDefaultRoutes set. On mac
 the I flag is scoped to its interface and never chosen for a socket that is not already bound to it,
 so it is not a candidate either.
 
+The same reading answers a second question: where a consumer's bypass route should point. A bypass
+keeps the tunnel's own transport -- the control connection, STUN, TURN, a peer -- off a rule that
+covers it, and its next hop is asked of the platform (`ip route get`, Find-NetRoute, `route -n get`).
+Once a rule's route is in the table that question answers with the tunnel, which is exactly when a
+bypass is needed: sampled on Linux, `ip route get 203.0.113.9` said `dev specus0` in a namespace
+where 203.0.113.0/24 had been routed into it. So when the platform answers with the tunnel, the hop
+comes from the table instead, by the same choice with this feature's own bypass prefixes also left
+out, and with a route that leads nowhere -- blackhole, prohibit, unreachable -- meaning no hop rather
+than a reason to try the next route.
+
 The expectations come from the reference implementation in this file, not from any of the three
 runtimes. The macOS tables are copied verbatim from the sampled captures in
 peer-egress-macos-routes-v1.json, and their normalised prefixes are taken from that file's
-expectations rather than recomputed.
+expectations rather than recomputed. The Linux tables are captures too, taken in network namespaces
+built for the purpose; see the block that holds them.
 """
 import ctypes
 import ipaddress
@@ -55,20 +66,23 @@ AF_INET6 = 23
 # ---- reference selection ----------------------------------------------------------------------
 
 
-def select_interface(routes, tunnel, destination):
-    """The interface a socket to destination is bound to, or None when nothing but the tunnel leads there.
+def select_route(routes, tunnel, destination, owned=()):
+    """The route a packet to destination would take with this feature's own routes left out.
 
     Longest prefix first, then the lowest metric, then the route listed first. Routes that are not
-    usable and routes on the tunnel's own interface are not candidates. The tunnel is compared by
-    exact equality: utun30 is not utun3.
+    usable, routes on the tunnel's own interface, and routes whose prefix this feature owns are not
+    candidates. The tunnel is compared by exact equality: utun30 is not utun3.
     """
     address = ipaddress.IPv4Address(destination)
+    owned = set(owned)
     best = None
     best_key = None
     for route in routes:
         if not route["usable"]:
             continue
         if tunnel and route["interface"] == tunnel:
+            continue
+        if route["prefix"] in owned:
             continue
         network = ipaddress.IPv4Network(route["prefix"])
         if address not in network:
@@ -77,11 +91,31 @@ def select_interface(routes, tunnel, destination):
         # Strictly greater, so a tie keeps the route listed first.
         if best_key is None or key > best_key:
             best, best_key = route, key
-    return None if best is None else best["interface"]
+    return best
 
 
-def route(prefix, interface, metric=0, usable=True):
-    return {"prefix": prefix, "interface": interface, "metric": metric, "usable": usable}
+def select_interface(routes, tunnel, destination):
+    """The interface a socket to destination is bound to, or None when nothing but the tunnel leads there."""
+    chosen = select_route(routes, tunnel, destination)
+    return None if chosen is None else chosen["interface"]
+
+
+def select_hop(routes, tunnel, destination, owned=()):
+    """Where a bypass route for destination points, or None.
+
+    None both when nothing but the tunnel leads there and when the route that wins leads nowhere --
+    a blackhole, prohibit or unreachable route has no interface. Pinning a bypass through some other
+    route would reach an address the table deliberately does not.
+    """
+    chosen = select_route(routes, tunnel, destination, owned)
+    if chosen is None or chosen["interface"] == "":
+        return None
+    return {"interface": chosen["interface"], "gateway": chosen["gateway"]}
+
+
+def route(prefix, interface, metric=0, usable=True, gateway=""):
+    return {"prefix": prefix, "interface": interface, "gateway": gateway, "metric": metric,
+            "usable": usable}
 
 
 SELECT_CASES = [
@@ -301,6 +335,8 @@ LAYOUT = {
         "prefixFamily": 12,
         "prefixAddress": 16,
         "prefixLength": 40,
+        "nextHopFamily": 44,
+        "nextHopAddress": 48,
         "metric": 84,
     },
     "interfaceRow": {
@@ -330,6 +366,9 @@ assert offset(MIB_IPFORWARD_ROW2, "DestinationPrefix", "Prefix") == LAYOUT["forw
 assert offset(MIB_IPFORWARD_ROW2, "DestinationPrefix", "Prefix") + SOCKADDR_IN.sin_addr.offset \
     == LAYOUT["forwardRow"]["prefixAddress"]
 assert offset(MIB_IPFORWARD_ROW2, "DestinationPrefix", "PrefixLength") == LAYOUT["forwardRow"]["prefixLength"]
+assert offset(MIB_IPFORWARD_ROW2, "NextHop") == LAYOUT["forwardRow"]["nextHopFamily"]
+assert offset(MIB_IPFORWARD_ROW2, "NextHop") + SOCKADDR_IN.sin_addr.offset \
+    == LAYOUT["forwardRow"]["nextHopAddress"]
 assert offset(MIB_IPFORWARD_ROW2, "Metric") == LAYOUT["forwardRow"]["metric"]
 assert ctypes.sizeof(MIB_IPINTERFACE_ROW) == LAYOUT["interfaceRow"]["size"]
 assert offset(MIB_IPINTERFACE_ROW, "Family") == LAYOUT["interfaceRow"]["family"]
@@ -416,8 +455,12 @@ def reference_forward_rows(raw):
             continue
         network = ipaddress.IPv4Network(
             (bytes(row.DestinationPrefix.Prefix.Ipv4.sin_addr), length), strict=False)
+        # The next hop is its own SOCKADDR_INET. 0.0.0.0 is how Windows writes on-link.
+        next_hop = ""
+        if row.NextHop.si_family == AF_INET:
+            next_hop = str(ipaddress.IPv4Address(bytes(row.NextHop.Ipv4.sin_addr)))
         rows.append({"interfaceIndex": row.InterfaceIndex, "prefix": str(network),
-                     "metric": row.Metric})
+                     "nextHop": next_hop, "metric": row.Metric})
     return rows
 
 
@@ -452,8 +495,9 @@ def reference_windows_routes(forward, interfaces):
             usable = interface["connected"] and not (
                 row["prefix"] == "0.0.0.0/0" and interface["disableDefaultRoutes"])
             metric = row["metric"] + interface["metric"]
+        gateway = "" if row["nextHop"] in ("", "0.0.0.0") else row["nextHop"]
         routes.append({"prefix": row["prefix"], "interface": str(row["interfaceIndex"]),
-                       "metric": metric, "usable": usable})
+                       "gateway": gateway, "metric": metric, "usable": usable})
     return routes
 
 
@@ -609,8 +653,26 @@ def reference_macos_routes(capture):
             lines.append(stripped.split())
     prefixes = capture["expect"]["prefixes"]
     assert len(lines) == len(prefixes) == capture["expect"]["rows"]
-    return [{"prefix": prefix, "interface": fields[3], "metric": 0, "usable": "I" not in fields[2]}
+    return [{"prefix": prefix, "interface": fields[3], "gateway": macos_gateway(fields[1], fields[2]),
+             "metric": 0, "usable": "I" not in fields[2]}
             for prefix, fields in zip(prefixes, lines)]
+
+
+def macos_gateway(column, flags):
+    """The Gateway column as a next hop: an IPv4 address on a route flagged G, or empty for on-link.
+
+    Only G (RTF_GATEWAY) makes the column a gateway. Without it the column says where the interface
+    is: link#N for a network on the interface, a MAC address for a cloned host entry, an interface
+    name for a route installed with -interface, and an address for a loopback or point-to-point
+    route -- 127 prints 127.0.0.1 there, and a utun host route prints its peer.
+    """
+    if "G" not in flags:
+        return ""
+    try:
+        ipaddress.IPv4Address(column)
+    except ValueError:
+        return ""
+    return column
 
 
 macos_tables = {name: macos_vector[name]["stdout"] for name in ("table", "duplicates", "tunRoute")}
@@ -651,6 +713,357 @@ assert macos_cases[1]["expect"]["interface"] == "utun3"
 assert macos_cases[4]["expect"]["interface"] is None
 assert macos_cases[5]["expect"]["interface"] == "lo0"
 assert macos_cases[6]["expect"]["interface"] == "en0"
+
+# ---- Linux main table -------------------------------------------------------------------------
+#
+# Linux sockets are marked rather than bound, so the table is read only for a bypass hop, and only
+# when `ip route get` answers with the tunnel. That query is kept as the first choice because it
+# follows policy routing -- another VPN's rules and tables -- which a reading of the main table
+# cannot; the table is what is left when the query can no longer see past this feature's own route.
+#
+# Captured under WSL 2 with iproute2 6.1.0, inside network namespaces made with `unshare -rn`, so the
+# TUN device, the dummy interfaces and every route in them are real. The setup that built each table
+# is kept with its capture.
+#
+# This block is machine-written from the capture records. Nothing here was retyped.
+# BEGIN LINUX SAMPLED
+LINUX_SAMPLED = {
+    'provenance-uname': {
+        "argv": ['uname', '-a'],
+        "exit": 0,
+        "stdout": 'Linux ShuaiWin 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux\n',
+        "stderr": '',
+    },
+    'provenance-iproute2': {
+        "argv": ['ip', '-V'],
+        "exit": 0,
+        "stdout": 'ip utility, iproute2-6.1.0, libbpf 1.3.0\n',
+        "stderr": '',
+    },
+    'show-host': {
+        "argv": ['ip', '-4', 'route', 'show', 'table', 'main'],
+        "exit": 0,
+        "stdout": 'default via 172.18.240.1 dev eth0 proto kernel \n172.18.240.0/20 dev eth0 proto kernel scope link src 172.18.245.210 \n',
+        "stderr": '',
+    },
+    'show-rich': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 metric 100',
+            'ip route add default via 10.9.0.1 dev eth1 metric 600',
+            'ip route add 203.0.113.0/24 dev specus0',
+            'ip route add 198.51.100.7 via 192.168.64.1 dev eth0',
+            'ip route add blackhole 192.0.2.0/24',
+            'ip route add unreachable 192.0.2.128/25',
+            'ip route add prohibit 192.0.2.64/26',
+            'ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1',
+            'ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50',
+            'ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20',
+            'ip route add 10.20.0.0/16 dev eth1 scope link',
+        ],
+        "argv": ['ip', '-4', 'route', 'show', 'table', 'main'],
+        "exit": 0,
+        "stdout": 'default via 192.168.64.1 dev eth0 metric 100 \ndefault via 10.9.0.1 dev eth1 metric 600 \n10.9.0.0/24 dev eth1 proto kernel scope link src 10.9.0.2 \n10.20.0.0/16 dev eth1 scope link \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 linkdown \n172.16.0.0/12 \n\tnexthop via 192.168.64.1 dev eth0 weight 1 \n\tnexthop via 10.9.0.1 dev eth1 weight 1 \nblackhole 192.0.2.0/24 \nprohibit 192.0.2.64/26 \nunreachable 192.0.2.128/25 \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20 \n198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50 \n198.51.100.7 via 192.168.64.1 dev eth0 \n203.0.113.0/24 dev specus0 scope link linkdown \n',
+        "stderr": '',
+    },
+    'get-covered-rich': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 metric 100',
+            'ip route add default via 10.9.0.1 dev eth1 metric 600',
+            'ip route add 203.0.113.0/24 dev specus0',
+            'ip route add 198.51.100.7 via 192.168.64.1 dev eth0',
+            'ip route add blackhole 192.0.2.0/24',
+            'ip route add unreachable 192.0.2.128/25',
+            'ip route add prohibit 192.0.2.64/26',
+            'ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1',
+            'ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50',
+            'ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20',
+            'ip route add 10.20.0.0/16 dev eth1 scope link',
+        ],
+        "argv": ['ip', 'route', 'get', '203.0.113.9'],
+        "exit": 0,
+        "stdout": '203.0.113.9 dev specus0 src 100.96.0.5 uid 0 \n    cache \n',
+        "stderr": '',
+    },
+    'get-host-rich': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 metric 100',
+            'ip route add default via 10.9.0.1 dev eth1 metric 600',
+            'ip route add 203.0.113.0/24 dev specus0',
+            'ip route add 198.51.100.7 via 192.168.64.1 dev eth0',
+            'ip route add blackhole 192.0.2.0/24',
+            'ip route add unreachable 192.0.2.128/25',
+            'ip route add prohibit 192.0.2.64/26',
+            'ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1',
+            'ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50',
+            'ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20',
+            'ip route add 10.20.0.0/16 dev eth1 scope link',
+        ],
+        "argv": ['ip', 'route', 'get', '198.51.100.7'],
+        "exit": 0,
+        "stdout": '198.51.100.7 via 192.168.64.1 dev eth0 src 192.168.64.7 uid 0 \n    cache \n',
+        "stderr": '',
+    },
+    'get-blackhole-rich': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip link add eth1 type dummy; ip link set eth1 up; ip addr add 10.9.0.2/24 dev eth1',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 metric 100',
+            'ip route add default via 10.9.0.1 dev eth1 metric 600',
+            'ip route add 203.0.113.0/24 dev specus0',
+            'ip route add 198.51.100.7 via 192.168.64.1 dev eth0',
+            'ip route add blackhole 192.0.2.0/24',
+            'ip route add unreachable 192.0.2.128/25',
+            'ip route add prohibit 192.0.2.64/26',
+            'ip route add 172.16.0.0/12 nexthop via 192.168.64.1 dev eth0 nexthop via 10.9.0.1 dev eth1',
+            'ip route add 198.18.0.0/15 via 10.9.0.1 dev eth1 proto static metric 50',
+            'ip route add 198.18.0.0/15 via 192.168.64.1 dev eth0 proto static metric 20',
+            'ip route add 10.20.0.0/16 dev eth1 scope link',
+        ],
+        "argv": ['ip', 'route', 'get', '192.0.2.9'],
+        "exit": 2,
+        "stdout": '',
+        "stderr": 'RTNETLINK answers: Invalid argument\n',
+    },
+    'show-tun-halves': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100',
+            'ip route add 0.0.0.0/1 dev specus0',
+            'ip route add 128.0.0.0/1 dev specus0',
+        ],
+        "argv": ['ip', '-4', 'route', 'show', 'table', 'main'],
+        "exit": 0,
+        "stdout": '0.0.0.0/1 dev specus0 scope link linkdown \ndefault via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100 \n100.96.0.0/11 dev specus0 proto kernel scope link src 100.96.0.5 \n128.0.0.0/1 dev specus0 scope link linkdown \n192.168.64.0/24 dev eth0 proto kernel scope link src 192.168.64.7 \n',
+        "stderr": '',
+    },
+    'get-covered-tun-halves': {
+        "setup": [
+            'set -e',
+            'ip link set lo up',
+            'ip link add eth0 type dummy; ip link set eth0 up; ip addr add 192.168.64.7/24 dev eth0',
+            'ip tuntap add dev specus0 mode tun',
+            'ip link set specus0 up; ip addr add 100.96.0.5/11 dev specus0',
+            'ip route add default via 192.168.64.1 dev eth0 proto dhcp src 192.168.64.7 metric 100',
+            'ip route add 0.0.0.0/1 dev specus0',
+            'ip route add 128.0.0.0/1 dev specus0',
+        ],
+        "argv": ['ip', 'route', 'get', '203.0.113.9'],
+        "exit": 0,
+        "stdout": '203.0.113.9 dev specus0 src 100.96.0.5 uid 0 \n    cache \n',
+        "stderr": '',
+    },
+}
+# END LINUX SAMPLED
+
+LINUX_NOWHERE = {"blackhole", "unreachable", "prohibit", "throw"}
+LINUX_NOT_FORWARDING = {"local", "broadcast", "anycast", "multicast", "nat"}
+
+
+def linux_prefix(text):
+    if text == "default":
+        return "0.0.0.0/0"
+    try:
+        return str(ipaddress.IPv4Network(text if "/" in text else text + "/32", strict=False))
+    except ValueError:
+        return ""
+
+
+def reference_linux_routes(stdout):
+    """Candidate routes from `ip -4 route show table main`.
+
+    A line may start with a route type. blackhole, unreachable, prohibit and throw lead nowhere: they
+    stay candidates, with no interface, so the address they cover is not reached another way. local,
+    broadcast, anycast, multicast and nat are not forwarding paths and are not read. A multipath route
+    prints its destination alone and its next hops on the indented lines after it; the first next hop
+    is the one taken. A route marked dead is not usable; linkdown is, as the kernel uses it too.
+    """
+    routes = []
+    pending = None
+    deviceless = []
+    for line in stdout.split("\n"):
+        if not line.strip():
+            continue
+        fields = line.split()
+        if line[0] in " \t":
+            if fields[0] == "nexthop" and pending is not None and pending["interface"] == "":
+                for key, value in zip(fields, fields[1:]):
+                    if key == "via" and linux_address(value):
+                        pending["gateway"] = value
+                    elif key == "dev":
+                        pending["interface"] = value
+            continue
+        pending = None
+        kind = "unicast"
+        if fields[0] in LINUX_NOWHERE or fields[0] in LINUX_NOT_FORWARDING:
+            kind = fields.pop(0)
+        if kind in LINUX_NOT_FORWARDING or not fields:
+            continue
+        prefix = linux_prefix(fields[0])
+        if not prefix:
+            continue
+        entry = {"prefix": prefix, "interface": "", "gateway": "", "metric": 0, "usable": True}
+        for key, value in zip(fields[1:], fields[2:]):
+            if key == "via" and linux_address(value):
+                entry["gateway"] = value
+            elif key == "dev":
+                entry["interface"] = value
+            elif key == "metric" and value.isdigit():
+                entry["metric"] = int(value)
+        if "dead" in fields[1:]:
+            entry["usable"] = False
+        if kind in LINUX_NOWHERE:
+            entry["interface"] = ""
+            entry["gateway"] = ""
+        elif entry["interface"] == "":
+            # A destination with no device of its own: the next hops follow on indented lines.
+            pending = entry
+            deviceless.append(entry)
+        routes.append(entry)
+    for entry in deviceless:
+        if entry["interface"] == "":
+            # No next hop could be read. Leading nowhere is a claim only the nowhere types make, so
+            # this one is dropped from the choice instead of blocking the addresses it covers.
+            entry["usable"] = False
+    return routes
+
+
+def linux_address(text):
+    try:
+        ipaddress.IPv4Address(text)
+    except ValueError:
+        return False
+    return True
+
+
+linux_tables = {name: LINUX_SAMPLED[name]["stdout"]
+                for name in ("show-host", "show-rich", "show-tun-halves")}
+linux_routes = {name: reference_linux_routes(text) for name, text in linux_tables.items()}
+
+# ---- bypass hops ------------------------------------------------------------------------------
+
+hop_cases = [
+    # Linux, from the sampled tables.
+    {"name": "linux-covered-address-goes-out-the-physical-default", "platform": "linux",
+     "table": "show-rich", "tunnel": "specus0", "destination": "203.0.113.9",
+     "note": "What `ip route get 203.0.113.9` could not answer: in the same namespace it said "
+             "dev specus0. Of the two default routes the lower metric wins."},
+    {"name": "linux-without-the-tunnel-left-out-the-tunnel-would-win", "platform": "linux",
+     "table": "show-rich", "tunnel": "", "destination": "203.0.113.9"},
+    {"name": "linux-host-route", "platform": "linux", "table": "show-rich", "tunnel": "specus0",
+     "destination": "198.51.100.7"},
+    {"name": "linux-on-link-network", "platform": "linux", "table": "show-rich", "tunnel": "specus0",
+     "destination": "10.20.3.4"},
+    {"name": "linux-lower-metric-wins-between-equal-prefixes", "platform": "linux",
+     "table": "show-rich", "tunnel": "specus0", "destination": "198.18.1.1",
+     "note": "Printed metric 20 first, but the metric decides, not the order."},
+    {"name": "linux-multipath-takes-its-first-next-hop", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0", "destination": "172.16.5.5"},
+    {"name": "linux-blackhole-leads-nowhere", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0", "destination": "192.0.2.9",
+     "note": "The default routes cover it too. The table deliberately does not reach it, so no "
+             "bypass is pinned through them."},
+    {"name": "linux-prohibit-leads-nowhere", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0", "destination": "192.0.2.70"},
+    {"name": "linux-unreachable-leads-nowhere", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0", "destination": "192.0.2.200"},
+    {"name": "linux-mesh-network-is-left-out", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0", "destination": "100.96.0.9"},
+    {"name": "linux-halves-over-the-default", "platform": "linux", "table": "show-tun-halves",
+     "tunnel": "specus0", "destination": "203.0.113.9",
+     "note": "Two /1 routes into the tunnel cover everything; the /0 behind them is still there."},
+    {"name": "linux-real-host-table", "platform": "linux", "table": "show-host", "tunnel": "specus0",
+     "destination": "1.1.1.1"},
+    # macOS, from the sampled netstat captures.
+    {"name": "macos-covered-address-goes-out-en0", "platform": "macos", "table": "tunRoute",
+     "tunnel": "utun3", "destination": "203.0.113.9"},
+    {"name": "macos-on-link-network-has-no-gateway", "platform": "macos", "table": "tunRoute",
+     "tunnel": "utun3", "destination": "192.168.64.20",
+     "note": "The Gateway column says link#7, which is not a hop."},
+    {"name": "macos-interface-route-has-no-gateway", "platform": "macos", "table": "table",
+     "tunnel": "utun3", "destination": "198.51.100.200",
+     "note": "The Gateway column names lo0, which is not a hop either."},
+    {"name": "macos-scoped-duplicates-leave-the-unscoped-gateway", "platform": "macos",
+     "table": "duplicates", "tunnel": "lo0", "destination": "203.0.113.9"},
+    # Windows, from the typical table.
+    {"name": "windows-covered-address-goes-out-the-default-gateway", "platform": "windows",
+     "table": "typical", "tunnel": "42", "destination": "203.0.113.9"},
+    {"name": "windows-on-link-network-has-no-gateway", "platform": "windows", "table": "typical",
+     "tunnel": "42", "destination": "192.168.1.50",
+     "note": "Windows writes on-link as a next hop of 0.0.0.0."},
+    {"name": "windows-vpn-route-keeps-its-gateway", "platform": "windows", "table": "typical",
+     "tunnel": "42", "destination": "172.16.5.5"},
+    # Inline tables, for what the samples cannot show.
+    {"name": "owned-bypass-is-left-out", "platform": "inline", "tunnel": "42",
+     "destination": "198.51.100.7", "owned": ["198.51.100.7/32"],
+     "routes": [route("0.0.0.0/0", "3", 20, gateway="192.168.1.1"),
+                route("198.51.100.7/32", "3", 20, gateway="192.168.2.1")],
+     "note": "A bypass this feature installed earlier still names the gateway it was resolved to. "
+             "Resolving again has to look past it, or a network change would keep the old hop."},
+    {"name": "owned-bypass-would-otherwise-win", "platform": "inline", "tunnel": "42",
+     "destination": "198.51.100.7", "owned": [],
+     "routes": [route("0.0.0.0/0", "3", 20, gateway="192.168.1.1"),
+                route("198.51.100.7/32", "3", 20, gateway="192.168.2.1")]},
+    {"name": "only-the-tunnel-leads-there", "platform": "inline", "tunnel": "42",
+     "destination": "203.0.113.9", "owned": [],
+     "routes": [route("203.0.113.0/24", "42", 5)]},
+]
+
+hop_tables = {
+    "linux": linux_routes,
+    "macos": macos_routes,
+    "windows": {"typical": typical_routes},
+}
+for case in hop_cases:
+    routes = case["routes"] if case["platform"] == "inline" else hop_tables[case["platform"]][case["table"]]
+    case.setdefault("owned", [])
+    case["expect"] = {"hop": select_hop(routes, case["tunnel"], case["destination"], case["owned"])}
+
+expected_hops = {case["name"]: case["expect"]["hop"] for case in hop_cases}
+assert expected_hops["linux-covered-address-goes-out-the-physical-default"] == \
+    {"interface": "eth0", "gateway": "192.168.64.1"}
+assert expected_hops["linux-without-the-tunnel-left-out-the-tunnel-would-win"] == \
+    {"interface": "specus0", "gateway": ""}
+assert expected_hops["linux-lower-metric-wins-between-equal-prefixes"] == \
+    {"interface": "eth0", "gateway": "192.168.64.1"}
+assert expected_hops["linux-multipath-takes-its-first-next-hop"] == \
+    {"interface": "eth0", "gateway": "192.168.64.1"}
+assert expected_hops["linux-on-link-network"] == {"interface": "eth1", "gateway": ""}
+for nowhere in ("linux-blackhole-leads-nowhere", "linux-prohibit-leads-nowhere",
+                "linux-unreachable-leads-nowhere", "only-the-tunnel-leads-there"):
+    assert expected_hops[nowhere] is None, nowhere
+assert expected_hops["macos-covered-address-goes-out-en0"] == {"interface": "en0", "gateway": "192.168.64.1"}
+assert expected_hops["macos-on-link-network-has-no-gateway"] == {"interface": "en0", "gateway": ""}
+assert expected_hops["windows-covered-address-goes-out-the-default-gateway"] == \
+    {"interface": "3", "gateway": "192.168.1.1"}
+assert expected_hops["windows-on-link-network-has-no-gateway"] == {"interface": "3", "gateway": ""}
+assert expected_hops["owned-bypass-is-left-out"] == {"interface": "3", "gateway": "192.168.1.1"}
+assert expected_hops["owned-bypass-would-otherwise-win"] == {"interface": "3", "gateway": "192.168.2.1"}
 
 # ---- socket options ---------------------------------------------------------------------------
 
@@ -701,6 +1114,18 @@ vector = {
         "macos: candidates are the rows of `netstat -rn -f inet` as the route vector normalises "
         "them; interface is the Netif column, metric is 0, and usable is the Flags column not "
         "containing I.",
+        "gateway: the route's next hop as an IPv4 address, or empty for on-link. Windows writes "
+        "on-link as 0.0.0.0. On macOS the Gateway column is a gateway only on a route whose Flags "
+        "contain G; otherwise it holds link#N, a MAC address, an interface name, or the address of "
+        "a loopback or point-to-point peer, none of which is a hop.",
+        "linux: candidates are the lines of `ip -4 route show table main`. A leading blackhole, "
+        "unreachable, prohibit or throw leads nowhere: the route stays a candidate with an empty "
+        "interface. local, broadcast, anycast, multicast and nat lines are not read. A multipath "
+        "route takes its first indented nexthop; one whose next hops cannot be read is not usable. "
+        "dead is not usable; linkdown is. metric defaults to 0.",
+        "hops: the same choice as select, with owned prefixes also left out; a chosen route with an "
+        "empty interface means no hop. Used for a bypass route when the platform's own query "
+        "answers with the tunnel.",
     ],
     "select": {"cases": SELECT_CASES},
     "windows": {
@@ -715,6 +1140,15 @@ vector = {
         "routes": [{"table": name, "expect": routes} for name, routes in macos_routes.items()],
         "cases": macos_cases,
     },
+    "linux": {
+        "provenance": {name: LINUX_SAMPLED[name]["stdout"]
+                       for name in ("provenance-uname", "provenance-iproute2")},
+        "captures": {name: {key: record.get(key) for key in ("setup", "argv", "exit", "stdout", "stderr")}
+                     for name, record in LINUX_SAMPLED.items() if not name.startswith("provenance")},
+        "tables": linux_tables,
+        "routes": [{"table": name, "expect": routes} for name, routes in linux_routes.items()],
+    },
+    "hops": {"cases": hop_cases},
     "socketOptions": socket_options,
 }
 
