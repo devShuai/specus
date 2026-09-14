@@ -4,7 +4,7 @@ package client
 
 import "syscall"
 
-// Keeping the egress's own forwarded traffic off the tunnel.
+// Keeping the egress's own forwarded traffic off the tunnel, on Linux.
 //
 // The egress sends a consumer's traffic to the real internet. If the outbound socket picked up this
 // node's own tunnel route, that traffic would go back into the mesh instead of out, and on a node
@@ -18,7 +18,11 @@ import "syscall"
 // because the client module carries no third-party dependencies.
 const egressSocketMark = 0x5350
 
-func bindEgressSocket(_ string, _ string, connection syscall.RawConn) error {
+func newEgressSocketBinder(tunnel func() string) *egressSocketBinder {
+	return &egressSocketBinder{tunnel: tunnel}
+}
+
+func (binder *egressSocketBinder) control(_ string, _ string, connection syscall.RawConn) error {
 	if connection == nil {
 		return nil
 	}
