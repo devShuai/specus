@@ -111,6 +111,11 @@ public class PeerEgressSocketBinderTests
     /// socket would reach 127.0.0.1 anyway; a bound one cannot. This is the test that fails if the
     /// option is never set, and it goes through the dialer, so it also fails if the dialer never asks
     /// the binder.
+    ///
+    /// <para>"Reach" is a connection for TCP and a delivered datagram for UDP. Windows refuses a
+    /// misbound UDP socket at connect; macOS not until the datagram is sent, because connecting a UDP
+    /// socket there only records the peer. So the UDP half sends and listens, and a correctly bound
+    /// send is tried first so that silence cannot pass for enforcement.</para>
     /// </remarks>
     [Fact]
     public void TheSocketIsHeldToTheBoundInterface()
@@ -126,16 +131,67 @@ public class PeerEgressSocketBinderTests
 
         var lying = PeerEgressSocketBinder.ForPlatform(() => "");
         lying.Routes = () => [new PeerEgressBindRoute("127.0.0.0/8", physical!, 0, true)];
-        var dialer = new PeerEgressSocketDialer(lying);
-        using var server = new TcpListener(IPAddress.Loopback, 0);
-        server.Start();
-        var port = ((IPEndPoint)server.LocalEndpoint).Port;
-        foreach (var protocol in new[] { "tcp", "udp" })
+        using (var server = new TcpListener(IPAddress.Loopback, 0))
         {
-            var failure = Record.Exception(() => dialer.Dial(protocol, "127.0.0.1", port, 2000).Dispose());
-            Assert.True(failure is not null, $"{protocol} reached 127.0.0.1 while bound to {physical}");
+            server.Start();
+            var port = ((IPEndPoint)server.LocalEndpoint).Port;
+            var failure = Record.Exception(() => new PeerEgressSocketDialer(lying).Dial("tcp", "127.0.0.1", port, 2000).Dispose());
+            Assert.True(failure is not null, $"tcp reached 127.0.0.1 while bound to {physical}");
             Assert.False(failure is PeerEgressNoPhysicalRouteException,
-                $"{protocol} was refused before any socket existed, so nothing was tested");
+                "tcp was refused before any socket existed, so nothing was tested");
+        }
+
+        using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        Assert.True(Delivers(real, listener, "control") == "delivered",
+            "udp bound to loopback did not deliver either, so silence would prove nothing");
+        Assert.False(Delivers(lying, listener, "misbound") == "delivered",
+            $"udp reached 127.0.0.1 while bound to {physical}");
+    }
+
+    /// <summary>Dials the listener through the binder, sends one datagram, and says whether it arrived or what stopped it.</summary>
+    private static string Delivers(PeerEgressSocketBinder binder, Socket listener, string label)
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes("specus-bind-" + label);
+        IPeerEgressSocket socket;
+        try
+        {
+            socket = new PeerEgressSocketDialer(binder).Dial("udp", "127.0.0.1",
+                ((IPEndPoint)listener.LocalEndPoint!).Port, 2000);
+        }
+        catch (PeerEgressNoPhysicalRouteException)
+        {
+            throw new InvalidOperationException($"udp {label} was refused before any socket existed");
+        }
+        catch (Exception failed)
+        {
+            return "connect: " + failed.Message;
+        }
+        using (socket)
+        {
+            try
+            {
+                socket.Write(payload);
+            }
+            catch (Exception failed)
+            {
+                return "send: " + failed.Message;
+            }
+        }
+        var buffer = new byte[64];
+        var deadline = DateTime.UtcNow.AddSeconds(1);
+        while (true)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero || !listener.Poll(remaining, SelectMode.SelectRead))
+            {
+                return "sent without error, never arrived";
+            }
+            var length = listener.Receive(buffer);
+            if (buffer.AsSpan(0, length).SequenceEqual(payload))
+            {
+                return "delivered";
+            }
         }
     }
 

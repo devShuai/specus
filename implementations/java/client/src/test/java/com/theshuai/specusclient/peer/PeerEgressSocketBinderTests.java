@@ -15,9 +15,12 @@ import com.sun.jna.Library;
 import com.sun.jna.Native;
 import com.sun.jna.ptr.IntByReference;
 import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
+import java.net.SocketTimeoutException;
 import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -179,6 +182,11 @@ class PeerEgressSocketBinderTests {
      * unbound socket would reach 127.0.0.1 anyway; a bound one cannot. This is the test that fails
      * if the option is never set, and it goes through the dialer, so it also fails if the dialer
      * never asks the binder.
+     *
+     * <p>"Reach" is a connection for TCP and a delivered datagram for UDP. Windows refuses a
+     * misbound UDP socket at connect; macOS not until the datagram is sent, because connecting a UDP
+     * socket there only records the peer. So the UDP half sends and listens, and a correctly bound
+     * send is tried first so that silence cannot pass for enforcement.
      */
     @Test
     void theSocketIsHeldToTheBoundInterface() throws IOException {
@@ -192,15 +200,60 @@ class PeerEgressSocketBinderTests {
 
         PeerEgressSocketBinder lying = PeerEgressSocketBinder.forPlatform(() -> "");
         lying.routes = () -> List.of(new PeerEgressSocketBinding.Route("127.0.0.0/8", physical, 0, true));
-        PeerEgressSocketDialer dialer = new PeerEgressSocketDialer(lying);
         try (ServerSocket server = new ServerSocket()) {
             server.bind(new InetSocketAddress("127.0.0.1", 0));
-            for (String protocol : List.of("tcp", "udp")) {
-                IOException failure = assertThrows(IOException.class,
-                        () -> dialer.dial(protocol, "127.0.0.1", server.getLocalPort(), 2000).close(),
-                        protocol + " reached 127.0.0.1 while bound to " + physical);
-                assertFalse(failure instanceof PeerEgressSocketBinder.NoPhysicalRouteException,
-                        protocol + " was refused before any socket existed, so nothing was tested");
+            IOException failure = assertThrows(IOException.class,
+                    () -> new PeerEgressSocketDialer(lying).dial("tcp", "127.0.0.1", server.getLocalPort(), 2000).close(),
+                    "tcp reached 127.0.0.1 while bound to " + physical);
+            assertFalse(failure instanceof PeerEgressSocketBinder.NoPhysicalRouteException,
+                    "tcp was refused before any socket existed, so nothing was tested");
+        }
+
+        try (DatagramSocket listener = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            String control = delivers(real, listener, "control");
+            assertEquals("delivered", control,
+                    "udp bound to loopback did not deliver either, so silence would prove nothing");
+            String misbound = delivers(lying, listener, "misbound");
+            assertFalse(misbound.equals("delivered"), "udp reached 127.0.0.1 while bound to " + physical);
+        }
+    }
+
+    /** Dials listener through binder, sends one datagram, and says whether it arrived or what stopped it. */
+    private static String delivers(PeerEgressSocketBinder binder, DatagramSocket listener, String label)
+            throws IOException {
+        byte[] payload = ("specus-bind-" + label).getBytes(StandardCharsets.US_ASCII);
+        PeerEgressRuntime.Socket socket;
+        try {
+            socket = new PeerEgressSocketDialer(binder).dial("udp", "127.0.0.1", listener.getLocalPort(), 2000);
+        } catch (PeerEgressSocketBinder.NoPhysicalRouteException refused) {
+            throw new AssertionError("udp " + label + " was refused before any socket existed", refused);
+        } catch (IOException failed) {
+            return "connect: " + failed;
+        }
+        try {
+            socket.write(payload);
+        } catch (IOException failed) {
+            return "send: " + failed;
+        } finally {
+            socket.close();
+        }
+        byte[] buffer = new byte[64];
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (true) {
+            long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+            if (remaining <= 0) {
+                return "sent without error, never arrived";
+            }
+            listener.setSoTimeout((int) remaining);
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            try {
+                listener.receive(packet);
+            } catch (SocketTimeoutException timedOut) {
+                return "sent without error, never arrived";
+            }
+            if (new String(buffer, 0, packet.getLength(), StandardCharsets.US_ASCII)
+                    .equals(new String(payload, StandardCharsets.US_ASCII))) {
+                return "delivered";
             }
         }
     }

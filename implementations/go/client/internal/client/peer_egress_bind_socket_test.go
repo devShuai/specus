@@ -126,9 +126,15 @@ func TestEgressDialIsRefusedWhenOnlyTheTunnelLeadsThere(t *testing.T) {
 // The binder is handed a table claiming 127.0.0.0/8 is behind a physical interface. An unbound
 // socket would reach 127.0.0.1 anyway, because the real table says otherwise; a bound one cannot.
 // This is the test that fails if the option is never set.
+//
+// "Reach" is a connection for TCP and a delivered datagram for UDP. The two platforms refuse a
+// misbound UDP socket at different points: Windows at connect, macOS not until the datagram is
+// sent, because connecting a UDP socket there only records the peer. So the UDP half sends and
+// listens rather than stopping at connect, and a correctly bound send is tried first so that
+// silence cannot pass for enforcement.
 func TestEgressSocketIsHeldToTheBoundInterface(t *testing.T) {
 	loopback := egressBindLoopback(t)
-	tcpAddress, udpAddress := egressBindListeners(t)
+	tcpAddress, _ := egressBindListeners(t)
 
 	real := newEgressSocketBinder(func() string { return "" })
 	routes, err := real.routes()
@@ -145,17 +151,59 @@ func TestEgressSocketIsHeldToTheBoundInterface(t *testing.T) {
 	lying.routes = func() ([]egressBindRoute, error) {
 		return []egressBindRoute{{Prefix: "127.0.0.0/8", Interface: physical, Usable: true}}, nil
 	}
-	for _, target := range []struct{ protocol, address string }{{"tcp", tcpAddress}, {"udp", udpAddress}} {
-		conn, err := lying.dial(target.protocol, target.address, 2*time.Second)
-		if err == nil {
-			bound, _ := egressBoundInterface(conn)
-			_ = conn.Close()
-			t.Fatalf("%s reached 127.0.0.1 while bound to %s (read back %d): the binding is not enforced",
-				target.protocol, physical, bound)
-		}
+
+	conn, err := lying.dial("tcp", tcpAddress, 2*time.Second)
+	if err == nil {
+		bound, _ := egressBoundInterface(conn)
+		_ = conn.Close()
+		t.Fatalf("tcp reached 127.0.0.1 while bound to %s (read back %d): the binding is not enforced", physical, bound)
+	}
+	if errors.Is(err, errEgressNoPhysicalRoute) {
+		t.Fatalf("tcp dial was refused before any socket existed, so nothing was tested: %v", err)
+	}
+	t.Logf("tcp bound to %s: %v", physical, err)
+
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer packet.Close()
+	if delivered, detail := egressBindDelivers(t, real, packet, "control"); !delivered {
+		t.Fatalf("udp bound to loopback did not deliver either (%s), so silence would prove nothing", detail)
+	}
+	delivered, detail := egressBindDelivers(t, lying, packet, "misbound")
+	if delivered {
+		t.Fatalf("udp reached 127.0.0.1 while bound to %s: the binding is not enforced", physical)
+	}
+	t.Logf("udp bound to %s: %s", physical, detail)
+}
+
+// egressBindDelivers dials packet's address through binder, sends one datagram, and reports whether
+// it arrived, with what stopped it when it did not.
+func egressBindDelivers(t *testing.T, binder *egressSocketBinder, packet net.PacketConn, label string) (bool, string) {
+	t.Helper()
+	conn, err := binder.dial("udp", packet.LocalAddr().String(), 2*time.Second)
+	if err != nil {
 		if errors.Is(err, errEgressNoPhysicalRoute) {
-			t.Fatalf("%s dial was refused before any socket existed, so nothing was tested: %v", target.protocol, err)
+			t.Fatalf("udp %s dial was refused before any socket existed: %v", label, err)
 		}
-		t.Logf("%s bound to %s: %v", target.protocol, physical, err)
+		return false, "connect: " + err.Error()
+	}
+	defer conn.Close()
+	payload := []byte("specus-bind-" + label)
+	if _, err := conn.Write(payload); err != nil {
+		return false, "send: " + err.Error()
+	}
+	buffer := make([]byte, 64)
+	deadline := time.Now().Add(time.Second)
+	for {
+		_ = packet.SetReadDeadline(deadline)
+		n, _, err := packet.ReadFrom(buffer)
+		if err != nil {
+			return false, "sent without error, never arrived"
+		}
+		if string(buffer[:n]) == string(payload) {
+			return true, "delivered"
+		}
 	}
 }
