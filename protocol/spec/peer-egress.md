@@ -285,7 +285,12 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | macOS | `IP_BOUND_IF`（`IPPROTO_IP`，25）。值为接口索引的主机序 |
 | Linux | 不绑定接口。Go 与 .NET 给 socket 打 `SO_MARK 0x5350`，由运维添加策略路由，见[对系统的改动](#对系统的改动)；Java 不打，见当前限制 |
 
-这两个选项都不需要提权，也都由协议栈强制执行：绑到一个没有路由通往目标的接口上，connect 直接失败（Windows 报 `WSAENETUNREACH`），不会换个接口出去。
+这两个选项都不需要提权，也都由协议栈强制执行：绑到一个没有路由通往目标的接口上，流量不会换个接口出去，而是失败。失败发生在哪一步因平台和协议而异，都是实测的：
+
+| | TCP | UDP |
+| --- | --- | --- |
+| Windows | connect 失败：目标经别的接口才到达时报 `WSAENETUNREACH`，目标是回环地址时报 `WSAEADDRNOTAVAIL` | 同 TCP，connect 时失败 |
+| macOS | connect 失败，`EADDRNOTAVAIL`（`can't assign requested address`） | **connect 成功**，第一次发送时失败，同样是 `EADDRNOTAVAIL`。macOS 上连接 UDP socket 只是记下对端，不查路由 |
 
 **接口按目标逐个选。** 统一绑到默认路由所在的接口，会让经第二块网卡或另一个 VPN 才能到达的目标全部不通。选法：
 
@@ -299,7 +304,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 **Java 的前提。** JDK 不提供这两个选项，也不暴露 socket 句柄。Java 客户端经 `sun.nio.ch.SelChImpl.getFDVal()` 取句柄，再用 JNA 调 setsockopt，这要求 JVM 带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`。发布的 jar 在清单里声明了 `Add-Exports`，`java -jar` 启动时自动生效，Spring Boot 嵌套加载的类同样适用；以其他方式启动又缺这个选项时，Windows 与 macOS 上的每次出口建流都会被拒绝，日志写明缺的是哪个选项。
 
-固定向量：`protocol/test-vectors/peer-egress-socket-binding-v1.json`，覆盖接口选择、Windows 两张表的二进制布局、macOS 的候选路由与两个选项的编码。Windows 表布局按 SDK 结构体用 ctypes 生成，偏移在 Windows 11 26200 上与 `Get-NetRoute`、`Get-NetIPInterface` 逐行比对过，三端测试在每次 Windows CI 上重做这一比对。三端另有真实 socket 测试：连 127.0.0.1 时读回绑定的是回环接口；把回环接口当作隧道时拒绝建流；给绑定器一张声称 `127.0.0.0/8` 在物理接口上的表时连接失败。最后一条在不设选项时会通过，所以它证明的是选项真的起了作用。Windows 部分在 CLI 矩阵的 windows runner 上运行，macOS 部分在 `peer-egress-macos.yml` 的 macOS runner 上运行。
+固定向量：`protocol/test-vectors/peer-egress-socket-binding-v1.json`，覆盖接口选择、Windows 两张表的二进制布局、macOS 的候选路由与两个选项的编码。Windows 表布局按 SDK 结构体用 ctypes 生成，偏移在 Windows 11 26200 上与 `Get-NetRoute`、`Get-NetIPInterface` 逐行比对过，三端测试在每次 Windows CI 上重做这一比对。三端另有真实 socket 测试：连 127.0.0.1 时读回绑定的是回环接口；把回环接口当作隧道时拒绝建流；给绑定器一张声称 `127.0.0.0/8` 在物理接口上的表时，TCP 连不上、UDP 数据报送不到。UDP 那一半真的发包并在监听端等待，先用正确绑定发一次、必须收到，因为 macOS 上错误绑定的 UDP socket 能连接成功，只看 connect 会误判。最后这条在不设选项时会通过，所以它证明的是选项真的起了作用。Windows 部分在 CLI 矩阵的 windows runner 上运行，macOS 部分在 `peer-egress-macos.yml` 的 macOS runner 上运行。
 
 ## 能力协商
 
