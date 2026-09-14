@@ -1,3 +1,6 @@
+using System.Globalization;
+using Specus.Protocol.PeerEgress;
+
 namespace Specus.Client.PeerMesh;
 
 /// <summary>
@@ -102,15 +105,146 @@ internal static class PeerEgressRouteCommands
     /// Reports whether a hop leads through the named interface.
     /// </summary>
     /// <remarks>
-    /// Used to refuse pinning a bypass address to the tunnel itself. That happens on a reapply,
-    /// once a rule's route is already installed and covers the address: asking the system where to
-    /// send it then answers "through the tunnel", and installing that would route the tunnel's own
-    /// transport into the tunnel.
+    /// That happens once a rule's route is already installed and covers the address: asking the
+    /// system where to send it then answers "through the tunnel", and installing that would route
+    /// the tunnel's own transport into the tunnel. The commander reads the table instead.
     /// </remarks>
     public static bool HopIsDevice(PeerEgressRouteHop hop, string? device)
     {
         var wanted = device?.Trim() ?? string.Empty;
         return wanted.Length > 0
             && string.Equals(hop.Device.Trim(), wanted, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Reads the main table, for a bypass hop <c>ip route get</c> could not give.</summary>
+    public static string[] ShowMainTableArgs() => ["-4", "route", "show", "table", "main"];
+
+    private static readonly HashSet<string> LeadsNowhere = ["blackhole", "unreachable", "prohibit", "throw"];
+    private static readonly HashSet<string> NotForwarding = ["local", "broadcast", "anycast", "multicast", "nat"];
+
+    /// <summary>Reads <c>ip -4 route show table main</c> into candidate routes.</summary>
+    /// <remarks>
+    /// Sampled rather than assumed, in network namespaces with a real TUN: a multipath route prints
+    /// its destination alone followed by indented nexthop lines, two routes on one prefix are printed
+    /// lowest metric first but the metric is what counts, and every line ends with a space. A route
+    /// that leads nowhere -- blackhole, unreachable, prohibit, throw -- stays a candidate with no
+    /// interface, so the address it covers is not reached some other way. The first nexthop of a
+    /// multipath route is the one taken; one whose next hops cannot be read is not usable. A dead
+    /// route is not usable; linkdown is, as the kernel uses it too.
+    ///
+    /// <para>Shared vector: <c>protocol/test-vectors/peer-egress-socket-binding-v1.json</c>, linux.</para>
+    /// </remarks>
+    public static List<PeerEgressBindRoute> ParseRouteTable(string? output)
+    {
+        var routes = new List<PeerEgressBindRoute>();
+        var pending = -1;
+        var deviceless = new List<int>();
+        foreach (var line in (output ?? string.Empty).Split('\n'))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+            var fields = line.Split(Whitespace, StringSplitOptions.RemoveEmptyEntries);
+            if (line[0] is ' ' or '\t')
+            {
+                if (fields[0] == "nexthop" && pending >= 0 && routes[pending].Interface.Length == 0)
+                {
+                    var route = routes[pending];
+                    var gateway = route.Gateway;
+                    var device = "";
+                    for (var index = 1; index + 1 < fields.Length; index++)
+                    {
+                        if (fields[index] == "via" && Ipv4Cidr.TryParseAddress(fields[index + 1], out _))
+                        {
+                            gateway = fields[index + 1];
+                        }
+                        else if (fields[index] == "dev")
+                        {
+                            device = fields[index + 1];
+                        }
+                    }
+                    routes[pending] = route with { Interface = device, Gateway = gateway };
+                }
+                continue;
+            }
+            pending = -1;
+            if (NotForwarding.Contains(fields[0]))
+            {
+                continue;
+            }
+            var nowhere = LeadsNowhere.Contains(fields[0]);
+            var start = nowhere ? 1 : 0;
+            if (start >= fields.Length || PrefixOf(fields[start]) is not { } prefix)
+            {
+                continue;
+            }
+            string deviceName = "", gatewayAddress = "";
+            long metric = 0;
+            var usable = true;
+            for (var index = start + 1; index < fields.Length; index++)
+            {
+                if (fields[index] == "dead")
+                {
+                    usable = false;
+                }
+                if (index + 1 >= fields.Length)
+                {
+                    continue;
+                }
+                switch (fields[index])
+                {
+                    case "via" when Ipv4Cidr.TryParseAddress(fields[index + 1], out _):
+                        gatewayAddress = fields[index + 1];
+                        break;
+                    case "dev":
+                        deviceName = fields[index + 1];
+                        break;
+                    case "metric" when long.TryParse(fields[index + 1], NumberStyles.None, CultureInfo.InvariantCulture, out var value):
+                        metric = value;
+                        break;
+                }
+            }
+            if (nowhere)
+            {
+                deviceName = "";
+                gatewayAddress = "";
+            }
+            else if (deviceName.Length == 0)
+            {
+                pending = routes.Count;
+                deviceless.Add(pending);
+            }
+            routes.Add(new PeerEgressBindRoute(prefix, deviceName, gatewayAddress, metric, usable));
+        }
+        foreach (var index in deviceless)
+        {
+            if (routes[index].Interface.Length == 0)
+            {
+                routes[index] = routes[index] with { Usable = false };
+            }
+        }
+        return routes;
+    }
+
+    private static string? PrefixOf(string text)
+    {
+        if (text == "default")
+        {
+            return "0.0.0.0/0";
+        }
+        var slash = text.IndexOf('/');
+        if (!Ipv4Cidr.TryParseAddress(slash < 0 ? text : text[..slash], out var address))
+        {
+            return null;
+        }
+        var length = 32;
+        if (slash >= 0 && (!int.TryParse(text[(slash + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out length)
+            || length > 32))
+        {
+            return null;
+        }
+        var mask = length == 0 ? 0u : uint.MaxValue << (32 - length);
+        return Ipv4Cidr.FormatAddress(address & mask) + "/" + length.ToString(CultureInfo.InvariantCulture);
     }
 }

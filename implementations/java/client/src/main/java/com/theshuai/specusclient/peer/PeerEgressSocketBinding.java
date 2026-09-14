@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -44,6 +45,8 @@ public final class PeerEgressSocketBinding {
     private static final int FORWARD_PREFIX_FAMILY = 12;
     private static final int FORWARD_PREFIX_ADDRESS = 16;
     private static final int FORWARD_PREFIX_LENGTH = 40;
+    private static final int FORWARD_NEXT_HOP_FAMILY = 44;
+    private static final int FORWARD_NEXT_HOP_ADDRESS = 48;
     private static final int FORWARD_METRIC = 84;
     private static final int INTERFACE_FAMILY = 0;
     private static final int INTERFACE_INDEX = 16;
@@ -58,20 +61,35 @@ public final class PeerEgressSocketBinding {
      */
     private static final String MACOS_SCOPED_FLAG = "I";
 
+    /**
+     * A macOS route whose Gateway column is a gateway (RTF_GATEWAY). Without it the column says where
+     * the interface is: link#N, a MAC address, an interface name, or the address of a loopback or
+     * point-to-point peer -- 127 prints 127.0.0.1 there.
+     */
+    private static final String MACOS_GATEWAY_FLAG = "G";
+
+    /** Windows writes an on-link next hop as this address. */
+    private static final String WINDOWS_ON_LINK = "0.0.0.0";
+
     private PeerEgressSocketBinding() {
     }
 
     /**
-     * One route considered for the interface.
+     * One route read from the platform's table: considered for the interface an egress socket is
+     * bound to, and for where a consumer's bypass route points.
      *
-     * @param iface the decimal interface index on Windows, the interface name on macOS
-     * @param metric the effective metric: on Windows the route's plus its interface's, on macOS zero
+     * @param iface the decimal interface index on Windows, the interface name elsewhere; empty for a
+     *     Linux route that leads nowhere
+     * @param gateway the next hop, or empty for on-link
+     * @param metric the effective metric: on Windows the route's plus its interface's, on Linux the
+     *     route's own, on macOS zero
      * @param usable false for a route the system would not use for an unbound socket
      */
-    public record Route(String prefix, String iface, long metric, boolean usable) {
+    public record Route(String prefix, String iface, String gateway, long metric, boolean usable) {
     }
 
-    public record WindowsForwardRow(long interfaceIndex, String prefix, long metric) {
+    /** @param nextHop the address as written, 0.0.0.0 for on-link, or empty when it is not IPv4 */
+    public record WindowsForwardRow(long interfaceIndex, String prefix, String nextHop, long metric) {
     }
 
     public record WindowsInterfaceRow(long interfaceIndex, long metric, boolean connected,
@@ -88,6 +106,51 @@ public final class PeerEgressSocketBinding {
      * that would follow the tunnel route.
      */
     public static String select(List<Route> routes, String tunnel, String destination) {
+        Route chosen = selectRoute(routes, tunnel, List.of(), destination);
+        return chosen == null ? null : chosen.iface();
+    }
+
+    /**
+     * Where a bypass route for destination points, or null.
+     *
+     * <p>Null both when nothing but the tunnel leads there and when the winning route leads nowhere:
+     * pinning a bypass through some other route would reach an address the table deliberately does
+     * not.
+     */
+    public static Route selectBypassHop(List<Route> routes, String tunnel, List<String> owned, String destination) {
+        Route chosen = selectRoute(routes, tunnel, owned, destination);
+        return chosen == null || chosen.iface().isEmpty() ? null : chosen;
+    }
+
+    /**
+     * Where a bypass goes when the platform's own query answered with the tunnel.
+     *
+     * <p>The query is asked first everywhere because it knows things a reading of the table does not
+     * -- policy routing on Linux above all. But once a rule's route covers the address the query can
+     * only see that route, and that is exactly when a bypass is needed; so the table is read and the
+     * choice made with the tunnel left out.
+     */
+    public static Route bypassHopFromTable(String address, String tunnel, PeerEgressSocketBinder.RouteSource read)
+            throws IOException {
+        List<Route> routes;
+        try {
+            routes = read.read();
+        } catch (IOException failed) {
+            throw new IOException("resolve bypass hop for " + address + " past the tunnel: " + failed.getMessage(),
+                    failed);
+        }
+        Route hop = selectBypassHop(routes, tunnel, List.of(), address);
+        if (hop == null) {
+            throw new PeerEgressSocketBinder.NoPhysicalRouteException(address);
+        }
+        return hop;
+    }
+
+    /**
+     * The route a packet to destination would take with this feature's own routes left out: the
+     * tunnel's, and any prefix in owned.
+     */
+    static Route selectRoute(List<Route> routes, String tunnel, List<String> owned, String destination) {
         Integer address = Ipv4Cidr.parseAddress(destination);
         if (address == null) {
             return null;
@@ -95,7 +158,8 @@ public final class PeerEgressSocketBinding {
         Route best = null;
         int bestBits = -1;
         for (Route route : routes) {
-            if (!route.usable() || (tunnel != null && !tunnel.isEmpty() && route.iface().equals(tunnel))) {
+            if (!route.usable() || (tunnel != null && !tunnel.isEmpty() && route.iface().equals(tunnel))
+                    || owned.contains(route.prefix())) {
                 continue;
             }
             Ipv4Cidr prefix = Ipv4Cidr.parse(route.prefix());
@@ -109,7 +173,7 @@ public final class PeerEgressSocketBinding {
                 bestBits = bits;
             }
         }
-        return best == null ? null : best.iface();
+        return best;
     }
 
     /**
@@ -154,9 +218,17 @@ public final class PeerEgressSocketBinding {
                     | ((row.get(FORWARD_PREFIX_ADDRESS + 2) & 0xFF) << 8)
                     | (row.get(FORWARD_PREFIX_ADDRESS + 3) & 0xFF);
             int mask = length == 0 ? 0 : (int) (0xFFFFFFFFL << (Ipv4Cidr.MAX_PREFIX - length));
+            String nextHop = "";
+            if ((row.getShort(FORWARD_NEXT_HOP_FAMILY) & 0xFFFF) == AF_INET) {
+                nextHop = Ipv4Cidr.format(((row.get(FORWARD_NEXT_HOP_ADDRESS) & 0xFF) << 24)
+                        | ((row.get(FORWARD_NEXT_HOP_ADDRESS + 1) & 0xFF) << 16)
+                        | ((row.get(FORWARD_NEXT_HOP_ADDRESS + 2) & 0xFF) << 8)
+                        | (row.get(FORWARD_NEXT_HOP_ADDRESS + 3) & 0xFF));
+            }
             parsed.add(new WindowsForwardRow(
                     row.getInt(FORWARD_INTERFACE_INDEX) & 0xFFFFFFFFL,
                     Ipv4Cidr.format(address & mask) + "/" + length,
+                    nextHop,
                     row.getInt(FORWARD_METRIC) & 0xFFFFFFFFL));
         }
         return parsed;
@@ -206,7 +278,8 @@ public final class PeerEgressSocketBinding {
                 usable = iface.connected()
                         && !(row.prefix().equals("0.0.0.0/0") && iface.disableDefaultRoutes());
             }
-            routes.add(new Route(row.prefix(), Long.toString(row.interfaceIndex()), metric, usable));
+            String gateway = row.nextHop().equals(WINDOWS_ON_LINK) ? "" : row.nextHop();
+            routes.add(new Route(row.prefix(), Long.toString(row.interfaceIndex()), gateway, metric, usable));
         }
         return routes;
     }
@@ -215,7 +288,10 @@ public final class PeerEgressSocketBinding {
     public static List<Route> macosRoutes(String table) {
         List<Route> routes = new ArrayList<>();
         for (PeerEgressMacosRouteCommands.NetstatRoute row : PeerEgressMacosRouteCommands.parseTable(table)) {
-            routes.add(new Route(row.prefix(), row.netif(), 0, !row.flags().contains(MACOS_SCOPED_FLAG)));
+            String gateway = row.flags().contains(MACOS_GATEWAY_FLAG) && Ipv4Cidr.parseAddress(row.gateway()) != null
+                    ? row.gateway()
+                    : "";
+            routes.add(new Route(row.prefix(), row.netif(), gateway, 0, !row.flags().contains(MACOS_SCOPED_FLAG)));
         }
         return routes;
     }

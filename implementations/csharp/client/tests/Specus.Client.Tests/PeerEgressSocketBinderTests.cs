@@ -130,7 +130,7 @@ public class PeerEgressSocketBinderTests
         Assert.True(physical is not null, "no default route outside loopback; this test needs working networking");
 
         var lying = PeerEgressSocketBinder.ForPlatform(() => "");
-        lying.Routes = () => [new PeerEgressBindRoute("127.0.0.0/8", physical!, 0, true)];
+        lying.Routes = () => [new PeerEgressBindRoute("127.0.0.0/8", physical!, "", 0, true)];
         using (var server = new TcpListener(IPAddress.Loopback, 0))
         {
             server.Start();

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 
 namespace Specus.Client.PeerMesh;
@@ -171,15 +172,22 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
             {
                 throw new InvalidOperationException($"no route to {address} to bypass through");
             }
-            if (_tunIndex > 0 && resolved.Value.InterfaceIndex == _tunIndex)
-            {
-                // Pinning it to the tunnel would send the transport through the thing it
-                // carries. Compared by index rather than by name, because the name is the one
-                // thing that cannot come back out of PowerShell intact.
-                throw new InvalidOperationException(
-                    $"bypass for {address} already resolves to the tunnel");
-            }
             hop = resolved.Value;
+            if (_tunIndex > 0 && hop.InterfaceIndex == _tunIndex)
+            {
+                // A rule's route covers the address, so the query can only see the tunnel. Compared
+                // by index rather than by name, because the name is the one thing that cannot come
+                // back out of PowerShell intact. The native table, read with the tunnel left out,
+                // says where it went before.
+                var fallback = PeerEgressSocketBinding.BypassHopFromTable(address,
+                    _tunIndex.ToString(CultureInfo.InvariantCulture), PeerEgressSocketBinder.Windows.Routes);
+                if (!int.TryParse(fallback.Interface, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+                {
+                    throw new InvalidOperationException(
+                        $"resolve bypass hop for {address}: interface {fallback.Interface} is not an index");
+                }
+                hop = new PeerEgressWindowsRouteHop(fallback.Gateway, index);
+            }
             _hops[address] = hop;
         }
         Apply(

@@ -128,10 +128,18 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
                 throw new IOException("no route to " + address + " to bypass through");
             }
             if (tunIndex > 0 && hop.interfaceIndex() == tunIndex) {
-                // Pinning it to the tunnel would send the transport through the thing it
-                // carries. Compared by index rather than by name, because the name is the one
-                // thing that cannot come back out of PowerShell intact.
-                throw new IOException("bypass for " + address + " already resolves to the tunnel");
+                // A rule's route covers the address, so the query can only see the tunnel. Compared
+                // by index rather than by name, because the name is the one thing that cannot come
+                // back out of PowerShell intact. The native table, read with the tunnel left out,
+                // says where it went before.
+                PeerEgressSocketBinding.Route fallback = PeerEgressSocketBinding.bypassHopFromTable(address,
+                        Integer.toString(tunIndex), PeerEgressSocketBinder.Windows::routes);
+                try {
+                    hop = new PeerEgressWindowsRouteCommands.Hop(fallback.gateway(), Integer.parseInt(fallback.iface()));
+                } catch (NumberFormatException notAnIndex) {
+                    throw new IOException("resolve bypass hop for " + address + ": interface " + fallback.iface()
+                            + " is not an index");
+                }
             }
             hops.put(address, hop);
         }

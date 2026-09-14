@@ -4,14 +4,22 @@ using Specus.Protocol.PeerEgress;
 
 namespace Specus.Client.PeerMesh;
 
-/// <summary>One route considered for the interface an egress socket is bound to.</summary>
+/// <summary>
+/// One route read from the platform's table: considered for the interface an egress socket is bound
+/// to, and for where a consumer's bypass route points.
+/// </summary>
 /// <param name="Prefix">The IPv4 prefix, masked.</param>
-/// <param name="Interface">The decimal interface index on Windows, the interface name on macOS.</param>
-/// <param name="Metric">The effective metric: on Windows the route's plus its interface's, on macOS zero.</param>
+/// <param name="Interface">The decimal interface index on Windows, the interface name elsewhere; empty for a Linux route that leads nowhere.</param>
+/// <param name="Gateway">The next hop, or empty for on-link.</param>
+/// <param name="Metric">The effective metric: on Windows the route's plus its interface's, on Linux the route's own, on macOS zero.</param>
 /// <param name="Usable">False for a route the system would not use for an unbound socket.</param>
-internal readonly record struct PeerEgressBindRoute(string Prefix, string Interface, long Metric, bool Usable);
+internal readonly record struct PeerEgressBindRoute(string Prefix, string Interface, string Gateway, long Metric, bool Usable);
 
-internal readonly record struct PeerEgressWindowsForwardRow(long InterfaceIndex, string Prefix, long Metric);
+/// <param name="InterfaceIndex">The interface index.</param>
+/// <param name="Prefix">The IPv4 prefix, masked.</param>
+/// <param name="NextHop">The address as written, 0.0.0.0 for on-link, or empty when it is not IPv4.</param>
+/// <param name="Metric">The route's own metric.</param>
+internal readonly record struct PeerEgressWindowsForwardRow(long InterfaceIndex, string Prefix, string NextHop, long Metric);
 
 internal readonly record struct PeerEgressWindowsInterfaceRow(long InterfaceIndex, long Metric, bool Connected,
     bool DisableDefaultRoutes);
@@ -53,6 +61,8 @@ internal static class PeerEgressSocketBinding
     private const int ForwardPrefixFamily = 12;
     private const int ForwardPrefixAddress = 16;
     private const int ForwardPrefixLength = 40;
+    private const int ForwardNextHopFamily = 44;
+    private const int ForwardNextHopAddress = 48;
     private const int ForwardMetric = 84;
     private const int InterfaceFamily = 0;
     private const int InterfaceIndex = 16;
@@ -68,6 +78,16 @@ internal static class PeerEgressSocketBinding
     private const string MacosScopedFlag = "I";
 
     /// <summary>
+    /// A macOS route whose Gateway column is a gateway (RTF_GATEWAY). Without it the column says
+    /// where the interface is: link#N, a MAC address, an interface name, or the address of a loopback
+    /// or point-to-point peer -- 127 prints 127.0.0.1 there.
+    /// </summary>
+    private const string MacosGatewayFlag = "G";
+
+    /// <summary>Windows writes an on-link next hop as this address.</summary>
+    private const string WindowsOnLink = "0.0.0.0";
+
+    /// <summary>
     /// The interface for a socket to <paramref name="destination"/> with the tunnel's routes left
     /// out, or null when nothing else leads there.
     /// </summary>
@@ -77,7 +97,47 @@ internal static class PeerEgressSocketBinding
     /// dial is refused rather than left unbound, because an unbound socket is exactly the one that
     /// would follow the tunnel route.
     /// </remarks>
-    public static string? Select(IReadOnlyList<PeerEgressBindRoute> routes, string? tunnel, string destination)
+    public static string? Select(IReadOnlyList<PeerEgressBindRoute> routes, string? tunnel, string destination) =>
+        SelectRoute(routes, tunnel, [], destination)?.Interface;
+
+    /// <summary>Where a bypass route for <paramref name="destination"/> points, or null.</summary>
+    /// <remarks>
+    /// Null both when nothing but the tunnel leads there and when the winning route leads nowhere:
+    /// pinning a bypass through some other route would reach an address the table deliberately does
+    /// not.
+    /// </remarks>
+    public static PeerEgressBindRoute? SelectBypassHop(IReadOnlyList<PeerEgressBindRoute> routes, string? tunnel,
+        IReadOnlyCollection<string> owned, string destination) =>
+        SelectRoute(routes, tunnel, owned, destination) is { } chosen && chosen.Interface.Length > 0 ? chosen : null;
+
+    /// <summary>Where a bypass goes when the platform's own query answered with the tunnel.</summary>
+    /// <remarks>
+    /// The query is asked first everywhere because it knows things a reading of the table does not --
+    /// policy routing on Linux above all. But once a rule's route covers the address the query can
+    /// only see that route, and that is exactly when a bypass is needed; so the table is read and the
+    /// choice made with the tunnel left out.
+    /// </remarks>
+    public static PeerEgressBindRoute BypassHopFromTable(string address, string? tunnel,
+        Func<IReadOnlyList<PeerEgressBindRoute>> read)
+    {
+        IReadOnlyList<PeerEgressBindRoute> routes;
+        try
+        {
+            routes = read();
+        }
+        catch (Exception failed) when (failed is not PeerEgressNoPhysicalRouteException)
+        {
+            throw new IOException($"resolve bypass hop for {address} past the tunnel: {failed.Message}", failed);
+        }
+        return SelectBypassHop(routes, tunnel, [], address) ?? throw new PeerEgressNoPhysicalRouteException(address);
+    }
+
+    /// <summary>
+    /// The route a packet to <paramref name="destination"/> would take with this feature's own routes
+    /// left out: the tunnel's, and any prefix in <paramref name="owned"/>.
+    /// </summary>
+    public static PeerEgressBindRoute? SelectRoute(IReadOnlyList<PeerEgressBindRoute> routes, string? tunnel,
+        IReadOnlyCollection<string> owned, string destination)
     {
         if (!Ipv4Cidr.TryParseAddress(destination, out var address))
         {
@@ -87,7 +147,8 @@ internal static class PeerEgressSocketBinding
         var bestBits = -1;
         foreach (var route in routes)
         {
-            if (!route.Usable || (!string.IsNullOrEmpty(tunnel) && route.Interface == tunnel))
+            if (!route.Usable || (!string.IsNullOrEmpty(tunnel) && route.Interface == tunnel)
+                || owned.Contains(route.Prefix))
             {
                 continue;
             }
@@ -103,7 +164,7 @@ internal static class PeerEgressSocketBinding
                 bestBits = bits;
             }
         }
-        return best?.Interface;
+        return best;
     }
 
     private static uint Mask(int bits) => bits == 0 ? 0 : uint.MaxValue << (32 - bits);
@@ -155,9 +216,13 @@ internal static class PeerEgressSocketBinding
             }
             // The address bytes are in network order inside a little-endian row.
             var address = BinaryPrimitives.ReadUInt32BigEndian(row[ForwardPrefixAddress..]) & Mask(length);
+            var nextHop = BinaryPrimitives.ReadUInt16LittleEndian(row[ForwardNextHopFamily..]) == AfInet
+                ? Ipv4Cidr.FormatAddress(BinaryPrimitives.ReadUInt32BigEndian(row[ForwardNextHopAddress..]))
+                : "";
             parsed.Add(new PeerEgressWindowsForwardRow(
                 BinaryPrimitives.ReadUInt32LittleEndian(row[ForwardInterfaceIndex..]),
                 Ipv4Cidr.FormatAddress(address) + "/" + length.ToString(CultureInfo.InvariantCulture),
+                nextHop,
                 BinaryPrimitives.ReadUInt32LittleEndian(row[ForwardMetric..])));
         }
         return parsed;
@@ -214,7 +279,8 @@ internal static class PeerEgressSocketBinding
                 usable = iface.Connected && !(row.Prefix == "0.0.0.0/0" && iface.DisableDefaultRoutes);
             }
             routes.Add(new PeerEgressBindRoute(row.Prefix,
-                row.InterfaceIndex.ToString(CultureInfo.InvariantCulture), metric, usable));
+                row.InterfaceIndex.ToString(CultureInfo.InvariantCulture),
+                row.NextHop == WindowsOnLink ? "" : row.NextHop, metric, usable));
         }
         return routes;
     }
@@ -225,7 +291,11 @@ internal static class PeerEgressSocketBinding
         var routes = new List<PeerEgressBindRoute>();
         foreach (var row in PeerEgressMacosRouteCommands.ParseTable(table))
         {
-            routes.Add(new PeerEgressBindRoute(row.Prefix, row.Netif, 0,
+            var gateway = row.Flags.Contains(MacosGatewayFlag, StringComparison.Ordinal)
+                && Ipv4Cidr.TryParseAddress(row.Gateway, out _)
+                    ? row.Gateway
+                    : "";
+            routes.Add(new PeerEgressBindRoute(row.Prefix, row.Netif, gateway, 0,
                 !row.Flags.Contains(MacosScopedFlag, StringComparison.Ordinal)));
         }
         return routes;
