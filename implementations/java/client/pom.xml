@@ -75,15 +75,29 @@
                         <manifestEntries>
                             <!-- SpecusClientApplication reports this in login and version checks. -->
                             <Implementation-Version>${project.version}</Implementation-Version>
+                            <!--
+                                PeerEgressSocketHandles reads a socket channel's handle to bind the
+                                egress socket to an interface on Windows and macOS. java -jar honours
+                                this; without it those dials are refused.
+                            -->
+                            <Add-Exports>java.base/sun.nio.ch</Add-Exports>
                         </manifestEntries>
                     </archive>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- The same export the jar manifest declares; see PeerEgressSocketHandles. -->
+                    <argLine>--add-exports java.base/sun.nio.ch=ALL-UNNAMED</argLine>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
+                    <jvmArguments>--enable-native-access=ALL-UNNAMED --add-exports java.base/sun.nio.ch=ALL-UNNAMED</jvmArguments>
                     <!-- 开发运行时保留 DevTools，但任何可发布的 exec JAR 都显式排除它。 -->
                     <excludeDevtools>true</excludeDevtools>
                     <!--

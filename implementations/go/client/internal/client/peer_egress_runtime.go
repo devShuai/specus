@@ -102,7 +102,8 @@ func newEgressRuntime(logger *log.Logger, send egressSendFunc, dial egressDialFu
 		logger = log.Default()
 	}
 	if dial == nil {
-		dial = dialEgressTarget
+		// No tunnel to leave out. The mesh passes a dialer that knows its device.
+		dial = newEgressDialer(nil)
 	}
 	return &egressRuntime{
 		logger:     logger,
@@ -743,13 +744,6 @@ func newEgressISS() uint32 {
 		return uint32(time.Now().UnixNano())
 	}
 	return binary.BigEndian.Uint32(raw[:])
-}
-
-// dialEgressTarget is the default dialer. bindEgressSocket is supplied per platform and is what
-// keeps the outbound socket on a physical interface rather than back through the tunnel.
-func dialEgressTarget(protocol string, address string, timeout time.Duration) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: timeout, Control: bindEgressSocket}
-	return dialer.Dial(protocol, address)
 }
 
 func isEgressEOF(err error) bool { return errors.Is(err, io.EOF) }

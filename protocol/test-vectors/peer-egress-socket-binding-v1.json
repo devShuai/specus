@@ -1,0 +1,1134 @@
+{
+  "name": "peer-egress-socket-binding",
+  "version": 1,
+  "notes": [
+    "select: routes are candidates in table order; the answer is the interface of the route with the longest prefix containing the destination, then the lowest metric, then the first listed. Routes with usable false, and routes whose interface equals the tunnel, are not candidates. A null interface means the dial is refused.",
+    "An empty tunnel name leaves nothing out. A node without a TUN device has no tunnel routes to avoid.",
+    "windows: metric is the route's metric plus its interface's metric; usable is the interface having an IPv4 row that is connected, and not a 0.0.0.0/0 route on an interface with DisableDefaultRoutes. interface is the decimal interface index.",
+    "windows tables: a ULONG count, padding to offset 8, then fixed-size rows. Rows whose family is not AF_INET are skipped, as are forward rows with a prefix length over 32. A forward prefix is masked by its length. A buffer shorter than the count claims is refused whole.",
+    "macos: candidates are the rows of `netstat -rn -f inet` as the route vector normalises them; interface is the Netif column, metric is 0, and usable is the Flags column not containing I."
+  ],
+  "select": {
+    "cases": [
+      {
+        "name": "default-only",
+        "note": "The common case: one physical default route and nothing else.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "tunnel-route-is-left-out",
+        "note": "The case the binding exists for. This node's own consumer rule sends 203.0.113.0/24 into the tunnel; the egress socket must take the default route instead.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "42",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "without-a-tunnel-the-tunnel-route-would-win",
+        "note": "The same table with no tunnel named, which is what makes the previous case load-bearing: leaving the tunnel out is the only thing that changes the answer.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "42",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "tunnel": "",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "42"
+        }
+      },
+      {
+        "name": "another-vpn-keeps-its-routes",
+        "note": "A route on some other interface -- a corporate VPN, a second NIC -- is not the tunnel and is respected, which binding everything to the default interface would break.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          },
+          {
+            "prefix": "10.0.0.0/8",
+            "interface": "7",
+            "metric": 30,
+            "usable": true
+          },
+          {
+            "prefix": "10.1.0.0/16",
+            "interface": "42",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "10.1.2.3",
+        "expect": {
+          "interface": "7"
+        }
+      },
+      {
+        "name": "prefix-length-beats-metric",
+        "note": "A longer prefix wins however large its metric is.",
+        "routes": [
+          {
+            "prefix": "10.0.0.0/8",
+            "interface": "7",
+            "metric": 5,
+            "usable": true
+          },
+          {
+            "prefix": "10.1.0.0/16",
+            "interface": "3",
+            "metric": 9000,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "10.1.2.3",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "equal-length-lower-metric-wins",
+        "note": "Two default routes, as on a laptop with both Ethernet and Wi-Fi up.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "15",
+            "metric": 291,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "198.51.100.1",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "equal-length-equal-metric-first-listed-wins",
+        "note": "A full tie keeps table order, so every runtime reading the same table agrees.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "15",
+            "metric": 276,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "198.51.100.1",
+        "expect": {
+          "interface": "15"
+        }
+      },
+      {
+        "name": "unusable-route-is-left-out",
+        "note": "A route on a disconnected interface, or a scoped route on macOS, is not a candidate however good it looks.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "15",
+            "metric": 1,
+            "usable": false
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "198.51.100.1",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "only-the-tunnel-leads-there",
+        "note": "No physical path. The dial is refused rather than left unbound, because unbound is exactly the socket that would follow the tunnel route.",
+        "routes": [
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "42",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": null
+        }
+      },
+      {
+        "name": "no-route-at-all",
+        "routes": [
+          {
+            "prefix": "10.0.0.0/8",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": null
+        }
+      },
+      {
+        "name": "last-address-in-prefix",
+        "routes": [
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "15",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.113.255",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "first-address-past-prefix",
+        "routes": [
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "15",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "203.0.114.0",
+        "expect": {
+          "interface": "15"
+        }
+      },
+      {
+        "name": "tunnel-name-match-is-exact",
+        "note": "utun30 is some other product's tunnel, not utun3.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "utun30",
+            "metric": 0,
+            "usable": true
+          }
+        ],
+        "tunnel": "utun3",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "utun30"
+        }
+      },
+      {
+        "name": "host-route",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.7/32",
+            "interface": "7",
+            "metric": 20,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "198.51.100.7",
+        "expect": {
+          "interface": "7"
+        }
+      },
+      {
+        "name": "loopback-destination",
+        "note": "What the real-socket tests lean on: 127.0.0.1 resolves to the loopback interface, and a socket bound anywhere else cannot reach it.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.0/8",
+            "interface": "1",
+            "metric": 331,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "127.0.0.1",
+        "expect": {
+          "interface": "1"
+        }
+      },
+      {
+        "name": "tunnel-owns-a-default-route",
+        "note": "Phase one refuses a 0.0.0.0/0 rule, but whatever routes the tunnel carries, they are left out the same way.",
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "42",
+            "metric": 5,
+            "usable": true
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "metric": 276,
+            "usable": true
+          }
+        ],
+        "tunnel": "42",
+        "destination": "198.51.100.1",
+        "expect": {
+          "interface": "3"
+        }
+      }
+    ]
+  },
+  "windows": {
+    "layout": {
+      "tableHeader": 8,
+      "forwardRow": {
+        "size": 104,
+        "interfaceIndex": 8,
+        "prefixFamily": 12,
+        "prefixAddress": 16,
+        "prefixLength": 40,
+        "metric": 84
+      },
+      "interfaceRow": {
+        "size": 168,
+        "family": 0,
+        "interfaceIndex": 16,
+        "metric": 148,
+        "connected": 156,
+        "disableDefaultRoutes": 166
+      }
+    },
+    "forwardTables": [
+      {
+        "name": "typical",
+        "note": "A physical default route, loopback, this node's tunnel carrying a rule prefix and the mesh network, a disconnected Wi-Fi with a stale default, a VPN interface that disables default routes, another VPN's 10/8, and three rows that must not be read: an IPv6 row, a prefix length of 33, and a row whose address has host bits set, which is read masked.",
+        "hex": "0d00000000000000030000000000060003000000020000000000000000000000000000000000000000000000000000000000000002000000c0a80101000000000000000000000000000000000000000000000000ffffffffffffffff0000000003000000000000000000000000000000010000000000060001000000020000007f0000000000000000000000000000000000000000000000080000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff0001000002000000000000000000000000000000010000000000060001000000020000007f0000010000000000000000000000000000000000000000200000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff000100000200000000000000000000000000000003000000000006000300000002000000c0a801000000000000000000000000000000000000000000180000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff00010000020000000000000000000000000000002a000000000006002a00000002000000cb0071000000000000000000000000000000000000000000180000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff05000000020000000000000000000000000000002a000000000006002a000000020000006460000000000000000000000000000000000000000000000b0000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff05000000020000000000000000000000000000000f000000000006000f000000020000000000000000000000000000000000000000000000000000000000000002000000c0a80201000000000000000000000000000000000000000000000000ffffffffffffffff00000000030000000000000000000000000000000900000000000600090000000200000000000000000000000000000000000000000000000000000000000000020000000a090001000000000000000000000000000000000000000000000000ffffffffffffffff000000000300000000000000000000000000000009000000000006000900000002000000ac10000000000000000000000000000000000000000000000c000000020000000a090001000000000000000000000000000000000000000000000000ffffffffffffffff0000000002000000000000000000000000000000070000000000060007000000020000000a0102030000000000000000000000000000000000000000080000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff01000000020000000000000000000000000000000300000000000600030000001700000000000000fe80000000000000000000000000000000000000400000001700000000000000000000000000000000000000000000000000000000000000ffffffffffffffff000100000200000000000000000000000000000003000000000006000300000002000000c63364000000000000000000000000000000000000000000210000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff000100000200000000000000000000000000000063000000000006006300000002000000c00002000000000000000000000000000000000000000000180000000200000000000000000000000000000000000000000000000000000000000000ffffffffffffffff0100000002000000000000000000000000000000",
+        "expect": {
+          "parsed": true,
+          "rows": [
+            {
+              "interfaceIndex": 3,
+              "prefix": "0.0.0.0/0",
+              "metric": 0
+            },
+            {
+              "interfaceIndex": 1,
+              "prefix": "127.0.0.0/8",
+              "metric": 256
+            },
+            {
+              "interfaceIndex": 1,
+              "prefix": "127.0.0.1/32",
+              "metric": 256
+            },
+            {
+              "interfaceIndex": 3,
+              "prefix": "192.168.1.0/24",
+              "metric": 256
+            },
+            {
+              "interfaceIndex": 42,
+              "prefix": "203.0.113.0/24",
+              "metric": 5
+            },
+            {
+              "interfaceIndex": 42,
+              "prefix": "100.96.0.0/11",
+              "metric": 5
+            },
+            {
+              "interfaceIndex": 15,
+              "prefix": "0.0.0.0/0",
+              "metric": 0
+            },
+            {
+              "interfaceIndex": 9,
+              "prefix": "0.0.0.0/0",
+              "metric": 0
+            },
+            {
+              "interfaceIndex": 9,
+              "prefix": "172.16.0.0/12",
+              "metric": 0
+            },
+            {
+              "interfaceIndex": 7,
+              "prefix": "10.0.0.0/8",
+              "metric": 1
+            },
+            {
+              "interfaceIndex": 99,
+              "prefix": "192.0.2.0/24",
+              "metric": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "empty",
+        "hex": "0000000000000000",
+        "expect": {
+          "parsed": true,
+          "rows": []
+        }
+      },
+      {
+        "name": "truncated",
+        "note": "The count says two rows and the buffer holds one. Reading the second would read past the allocation, so the whole table is refused.",
+        "hex": "0200000000000000030000000000060003000000020000000000000000000000000000000000000000000000000000000000000002000000c0a80101000000000000000000000000000000000000000000000000ffffffffffffffff0000000003000000000000000000000000000000",
+        "expect": {
+          "parsed": false,
+          "rows": []
+        }
+      },
+      {
+        "name": "short-header",
+        "hex": "01000000",
+        "expect": {
+          "parsed": false,
+          "rows": []
+        }
+      }
+    ],
+    "interfaceTables": [
+      {
+        "name": "typical",
+        "note": "The interfaces of the typical forward table, plus an IPv6 row for an index that also has an IPv4 row; only the IPv4 one is read.",
+        "hex": "07000000000000000200000000000000010000000000060001000000ffff0000000000000000000000000000000000000000000001000000000000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000004b000000dc0500000100000030750000000000000200000000000000030000000000060003000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000014000000dc05000001000000307500000000000002000000000000002a000000000006002a000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000005000000dc05000001000000307500000000000002000000000000000f000000000006000f000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000019000000dc0500000000000030750000000000000200000000000000090000000000060009000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000001000000dc0500000100000030750000000001000200000000000000070000000000060007000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000032000000dc0500000100000030750000000000001700000000000000030000000000060003000000ffff00000000000000000000000000000000000000000000010000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000014000000dc050000010000003075000000000000",
+        "expect": {
+          "parsed": true,
+          "rows": [
+            {
+              "interfaceIndex": 1,
+              "metric": 75,
+              "connected": true,
+              "disableDefaultRoutes": false
+            },
+            {
+              "interfaceIndex": 3,
+              "metric": 20,
+              "connected": true,
+              "disableDefaultRoutes": false
+            },
+            {
+              "interfaceIndex": 42,
+              "metric": 5,
+              "connected": true,
+              "disableDefaultRoutes": false
+            },
+            {
+              "interfaceIndex": 15,
+              "metric": 25,
+              "connected": false,
+              "disableDefaultRoutes": false
+            },
+            {
+              "interfaceIndex": 9,
+              "metric": 1,
+              "connected": true,
+              "disableDefaultRoutes": true
+            },
+            {
+              "interfaceIndex": 7,
+              "metric": 50,
+              "connected": true,
+              "disableDefaultRoutes": false
+            }
+          ]
+        }
+      },
+      {
+        "name": "truncated",
+        "hex": "03000000000000000200000000000000010000000000060001000000ffff0000000000000000000000000000000000000000000001000000000000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000004b000000dc050000010000003075000000000000",
+        "expect": {
+          "parsed": false,
+          "rows": []
+        }
+      }
+    ],
+    "routes": {
+      "forward": "typical",
+      "interfaces": "typical",
+      "expect": [
+        {
+          "prefix": "0.0.0.0/0",
+          "interface": "3",
+          "metric": 20,
+          "usable": true
+        },
+        {
+          "prefix": "127.0.0.0/8",
+          "interface": "1",
+          "metric": 331,
+          "usable": true
+        },
+        {
+          "prefix": "127.0.0.1/32",
+          "interface": "1",
+          "metric": 331,
+          "usable": true
+        },
+        {
+          "prefix": "192.168.1.0/24",
+          "interface": "3",
+          "metric": 276,
+          "usable": true
+        },
+        {
+          "prefix": "203.0.113.0/24",
+          "interface": "42",
+          "metric": 10,
+          "usable": true
+        },
+        {
+          "prefix": "100.96.0.0/11",
+          "interface": "42",
+          "metric": 10,
+          "usable": true
+        },
+        {
+          "prefix": "0.0.0.0/0",
+          "interface": "15",
+          "metric": 25,
+          "usable": false
+        },
+        {
+          "prefix": "0.0.0.0/0",
+          "interface": "9",
+          "metric": 1,
+          "usable": false
+        },
+        {
+          "prefix": "172.16.0.0/12",
+          "interface": "9",
+          "metric": 1,
+          "usable": true
+        },
+        {
+          "prefix": "10.0.0.0/8",
+          "interface": "7",
+          "metric": 51,
+          "usable": true
+        },
+        {
+          "prefix": "192.0.2.0/24",
+          "interface": "99",
+          "metric": 1,
+          "usable": false
+        }
+      ]
+    },
+    "cases": [
+      {
+        "name": "rule-prefix-goes-out-the-physical-default",
+        "note": "Interface 9's default route has the best metric of the three but its interface disables default routes, and interface 15's is on a disconnected adapter, so the answer is 3.",
+        "tunnel": "42",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "disable-default-routes-leaves-other-routes-usable",
+        "note": "The flag rules out interface 9's default route only; its 172.16.0.0/12 still carries traffic.",
+        "tunnel": "42",
+        "destination": "172.16.5.5",
+        "expect": {
+          "interface": "9"
+        }
+      },
+      {
+        "name": "mesh-network-route-is-left-out",
+        "note": "The forced-deny list refuses a mesh address before any dial; were one to get this far, it still would not be sent into the tunnel.",
+        "tunnel": "42",
+        "destination": "100.96.0.5",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "masked-row-matches-its-network",
+        "note": "The row for interface 7 carries 10.1.2.3 with a length of 8. Read masked it is 10.0.0.0/8 and covers 10.200.0.1.",
+        "tunnel": "42",
+        "destination": "10.200.0.1",
+        "expect": {
+          "interface": "7"
+        }
+      },
+      {
+        "name": "route-on-an-interface-with-no-interface-row-is-not-used",
+        "tunnel": "42",
+        "destination": "192.0.2.10",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "prefix-length-over-32-is-not-read",
+        "tunnel": "42",
+        "destination": "198.51.100.9",
+        "expect": {
+          "interface": "3"
+        }
+      },
+      {
+        "name": "loopback",
+        "tunnel": "42",
+        "destination": "127.0.0.1",
+        "expect": {
+          "interface": "1"
+        }
+      }
+    ]
+  },
+  "macos": {
+    "tables": {
+      "table": "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\ndefault            192.168.64.1       UGScg                 en0       \n100.64/10          192.168.64.1       UGSc                  en0       \n127                127.0.0.1          UCS                   lo0       \n127.0.0.1          127.0.0.1          UH                    lo0       \n169.254            link#7             UCS                   en0      !\n192.0.2.1          192.168.64.1       UGHS                  en0       \n192.0.2.2/32       192.168.64.1       UGSc                  en0       \n192.0.2.128/25     192.168.64.1       UGSc                  en0       \n192.168.64         link#7             UCS                   en0      !\n192.168.64.1/32    link#7             UCS                   en0      !\n192.168.64.1       5e:e9:1e:f:c3:64   UHLWIir               en0   1177\n192.168.64.3/32    link#7             UCS                   en0      !\n192.168.64.255     ff:ff:ff:ff:ff:ff  UHLWbI                en0      !\n198.18.0/15        192.168.64.1       UGSc                  en0       \n198.51.100/26      192.168.64.1       UGSc                  en0       \n198.51.100.128/25  lo0                USc                   lo0       \n203.0.113          192.168.64.1       UGSc                  en0       \n224.0.0/4          link#7             UmCS                  en0      !\n224.0.0.251        1:0:5e:0:0:fb      UHmLWI                en0       \n255.255.255.255/32 link#7             UCS                   en0      !\n",
+      "duplicates": "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\ndefault            192.168.64.1       UGScg                 en0       \n127                127.0.0.1          UCS                   lo0       \n127.0.0.1          127.0.0.1          UH                    lo0       \n128.0/1            192.168.64.1       UGSc                  en0       \n169.254            link#7             UCS                   en0      !\n192.168.64         link#7             UCS                   en0      !\n192.168.64.1/32    link#7             UCS                   en0      !\n192.168.64.1       a6:77:f3:60:e5:64  UHLWIir               en0   1190\n192.168.64.7/32    link#7             UCS                   en0      !\n192.168.64.255     ff:ff:ff:ff:ff:ff  UHLWbI                en0      !\n203.0.113          192.168.64.1       UGSc                  en0       \n203.0.113          lo0                UScI                  lo0       \n203.0.113          192.168.64.1       UGScI                 en0       \n224.0.0/4          link#7             UmCS                  en0      !\n224.0.0.251        1:0:5e:0:0:fb      UHmLWI                en0       \n255.255.255.255/32 link#7             UCS                   en0      !\n",
+      "tunRoute": "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\ndefault            192.168.64.1       UGScg                 en0       \n10.255.0.2         10.255.0.1         UH                  utun3       \n127                127.0.0.1          UCS                   lo0       \n127.0.0.1          127.0.0.1          UH                    lo0       \n128.0/1            192.168.64.1       UGSc                  en0       \n169.254            link#7             UCS                   en0      !\n192.168.64         link#7             UCS                   en0      !\n192.168.64.1/32    link#7             UCS                   en0      !\n192.168.64.1       a6:77:f3:60:e5:64  UHLWIir               en0   1189\n192.168.64.7/32    link#7             UCS                   en0      !\n192.168.64.255     ff:ff:ff:ff:ff:ff  UHLWbI                en0      !\n203.0.113          utun3              USc                 utun3       \n224.0.0/4          link#7             UmCS                  en0      !\n224.0.0.251        1:0:5e:0:0:fb      UHmLWI                en0       \n255.255.255.255/32 link#7             UCS                   en0      !\n"
+    },
+    "routes": [
+      {
+        "table": "table",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "100.64.0.0/10",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.0/8",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.1/32",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "169.254.0.0/16",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.2/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.0.2.128/25",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "192.168.64.3/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "198.18.0.0/15",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.0/26",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "198.51.100.128/25",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "224.0.0.0/4",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "224.0.0.251/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "255.255.255.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      },
+      {
+        "table": "duplicates",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.0/8",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.1/32",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "128.0.0.0/1",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "169.254.0.0/16",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "192.168.64.7/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "224.0.0.0/4",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "224.0.0.251/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "255.255.255.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      },
+      {
+        "table": "tunRoute",
+        "expect": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "10.255.0.2/32",
+            "interface": "utun3",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.0/8",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "127.0.0.1/32",
+            "interface": "lo0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "128.0.0.0/1",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "169.254.0.0/16",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.0/24",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.1/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "192.168.64.7/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "192.168.64.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "utun3",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "224.0.0.0/4",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "224.0.0.251/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": false
+          },
+          {
+            "prefix": "255.255.255.255/32",
+            "interface": "en0",
+            "metric": 0,
+            "usable": true
+          }
+        ]
+      }
+    ],
+    "cases": [
+      {
+        "name": "rule-prefix-in-utun-goes-out-en0",
+        "table": "tunRoute",
+        "tunnel": "utun3",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "en0"
+        }
+      },
+      {
+        "name": "without-a-tunnel-utun3-would-win",
+        "table": "tunRoute",
+        "tunnel": "",
+        "destination": "203.0.113.9",
+        "expect": {
+          "interface": "utun3"
+        }
+      },
+      {
+        "name": "tunnel-host-route-is-left-out",
+        "table": "tunRoute",
+        "tunnel": "utun3",
+        "destination": "10.255.0.2",
+        "expect": {
+          "interface": "en0"
+        }
+      },
+      {
+        "name": "scoped-duplicates-are-not-candidates",
+        "table": "duplicates",
+        "tunnel": "utun3",
+        "destination": "203.0.113.9",
+        "note": "Three routes for 203.0.113.0/24: an unscoped one via en0 and two scoped with I, one of them to lo0. Only the unscoped one is a candidate.",
+        "expect": {
+          "interface": "en0"
+        }
+      },
+      {
+        "name": "nothing-left-when-the-physical-interface-is-named-as-the-tunnel",
+        "table": "duplicates",
+        "tunnel": "en0",
+        "destination": "203.0.113.9",
+        "note": "Every unscoped route to the destination is on en0, the scoped lo0 route does not count, and 127/8 does not cover it.",
+        "expect": {
+          "interface": null
+        }
+      },
+      {
+        "name": "unscoped-route-to-lo0-is-respected",
+        "table": "table",
+        "tunnel": "utun3",
+        "destination": "198.51.100.200",
+        "expect": {
+          "interface": "lo0"
+        }
+      },
+      {
+        "name": "same-destination-with-lo0-left-out",
+        "table": "table",
+        "tunnel": "lo0",
+        "destination": "198.51.100.200",
+        "expect": {
+          "interface": "en0"
+        }
+      },
+      {
+        "name": "cloned-host-route-is-scoped-but-its-network-is-not",
+        "table": "table",
+        "tunnel": "utun3",
+        "destination": "192.168.64.1",
+        "note": "The link-level entry for the gateway carries I; the /32 link#7 entry and the /24 behind it are on the same interface anyway.",
+        "expect": {
+          "interface": "en0"
+        }
+      },
+      {
+        "name": "loopback",
+        "table": "table",
+        "tunnel": "utun3",
+        "destination": "127.0.0.1",
+        "expect": {
+          "interface": "lo0"
+        }
+      }
+    ]
+  },
+  "socketOptions": {
+    "windows": {
+      "level": 0,
+      "name": 31,
+      "constant": "IP_UNICAST_IF",
+      "byteOrder": "network",
+      "note": "A four-byte value holding the interface index in network byte order. In host order setsockopt refuses it with WSAEADDRNOTAVAIL (\"The requested address is not valid in its context\").",
+      "cases": [
+        {
+          "index": 1,
+          "hex": "00000001"
+        },
+        {
+          "index": 3,
+          "hex": "00000003"
+        },
+        {
+          "index": 258,
+          "hex": "00000102"
+        },
+        {
+          "index": 305419896,
+          "hex": "12345678"
+        }
+      ]
+    },
+    "macos": {
+      "level": 0,
+      "name": 25,
+      "constant": "IP_BOUND_IF",
+      "byteOrder": "host",
+      "note": "A four-byte int holding the interface index in host byte order, which is little-endian on every Mac this ships to.",
+      "cases": [
+        {
+          "index": 1,
+          "hex": "01000000"
+        },
+        {
+          "index": 4,
+          "hex": "04000000"
+        },
+        {
+          "index": 258,
+          "hex": "02010000"
+        }
+      ]
+    }
+  }
+}

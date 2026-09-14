@@ -175,14 +175,18 @@ PID 12345 | ready
 | `return-mesh-source` / `return-no-flow` | 回程包来源异常，被拒收 |
 | `rejected-<错误码>` | 出口拒绝了这个连接 |
 
-**macOS 注意：** 虚拟网卡必须先配好 IPv4 地址，路由才能指向它；这由网卡启动完成。Linux 上若本机隧道接管了默认路由，Go 与 .NET 出口会给出站 socket 打 `SO_MARK 0x5350`，需要运维自行添加策略路由，把带这个标记的流量交给一张以物理网关为默认路由的独立路由表，才能把转发流量固定在物理接口上。例如（网关、网卡与表号按实际环境替换）：
+**macOS 注意：** 虚拟网卡必须先配好 IPv4 地址，路由才能指向它；这由网卡启动完成。
+
+**出口的转发流量不会走进本机隧道。** 一台设备同时是出口和消费端时，它为自己的规则装的隧道路由可能覆盖别人托它访问的目标。Windows 与 macOS 上，出口在连接目标前会把 socket 绑定到「没有隧道路由时系统本来会选的接口」（`IP_UNICAST_IF` / `IP_BOUND_IF`），按目标逐个选择，另一个 VPN 或第二块网卡上的路由照常生效，不需要任何配置。除了隧道之外没有路由通往目标时，这个连接会被拒绝，日志里是 `no route outside the tunnel`。Java 客户端用 `java -jar` 启动即可；自己拼 classpath 或用服务包装器启动时，要加上 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`，否则 Windows 与 macOS 上所有出口连接都会被拒绝，日志会写明缺这个选项。
+
+Linux 上若本机隧道接管了默认路由，Go 与 .NET 出口会给出站 socket 打 `SO_MARK 0x5350`，需要运维自行添加策略路由，把带这个标记的流量交给一张以物理网关为默认路由的独立路由表，才能把转发流量固定在物理接口上。例如（网关、网卡与表号按实际环境替换）：
 
 ```sh
 ip route add default via 192.0.2.1 dev eth0 table 100
 ip rule add fwmark 0x5350 table 100
 ```
 
-不要让它查主路由表：主表里正是隧道的路由。Java 出口做不到打标记。
+不要让它查主路由表：主表里正是隧道的路由。Java 出口在 Linux 上目前不打标记。
 
 ## 五、已知限制
 

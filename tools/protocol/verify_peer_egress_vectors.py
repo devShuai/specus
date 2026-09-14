@@ -439,6 +439,142 @@ check(macos["tunNeedsAddress"]["withoutAddress"]["stderr"].strip()
       and not macos["tunNeedsAddress"]["withAddress"]["stderr"].strip(),
       "macos: the evidence that a TUN needs an address before a route can point at it is gone")
 
+# ---- socket binding vector ----------------------------------------------
+#
+# Recomputed from the raw inputs rather than trusted, and each behaviour that decides an answer has
+# to still be the thing deciding at least one case.
+
+def binding_select(routes, tunnel, destination):
+    address = ipaddress.IPv4Address(destination)
+    best, best_key = None, None
+    for candidate in routes:
+        if not candidate["usable"] or (tunnel and candidate["interface"] == tunnel):
+            continue
+        network = ipaddress.IPv4Network(candidate["prefix"])
+        if address in network:
+            key = (network.prefixlen, -candidate["metric"])
+            if best_key is None or key > best_key:
+                best, best_key = candidate["interface"], key
+    return best
+
+
+def binding_without(routes, tunnel, destination, change):
+    return binding_select([change(dict(r)) for r in routes], tunnel, destination)
+
+
+binding = json.loads((VECTORS / "peer-egress-socket-binding-v1.json").read_text(encoding="utf-8"))
+select_cases = binding["select"]["cases"]
+for case in select_cases:
+    check(binding_select(case["routes"], case["tunnel"], case["destination"])
+          == case["expect"]["interface"], f"binding select {case['name']}: expectation is wrong")
+
+check(any(case["expect"]["interface"] is not None
+          and binding_select(case["routes"], "", case["destination"]) != case["expect"]["interface"]
+          for case in select_cases),
+      "binding: no case where leaving the tunnel out changes the answer")
+check(any(case["expect"]["interface"] is None for case in select_cases),
+      "binding: no case refuses the dial, so failing closed is untested")
+check(any(binding_without(case["routes"], case["tunnel"], case["destination"],
+                          lambda r: {**r, "usable": True}) != case["expect"]["interface"]
+          for case in select_cases),
+      "binding: no case where an unusable route would otherwise win")
+check(any(binding_without(case["routes"], case["tunnel"], case["destination"],
+                          lambda r: {**r, "metric": 0}) != case["expect"]["interface"]
+          for case in select_cases),
+      "binding: no case where the metric decides")
+check(any(case["tunnel"] and any(r["interface"].startswith(case["tunnel"])
+                                 and r["interface"] != case["tunnel"] for r in case["routes"])
+          for case in select_cases),
+      "binding: nothing pins the tunnel comparison being exact")
+
+
+def binding_table(hex_text, size, family_offset, family_width):
+    raw = bytes.fromhex(hex_text)
+    if len(raw) < 8:
+        return None
+    count = struct.unpack_from("<I", raw, 0)[0]
+    if len(raw) < 8 + count * size:
+        return None
+    return [raw[8 + i * size: 8 + (i + 1) * size] for i in range(count)]
+
+
+layout = binding["windows"]["layout"]
+forward_layout = layout["forwardRow"]
+interface_layout = layout["interfaceRow"]
+check(layout["tableHeader"] == 8 and forward_layout["size"] == 104 and interface_layout["size"] == 168,
+      "binding: the Windows row sizes changed, and they were measured, not chosen")
+for table in binding["windows"]["forwardTables"]:
+    rows = binding_table(table["hex"], forward_layout["size"], forward_layout["prefixFamily"], 2)
+    check((rows is not None) == table["expect"]["parsed"],
+          f"binding forward table {table['name']}: parsed flag is wrong")
+    read = []
+    for row in rows or []:
+        if struct.unpack_from("<H", row, forward_layout["prefixFamily"])[0] != 2:
+            continue
+        length = row[forward_layout["prefixLength"]]
+        if length > 32:
+            continue
+        network = ipaddress.IPv4Network(
+            (bytes(row[forward_layout["prefixAddress"]:forward_layout["prefixAddress"] + 4]), length),
+            strict=False)
+        read.append({"interfaceIndex": struct.unpack_from("<I", row, forward_layout["interfaceIndex"])[0],
+                     "prefix": str(network),
+                     "metric": struct.unpack_from("<I", row, forward_layout["metric"])[0]})
+    check(read == table["expect"]["rows"], f"binding forward table {table['name']}: rows are wrong")
+for table in binding["windows"]["interfaceTables"]:
+    rows = binding_table(table["hex"], interface_layout["size"], interface_layout["family"], 2)
+    check((rows is not None) == table["expect"]["parsed"],
+          f"binding interface table {table['name']}: parsed flag is wrong")
+    read = []
+    for row in rows or []:
+        if struct.unpack_from("<H", row, interface_layout["family"])[0] != 2:
+            continue
+        read.append({"interfaceIndex": struct.unpack_from("<I", row, interface_layout["interfaceIndex"])[0],
+                     "metric": struct.unpack_from("<I", row, interface_layout["metric"])[0],
+                     "connected": row[interface_layout["connected"]] != 0,
+                     "disableDefaultRoutes": row[interface_layout["disableDefaultRoutes"]] != 0})
+    check(read == table["expect"]["rows"], f"binding interface table {table['name']}: rows are wrong")
+check(any(not table["expect"]["parsed"] for table in binding["windows"]["forwardTables"]),
+      "binding: no truncated forward table, so reading past the buffer is untested")
+
+windows_routes = binding["windows"]["routes"]["expect"]
+for case in binding["windows"]["cases"]:
+    check(binding_select(windows_routes, case["tunnel"], case["destination"])
+          == case["expect"]["interface"], f"binding windows {case['name']}: expectation is wrong")
+default_ruled_out = ({r["interface"] for r in windows_routes
+                      if r["prefix"] == "0.0.0.0/0" and not r["usable"]}
+                     & {r["interface"] for r in windows_routes
+                        if r["prefix"] != "0.0.0.0/0" and r["usable"]})
+check(default_ruled_out and any(case["expect"]["interface"] in default_ruled_out
+                                for case in binding["windows"]["cases"]),
+      "binding: nothing pins DisableDefaultRoutes ruling out a default route while leaving the "
+      "interface's other routes usable")
+
+macos_binding_routes = {entry["table"]: entry["expect"] for entry in binding["macos"]["routes"]}
+for entry in binding["macos"]["routes"]:
+    check(binding["macos"]["tables"][entry["table"]] == macos[entry["table"]]["stdout"],
+          f"binding macos table {entry['table']}: no longer the sampled capture")
+for case in binding["macos"]["cases"]:
+    check(binding_select(macos_binding_routes[case["table"]], case["tunnel"], case["destination"])
+          == case["expect"]["interface"], f"binding macos {case['name']}: expectation is wrong")
+check(any(not r["usable"] for routes in macos_binding_routes.values() for r in routes),
+      "binding: no scoped route in the macOS tables")
+
+options = binding["socketOptions"]
+check(options["windows"]["name"] == 31 and options["windows"]["byteOrder"] == "network",
+      "binding: IP_UNICAST_IF changed shape")
+check(options["macos"]["name"] == 25 and options["macos"]["byteOrder"] == "host",
+      "binding: IP_BOUND_IF changed shape")
+for case in options["windows"]["cases"]:
+    check(bytes.fromhex(case["hex"]) == struct.pack(">I", case["index"]),
+          f"binding: IP_UNICAST_IF {case['index']} is not in network order")
+for case in options["macos"]["cases"]:
+    check(bytes.fromhex(case["hex"]) == struct.pack("<I", case["index"]),
+          f"binding: IP_BOUND_IF {case['index']} is not in host order")
+check(any(struct.pack(">I", c["index"]) != struct.pack("<I", c["index"])
+          for c in options["windows"]["cases"]),
+      "binding: every Windows option case reads the same in both byte orders")
+
 print(f"frame accept={len(frame['accept'])} reject={len(frame['reject'])}")
 print(f"rules cases={len(rules['cases'])} configValidation={len(rules['configValidation'])}"
       f" refusedRules={len(rules['refusedRules'])}")
@@ -456,6 +592,8 @@ print(f"macos routes get={len(macos['routeGet'])} normalise={len(macos['normalis
       f" results={len(macos['commandResults'])}"
       f" refused={len(macos['commands']['rejectedArguments'])}"
       f" sampled={len(macos_sampled)}")
+print(f"socket binding select={len(select_cases)} windows={len(binding['windows']['cases'])}"
+      f" macos={len(binding['macos']['cases'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")

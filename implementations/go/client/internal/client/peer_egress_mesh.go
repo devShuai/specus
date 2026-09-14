@@ -77,7 +77,7 @@ func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 		default:
 		}
 		return nil
-	}, nil)
+	}, newEgressDialer(mesh.egressTunnelName))
 	mesh.egress = runtime
 	mesh.egressQueue = queue
 	mesh.egressDone = done
@@ -86,6 +86,22 @@ func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 	go mesh.egressSendLoop(queue, done)
 	go mesh.egressTickLoop(runtime, done)
 	return runtime
+}
+
+// egressTunnelName is the interface whose routes an egress socket must not follow: this node's own
+// TUN, or "" when the device is a noop that creates no interface. Called by the dialer with no mesh
+// lock held.
+func (mesh *peerMeshClient) egressTunnelName() string {
+	mesh.mu.Lock()
+	device := mesh.device
+	mesh.mu.Unlock()
+	if device == nil {
+		return ""
+	}
+	if _, noop := device.(*noopPeerVirtualDevice); noop {
+		return ""
+	}
+	return device.Name()
 }
 
 // egressSendLoop encrypts and sends queued frames. It is the only place the egress plane's output
