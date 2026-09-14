@@ -517,8 +517,13 @@ for table in binding["windows"]["forwardTables"]:
         network = ipaddress.IPv4Network(
             (bytes(row[forward_layout["prefixAddress"]:forward_layout["prefixAddress"] + 4]), length),
             strict=False)
+        next_hop = ""
+        if struct.unpack_from("<H", row, forward_layout["nextHopFamily"])[0] == 2:
+            next_hop = str(ipaddress.IPv4Address(
+                bytes(row[forward_layout["nextHopAddress"]:forward_layout["nextHopAddress"] + 4])))
         read.append({"interfaceIndex": struct.unpack_from("<I", row, forward_layout["interfaceIndex"])[0],
                      "prefix": str(network),
+                     "nextHop": next_hop,
                      "metric": struct.unpack_from("<I", row, forward_layout["metric"])[0]})
     check(read == table["expect"]["rows"], f"binding forward table {table['name']}: rows are wrong")
 for table in binding["windows"]["interfaceTables"]:
@@ -559,6 +564,105 @@ for case in binding["macos"]["cases"]:
           == case["expect"]["interface"], f"binding macos {case['name']}: expectation is wrong")
 check(any(not r["usable"] for routes in macos_binding_routes.values() for r in routes),
       "binding: no scoped route in the macOS tables")
+
+# Linux: re-read the sampled main tables here, without the generator's parser.
+def binding_linux_routes(text):
+    rows, last, deviceless = [], None, []
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        words = line.split()
+        if line[0] in " \t":
+            if words[0] == "nexthop" and last is not None and last["interface"] == "":
+                pairs = dict(zip(words[1::2], words[2::2]))
+                if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", pairs.get("via", "")):
+                    last["gateway"] = pairs["via"]
+                last["interface"] = pairs.get("dev", "")
+            continue
+        last = None
+        nowhere = words[0] in ("blackhole", "unreachable", "prohibit", "throw")
+        if words[0] in ("local", "broadcast", "anycast", "multicast", "nat"):
+            continue
+        if nowhere:
+            words = words[1:]
+        destination = "0.0.0.0/0" if words[0] == "default" else words[0]
+        if "/" not in destination:
+            destination += "/32"
+        entry = {"prefix": str(ipaddress.IPv4Network(destination, strict=False)), "interface": "",
+                 "gateway": "", "metric": 0, "usable": "dead" not in words}
+        for index in range(1, len(words) - 1):
+            if words[index] == "via" and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", words[index + 1]):
+                entry["gateway"] = words[index + 1]
+            if words[index] == "dev":
+                entry["interface"] = words[index + 1]
+            if words[index] == "metric":
+                entry["metric"] = int(words[index + 1])
+        if nowhere:
+            entry["interface"], entry["gateway"] = "", ""
+        elif entry["interface"] == "":
+            last = entry
+            deviceless.append(entry)
+        rows.append(entry)
+    for entry in deviceless:
+        if entry["interface"] == "":
+            entry["usable"] = False
+    return rows
+
+
+linux_binding = binding["linux"]
+for entry in linux_binding["routes"]:
+    check(linux_binding["tables"][entry["table"]] == linux_binding["captures"][entry["table"]]["stdout"],
+          f"binding linux table {entry['table']}: no longer the sampled capture")
+    check(binding_linux_routes(linux_binding["tables"][entry["table"]]) == entry["expect"],
+          f"binding linux table {entry['table']}: rows are wrong")
+covered = [capture for name, capture in linux_binding["captures"].items() if name.startswith("get-covered")]
+check(covered and all(capture["exit"] == 0 and " dev specus0 " in capture["stdout"] for capture in covered),
+      "binding: the evidence that `ip route get` answers with the tunnel is gone")
+check("\tnexthop " in linux_binding["tables"]["show-rich"],
+      "binding: the sampled Linux table no longer has a multipath route")
+
+hop_tables = {"linux": {e["table"]: e["expect"] for e in linux_binding["routes"]},
+              "macos": macos_binding_routes,
+              "windows": {"typical": windows_routes}}
+
+
+def binding_hop(routes, tunnel, destination, owned):
+    kept = [r for r in routes if r["prefix"] not in set(owned)]
+    address = ipaddress.IPv4Address(destination)
+    best, best_key = None, None
+    for candidate in kept:
+        if not candidate["usable"] or (tunnel and candidate["interface"] == tunnel):
+            continue
+        network = ipaddress.IPv4Network(candidate["prefix"])
+        if address in network:
+            key = (network.prefixlen, -candidate["metric"])
+            if best_key is None or key > best_key:
+                best, best_key = candidate, key
+    if best is None or best["interface"] == "":
+        return None
+    return {"interface": best["interface"], "gateway": best["gateway"]}
+
+
+hop_cases = binding["hops"]["cases"]
+for case in hop_cases:
+    routes = case["routes"] if case["platform"] == "inline" else hop_tables[case["platform"]][case["table"]]
+    case["_routes"] = routes
+    check(binding_hop(routes, case["tunnel"], case["destination"], case["owned"]) == case["expect"]["hop"],
+          f"binding hop {case['name']}: expectation is wrong")
+check(any(case["owned"] and binding_hop(case["_routes"], case["tunnel"], case["destination"], [])
+          != case["expect"]["hop"] for case in hop_cases),
+      "binding: no hop case where leaving an owned bypass out changes the answer")
+check(any(case["expect"]["hop"] is None and any(
+          r["interface"] == "" and r["usable"] for r in case["_routes"]) for case in hop_cases),
+      "binding: no hop case where a route leading nowhere decides")
+check(any(case["expect"]["hop"] is not None and case["expect"]["hop"]["gateway"] == ""
+          for case in hop_cases),
+      "binding: no hop case with an on-link answer")
+for platform in ("linux", "macos", "windows"):
+    check(any(case["platform"] == platform and case["tunnel"] and case["expect"]["hop"] is not None
+              and binding_hop(case["_routes"], "", case["destination"], case["owned"]) != case["expect"]["hop"]
+              for case in hop_cases),
+          f"binding: no {platform} hop case where leaving the tunnel out changes the answer")
 
 options = binding["socketOptions"]
 check(options["windows"]["name"] == 31 and options["windows"]["byteOrder"] == "network",
