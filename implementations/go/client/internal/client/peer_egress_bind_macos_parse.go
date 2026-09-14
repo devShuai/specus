@@ -27,15 +27,26 @@ const macosIPBoundIf = 25
 // fails rather than leaking.
 const macosBindTableLifetime = 2 * time.Second
 
+// macosGatewayFlag marks a route whose Gateway column is a gateway (RTF_GATEWAY). Without it the
+// column says where the interface is: link#N, a MAC address, an interface name, or the address of a
+// loopback or point-to-point peer -- 127 prints 127.0.0.1 there.
+const macosGatewayFlag = "G"
+
 func macosBindRoutes(table string) []egressBindRoute {
 	rows := parseMacosRouteTable(table)
 	routes := make([]egressBindRoute, 0, len(rows))
 	for _, row := range rows {
-		routes = append(routes, egressBindRoute{
+		route := egressBindRoute{
 			Prefix:    row.Prefix,
 			Interface: row.Netif,
 			Usable:    !strings.Contains(row.Flags, macosScopedFlag),
-		})
+		}
+		if strings.Contains(row.Flags, macosGatewayFlag) {
+			if _, ok := parseEgressAddress(row.Gateway); ok {
+				route.Gateway = row.Gateway
+			}
+		}
+		routes = append(routes, route)
 	}
 	return routes
 }

@@ -32,33 +32,38 @@ import (
 // would follow the tunnel route.
 var errEgressNoPhysicalRoute = errors.New("no route outside the tunnel")
 
-// egressBindRoute is one route considered for the interface an egress socket is bound to.
+// egressBindRoute is one route read from the platform's table: considered for the interface an
+// egress socket is bound to, and for where a consumer's bypass route points.
 type egressBindRoute struct {
 	Prefix string
-	// Interface is the decimal interface index on Windows and the interface name on macOS.
+	// Interface is the decimal interface index on Windows and the interface name elsewhere. It is
+	// empty for a Linux route that leads nowhere: blackhole, unreachable, prohibit or throw.
 	Interface string
-	// Metric is the effective metric: on Windows the route's plus its interface's, on macOS zero.
+	// Gateway is the next hop, or empty for on-link.
+	Gateway string
+	// Metric is the effective metric: on Windows the route's plus its interface's, on Linux the
+	// route's own, on macOS zero.
 	Metric int64
 	// Usable is false for a route the system would not use for an unbound socket: one on a
-	// disconnected interface, a default route on an interface that disables default routes, or a
-	// macOS route scoped to its interface.
+	// disconnected interface, a default route on an interface that disables default routes, a
+	// macOS route scoped to its interface, or a dead Linux route.
 	Usable bool
 }
 
-// selectEgressBindInterface picks the interface for a socket to destination, leaving out the
-// tunnel's own routes.
+// selectEgressRoute picks the route a packet to destination would take with this feature's own
+// routes left out: the tunnel's, and any prefix in owned.
 //
 // Longest prefix, then the lowest metric, then the route listed first. The tunnel is compared by
 // exact equality -- utun30 is not utun3 -- and an empty tunnel leaves nothing out.
-func selectEgressBindInterface(routes []egressBindRoute, tunnel string, destination string) (string, bool) {
+func selectEgressRoute(routes []egressBindRoute, tunnel string, owned []string, destination string) (egressBindRoute, bool) {
 	address, err := netip.ParseAddr(destination)
 	if err != nil || !address.Is4() {
-		return "", false
+		return egressBindRoute{}, false
 	}
 	var best egressBindRoute
 	bestBits := -1
 	for _, route := range routes {
-		if !route.Usable || (tunnel != "" && route.Interface == tunnel) {
+		if !route.Usable || (tunnel != "" && route.Interface == tunnel) || egressPrefixOwned(owned, route.Prefix) {
 			continue
 		}
 		prefix, err := netip.ParsePrefix(route.Prefix)
@@ -70,7 +75,54 @@ func selectEgressBindInterface(routes []egressBindRoute, tunnel string, destinat
 			best, bestBits = route, bits
 		}
 	}
-	return best.Interface, bestBits >= 0
+	return best, bestBits >= 0
+}
+
+func egressPrefixOwned(owned []string, prefix string) bool {
+	for _, candidate := range owned {
+		if candidate == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// selectEgressBindInterface picks the interface for a socket to destination, leaving out the
+// tunnel's own routes.
+func selectEgressBindInterface(routes []egressBindRoute, tunnel string, destination string) (string, bool) {
+	chosen, ok := selectEgressRoute(routes, tunnel, nil, destination)
+	return chosen.Interface, ok
+}
+
+// selectEgressBypassHop picks where a bypass route for destination points.
+//
+// Not found both when nothing but the tunnel leads there and when the winning route leads nowhere:
+// pinning a bypass through some other route would reach an address the table deliberately does not.
+func selectEgressBypassHop(routes []egressBindRoute, tunnel string, owned []string, destination string) (egressBindRoute, bool) {
+	chosen, ok := selectEgressRoute(routes, tunnel, owned, destination)
+	if !ok || chosen.Interface == "" {
+		return egressBindRoute{}, false
+	}
+	return chosen, true
+}
+
+// egressBypassHopFromTable is where a bypass goes when the platform's own query answered with the
+// tunnel.
+//
+// The query is asked first everywhere because it knows things a reading of the table does not --
+// policy routing on Linux above all. But once a rule's route covers the address, the query can only
+// see that route, and that is exactly when a bypass is needed; so the table is read and the choice
+// made with the tunnel left out.
+func egressBypassHopFromTable(address string, tunnel string, read func() ([]egressBindRoute, error)) (egressBindRoute, error) {
+	routes, err := read()
+	if err != nil {
+		return egressBindRoute{}, fmt.Errorf("resolve bypass hop for %s past the tunnel: %w", address, err)
+	}
+	hop, ok := selectEgressBypassHop(routes, tunnel, nil, address)
+	if !ok {
+		return egressBindRoute{}, fmt.Errorf("resolve bypass hop for %s: %w", address, errEgressNoPhysicalRoute)
+	}
+	return hop, nil
 }
 
 // egressSocketBinder chooses and applies the interface for each outbound socket.

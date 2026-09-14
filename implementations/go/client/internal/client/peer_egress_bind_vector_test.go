@@ -2,7 +2,9 @@ package client
 
 import (
 	"encoding/hex"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +18,7 @@ import (
 type egressBindVectorRoute struct {
 	Prefix    string `json:"prefix"`
 	Interface string `json:"interface"`
+	Gateway   string `json:"gateway"`
 	Metric    int64  `json:"metric"`
 	Usable    bool   `json:"usable"`
 }
@@ -44,6 +47,7 @@ type egressBindVector struct {
 				Rows   []struct {
 					InterfaceIndex uint32 `json:"interfaceIndex"`
 					Prefix         string `json:"prefix"`
+					NextHop        string `json:"nextHop"`
 					Metric         uint32 `json:"metric"`
 				} `json:"rows"`
 			} `json:"expect"`
@@ -76,6 +80,34 @@ type egressBindVector struct {
 		} `json:"routes"`
 		Cases []egressBindVectorCase `json:"cases"`
 	} `json:"macos"`
+	Linux struct {
+		Tables   map[string]string `json:"tables"`
+		Captures map[string]struct {
+			Exit   int    `json:"exit"`
+			Stdout string `json:"stdout"`
+		} `json:"captures"`
+		Routes []struct {
+			Table  string                  `json:"table"`
+			Expect []egressBindVectorRoute `json:"expect"`
+		} `json:"routes"`
+	} `json:"linux"`
+	Hops struct {
+		Cases []struct {
+			Name        string                  `json:"name"`
+			Platform    string                  `json:"platform"`
+			Table       string                  `json:"table"`
+			Tunnel      string                  `json:"tunnel"`
+			Owned       []string                `json:"owned"`
+			Destination string                  `json:"destination"`
+			Routes      []egressBindVectorRoute `json:"routes"`
+			Expect      struct {
+				Hop *struct {
+					Interface string `json:"interface"`
+					Gateway   string `json:"gateway"`
+				} `json:"hop"`
+			} `json:"expect"`
+		} `json:"cases"`
+	} `json:"hops"`
 	SocketOptions struct {
 		Windows egressBindVectorOption `json:"windows"`
 		Macos   egressBindVectorOption `json:"macos"`
@@ -181,6 +213,96 @@ func TestEgressBindWindowsTableVectors(t *testing.T) {
 	}
 	for _, c := range vector.Windows.Cases {
 		checkEgressBindChoice(t, "windows "+c.Name, routes, c.Tunnel, c.Destination, c.Expect.Interface)
+	}
+}
+
+func TestEgressLinuxRouteTableVectors(t *testing.T) {
+	vector := loadEgressBindVector(t)
+	if len(vector.Linux.Routes) == 0 {
+		t.Fatal("no Linux tables")
+	}
+	for _, entry := range vector.Linux.Routes {
+		routes := parseIPRouteTable(vector.Linux.Tables[entry.Table])
+		if want := egressBindRoutesFromVector(entry.Expect); !reflect.DeepEqual(routes, want) {
+			t.Errorf("linux routes %s:\n got %+v\nwant %+v", entry.Table, routes, want)
+		}
+	}
+	// The captures that justify reading the table at all: `ip route get` answering with the tunnel.
+	for name, capture := range vector.Linux.Captures {
+		if !strings.HasPrefix(name, "get-covered") {
+			continue
+		}
+		hop, ok := parseIPRouteGet(capture.Stdout)
+		if !ok || !egressRouteHopIsDevice(hop, "specus0") {
+			t.Errorf("%s: parsed %+v (ok=%v), want the tunnel", name, hop, ok)
+		}
+	}
+}
+
+func TestEgressBypassHopVectors(t *testing.T) {
+	vector := loadEgressBindVector(t)
+	tables := map[string]map[string][]egressBindRoute{"linux": {}, "macos": {}, "windows": {}}
+	for name, text := range vector.Linux.Tables {
+		tables["linux"][name] = parseIPRouteTable(text)
+	}
+	for name, text := range vector.Macos.Tables {
+		tables["macos"][name] = macosBindRoutes(text)
+	}
+	var forward []windowsForwardRow
+	var interfaces []windowsInterfaceRow
+	for _, table := range vector.Windows.ForwardTables {
+		if table.Name == vector.Windows.Routes.Forward {
+			raw, _ := hex.DecodeString(table.Hex)
+			forward, _ = parseWindowsForwardTable(raw)
+		}
+	}
+	for _, table := range vector.Windows.InterfaceTables {
+		if table.Name == vector.Windows.Routes.Interfaces {
+			raw, _ := hex.DecodeString(table.Hex)
+			interfaces, _ = parseWindowsInterfaceTable(raw)
+		}
+	}
+	tables["windows"]["typical"] = windowsBindRoutes(forward, interfaces)
+
+	if len(vector.Hops.Cases) == 0 {
+		t.Fatal("no hop cases")
+	}
+	for _, c := range vector.Hops.Cases {
+		routes := tables[c.Platform][c.Table]
+		if c.Platform == "inline" {
+			routes = egressBindRoutesFromVector(c.Routes)
+		}
+		hop, ok := selectEgressBypassHop(routes, c.Tunnel, c.Owned, c.Destination)
+		switch {
+		case c.Expect.Hop == nil && ok:
+			t.Errorf("%s: chose %+v, want no hop", c.Name, hop)
+		case c.Expect.Hop != nil && !ok:
+			t.Errorf("%s: no hop, want %+v", c.Name, *c.Expect.Hop)
+		case c.Expect.Hop != nil && (hop.Interface != c.Expect.Hop.Interface || hop.Gateway != c.Expect.Hop.Gateway):
+			t.Errorf("%s: chose %s via %q, want %s via %q", c.Name, hop.Interface, hop.Gateway,
+				c.Expect.Hop.Interface, c.Expect.Hop.Gateway)
+		}
+	}
+}
+
+// The fallback a commander takes when its query answers with the tunnel: the table with the tunnel
+// left out, and a refusal that names why when nothing else leads there.
+func TestEgressBypassHopFromTableLeavesTheTunnelOut(t *testing.T) {
+	vector := loadEgressBindVector(t)
+	routes := parseIPRouteTable(vector.Linux.Tables["show-rich"])
+	read := func() ([]egressBindRoute, error) { return routes, nil }
+
+	hop, err := egressBypassHopFromTable("203.0.113.9", "specus0", read)
+	if err != nil || hop.Interface != "eth0" || hop.Gateway != "192.168.64.1" {
+		t.Fatalf("hop = %+v, %v; want eth0 via 192.168.64.1", hop, err)
+	}
+	if _, err := egressBypassHopFromTable("192.0.2.9", "specus0", read); !errors.Is(err, errEgressNoPhysicalRoute) {
+		t.Errorf("blackholed address: err = %v, want the no-physical-route refusal", err)
+	}
+	failing := func() ([]egressBindRoute, error) { return nil, errors.New("ip: not found") }
+	if _, err := egressBypassHopFromTable("203.0.113.9", "specus0", failing); err == nil ||
+		!strings.Contains(err.Error(), "ip: not found") {
+		t.Errorf("unreadable table: err = %v, want the read error carried", err)
 	}
 }
 

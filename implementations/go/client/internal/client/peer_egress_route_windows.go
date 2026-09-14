@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -124,10 +125,19 @@ func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
 			return fmt.Errorf("no route to %s to bypass through", address)
 		}
 		if index, known := c.tunnelIndexIfKnown(); known && resolved.InterfaceIndex == index {
-			// Pinning it to the tunnel would send the transport through the thing it
-			// carries. Compared by index rather than by name, because the name is the one
-			// thing that cannot come back out of PowerShell intact.
-			return fmt.Errorf("bypass for %s already resolves to the tunnel", address)
+			// A rule's route covers the address, so the query can only see the tunnel. Compared
+			// by index rather than by name, because the name is the one thing that cannot come
+			// back out of PowerShell intact. The native table, read with the tunnel left out,
+			// says where it went before.
+			fallback, err := egressBypassHopFromTable(address, strconv.Itoa(index), readWindowsBindRoutes)
+			if err != nil {
+				return err
+			}
+			fallbackIndex, err := strconv.Atoi(fallback.Interface)
+			if err != nil {
+				return fmt.Errorf("resolve bypass hop for %s: interface %q is not an index", address, fallback.Interface)
+			}
+			resolved = windowsEgressRouteHop{Gateway: fallback.Gateway, InterfaceIndex: fallbackIndex}
 		}
 		c.hops[address] = resolved
 		hop = resolved

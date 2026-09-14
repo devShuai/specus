@@ -5,6 +5,7 @@ package client
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -187,6 +188,62 @@ func TestMacosCommanderInstallsABypassThroughTheRealNextHop(t *testing.T) {
 	} else if !strings.HasPrefix(existing, "203.0.113.5/32 ") {
 		t.Errorf("the bypass is described as %q", existing)
 	}
+}
+
+// A bypass for an address a rule has already routed into the tunnel goes out the real gateway.
+//
+// The order a running consumer meets: the rule's route is in the table and a peer turns up later at
+// an address it covers. lo0 stands in for the tunnel, as above. `route -n get` then answers lo0 --
+// asserted first, so the test cannot pass without reaching the fallback -- and the bypass has to
+// come from the table with lo0 left out.
+func TestMacosCommanderInstallsABypassUnderItsOwnTunnelRoute(t *testing.T) {
+	commander := requireMacosMutation(t)
+	const rulePrefix = "198.51.100.0/24"
+	const address = "198.51.100.9"
+	rule := egressRoute{CIDR: rulePrefix, Kind: egressRouteToTun, Origin: "rule:" + rulePrefix}
+	bypass := egressRoute{CIDR: address + "/32", Kind: egressRouteBypass, Origin: "bypass"}
+
+	defaultHop, ok := macosTestRouteGet(t, "default")
+	if !ok || defaultHop.Gateway == "" {
+		t.Fatalf("this machine has no default gateway to bypass through (%+v)", defaultHop)
+	}
+	for _, route := range []egressRoute{rule, bypass} {
+		if present, existing := commander.Conflict(route); present {
+			t.Fatalf("%s is already in this machine's table: %s", route.CIDR, existing)
+		}
+	}
+	defer func() {
+		for _, route := range []egressRoute{bypass, rule} {
+			if err := commander.Remove(route); err != nil {
+				t.Errorf("cleanup of %s: %v", route.CIDR, err)
+			}
+		}
+	}()
+
+	if err := commander.Install(rule); err != nil {
+		t.Fatalf("install the rule's route: %v", err)
+	}
+	if hop, ok := macosTestRouteGet(t, address); !ok || hop.Device != "lo0" {
+		t.Fatalf("precondition: route -n get %s answered %+v, want lo0", address, hop)
+	}
+
+	if err := commander.Install(bypass); err != nil {
+		t.Fatalf("install the bypass: %v", err)
+	}
+	hop, ok := macosTestRouteGet(t, address)
+	if !ok || hop.Device == "lo0" || hop.Gateway != defaultHop.Gateway {
+		t.Errorf("after the bypass route -n get %s answers %+v, want the default gateway %s",
+			address, hop, defaultHop.Gateway)
+	}
+}
+
+func macosTestRouteGet(t *testing.T, destination string) (egressRouteHop, bool) {
+	t.Helper()
+	var stdout, stderr strings.Builder
+	command := exec.Command("route", "-n", "get", destination)
+	command.Stdout, command.Stderr = &stdout, &stderr
+	_ = command.Run()
+	return parseMacosRouteGet(stdout.String(), stderr.String())
 }
 
 func requireMacosMutation(t *testing.T) egressRouteCommander {
