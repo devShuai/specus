@@ -108,7 +108,7 @@ final class PeerEgressMesh implements AutoCloseable {
     private volatile PeerEgressStatus.ApplyOutcome applied = PeerEgressStatus.ApplyOutcome.none();
 
     PeerEgressMesh(Host host) {
-        this(host, new PeerEgressSocketDialer(), null);
+        this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())), null);
     }
 
     PeerEgressMesh(Host host, PeerEgressRuntime.Dialer dialer,

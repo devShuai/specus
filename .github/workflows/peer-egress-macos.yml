@@ -11,15 +11,22 @@ name: Peer egress macOS routes
 # sudo, so the install, verify and withdraw cycle runs against the real routing table instead of
 # only against fixtures. It installs a prefix reserved for documentation, pointed at the loopback,
 # and withdraws it in the same test.
+#
+# The egress socket binding is here too. It needs no privileges -- IP_BOUND_IF is an ordinary socket
+# option -- but it does need a Mac, and the Windows half already runs in the CLI matrix.
 
 on:
   pull_request:
     paths:
       - '.github/workflows/peer-egress-macos.yml'
       - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
+      - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
       - 'tools/protocol/generate_peer_egress_macos_route_vectors.py'
+      - 'tools/protocol/generate_peer_egress_socket_binding_vectors.py'
       - 'tools/protocol/verify_peer_egress_vectors.py'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
+      - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/java/client/pom.xml'
       - 'implementations/java/client/src/main/java/com/theshuai/specusclient/peer/**'
       - 'implementations/java/client/src/test/java/com/theshuai/specusclient/peer/**'
       - 'implementations/csharp/client/src/Specus.Client/PeerMesh/**'
@@ -29,7 +36,10 @@ on:
     paths:
       - '.github/workflows/peer-egress-macos.yml'
       - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
+      - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
+      - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/java/client/pom.xml'
       - 'implementations/java/client/src/main/java/com/theshuai/specusclient/peer/**'
       - 'implementations/csharp/client/src/Specus.Client/PeerMesh/**'
   workflow_dispatch:
@@ -65,24 +75,40 @@ jobs:
       - name: Vectors
         run: |
           python tools/protocol/generate_peer_egress_macos_route_vectors.py
-          git diff --exit-code protocol/test-vectors/peer-egress-macos-routes-v1.json
+          python tools/protocol/generate_peer_egress_socket_binding_vectors.py
+          git diff --exit-code protocol/test-vectors/peer-egress-macos-routes-v1.json \
+            protocol/test-vectors/peer-egress-socket-binding-v1.json
           python tools/protocol/verify_peer_egress_vectors.py
 
+      # The socket binding tests are the ones that need this machine: IP_BOUND_IF against a real
+      # socket and the real table. Searched for by name afterwards, for the same reason the mutation
+      # step below is -- a -run pattern that stopped matching would leave the step green having
+      # proved nothing.
       - name: Go
         working-directory: implementations/go/client
-        run: go test ./internal/client -run 'TestMacos' -count=1 -v
+        run: |
+          set -o pipefail
+          go test ./internal/client -run 'TestMacos|TestEgressBind|TestEgressDial|TestEgressSocket' -count=1 -v \
+            | tee "$RUNNER_TEMP/go.log"
+          for name in TestEgressDialBindsTheSocketToTheInterfaceItChose \
+              TestEgressDialIsRefusedWhenOnlyTheTunnelLeadsThere TestEgressSocketIsHeldToTheBoundInterface; do
+            if ! grep -q "^--- PASS: $name" "$RUNNER_TEMP/go.log"; then
+              echo "$name did not run"
+              exit 1
+            fi
+          done
 
       - name: Java
         run: >
           mvn -B -ntp -pl implementations/java/client -am test
-          -Dtest='PeerEgressMacosRouteVectorTests,PeerEgressRouteCommandersTests'
+          -Dtest='PeerEgressMacosRouteVectorTests,PeerEgressRouteCommandersTests,PeerEgressSocketBindingVectorTests,PeerEgressSocketBinderTests'
           -Dsurefire.failIfNoSpecifiedTests=false
 
       - name: .NET
         run: >
           dotnet test implementations/csharp/client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj
           -c Release -v minimal
-          --filter "FullyQualifiedName~PeerEgressMacosRouteVectorTests|FullyQualifiedName~PeerEgressRouteCommandersTests"
+          --filter "FullyQualifiedName~PeerEgressMacosRouteVectorTests|FullyQualifiedName~PeerEgressRouteCommandersTests|FullyQualifiedName~PeerEgressSocketBind"
 
       # And the routing table itself. Compiled first and then run under sudo, rather than running
       # the whole suite elevated, so nothing else in this job leaves root-owned files behind in a

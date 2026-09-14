@@ -78,6 +78,11 @@ jobs:
           mvn -pl implementations/java/client -am package -q
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $jar = (Resolve-Path implementations/java/client/target/specus-client-exec.jar).Path
+          # The egress binds its sockets through a JDK-internal handle that java -jar only reaches
+          # when the manifest exports it; without the entry every egress dial on Windows and macOS
+          # is refused. The tests pass it on the command line, so only the jar can show it is lost.
+          python -c "import sys, zipfile; manifest = zipfile.ZipFile(sys.argv[1]).read('META-INF/MANIFEST.MF').decode(); sys.exit(0 if 'Add-Exports: java.base/sun.nio.ch' in manifest else 'the exec jar no longer exports sun.nio.ch')" $jar
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test-cli-ui.py --name java -- java -jar $jar
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test-cli-matrix.py --name java -- java -jar $jar

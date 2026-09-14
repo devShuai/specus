@@ -146,7 +146,7 @@ internal sealed class PeerEgressMesh(
                     // TryAdd rather than Add: a full queue drops, it never blocks the plane.
                     _queue.TryAdd((consumer, frame));
                 },
-                dialer ?? new PeerEgressSocketDialer(),
+                dialer ?? new PeerEgressSocketDialer(PeerEgressSocketBinder.ForPlatform(() => host.TunName)),
                 logger: logger);
             _runtime = built;
             EnsureLoops();

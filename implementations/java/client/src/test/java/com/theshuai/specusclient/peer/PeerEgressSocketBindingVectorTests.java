@@ -1,0 +1,160 @@
+package com.theshuai.specusclient.peer;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Replays {@code peer-egress-socket-binding-v1.json} against the Java choice of interface for an
+ * egress socket and the two platforms' table readings.
+ *
+ * <p>The expectations come from an independent reference in
+ * {@code tools/protocol/generate_peer_egress_socket_binding_vectors.py}, whose Windows tables are
+ * built from the SDK's structure layouts with ctypes and whose macOS tables are sampled captures.
+ */
+class PeerEgressSocketBindingVectorTests {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private static JsonNode vector() throws IOException {
+        Path directory = Path.of("").toAbsolutePath();
+        for (int depth = 0; depth < 8 && directory != null; depth++) {
+            Path candidate = directory.resolve("protocol").resolve("test-vectors")
+                    .resolve("peer-egress-socket-binding-v1.json");
+            if (Files.exists(candidate)) {
+                return MAPPER.readTree(Files.readString(candidate));
+            }
+            directory = directory.getParent();
+        }
+        throw new IOException("cannot locate peer-egress-socket-binding-v1.json");
+    }
+
+    private static List<PeerEgressSocketBinding.Route> routes(JsonNode array) {
+        List<PeerEgressSocketBinding.Route> routes = new ArrayList<>();
+        for (JsonNode route : array) {
+            routes.add(new PeerEgressSocketBinding.Route(route.path("prefix").asText(),
+                    route.path("interface").asText(), route.path("metric").asLong(),
+                    route.path("usable").asBoolean()));
+        }
+        return routes;
+    }
+
+    private static void assertChoice(String name, List<PeerEgressSocketBinding.Route> routes, JsonNode testCase) {
+        JsonNode expected = testCase.path("expect").path("interface");
+        String chosen = PeerEgressSocketBinding.select(routes, testCase.path("tunnel").asText(),
+                testCase.path("destination").asText());
+        if (expected.isNull()) {
+            assertNull(chosen, name + ": want the dial refused");
+        } else {
+            assertEquals(expected.asText(), chosen, name);
+        }
+    }
+
+    @Test
+    void selectionMatchesTheSharedVector() throws IOException {
+        JsonNode cases = vector().path("select").path("cases");
+        assertTrue(cases.size() > 0, "no selection cases");
+        for (JsonNode testCase : cases) {
+            assertChoice(testCase.path("name").asText(), routes(testCase.path("routes")), testCase);
+        }
+    }
+
+    @Test
+    void windowsTablesMatchTheSharedVector() throws IOException {
+        JsonNode windows = vector().path("windows");
+        Map<String, List<PeerEgressSocketBinding.WindowsForwardRow>> forwardByName = new HashMap<>();
+        for (JsonNode table : windows.path("forwardTables")) {
+            String name = table.path("name").asText();
+            var rows = PeerEgressSocketBinding.parseWindowsForwardTable(
+                    HexFormat.of().parseHex(table.path("hex").asText()));
+            assertEquals(table.path("expect").path("parsed").asBoolean(), rows != null, "forward " + name);
+            if (rows == null) {
+                continue;
+            }
+            List<PeerEgressSocketBinding.WindowsForwardRow> expected = new ArrayList<>();
+            for (JsonNode row : table.path("expect").path("rows")) {
+                expected.add(new PeerEgressSocketBinding.WindowsForwardRow(row.path("interfaceIndex").asLong(),
+                        row.path("prefix").asText(), row.path("metric").asLong()));
+            }
+            assertEquals(expected, rows, "forward " + name);
+            forwardByName.put(name, rows);
+        }
+        Map<String, List<PeerEgressSocketBinding.WindowsInterfaceRow>> interfacesByName = new HashMap<>();
+        for (JsonNode table : windows.path("interfaceTables")) {
+            String name = table.path("name").asText();
+            var rows = PeerEgressSocketBinding.parseWindowsInterfaceTable(
+                    HexFormat.of().parseHex(table.path("hex").asText()));
+            assertEquals(table.path("expect").path("parsed").asBoolean(), rows != null, "interfaces " + name);
+            if (rows == null) {
+                continue;
+            }
+            List<PeerEgressSocketBinding.WindowsInterfaceRow> expected = new ArrayList<>();
+            for (JsonNode row : table.path("expect").path("rows")) {
+                expected.add(new PeerEgressSocketBinding.WindowsInterfaceRow(row.path("interfaceIndex").asLong(),
+                        row.path("metric").asLong(), row.path("connected").asBoolean(),
+                        row.path("disableDefaultRoutes").asBoolean()));
+            }
+            assertEquals(expected, rows, "interfaces " + name);
+            interfacesByName.put(name, rows);
+        }
+
+        JsonNode joined = windows.path("routes");
+        var forward = forwardByName.get(joined.path("forward").asText());
+        var interfaces = interfacesByName.get(joined.path("interfaces").asText());
+        assertNotNull(forward);
+        assertNotNull(interfaces);
+        var routes = PeerEgressSocketBinding.windowsRoutes(forward, interfaces);
+        assertEquals(routes(joined.path("expect")), routes, "joined routes");
+        for (JsonNode testCase : windows.path("cases")) {
+            assertChoice("windows " + testCase.path("name").asText(), routes, testCase);
+        }
+    }
+
+    @Test
+    void macosTablesMatchTheSharedVector() throws IOException {
+        JsonNode macos = vector().path("macos");
+        Map<String, List<PeerEgressSocketBinding.Route>> byTable = new HashMap<>();
+        for (JsonNode entry : macos.path("routes")) {
+            String table = entry.path("table").asText();
+            var routes = PeerEgressSocketBinding.macosRoutes(macos.path("tables").path(table).asText());
+            assertEquals(routes(entry.path("expect")), routes, "macos routes " + table);
+            byTable.put(table, routes);
+        }
+        for (JsonNode testCase : macos.path("cases")) {
+            assertChoice("macos " + testCase.path("name").asText(),
+                    byTable.get(testCase.path("table").asText()), testCase);
+        }
+    }
+
+    @Test
+    void socketOptionsMatchTheSharedVector() throws IOException {
+        JsonNode options = vector().path("socketOptions");
+        assertEquals(PeerEgressSocketBinding.WINDOWS_IP_UNICAST_IF, options.path("windows").path("name").asInt());
+        assertEquals(PeerEgressSocketBinding.MACOS_IP_BOUND_IF, options.path("macos").path("name").asInt());
+        assertEquals(PeerEgressSocketBinding.IPPROTO_IP, options.path("windows").path("level").asInt());
+        assertEquals(PeerEgressSocketBinding.IPPROTO_IP, options.path("macos").path("level").asInt());
+        for (JsonNode testCase : options.path("windows").path("cases")) {
+            assertEquals(testCase.path("hex").asText(), HexFormat.of().formatHex(
+                    PeerEgressSocketBinding.windowsUnicastInterfaceOption(testCase.path("index").asLong())),
+                    "IP_UNICAST_IF " + testCase.path("index").asLong());
+        }
+        for (JsonNode testCase : options.path("macos").path("cases")) {
+            assertEquals(testCase.path("hex").asText(), HexFormat.of().formatHex(
+                    PeerEgressSocketBinding.macosBoundInterfaceOption(testCase.path("index").asLong())),
+                    "IP_BOUND_IF " + testCase.path("index").asLong());
+        }
+    }
+}
