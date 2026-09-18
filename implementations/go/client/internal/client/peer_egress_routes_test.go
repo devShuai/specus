@@ -15,12 +15,13 @@ import (
 // deterministically instead of waiting for a machine to be in the wrong state.
 
 type fakeRouteCommander struct {
-	table      map[string]egressRoute
-	foreign    map[string]string
-	installErr map[string]error
-	removeErr  map[string]error
-	installLog []string
-	removeLog  []string
+	table       map[string]egressRoute
+	foreign     map[string]string
+	installErr  map[string]error
+	removeErr   map[string]error
+	installLog  []string
+	removeLog   []string
+	conflictLog []string
 }
 
 func newFakeRouteCommander() *fakeRouteCommander {
@@ -33,6 +34,7 @@ func newFakeRouteCommander() *fakeRouteCommander {
 }
 
 func (c *fakeRouteCommander) Conflict(route egressRoute) (bool, string) {
+	c.conflictLog = append(c.conflictLog, route.CIDR)
 	existing, ok := c.foreign[route.CIDR]
 	return ok, existing
 }
@@ -114,6 +116,10 @@ func TestEgressRoutePlanNeverTakesTheDefaultRoute(t *testing.T) {
 }
 
 // The addresses that carry the tunnel have to be in place before anything is pointed into it.
+//
+// Of the three bypass entries, only 192.0.2.99 needs a route: it sits under the block rule, which
+// installs one. 198.51.100.7 is under the direct rule, which installs nothing, so the platform's own
+// routing carries it already; the third cannot be read.
 func TestEgressRoutePlanPutsBypassFirst(t *testing.T) {
 	routes, _ := planEgressRoutes(egressTestRules(),
 		[]string{"198.51.100.7", "192.0.2.99", "not-an-address"}, egressDefaultMeshCIDR)
@@ -128,15 +134,27 @@ func TestEgressRoutePlanPutsBypassFirst(t *testing.T) {
 				t.Error("a bypass route was ordered after a tunnel route")
 			}
 			bypassSeen++
-			if route.CIDR != "198.51.100.7/32" && route.CIDR != "192.0.2.99/32" {
+			if route.CIDR != "192.0.2.99/32" {
 				t.Errorf("unexpected bypass route %s", route.CIDR)
 			}
 		} else {
 			tunSeen++
 		}
 	}
-	if bypassSeen != 2 {
-		t.Errorf("planned %d bypass routes, want 2 with the unparseable one skipped", bypassSeen)
+	if bypassSeen != 1 {
+		t.Errorf("planned %d bypass routes, want 1: the uncovered and the unparseable are skipped", bypassSeen)
+	}
+}
+
+// A bypass address no rule's route covers gets none of its own. The platform already routes it, and
+// a /32 of ours would be one more thing to keep true as peers come and go.
+func TestEgressRoutePlanLeavesAnUncoveredBypassToThePlatform(t *testing.T) {
+	routes, _ := planEgressRoutes([]egressRule{
+		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2},
+	}, []string{"198.51.100.7"}, egressDefaultMeshCIDR)
+
+	if len(routes) != 1 || routes[0].Kind != egressRouteToTun {
+		t.Fatalf("planned %+v, want only the rule's own route", routes)
 	}
 }
 
@@ -168,7 +186,7 @@ func TestEgressRouteInstallerAppliesAndWithdraws(t *testing.T) {
 	commander := newFakeRouteCommander()
 	installer := newEgressRouteInstaller(commander, journalPath(t))
 
-	routes, _ := planEgressRoutes(egressTestRules(), []string{"198.51.100.7"}, egressDefaultMeshCIDR)
+	routes, _ := planEgressRoutes(egressTestRules(), []string{"192.0.2.99"}, egressDefaultMeshCIDR)
 	result := installer.apply(routes)
 	if result.Err != nil || result.RolledBack {
 		t.Fatalf("apply failed: %v rolledBack=%v", result.Err, result.RolledBack)
@@ -177,10 +195,15 @@ func TestEgressRouteInstallerAppliesAndWithdraws(t *testing.T) {
 		t.Fatalf("added %d, table has %d", len(result.Added), len(commander.table))
 	}
 
-	// Applying the same plan again is a no-op rather than a reinstall.
+	// Applying the same plan again is a no-op rather than a reinstall, and it does not go back
+	// to the table to ask: this runs on a periodic tick, and an unchanged plan is the common case.
+	queries := len(commander.conflictLog)
 	repeat := installer.apply(routes)
 	if len(repeat.Added) != 0 || len(repeat.Removed) != 0 {
 		t.Errorf("a repeated apply changed %d/%d routes", len(repeat.Added), len(repeat.Removed))
+	}
+	if len(commander.conflictLog) != queries {
+		t.Errorf("a repeated apply queried the table %d more times", len(commander.conflictLog)-queries)
 	}
 
 	withdrawn := installer.withdrawAll()
@@ -196,7 +219,7 @@ func TestEgressRouteInstallerRollsBackAPartialInstall(t *testing.T) {
 	commander.installErr["192.0.2.0/24"] = errors.New("permission denied")
 	installer := newEgressRouteInstaller(commander, journalPath(t))
 
-	routes, _ := planEgressRoutes(egressTestRules(), []string{"198.51.100.7"}, egressDefaultMeshCIDR)
+	routes, _ := planEgressRoutes(egressTestRules(), []string{"192.0.2.99"}, egressDefaultMeshCIDR)
 	result := installer.apply(routes)
 
 	if !result.RolledBack || result.Err == nil {
@@ -273,7 +296,7 @@ func TestEgressRouteInstallerWithdrawsAJournalFromAPreviousRun(t *testing.T) {
 	commander := newFakeRouteCommander()
 
 	previous := newEgressRouteInstaller(commander, path)
-	routes, _ := planEgressRoutes(egressTestRules(), []string{"198.51.100.7"}, egressDefaultMeshCIDR)
+	routes, _ := planEgressRoutes(egressTestRules(), []string{"192.0.2.99"}, egressDefaultMeshCIDR)
 	if result := previous.apply(routes); result.Err != nil {
 		t.Fatalf("apply failed: %v", result.Err)
 	}

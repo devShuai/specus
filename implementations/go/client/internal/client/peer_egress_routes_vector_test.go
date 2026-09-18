@@ -3,6 +3,7 @@ package client
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // Binds the route planner to protocol/test-vectors/peer-egress-routes-v1.json.
@@ -41,6 +42,21 @@ type egressRoutesVector struct {
 			Add    []egressRouteVectorEntry `json:"add"`
 		} `json:"expect"`
 	} `json:"diffCases"`
+	Reconcile struct {
+		RetryAfterMs int64 `json:"retryAfterMs"`
+		Cases        []struct {
+			Name string `json:"name"`
+			// A pointer, because null (never applied) and an empty list (applied nothing) are
+			// different inputs.
+			Previous  *[]egressRouteVectorEntry `json:"previous"`
+			Desired   []egressRouteVectorEntry  `json:"desired"`
+			Troubled  bool                      `json:"troubled"`
+			ElapsedMs int64                     `json:"elapsedMs"`
+			Expect    struct {
+				Apply bool `json:"apply"`
+			} `json:"expect"`
+		} `json:"cases"`
+	} `json:"reconcile"`
 	Journal struct {
 		Text    string                   `json:"text"`
 		Routes  []egressRouteVectorEntry `json:"routes"`
@@ -161,6 +177,39 @@ func TestEgressRouteDiffMatchesSharedVector(t *testing.T) {
 		remove, add := diffEgressRoutes(current, desired)
 		compareEgressRoutes(t, testCase.Name+"/remove", remove, testCase.Expect.Remove)
 		compareEgressRoutes(t, testCase.Name+"/add", add, testCase.Expect.Add)
+	}
+}
+
+// Whether a plan recomputed on the tick is applied. Three runtimes that disagreed here would
+// rewrite their journals and retry their conflicts on different schedules for the same inputs.
+func TestEgressRouteReconcileMatchesSharedVector(t *testing.T) {
+	var vector egressRoutesVector
+	readEgressVector(t, "peer-egress-routes-v1.json", &vector)
+	if len(vector.Reconcile.Cases) == 0 {
+		t.Fatal("routes vector carried no reconcile cases")
+	}
+	if time.Duration(vector.Reconcile.RetryAfterMs)*time.Millisecond != egressRouteRetryInterval {
+		t.Fatalf("retry interval is %v, vector says %d ms", egressRouteRetryInterval, vector.Reconcile.RetryAfterMs)
+	}
+
+	start := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	for _, testCase := range vector.Reconcile.Cases {
+		var last *egressRoutePlanAttempt
+		if testCase.Previous != nil {
+			previous := make([]egressRoute, 0, len(*testCase.Previous))
+			for _, entry := range *testCase.Previous {
+				previous = append(previous, entry.route(t))
+			}
+			last = &egressRoutePlanAttempt{At: start, Desired: previous, Troubled: testCase.Troubled}
+		}
+		desired := make([]egressRoute, 0, len(testCase.Desired))
+		for _, entry := range testCase.Desired {
+			desired = append(desired, entry.route(t))
+		}
+		now := start.Add(time.Duration(testCase.ElapsedMs) * time.Millisecond)
+		if got := egressRouteReconcileDue(last, desired, now); got != testCase.Expect.Apply {
+			t.Errorf("%s: apply = %v, want %v", testCase.Name, got, testCase.Expect.Apply)
+		}
 	}
 }
 
