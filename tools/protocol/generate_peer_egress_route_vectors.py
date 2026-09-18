@@ -69,13 +69,33 @@ def plan(rules, bypass, mesh_cidr=MESH_CIDR):
             refused.append({"index": index, "match": rule.get("match", ""), "code": code})
     skip = {entry["index"] for entry in refused}
 
+    # The prefixes the rules want captured come first, because they decide which bypass
+    # addresses need a route at all. A direct rule installs nothing: traffic stays local by having
+    # no route, the same mechanism that makes unmatched traffic local. A block rule does install
+    # one, because the packet has to be captured before the data plane can drop it.
+    captured = []
+    for index, rule in enumerate(rules):
+        if index in skip or rule.get("action") not in ("egress", "block"):
+            continue
+        network = ipaddress.IPv4Network((rule.get("match") or "").strip())
+        if str(network) in {str(existing) for existing, _ in captured}:
+            # Two rules over one prefix need one route; the engine decides between them per
+            # packet, and installing the prefix twice would make removal ambiguous.
+            continue
+        captured.append((network, rule["match"]))
+
     seen = set()
     routes = []
-    # Bypass first, so a rule naming the same prefix cannot displace one of these.
+    # A bypass address gets a /32 only when one of those prefixes covers it. Uncovered, the
+    # platform's own routing already carries it and a route of ours would be one more thing to
+    # keep true as peers come and go. Covered, the /32 is what keeps the tunnel's transport out
+    # of the tunnel, and it is added first so a rule naming the same prefix cannot displace it.
     for endpoint in bypass:
         try:
             address = ipaddress.IPv4Address((endpoint or "").strip())
         except ValueError:
+            continue
+        if not any(address in network for network, _ in captured):
             continue
         cidr = str(address) + "/32"
         if cidr in seen:
@@ -83,22 +103,12 @@ def plan(rules, bypass, mesh_cidr=MESH_CIDR):
         seen.add(cidr)
         routes.append({"cidr": cidr, "kind": "bypass", "origin": "bypass"})
 
-    for index, rule in enumerate(rules):
-        if index in skip:
-            continue
-        # A direct rule installs nothing: traffic stays local by having no route, the same
-        # mechanism that makes unmatched traffic local. A block rule does install one, because
-        # the packet has to be captured before the data plane can drop it.
-        if rule.get("action") not in ("egress", "block"):
-            continue
-        network = ipaddress.IPv4Network((rule.get("match") or "").strip())
+    for network, match in captured:
         cidr = str(network)
         if cidr in seen:
-            # Two rules over one prefix need one route; the engine decides between them per
-            # packet, and installing the prefix twice would make removal ambiguous.
             continue
         seen.add(cidr)
-        routes.append({"cidr": cidr, "kind": "tun", "origin": "rule:" + rule["match"]})
+        routes.append({"cidr": cidr, "kind": "tun", "origin": "rule:" + match})
 
     routes.sort(key=sort_key)
     return routes, refused
@@ -147,15 +157,43 @@ PLAN_CASES = [
         "name": "bypass-comes-first",
         "description": "旁路条目排在最前：先让承载隧道的传输保持可达，再把任何流量指进隧道",
         "rules": [
-            {"match": "10.0.0.0/8", "action": "egress", "egressClientId": 2},
+            {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+            {"match": "198.51.100.0/24", "action": "block"},
         ],
         "bypass": ["203.0.113.7", "198.51.100.9"],
     },
     {
         "name": "bypass-inside-a-captured-prefix",
-        "description": "旁路地址落在某条规则的前缀内时仍要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
+        "description": "旁路地址落在某条规则的前缀内时要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
         "rules": [
             {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["203.0.113.7"],
+    },
+    {
+        "name": "uncovered-bypass-installs-nothing",
+        "description": "没有任何规则前缀覆盖的旁路地址不装路由：系统自己的路由本来就送得到它，"
+                       "多装一条 /32 只是多一条要随对端来去而维护的东西。旁路列表随会话变化，"
+                       "只为被覆盖的地址装路由，计划才不会每次对端换端点就变",
+        "rules": [
+            {"match": "10.0.0.0/8", "action": "egress", "egressClientId": 2},
+        ],
+        "bypass": ["203.0.113.7", "198.51.100.9"],
+    },
+    {
+        "name": "bypass-covered-only-by-a-refused-rule-installs-nothing",
+        "description": "被拒的规则不装路由，也就不需要为它覆盖的地址装旁路",
+        "rules": [
+            {"match": "example.com", "action": "egress", "egressClientId": 2},
+            {"match": "203.0.113.0/24", "action": "egress"},
+        ],
+        "bypass": ["203.0.113.7"],
+    },
+    {
+        "name": "bypass-covered-only-by-a-direct-rule-installs-nothing",
+        "description": "direct 规则不装路由，它覆盖的地址走的是系统自己的路由，同样不需要旁路",
+        "rules": [
+            {"match": "203.0.113.0/24", "action": "direct"},
         ],
         "bypass": ["203.0.113.7"],
     },
@@ -166,7 +204,7 @@ PLAN_CASES = [
             {"match": "192.0.2.0/24", "action": "egress", "egressClientId": 2},
             {"match": "192.0.2.0/24", "action": "block"},
         ],
-        "bypass": ["203.0.113.7", "203.0.113.7"],
+        "bypass": ["192.0.2.7", "192.0.2.7"],
     },
     {
         "name": "bypass-outranks-a-rule-for-the-same-address",
@@ -181,7 +219,7 @@ PLAN_CASES = [
         "description": "旁路来自运行期发现的对端与端点，不是用户配置。读不出的条目跳过即可，"
                        "整体拒绝会因为一个失联对端停掉全部分流",
         "rules": [
-            {"match": "10.0.0.0/8", "action": "egress", "egressClientId": 2},
+            {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
         ],
         "bypass": ["not-an-address", "203.0.113.7", "", "203.0.113.7:443"],
     },
@@ -277,6 +315,112 @@ for case in DIFF_CASES:
         "current": case["current"],
         "desired": case["desired"],
         "expect": {"remove": remove, "add": add},
+    })
+
+# When a plan computed on the periodic tick is applied and when it is left alone.
+#
+# The plan is recomputed every few seconds because its inputs move: peers come and go, the relay
+# changes, a hostname resolves differently. Applying every time would rewrite the journal and
+# purge the consumer's flows on every tick for nothing. So a plan is applied when it differs from
+# the one last applied, and otherwise only to retry an apply that left something undone -- a
+# conflict or a failure -- and then no more often than this.
+RETRY_AFTER_MS = 60_000
+
+
+def reconcile_due(previous, desired, troubled, elapsed_ms):
+    """Whether the tick should apply. previous is None when nothing was ever applied."""
+    if previous is None:
+        return True
+    same = ({(r["cidr"], r["kind"], r["origin"]) for r in previous}
+            == {(r["cidr"], r["kind"], r["origin"]) for r in desired})
+    if not same:
+        return True
+    return troubled and elapsed_ms >= RETRY_AFTER_MS
+
+
+RECONCILE_CASES = [
+    {
+        "name": "the-first-plan-is-applied",
+        "description": "从未应用过就应用，哪怕计划是空的：空计划也要走一遍安装器，"
+                       "上一次进程留下的记录才会被接管并撤销",
+        "previous": None, "desired": [], "troubled": False, "elapsedMs": 0,
+    },
+    {
+        "name": "an-unchanged-plan-is-left-alone",
+        "description": "计划没变就不动：每 5 秒重写一次记录、清一次活动流，等于自己打断自己的流",
+        "previous": [bypass_route("203.0.113.7/32"), tun("203.0.113.0/24")],
+        "desired": [bypass_route("203.0.113.7/32"), tun("203.0.113.0/24")],
+        "troubled": False, "elapsedMs": 5_000,
+    },
+    {
+        "name": "order-is-not-a-change",
+        "description": "同一组路由换个顺序不算变化；比较的是集合",
+        "previous": [tun("203.0.113.0/24"), bypass_route("203.0.113.7/32")],
+        "desired": [bypass_route("203.0.113.7/32"), tun("203.0.113.0/24")],
+        "troubled": False, "elapsedMs": 5_000,
+    },
+    {
+        "name": "a-new-route-is-applied-at-once",
+        "description": "对端换了端点、规则前缀覆盖了它，旁路要立刻装上，不等重试间隔",
+        "previous": [tun("203.0.113.0/24")],
+        "desired": [bypass_route("203.0.113.7/32"), tun("203.0.113.0/24")],
+        "troubled": False, "elapsedMs": 5_000,
+    },
+    {
+        "name": "a-dropped-route-is-applied-at-once",
+        "description": "对端走了，它的旁路要撤：留着是一条不再有理由存在的 /32",
+        "previous": [bypass_route("203.0.113.7/32"), tun("203.0.113.0/24")],
+        "desired": [tun("203.0.113.0/24")],
+        "troubled": False, "elapsedMs": 5_000,
+    },
+    {
+        "name": "a-changed-kind-is-a-change",
+        "description": "同一前缀从规则路由变成旁路也是变化，装的东西不一样",
+        "previous": [tun("203.0.113.7/32")],
+        "desired": [bypass_route("203.0.113.7/32")],
+        "troubled": False, "elapsedMs": 5_000,
+    },
+    {
+        "name": "a-changed-plan-does-not-wait-out-the-retry-interval",
+        "description": "上次有冲突、还没到重试时间，但计划变了：变化优先，立刻应用",
+        "previous": [tun("203.0.113.0/24")],
+        "desired": [tun("203.0.113.0/24"), tun("198.51.100.0/24")],
+        "troubled": True, "elapsedMs": 5_000,
+    },
+    {
+        "name": "a-conflict-is-retried-after-the-interval",
+        "description": "上次有前缀被别人占着，计划没变：到了间隔再试一次，别人的路由可能已经撤了",
+        "previous": [tun("203.0.113.0/24")],
+        "desired": [tun("203.0.113.0/24")],
+        "troubled": True, "elapsedMs": RETRY_AFTER_MS,
+    },
+    {
+        "name": "a-conflict-is-not-retried-inside-the-interval",
+        "description": "间隔没到就不试：每 5 秒对着同一条别人的路由再查一次，只是刷日志",
+        "previous": [tun("203.0.113.0/24")],
+        "desired": [tun("203.0.113.0/24")],
+        "troubled": True, "elapsedMs": RETRY_AFTER_MS - 1,
+    },
+    {
+        "name": "a-clean-apply-is-not-retried",
+        "description": "上次全部装上了、计划没变，间隔过了也不动",
+        "previous": [tun("203.0.113.0/24")],
+        "desired": [tun("203.0.113.0/24")],
+        "troubled": False, "elapsedMs": RETRY_AFTER_MS * 10,
+    },
+]
+
+reconcile_cases = []
+for case in RECONCILE_CASES:
+    reconcile_cases.append({
+        "name": case["name"],
+        "description": case["description"],
+        "previous": case["previous"],
+        "desired": case["desired"],
+        "troubled": case["troubled"],
+        "elapsedMs": case["elapsedMs"],
+        "expect": {"apply": reconcile_due(case["previous"], case["desired"],
+                                          case["troubled"], case["elapsedMs"])},
     })
 
 # The journal is the on-disk record of what the consumer installed, and it is a contract between
@@ -405,6 +549,11 @@ vector = {
         "不在本次移植的范围内，见 planCases 里的 default-route-is-refused-but-its-halves-are-ordinary-prefixes。",
         "旁路条目排在最前，安装也按此顺序：承载隧道的传输（控制连接、STUN 与 TURN、对端端点）先保持可达，"
         "再把流量指进隧道。",
+        "旁路地址只在被某条规则的路由前缀覆盖时才装 /32。没被覆盖的地址由系统自己的路由送达，"
+        "多装一条只是多一条要随对端来去而维护的东西；旁路列表每几秒重算一次，只为被覆盖的地址装路由，"
+        "计划才不会每次对端换端点就变。",
+        "reconcile 是周期重算之后「要不要应用」的判定：计划与上次应用的不同就应用；相同时只为重试"
+        "上次没做完的事（冲突或失败），且不早于 retryAfterMs。比较的是集合，顺序不算变化。",
         "action=direct 不安装路由。流量靠「没有路由」留在本地，与未匹配流量是同一个机制，"
         "而不是两处需要彼此保持一致的行为。action=block 要安装：包必须先被捕获，数据面才谈得上丢弃它。",
         "计划是纯函数：它只说应该存在哪些路由，执行与回滚由安装器负责。这样回滚、冲突拒绝与归属判定"
@@ -419,6 +568,12 @@ vector = {
     "meshCidr": MESH_CIDR,
     "planCases": plan_cases,
     "diffCases": diff_cases,
+    "reconcile": {
+        "description": "周期重算之后要不要应用。previous 为 null 表示从未应用过；troubled 表示上次应用"
+                       "留下了冲突或失败；elapsedMs 是距上次应用的时间。",
+        "retryAfterMs": RETRY_AFTER_MS,
+        "cases": reconcile_cases,
+    },
     "journal": journal,
     "routeCommands": route_commands,
 }
@@ -427,6 +582,7 @@ out = VECTORS / "peer-egress-routes-v1.json"
 out.write_text(json.dumps(vector, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print("wrote", out, out.stat().st_size, "bytes")
 print("plan cases:", len(plan_cases), "diff cases:", len(diff_cases),
+      "reconcile cases:", len(reconcile_cases),
       "journal rejects:", len(journal["rejects"]),
       "route-get:", len(ROUTE_GET), "show-exact:", len(SHOW_EXACT))
 for case in plan_cases:

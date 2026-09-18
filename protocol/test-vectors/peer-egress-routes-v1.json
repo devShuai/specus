@@ -5,6 +5,8 @@
     "只安装精确前缀，计划器不会自己造出 0.0.0.0/0 或它的两个 /1 半区。接管一切的工具没法被运行它的人推理，「未匹配即本地」也会在那一刻不再成立。",
     "已知缺口：校验只拒绝 /0。运维手写 0.0.0.0/1 与 128.0.0.0/1 两条规则仍然可以覆盖全部地址，其中下半区目前只是因为覆盖 mesh 网段才被拒。设一个最小前缀长度属于策略决定，不在本次移植的范围内，见 planCases 里的 default-route-is-refused-but-its-halves-are-ordinary-prefixes。",
     "旁路条目排在最前，安装也按此顺序：承载隧道的传输（控制连接、STUN 与 TURN、对端端点）先保持可达，再把流量指进隧道。",
+    "旁路地址只在被某条规则的路由前缀覆盖时才装 /32。没被覆盖的地址由系统自己的路由送达，多装一条只是多一条要随对端来去而维护的东西；旁路列表每几秒重算一次，只为被覆盖的地址装路由，计划才不会每次对端换端点就变。",
+    "reconcile 是周期重算之后「要不要应用」的判定：计划与上次应用的不同就应用；相同时只为重试上次没做完的事（冲突或失败），且不早于 retryAfterMs。比较的是集合，顺序不算变化。",
     "action=direct 不安装路由。流量靠「没有路由」留在本地，与未匹配流量是同一个机制，而不是两处需要彼此保持一致的行为。action=block 要安装：包必须先被捕获，数据面才谈得上丢弃它。",
     "计划是纯函数：它只说应该存在哪些路由，执行与回滚由安装器负责。这样回滚、冲突拒绝与归属判定都能脱离真实路由表被测试。",
     "origin 是运维会读到的字符串，因此也被固定：旁路为 bypass，规则为 rule: 加上规则里原样的 match。",
@@ -97,9 +99,13 @@
       "description": "旁路条目排在最前：先让承载隧道的传输保持可达，再把任何流量指进隧道",
       "rules": [
         {
-          "match": "10.0.0.0/8",
+          "match": "203.0.113.0/24",
           "action": "egress",
           "egressClientId": 2
+        },
+        {
+          "match": "198.51.100.0/24",
+          "action": "block"
         }
       ],
       "bypass": [
@@ -119,9 +125,14 @@
             "origin": "bypass"
           },
           {
-            "cidr": "10.0.0.0/8",
+            "cidr": "198.51.100.0/24",
             "kind": "tun",
-            "origin": "rule:10.0.0.0/8"
+            "origin": "rule:198.51.100.0/24"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
           }
         ],
         "refused": []
@@ -129,7 +140,7 @@
     },
     {
       "name": "bypass-inside-a-captured-prefix",
-      "description": "旁路地址落在某条规则的前缀内时仍要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
+      "description": "旁路地址落在某条规则的前缀内时要单独装 /32，否则控制连接会被卷进它自己承载的隧道",
       "rules": [
         {
           "match": "203.0.113.0/24",
@@ -157,6 +168,81 @@
       }
     },
     {
+      "name": "uncovered-bypass-installs-nothing",
+      "description": "没有任何规则前缀覆盖的旁路地址不装路由：系统自己的路由本来就送得到它，多装一条 /32 只是多一条要随对端来去而维护的东西。旁路列表随会话变化，只为被覆盖的地址装路由，计划才不会每次对端换端点就变",
+      "rules": [
+        {
+          "match": "10.0.0.0/8",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "bypass": [
+        "203.0.113.7",
+        "198.51.100.9"
+      ],
+      "expect": {
+        "routes": [
+          {
+            "cidr": "10.0.0.0/8",
+            "kind": "tun",
+            "origin": "rule:10.0.0.0/8"
+          }
+        ],
+        "refused": []
+      }
+    },
+    {
+      "name": "bypass-covered-only-by-a-refused-rule-installs-nothing",
+      "description": "被拒的规则不装路由，也就不需要为它覆盖的地址装旁路",
+      "rules": [
+        {
+          "match": "example.com",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "203.0.113.0/24",
+          "action": "egress"
+        }
+      ],
+      "bypass": [
+        "203.0.113.7"
+      ],
+      "expect": {
+        "routes": [],
+        "refused": [
+          {
+            "index": 0,
+            "match": "example.com",
+            "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+          },
+          {
+            "index": 1,
+            "match": "203.0.113.0/24",
+            "code": "EGRESS_RULE_MISSING_TARGET"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bypass-covered-only-by-a-direct-rule-installs-nothing",
+      "description": "direct 规则不装路由，它覆盖的地址走的是系统自己的路由，同样不需要旁路",
+      "rules": [
+        {
+          "match": "203.0.113.0/24",
+          "action": "direct"
+        }
+      ],
+      "bypass": [
+        "203.0.113.7"
+      ],
+      "expect": {
+        "routes": [],
+        "refused": []
+      }
+    },
+    {
       "name": "duplicate-prefixes-yield-one-route",
       "description": "同一前缀的两条规则只需要一条路由；装两次会让撤销失去定论。旁路重复同理",
       "rules": [
@@ -171,13 +257,13 @@
         }
       ],
       "bypass": [
-        "203.0.113.7",
-        "203.0.113.7"
+        "192.0.2.7",
+        "192.0.2.7"
       ],
       "expect": {
         "routes": [
           {
-            "cidr": "203.0.113.7/32",
+            "cidr": "192.0.2.7/32",
             "kind": "bypass",
             "origin": "bypass"
           },
@@ -219,7 +305,7 @@
       "description": "旁路来自运行期发现的对端与端点，不是用户配置。读不出的条目跳过即可，整体拒绝会因为一个失联对端停掉全部分流",
       "rules": [
         {
-          "match": "10.0.0.0/8",
+          "match": "203.0.113.0/24",
           "action": "egress",
           "egressClientId": 2
         }
@@ -238,9 +324,9 @@
             "origin": "bypass"
           },
           {
-            "cidr": "10.0.0.0/8",
+            "cidr": "203.0.113.0/24",
             "kind": "tun",
-            "origin": "rule:10.0.0.0/8"
+            "origin": "rule:203.0.113.0/24"
           }
         ],
         "refused": []
@@ -527,6 +613,265 @@
       }
     }
   ],
+  "reconcile": {
+    "description": "周期重算之后要不要应用。previous 为 null 表示从未应用过；troubled 表示上次应用留下了冲突或失败；elapsedMs 是距上次应用的时间。",
+    "retryAfterMs": 60000,
+    "cases": [
+      {
+        "name": "the-first-plan-is-applied",
+        "description": "从未应用过就应用，哪怕计划是空的：空计划也要走一遍安装器，上一次进程留下的记录才会被接管并撤销",
+        "previous": null,
+        "desired": [],
+        "troubled": false,
+        "elapsedMs": 0,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "an-unchanged-plan-is-left-alone",
+        "description": "计划没变就不动：每 5 秒重写一次记录、清一次活动流，等于自己打断自己的流",
+        "previous": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": false
+        }
+      },
+      {
+        "name": "order-is-not-a-change",
+        "description": "同一组路由换个顺序不算变化；比较的是集合",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          },
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": false
+        }
+      },
+      {
+        "name": "a-new-route-is-applied-at-once",
+        "description": "对端换了端点、规则前缀覆盖了它，旁路要立刻装上，不等重试间隔",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "a-dropped-route-is-applied-at-once",
+        "description": "对端走了，它的旁路要撤：留着是一条不再有理由存在的 /32",
+        "previous": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "a-changed-kind-is-a-change",
+        "description": "同一前缀从规则路由变成旁路也是变化，装的东西不一样",
+        "previous": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "tun",
+            "origin": "rule:203.0.113.7/32"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass",
+            "origin": "bypass"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "a-changed-plan-does-not-wait-out-the-retry-interval",
+        "description": "上次有冲突、还没到重试时间，但计划变了：变化优先，立刻应用",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          },
+          {
+            "cidr": "198.51.100.0/24",
+            "kind": "tun",
+            "origin": "rule:198.51.100.0/24"
+          }
+        ],
+        "troubled": true,
+        "elapsedMs": 5000,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "a-conflict-is-retried-after-the-interval",
+        "description": "上次有前缀被别人占着，计划没变：到了间隔再试一次，别人的路由可能已经撤了",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": true,
+        "elapsedMs": 60000,
+        "expect": {
+          "apply": true
+        }
+      },
+      {
+        "name": "a-conflict-is-not-retried-inside-the-interval",
+        "description": "间隔没到就不试：每 5 秒对着同一条别人的路由再查一次，只是刷日志",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": true,
+        "elapsedMs": 59999,
+        "expect": {
+          "apply": false
+        }
+      },
+      {
+        "name": "a-clean-apply-is-not-retried",
+        "description": "上次全部装上了、计划没变，间隔过了也不动",
+        "previous": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "desired": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun",
+            "origin": "rule:203.0.113.0/24"
+          }
+        ],
+        "troubled": false,
+        "elapsedMs": 600000,
+        "expect": {
+          "apply": false
+        }
+      }
+    ]
+  },
   "journal": {
     "version": 1,
     "description": "消费端安装记录的磁盘格式。三个实现必须能互相读懂：同一台机器上换实现之后，上一次装下的路由要被接管并撤销，而不是因为读不懂文件被留在表里。钉住的是「读得出、写回去还能读成同一份」，不是三端输出的字节完全一致——为没有任何读取方在意的空白差异而失败没有意义。",
