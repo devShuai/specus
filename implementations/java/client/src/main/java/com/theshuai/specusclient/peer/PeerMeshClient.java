@@ -25,6 +25,7 @@ import java.net.Inet6Address;
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.SocketAddress;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -51,6 +52,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 @Slf4j
 public class PeerMeshClient implements AutoCloseable {
@@ -59,6 +61,10 @@ public class PeerMeshClient implements AutoCloseable {
     private final PeerEgressMesh egress = new PeerEgressMesh(new EgressHost());
     /** This deployment's control endpoint, for the egress forced-deny list. */
     private volatile String controlEndpoint = "";
+    /** This node's own consumer rules, from local configuration; empty when it is not a consumer. */
+    private volatile List<PeerEgressRule> egressRules = List.of();
+    /** The control connection's live remote address, for the bypass that keeps it out of the tunnel. */
+    private volatile Supplier<SocketAddress> controlRemote;
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessionsById = new ConcurrentHashMap<>();
     private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
@@ -261,6 +267,8 @@ public class PeerMeshClient implements AutoCloseable {
             log.debug("Peer mesh 配置未变化，已执行轻量刷新: client={}, virtualIp={}",
                     nextConfig.getClientName(), nextConfig.getVirtualIp());
             serviceRuntime.applyConfig(nextConfig);
+            // The control connection is new, so the address its bypass pins may be too.
+            scheduleEgressReconcile();
             return;
         }
         if (!sameRuntimeConfig) {
@@ -284,6 +292,9 @@ public class PeerMeshClient implements AutoCloseable {
         requestPeerServerCandidates();
         PeerVirtualDevice activeDevice = startVirtualDevice(nextConfig);
         syncVirtualDeviceRoutes();
+        // After the device, because the routes point into it. Kept true from here on by the
+        // maintenance tick.
+        scheduleEgressReconcile();
         log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}, publicStun={}",
                 nextConfig.getClientName(),
                 nextConfig.getVirtualIp(),
@@ -454,10 +465,12 @@ public class PeerMeshClient implements AutoCloseable {
     @Override
     public void close() {
         serviceRuntime.close();
-        // Routes first, so traffic stops being captured before the plane stops answering for it.
+        // Stopped before the routes go, so a reconcile racing with this finds no device to route
+        // into and cannot put them back. Then routes first, so traffic stops being captured
+        // before the plane stops answering for it.
+        running = false;
         egress.withdrawRoutes();
         egress.close();
-        running = false;
         runtimeConfigKey = "";
         peerIndex = PeerIndex.empty();
         sessions.clear();
@@ -1662,6 +1675,9 @@ public class PeerMeshClient implements AutoCloseable {
                 if (running) {
                     keepaliveDirectPaths();
                     fallbackStaleDirectPaths();
+                    // Peers and the relay move between ticks; the routes that keep their
+                    // addresses out of the tunnel follow them here.
+                    egress.reconcileRoutes();
                 }
             } catch (Exception e) {
                 log.debug("Peer mesh keepalive failed: {}", e.getMessage());
@@ -2034,6 +2050,10 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private synchronized void closeVirtualDevice() {
+        // The device's routes go with it: on every platform a route through an interface that
+        // closes is dropped by the kernel. Withdrawn now, while the interface is still there to
+        // withdraw from; a device that replaces this one gets them back on its first reconcile.
+        egress.withdrawRoutes();
         PeerVirtualDevice current = virtualDevice;
         virtualDevice = null;
         virtualDeviceKey = "";
@@ -4143,11 +4163,34 @@ public class PeerMeshClient implements AutoCloseable {
      * than from the mesh config the server pushes, and because the rules can change without the
      * mesh being rebuilt.
      */
-    public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules) {
+    public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules,
+            Supplier<SocketAddress> controlRemote) {
         controlEndpoint = StringUtils.hasText(controlHost)
                 ? controlHost.trim() + (controlPort > 0 ? ":" + controlPort : "")
                 : "";
-        egress.applyRules(rules == null ? List.of() : rules);
+        egressRules = rules == null ? List.of() : List.copyOf(rules);
+        this.controlRemote = controlRemote;
+        // Not applied here. The routes point into the virtual device, which does not exist until
+        // the mesh starts; the plane applies them once it is up and keeps them true on the
+        // maintenance tick from then on.
+    }
+
+    /**
+     * Has the plane recompute its routes off this thread. Off it because a reconcile resolves
+     * hostnames and runs route commands, and {@link #startOrUpdate} holds this client's monitor.
+     */
+    private void scheduleEgressReconcile() {
+        ScheduledExecutorService executor = maintenanceExecutor;
+        if (executor == null || executor.isShutdown()) {
+            return;
+        }
+        executor.execute(() -> {
+            try {
+                egress.reconcileRoutes();
+            } catch (Exception e) {
+                log.debug("Peer egress route reconcile failed: {}", e.getMessage());
+            }
+        });
     }
 
     /** What the egress plane needs from this client. Every method is called with no lock held. */
@@ -4210,6 +4253,49 @@ public class PeerMeshClient implements AutoCloseable {
                 }
             }
             return addresses;
+        }
+
+        @Override
+        public List<PeerEgressRule> consumerRules() {
+            return egressRules;
+        }
+
+        @Override
+        public boolean deviceReady() {
+            PeerVirtualDevice device = virtualDevice;
+            return running && device != null && !(device instanceof NoopPeerVirtualDevice);
+        }
+
+        @Override
+        public String deviceStatus() {
+            PeerVirtualDevice device = virtualDevice;
+            return device == null ? "absent" : PeerMeshClient.this.deviceStatus(device);
+        }
+
+        @Override
+        public List<String> bypassHosts() {
+            List<String> hosts = new ArrayList<>();
+            // The control connection by its live address first, then by the name it was
+            // configured with: the two differ when the name resolves to more than one address.
+            Supplier<SocketAddress> remote = controlRemote;
+            SocketAddress live = remote == null ? null : remote.get();
+            if (live instanceof InetSocketAddress inet && inet.getAddress() != null) {
+                hosts.add(inet.getAddress().getHostAddress());
+            }
+            hosts.add(controlEndpoint);
+            ClientAuthLoginResponse.PeerMeshConfig current = config;
+            if (current != null) {
+                hosts.add(current.getStunHost());
+                hosts.add(current.getTurnHost());
+                if (current.getPublicStunServers() != null) {
+                    hosts.addAll(current.getPublicStunServers());
+                }
+            }
+            PeerCandidate relay = relayCandidate;
+            if (relay != null) {
+                hosts.add(relay.getAddress());
+            }
+            return hosts;
         }
 
         @Override

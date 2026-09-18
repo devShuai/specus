@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Turning consumer rules into routes.
@@ -99,34 +100,23 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 		skip[entry.Index] = struct{}{}
 	}
 
-	seen := make(map[string]struct{})
-	routes := make([]egressRoute, 0, len(rules)+len(bypass))
-
-	// Bypass first: these are the addresses that must not be captured under any rule, and adding
-	// them first means a rule naming the same prefix cannot displace one.
-	for _, endpoint := range bypass {
-		address, ok := parseEgressAddress(strings.TrimSpace(endpoint))
-		if !ok {
-			continue
-		}
-		cidr := formatEgressAddress(address) + "/32"
-		if _, duplicate := seen[cidr]; duplicate {
-			continue
-		}
-		seen[cidr] = struct{}{}
-		routes = append(routes, egressRoute{CIDR: cidr, Kind: egressRouteBypass, Origin: "bypass"})
+	// The prefixes the rules want captured come first, because they decide which bypass
+	// addresses need a route at all.
+	//
+	// A direct rule installs nothing. Traffic stays local by not having a route, which is the
+	// same mechanism that makes unmatched traffic local, so there is one behaviour rather than
+	// two that have to agree. A block rule does install one: the packet has to be captured
+	// before it can be dropped, and the data plane is what drops it.
+	type captured struct {
+		cidr  egressCIDR
+		match string
 	}
-
+	seen := make(map[string]struct{})
+	capturing := make([]captured, 0, len(rules))
 	for index, rule := range rules {
 		if _, refusedRule := skip[index]; refusedRule {
 			continue
 		}
-		// A direct rule installs nothing. Traffic stays local by not having a route, which is
-		// the same mechanism that makes unmatched traffic local, so there is one behaviour
-		// rather than two that have to agree.
-		//
-		// A block rule does install one: the packet has to be captured before it can be
-		// dropped, and the data plane is what drops it.
 		if rule.Action != egressActionEgress && rule.Action != egressActionBlock {
 			continue
 		}
@@ -141,13 +131,103 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 			continue
 		}
 		seen[normalised] = struct{}{}
+		capturing = append(capturing, captured{cidr: cidr, match: rule.Match})
+	}
+
+	routes := make([]egressRoute, 0, len(capturing)+len(bypass))
+	seen = make(map[string]struct{})
+
+	// A bypass address gets a /32 only when one of those prefixes covers it. Uncovered, the
+	// platform's own routing already carries it, and a route of ours would be one more thing to
+	// keep true as peers come and go. Covered, the /32 is what keeps the tunnel's transport out
+	// of the tunnel, and it goes in first so a rule naming the same prefix cannot displace it.
+	for _, endpoint := range bypass {
+		address, ok := parseEgressAddress(strings.TrimSpace(endpoint))
+		if !ok {
+			continue
+		}
+		covered := false
+		for _, entry := range capturing {
+			if entry.cidr.contains(address) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			continue
+		}
+		cidr := formatEgressAddress(address) + "/32"
+		if _, duplicate := seen[cidr]; duplicate {
+			continue
+		}
+		seen[cidr] = struct{}{}
+		routes = append(routes, egressRoute{CIDR: cidr, Kind: egressRouteBypass, Origin: "bypass"})
+	}
+
+	for _, entry := range capturing {
+		normalised := formatEgressCIDR(entry.cidr)
+		if _, duplicate := seen[normalised]; duplicate {
+			continue
+		}
+		seen[normalised] = struct{}{}
 		routes = append(routes, egressRoute{
-			CIDR: normalised, Kind: egressRouteToTun, Origin: "rule:" + rule.Match,
+			CIDR: normalised, Kind: egressRouteToTun, Origin: "rule:" + entry.match,
 		})
 	}
 
 	sortEgressRoutes(routes)
 	return routes, refused
+}
+
+// egressRouteRetryInterval is how long an apply that left something undone -- a conflict or a
+// failure -- waits before the same plan is tried again. Long enough that an operator's route sitting
+// on one of our prefixes is not queried every tick, short enough that its removal is noticed.
+//
+// Shared vector: protocol/test-vectors/peer-egress-routes-v1.json, reconcile.retryAfterMs.
+const egressRouteRetryInterval = 60 * time.Second
+
+// egressRoutePlanAttempt is what the last apply was asked to install, and how it went.
+type egressRoutePlanAttempt struct {
+	At      time.Time
+	Desired []egressRoute
+	// Troubled says the apply left something undone: a prefix refused because somebody else
+	// owned it, or an install that failed and was rolled back.
+	Troubled bool
+}
+
+// egressRouteReconcileDue says whether a plan computed on the periodic tick should be applied.
+//
+// The plan is recomputed every few seconds because its inputs move: peers come and go, the relay
+// changes, a hostname resolves differently. Applying every time would rewrite the journal on every
+// tick for nothing. So a plan is applied when it differs from the one last applied, and otherwise
+// only to retry an apply that left something undone, and then no more often than the interval.
+//
+// Compared as sets: the planner sorts, but nothing here should depend on that.
+func egressRouteReconcileDue(last *egressRoutePlanAttempt, desired []egressRoute, now time.Time) bool {
+	if last == nil {
+		return true
+	}
+	if !sameEgressRouteSet(last.Desired, desired) {
+		return true
+	}
+	return last.Troubled && now.Sub(last.At) >= egressRouteRetryInterval
+}
+
+func sameEgressRouteSet(left, right []egressRoute) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[egressRoute]int, len(left))
+	for _, route := range left {
+		counts[route]++
+	}
+	for _, route := range right {
+		counts[route]--
+		if counts[route] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // formatEgressCIDR renders a prefix the one way this feature writes it, so a route installed in one

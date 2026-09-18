@@ -137,6 +137,11 @@ func (installer *egressRouteInstaller) save() error {
 func (installer *egressRouteInstaller) apply(desired []egressRoute) egressRouteApplyResult {
 	var result egressRouteApplyResult
 	remove, add := diffEgressRoutes(installer.installed, desired)
+	if len(remove) == 0 && len(add) == 0 {
+		// Nothing to do means nothing to write. This runs on a periodic tick, and rewriting an
+		// unchanged journal every few seconds is wear on the disk for a file that did not change.
+		return result
+	}
 
 	for _, route := range remove {
 		if err := installer.commander.Remove(route); err != nil {

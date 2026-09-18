@@ -327,6 +327,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
         EnsureLoginSucceeded(controlLogin, ConnectionRole.Control);
         _observer?.OnControlAuthenticated();
         _activeWriter = controlWriter;
+        _peerMesh.ControlRemoteEndPoint = controlConnection.RemoteEndPoint;
         await _peerMesh.StartAsync(runtime, controlWriter, session).ConfigureAwait(false);
 
         await using var dataConnection = await ConnectAsync(runtime, ConnectionRole.Data, session)

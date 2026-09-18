@@ -38,6 +38,13 @@ internal sealed record PeerEgressRoutePlan(
 internal sealed record PeerEgressRouteDifference(
     IReadOnlyList<PeerEgressRoute> Remove, IReadOnlyList<PeerEgressRoute> Add);
 
+/// <summary>What the last apply was asked to install, and how it went.</summary>
+/// <param name="Troubled">
+/// The apply left something undone: a prefix refused because somebody else owned it, or an install
+/// that failed and was rolled back.
+/// </param>
+internal sealed record PeerEgressPlanAttempt(long AtMillis, IReadOnlyList<PeerEgressRoute> Desired, bool Troubled);
+
 /// <summary>
 /// Turning consumer rules into routes.
 /// </summary>
@@ -93,24 +100,15 @@ internal static class PeerEgressRoutePlanner
             }
         }
 
+        // The prefixes the rules want captured come first, because they decide which bypass
+        // addresses need a route at all.
+        //
+        // A direct rule installs nothing. Traffic stays local by not having a route, which is the
+        // same mechanism that makes unmatched traffic local, so there is one behaviour rather than
+        // two that have to agree. A block rule does install one: the packet has to be captured
+        // before it can be dropped, and the data plane is what drops it.
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        var routes = new List<PeerEgressRoute>(rules.Count + (bypass?.Count ?? 0));
-
-        // Bypass first: these are the addresses that must not be captured under any rule, and
-        // adding them first means a rule naming the same prefix cannot displace one.
-        foreach (var endpoint in bypass ?? [])
-        {
-            if (!Ipv4Cidr.TryParseAddress(endpoint?.Trim(), out var address))
-            {
-                continue;
-            }
-            var pinned = Ipv4Cidr.FormatAddress(address) + "/32";
-            if (seen.Add(pinned))
-            {
-                routes.Add(new PeerEgressRoute(pinned, PeerEgressRouteKind.Bypass, "bypass"));
-            }
-        }
-
+        var capturing = new List<(Ipv4Cidr Cidr, string Match)>(rules.Count);
         for (var index = 0; index < rules.Count; index++)
         {
             if (skip.Contains(index))
@@ -118,12 +116,6 @@ internal static class PeerEgressRoutePlanner
                 continue;
             }
             var rule = rules[index];
-            // A direct rule installs nothing. Traffic stays local by not having a route, which is
-            // the same mechanism that makes unmatched traffic local, so there is one behaviour
-            // rather than two that have to agree.
-            //
-            // A block rule does install one: the packet has to be captured before it can be
-            // dropped, and the data plane is what drops it.
             var action = rule.Action?.Trim() ?? string.Empty;
             if (action is not (PeerEgressRules.ActionEgress or PeerEgressRules.ActionBlock))
             {
@@ -135,18 +127,97 @@ internal static class PeerEgressRoutePlanner
             }
             // Rendered the one way this feature writes a prefix, so a route installed in one run is
             // recognised as the same route in the next.
-            var normalised = cidr.ToString();
-            if (!seen.Add(normalised))
+            if (!seen.Add(cidr.ToString()))
             {
                 // Two rules over the same prefix need one route; the engine decides between them
                 // per packet, and installing the prefix twice would make removal ambiguous.
                 continue;
             }
-            routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun, "rule:" + rule.Match));
+            capturing.Add((cidr, rule.Match));
+        }
+
+        seen.Clear();
+        var routes = new List<PeerEgressRoute>(capturing.Count + (bypass?.Count ?? 0));
+
+        // A bypass address gets a /32 only when one of those prefixes covers it. Uncovered, the
+        // platform's own routing already carries it, and a route of ours would be one more thing
+        // to keep true as peers come and go. Covered, the /32 is what keeps the tunnel's transport
+        // out of the tunnel, and it goes in first so a rule naming the same prefix cannot displace
+        // it.
+        foreach (var endpoint in bypass ?? [])
+        {
+            if (!Ipv4Cidr.TryParseAddress(endpoint?.Trim(), out var address))
+            {
+                continue;
+            }
+            var covered = false;
+            foreach (var entry in capturing)
+            {
+                if (entry.Cidr.Contains(address))
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered)
+            {
+                continue;
+            }
+            var pinned = Ipv4Cidr.FormatAddress(address) + "/32";
+            if (seen.Add(pinned))
+            {
+                routes.Add(new PeerEgressRoute(pinned, PeerEgressRouteKind.Bypass, "bypass"));
+            }
+        }
+
+        foreach (var entry in capturing)
+        {
+            var normalised = entry.Cidr.ToString();
+            if (seen.Add(normalised))
+            {
+                routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun, "rule:" + entry.Match));
+            }
         }
 
         Sort(routes);
         return new PeerEgressRoutePlan(routes, refused);
+    }
+
+    /// <summary>
+    /// How long an apply that left something undone -- a conflict or a failure -- waits before the
+    /// same plan is tried again. Long enough that an operator's route sitting on one of our prefixes
+    /// is not queried every tick, short enough that its removal is noticed.
+    /// </summary>
+    /// <remarks>Shared vector: <c>reconcile.retryAfterMs</c>.</remarks>
+    public const long RetryAfterMillis = 60_000L;
+
+    /// <summary>
+    /// Whether a plan computed on the periodic tick should be applied.
+    /// </summary>
+    /// <remarks>
+    /// The plan is recomputed every few seconds because its inputs move: peers come and go, the
+    /// relay changes, a hostname resolves differently. Applying every time would rewrite the
+    /// journal on every tick for nothing. So a plan is applied when it differs from the one last
+    /// applied, and otherwise only to retry an apply that left something undone, and then no more
+    /// often than the interval.
+    ///
+    /// <para>Compared as sets: the planner sorts, but nothing here should depend on that.</para>
+    /// </remarks>
+    public static bool ReconcileDue(PeerEgressPlanAttempt? last, IReadOnlyList<PeerEgressRoute> desired, long nowMillis)
+    {
+        if (last is null)
+        {
+            return true;
+        }
+        var previous = last.Desired.ToList();
+        var next = desired.ToList();
+        Sort(previous);
+        Sort(next);
+        if (!previous.SequenceEqual(next))
+        {
+            return true;
+        }
+        return last.Troubled && nowMillis - last.AtMillis >= RetryAfterMillis;
     }
 
     /// <summary>

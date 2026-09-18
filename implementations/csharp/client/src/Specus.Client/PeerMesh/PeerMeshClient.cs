@@ -161,17 +161,51 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _observer = observer;
         _portMappingService = new NatPortMappingService(logger);
         _serviceRuntime = new PeerServiceRuntime(SendServiceReport, logger);
+        // The rules are not applied here. The routes point into the virtual device, which does not
+        // exist until the mesh starts; the plane applies them once it is up and keeps them true on
+        // the maintenance tick from then on.
         _egress = new PeerEgressMesh(new EgressHost(this), logger);
-        if (config.PeerEgressRules.Count > 0)
-        {
-            // Only when there is something to apply. Building the consumer starts the threads that
-            // carry its work, and a node with no rules has none.
-            _egress.ApplyRules(config.PeerEgressRules);
-        }
     }
 
     /// <summary>The egress data plane and its three joins with this client.</summary>
     private readonly PeerEgressMesh _egress;
+
+    /// <summary>
+    /// The control connection's live remote address, for the bypass that keeps it out of the
+    /// tunnel. Set by the control client before the mesh starts.
+    /// </summary>
+    internal EndPoint? ControlRemoteEndPoint
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _controlRemote;
+            }
+        }
+        set
+        {
+            lock (_sync)
+            {
+                _controlRemote = value;
+            }
+        }
+    }
+
+    private EndPoint? _controlRemote;
+
+    /// <summary>Has the plane recompute its routes. Never throws into a loop that has to keep running.</summary>
+    private void ReconcileEgressRoutes()
+    {
+        try
+        {
+            _egress.ReconcileRoutes();
+        }
+        catch (Exception ex) when (!IsFatalProcessException(ex))
+        {
+            _logger.LogDebug(ex, "Peer egress route reconcile failed");
+        }
+    }
 
     /// <summary>The egress section of the diagnostic snapshot. See <see cref="PeerEgressStatus"/>.</summary>
     internal Dictionary<string, object?> EgressStatus() => _egress.Status();
@@ -253,6 +287,63 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     : null;
             }
         }
+
+        public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
+
+        public bool DeviceReady
+        {
+            get
+            {
+                lock (owner._sync)
+                {
+                    return owner._device is { } device
+                        && device is not NoopPeerVirtualDevice
+                        && string.Equals(device.Status, "UP", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+        }
+
+        public string DeviceStatus
+        {
+            get
+            {
+                lock (owner._sync)
+                {
+                    return owner._device?.Status ?? "absent";
+                }
+            }
+        }
+
+        public IReadOnlyList<string?> BypassHosts()
+        {
+            PeerMeshConfig? mesh;
+            PeerCandidate? relay;
+            EndPoint? control;
+            lock (owner._sync)
+            {
+                mesh = owner._runtime?.PeerMesh;
+                relay = owner._relay;
+                control = owner._controlRemote;
+            }
+            var hosts = new List<string?>();
+            if (control is IPEndPoint endpoint)
+            {
+                var address = endpoint.Address.IsIPv4MappedToIPv6 ? endpoint.Address.MapToIPv4() : endpoint.Address;
+                hosts.Add(address.ToString());
+            }
+            hosts.Add(owner._config.ServerBaseUrl);
+            if (mesh is not null)
+            {
+                hosts.Add(mesh.StunHost);
+                hosts.Add(mesh.TurnHost);
+                hosts.AddRange(mesh.PublicStunServers);
+            }
+            if (relay is not null)
+            {
+                hosts.Add(relay.Address);
+            }
+            return hosts;
+        }
     }
 
     internal Task? ReceiveTask
@@ -313,6 +404,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _ = TryAcquirePortMappingAsync(CancellationToken.None);
             await RequestRelayCandidatesAsync().ConfigureAwait(false);
             await AnnounceCandidatesAsync().ConfigureAwait(false);
+            // The control connection is new, so the address its bypass pins may be too.
+            ReconcileEgressRoutes();
             return;
         }
 
@@ -424,6 +517,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
         await AnnounceCandidatesAsync().ConfigureAwait(false);
+        // After the device, because the routes point into it. Kept true from here on by the
+        // maintenance loop.
+        ReconcileEgressRoutes();
     }
 
     private void UpdateTurnCredentials(PeerMeshConfig config)
@@ -838,6 +934,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 }
                 await KeepaliveDirectPathsAsync().ConfigureAwait(false);
                 await FallbackStaleDirectPathsAsync().ConfigureAwait(false);
+                // Peers and the relay move between ticks; the routes that keep their addresses
+                // out of the tunnel follow them here. Off this loop, because a reconcile may
+                // resolve a hostname and run a route command.
+                await Task.Run(ReconcileEgressRoutes, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -4508,6 +4608,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private Task StopAsyncCore(bool receiveLoopInitiated)
     {
+        // The device is about to go, and its routes with it: on every platform a route through an
+        // interface that closes is dropped by the kernel. Withdrawn now, while the interface is
+        // still there to withdraw from, and reinstalled once the next one is up.
+        _egress.WithdrawRoutes();
         StopState state;
         TaskCompletionSource<bool> completion;
         lock (_sync)

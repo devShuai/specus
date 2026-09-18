@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -273,35 +274,73 @@ func (mesh *peerMeshClient) deliverEgressPurges(purge map[int64][]string) {
 	}
 }
 
-// applyEgressRules installs the consumer's own rules and the routes they need.
+// Keeping the routes true while the process runs.
 //
-// Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong all at
-// once, and refusing to apply any of it would leave a user with one typo sending everything out
-// locally, which is the failure this feature exists to prevent.
-func (mesh *peerMeshClient) applyEgressRules(rules []egressRule, runtime RuntimeConfig) {
-	consumer := mesh.ensureEgressConsumer()
+// The rules are fixed for the life of the process, but what they need installed is not. A bypass
+// exists for an address a rule covers, and those addresses move: peers connect and drop, the relay
+// is reassigned, the control connection is re-established. So the plan is recomputed on the mesh's
+// own tick -- after the virtual device is up, then every few seconds -- and applied only when it
+// changed, or to retry an apply that left something undone. Everything below runs under
+// egressPlanMu, which serialises the installer, and never under the mesh lock, because resolving a
+// hostname and running a route command are both things nothing else should wait on.
+
+// reconcileEgressRoutes recomputes the consumer's routes and applies them if that is due. Called
+// with no mesh lock held.
+func (mesh *peerMeshClient) reconcileEgressRoutes() {
+	mesh.reconcileEgressRoutesAt(time.Now())
+}
+
+func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
+	mesh.egressPlanMu.Lock()
+	defer mesh.egressPlanMu.Unlock()
+
+	rules := mesh.config.PeerEgressRules
+	mesh.mu.Lock()
+	runtime := mesh.runtime
+	device := mesh.device
+	mesh.mu.Unlock()
 	meshCIDR := strings.TrimSpace(runtime.PeerMesh.CIDR)
 	if meshCIDR == "" {
 		meshCIDR = egressDefaultMeshCIDR
 	}
-	mesh.deliverEgressPurges(consumer.configure(rules, meshCIDR, runtime.PeerMesh.VirtualIP, time.Now()))
 
-	desired, refused := planEgressRoutes(rules, mesh.egressBypassAddresses(), meshCIDR)
-	for _, entry := range refused {
-		mesh.logger.Printf("[peer-egress-consumer] rule %d (%s) refused: %s", entry.Index, entry.Match, entry.Code)
+	// The consumer exists only when there are rules for it to apply. Building it for an empty
+	// set would start the threads that carry its work and report a consumer with nothing to do.
+	if len(rules) > 0 {
+		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, now)
+	}
+
+	// Without a device there is nothing to route into. A rule's route pointed at an interface
+	// that is not there is a black hole rather than the local fallback the user would get with
+	// no route at all, so the plan is empty until the device is up, and empties again if it goes.
+	var desired []egressRoute
+	if egressDeviceReady(device) {
+		mesh.egressDeviceWaitLogged = false
+		bypass := mesh.egressBypassAddresses(now)
+		var refused []egressRuleSetError
+		desired, refused = planEgressRoutes(rules, bypass, meshCIDR)
+		mesh.logEgressRefusals(refused)
+	} else if len(rules) > 0 && !mesh.egressDeviceWaitLogged {
+		mesh.egressDeviceWaitLogged = true
+		mesh.logger.Printf("[peer-egress-consumer] routes not installed: virtual device is %s",
+			egressDeviceStatus(device))
 	}
 
 	installer := mesh.ensureEgressRouteInstaller()
-	if installer == nil {
+	if installer == nil || !egressRouteReconcileDue(mesh.egressPlan, desired, now) {
 		return
 	}
 	result := installer.apply(desired)
+	mesh.egressPlan = &egressRoutePlanAttempt{
+		At: now, Desired: desired, Troubled: len(result.Conflicts) > 0 || result.Err != nil,
+	}
+
 	// Remembered before it is logged. A conflict is the one part of this outcome nothing can
 	// recompute -- the answer came from the platform's routing table at this moment -- and
 	// writing it only to the log is what left an operator with no way to see that a rule they
 	// wrote is not in force.
 	outcome := egressApplyOutcome{
-		At:         time.Now(),
+		At:         now,
 		Conflicts:  append([]egressRouteConflict(nil), result.Conflicts...),
 		RolledBack: result.RolledBack,
 		Applied:    true,
@@ -312,15 +351,29 @@ func (mesh *peerMeshClient) applyEgressRules(rules []egressRule, runtime Runtime
 	mesh.mu.Lock()
 	mesh.egressApplied = outcome
 	mesh.mu.Unlock()
+
+	// Logged when they change, not on every retry. A conflict is retried every minute for as
+	// long as the other route is there, and repeating the same line each time would bury the
+	// one that says it went away.
+	conflicts := make([]string, 0, len(result.Conflicts))
 	for _, conflict := range result.Conflicts {
-		// Not preempted and not compared by metric. The operator is told which of their own
-		// routes is in the way, so they can decide rather than discover it later.
-		mesh.logger.Printf("[peer-egress-consumer] route %s not installed, already present: %s",
-			conflict.Route.CIDR, conflict.Existing)
+		conflicts = append(conflicts, conflict.Route.CIDR+"="+conflict.Existing)
 	}
-	if result.Err != nil {
-		mesh.logger.Printf("[peer-egress-consumer] route install failed: %v rolledBack=%v",
-			result.Err, result.RolledBack)
+	if joined := strings.Join(conflicts, ";"); joined != mesh.egressConflictsLogged {
+		mesh.egressConflictsLogged = joined
+		for _, conflict := range result.Conflicts {
+			// Not preempted and not compared by metric. The operator is told which of their
+			// own routes is in the way, so they can decide rather than discover it later.
+			mesh.logger.Printf("[peer-egress-consumer] route %s not installed, already present: %s",
+				conflict.Route.CIDR, conflict.Existing)
+		}
+	}
+	if outcome.Err != mesh.egressErrorLogged {
+		mesh.egressErrorLogged = outcome.Err
+		if result.Err != nil {
+			mesh.logger.Printf("[peer-egress-consumer] route install failed: %v rolledBack=%v",
+				result.Err, result.RolledBack)
+		}
 	}
 	if len(result.Added) > 0 || len(result.Removed) > 0 {
 		mesh.logger.Printf("[peer-egress-consumer] routes added=%d removed=%d",
@@ -328,10 +381,63 @@ func (mesh *peerMeshClient) applyEgressRules(rules []egressRule, runtime Runtime
 	}
 }
 
-// ensureEgressRouteInstaller builds the installer and adopts any journal a previous run left.
+// configureEgressConsumer gives the consumer its rules, once per distinct configuration.
 //
-// Adoption comes first so a process that was killed has its routes taken back rather than left for
-// a user to find and wonder about.
+// Reconfiguring purges the flows the new rules no longer cover, and with the same rules that is
+// every flow being re-examined for nothing on every tick; with a change of virtual IP it is what
+// has to happen.
+func (mesh *peerMeshClient) configureEgressConsumer(rules []egressRule, meshCIDR, virtualIP string, now time.Time) {
+	key := fmt.Sprintf("%s|%s|%+v", meshCIDR, strings.TrimSpace(virtualIP), rules)
+	if key == mesh.egressConsumerKey {
+		return
+	}
+	mesh.egressConsumerKey = key
+	consumer := mesh.ensureEgressConsumer()
+	mesh.deliverEgressPurges(consumer.configure(rules, meshCIDR, virtualIP, now))
+}
+
+// logEgressRefusals reports the rules that were thrown out, once per distinct set. The rules do not
+// change while the process runs, so in practice this is once.
+func (mesh *peerMeshClient) logEgressRefusals(refused []egressRuleSetError) {
+	keys := make([]string, 0, len(refused))
+	for _, entry := range refused {
+		keys = append(keys, strconv.Itoa(entry.Index)+":"+entry.Code)
+	}
+	if joined := strings.Join(keys, ","); joined != mesh.egressRefusalsLogged {
+		mesh.egressRefusalsLogged = joined
+		for _, entry := range refused {
+			mesh.logger.Printf("[peer-egress-consumer] rule %d (%s) refused: %s", entry.Index, entry.Match, entry.Code)
+		}
+	}
+}
+
+// egressDeviceReady says whether there is an interface to route into: a real device that started.
+// A noop device creates no interface, and one that failed has none either.
+func egressDeviceReady(device peerVirtualDevice) bool {
+	if device == nil {
+		return false
+	}
+	if _, noop := device.(*noopPeerVirtualDevice); noop {
+		return false
+	}
+	return strings.EqualFold(device.Status(), "UP")
+}
+
+func egressDeviceStatus(device peerVirtualDevice) string {
+	if device == nil {
+		return "absent"
+	}
+	return device.Status()
+}
+
+// ensureEgressRouteInstaller builds the installer and takes back whatever a previous run left in
+// the journal.
+//
+// Taken back rather than adopted. A journal outlives the process that wrote it, and that process's
+// interface is gone with it, so the routes it describes are either gone too or pointing at nothing;
+// what is still wanted is put back by the apply that follows. This is also what clears a crash's
+// leftovers when the rules have since been removed: there is no rule set so small that the journal
+// is not read.
 func (mesh *peerMeshClient) ensureEgressRouteInstaller() *egressRouteInstaller {
 	mesh.mu.Lock()
 	if mesh.egressRoutes != nil {
@@ -340,9 +446,10 @@ func (mesh *peerMeshClient) ensureEgressRouteInstaller() *egressRouteInstaller {
 		return installer
 	}
 	device := mesh.device
+	commander := mesh.egressCommander
 	mesh.mu.Unlock()
 
-	tun := ""
+	tun := strings.TrimSpace(mesh.config.PeerMeshTunName)
 	if device != nil {
 		tun = device.Name()
 	}
@@ -350,9 +457,15 @@ func (mesh *peerMeshClient) ensureEgressRouteInstaller() *egressRouteInstaller {
 	if journal == "" {
 		journal = egressRouteJournalPath()
 	}
-	installer := newEgressRouteInstaller(newEgressRouteCommanderForPlatform(tun), journal)
+	if commander == nil {
+		commander = newEgressRouteCommanderForPlatform(tun)
+	}
+	installer := newEgressRouteInstaller(commander, journal)
 	if err := installer.load(); err != nil {
 		mesh.logger.Printf("[peer-egress-consumer] route journal unusable, starting empty: %v", err)
+	}
+	if leftover := installer.withdrawAll(); len(leftover) > 0 {
+		mesh.logger.Printf("[peer-egress-consumer] took back %d routes left by a previous run", len(leftover))
 	}
 
 	mesh.mu.Lock()
@@ -370,29 +483,58 @@ func egressRouteJournalPath() string {
 }
 
 // egressBypassAddresses are the addresses that must keep reaching the physical network: the control
-// connection, STUN and TURN, and every peer's own endpoint. Without them a rule broad enough to
-// cover one would route the tunnel's transport into the tunnel.
-func (mesh *peerMeshClient) egressBypassAddresses() []string {
-	bypass := make([]string, 0, 8)
-	for _, cidr := range mesh.deploymentDenyCIDRs() {
-		bypass = append(bypass, strings.TrimSuffix(cidr, "/32"))
-	}
+// connection, the server the client logs in to, STUN and TURN, the relay, and every peer's own
+// endpoint. Without them a rule broad enough to cover one would route the tunnel's transport into
+// the tunnel. Called under egressPlanMu with no mesh lock held; hostnames are resolved here.
+func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 	mesh.mu.Lock()
+	runtime := mesh.runtime
+	conn := mesh.conn
+	relay := mesh.relay
+	peers := make([]string, 0, len(mesh.sessions))
 	for _, session := range mesh.sessions {
 		if session.RemoteEndpoint != nil && session.RemoteEndpoint.IP != nil {
-			bypass = append(bypass, session.RemoteEndpoint.IP.String())
+			peers = append(peers, session.RemoteEndpoint.IP.String())
 		}
 	}
 	mesh.mu.Unlock()
-	return bypass
+
+	hosts := make([]string, 0, 8)
+	if conn != nil && conn.RemoteAddr() != nil {
+		hosts = append(hosts, conn.RemoteAddr().String())
+	}
+	hosts = append(hosts, mesh.config.ServerBaseURL, runtime.PeerMesh.StunHost, runtime.PeerMesh.TurnHost)
+	hosts = append(hosts, runtime.PeerMesh.PublicStunServers...)
+	if relay != nil {
+		hosts = append(hosts, relay.Address)
+	}
+	if mesh.egressBypass == nil {
+		mesh.egressBypass = newEgressBypassResolver(nil)
+	}
+	resolved, failed := mesh.egressBypass.resolve(hosts, now)
+	if joined := strings.Join(failed, ","); joined != mesh.egressBypassFailedLogged {
+		mesh.egressBypassFailedLogged = joined
+		for _, host := range failed {
+			// Said once per failure, not per tick: the cache retries after its TTL and the next
+			// line is the one that says it resolved.
+			mesh.logger.Printf("[peer-egress-consumer] bypass host %s did not resolve; a rule covering it would capture it", host)
+		}
+	}
+	return append(resolved, peers...)
 }
 
-// withdrawEgressRoutes takes back every route this feature installed. Called with no mesh lock held.
+// withdrawEgressRoutes takes back every route this feature installed and forgets the plan, so the
+// next reconcile starts from nothing. Called with no mesh lock held.
 func (mesh *peerMeshClient) withdrawEgressRoutes() {
+	mesh.egressPlanMu.Lock()
+	defer mesh.egressPlanMu.Unlock()
 	mesh.mu.Lock()
 	installer := mesh.egressRoutes
 	mesh.egressRoutes = nil
 	mesh.mu.Unlock()
+	mesh.egressPlan = nil
+	// What was logged belongs to the routes that are going; the next start says its own.
+	mesh.egressConflictsLogged, mesh.egressErrorLogged, mesh.egressDeviceWaitLogged = "", "", false
 	if installer != nil {
 		installer.withdrawAll()
 	}

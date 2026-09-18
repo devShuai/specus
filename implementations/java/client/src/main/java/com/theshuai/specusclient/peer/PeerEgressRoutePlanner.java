@@ -108,33 +108,22 @@ public final class PeerEgressRoutePlanner {
             }
         }
 
-        Set<String> seen = new LinkedHashSet<>();
-        List<Route> routes = new ArrayList<>();
-
-        // Bypass first: these are the addresses that must not be captured under any rule, and
-        // adding them first means a rule naming the same prefix cannot displace one.
-        for (String endpoint : bypass == null ? List.<String>of() : bypass) {
-            Integer address = Ipv4Cidr.parseAddress(endpoint == null ? null : endpoint.trim());
-            if (address == null) {
-                continue;
-            }
-            String cidr = Ipv4Cidr.format(address) + "/32";
-            if (seen.add(cidr)) {
-                routes.add(new Route(cidr, Kind.BYPASS, "bypass"));
-            }
+        // The prefixes the rules want captured come first, because they decide which bypass
+        // addresses need a route at all.
+        //
+        // A direct rule installs nothing. Traffic stays local by not having a route, which is the
+        // same mechanism that makes unmatched traffic local, so there is one behaviour rather than
+        // two that have to agree. A block rule does install one: the packet has to be captured
+        // before it can be dropped, and the data plane is what drops it.
+        record Captured(Ipv4Cidr cidr, String match) {
         }
-
+        Set<String> seen = new LinkedHashSet<>();
+        List<Captured> capturing = new ArrayList<>();
         for (int index = 0; index < ruleList.size(); index++) {
             if (skip.contains(index)) {
                 continue;
             }
             PeerEgressRule rule = ruleList.get(index);
-            // A direct rule installs nothing. Traffic stays local by not having a route, which is
-            // the same mechanism that makes unmatched traffic local, so there is one behaviour
-            // rather than two that have to agree.
-            //
-            // A block rule does install one: the packet has to be captured before it can be
-            // dropped, and the data plane is what drops it.
             String action = rule.getAction() == null ? "" : rule.getAction().trim();
             if (!PeerEgressRule.ACTION_EGRESS.equals(action) && !PeerEgressRule.ACTION_BLOCK.equals(action)) {
                 continue;
@@ -145,17 +134,95 @@ public final class PeerEgressRoutePlanner {
             }
             // Rendered the one way this feature writes a prefix, so a route installed in one run
             // is recognised as the same route in the next.
-            String normalised = cidr.toString();
-            if (!seen.add(normalised)) {
+            if (!seen.add(cidr.toString())) {
                 // Two rules over the same prefix need one route; the engine decides between them
                 // per packet, and installing the prefix twice would make removal ambiguous.
                 continue;
             }
-            routes.add(new Route(normalised, Kind.TUN, "rule:" + rule.getMatch()));
+            capturing.add(new Captured(cidr, rule.getMatch()));
+        }
+
+        seen = new LinkedHashSet<>();
+        List<Route> routes = new ArrayList<>();
+
+        // A bypass address gets a /32 only when one of those prefixes covers it. Uncovered, the
+        // platform's own routing already carries it, and a route of ours would be one more thing
+        // to keep true as peers come and go. Covered, the /32 is what keeps the tunnel's transport
+        // out of the tunnel, and it goes in first so a rule naming the same prefix cannot displace
+        // it.
+        for (String endpoint : bypass == null ? List.<String>of() : bypass) {
+            Integer address = Ipv4Cidr.parseAddress(endpoint == null ? null : endpoint.trim());
+            if (address == null) {
+                continue;
+            }
+            boolean covered = false;
+            for (Captured entry : capturing) {
+                if (entry.cidr().contains(address)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                continue;
+            }
+            String cidr = Ipv4Cidr.format(address) + "/32";
+            if (seen.add(cidr)) {
+                routes.add(new Route(cidr, Kind.BYPASS, "bypass"));
+            }
+        }
+
+        for (Captured entry : capturing) {
+            String normalised = entry.cidr().toString();
+            if (seen.add(normalised)) {
+                routes.add(new Route(normalised, Kind.TUN, "rule:" + entry.match()));
+            }
         }
 
         sort(routes);
         return new Plan(routes, refused);
+    }
+
+    /**
+     * How long an apply that left something undone -- a conflict or a failure -- waits before the
+     * same plan is tried again. Long enough that an operator's route sitting on one of our
+     * prefixes is not queried every tick, short enough that its removal is noticed.
+     *
+     * <p>Shared vector: {@code reconcile.retryAfterMs}.
+     */
+    public static final long RETRY_AFTER_MILLIS = 60_000L;
+
+    /**
+     * What the last apply was asked to install, and how it went.
+     *
+     * @param troubled the apply left something undone: a prefix refused because somebody else
+     *                 owned it, or an install that failed and was rolled back
+     */
+    public record PlanAttempt(long atMillis, List<Route> desired, boolean troubled) {
+    }
+
+    /**
+     * Whether a plan computed on the periodic tick should be applied.
+     *
+     * <p>The plan is recomputed every few seconds because its inputs move: peers come and go, the
+     * relay changes, a hostname resolves differently. Applying every time would rewrite the journal
+     * on every tick for nothing. So a plan is applied when it differs from the one last applied,
+     * and otherwise only to retry an apply that left something undone, and then no more often than
+     * the interval.
+     *
+     * <p>Compared as sets: the planner sorts, but nothing here should depend on that.
+     */
+    public static boolean reconcileDue(PlanAttempt last, List<Route> desired, long nowMillis) {
+        if (last == null) {
+            return true;
+        }
+        List<Route> previous = new ArrayList<>(last.desired());
+        List<Route> next = new ArrayList<>(desired);
+        sort(previous);
+        sort(next);
+        if (!previous.equals(next)) {
+            return true;
+        }
+        return last.troubled() && nowMillis - last.atMillis() >= RETRY_AFTER_MILLIS;
     }
 
     /**

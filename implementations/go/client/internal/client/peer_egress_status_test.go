@@ -26,7 +26,7 @@ func TestEgressStatusReportsARuleThatIsNotInForce(t *testing.T) {
 	commander := newFakeRouteCommander()
 	mesh.egressRoutes = newEgressRouteInstaller(commander, journalPath(t))
 
-	mesh.applyEgressRules([]egressRule{
+	applyEgressRulesForTest(t, mesh, []egressRule{
 		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42},
 		// Refused: phase one does not take over the default route.
 		{Match: "0.0.0.0/0", Action: egressActionEgress, EgressClientID: 42},
@@ -63,7 +63,7 @@ func TestEgressStatusOmitsPeersNamedOnlyByRefusedRules(t *testing.T) {
 	defer mesh.shutdownEgress()
 	mesh.egressRoutes = newEgressRouteInstaller(newFakeRouteCommander(), journalPath(t))
 
-	mesh.applyEgressRules([]egressRule{
+	applyEgressRulesForTest(t, mesh, []egressRule{
 		{Match: "0.0.0.0/0", Action: egressActionEgress, EgressClientID: 77},
 	}, statusRuntimeConfig())
 
@@ -83,7 +83,7 @@ func TestEgressStatusReportsARouteThatWasNotInstalled(t *testing.T) {
 	commander.foreign["203.0.113.0/24"] = existing
 	mesh.egressRoutes = newEgressRouteInstaller(commander, journalPath(t))
 
-	mesh.applyEgressRules([]egressRule{
+	applyEgressRulesForTest(t, mesh, []egressRule{
 		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42},
 	}, statusRuntimeConfig())
 
@@ -119,7 +119,7 @@ func TestEgressStatusReportsTheRoutesItOwns(t *testing.T) {
 	defer mesh.shutdownEgress()
 	mesh.egressRoutes = newEgressRouteInstaller(newFakeRouteCommander(), journalPath(t))
 
-	mesh.applyEgressRules([]egressRule{
+	applyEgressRulesForTest(t, mesh, []egressRule{
 		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42},
 	}, statusRuntimeConfig())
 

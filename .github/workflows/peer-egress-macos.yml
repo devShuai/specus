@@ -19,8 +19,10 @@ on:
   pull_request:
     paths:
       - '.github/workflows/peer-egress-macos.yml'
+      - 'protocol/test-vectors/peer-egress-routes-v1.json'
       - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
       - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
+      - 'tools/protocol/generate_peer_egress_route_vectors.py'
       - 'tools/protocol/generate_peer_egress_macos_route_vectors.py'
       - 'tools/protocol/generate_peer_egress_socket_binding_vectors.py'
       - 'tools/protocol/verify_peer_egress_vectors.py'
@@ -35,6 +37,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/peer-egress-macos.yml'
+      - 'protocol/test-vectors/peer-egress-routes-v1.json'
       - 'protocol/test-vectors/peer-egress-macos-routes-v1.json'
       - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
@@ -74,9 +77,11 @@ jobs:
       # from the reference implementation to check the shipped file is what the reference produces.
       - name: Vectors
         run: |
+          python tools/protocol/generate_peer_egress_route_vectors.py
           python tools/protocol/generate_peer_egress_macos_route_vectors.py
           python tools/protocol/generate_peer_egress_socket_binding_vectors.py
-          git diff --exit-code protocol/test-vectors/peer-egress-macos-routes-v1.json \
+          git diff --exit-code protocol/test-vectors/peer-egress-routes-v1.json \
+            protocol/test-vectors/peer-egress-macos-routes-v1.json \
             protocol/test-vectors/peer-egress-socket-binding-v1.json
           python tools/protocol/verify_peer_egress_vectors.py
 

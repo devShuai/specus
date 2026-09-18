@@ -157,6 +157,21 @@ type peerMeshClient struct {
 	// egressJournalPath overrides where the route journal lives. Empty means the real location
 	// beside the machine identity; tests set it so they never touch a user's own journal.
 	egressJournalPath string
+	// egressCommander overrides the platform's routing table. Nil means the real one; tests set
+	// it so applying rules never runs a route command on the machine they run on.
+	egressCommander egressRouteCommander
+
+	// The consumer's route plan, kept true on the mesh's own tick. Guarded by egressPlanMu, which
+	// is never taken under mu: a reconcile resolves hostnames and runs route commands.
+	egressPlanMu             sync.Mutex
+	egressPlan               *egressRoutePlanAttempt
+	egressBypass             *egressBypassResolver
+	egressConsumerKey        string
+	egressRefusalsLogged     string
+	egressConflictsLogged    string
+	egressErrorLogged        string
+	egressBypassFailedLogged string
+	egressDeviceWaitLogged   bool
 }
 
 type peerMeshPeer struct {
@@ -458,11 +473,17 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 		mesh.requestRelayCandidates()
 		mesh.announceCandidates()
 		mesh.ensureServices().applyConfig(runtime.PeerMesh)
+		// The control connection is new, so the address its bypass pins may be too.
+		mesh.reconcileEgressRoutes()
 		return
 	}
 	mesh.mu.Unlock()
 
 	localKey, keyErr := loadPeerPrivateKey()
+	// The device is about to be replaced, and its routes go with it: on every platform a route
+	// through an interface that closes is dropped by the kernel. Withdrawn now, while the
+	// interface is still there to withdraw from, and reinstalled once the new one is up.
+	mesh.withdrawEgressRoutes()
 	mesh.mu.Lock()
 	mesh.stopLocked()
 	mesh.runtime = runtime
@@ -536,9 +557,9 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.requestRelayCandidates()
 	mesh.announceCandidates()
 	mesh.ensureServices().applyConfig(runtime.PeerMesh)
-	if len(mesh.config.PeerEgressRules) > 0 {
-		mesh.applyEgressRules(mesh.config.PeerEgressRules, runtime)
-	}
+	// After the device, because the routes point into it. Kept true from here on by the
+	// maintenance loop.
+	mesh.reconcileEgressRoutes()
 }
 
 func (mesh *peerMeshClient) ensureServices() *peerServiceRuntime {
@@ -739,6 +760,9 @@ func (mesh *peerMeshClient) maintenanceLoop(stopCh <-chan struct{}) {
 		case <-keepaliveTicker.C:
 			mesh.keepaliveDirectPaths()
 			mesh.fallbackStaleDirectPaths()
+			// Peers and the relay move between ticks; the routes that keep their addresses
+			// out of the tunnel follow them here.
+			mesh.reconcileEgressRoutes()
 		}
 	}
 }

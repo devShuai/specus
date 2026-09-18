@@ -194,6 +194,12 @@ public final class PeerEgressRouteInstaller {
         Exception error = null;
 
         PeerEgressRoutePlanner.Difference difference = PeerEgressRoutePlanner.diff(installed(), desired);
+        if (difference.remove().isEmpty() && difference.add().isEmpty()) {
+            // Nothing to do means nothing to write. This runs on a periodic tick, and rewriting an
+            // unchanged journal every few seconds is wear on the disk for a file that did not
+            // change.
+            return new ApplyResult(List.of(), List.of(), List.of(), false, null);
+        }
         for (Route route : difference.remove()) {
             try {
                 commander.remove(route);

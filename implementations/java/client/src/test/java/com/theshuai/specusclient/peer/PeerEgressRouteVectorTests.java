@@ -111,6 +111,30 @@ class PeerEgressRouteVectorTests {
     }
 
     /**
+     * Whether a plan recomputed on the tick is applied. Three runtimes that disagreed here would
+     * rewrite their journals and retry their conflicts on different schedules for the same inputs.
+     */
+    @Test
+    void reconcileDecisionsMatchTheSharedVector() throws IOException {
+        JsonNode reconcile = readVector("peer-egress-routes-v1.json").path("reconcile");
+        assertFalse(reconcile.path("cases").isEmpty(), "routes vector carried no reconcile cases");
+        assertEquals(reconcile.path("retryAfterMs").asLong(), PeerEgressRoutePlanner.RETRY_AFTER_MILLIS,
+                "retry interval differs from the vector's");
+
+        long start = 1_758_196_800_000L;
+        for (JsonNode node : reconcile.path("cases")) {
+            String name = node.path("name").asText();
+            PeerEgressRoutePlanner.PlanAttempt last = node.path("previous").isNull()
+                    ? null
+                    : new PeerEgressRoutePlanner.PlanAttempt(start, routesOf(node.path("previous")),
+                            node.path("troubled").asBoolean());
+            boolean apply = PeerEgressRoutePlanner.reconcileDue(last, routesOf(node.path("desired")),
+                    start + node.path("elapsedMs").asLong());
+            assertEquals(node.path("expect").path("apply").asBoolean(), apply, name);
+        }
+    }
+
+    /**
      * The parsers read output formats nobody controls, which makes them the part most likely to be
      * wrong. Each runtime writing its own fixtures from its own reading of the man page is how
      * three readings of one format come about, so all three read these.

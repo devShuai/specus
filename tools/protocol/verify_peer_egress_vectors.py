@@ -696,8 +696,97 @@ print(f"macos routes get={len(macos['routeGet'])} normalise={len(macos['normalis
       f" results={len(macos['commandResults'])}"
       f" refused={len(macos['commands']['rejectedArguments'])}"
       f" sampled={len(macos_sampled)}")
+# ---- routes vector ------------------------------------------------------
+# The planner's contract with the bypass list, stated a second time here so the generator's own
+# planner cannot quietly change it: a bypass address gets a route only when a rule's route would
+# otherwise capture it, and never through a rule that installs nothing.
+routes_vector = json.loads((VECTORS / "peer-egress-routes-v1.json").read_text(encoding="utf-8"))
+routes_refused = set()
+covered_bypass_seen = uncovered_bypass_seen = 0
+for case in routes_vector["planCases"]:
+    name = case["name"]
+    planned = case["expect"]["routes"]
+    refused = {entry["index"] for entry in case["expect"]["refused"]}
+    routes_refused |= {entry["code"] for entry in case["expect"]["refused"]}
+    installing = []
+    for index, rule in enumerate(case["rules"]):
+        if index in refused or rule.get("action") not in ("egress", "block"):
+            continue
+        installing.append(ipaddress.IPv4Network(rule["match"].strip()))
+    check(len({r["cidr"] for r in planned}) == len(planned), f"routes: {name} plans a prefix twice")
+    kinds = [r["kind"] for r in planned]
+    check(kinds == sorted(kinds, key=lambda k: 0 if k == "bypass" else 1),
+          f"routes: {name} orders a tunnel route before a bypass")
+    for route in planned:
+        network = ipaddress.IPv4Network(route["cidr"])
+        if route["kind"] == "bypass":
+            check(network.prefixlen == 32, f"routes: {name} plans a bypass wider than /32")
+            check(any(network.network_address in captured for captured in installing),
+                  f"routes: {name} plans a bypass {route['cidr']} no installing rule covers")
+            check(route["origin"] == "bypass", f"routes: {name} bypass origin is not 'bypass'")
+        else:
+            check(network in installing,
+                  f"routes: {name} plans {route['cidr']} which no installing rule asked for")
+            check(route["origin"].startswith("rule:"),
+                  f"routes: {name} tunnel route origin does not name its rule")
+    planned_bypass = {r["cidr"] for r in planned if r["kind"] == "bypass"}
+    for endpoint in case["bypass"]:
+        try:
+            address = ipaddress.IPv4Address(endpoint.strip())
+        except ValueError:
+            continue
+        covered = any(address in captured for captured in installing)
+        if covered:
+            covered_bypass_seen += 1
+            check(str(address) + "/32" in planned_bypass,
+                  f"routes: {name} left out a bypass for {address}, which a rule covers")
+        else:
+            uncovered_bypass_seen += 1
+            check(str(address) + "/32" not in {r["cidr"] for r in planned},
+                  f"routes: {name} planned a route for {address}, which nothing covers")
+check(covered_bypass_seen > 0, "routes: no plan case has a bypass a rule covers")
+check(uncovered_bypass_seen > 0, "routes: no plan case has a bypass nothing covers")
+check(any(rule.get("action") == "direct" and case["bypass"]
+          for case in routes_vector["planCases"] for rule in case["rules"]),
+      "routes: no plan case puts a bypass under a direct rule")
+check(routes_refused, "routes: no plan case refuses a rule")
+
+
+def routes_reconcile(previous, desired, troubled, elapsed_ms, retry_after_ms):
+    if previous is None:
+        return True
+    key = lambda r: (r["cidr"], r["kind"], r["origin"])  # noqa: E731
+    if sorted(map(key, previous)) != sorted(map(key, desired)):
+        return True
+    return bool(troubled) and elapsed_ms >= retry_after_ms
+
+
+reconcile = routes_vector["reconcile"]
+check(reconcile["retryAfterMs"] >= 30_000, "routes: reconcile retries faster than every 30 s")
+outcomes = set()
+for case in reconcile["cases"]:
+    produced = routes_reconcile(case["previous"], case["desired"], case["troubled"],
+                                case["elapsedMs"], reconcile["retryAfterMs"])
+    check(produced == case["expect"]["apply"],
+          f"routes: reconcile case {case['name']} expects {case['expect']['apply']}")
+    outcomes.add((case["previous"] is None, case["troubled"],
+                  case["elapsedMs"] >= reconcile["retryAfterMs"], case["expect"]["apply"]))
+# The decisions that have to be exercised: never applied, an unchanged troubled plan on either side
+# of the interval, and a changed plan inside it.
+check((True, False, False, True) in outcomes, "routes: no reconcile case for a first apply")
+check((False, True, False, False) in outcomes, "routes: no reconcile case waits out the interval")
+check((False, True, True, True) in outcomes, "routes: no reconcile case retries after the interval")
+check(any(not case["troubled"] and case["previous"] is not None and case["expect"]["apply"]
+          for case in reconcile["cases"]),
+      "routes: no reconcile case applies a changed plan without trouble")
+check(any(case["troubled"] and case["elapsedMs"] < reconcile["retryAfterMs"] and case["expect"]["apply"]
+          for case in reconcile["cases"]),
+      "routes: no reconcile case applies a changed plan inside the interval")
+
 print(f"socket binding select={len(select_cases)} windows={len(binding['windows']['cases'])}"
       f" macos={len(binding['macos']['cases'])}")
+print(f"routes plan={len(routes_vector['planCases'])} diff={len(routes_vector['diffCases'])}"
+      f" reconcile={len(reconcile['cases'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")
