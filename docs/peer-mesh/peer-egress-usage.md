@@ -159,6 +159,9 @@ PID 12345 | ready
 | 规则生效但流量仍走本机 | `egress` 里的 `NOT INSTALLED` | 该前缀已被本功能之外的路由占用。本功能不抢占，删掉或调整那条路由后重新连接 |
 | `route install failed`，Windows 带 `needs administrator rights`、macOS 带 `needs root`、Linux 带 `Operation not permitted` | `egress` 里的 `route install failed` | 消费端没有改路由表的权限。以管理员或 root 运行，Linux 也可授予 `CAP_NET_ADMIN` |
 | `route install failed` 带 `no route outside the tunnel` | `egress` 里的 `route install failed` | 某条规则覆盖了控制服务器、STUN/TURN 或某个对端的地址，而除了隧道之外路由表里没有能到达它的路由（或者到它的路由是黑洞）。这条旁路没装上，经过它的连接会走进隧道。检查规则前缀是否写得过宽，或者本机的路由表 |
+| 日志有 `routes not installed: virtual device is NOOP`（或 `ERROR`） | 日志 | 消费端的虚拟网卡没起来，路由不会装。`peerMeshDevice` 还是默认的 `noop`，或网卡创建失败（看同一段日志里的原因，通常是权限）。网卡起来后自动装上，不用重启 |
+| 日志有 `took back N routes left by a previous run` | 日志 | 上一次进程没有正常退出，留下的路由已在这次启动时收回，随后按当前规则重装。只是说明，不需要处理 |
+| 日志有 `bypass host X did not resolve` | 日志 | 服务端、STUN 或 TURN 的主机名解析失败，它的旁路没装。若某条规则的前缀覆盖了它的地址，去它的连接会走进隧道。检查 DNS；解析恢复后一分钟内自动补上 |
 | 命中规则的目标不通，状态里出口离线 | `egress peer N: offline`，拦截计数 `egress-unavailable` | 出口设备不在线、服务端未打开租户开关或出口策略、或这台消费端不在允许列表里。出口设备上 `egress` 显示 `not serving` 说明它没收到策略 |
 | 出口在线但特定目标不通 | 拦截计数 `rejected-egress_dest_denied` 等；出口上的 `refused` | 出口策略拒绝了这个目标，检查 `destinationRules`、`scope`、协议与端口 |
 | ping 不通但 TCP 正常 | 拦截计数 `unsupported-protocol` | 一期不转发 ICMP，符合预期 |
@@ -197,7 +200,6 @@ ip rule add fwmark 0x5350 table 100
 - **客户端不处理服务端下发的出口目录，也不上报出口计数。** 出口是否可用取自组网在线状态；管理接口的活动页现在总是空的。
 - **遇到版本过旧的对端时没有专门提示**，只会表现为出口离线。
 - **出口侧没有字节速率限制**，只有并发数与空闲超时上限。
-- **Go、.NET 客户端崩溃后若删光规则再启动，残留路由不会被撤回**，这些目标会一直不通到重启。先恢复一条规则启动一次再删，或重启机器。
-- **Java 客户端应用规则的时机过早**，控制端点与对端端点的旁路保护在 Java 上没有生效。在修复前，消费端建议使用 Go 或 .NET 客户端。
+- **切网或休眠恢复后不会对照真实路由表修复。** 虚拟网卡重建时路由会跟着重装；但网卡没动、只是系统路由表被别的东西改了（切网、休眠恢复、另一个 VPN 起落），本功能发现不了。遇到这种情况重新连接一次（断开再连，或重启客户端）。
 - **Windows 的路由安装与撤销尚未在真机上执行过**；macOS 的安装路径在 CI 真机上验证过，但指向的是回环接口而不是 utun。
 - **桌面图形界面没有出口分流页面。**
