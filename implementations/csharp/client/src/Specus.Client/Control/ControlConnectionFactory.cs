@@ -110,9 +110,28 @@ internal sealed class ControlConnection : IAsyncDisposable
     {
         _tcp = tcp;
         Stream = stream;
+        RemoteEndPoint = RemoteEndPointOf(tcp);
     }
 
     internal Stream Stream { get; }
+
+    /// <summary>
+    /// The address this connection was made to, read once at connect time: it is what the egress
+    /// consumer's bypass has to pin, and the socket may be disposed by the time that is asked.
+    /// </summary>
+    internal System.Net.EndPoint? RemoteEndPoint { get; }
+
+    private static System.Net.EndPoint? RemoteEndPointOf(TcpClient tcp)
+    {
+        try
+        {
+            return tcp.Client.RemoteEndPoint;
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+            return null;
+        }
+    }
 
     public async ValueTask DisposeAsync()
     {

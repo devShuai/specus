@@ -100,6 +100,33 @@ public class PeerEgressRouteVectorTests
         }
     }
 
+    /// <summary>
+    /// Whether a plan recomputed on the tick is applied. Three runtimes that disagreed here would
+    /// rewrite their journals and retry their conflicts on different schedules for the same inputs.
+    /// </summary>
+    [Fact]
+    public void ReconcileDecisionsMatchTheSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-routes-v1.json");
+        var reconcile = vector.RootElement.GetProperty("reconcile");
+        var cases = reconcile.GetProperty("cases");
+        Assert.True(cases.GetArrayLength() > 0, "routes vector carried no reconcile cases");
+        Assert.Equal(PeerEgressRoutePlanner.RetryAfterMillis, reconcile.GetProperty("retryAfterMs").GetInt64());
+
+        const long start = 1_758_196_800_000L;
+        foreach (var testCase in cases.EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString();
+            var previous = testCase.GetProperty("previous");
+            var last = previous.ValueKind == JsonValueKind.Null
+                ? null
+                : new PeerEgressPlanAttempt(start, RoutesOf(previous), testCase.GetProperty("troubled").GetBoolean());
+            var apply = PeerEgressRoutePlanner.ReconcileDue(last,
+                RoutesOf(testCase.GetProperty("desired")), start + testCase.GetProperty("elapsedMs").GetInt64());
+            Assert.True(testCase.GetProperty("expect").GetProperty("apply").GetBoolean() == apply, name);
+        }
+    }
+
     [Fact]
     public void RouteDiffsMatchTheSharedVector()
     {

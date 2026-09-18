@@ -7,6 +7,7 @@ import com.theshuai.common.peeregress.PeerEgressFrame;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -74,6 +75,30 @@ final class PeerEgressMesh implements AutoCloseable {
         default Path routeJournalPath() {
             return null;
         }
+
+        /** This node's own consumer rules, fixed for the life of the process. */
+        default List<PeerEgressRule> consumerRules() {
+            return List.of();
+        }
+
+        /** Whether there is an interface to route into: a real device that started. */
+        default boolean deviceReady() {
+            return true;
+        }
+
+        /** What the device is instead, for the line that says the routes are waiting on it. */
+        default String deviceStatus() {
+            return "absent";
+        }
+
+        /**
+         * The hosts the tunnel's transport talks to, as URLs, host:port pairs or bare hosts: the
+         * control connection, the login server, STUN and TURN, the relay. Resolved by the plane,
+         * so a hostname is fine here.
+         */
+        default List<String> bypassHosts() {
+            return List.of();
+        }
     }
 
     private record Outbound(long consumer, byte[] frame) {
@@ -107,15 +132,38 @@ final class PeerEgressMesh implements AutoCloseable {
      */
     private volatile PeerEgressStatus.ApplyOutcome applied = PeerEgressStatus.ApplyOutcome.none();
 
+    /**
+     * The consumer's route plan, kept true on the mesh's own tick. Guarded by {@link #planLock},
+     * which is never held while anything that can wait on the mesh runs: a reconcile resolves
+     * hostnames and runs route commands, and the mesh's own thread must never queue behind it.
+     */
+    private final Object planLock = new Object();
+    private final PeerEgressBypassResolver bypass;
+    private PeerEgressRoutePlanner.PlanAttempt lastPlan;
+    private String consumerKey = "";
+    private String refusalsLogged = "";
+    private String conflictsLogged = "";
+    private String errorLogged = "";
+    private String bypassFailedLogged = "";
+    private boolean deviceWaitLogged;
+
     PeerEgressMesh(Host host) {
-        this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())), null);
+        this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())),
+                null, null);
     }
 
     PeerEgressMesh(Host host, PeerEgressRuntime.Dialer dialer,
             PeerEgressRouteInstaller.Commander commander) {
+        this(host, dialer, commander, null);
+    }
+
+    /** @param lookup how bypass hostnames are resolved, or null for the system resolver */
+    PeerEgressMesh(Host host, PeerEgressRuntime.Dialer dialer,
+            PeerEgressRouteInstaller.Commander commander, PeerEgressBypassResolver.Lookup lookup) {
         this.host = host;
         this.dialer = dialer;
         this.commander = commander;
+        this.bypass = new PeerEgressBypassResolver(lookup);
     }
 
     /**
@@ -279,13 +327,6 @@ final class PeerEgressMesh implements AutoCloseable {
     }
 
     /**
-     * Installs the consumer's own rules and the routes they need.
-     *
-     * <p>Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong
-     * all at once, and refusing to apply any of it would leave a user with one typo sending
-     * everything out locally, which is the failure this feature exists to prevent.
-     */
-    /**
      * The egress section of the diagnostic snapshot.
      *
      * <p>The consumer's half is read under this monitor because the consumer has no lock of its
@@ -306,50 +347,183 @@ final class PeerEgressMesh implements AutoCloseable {
                 plane == null ? null : plane.statusSnapshot());
     }
 
+    /**
+     * Installs the consumer's own rules and the routes they need, now.
+     *
+     * <p>Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong
+     * all at once, and refusing to apply any of it would leave a user with one typo sending
+     * everything out locally, which is the failure this feature exists to prevent.
+     */
     void applyRules(List<PeerEgressRule> rules) {
-        PeerEgressConsumer consumerRole = ensureConsumer();
-        String meshCidr = meshCidrOrDefault();
-        deliverPurges(consumerRole.configure(rules, meshCidr, host.virtualIp(),
-                System.currentTimeMillis()));
+        reconcile(rules == null ? List.of() : rules, System.currentTimeMillis());
+    }
 
-        PeerEgressRoutePlanner.Plan plan =
-                PeerEgressRoutePlanner.plan(rules, host.peerEndpointAddresses(), meshCidr);
-        for (PeerEgressRoutePlanner.Refusal refusal : plan.refused()) {
-            log.warn("[peer-egress-consumer] rule {} ({}) refused: {}",
-                    refusal.index(), refusal.match(), refusal.code());
+    /**
+     * Recomputes the consumer's routes from what the host knows now and applies them if that is
+     * due: once the virtual device is up, and on the mesh's own tick from then on.
+     *
+     * <p>The rules are fixed for the life of the process, but what they need installed is not. A
+     * bypass exists for an address a rule covers, and those addresses move: peers connect and
+     * drop, the relay is reassigned, the control connection is re-established.
+     */
+    void reconcileRoutes() {
+        reconcile(host.consumerRules(), System.currentTimeMillis());
+    }
+
+    void reconcile(List<PeerEgressRule> rules, long nowMs) {
+        Map<Long, List<String>> purge;
+        synchronized (planLock) {
+            if (closed.get()) {
+                return;
+            }
+            purge = reconcileLocked(rules, nowMs);
+        }
+        // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
+        // that can wait on the mesh may run while a lock the mesh itself may need is held.
+        deliverPurges(purge);
+    }
+
+    private Map<Long, List<String>> reconcileLocked(List<PeerEgressRule> rules, long nowMs) {
+        String meshCidr = meshCidrOrDefault();
+        // The consumer exists only when there are rules for it to apply. Building it for an empty
+        // set would report a consumer with nothing to do.
+        Map<Long, List<String>> purge = rules.isEmpty() ? Map.of() : configureConsumer(rules, meshCidr, nowMs);
+
+        // Without a device there is nothing to route into. A rule's route pointed at an interface
+        // that is not there is a black hole rather than the local fallback the user would get
+        // with no route at all, so the plan is empty until the device is up, and empties again if
+        // it goes.
+        List<PeerEgressRoutePlanner.Route> desired = List.of();
+        if (host.deviceReady()) {
+            deviceWaitLogged = false;
+            PeerEgressRoutePlanner.Plan plan =
+                    PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs), meshCidr);
+            logRefusals(plan.refused());
+            desired = plan.routes();
+        } else if (!rules.isEmpty() && !deviceWaitLogged) {
+            deviceWaitLogged = true;
+            log.warn("[peer-egress-consumer] routes not installed: virtual device is {}",
+                    host.deviceStatus());
         }
 
         PeerEgressRouteInstaller installer = ensureRouteInstaller();
-        PeerEgressRouteInstaller.ApplyResult result = installer.apply(plan.routes());
+        if (!PeerEgressRoutePlanner.reconcileDue(lastPlan, desired, nowMs)) {
+            return purge;
+        }
+        PeerEgressRouteInstaller.ApplyResult result = installer.apply(desired);
+        lastPlan = new PeerEgressRoutePlanner.PlanAttempt(nowMs, desired,
+                !result.conflicts().isEmpty() || result.error() != null);
+
         // Remembered before it is logged. A conflict is the one part of this outcome nothing can
         // recompute -- the answer came from the platform's routing table at this moment -- and
         // writing it only to the log is what left an operator with no way to see that a rule they
         // wrote is not in force.
-        applied = new PeerEgressStatus.ApplyOutcome(System.currentTimeMillis(),
-                List.copyOf(result.conflicts()),
-                result.error() == null ? "" : String.valueOf(result.error().getMessage()),
+        String error = result.error() == null ? "" : String.valueOf(result.error().getMessage());
+        applied = new PeerEgressStatus.ApplyOutcome(nowMs, List.copyOf(result.conflicts()), error,
                 result.rolledBack(), true);
+
+        // Logged when they change, not on every retry. A conflict is retried every minute for as
+        // long as the other route is there, and repeating the same line each time would bury the
+        // one that says it went away.
+        List<String> conflicts = new ArrayList<>();
         for (PeerEgressRouteInstaller.RouteConflict conflict : result.conflicts()) {
-            // Not preempted and not compared by metric. The operator is told which of their own
-            // routes is in the way, so they can decide rather than discover it later.
-            log.warn("[peer-egress-consumer] route {} not installed, already present: {}",
-                    conflict.route().cidr(), conflict.existing());
+            conflicts.add(conflict.route().cidr() + "=" + conflict.existing());
         }
-        if (result.error() != null) {
-            log.warn("[peer-egress-consumer] route install failed: {} rolledBack={}",
-                    result.error().getMessage(), result.rolledBack());
+        String joined = String.join(";", conflicts);
+        if (!joined.equals(conflictsLogged)) {
+            conflictsLogged = joined;
+            for (PeerEgressRouteInstaller.RouteConflict conflict : result.conflicts()) {
+                // Not preempted and not compared by metric. The operator is told which of their
+                // own routes is in the way, so they can decide rather than discover it later.
+                log.warn("[peer-egress-consumer] route {} not installed, already present: {}",
+                        conflict.route().cidr(), conflict.existing());
+            }
+        }
+        if (!error.equals(errorLogged)) {
+            errorLogged = error;
+            if (result.error() != null) {
+                log.warn("[peer-egress-consumer] route install failed: {} rolledBack={}",
+                        result.error().getMessage(), result.rolledBack());
+            }
         }
         if (!result.added().isEmpty() || !result.removed().isEmpty()) {
             log.info("[peer-egress-consumer] routes added={} removed={}",
                     result.added().size(), result.removed().size());
         }
+        return purge;
     }
 
     /**
-     * Builds the installer and adopts any journal a previous run left.
+     * Gives the consumer its rules, once per distinct configuration.
      *
-     * <p>Adoption comes first so a process that was killed has its routes taken back rather than
-     * left for a user to find and wonder about.
+     * <p>Reconfiguring purges the flows the new rules no longer cover, and with the same rules that
+     * is every flow being re-examined for nothing on every tick; with a change of virtual IP it is
+     * what has to happen.
+     */
+    private Map<Long, List<String>> configureConsumer(List<PeerEgressRule> rules, String meshCidr, long nowMs) {
+        String virtualIp = host.virtualIp() == null ? "" : host.virtualIp().trim();
+        StringBuilder key = new StringBuilder(meshCidr).append('|').append(virtualIp);
+        for (PeerEgressRule rule : rules) {
+            key.append('|').append(rule.getMatch()).append(' ').append(rule.getAction())
+                    .append(' ').append(rule.getEgressClientId()).append(' ').append(rule.getPort());
+        }
+        if (key.toString().equals(consumerKey)) {
+            return Map.of();
+        }
+        consumerKey = key.toString();
+        return ensureConsumer().configure(rules, meshCidr, virtualIp, nowMs);
+    }
+
+    /**
+     * Reports the rules that were thrown out, once per distinct set. The rules do not change while
+     * the process runs, so in practice this is once.
+     */
+    private void logRefusals(List<PeerEgressRoutePlanner.Refusal> refused) {
+        List<String> keys = new ArrayList<>();
+        for (PeerEgressRoutePlanner.Refusal refusal : refused) {
+            keys.add(refusal.index() + ":" + refusal.code());
+        }
+        String joined = String.join(",", keys);
+        if (joined.equals(refusalsLogged)) {
+            return;
+        }
+        refusalsLogged = joined;
+        for (PeerEgressRoutePlanner.Refusal refusal : refused) {
+            log.warn("[peer-egress-consumer] rule {} ({}) refused: {}",
+                    refusal.index(), refusal.match(), refusal.code());
+        }
+    }
+
+    /**
+     * The addresses that must keep reaching the physical network: the host's transport endpoints,
+     * resolved, and every peer's own endpoint. Without them a rule broad enough to cover one would
+     * route the tunnel's transport into the tunnel.
+     */
+    private List<String> bypassAddresses(long nowMs) {
+        PeerEgressBypassResolver.Resolution resolution = bypass.resolve(host.bypassHosts(), nowMs);
+        String failed = String.join(",", resolution.failed());
+        if (!failed.equals(bypassFailedLogged)) {
+            bypassFailedLogged = failed;
+            for (String hostName : resolution.failed()) {
+                // Said once per failure, not per tick: the cache retries after its TTL and the
+                // next line is the one that says it resolved.
+                log.warn("[peer-egress-consumer] bypass host {} did not resolve; a rule covering it would capture it",
+                        hostName);
+            }
+        }
+        List<String> addresses = new ArrayList<>(resolution.addresses());
+        addresses.addAll(host.peerEndpointAddresses());
+        return addresses;
+    }
+
+    /**
+     * Builds the installer and takes back whatever a previous run left in the journal.
+     *
+     * <p>Taken back rather than adopted. A journal outlives the process that wrote it, and that
+     * process's interface is gone with it, so the routes it describes are either gone too or
+     * pointing at nothing; what is still wanted is put back by the apply that follows. This is
+     * also what clears a crash's leftovers when the rules have since been removed: there is no rule
+     * set so small that the journal is not read.
      */
     private PeerEgressRouteInstaller ensureRouteInstaller() {
         PeerEgressRouteInstaller existing = routes;
@@ -373,6 +547,10 @@ final class PeerEgressMesh implements AutoCloseable {
             } catch (Exception unusable) {
                 log.warn("[peer-egress-consumer] route journal unusable, starting empty: {}",
                         unusable.getMessage());
+            }
+            List<PeerEgressRoutePlanner.Route> leftover = installer.withdrawAll();
+            if (!leftover.isEmpty()) {
+                log.info("[peer-egress-consumer] took back {} routes left by a previous run", leftover.size());
             }
             routes = installer;
             return installer;
@@ -428,15 +606,25 @@ final class PeerEgressMesh implements AutoCloseable {
         }
     }
 
-    /** Takes back every route this feature installed. */
+    /**
+     * Takes back every route this feature installed and forgets the plan, so the next reconcile
+     * starts from nothing. Safe to call with the mesh's own lock held: nothing here waits on it.
+     */
     void withdrawRoutes() {
-        PeerEgressRouteInstaller installer;
-        synchronized (this) {
-            installer = routes;
-            routes = null;
-        }
-        if (installer != null) {
-            installer.withdrawAll();
+        synchronized (planLock) {
+            PeerEgressRouteInstaller installer;
+            synchronized (this) {
+                installer = routes;
+                routes = null;
+            }
+            lastPlan = null;
+            // What was logged belongs to the routes that are going; the next start says its own.
+            conflictsLogged = "";
+            errorLogged = "";
+            deviceWaitLogged = false;
+            if (installer != null) {
+                installer.withdrawAll();
+            }
         }
     }
 

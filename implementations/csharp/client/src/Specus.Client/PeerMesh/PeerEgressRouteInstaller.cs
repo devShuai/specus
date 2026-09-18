@@ -197,6 +197,13 @@ internal sealed class PeerEgressRouteInstaller(IPeerEgressRouteCommander command
         Exception? error = null;
 
         var difference = PeerEgressRoutePlanner.Diff([.. _installed], desired);
+        if (difference.Remove.Count == 0 && difference.Add.Count == 0)
+        {
+            // Nothing to do means nothing to write. This runs on a periodic tick, and rewriting an
+            // unchanged journal every few seconds is wear on the disk for a file that did not
+            // change.
+            return new PeerEgressRouteApplyResult([], [], [], false, null);
+        }
         foreach (var route in difference.Remove)
         {
             try

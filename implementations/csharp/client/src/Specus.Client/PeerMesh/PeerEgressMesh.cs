@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net;
 using Microsoft.Extensions.Logging;
 using Specus.Protocol.PeerEgress;
 
@@ -45,6 +46,22 @@ internal interface IPeerEgressMeshHost
 
     /// <summary>Where the route journal lives, or null for the default location.</summary>
     string? RouteJournalPath => null;
+
+    /// <summary>This node's own consumer rules, fixed for the life of the process.</summary>
+    IReadOnlyList<PeerEgressRule> ConsumerRules => [];
+
+    /// <summary>Whether there is an interface to route into: a real device that started.</summary>
+    bool DeviceReady => true;
+
+    /// <summary>What the device is instead, for the line that says the routes are waiting on it.</summary>
+    string DeviceStatus => "absent";
+
+    /// <summary>
+    /// The hosts the tunnel's transport talks to, as URLs, host:port pairs or bare hosts: the
+    /// control connection, the login server, STUN and TURN, the relay. Resolved by the plane, so a
+    /// hostname is fine here.
+    /// </summary>
+    IReadOnlyList<string?> BypassHosts() => [];
 }
 
 /// <summary>
@@ -71,11 +88,13 @@ internal interface IPeerEgressMeshHost
 /// for the same reason the dialer is: a test that applies rules must not run <c>ip route</c> on the
 /// machine it is running on.
 /// </param>
+/// <param name="lookup">How bypass hostnames are resolved, or null for the system resolver.</param>
 internal sealed class PeerEgressMesh(
     IPeerEgressMeshHost host,
     ILogger? logger = null,
     IPeerEgressDialer? dialer = null,
-    IPeerEgressRouteCommander? commander = null) : IDisposable
+    IPeerEgressRouteCommander? commander = null,
+    Func<string, IPAddress[]>? lookup = null) : IDisposable
 {
     /// <summary>
     /// Bounds frames waiting to be encrypted and sent. A full queue drops, which is safe here in a
@@ -120,6 +139,21 @@ internal sealed class PeerEgressMesh(
     private Thread? _tickLoop;
     private Thread? _deviceLoop;
     private bool _closed;
+
+    /// <summary>
+    /// The consumer's route plan, kept true on the mesh's own tick. Guarded by <see cref="_planLock"/>,
+    /// which is never held while anything that can wait on the mesh runs: a reconcile resolves
+    /// hostnames and runs route commands, and the mesh's own thread must never queue behind it.
+    /// </summary>
+    private readonly object _planLock = new();
+    private readonly PeerEgressBypassResolver _bypass = new(lookup);
+    private PeerEgressPlanAttempt? _lastPlan;
+    private string _consumerKey = "";
+    private string _refusalsLogged = "";
+    private string _conflictsLogged = "";
+    private string _errorLogged = "";
+    private string _bypassFailedLogged = "";
+    private bool _deviceWaitLogged;
 
     /// <summary>
     /// Builds the plane and the threads that carry its frames and its clock, on first use.
@@ -349,14 +383,6 @@ internal sealed class PeerEgressMesh(
             message.Policy.Enabled, message.Revision, message.Policy.DestinationRules.Count);
     }
 
-    /// <summary>
-    /// Installs the consumer's own rules and the routes they need.
-    /// </summary>
-    /// <remarks>
-    /// Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong all
-    /// at once, and refusing to apply any of it would leave a user with one typo sending everything
-    /// out locally, which is the failure this feature exists to prevent.
-    /// </remarks>
     /// <summary>The egress section of the diagnostic snapshot.</summary>
     /// <remarks>
     /// The consumer's half is read under this mesh's gate because the consumer has no lock of its
@@ -379,55 +405,201 @@ internal sealed class PeerEgressMesh(
             installer?.Installed ?? [], _applied, plane?.StatusSnapshot());
     }
 
-    public void ApplyRules(IReadOnlyList<PeerEgressRule> rules)
-    {
-        var consumerRole = EnsureConsumer();
-        var meshCidr = MeshCidrOrDefault();
-        DeliverPurges(consumerRole.Configure(rules, meshCidr, host.VirtualIp,
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+    /// <summary>
+    /// Installs the consumer's own rules and the routes they need, now.
+    /// </summary>
+    /// <remarks>
+    /// Refused rules are reported and skipped; the rest take effect. A rule set is rarely wrong all
+    /// at once, and refusing to apply any of it would leave a user with one typo sending everything
+    /// out locally, which is the failure this feature exists to prevent.
+    /// </remarks>
+    public void ApplyRules(IReadOnlyList<PeerEgressRule> rules) =>
+        Reconcile(rules, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
-        var plan = PeerEgressRoutePlanner.Plan(rules, host.PeerEndpointAddresses(), meshCidr);
-        foreach (var refusal in plan.Refused)
+    /// <summary>
+    /// Recomputes the consumer's routes from what the host knows now and applies them if that is
+    /// due: once the virtual device is up, and on the mesh's own tick from then on.
+    /// </summary>
+    /// <remarks>
+    /// The rules are fixed for the life of the process, but what they need installed is not. A
+    /// bypass exists for an address a rule covers, and those addresses move: peers connect and
+    /// drop, the relay is reassigned, the control connection is re-established.
+    /// </remarks>
+    public void ReconcileRoutes() =>
+        Reconcile(host.ConsumerRules, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+    public void Reconcile(IReadOnlyList<PeerEgressRule> rules, long nowMs)
+    {
+        IReadOnlyDictionary<long, IReadOnlyList<string>> purge;
+        lock (_planLock)
         {
-            logger?.LogWarning("[peer-egress-consumer] rule {Index} ({Match}) refused: {Code}",
-                refusal.Index, refusal.Match, refusal.Code);
+            lock (_gate)
+            {
+                if (_closed)
+                {
+                    return;
+                }
+            }
+            purge = ReconcileLocked(rules, nowMs);
+        }
+        // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
+        // that can wait on the mesh may run while a lock the mesh itself may need is held.
+        DeliverPurges(purge);
+    }
+
+    private IReadOnlyDictionary<long, IReadOnlyList<string>> ReconcileLocked(
+        IReadOnlyList<PeerEgressRule> rules, long nowMs)
+    {
+        var meshCidr = MeshCidrOrDefault();
+        // The consumer exists only when there are rules for it to apply. Building it for an empty
+        // set would start the threads that carry its work and report a consumer with nothing to do.
+        var purge = rules.Count == 0
+            ? new Dictionary<long, IReadOnlyList<string>>()
+            : ConfigureConsumer(rules, meshCidr, nowMs);
+
+        // Without a device there is nothing to route into. A rule's route pointed at an interface
+        // that is not there is a black hole rather than the local fallback the user would get with
+        // no route at all, so the plan is empty until the device is up, and empties again if it
+        // goes.
+        IReadOnlyList<PeerEgressRoute> desired = [];
+        if (host.DeviceReady)
+        {
+            _deviceWaitLogged = false;
+            var plan = PeerEgressRoutePlanner.Plan(rules, BypassAddresses(nowMs), meshCidr);
+            LogRefusals(plan.Refused);
+            desired = plan.Routes;
+        }
+        else if (rules.Count > 0 && !_deviceWaitLogged)
+        {
+            _deviceWaitLogged = true;
+            logger?.LogWarning("[peer-egress-consumer] routes not installed: virtual device is {Status}",
+                host.DeviceStatus);
         }
 
         var installer = EnsureRouteInstaller();
-        var result = installer.Apply(plan.Routes);
+        if (!PeerEgressRoutePlanner.ReconcileDue(_lastPlan, desired, nowMs))
+        {
+            return purge;
+        }
+        var result = installer.Apply(desired);
+        _lastPlan = new PeerEgressPlanAttempt(nowMs, desired, result.Conflicts.Count > 0 || result.Error is not null);
+
         // Remembered before it is logged. A conflict is the one part of this outcome nothing can
         // recompute -- the answer came from the platform's routing table at this moment -- and
         // writing it only to the log is what left an operator with no way to see that a rule they
         // wrote is not in force.
-        _applied = new PeerEgressApplyOutcome(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            result.Conflicts.ToList(), result.Error?.Message ?? string.Empty, result.RolledBack,
-            true);
-        foreach (var conflict in result.Conflicts)
+        var error = result.Error?.Message ?? string.Empty;
+        _applied = new PeerEgressApplyOutcome(nowMs, result.Conflicts.ToList(), error, result.RolledBack, true);
+
+        // Logged when they change, not on every retry. A conflict is retried every minute for as
+        // long as the other route is there, and repeating the same line each time would bury the
+        // one that says it went away.
+        var conflicts = string.Join(";", result.Conflicts.Select(c => c.Route.Cidr + "=" + c.Existing));
+        if (!string.Equals(conflicts, _conflictsLogged, StringComparison.Ordinal))
         {
-            // Not preempted and not compared by metric. The operator is told which of their own
-            // routes is in the way, so they can decide rather than discover it later.
-            logger?.LogWarning(
-                "[peer-egress-consumer] route {Cidr} not installed, already present: {Existing}",
-                conflict.Route.Cidr, conflict.Existing);
+            _conflictsLogged = conflicts;
+            foreach (var conflict in result.Conflicts)
+            {
+                // Not preempted and not compared by metric. The operator is told which of their
+                // own routes is in the way, so they can decide rather than discover it later.
+                logger?.LogWarning(
+                    "[peer-egress-consumer] route {Cidr} not installed, already present: {Existing}",
+                    conflict.Route.Cidr, conflict.Existing);
+            }
         }
-        if (result.Error is not null)
+        if (!string.Equals(error, _errorLogged, StringComparison.Ordinal))
         {
-            logger?.LogWarning("[peer-egress-consumer] route install failed: {Error} rolledBack={RolledBack}",
-                result.Error.Message, result.RolledBack);
+            _errorLogged = error;
+            if (result.Error is not null)
+            {
+                logger?.LogWarning("[peer-egress-consumer] route install failed: {Error} rolledBack={RolledBack}",
+                    result.Error.Message, result.RolledBack);
+            }
         }
         if (result.Added.Count > 0 || result.Removed.Count > 0)
         {
             logger?.LogInformation("[peer-egress-consumer] routes added={Added} removed={Removed}",
                 result.Added.Count, result.Removed.Count);
         }
+        return purge;
     }
 
     /// <summary>
-    /// Builds the installer and adopts any journal a previous run left.
+    /// Gives the consumer its rules, once per distinct configuration.
     /// </summary>
     /// <remarks>
-    /// Adoption comes first so a process that was killed has its routes taken back rather than left
-    /// for a user to find and wonder about.
+    /// Reconfiguring purges the flows the new rules no longer cover, and with the same rules that is
+    /// every flow being re-examined for nothing on every tick; with a change of virtual IP it is
+    /// what has to happen.
+    /// </remarks>
+    private IReadOnlyDictionary<long, IReadOnlyList<string>> ConfigureConsumer(
+        IReadOnlyList<PeerEgressRule> rules, string meshCidr, long nowMs)
+    {
+        var virtualIp = host.VirtualIp?.Trim() ?? string.Empty;
+        var key = meshCidr + "|" + virtualIp + "|" + string.Join("|",
+            rules.Select(rule => $"{rule.Match} {rule.Action} {rule.EgressClientId} {rule.Port}"));
+        if (string.Equals(key, _consumerKey, StringComparison.Ordinal))
+        {
+            return new Dictionary<long, IReadOnlyList<string>>();
+        }
+        _consumerKey = key;
+        return EnsureConsumer().Configure(rules, meshCidr, virtualIp, nowMs);
+    }
+
+    /// <summary>
+    /// Reports the rules that were thrown out, once per distinct set. The rules do not change while
+    /// the process runs, so in practice this is once.
+    /// </summary>
+    private void LogRefusals(IReadOnlyList<PeerEgressRuleRefusal> refused)
+    {
+        var joined = string.Join(",", refused.Select(r => r.Index + ":" + r.Code));
+        if (string.Equals(joined, _refusalsLogged, StringComparison.Ordinal))
+        {
+            return;
+        }
+        _refusalsLogged = joined;
+        foreach (var refusal in refused)
+        {
+            logger?.LogWarning("[peer-egress-consumer] rule {Index} ({Match}) refused: {Code}",
+                refusal.Index, refusal.Match, refusal.Code);
+        }
+    }
+
+    /// <summary>
+    /// The addresses that must keep reaching the physical network: the host's transport endpoints,
+    /// resolved, and every peer's own endpoint. Without them a rule broad enough to cover one would
+    /// route the tunnel's transport into the tunnel.
+    /// </summary>
+    private List<string> BypassAddresses(long nowMs)
+    {
+        var resolution = _bypass.Resolve(host.BypassHosts(), nowMs);
+        var failed = string.Join(",", resolution.Failed);
+        if (!string.Equals(failed, _bypassFailedLogged, StringComparison.Ordinal))
+        {
+            _bypassFailedLogged = failed;
+            foreach (var hostName in resolution.Failed)
+            {
+                // Said once per failure, not per tick: the cache retries after its TTL and the
+                // next line is the one that says it resolved.
+                logger?.LogWarning(
+                    "[peer-egress-consumer] bypass host {Host} did not resolve; a rule covering it would capture it",
+                    hostName);
+            }
+        }
+        var addresses = new List<string>(resolution.Addresses);
+        addresses.AddRange(host.PeerEndpointAddresses());
+        return addresses;
+    }
+
+    /// <summary>
+    /// Builds the installer and takes back whatever a previous run left in the journal.
+    /// </summary>
+    /// <remarks>
+    /// Taken back rather than adopted. A journal outlives the process that wrote it, and that
+    /// process's interface is gone with it, so the routes it describes are either gone too or
+    /// pointing at nothing; what is still wanted is put back by the apply that follows. This is
+    /// also what clears a crash's leftovers when the rules have since been removed: there is no
+    /// rule set so small that the journal is not read.
     /// </remarks>
     private PeerEgressRouteInstaller EnsureRouteInstaller()
     {
@@ -455,6 +627,12 @@ internal sealed class PeerEgressMesh(
                 logger?.LogWarning(
                     "[peer-egress-consumer] route journal unusable, starting empty: {Error}",
                     unusable.Message);
+            }
+            var leftover = installer.WithdrawAll();
+            if (leftover.Count > 0)
+            {
+                logger?.LogInformation("[peer-egress-consumer] took back {Count} routes left by a previous run",
+                    leftover.Count);
             }
             _routes = installer;
             return installer;
@@ -516,16 +694,27 @@ internal sealed class PeerEgressMesh(
         }
     }
 
-    /// <summary>Takes back every route this feature installed.</summary>
+    /// <summary>
+    /// Takes back every route this feature installed and forgets the plan, so the next reconcile
+    /// starts from nothing. Safe to call with the mesh's own lock held: nothing here waits on it.
+    /// </summary>
     public void WithdrawRoutes()
     {
-        PeerEgressRouteInstaller? installer;
-        lock (_gate)
+        lock (_planLock)
         {
-            installer = _routes;
-            _routes = null;
+            PeerEgressRouteInstaller? installer;
+            lock (_gate)
+            {
+                installer = _routes;
+                _routes = null;
+            }
+            _lastPlan = null;
+            // What was logged belongs to the routes that are going; the next start says its own.
+            _conflictsLogged = "";
+            _errorLogged = "";
+            _deviceWaitLogged = false;
+            installer?.WithdrawAll();
         }
-        installer?.WithdrawAll();
     }
 
     /// <summary>
