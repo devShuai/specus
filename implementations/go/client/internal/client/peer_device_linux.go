@@ -60,7 +60,15 @@ func (device *linuxTunDevice) Start(stopCh <-chan struct{}, outbound func([]byte
 		device.setStatus("ERROR", "missing peer mesh virtual IP or CIDR")
 		return errors.New(device.err)
 	}
-	file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	// Opened as a bare descriptor, attached, and only then wrapped in an os.File.
+	//
+	// os.OpenFile would register the descriptor with the runtime's network poller immediately, and
+	// at that moment it is still an unattached /dev/net/tun: the kernel answers a poll on one with
+	// EPOLLERR, the poller records that error against the descriptor, and it stays recorded after
+	// TUNSETIFF attaches the interface. Every later read then fails with "not pollable" before it
+	// reaches the kernel, so the device comes up, carries its address and routes, and never
+	// delivers a packet. Attaching first means the descriptor is only ever polled as a live tun.
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		device.setStatus("ERROR", fmt.Sprintf("open /dev/net/tun failed: %v", err))
 		return err
@@ -68,13 +76,21 @@ func (device *linuxTunDevice) Start(stopCh <-chan struct{}, outbound func([]byte
 	var ifr [linuxIFNAMSIZ + 64]byte
 	copy(ifr[:linuxIFNAMSIZ], []byte(device.name))
 	binary.LittleEndian.PutUint16(ifr[linuxIFNAMSIZ:], linuxIFFTUN|linuxIFFNOPI)
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(linuxTunSetIFF), uintptr(unsafe.Pointer(&ifr[0])))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(linuxTunSetIFF), uintptr(unsafe.Pointer(&ifr[0])))
 	if errno != 0 {
-		_ = file.Close()
+		_ = syscall.Close(fd)
 		err := errno
 		device.setStatus("ERROR", fmt.Sprintf("create TUN device failed: %v", err))
 		return err
 	}
+	// Non-blocking, so the os.File below is handed to the poller rather than parking an OS thread
+	// in every read. The descriptor is attached by now, which is the part that has to be true.
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		device.setStatus("ERROR", fmt.Sprintf("set /dev/net/tun non-blocking failed: %v", err))
+		return err
+	}
+	file := os.NewFile(uintptr(fd), "/dev/net/tun")
 	actualName := strings.TrimRight(string(ifr[:linuxIFNAMSIZ]), "\x00")
 	if actualName != "" {
 		device.name = actualName
