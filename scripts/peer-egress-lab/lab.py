@@ -332,7 +332,7 @@ class Lab:
         }
         path = self.work / "server.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        self.start("server", ns("srv", "env", "SPECUS_ENV=test", self.args.server, "-config", str(path)))
+        self.launch_server(path)
         ready, elapsed = self.wait_for("server admin HTTP",
                                        lambda: self.http_alive(f"http://{SERVER_IP}:{ADMIN_PORT}/"), 60)
         if not ready:
@@ -343,6 +343,23 @@ class Lab:
             self.admin.call("POST", "/api/admin/client-credentials",
                             {"apiKey": f"lab-{role}", "secret": self.secrets[role], "maxOnlineInstances": 2})
         self.say(f"server up in {elapsed:.1f}s, credentials created")
+
+    def restart_server(self):
+        """Takes the server away and brings it back on the same config and database.
+
+        The point is the consumer's control connection: every client loses it and reconnects, which
+        is the routine event that used to withdraw the consumer's routes for the length of the
+        reconnect. Doing it this way makes that window happen on purpose rather than waiting for
+        one to turn up.
+        """
+        self.procs["server"].stop()
+        return self.launch_server(self.work / "server.json")
+
+    def launch_server(self, path):
+        self.start("server", ns("srv", "env", "SPECUS_ENV=test", self.args.server, "-config", str(path)))
+        ready, _ = self.wait_for("the server's admin HTTP",
+                                 lambda: self.http_alive(f"http://{SERVER_IP}:{ADMIN_PORT}/"), 60)
+        return bool(ready)
 
     def client_config(self, role, rules=None):
         config = {
@@ -824,6 +841,52 @@ class Lab:
         if got:
             self.measure("egress restart to first flow through it again", round(time.time() - restarted_at, 1), "s")
 
+    def fault_server_restart(self):
+        """The control connection going away must not hand the claimed destinations back to the
+        machine's own default route.
+
+        Restarting the server drops every client's control connection at a moment this can watch,
+        instead of waiting for a blip. While it is down the consumer cannot signal, but the routes
+        it installed are still the truth about where that traffic goes: into the tunnel, to be
+        carried or refused. Out of the physical interface is the one answer that is never right.
+        """
+        mark = self.target_mark()
+        consumer = self.procs["consumer"]
+        offset = consumer.log_offset()
+        self.procs["server"].stop()
+        dropped = consumer.wait_log(r"control connection closed", 30, offset)
+        self.check("server gone: the consumer notices its control connection is gone", bool(dropped),
+                   dropped.group(0) if dropped else "the consumer never logged a lost connection")
+
+        table = self.consumer_table()
+        self.snapshots["while the control connection was down"] = table
+        held = f"{RULE_CIDR} dev {CONSUMER_TUN}" in table
+        self.check("server gone: the rule's route stays installed while the connection is down",
+                   held, "\n".join(self.lab_routes(table)) or "nothing is installed")
+
+        outcomes = []
+        for _ in range(4):
+            got = self.whoami(TARGET_URL)
+            outcomes.append((got["code"], got.get("src")))
+        direct = [source for _, source in outcomes if source == CONSUMER_IP]
+        self.check("server gone: no request under the rule leaves from the consumer's own address",
+                   not direct, f"{len(direct)} of {len(outcomes)} probes came from the consumer itself")
+        self.leak_check("server gone: nothing leaked to the target from the consumer's address", mark)
+
+        offset = consumer.log_offset()
+        if not self.launch_server(self.work / "server.json"):
+            raise LabAbort("the server did not come back:\n" + self.procs["server"].log_since()[-3000:])
+        back = consumer.wait_log(r"control connection established", 90, offset)
+        self.check("server back: the consumer reconnects", bool(back))
+        self.check("server back: flows go through the egress again", bool(self.wait_ready()))
+        # Whatever the reconnect did to the table, what it ends with is what matters.
+        table = self.consumer_table()
+        self.snapshots["after the control connection came back"] = table
+        self.check("server back: the rule's route and the bypass are both in place",
+                   f"{RULE_CIDR} dev {CONSUMER_TUN}" in table
+                   and any(line.startswith(f"{SERVER_IP} via {CONSUMER_GW}") for line in table.splitlines()),
+                   "\n".join(self.lab_routes(table)))
+
     def fault_rule_block(self):
         consumer = self.procs["consumer"]
         consumer.stop()
@@ -935,6 +998,7 @@ class Lab:
                 self.fault_acl_revoked()
                 self.fault_switch_off()
                 self.fault_egress_stopped()
+                self.fault_server_restart()
                 self.fault_rule_block()
                 self.fault_kill_9()
         except LabAbort as error:

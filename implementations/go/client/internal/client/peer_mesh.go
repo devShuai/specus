@@ -88,20 +88,25 @@ type peerMeshClient struct {
 	config Config
 	logger *log.Logger
 
-	mu           sync.Mutex
-	runtime      RuntimeConfig
-	conn         net.Conn
-	sender       peerControlSender
-	udp          *net.UDPConn
-	stopCh       chan struct{}
-	peers        map[int64]*peerMeshPeer
-	sessions     map[int64]*peerMeshSession
-	sessionsByID map[int64]*peerMeshSession
-	pending      map[string]pendingPeerProbe
-	pendingStun  map[string]pendingStunBinding
-	pendingTurn  map[string]pendingTurnRequest
-	packets      map[int64][]pendingPeerPacket
-	prepared     map[int64]time.Time
+	mu      sync.Mutex
+	runtime RuntimeConfig
+	conn    net.Conn
+	sender  peerControlSender
+	// lastControlRemote is the address the control connection last reached the server at, kept
+	// across a suspension. The bypass needs it while conn is nil: the routes stay installed now
+	// that a reconnect no longer withdraws them, so a rule covering the server's prefix would
+	// capture the reconnect itself and turn it into a black hole.
+	lastControlRemote string
+	udp               *net.UDPConn
+	stopCh            chan struct{}
+	peers             map[int64]*peerMeshPeer
+	sessions          map[int64]*peerMeshSession
+	sessionsByID      map[int64]*peerMeshSession
+	pending           map[string]pendingPeerProbe
+	pendingStun       map[string]pendingStunBinding
+	pendingTurn       map[string]pendingTurnRequest
+	packets           map[int64][]pendingPeerPacket
+	prepared          map[int64]time.Time
 	// H-2：记录已排程密集退避重试的 session，防止重复排程；本轮结束后释放以便路径失效后重新进入。
 	holePunchRetryScheduled map[int64]bool
 	// H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
@@ -571,6 +576,35 @@ func (mesh *peerMeshClient) ensureServices() *peerServiceRuntime {
 		mesh.services = newPeerServiceRuntime(mesh.logger, nil)
 	}
 	return mesh.services
+}
+
+// suspend gives up the control connection without giving up what the mesh installed.
+//
+// A control connection that drops is routine: a blip, a server restart, a network change. The
+// client reconnects within seconds, and tearing the mesh down for that used to withdraw every
+// route this feature owns and close the virtual device the rest of them point into. For as long
+// as the reconnect took, traffic a rule had claimed went out of the local default route instead
+// of being blocked -- the one outcome the feature exists to prevent, and worse than the black
+// hole the withdrawal was there to avoid. A black hole fails; a leak succeeds at the wrong thing.
+//
+// So the device, the routes and the peer sessions stay. Peer traffic runs over UDP and does not
+// need the server, so flows that were working keep working, and traffic a rule claims keeps going
+// into a tunnel that either carries it or refuses it. Only the serving side stops: while the
+// control connection is down a revocation cannot reach us, and an egress that cannot hear one
+// should not be taking new flows.
+//
+// The next start finds the mesh still running under an unchanged runtime config and takes its
+// light path, which reuses the device and reconciles the routes rather than replacing them.
+func (mesh *peerMeshClient) suspend() {
+	// Outside the lock, for the ordering reason stop() gives below.
+	mesh.shutdownEgress()
+	mesh.mu.Lock()
+	if mesh.conn != nil && mesh.conn.RemoteAddr() != nil {
+		mesh.lastControlRemote = mesh.conn.RemoteAddr().String()
+	}
+	mesh.conn = nil
+	mesh.sender = nil
+	mesh.mu.Unlock()
 }
 
 func (mesh *peerMeshClient) stop() {

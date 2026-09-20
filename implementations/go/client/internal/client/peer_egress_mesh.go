@@ -570,6 +570,7 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	conn := mesh.conn
+	lastControlRemote := mesh.lastControlRemote
 	relay := mesh.relay
 	peers := make([]string, 0, len(mesh.sessions))
 	for _, session := range mesh.sessions {
@@ -582,6 +583,10 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 	hosts := make([]string, 0, 8)
 	if conn != nil && conn.RemoteAddr() != nil {
 		hosts = append(hosts, conn.RemoteAddr().String())
+	} else if lastControlRemote != "" {
+		// Suspended: the connection is gone but the routes are not, so the address it used still
+		// has to stay out of the tunnel or the reconnect that restores it cannot get through.
+		hosts = append(hosts, lastControlRemote)
 	}
 	hosts = append(hosts, mesh.config.ServerBaseURL, runtime.PeerMesh.StunHost, runtime.PeerMesh.TurnHost)
 	hosts = append(hosts, runtime.PeerMesh.PublicStunServers...)
