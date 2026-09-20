@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,14 @@ type fakeRouteCommander struct {
 	installLog  []string
 	removeLog   []string
 	conflictLog []string
+
+	// The table as a repair reads it: the physical routes, which a test changes to move the
+	// machine to another network, and where each bypass was pointed when it was installed, which
+	// stays put the way a real row does.
+	tunnel   string
+	physical []egressBindRoute
+	hops     map[string]egressBindRoute
+	tableErr error
 }
 
 func newFakeRouteCommander() *fakeRouteCommander {
@@ -30,6 +40,11 @@ func newFakeRouteCommander() *fakeRouteCommander {
 		foreign:    map[string]string{},
 		installErr: map[string]error{},
 		removeErr:  map[string]error{},
+		tunnel:     "specus0",
+		physical: []egressBindRoute{
+			{Prefix: "0.0.0.0/0", Interface: "eth0", Gateway: "192.0.2.1", Metric: 100, Usable: true},
+		},
+		hops: map[string]egressBindRoute{},
 	}
 }
 
@@ -43,6 +58,14 @@ func (c *fakeRouteCommander) Install(route egressRoute) error {
 	if err := c.installErr[route.CIDR]; err != nil {
 		return err
 	}
+	if route.Kind == egressRouteBypass {
+		// Resolved the way the real commanders resolve it: from the physical routes, now.
+		hop, ok := selectEgressBypassHop(c.physical, c.tunnel, nil, strings.TrimSuffix(route.CIDR, "/32"))
+		if !ok {
+			return errEgressNoPhysicalRoute
+		}
+		c.hops[route.CIDR] = hop
+	}
 	c.table[route.CIDR] = route
 	c.installLog = append(c.installLog, route.CIDR)
 	return nil
@@ -53,8 +76,36 @@ func (c *fakeRouteCommander) Remove(route egressRoute) error {
 		return err
 	}
 	delete(c.table, route.CIDR)
+	delete(c.hops, route.CIDR)
 	c.removeLog = append(c.removeLog, route.CIDR)
 	return nil
+}
+
+func (c *fakeRouteCommander) Table() ([]egressBindRoute, string, error) {
+	if c.tableErr != nil {
+		return nil, "", c.tableErr
+	}
+	rows := append([]egressBindRoute(nil), c.physical...)
+	cidrs := make([]string, 0, len(c.table))
+	for cidr := range c.table {
+		cidrs = append(cidrs, cidr)
+	}
+	sort.Strings(cidrs)
+	for _, cidr := range cidrs {
+		if c.table[cidr].Kind == egressRouteBypass {
+			hop := c.hops[cidr]
+			rows = append(rows, egressBindRoute{Prefix: cidr, Interface: hop.Interface, Gateway: hop.Gateway, Usable: true})
+			continue
+		}
+		rows = append(rows, egressBindRoute{Prefix: cidr, Interface: c.tunnel, Usable: true})
+	}
+	return rows, c.tunnel, nil
+}
+
+// lose drops a route from the table behind the journal's back, the way an interface going down does.
+func (c *fakeRouteCommander) lose(cidr string) {
+	delete(c.table, cidr)
+	delete(c.hops, cidr)
 }
 
 func journalPath(t *testing.T) string {

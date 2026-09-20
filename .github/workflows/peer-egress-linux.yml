@@ -54,7 +54,8 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           sudo -n unshare -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
             -test.run 'TestLinuxCommander' -test.v | tee "$RUNNER_TEMP/linux.log"
-          for name in InstallsABypassUnderItsOwnTunnelRoute RefusesABypassOnlyABlackholeWouldCarry; do
+          for name in InstallsABypassUnderItsOwnTunnelRoute RefusesABypassOnlyABlackholeWouldCarry \
+              RepairsARouteTheTableLost; do
             if ! grep -q "^--- PASS: TestLinuxCommander$name" "$RUNNER_TEMP/linux.log"; then
               echo "TestLinuxCommander$name did not run against a real routing table"
               exit 1

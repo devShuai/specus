@@ -152,11 +152,17 @@ func (c *macosEgressRouteCommander) bypassArgs(cidr string, hop egressRouteHop) 
 }
 
 func (c *macosEgressRouteCommander) Remove(route egressRoute) error {
+	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
 	args, err := macosRemoveArgs(route.CIDR)
 	if err != nil {
 		return fmt.Errorf("remove %s: %w", route.CIDR, err)
 	}
 	return c.apply(args, "remove "+route.CIDR)
+}
+
+func (c *macosEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
+	routes, err := c.readTable()
+	return routes, c.tun, err
 }
 
 // apply runs a mutation and decides whether it worked.

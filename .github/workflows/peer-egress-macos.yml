@@ -133,7 +133,7 @@ jobs:
           sudo -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
             -test.run 'TestMacosCommander' -test.v | tee "$RUNNER_TEMP/mutation.log"
           for name in InstallsAndWithdrawsARealRoute InstallsABypassThroughTheRealNextHop \
-              InstallsABypassUnderItsOwnTunnelRoute; do
+              InstallsABypassUnderItsOwnTunnelRoute RepairsARouteTheTableLost; do
             if ! grep -q "^--- PASS: TestMacosCommander$name" "$RUNNER_TEMP/mutation.log"; then
               echo "TestMacosCommander$name did not run against the real routing table"
               exit 1

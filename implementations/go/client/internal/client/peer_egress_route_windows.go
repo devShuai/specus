@@ -150,11 +150,23 @@ func (c *windowsEgressRouteCommander) installBypass(route egressRoute) error {
 }
 
 func (c *windowsEgressRouteCommander) Remove(route egressRoute) error {
+	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
 	script, err := windowsRemoveRouteScript(route.CIDR)
 	if err != nil {
 		return err
 	}
 	return c.apply(script, "remove "+route.CIDR)
+}
+
+// Table reads the native forwarding table, the same reading the bypass fallback uses. The tunnel
+// is its index: that is what the rows carry, and the name cannot be matched against them.
+func (c *windowsEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
+	index, err := c.tunnelIndex()
+	if err != nil {
+		return nil, "", err
+	}
+	routes, err := readWindowsBindRoutes()
+	return routes, strconv.Itoa(index), err
 }
 
 // tunnelIndex resolves the TUN adapter's interface index, once.

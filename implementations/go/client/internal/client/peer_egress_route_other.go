@@ -26,3 +26,6 @@ func newEgressRouteCommanderForPlatform(_ string) egressRouteCommander {
 func (unsupportedEgressRouteCommander) Conflict(egressRoute) (bool, string) { return false, "" }
 func (unsupportedEgressRouteCommander) Install(egressRoute) error           { return errEgressRoutesUnsupported }
 func (unsupportedEgressRouteCommander) Remove(egressRoute) error            { return errEgressRoutesUnsupported }
+func (unsupportedEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
+	return nil, "", errEgressRoutesUnsupported
+}

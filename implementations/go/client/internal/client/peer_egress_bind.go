@@ -118,7 +118,10 @@ func egressBypassHopFromTable(address string, tunnel string, read func() ([]egre
 	if err != nil {
 		return egressBindRoute{}, fmt.Errorf("resolve bypass hop for %s past the tunnel: %w", address, err)
 	}
-	hop, ok := selectEgressBypassHop(routes, tunnel, nil, address)
+	// The bypass's own /32 is left out too. When one is being put back after a network change,
+	// the stale row is still in the table naming the old gateway, and it would win the lookup for
+	// its own address.
+	hop, ok := selectEgressBypassHop(routes, tunnel, []string{address + "/32"}, address)
 	if !ok {
 		return egressBindRoute{}, fmt.Errorf("resolve bypass hop for %s: %w", address, errEgressNoPhysicalRoute)
 	}

@@ -162,6 +162,36 @@ func TestMacosCommanderInstallsAndWithdrawsARealRoute(t *testing.T) {
 	}
 }
 
+// A route that left the table is found by reading the real one and put back.
+func TestMacosCommanderRepairsARouteTheTableLost(t *testing.T) {
+	commander := requireMacosMutation(t)
+	installer := newEgressRouteInstaller(commander, journalPath(t))
+	route := egressRoute{CIDR: macosTestPrefix, Kind: egressRouteToTun, Origin: "rule:" + macosTestPrefix}
+	if present, existing := commander.Conflict(route); present {
+		t.Fatalf("%s is already in this machine's table: %s", macosTestPrefix, existing)
+	}
+	if result := installer.apply([]egressRoute{route}); result.Err != nil || len(result.Added) != 1 {
+		t.Fatalf("apply: %+v", result)
+	}
+	defer installer.withdrawAll()
+
+	if healthy := installer.repair(); healthy.TableErr != nil || len(healthy.Repaired) != 0 {
+		t.Fatalf("a table with the route in it: %+v", healthy)
+	}
+	// Taken out behind the installer's back, the way a network change would.
+	if err := commander.Remove(route); err != nil {
+		t.Fatalf("remove %s: %v", macosTestPrefix, err)
+	}
+
+	result := installer.repair()
+	if result.TableErr != nil || result.Err != nil || len(result.Repaired) != 1 {
+		t.Fatalf("repair: %+v", result)
+	}
+	if present, existing := commander.Conflict(route); !present || !strings.Contains(existing, "lo0") {
+		t.Errorf("after the repair the table says present=%v %q, want the route back on lo0", present, existing)
+	}
+}
+
 // A bypass route, which is the other install form and the only one that reads `route -n get`.
 //
 // The next hop is resolved from the real table rather than supplied, so this is where the reading
