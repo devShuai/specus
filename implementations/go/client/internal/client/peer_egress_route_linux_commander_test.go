@@ -119,6 +119,39 @@ func TestLinuxCommanderInstallsABypassUnderItsOwnTunnelRoute(t *testing.T) {
 	}
 }
 
+// Routes the kernel dropped -- as it does with every route through an interface that goes down --
+// are found by reading the real table and put back through the real commands.
+func TestLinuxCommanderRepairsARouteTheTableLost(t *testing.T) {
+	linuxMutationNamespace(t)
+	installer := newEgressRouteInstaller(newLinuxEgressRouteCommander("specus0"), journalPath(t))
+	rule := egressRoute{CIDR: "203.0.113.0/24", Kind: egressRouteToTun, Origin: "rule:203.0.113.0/24"}
+	bypass := egressRoute{CIDR: "203.0.113.9/32", Kind: egressRouteBypass, Origin: "bypass"}
+	if result := installer.apply([]egressRoute{bypass, rule}); result.Err != nil || len(result.Added) != 2 {
+		t.Fatalf("apply: %+v", result)
+	}
+	defer installer.withdrawAll()
+
+	if healthy := installer.repair(); healthy.TableErr != nil || len(healthy.Repaired) != 0 {
+		t.Fatalf("a table with everything in it: %+v", healthy)
+	}
+	linuxRouteOutput(t, "route", "del", "203.0.113.0/24")
+	linuxRouteOutput(t, "route", "del", "203.0.113.9/32")
+
+	result := installer.repair()
+	if result.TableErr != nil || result.Err != nil || len(result.Repaired) != 2 || len(result.Lost) != 0 {
+		t.Fatalf("repair: %+v", result)
+	}
+	if got := linuxRouteOutput(t, "route", "show", "exact", "203.0.113.0/24"); !strings.Contains(got, "dev specus0") {
+		t.Errorf("the rule's route is %q after the repair, want it back in the tunnel", strings.TrimSpace(got))
+	}
+	if got := linuxRouteOutput(t, "route", "show", "exact", "203.0.113.9/32"); !strings.Contains(got, "via 192.168.64.1 dev eth0") {
+		t.Errorf("the bypass is %q after the repair, want it back via the gateway", strings.TrimSpace(got))
+	}
+	if again := installer.repair(); len(again.Repaired) != 0 {
+		t.Errorf("a second repair found more to do: %+v", again)
+	}
+}
+
 // When the only route past the tunnel is a blackhole, the bypass is refused rather than pinned
 // through the default route the blackhole deliberately overrides.
 func TestLinuxCommanderRefusesABypassOnlyABlackholeWouldCarry(t *testing.T) {

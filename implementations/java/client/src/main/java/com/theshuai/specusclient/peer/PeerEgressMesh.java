@@ -146,6 +146,10 @@ final class PeerEgressMesh implements AutoCloseable {
     private String errorLogged = "";
     private String bypassFailedLogged = "";
     private boolean deviceWaitLogged;
+    /** The last check of the table against the plan, and whether it left a reinstall undone. */
+    private long repairAtMillis;
+    private boolean repairTroubled;
+    private String tableErrorLogged = "";
 
     PeerEgressMesh(Host host) {
         this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())),
@@ -408,11 +412,17 @@ final class PeerEgressMesh implements AutoCloseable {
 
         PeerEgressRouteInstaller installer = ensureRouteInstaller();
         if (!PeerEgressRoutePlanner.reconcileDue(lastPlan, desired, nowMs)) {
+            // The common tick: the plan has nothing to do, so the table is checked against it.
+            if (host.deviceReady()) {
+                repairDrift(installer, nowMs);
+            }
             return purge;
         }
         PeerEgressRouteInstaller.ApplyResult result = installer.apply(desired);
         lastPlan = new PeerEgressRoutePlanner.PlanAttempt(nowMs, desired,
                 !result.conflicts().isEmpty() || result.error() != null);
+        repairAtMillis = 0;
+        repairTroubled = false;
 
         // Remembered before it is logged. A conflict is the one part of this outcome nothing can
         // recompute -- the answer came from the platform's routing table at this moment -- and
@@ -451,6 +461,63 @@ final class PeerEgressMesh implements AutoCloseable {
                     result.added().size(), result.removed().size());
         }
         return purge;
+    }
+
+    /**
+     * Puts back what the routing table lost since the plan was applied: a route dropped with its
+     * interface, a bypass still naming a gateway the machine left behind. Called under the plan
+     * lock on the ticks the plan itself has nothing to do.
+     */
+    private void repairDrift(PeerEgressRouteInstaller installer, long nowMs) {
+        if (repairTroubled && nowMs - repairAtMillis < PeerEgressRoutePlanner.RETRY_AFTER_MILLIS) {
+            return;
+        }
+        PeerEgressRouteInstaller.RepairResult result = installer.repair();
+        if (result.tableError() != null) {
+            // Said once per failure. Without the table nothing can be compared, and a machine
+            // whose `ip` is missing would otherwise say so every five seconds.
+            String text = String.valueOf(result.tableError().getMessage());
+            if (!text.equals(tableErrorLogged)) {
+                tableErrorLogged = text;
+                log.warn("[peer-egress-consumer] cannot read the routing table to check the routes: {}", text);
+            }
+            repairAtMillis = nowMs;
+            repairTroubled = true;
+            return;
+        }
+        tableErrorLogged = "";
+        repairAtMillis = nowMs;
+        repairTroubled = result.error() != null;
+
+        for (PeerEgressSocketBinding.Drift drift : result.repaired()) {
+            // Each one is a real event -- the machine changed networks -- so each one is said.
+            log.info("[peer-egress-consumer] route {} put back, it was {}", drift.route().cidr(), drift.reason());
+        }
+        if (!result.lost().isEmpty()) {
+            // Reported the way an apply reports a conflict, and remembered the same way, so the
+            // status lists the prefix as not installed with what holds it. The plan still wants
+            // it: marked troubled, it asks again after the interval and reports the conflict if
+            // it is still there.
+            List<PeerEgressRouteInstaller.RouteConflict> merged = new ArrayList<>(applied.conflicts());
+            for (PeerEgressRouteInstaller.RouteConflict lost : result.lost()) {
+                merged.removeIf(existing -> existing.route().cidr().equals(lost.route().cidr()));
+                merged.add(lost);
+                log.warn("[peer-egress-consumer] route {} lost to another route, not taken back: {}",
+                        lost.route().cidr(), lost.existing());
+            }
+            applied = new PeerEgressStatus.ApplyOutcome(nowMs, List.copyOf(merged), applied.error(),
+                    applied.rolledBack(), true);
+            if (lastPlan != null) {
+                lastPlan = new PeerEgressRoutePlanner.PlanAttempt(nowMs, lastPlan.desired(), true);
+            }
+        }
+        if (result.error() != null) {
+            String text = String.valueOf(result.error().getMessage());
+            if (!text.equals(errorLogged)) {
+                errorLogged = text;
+                log.warn("[peer-egress-consumer] route repair failed: {}", text);
+            }
+        }
     }
 
     /**
@@ -618,10 +685,13 @@ final class PeerEgressMesh implements AutoCloseable {
                 routes = null;
             }
             lastPlan = null;
+            repairAtMillis = 0;
+            repairTroubled = false;
             // What was logged belongs to the routes that are going; the next start says its own.
             conflictsLogged = "";
             errorLogged = "";
             deviceWaitLogged = false;
+            tableErrorLogged = "";
             if (installer != null) {
                 installer.withdrawAll();
             }

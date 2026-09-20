@@ -108,6 +108,24 @@ type egressBindVector struct {
 			} `json:"expect"`
 		} `json:"cases"`
 	} `json:"hops"`
+	Drift struct {
+		Cases []struct {
+			Name     string `json:"name"`
+			Platform string `json:"platform"`
+			Table    string `json:"table"`
+			Tunnel   string `json:"tunnel"`
+			Owned    []struct {
+				CIDR string `json:"cidr"`
+				Kind string `json:"kind"`
+			} `json:"owned"`
+			Routes []egressBindVectorRoute `json:"routes"`
+			Expect []struct {
+				CIDR   string `json:"cidr"`
+				Reason string `json:"reason"`
+				Action string `json:"action"`
+			} `json:"expect"`
+		} `json:"cases"`
+	} `json:"drift"`
 	SocketOptions struct {
 		Windows egressBindVectorOption `json:"windows"`
 		Macos   egressBindVectorOption `json:"macos"`

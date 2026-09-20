@@ -102,7 +102,13 @@ func readLinuxMainTable() ([]egressBindRoute, error) {
 }
 
 func (c *linuxEgressRouteCommander) Remove(route egressRoute) error {
+	delete(c.hops, strings.TrimSuffix(route.CIDR, "/32"))
 	return runCommand("ip", "route", "del", route.CIDR)
+}
+
+func (c *linuxEgressRouteCommander) Table() ([]egressBindRoute, string, error) {
+	routes, err := readLinuxMainTable()
+	return routes, c.tun, err
 }
 
 func runCommandOutput(args ...string) (string, error) {

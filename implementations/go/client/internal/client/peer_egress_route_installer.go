@@ -28,7 +28,12 @@ type egressRouteCommander interface {
 	// The description is what an operator reads, so it should say what is already there.
 	Conflict(route egressRoute) (bool, string)
 	Install(route egressRoute) error
+	// Remove takes a route out, and forgets whatever it had learned about where the route went:
+	// a bypass put back after a removal has to have its hop resolved again.
 	Remove(route egressRoute) error
+	// Table reads the platform's routing table as the routes this feature reasons about, and says
+	// how the tunnel appears in it: its interface index on Windows, its name elsewhere.
+	Table() (routes []egressBindRoute, tunnel string, err error)
 }
 
 // egressRouteJournal is the on-disk record of what this feature installed.
@@ -186,6 +191,70 @@ func (installer *egressRouteInstaller) apply(desired []egressRoute) egressRouteA
 
 	if err := installer.save(); err != nil && result.Err == nil {
 		result.Err = err
+	}
+	return result
+}
+
+// egressRouteRepairResult says what a repair found and did.
+type egressRouteRepairResult struct {
+	// TableErr is set when the table could not be read, in which case nothing else is.
+	TableErr error
+	// Repaired are the routes put back, with why they had to be.
+	Repaired []egressRouteDrift
+	// Lost are prefixes that are somebody else's now. They are no longer owned; the next apply
+	// will ask for them again and report the conflict if it is still there.
+	Lost []egressRouteConflict
+	// Err is the last reinstall that failed. The route stays owned, so the next repair tries again.
+	Err error
+}
+
+// repair reads the table and puts back what it no longer carries.
+//
+// A route to reinstall is removed first, whether or not a row is there. The row may be a stale one
+// naming a gateway that is gone, and the removal is also what makes the commander resolve the hop
+// again instead of answering from what it learned before the network changed. Then the same
+// conflict check an install gets: a prefix somebody else took while ours was gone is theirs.
+func (installer *egressRouteInstaller) repair() egressRouteRepairResult {
+	var result egressRouteRepairResult
+	if len(installer.installed) == 0 {
+		return result
+	}
+	table, tunnel, err := installer.commander.Table()
+	if err != nil {
+		result.TableErr = err
+		return result
+	}
+	drifts := egressRouteDrifts(installer.installed, table, tunnel)
+	changed := false
+	for _, drift := range drifts {
+		route := drift.Route
+		if drift.Action == egressDriftConflict {
+			existing := drift.Existing
+			if conflicted, described := installer.commander.Conflict(route); conflicted {
+				existing = described
+			}
+			installer.forget(route)
+			changed = true
+			result.Lost = append(result.Lost, egressRouteConflict{Route: route, Existing: existing})
+			continue
+		}
+		_ = installer.commander.Remove(route)
+		if conflicted, existing := installer.commander.Conflict(route); conflicted {
+			installer.forget(route)
+			changed = true
+			result.Lost = append(result.Lost, egressRouteConflict{Route: route, Existing: existing})
+			continue
+		}
+		if err := installer.commander.Install(route); err != nil {
+			result.Err = err
+			continue
+		}
+		result.Repaired = append(result.Repaired, drift)
+	}
+	if changed {
+		if err := installer.save(); err != nil && result.Err == nil {
+			result.Err = err
+		}
 	}
 	return result
 }

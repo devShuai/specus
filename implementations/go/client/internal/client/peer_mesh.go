@@ -172,6 +172,10 @@ type peerMeshClient struct {
 	egressErrorLogged        string
 	egressBypassFailedLogged string
 	egressDeviceWaitLogged   bool
+	// The last check of the table against the plan, and whether it left a reinstall undone.
+	egressRepairAt         time.Time
+	egressRepairTroubled   bool
+	egressTableErrorLogged string
 }
 
 type peerMeshPeer struct {

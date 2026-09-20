@@ -327,13 +327,21 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	}
 
 	installer := mesh.ensureEgressRouteInstaller()
-	if installer == nil || !egressRouteReconcileDue(mesh.egressPlan, desired, now) {
+	if installer == nil {
+		return
+	}
+	if !egressRouteReconcileDue(mesh.egressPlan, desired, now) {
+		// The common tick: the plan has nothing to do, so the table is checked against it.
+		if egressDeviceReady(device) {
+			mesh.repairEgressDrift(installer, now)
+		}
 		return
 	}
 	result := installer.apply(desired)
 	mesh.egressPlan = &egressRoutePlanAttempt{
 		At: now, Desired: desired, Troubled: len(result.Conflicts) > 0 || result.Err != nil,
 	}
+	mesh.egressRepairAt, mesh.egressRepairTroubled = time.Time{}, false
 
 	// Remembered before it is logged. A conflict is the one part of this outcome nothing can
 	// recompute -- the answer came from the platform's routing table at this moment -- and
@@ -379,6 +387,78 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 		mesh.logger.Printf("[peer-egress-consumer] routes added=%d removed=%d",
 			len(result.Added), len(result.Removed))
 	}
+}
+
+// repairEgressDrift puts back what the routing table lost since the plan was applied: a route
+// dropped with its interface, a bypass still naming a gateway the machine left behind. Called
+// under egressPlanMu on the ticks the plan itself has nothing to do.
+func (mesh *peerMeshClient) repairEgressDrift(installer *egressRouteInstaller, now time.Time) {
+	if mesh.egressRepairTroubled && now.Sub(mesh.egressRepairAt) < egressRouteRetryInterval {
+		return
+	}
+	result := installer.repair()
+	if result.TableErr != nil {
+		// Said once per failure. Without the table nothing can be compared, and a machine whose
+		// `ip` is missing would otherwise say so every five seconds.
+		if text := result.TableErr.Error(); text != mesh.egressTableErrorLogged {
+			mesh.egressTableErrorLogged = text
+			mesh.logger.Printf("[peer-egress-consumer] cannot read the routing table to check the routes: %v",
+				result.TableErr)
+		}
+		mesh.egressRepairAt, mesh.egressRepairTroubled = now, true
+		return
+	}
+	mesh.egressTableErrorLogged = ""
+	mesh.egressRepairAt, mesh.egressRepairTroubled = now, result.Err != nil
+
+	for _, drift := range result.Repaired {
+		// Each one is a real event -- the machine changed networks -- so each one is said.
+		mesh.logger.Printf("[peer-egress-consumer] route %s put back, it was %s", drift.Route.CIDR, drift.Reason)
+	}
+	if len(result.Lost) > 0 {
+		// Reported the way an apply reports a conflict, and remembered the same way, so the
+		// status lists the prefix as not installed with what holds it. The plan still wants it:
+		// marked troubled, it asks again after the interval and reports the conflict if it is
+		// still there.
+		mesh.mu.Lock()
+		outcome := mesh.egressApplied
+		outcome.At = now
+		outcome.Conflicts = mergeEgressConflicts(outcome.Conflicts, result.Lost)
+		mesh.egressApplied = outcome
+		mesh.mu.Unlock()
+		if mesh.egressPlan != nil {
+			mesh.egressPlan.At, mesh.egressPlan.Troubled = now, true
+		}
+		for _, lost := range result.Lost {
+			mesh.logger.Printf("[peer-egress-consumer] route %s lost to another route, not taken back: %s",
+				lost.Route.CIDR, lost.Existing)
+		}
+	}
+	if result.Err != nil {
+		if text := result.Err.Error(); text != mesh.egressErrorLogged {
+			mesh.egressErrorLogged = text
+			mesh.logger.Printf("[peer-egress-consumer] route repair failed: %v", result.Err)
+		}
+	}
+}
+
+// mergeEgressConflicts adds conflicts to a list, replacing an entry for the same prefix.
+func mergeEgressConflicts(existing, more []egressRouteConflict) []egressRouteConflict {
+	merged := append([]egressRouteConflict(nil), existing...)
+	for _, conflict := range more {
+		replaced := false
+		for index := range merged {
+			if merged[index].Route.CIDR == conflict.Route.CIDR {
+				merged[index] = conflict
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			merged = append(merged, conflict)
+		}
+	}
+	return merged
 }
 
 // configureEgressConsumer gives the consumer its rules, once per distinct configuration.
@@ -533,8 +613,10 @@ func (mesh *peerMeshClient) withdrawEgressRoutes() {
 	mesh.egressRoutes = nil
 	mesh.mu.Unlock()
 	mesh.egressPlan = nil
+	mesh.egressRepairAt, mesh.egressRepairTroubled = time.Time{}, false
 	// What was logged belongs to the routes that are going; the next start says its own.
 	mesh.egressConflictsLogged, mesh.egressErrorLogged, mesh.egressDeviceWaitLogged = "", "", false
+	mesh.egressTableErrorLogged = ""
 	if installer != nil {
 		installer.withdrawAll()
 	}

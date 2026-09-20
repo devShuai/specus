@@ -155,6 +155,11 @@ internal sealed class PeerEgressMesh(
     private string _bypassFailedLogged = "";
     private bool _deviceWaitLogged;
 
+    /// <summary>The last check of the table against the plan, and whether it left a reinstall undone.</summary>
+    private long _repairAtMillis;
+    private bool _repairTroubled;
+    private string _tableErrorLogged = "";
+
     /// <summary>
     /// Builds the plane and the threads that carry its frames and its clock, on first use.
     /// </summary>
@@ -479,10 +484,17 @@ internal sealed class PeerEgressMesh(
         var installer = EnsureRouteInstaller();
         if (!PeerEgressRoutePlanner.ReconcileDue(_lastPlan, desired, nowMs))
         {
+            // The common tick: the plan has nothing to do, so the table is checked against it.
+            if (host.DeviceReady)
+            {
+                RepairDrift(installer, nowMs);
+            }
             return purge;
         }
         var result = installer.Apply(desired);
         _lastPlan = new PeerEgressPlanAttempt(nowMs, desired, result.Conflicts.Count > 0 || result.Error is not null);
+        _repairAtMillis = 0;
+        _repairTroubled = false;
 
         // Remembered before it is logged. A conflict is the one part of this outcome nothing can
         // recompute -- the answer came from the platform's routing table at this moment -- and
@@ -522,6 +534,74 @@ internal sealed class PeerEgressMesh(
                 result.Added.Count, result.Removed.Count);
         }
         return purge;
+    }
+
+    /// <summary>
+    /// Puts back what the routing table lost since the plan was applied: a route dropped with its
+    /// interface, a bypass still naming a gateway the machine left behind. Called under the plan
+    /// lock on the ticks the plan itself has nothing to do.
+    /// </summary>
+    private void RepairDrift(PeerEgressRouteInstaller installer, long nowMs)
+    {
+        if (_repairTroubled && nowMs - _repairAtMillis < PeerEgressRoutePlanner.RetryAfterMillis)
+        {
+            return;
+        }
+        var result = installer.Repair();
+        if (result.TableError is not null)
+        {
+            // Said once per failure. Without the table nothing can be compared, and a machine
+            // whose `ip` is missing would otherwise say so every five seconds.
+            var text = result.TableError.Message;
+            if (!string.Equals(text, _tableErrorLogged, StringComparison.Ordinal))
+            {
+                _tableErrorLogged = text;
+                logger?.LogWarning("[peer-egress-consumer] cannot read the routing table to check the routes: {Error}", text);
+            }
+            _repairAtMillis = nowMs;
+            _repairTroubled = true;
+            return;
+        }
+        _tableErrorLogged = "";
+        _repairAtMillis = nowMs;
+        _repairTroubled = result.Error is not null;
+
+        foreach (var drift in result.Repaired)
+        {
+            // Each one is a real event -- the machine changed networks -- so each one is said.
+            logger?.LogInformation("[peer-egress-consumer] route {Cidr} put back, it was {Reason}",
+                drift.Route.Cidr, drift.Reason);
+        }
+        if (result.Lost.Count > 0)
+        {
+            // Reported the way an apply reports a conflict, and remembered the same way, so the
+            // status lists the prefix as not installed with what holds it. The plan still wants
+            // it: marked troubled, it asks again after the interval and reports the conflict if
+            // it is still there.
+            var previous = _applied;
+            var merged = previous.Conflicts.ToList();
+            foreach (var lost in result.Lost)
+            {
+                merged.RemoveAll(existing => existing.Route.Cidr == lost.Route.Cidr);
+                merged.Add(lost);
+                logger?.LogWarning("[peer-egress-consumer] route {Cidr} lost to another route, not taken back: {Existing}",
+                    lost.Route.Cidr, lost.Existing);
+            }
+            _applied = new PeerEgressApplyOutcome(nowMs, merged, previous.Error, previous.RolledBack, true);
+            if (_lastPlan is { } plan)
+            {
+                _lastPlan = new PeerEgressPlanAttempt(nowMs, plan.Desired, true);
+            }
+        }
+        if (result.Error is not null)
+        {
+            var text = result.Error.Message;
+            if (!string.Equals(text, _errorLogged, StringComparison.Ordinal))
+            {
+                _errorLogged = text;
+                logger?.LogWarning("[peer-egress-consumer] route repair failed: {Error}", text);
+            }
+        }
     }
 
     /// <summary>
@@ -709,10 +789,13 @@ internal sealed class PeerEgressMesh(
                 _routes = null;
             }
             _lastPlan = null;
+            _repairAtMillis = 0;
+            _repairTroubled = false;
             // What was logged belongs to the routes that are going; the next start says its own.
             _conflictsLogged = "";
             _errorLogged = "";
             _deviceWaitLogged = false;
+            _tableErrorLogged = "";
             installer?.WithdrawAll();
         }
     }

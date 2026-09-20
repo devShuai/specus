@@ -92,7 +92,14 @@ internal sealed class LinuxPeerEgressRouteCommander(string? tun) : IPeerEgressRo
             : ["route", "add", route.Cidr, "via", hop.Gateway, "dev", hop.Device]);
     }
 
-    public void Remove(PeerEgressRoute route) => RunForOutput("ip", ["route", "del", route.Cidr]);
+    public void Remove(PeerEgressRoute route)
+    {
+        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
+        RunForOutput("ip", ["route", "del", route.Cidr]);
+    }
+
+    public PeerEgressRouteTable Table() => new(
+        PeerEgressRouteCommands.ParseRouteTable(RunForOutput("ip", PeerEgressRouteCommands.ShowMainTableArgs())), tun ?? string.Empty);
 
     private static string RunForOutput(string program, string[] arguments)
     {

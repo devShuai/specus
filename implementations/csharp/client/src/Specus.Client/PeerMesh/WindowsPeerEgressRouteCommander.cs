@@ -196,8 +196,20 @@ internal sealed class WindowsPeerEgressRouteCommander(string? tun) : IPeerEgress
             $"install bypass {route.Cidr}");
     }
 
+    /// <summary>
+    /// Reads the native forwarding table, the same reading the bypass fallback uses. The tunnel
+    /// is its index: that is what the rows carry, and the name cannot be matched against them.
+    /// </summary>
+    public PeerEgressRouteTable Table()
+    {
+        var index = TunnelIndex();
+        return new PeerEgressRouteTable(PeerEgressSocketBinder.Windows.Routes(),
+            index.ToString(CultureInfo.InvariantCulture));
+    }
+
     public void Remove(PeerEgressRoute route)
     {
+        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
         if (!PeerEgressWindowsRouteCommands.ValidPrefix(route.Cidr))
         {
             throw new ArgumentException(

@@ -148,8 +148,19 @@ public final class WindowsPeerEgressRouteCommander implements PeerEgressRouteIns
                 "install bypass " + route.cidr());
     }
 
+    /**
+     * Reads the native forwarding table, the same reading the bypass fallback uses. The tunnel
+     * is its index: that is what the rows carry, and the name cannot be matched against them.
+     */
+    @Override
+    public PeerEgressRouteInstaller.Table table() throws IOException {
+        int index = tunnelIndex();
+        return new PeerEgressRouteInstaller.Table(PeerEgressSocketBinder.Windows.routes(), Integer.toString(index));
+    }
+
     @Override
     public void remove(Route route) throws IOException {
+        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
         if (!PeerEgressWindowsRouteCommands.validPrefix(route.cidr())) {
             throw new IOException(
                     "refusing to build a route command from this argument: " + route.cidr());

@@ -97,7 +97,14 @@ public final class LinuxPeerEgressRouteCommander implements PeerEgressRouteInsta
     }
 
     @Override
+    public PeerEgressRouteInstaller.Table table() throws IOException {
+        return new PeerEgressRouteInstaller.Table(
+                PeerEgressRouteCommands.parseRouteTable(runForOutput(PeerEgressRouteCommands.showMainTableArgs())), tun);
+    }
+
+    @Override
     public void remove(Route route) throws IOException {
+        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
         run(List.of("ip", "route", "del", route.cidr()));
     }
 
