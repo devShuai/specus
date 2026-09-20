@@ -957,15 +957,17 @@ def main():
     parser.add_argument("--client", required=True, help="specus-client binary (Go)")
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--work", help="working directory; a fresh temporary one by default")
-    # Sized under the ceiling the egress can currently deliver, which downstream_ceiling measures
-    # and the report states. 256 KiB still crosses two hundred segment boundaries at this MTU,
-    # which is what the intact-arrival check is there to exercise.
-    parser.add_argument("--blob-bytes", type=int, default=256 * 1024)
+    # Sized clear of the ceiling the egress can currently deliver, which downstream_ceiling
+    # measures and the report states. That ceiling moves with the receiver's socket buffer, and a
+    # size sitting on it makes this check flap: one CI run had 256 KiB pass the ceiling probe and
+    # fail this check minutes apart. 64 KiB is still fifty-odd segments at this MTU, which is what
+    # the intact-arrival check is there to exercise, and it survives the lossy link too.
+    parser.add_argument("--blob-bytes", type=int, default=64 * 1024)
     parser.add_argument("--upload-bytes", type=int, default=8 * 1048576)
     parser.add_argument("--lossy-blob-bytes", type=int, default=64 * 1024)
     parser.add_argument("--lossy-timeout", type=int, default=60)
     parser.add_argument("--ceiling-sizes", type=int, nargs="+",
-                        default=[256 * 1024, 512 * 1024, 1048576])
+                        default=[128 * 1024, 256 * 1024, 512 * 1024, 1048576])
     parser.add_argument("--ceiling-timeout", type=int, default=20)
     parser.add_argument("--loss-percent", type=float, default=2.0)
     parser.add_argument("--skip-lossy", action="store_true")

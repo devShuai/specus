@@ -22,15 +22,25 @@ tell the consumer's own address from the egress's.
 - TCP and UDP under the rule arrive from the egress's address; under no rule from the consumer's.
 - The consumer's table holds the exact prefix, the bypass `/32` and the mesh host routes, and no
   default or half-default route.
-- 16 MiB down and 8 MiB up arrive intact through the egress; throughput and connect times are
+- 64 KiB down and 8 MiB up arrive intact through the egress; throughput and connect times are
   recorded as the first input for the performance baseline (#50), together with a download over a
   link that drops 2% each way.
+- How large a response the egress can actually deliver. It cannot deliver an arbitrary one: past
+  what the receiver's buffer holds, a download stalls and is reset rather than slowing down
+  (issue #74). The ceiling moves with that buffer, so the lab measures it and records it in the
+  report instead of asserting a number, and the intact-arrival check above sits well clear of it.
 - Fault injection, each with a leak check on the target's log: ACL revoked (flow-reject at the
   consumer), tenant switch off (an established flow is cut, a new one refused), egress process
   stopped and restarted, rule changed to `block` across a consumer restart, consumer `kill -9`
   with a user route of its own in the table.
 - The consumer's routing table after a normal exit, after `kill -9`, after the restart, and at the
   end.
+
+A leak check can fail intermittently, and when it does it is not the lab being flaky. A control
+connection that drops takes the client through its full restart, which withdraws every route it
+owns and reinstalls them a couple of seconds later; requests under a rule go out locally in that
+window. It reproduces on some runs and not others, which is why the probe that catches it also
+captures the consumer's routing table at that instant. Tracked in issue #73.
 
 ## Running it
 
