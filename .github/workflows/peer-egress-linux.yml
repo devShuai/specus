@@ -17,6 +17,7 @@ on:
       - 'tools/protocol/generate_peer_egress_socket_binding_vectors.py'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
       - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/go/client/internal/client/peer_device_linux*'
   push:
     branches: [main]
     paths:
@@ -24,6 +25,7 @@ on:
       - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
       - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/go/client/internal/client/peer_device_linux*'
   workflow_dispatch:
 
 permissions:
@@ -46,18 +48,20 @@ jobs:
       #
       # The output is searched for the tests by name, because they skip themselves when the
       # namespace is not theirs and a skipped test leaves this step green.
-      - name: Install bypass routes under the tunnel's own routes
+      - name: Install bypass routes under the tunnel's own routes, and read from a real TUN
         working-directory: implementations/go/client
         run: |
           set -o pipefail
           go test -c -o "$RUNNER_TEMP/client.test" ./internal/client
           cd "$GITHUB_WORKSPACE"
           sudo -n unshare -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
-            -test.run 'TestLinuxCommander' -test.v | tee "$RUNNER_TEMP/linux.log"
-          for name in InstallsABypassUnderItsOwnTunnelRoute RefusesABypassOnlyABlackholeWouldCarry \
-              RepairsARouteTheTableLost; do
-            if ! grep -q "^--- PASS: TestLinuxCommander$name" "$RUNNER_TEMP/linux.log"; then
-              echo "TestLinuxCommander$name did not run against a real routing table"
+            -test.run 'TestLinuxCommander|TestLinuxTunDevice' -test.v | tee "$RUNNER_TEMP/linux.log"
+          for name in TestLinuxCommanderInstallsABypassUnderItsOwnTunnelRoute \
+              TestLinuxCommanderRefusesABypassOnlyABlackholeWouldCarry \
+              TestLinuxCommanderRepairsARouteTheTableLost \
+              TestLinuxTunDeviceDeliversWhatTheKernelWritesIntoIt; do
+            if ! grep -q "^--- PASS: $name" "$RUNNER_TEMP/linux.log"; then
+              echo "$name did not run against a real interface"
               exit 1
             fi
           done

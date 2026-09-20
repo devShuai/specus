@@ -351,6 +351,10 @@
           "type": "string",
           "contentEncoding": "base64"
         },
+        "sourceKeyEpoch": {
+          "type": "string",
+          "description": "发送方本次运行实例的随机 key epoch。两端由它派生 SPM2 单向 traffic key，客户端重启后必须变化；服务端原样转发，既不生成也不改写。"
+        },
         "targetClientId": {
           "$ref": "#/$defs/LongId"
         },

@@ -1,0 +1,91 @@
+name: Peer egress Linux lab
+
+# The consumer-to-egress path end to end, on Linux, with real processes: the Go server, a Go
+# consumer with a TUN device and routes of its own, a Go egress, and a target that records who
+# reached it, in network namespaces behind one router namespace. scripts/peer-egress-lab/lab.py
+# builds the namespaces and drives the acceptance list of issue #56; its report goes to the job
+# summary and the artifact.
+#
+# Its own workflow because it needs both binaries built and runs for minutes rather than seconds,
+# and because it needs root and a kernel with TUN, which the CLI matrix does not.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/peer-egress-lab.yml'
+      - 'scripts/peer-egress-lab/**'
+      - 'implementations/go/client/**'
+      - 'implementations/go/server/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/peer-egress-lab.yml'
+      - 'scripts/peer-egress-lab/**'
+      - 'implementations/go/client/**'
+      - 'implementations/go/server/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    name: Consumer to egress through real namespaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/client/go.mod
+          cache-dependency-path: |
+            implementations/go/client/go.sum
+            implementations/go/server/go.sum
+
+      # The management SPA the server embeds is built from apps/admin-web and is not committed.
+      # The lab never opens it, and a placeholder satisfies the embed directive without the npm
+      # build.
+      - name: Build the server and the client
+        run: |
+          mkdir -p implementations/go/server/web/static
+          if [ ! -e implementations/go/server/web/static/index.html ]; then
+            echo '<!doctype html><title>lab</title>' > implementations/go/server/web/static/index.html
+          fi
+          (cd implementations/go/server && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-server" ./cmd/specus-server)
+          (cd implementations/go/client && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-client" ./cmd/specus-client)
+
+      # Root, in a network namespace of its own so that nothing it installs can touch the
+      # runner's table, and in a mount namespace so that the netns handles go with it.
+      - name: Run the lab
+        run: |
+          mkdir -p "$RUNNER_TEMP/lab"
+          sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
+            --server "$RUNNER_TEMP/specus-server" \
+            --client "$RUNNER_TEMP/specus-client" \
+            --report-dir "$RUNNER_TEMP/lab"
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/lab/report.md" ]; then
+            cat "$RUNNER_TEMP/lab/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peer-egress-lab
+          path: ${{ runner.temp }}/lab
+          if-no-files-found: warn
+
+      # The namespace is gone with the process, so nothing can be left in the runner's own table.
+      # Checked anyway: a step that ran outside the namespace would show up here.
+      - name: No residue in the runner's table
+        if: always()
+        run: |
+          ip -4 route show table main
+          if ip -4 route show table main | grep -E '^(203\.0\.113|198\.51\.100|10\.90\.|192\.0\.2)' \
+              || ip link show br-wan 2>/dev/null; then
+            echo "the lab reached the runner's own namespace"
+            exit 1
+          fi

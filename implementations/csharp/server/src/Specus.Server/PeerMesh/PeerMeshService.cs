@@ -2147,6 +2147,13 @@ public sealed class PeerControlMessage
     [JsonPropertyName("sourcePublicKey")]
     public string? SourcePublicKey { get; set; }
 
+    // The sender's random epoch for this run of its process, relayed verbatim. The peers derive
+    // their SPM2 traffic keys from it, so a signal that arrives without it leaves the receiver
+    // unable to build a codec and the data plane never comes up. The server neither reads nor
+    // rewrites it: FillSource owns the identity fields, this one belongs to the sender.
+    [JsonPropertyName("sourceKeyEpoch")]
+    public string? SourceKeyEpoch { get; set; }
+
     [JsonPropertyName("targetClientId")]
     public long TargetClientId { get; set; }
 
