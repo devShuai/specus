@@ -1065,6 +1065,119 @@ assert expected_hops["windows-on-link-network-has-no-gateway"] == {"interface": 
 assert expected_hops["owned-bypass-is-left-out"] == {"interface": "3", "gateway": "192.168.1.1"}
 assert expected_hops["owned-bypass-would-otherwise-win"] == {"interface": "3", "gateway": "192.168.2.1"}
 
+# ---- drift ---------------------------------------------------------------------------------------
+#
+# What the consumer's own routes look like in the table after the machine changed networks or came
+# back from sleep, and what to do about each. The consumer reads the table on its tick and compares
+# it with what the journal says it owns.
+
+
+def drift(owned, routes, tunnel):
+    """The owned routes the table no longer carries as installed, with the repair each one needs."""
+    owned_prefixes = [entry["cidr"] for entry in owned]
+    found = []
+    for entry in owned:
+        rows = [r for r in routes if r["prefix"] == entry["cidr"]]
+        if entry["kind"] == "tun":
+            if any(r["interface"] == tunnel for r in rows):
+                continue
+            # A route into the tunnel cannot change interface on its own, so a row on another one
+            # is somebody else's: the prefix is theirs now, and it is reported rather than taken.
+            found.append({"cidr": entry["cidr"], "reason": "moved" if rows else "missing",
+                          "action": "conflict" if rows else "reinstall"})
+            continue
+        # A bypass is compared with where the table would send the address now, with this
+        # feature's own routes left out: a network change leaves the old /32 in place naming a
+        # gateway that is no longer the way out.
+        address = entry["cidr"].removesuffix("/32")
+        hop = select_hop(routes, tunnel, address, owned_prefixes)
+        present = [r for r in rows if r["interface"] != tunnel]
+        if not present:
+            found.append({"cidr": entry["cidr"], "reason": "missing", "action": "reinstall"})
+        elif hop is not None and (present[0]["interface"], present[0]["gateway"]) != (hop["interface"], hop["gateway"]):
+            found.append({"cidr": entry["cidr"], "reason": "moved", "action": "reinstall"})
+        # Present and nothing better outside the tunnel: the route that is there is the best there is.
+    return found
+
+
+def owned_tun(cidr):
+    return {"cidr": cidr, "kind": "tun"}
+
+
+def owned_bypass(cidr):
+    return {"cidr": cidr, "kind": "bypass"}
+
+
+drift_cases = [
+    {"name": "linux-everything-is-where-it-was-put", "platform": "linux", "table": "show-rich",
+     "tunnel": "specus0",
+     "owned": [owned_bypass("198.51.100.7/32"), owned_tun("203.0.113.0/24")],
+     "note": "The sampled table carries both: the /32 via the default's gateway, the /24 into the tunnel."},
+    {"name": "linux-tunnel-route-gone", "platform": "linux", "table": "show-host", "tunnel": "specus0",
+     "owned": [owned_tun("203.0.113.0/24")],
+     "note": "A host table with no tunnel in it: the route this feature installed is not there."},
+    {"name": "bypass-gone-with-its-interface", "platform": "inline", "tunnel": "specus0",
+     "owned": [owned_bypass("203.0.113.7/32"), owned_tun("203.0.113.0/24")],
+     "routes": [route("0.0.0.0/0", "wlan0", 600, gateway="10.0.0.1"),
+                route("203.0.113.0/24", "specus0")],
+     "note": "eth0 went down and the kernel dropped every route through it, the /32 included. The "
+             "tunnel route survived; the bypass has to come back through wlan0."},
+    {"name": "bypass-still-names-the-old-gateway", "platform": "inline", "tunnel": "specus0",
+     "owned": [owned_bypass("203.0.113.7/32"), owned_tun("203.0.113.0/24")],
+     "routes": [route("0.0.0.0/0", "wlan0", 600, gateway="10.0.0.1"),
+                route("203.0.113.7/32", "eth0", gateway="192.168.64.1"),
+                route("203.0.113.0/24", "specus0")],
+     "note": "Back from sleep on a different network. The /32 is still there, via a gateway that is "
+             "no longer the way out; left alone it would pin the control connection to a dead hop. "
+             "Compared with the /32 itself left out, or it would choose itself and look right."},
+    {"name": "bypass-moved-with-the-default-on-windows", "platform": "inline", "tunnel": "42",
+     "owned": [owned_bypass("203.0.113.7/32"), owned_tun("203.0.113.0/24")],
+     "routes": [route("0.0.0.0/0", "3", 20, usable=False, gateway="192.168.1.1"),
+                route("0.0.0.0/0", "5", 25, gateway="10.0.0.1"),
+                route("203.0.113.7/32", "3", 20, gateway="192.168.1.1"),
+                route("203.0.113.0/24", "42", 5)],
+     "note": "Windows keeps the routes of a disconnected interface, so the old default is still "
+             "listed and unusable; the /32 next to it is what has to move."},
+    {"name": "tunnel-prefix-taken-by-somebody-else", "platform": "inline", "tunnel": "specus0",
+     "owned": [owned_tun("203.0.113.0/24")],
+     "routes": [route("0.0.0.0/0", "eth0", 100, gateway="192.168.64.1"),
+                route("203.0.113.0/24", "eth0", gateway="192.0.2.1")],
+     "note": "Not taken back. A route into the tunnel does not change interface by itself, so this "
+             "is another tool's route, and this feature does not preempt."},
+    {"name": "bypass-present-and-nothing-better-outside-the-tunnel", "platform": "inline",
+     "tunnel": "specus0",
+     "owned": [owned_bypass("203.0.113.7/32"), owned_tun("203.0.113.0/24")],
+     "routes": [route("203.0.113.7/32", "eth0", gateway="192.168.64.1"),
+                route("203.0.113.0/24", "specus0")],
+     "note": "No default route at all. The /32 that is there cannot be improved on, so it is left."},
+    {"name": "macos-everything-is-where-it-was-put", "platform": "macos", "table": "tunRoute",
+     "tunnel": "utun3", "owned": [owned_tun("203.0.113.0/24")]},
+    {"name": "windows-everything-is-where-it-was-put", "platform": "windows", "table": "typical",
+     "tunnel": "42", "owned": [owned_tun("203.0.113.0/24")]},
+    {"name": "nothing-owned-nothing-to-repair", "platform": "linux", "table": "show-host",
+     "tunnel": "specus0", "owned": []},
+]
+
+for case in drift_cases:
+    routes = case["routes"] if case["platform"] == "inline" else hop_tables[case["platform"]][case["table"]]
+    case["expect"] = drift(case["owned"], routes, case["tunnel"])
+
+expected_drift = {case["name"]: case["expect"] for case in drift_cases}
+assert expected_drift["linux-everything-is-where-it-was-put"] == []
+assert expected_drift["linux-tunnel-route-gone"] == [
+    {"cidr": "203.0.113.0/24", "reason": "missing", "action": "reinstall"}]
+assert expected_drift["bypass-gone-with-its-interface"] == [
+    {"cidr": "203.0.113.7/32", "reason": "missing", "action": "reinstall"}]
+assert expected_drift["bypass-still-names-the-old-gateway"] == [
+    {"cidr": "203.0.113.7/32", "reason": "moved", "action": "reinstall"}]
+assert expected_drift["bypass-moved-with-the-default-on-windows"] == [
+    {"cidr": "203.0.113.7/32", "reason": "moved", "action": "reinstall"}]
+assert expected_drift["tunnel-prefix-taken-by-somebody-else"] == [
+    {"cidr": "203.0.113.0/24", "reason": "moved", "action": "conflict"}]
+assert expected_drift["bypass-present-and-nothing-better-outside-the-tunnel"] == []
+assert expected_drift["macos-everything-is-where-it-was-put"] == []
+assert expected_drift["windows-everything-is-where-it-was-put"] == []
+
 # ---- socket options ---------------------------------------------------------------------------
 
 
@@ -1126,6 +1239,11 @@ vector = {
         "hops: the same choice as select, with owned prefixes also left out; a chosen route with an "
         "empty interface means no hop. Used for a bypass route when the platform's own query "
         "answers with the tunnel.",
+        "drift: what the consumer's own routes look like in the table after a network change, and "
+        "the repair each needs. A tunnel route is present when a row for its prefix names the "
+        "tunnel; a row on another interface is somebody else's and is reported, not taken. A "
+        "bypass is compared with the hop the table would choose now with the owned prefixes left "
+        "out: absent or different means reinstall; present with nothing better means leave it.",
     ],
     "select": {"cases": SELECT_CASES},
     "windows": {
@@ -1149,6 +1267,14 @@ vector = {
         "routes": [{"table": name, "expect": routes} for name, routes in linux_routes.items()],
     },
     "hops": {"cases": hop_cases},
+    "drift": {
+        "description": "本功能拥有的路由在切网或休眠恢复后在真实路由表里的状态，以及各自需要的修复。"
+                       "tun 路由：表里有指向隧道的行就是好的；行在别的接口上是别人的路由，报冲突、不抢占；"
+                       "没有行就重装。旁路：与「去掉隧道和本功能自己的路由之后，表现在会把该地址送去哪」比较；"
+                       "没有行就重装，有行但接口或网关不同就重装（先撤再装，重新解析下一跳）；"
+                       "有行而隧道之外已无更好的路可走，就保留。",
+        "cases": drift_cases,
+    },
     "socketOptions": socket_options,
 }
 

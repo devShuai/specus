@@ -9,7 +9,8 @@
     "macos: candidates are the rows of `netstat -rn -f inet` as the route vector normalises them; interface is the Netif column, metric is 0, and usable is the Flags column not containing I.",
     "gateway: the route's next hop as an IPv4 address, or empty for on-link. Windows writes on-link as 0.0.0.0. On macOS the Gateway column is a gateway only on a route whose Flags contain G; otherwise it holds link#N, a MAC address, an interface name, or the address of a loopback or point-to-point peer, none of which is a hop.",
     "linux: candidates are the lines of `ip -4 route show table main`. A leading blackhole, unreachable, prohibit or throw leads nowhere: the route stays a candidate with an empty interface. local, broadcast, anycast, multicast and nat lines are not read. A multipath route takes its first indented nexthop; one whose next hops cannot be read is not usable. dead is not usable; linkdown is. metric defaults to 0.",
-    "hops: the same choice as select, with owned prefixes also left out; a chosen route with an empty interface means no hop. Used for a bypass route when the platform's own query answers with the tunnel."
+    "hops: the same choice as select, with owned prefixes also left out; a chosen route with an empty interface means no hop. Used for a bypass route when the platform's own query answers with the tunnel.",
+    "drift: what the consumer's own routes look like in the table after a network change, and the repair each needs. A tunnel route is present when a row for its prefix names the tunnel; a row on another interface is somebody else's and is reported, not taken. A bypass is compared with the hop the table would choose now with the owned prefixes left out: absent or different means reinstall; present with nothing better means leave it."
   ],
   "select": {
     "cases": [
@@ -1893,6 +1894,289 @@
         "expect": {
           "hop": null
         }
+      }
+    ]
+  },
+  "drift": {
+    "description": "本功能拥有的路由在切网或休眠恢复后在真实路由表里的状态，以及各自需要的修复。tun 路由：表里有指向隧道的行就是好的；行在别的接口上是别人的路由，报冲突、不抢占；没有行就重装。旁路：与「去掉隧道和本功能自己的路由之后，表现在会把该地址送去哪」比较；没有行就重装，有行但接口或网关不同就重装（先撤再装，重新解析下一跳）；有行而隧道之外已无更好的路可走，就保留。",
+    "cases": [
+      {
+        "name": "linux-everything-is-where-it-was-put",
+        "platform": "linux",
+        "table": "show-rich",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "198.51.100.7/32",
+            "kind": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "note": "The sampled table carries both: the /32 via the default's gateway, the /24 into the tunnel.",
+        "expect": []
+      },
+      {
+        "name": "linux-tunnel-route-gone",
+        "platform": "linux",
+        "table": "show-host",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "note": "A host table with no tunnel in it: the route this feature installed is not there.",
+        "expect": [
+          {
+            "cidr": "203.0.113.0/24",
+            "reason": "missing",
+            "action": "reinstall"
+          }
+        ]
+      },
+      {
+        "name": "bypass-gone-with-its-interface",
+        "platform": "inline",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "wlan0",
+            "gateway": "10.0.0.1",
+            "metric": 600,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ],
+        "note": "eth0 went down and the kernel dropped every route through it, the /32 included. The tunnel route survived; the bypass has to come back through wlan0.",
+        "expect": [
+          {
+            "cidr": "203.0.113.7/32",
+            "reason": "missing",
+            "action": "reinstall"
+          }
+        ]
+      },
+      {
+        "name": "bypass-still-names-the-old-gateway",
+        "platform": "inline",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "wlan0",
+            "gateway": "10.0.0.1",
+            "metric": 600,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.7/32",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ],
+        "note": "Back from sleep on a different network. The /32 is still there, via a gateway that is no longer the way out; left alone it would pin the control connection to a dead hop. Compared with the /32 itself left out, or it would choose itself and look right.",
+        "expect": [
+          {
+            "cidr": "203.0.113.7/32",
+            "reason": "moved",
+            "action": "reinstall"
+          }
+        ]
+      },
+      {
+        "name": "bypass-moved-with-the-default-on-windows",
+        "platform": "inline",
+        "tunnel": "42",
+        "owned": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "3",
+            "gateway": "192.168.1.1",
+            "metric": 20,
+            "usable": false
+          },
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "5",
+            "gateway": "10.0.0.1",
+            "metric": 25,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.7/32",
+            "interface": "3",
+            "gateway": "192.168.1.1",
+            "metric": 20,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "42",
+            "gateway": "",
+            "metric": 5,
+            "usable": true
+          }
+        ],
+        "note": "Windows keeps the routes of a disconnected interface, so the old default is still listed and unusable; the /32 next to it is what has to move.",
+        "expect": [
+          {
+            "cidr": "203.0.113.7/32",
+            "reason": "moved",
+            "action": "reinstall"
+          }
+        ]
+      },
+      {
+        "name": "tunnel-prefix-taken-by-somebody-else",
+        "platform": "inline",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "routes": [
+          {
+            "prefix": "0.0.0.0/0",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 100,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "eth0",
+            "gateway": "192.0.2.1",
+            "metric": 0,
+            "usable": true
+          }
+        ],
+        "note": "Not taken back. A route into the tunnel does not change interface by itself, so this is another tool's route, and this feature does not preempt.",
+        "expect": [
+          {
+            "cidr": "203.0.113.0/24",
+            "reason": "moved",
+            "action": "conflict"
+          }
+        ]
+      },
+      {
+        "name": "bypass-present-and-nothing-better-outside-the-tunnel",
+        "platform": "inline",
+        "tunnel": "specus0",
+        "owned": [
+          {
+            "cidr": "203.0.113.7/32",
+            "kind": "bypass"
+          },
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "routes": [
+          {
+            "prefix": "203.0.113.7/32",
+            "interface": "eth0",
+            "gateway": "192.168.64.1",
+            "metric": 0,
+            "usable": true
+          },
+          {
+            "prefix": "203.0.113.0/24",
+            "interface": "specus0",
+            "gateway": "",
+            "metric": 0,
+            "usable": true
+          }
+        ],
+        "note": "No default route at all. The /32 that is there cannot be improved on, so it is left.",
+        "expect": []
+      },
+      {
+        "name": "macos-everything-is-where-it-was-put",
+        "platform": "macos",
+        "table": "tunRoute",
+        "tunnel": "utun3",
+        "owned": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "expect": []
+      },
+      {
+        "name": "windows-everything-is-where-it-was-put",
+        "platform": "windows",
+        "table": "typical",
+        "tunnel": "42",
+        "owned": [
+          {
+            "cidr": "203.0.113.0/24",
+            "kind": "tun"
+          }
+        ],
+        "expect": []
+      },
+      {
+        "name": "nothing-owned-nothing-to-repair",
+        "platform": "linux",
+        "table": "show-host",
+        "tunnel": "specus0",
+        "owned": [],
+        "expect": []
       }
     ]
   },

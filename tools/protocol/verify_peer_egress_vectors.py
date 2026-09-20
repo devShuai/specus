@@ -664,6 +664,59 @@ for platform in ("linux", "macos", "windows"):
               for case in hop_cases),
           f"binding: no {platform} hop case where leaving the tunnel out changes the answer")
 
+# Drift: the consumer's own routes after a network change, restated independently of the
+# generator's function. What matters is the policy -- a tunnel route on another interface is a
+# conflict rather than something to take back, a bypass follows the hop the table would choose
+# now with the owned prefixes left out -- so each of those has to be exercised by some case.
+def binding_drift(owned, routes, tunnel):
+    prefixes = [o["cidr"] for o in owned]
+    found = []
+    for entry in owned:
+        rows = [r for r in routes if r["prefix"] == entry["cidr"]]
+        if entry["kind"] == "tun":
+            if not any(r["interface"] == tunnel for r in rows):
+                found.append((entry["cidr"], "moved" if rows else "missing", "conflict" if rows else "reinstall"))
+            continue
+        hop = binding_hop(routes, tunnel, entry["cidr"][:-3], prefixes)
+        present = [r for r in rows if r["interface"] != tunnel]
+        if not present:
+            found.append((entry["cidr"], "missing", "reinstall"))
+        elif hop is not None and (present[0]["interface"], present[0]["gateway"]) != (hop["interface"], hop["gateway"]):
+            found.append((entry["cidr"], "moved", "reinstall"))
+    return found
+
+
+drift_cases = binding["drift"]["cases"]
+drift_seen = set()
+for case in drift_cases:
+    routes = case["routes"] if case["platform"] == "inline" else hop_tables[case["platform"]][case["table"]]
+    case["_routes"] = routes
+    for entry in case["owned"]:
+        check(entry["kind"] in ("tun", "bypass"), f"binding drift {case['name']}: unknown kind")
+        check(entry["kind"] != "bypass" or entry["cidr"].endswith("/32"),
+              f"binding drift {case['name']}: a bypass wider than /32")
+    produced = [(d["cidr"], d["reason"], d["action"]) for d in case["expect"]]
+    check(binding_drift(case["owned"], routes, case["tunnel"]) == produced,
+          f"binding drift {case['name']}: expectation is wrong")
+    for entry in case["expect"]:
+        check(entry["cidr"] in {o["cidr"] for o in case["owned"]},
+              f"binding drift {case['name']}: reports a route it does not own")
+        drift_seen.add((entry["reason"], entry["action"]))
+    if not case["expect"]:
+        drift_seen.add(("none", "none"))
+for needed in (("missing", "reinstall"), ("moved", "reinstall"), ("moved", "conflict"), ("none", "none")):
+    check(needed in drift_seen, f"binding: no drift case ends in {needed}")
+check(any(entry["kind"] == "bypass"
+          and binding_hop(case["_routes"], case["tunnel"], entry["cidr"][:-3], [])
+          != binding_hop(case["_routes"], case["tunnel"], entry["cidr"][:-3],
+                         [o["cidr"] for o in case["owned"]])
+          for case in drift_cases for entry in case["owned"]),
+      "binding: no drift case where leaving the owned bypass out changes the hop it is compared with")
+check(any(case["platform"] != "inline" and case["owned"] and not case["expect"] for case in drift_cases),
+      "binding: no drift case where a sampled table carries everything owned")
+check(any(case["platform"] != "inline" and case["expect"] for case in drift_cases),
+      "binding: no drift case where a sampled table has lost an owned route")
+
 options = binding["socketOptions"]
 check(options["windows"]["name"] == 31 and options["windows"]["byteOrder"] == "network",
       "binding: IP_UNICAST_IF changed shape")
@@ -784,7 +837,7 @@ check(any(case["troubled"] and case["elapsedMs"] < reconcile["retryAfterMs"] and
       "routes: no reconcile case applies a changed plan inside the interval")
 
 print(f"socket binding select={len(select_cases)} windows={len(binding['windows']['cases'])}"
-      f" macos={len(binding['macos']['cases'])}")
+      f" macos={len(binding['macos']['cases'])} hops={len(hop_cases)} drift={len(drift_cases)}")
 print(f"routes plan={len(routes_vector['planCases'])} diff={len(routes_vector['diffCases'])}"
       f" reconcile={len(reconcile['cases'])}")
 
