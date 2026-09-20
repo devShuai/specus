@@ -1,0 +1,111 @@
+{
+  "name": "peer-egress-failure-v1",
+  "version": 1,
+  "notes": [
+    "消费端在命中 egress 规则的流走不通时写回本机 TUN 的包。不写，应用只能等自己的超时——TCP 要一分钟以上——而规则其实在正常工作；写了，应用立刻失败、自行重试，这就是规范里「不能无缝恢复的流明确失败」。",
+    "resetOnPurge：消费端自己清掉的流（出口离线、规则改动），应用没有发来可以回应的段，复位从消费端记住的东西造出来：应用最后一次的确认号就是它的接收窗口起点，现代协议栈（RFC 5961）只在这个序号上接受复位而不发质询 ACK。RST|ACK，确认号为应用发到的位置。",
+    "resetOnPacket：消费端拒绝转发的段，按 RFC 793 回应，与出口用户态栈同一条规则：带 ACK 的段，复位的序号取它的确认号；不带 ACK 的段（新连接的 SYN），复位带 ACK，确认号覆盖它的序号空间（SYN、FIN 各占一个）。",
+    "unreachableOnDatagram：消费端拒绝转发的数据报，回 ICMP 目的不可达、主机不可达（类型 3 代码 1），引用原包的 IP 头和前 8 字节——正是 UDP 头，协议栈靠它把错误对到 socket 上。",
+    "只在「出口不可用」时写回：出口离线、尚未在线、流被清掉。发送失败（会话正在重建）不写，那条流可能还能恢复；block 规则不写，它是丢弃；不承载的协议不写。",
+    "IPv4 头固定：无标识、无标志、TTL 64；TCP 窗口 0，无选项。三端产出的字节必须完全一致。"
+  ],
+  "resetOnPurge": {
+    "cases": [
+      {
+        "name": "established-flow",
+        "consumerPort": 40000,
+        "remotePort": 443,
+        "appAck": 700001,
+        "appSeqNext": 1234,
+        "note": "The application acknowledged up to 700001 and sent up to 1233; the reset's sequence is its receive-next, which RFC 5961 stacks accept without a challenge.",
+        "consumerIp": "100.96.0.1",
+        "remoteIp": "203.0.113.10",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c40000aae61000004d250140000be2b0000"
+        }
+      },
+      {
+        "name": "flow-after-the-handshake-only",
+        "consumerPort": 40001,
+        "remotePort": 8080,
+        "appAck": 1,
+        "appSeqNext": 1001,
+        "note": "Only the handshake happened: ISS 1000, so the SYN advanced seq to 1001; the egress's ISN 0 was acknowledged as 1.",
+        "consumerIp": "100.96.0.1",
+        "remoteIp": "203.0.113.10",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a646000011f909c4100000001000003e9501400004fa90000"
+        }
+      },
+      {
+        "name": "sequence-numbers-near-the-wrap",
+        "consumerPort": 40002,
+        "remotePort": 443,
+        "appAck": 4294967280,
+        "appSeqNext": 4294967294,
+        "note": "Written as unsigned 32-bit values; a runtime that carries them signed writes the same bytes.",
+        "consumerIp": "100.96.0.1",
+        "remoteIp": "203.0.113.10",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c42fffffff0fffffffe5014000071770000"
+        }
+      }
+    ]
+  },
+  "resetOnPacket": {
+    "cases": [
+      {
+        "name": "syn-for-a-new-connection",
+        "note": "The egress is unavailable when the application connects. RST|ACK acknowledging the SYN is what a SYN-SENT socket accepts; the application sees connection refused.",
+        "packetHex": "45000028000000004006da6464600001cb00710a9c4001bb000003e8000000005002ffff6d930000",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c4000000000000003e9501400006d800000"
+        }
+      },
+      {
+        "name": "data-on-a-flow-that-was-purged",
+        "note": "The segment carries ACK, so the reset's sequence is that acknowledgement: the application's own receive-next.",
+        "packetHex": "4500002e000000004006da5e64600001cb00710a9c4001bb000003e9000013895018ffff8f670000474554202f20",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c400000138900000000500400005df00000"
+        }
+      },
+      {
+        "name": "fin-after-the-egress-went-away",
+        "note": "Same rule; the FIN's own sequence number does not enter into it.",
+        "packetHex": "45000028000000004006da6464600001cb00710a9c4001bb000007d1000013895011ffff56120000",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c400000138900000000500400005df00000"
+        }
+      },
+      {
+        "name": "bare-syn-with-payload",
+        "note": "TCP Fast Open puts data on the SYN; the acknowledgement covers the SYN and the data.",
+        "packetHex": "4500002b000000004006da6164600001cb00710a9c4301bb000003e8000000005002ffff568a0000160301",
+        "expect": {
+          "packetHex": "45000028000000004006da64cb00710a6460000101bb9c4300000000000003ec501400006d7a0000"
+        }
+      }
+    ]
+  },
+  "unreachableOnDatagram": {
+    "cases": [
+      {
+        "name": "dns-query",
+        "note": "The quoted part is the header plus the first eight bytes of the datagram: the UDP header, which is what lets the stack match the error to the socket.",
+        "packetHex": "4500003d000000004011da4464600001cb00710ac73800350029a198abcd0100000100000000000003777777076578616d706c6503636f6d0000010001",
+        "expect": {
+          "packetHex": "45000038000000004001da59cb00710a64600001030193cf000000004500003d000000004011da4464600001cb00710ac73800350029a198"
+        }
+      },
+      {
+        "name": "short-datagram",
+        "note": "Ten bytes of UDP in all. The quote is still the header plus eight bytes, which is exactly the UDP header; the two payload bytes are not quoted.",
+        "packetHex": "4500001e000000004011da6364600001cb00710ac7390d96000a8a9d0001",
+        "expect": {
+          "packetHex": "45000038000000004001da59cb00710a6460000103019d87000000004500001e000000004011da6364600001cb00710ac7390d96000a8a9d"
+        }
+      }
+    ]
+  }
+}
