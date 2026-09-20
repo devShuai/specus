@@ -14,6 +14,7 @@ const (
 	icmpEchoReply              = 0
 	icmpEchoRequest            = 8
 	icmpDestinationUnreachable = 3
+	icmpHostUnreachable        = 1
 	icmpFragmentationNeeded    = 4
 )
 
@@ -143,6 +144,20 @@ func peerPacketClampTCPMSS(packet []byte, pathMTU int) []byte {
 }
 
 func peerPacketICMPFragmentationNeededFor(packet []byte, pathMTU int) []byte {
+	return peerPacketICMPUnreachableFor(packet, icmpFragmentationNeeded, uint16(pathMTU))
+}
+
+// peerPacketICMPHostUnreachableFor answers a packet the consumer refused to forward, so the
+// application's stack reports the failure on the socket instead of waiting for a reply that will
+// not come. Shared vector: protocol/test-vectors/peer-egress-failure-v1.json.
+func peerPacketICMPHostUnreachableFor(packet []byte) []byte {
+	return peerPacketICMPUnreachableFor(packet, icmpHostUnreachable, 0)
+}
+
+// peerPacketICMPUnreachableFor builds a destination-unreachable for a packet, addressed back to its
+// sender and quoting its header and first eight bytes. The last two bytes of the unused field carry
+// the next-hop MTU when the code is fragmentation-needed, and zero otherwise.
+func peerPacketICMPUnreachableFor(packet []byte, code byte, mtu uint16) []byte {
 	if len(packet) < 20 || packet[0]>>4 != 4 {
 		return nil
 	}
@@ -160,8 +175,8 @@ func peerPacketICMPFragmentationNeededFor(packet []byte, pathMTU int) []byte {
 	copy(response[12:16], packet[16:20])
 	copy(response[16:20], packet[12:16])
 	response[20] = icmpDestinationUnreachable
-	response[21] = icmpFragmentationNeeded
-	binary.BigEndian.PutUint16(response[26:28], uint16(pathMTU))
+	response[21] = code
+	binary.BigEndian.PutUint16(response[26:28], mtu)
 	copy(response[28:], packet[:quotedLength])
 	binary.BigEndian.PutUint16(response[22:24], peerPacketChecksum(response[20:]))
 	binary.BigEndian.PutUint16(response[10:12], peerPacketChecksum(response[:20]))

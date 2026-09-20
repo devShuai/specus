@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -134,6 +135,105 @@ func TestConsumerBlocksWhenTheEgressIsUnavailable(t *testing.T) {
 		if outcome == egressOutcomeNotMine {
 			t.Errorf("%s: the packet was handed back to the local stack", testCase.name)
 		}
+	}
+}
+
+// A connection the egress cannot take fails now rather than after the application's own timeout:
+// the SYN is answered with the reset a SYN-SENT socket accepts. A send that failed is not
+// answered, because the session may be re-establishing and the flow may yet recover.
+func TestConsumerAnswersWhatItCannotForward(t *testing.T) {
+	harness := newConsumerHarness(t, consumerRules(), nil)
+	syn := consumerPacket(t, "203.0.113.10", 443)
+
+	if outcome := harness.consumer.handleOutbound(syn, flowEpoch); outcome != egressOutcomeBlockedNoEgress {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	if len(harness.toTun) != 1 {
+		t.Fatalf("wrote %d packets to the TUN, want the reset", len(harness.toTun))
+	}
+	reset, ok := parseTCPSegment(harness.toTun[0])
+	if !ok || reset.Flags != tcpFlagRST|tcpFlagACK || reset.Ack != 1001 ||
+		reset.SourceIP != testAddr(t, "203.0.113.10") || reset.SourcePort != 443 || reset.DestinationPort != 40000 {
+		t.Errorf("the answer is %+v, want RST|ACK from 203.0.113.10:443 acknowledging the SYN", reset)
+	}
+
+	harness.consumer.setEgressOnline(2, true, flowEpoch)
+	harness.sendErr = errors.New("no path to peer")
+	harness.consumer.handleOutbound(syn, flowEpoch)
+	if len(harness.toTun) != 1 {
+		t.Errorf("a failed send was answered: %d packets to the TUN", len(harness.toTun))
+	}
+}
+
+// A datagram the egress cannot take is answered with the ICMP the application's stack turns into
+// an error on the socket.
+func TestConsumerAnswersADatagramItCannotForward(t *testing.T) {
+	vector := loadEgressFailureVector(t)
+	harness := newConsumerHarness(t, consumerRules(), nil)
+	for _, c := range vector.UnreachableOnDatagram.Cases {
+		harness.toTun = nil
+		datagram, _ := hex.DecodeString(c.PacketHex)
+		if outcome := harness.consumer.handleOutbound(datagram, flowEpoch); outcome != egressOutcomeBlockedNoEgress {
+			t.Fatalf("%s: outcome = %s", c.Name, outcome)
+		}
+		if len(harness.toTun) != 1 || hex.EncodeToString(harness.toTun[0]) != c.Expect.PacketHex {
+			t.Errorf("%s: wrote %d packets, want the host-unreachable from the vector", c.Name, len(harness.toTun))
+		}
+	}
+}
+
+// Flows the consumer closes itself are reset from what it remembered: the application's last
+// acknowledgement is where its stack accepts a reset. A flow on which the application has only
+// sent its SYN has nothing to be reset at, and its retransmitted SYN is answered when it comes.
+func TestConsumerResetsTheFlowsItPurges(t *testing.T) {
+	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
+	harness.consumer.handleOutbound(consumerPacket(t, "203.0.113.10", 443), flowEpoch)
+	harness.consumer.handleOutbound(buildTCPSegment(tcpSegment{
+		SourceIP: testAddr(t, "100.96.0.1"), DestinationIP: testAddr(t, "203.0.113.10"),
+		SourcePort: 40000, DestinationPort: 443,
+		Seq: 1001, Ack: 700001, Flags: tcpFlagACK | tcpFlagPSH, Window: 65535, Payload: []byte("GET / "),
+	}), flowEpoch)
+	// A second flow on which only the SYN went.
+	harness.consumer.handleOutbound(consumerPacket(t, "203.0.113.11", 443), flowEpoch)
+	if len(harness.toTun) != 0 {
+		t.Fatalf("%d packets reached the TUN before anything was purged", len(harness.toTun))
+	}
+
+	harness.consumer.setEgressOnline(2, false, flowEpoch)
+
+	if len(harness.toTun) != 1 {
+		t.Fatalf("wrote %d packets to the TUN, want one reset for the established flow", len(harness.toTun))
+	}
+	reset, ok := parseTCPSegment(harness.toTun[0])
+	if !ok || reset.Flags != tcpFlagRST|tcpFlagACK || reset.Seq != 700001 || reset.Ack != 1007 ||
+		reset.SourceIP != testAddr(t, "203.0.113.10") || reset.SourcePort != 443 ||
+		reset.DestinationIP != testAddr(t, "100.96.0.1") || reset.DestinationPort != 40000 {
+		t.Errorf("reset = %+v, want seq 700001 ack 1007 from 203.0.113.10:443 to 100.96.0.1:40000", reset)
+	}
+}
+
+// A rule change resets the flows it invalidates the same way.
+func TestConsumerResetsFlowsARuleChangeInvalidates(t *testing.T) {
+	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
+	harness.consumer.handleOutbound(buildTCPSegment(tcpSegment{
+		SourceIP: testAddr(t, "100.96.0.1"), DestinationIP: testAddr(t, "203.0.113.10"),
+		SourcePort: 40000, DestinationPort: 443, Seq: 1001, Ack: 1, Flags: tcpFlagACK, Window: 65535,
+	}), flowEpoch)
+
+	harness.consumer.configure([]egressRule{
+		{Match: "203.0.113.0/24", Action: egressActionBlock},
+	}, egressDefaultMeshCIDR, "100.96.0.1", flowEpoch)
+
+	if len(harness.toTun) != 1 {
+		t.Fatalf("wrote %d packets to the TUN, want the reset", len(harness.toTun))
+	}
+	if reset, ok := parseTCPSegment(harness.toTun[0]); !ok || reset.Flags != tcpFlagRST|tcpFlagACK || reset.Seq != 1 || reset.Ack != 1001 {
+		t.Errorf("reset = %+v", reset)
+	}
+	// Under the block rule the next segment is dropped, not answered: a block is a drop.
+	harness.consumer.handleOutbound(consumerPacket(t, "203.0.113.10", 443), flowEpoch)
+	if len(harness.toTun) != 1 {
+		t.Errorf("a block rule answered a packet: %d packets to the TUN", len(harness.toTun))
 	}
 }
 

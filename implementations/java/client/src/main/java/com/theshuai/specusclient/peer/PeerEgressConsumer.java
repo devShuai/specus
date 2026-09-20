@@ -74,10 +74,50 @@ final class PeerEgressConsumer {
     private static final class Flow {
         final long egress;
         long lastSeenMs;
+        /**
+         * What the application last said on a TCP flow, kept so the flow can be reset without
+         * waiting for it to speak again. Its acknowledgement number is its receive-next, the one
+         * sequence number a stack accepts a reset at (RFC 5961); its next sequence number is what
+         * the reset acknowledges. Unknown until the application has sent a segment carrying ACK.
+         */
+        boolean appAckKnown;
+        int appAck;
+        int appSeqNext;
 
         Flow(long egress, long lastSeenMs) {
             this.egress = egress;
             this.lastSeenMs = lastSeenMs;
+        }
+
+        /**
+         * Records where the application is on a TCP flow from a segment it sent. Read from the
+         * header directly rather than through the parser: this runs on every forwarded packet, and
+         * a checksum over the whole segment for two numbers would be paid on every one.
+         */
+        void noteApplicationProgress(byte[] packet) {
+            int ihl = (packet[0] & 0x0f) * 4;
+            if (packet.length < ihl + 20) {
+                return;
+            }
+            int dataOffset = ((packet[ihl + 12] & 0xff) >>> 4) * 4;
+            if (dataOffset < 20) {
+                return;
+            }
+            int total = Math.min(((packet[2] & 0xff) << 8) | (packet[3] & 0xff), packet.length);
+            int payload = Math.max(total - ihl - dataOffset, 0);
+            int flags = packet[ihl + 13] & 0xff;
+            int next = readInt(packet, ihl + 4) + payload;
+            if ((flags & PeerEgressSegment.FLAG_SYN) != 0) {
+                next++;
+            }
+            if ((flags & PeerEgressSegment.FLAG_FIN) != 0) {
+                next++;
+            }
+            appSeqNext = next;
+            if ((flags & PeerEgressSegment.FLAG_ACK) != 0) {
+                appAck = readInt(packet, ihl + 8);
+                appAckKnown = true;
+            }
         }
     }
 
@@ -153,6 +193,7 @@ final class PeerEgressConsumer {
     private Map<Long, List<String>> purgeInvalidated(long nowMs) {
         Map<Long, TreeSet<String>> purge = new TreeMap<>();
         List<PeerEgressFlowTable.Key> dropped = new ArrayList<>();
+        List<byte[]> resets = new ArrayList<>();
         for (Map.Entry<PeerEgressFlowTable.Key, Flow> entry : flows.entrySet()) {
             PeerEgressFlowTable.Key key = entry.getKey();
             Flow flow = entry.getValue();
@@ -168,9 +209,20 @@ final class PeerEgressConsumer {
             dropped.add(key);
             purge.computeIfAbsent(flow.egress, unused -> new TreeSet<>())
                     .add(Ipv4Cidr.format(key.remoteIp()) + "/32");
+            byte[] reset = flowResetPacket(key, flow);
+            if (reset != null) {
+                resets.add(reset);
+            }
         }
         for (PeerEgressFlowTable.Key key : dropped) {
             flows.remove(key);
+        }
+        // The application is told each flow is over, so it fails now rather than at its own
+        // timeout; the egress is told through the purge messages returned.
+        if (tunWriter != null) {
+            for (byte[] reset : resets) {
+                tunWriter.write(reset);
+            }
         }
 
         Map<Long, List<String>> out = new LinkedHashMap<>();
@@ -222,16 +274,27 @@ final class PeerEgressConsumer {
         Long egress = match.egressClientId();
         if (egress == null || !Boolean.TRUE.equals(online.get(egress))) {
             recordBlocked("egress-unavailable");
+            // Answered, not just dropped. The rule is doing what it should, but the application
+            // would only learn that from its own timeout; a reset or an unreachable lets it fail
+            // now and retry when the egress is back. A failed send, by contrast, stays silent:
+            // the session may be re-establishing and the flow may yet recover.
+            byte[] answer = failurePacket(packet, protocol);
+            if (answer != null && tunWriter != null) {
+                tunWriter.write(answer);
+            }
             return Outcome.BLOCKED_NO_EGRESS;
         }
 
         PeerEgressFlowTable.Key key = flowKeyFor(packet, protocol);
         if (key != null) {
             Flow flow = flows.get(key);
-            if (flow != null) {
-                flow.lastSeenMs = nowMs;
-            } else {
-                flows.put(key, new Flow(egress, nowMs));
+            if (flow == null) {
+                flow = new Flow(egress, nowMs);
+                flows.put(key, flow);
+            }
+            flow.lastSeenMs = nowMs;
+            if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+                flow.noteApplicationProgress(packet);
             }
         }
 
@@ -246,6 +309,38 @@ final class PeerEgressConsumer {
             return Outcome.BLOCKED_NO_EGRESS;
         }
         return Outcome.FORWARDED;
+    }
+
+    /**
+     * Answers a packet the consumer refused to forward, the way an unreachable host would: a TCP
+     * reset placed where the application's stack accepts it (RFC 793), or an ICMP host-unreachable
+     * for a datagram. Null when there is nothing an application could act on. Shared vector:
+     * {@code protocol/test-vectors/peer-egress-failure-v1.json}.
+     */
+    static byte[] failurePacket(byte[] packet, int protocol) {
+        if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            PeerEgressSegment.Segment segment = PeerEgressSegment.parse(packet);
+            return segment == null ? null : PeerEgressSegment.buildReset(segment);
+        }
+        if (protocol == PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            return PeerIpPacket.icmpHostUnreachableFor(packet);
+        }
+        return null;
+    }
+
+    /**
+     * The reset for a flow the consumer closed, or null when there is none to build: a datagram
+     * flow, or a TCP flow on which the application has not yet sent an acknowledgement, whose
+     * retransmitted SYN will be answered when it arrives.
+     */
+    private static byte[] flowResetPacket(PeerEgressFlowTable.Key key, Flow flow) {
+        if (key.protocol() != PeerEgressSegment.IPV4_PROTOCOL_TCP || !flow.appAckKnown) {
+            return null;
+        }
+        return PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                key.remoteIp(), key.consumerIp(), key.remotePort(), key.consumerPort(),
+                flow.appAck, flow.appSeqNext, PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_ACK,
+                0, 0, new byte[0]));
     }
 
     /**

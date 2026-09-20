@@ -749,6 +749,74 @@ print(f"macos routes get={len(macos['routeGet'])} normalise={len(macos['normalis
       f" results={len(macos['commandResults'])}"
       f" refused={len(macos['commands']['rejectedArguments'])}"
       f" sampled={len(macos_sampled)}")
+# ---- failure vector -----------------------------------------------------
+# What the consumer writes back into the TUN. Checked from the packet bytes up: every expected
+# packet has to be a well-formed IPv4 packet with verifying checksums, the reset has to sit where
+# RFC 793 and RFC 5961 say a stack accepts it, and the ICMP has to quote the datagram it answers.
+failure = json.loads((VECTORS / "peer-egress-failure-v1.json").read_text(encoding="utf-8"))
+
+
+def failure_tcp(packet):
+    ihl = (packet[0] & 0x0F) * 4
+    check(packet[0] == 0x45 and packet[9] == 6 and verifies(packet[:20]), "failure: not a checksummed IPv4/TCP packet")
+    segment = packet[ihl:struct.unpack("!H", packet[2:4])[0]]
+    pseudo = packet[12:20] + struct.pack("!BBH", 0, 6, len(segment))
+    check(verifies(pseudo + segment), "failure: TCP checksum does not verify")
+    sport, dport, seq, ack, offset, flags, window = struct.unpack("!HHIIBBH", segment[:16])
+    return {"src": packet[12:16], "dst": packet[16:20], "sport": sport, "dport": dport, "seq": seq,
+            "ack": ack, "flags": flags, "window": window, "payload": segment[(offset >> 4) * 4:]}
+
+
+for case in failure["resetOnPurge"]["cases"]:
+    reset = failure_tcp(bytes.fromhex(case["expect"]["packetHex"]))
+    check(reset["src"] == ipaddress.IPv4Address(case["remoteIp"]).packed
+          and reset["dst"] == ipaddress.IPv4Address(case["consumerIp"]).packed,
+          f"failure purge {case['name']}: the reset does not travel from the remote to the application")
+    check(reset["sport"] == case["remotePort"] and reset["dport"] == case["consumerPort"],
+          f"failure purge {case['name']}: ports are not mirrored")
+    check(reset["flags"] == 0x14, f"failure purge {case['name']}: flags are not RST|ACK")
+    check(reset["seq"] == case["appAck"], f"failure purge {case['name']}: sequence is not the application's receive-next")
+    check(reset["ack"] == case["appSeqNext"], f"failure purge {case['name']}: ack is not what the application sent")
+    check(reset["window"] == 0 and not reset["payload"], f"failure purge {case['name']}: a reset carries a window or data")
+check(any(case["appAck"] > 0x7FFFFFFF for case in failure["resetOnPurge"]["cases"]),
+      "failure: no purge case with a sequence number above the signed range")
+
+for case in failure["resetOnPacket"]["cases"]:
+    incoming = failure_tcp(bytes.fromhex(case["packetHex"]))
+    reset = failure_tcp(bytes.fromhex(case["expect"]["packetHex"]))
+    check(reset["src"] == incoming["dst"] and reset["dst"] == incoming["src"]
+          and reset["sport"] == incoming["dport"] and reset["dport"] == incoming["sport"],
+          f"failure packet {case['name']}: the reset is not addressed back to the sender")
+    if incoming["flags"] & 0x10:
+        check(reset["flags"] == 0x04 and reset["seq"] == incoming["ack"],
+              f"failure packet {case['name']}: a segment with ACK must be reset at its acknowledgement")
+    else:
+        length = len(incoming["payload"]) + bool(incoming["flags"] & 0x02) + bool(incoming["flags"] & 0x01)
+        check(reset["flags"] == 0x14 and reset["ack"] == (incoming["seq"] + length) & 0xFFFFFFFF,
+              f"failure packet {case['name']}: a segment without ACK must be answered with RST|ACK covering it")
+check(any(not (failure_tcp(bytes.fromhex(c["packetHex"]))["flags"] & 0x10) for c in failure["resetOnPacket"]["cases"]),
+      "failure: no packet case for a SYN without ACK")
+check(any(failure_tcp(bytes.fromhex(c["packetHex"]))["flags"] & 0x10 for c in failure["resetOnPacket"]["cases"]),
+      "failure: no packet case for a segment carrying ACK")
+check(any(failure_tcp(bytes.fromhex(c["packetHex"]))["payload"] and not (failure_tcp(bytes.fromhex(c["packetHex"]))["flags"] & 0x10)
+          for c in failure["resetOnPacket"]["cases"]),
+      "failure: no packet case where data on a SYN has to be covered by the ack")
+
+for case in failure["unreachableOnDatagram"]["cases"]:
+    datagram = bytes.fromhex(case["packetHex"])
+    icmp = bytes.fromhex(case["expect"]["packetHex"])
+    check(icmp[0] == 0x45 and icmp[9] == 1 and verifies(icmp[:20]), f"failure datagram {case['name']}: not a checksummed IPv4/ICMP packet")
+    check(icmp[12:16] == datagram[16:20] and icmp[16:20] == datagram[12:16],
+          f"failure datagram {case['name']}: the ICMP is not addressed back to the sender")
+    body = icmp[20:struct.unpack("!H", icmp[2:4])[0]]
+    check(verifies(body), f"failure datagram {case['name']}: ICMP checksum does not verify")
+    check(body[0] == 3 and body[1] == 1, f"failure datagram {case['name']}: not host unreachable")
+    ihl = (datagram[0] & 0x0F) * 4
+    quoted = datagram[:min(struct.unpack("!H", datagram[2:4])[0], ihl + 8)]
+    check(body[8:] == quoted, f"failure datagram {case['name']}: the quoted datagram is not its header plus eight bytes")
+check(any(len(bytes.fromhex(c["packetHex"])) > 20 + 16 for c in failure["unreachableOnDatagram"]["cases"]),
+      "failure: no datagram case with payload beyond the quoted eight bytes")
+
 # ---- routes vector ------------------------------------------------------
 # The planner's contract with the bypass list, stated a second time here so the generator's own
 # planner cannot quietly change it: a bypass address gets a route only when a rule's route would
@@ -840,6 +908,8 @@ print(f"socket binding select={len(select_cases)} windows={len(binding['windows'
       f" macos={len(binding['macos']['cases'])} hops={len(hop_cases)} drift={len(drift_cases)}")
 print(f"routes plan={len(routes_vector['planCases'])} diff={len(routes_vector['diffCases'])}"
       f" reconcile={len(reconcile['cases'])}")
+print(f"failure purge={len(failure['resetOnPurge']['cases'])} packet={len(failure['resetOnPacket']['cases'])}"
+      f" datagram={len(failure['unreachableOnDatagram']['cases'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")

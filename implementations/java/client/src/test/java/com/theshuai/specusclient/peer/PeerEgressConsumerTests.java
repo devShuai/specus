@@ -1,6 +1,8 @@
 package com.theshuai.specusclient.peer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import java.nio.charset.StandardCharsets;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -134,6 +136,83 @@ class PeerEgressConsumerTests {
         assertEquals(PeerEgressConsumer.Outcome.BLOCKED_NO_EGRESS,
                 sendBroken.handleOutbound(packetTo("203.0.113.10", 443), EPOCH), "the send fails");
         sendFails = false;
+    }
+
+    /**
+     * A connection the egress cannot take fails now rather than after the application's own
+     * timeout: the SYN is answered with the reset a SYN-SENT socket accepts. A send that failed is
+     * not answered, because the session may be re-establishing and the flow may yet recover.
+     */
+    @Test
+    void answersWhatItCannotForward() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of());
+        byte[] syn = packetTo("203.0.113.10", 443);
+
+        assertEquals(PeerEgressConsumer.Outcome.BLOCKED_NO_EGRESS, consumer.handleOutbound(syn, EPOCH));
+        assertEquals(1, toTun.size(), "want the reset written to the TUN");
+        PeerEgressSegment.Segment reset = PeerEgressSegment.parse(toTun.get(0));
+        assertNotNull(reset, "the answer does not parse as TCP");
+        assertEquals(PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_ACK, reset.flags());
+        assertEquals(1001, reset.ack());
+        assertEquals(address("203.0.113.10"), reset.sourceIp());
+        assertEquals(443, reset.sourcePort());
+        assertEquals(40000, reset.destinationPort());
+
+        consumer.setEgressOnline(2L, true, EPOCH);
+        sendFails = true;
+        consumer.handleOutbound(syn, EPOCH);
+        assertEquals(1, toTun.size(), "a failed send was answered");
+    }
+
+    /**
+     * Flows the consumer closes itself are reset from what it remembered: the application's last
+     * acknowledgement is where its stack accepts a reset. A flow on which the application has only
+     * sent its SYN has nothing to be reset at, and its retransmitted SYN is answered when it comes.
+     */
+    @Test
+    void resetsTheFlowsItPurges() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true));
+        consumer.handleOutbound(packetTo("203.0.113.10", 443), EPOCH);
+        consumer.handleOutbound(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                address(VIRTUAL_IP), address("203.0.113.10"), 40000, 443,
+                1001, 700001, PeerEgressSegment.FLAG_ACK, 65535, 0,
+                "GET / ".getBytes(StandardCharsets.US_ASCII))), EPOCH);
+        // A second flow on which only the SYN went.
+        consumer.handleOutbound(packetTo("203.0.113.11", 443), EPOCH);
+        assertTrue(toTun.isEmpty(), "packets reached the TUN before anything was purged");
+
+        consumer.setEgressOnline(2L, false, EPOCH);
+
+        assertEquals(1, toTun.size(), "want one reset, for the established flow");
+        PeerEgressSegment.Segment reset = PeerEgressSegment.parse(toTun.get(0));
+        assertNotNull(reset, "the reset does not parse as TCP");
+        assertEquals(PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_ACK, reset.flags());
+        assertEquals(700001, reset.seq());
+        assertEquals(1007, reset.ack());
+        assertEquals(address("203.0.113.10"), reset.sourceIp());
+        assertEquals(address(VIRTUAL_IP), reset.destinationIp());
+        assertEquals(443, reset.sourcePort());
+        assertEquals(40000, reset.destinationPort());
+    }
+
+    /** A rule change resets the flows it invalidates the same way; a block rule then drops. */
+    @Test
+    void resetsFlowsARuleChangeInvalidates() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true));
+        consumer.handleOutbound(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                address(VIRTUAL_IP), address("203.0.113.10"), 40000, 443,
+                1001, 1, PeerEgressSegment.FLAG_ACK, 65535, 0, new byte[0])), EPOCH);
+
+        consumer.configure(List.of(rule("203.0.113.0/24", PeerEgressRule.ACTION_BLOCK, null)),
+                PeerEgressRules.DEFAULT_MESH_CIDR, VIRTUAL_IP, EPOCH);
+
+        assertEquals(1, toTun.size(), "want the reset written to the TUN");
+        PeerEgressSegment.Segment reset = PeerEgressSegment.parse(toTun.get(0));
+        assertNotNull(reset);
+        assertEquals(1, reset.seq());
+        assertEquals(1001, reset.ack());
+        consumer.handleOutbound(packetTo("203.0.113.10", 443), EPOCH);
+        assertEquals(1, toTun.size(), "a block rule answered a packet");
     }
 
     @Test

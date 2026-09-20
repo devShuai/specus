@@ -50,6 +50,55 @@ internal sealed class PeerEgressConsumer(
     {
         public long Egress { get; } = egress;
         public long LastSeenMs { get; set; } = lastSeenMs;
+
+        /// <summary>
+        /// What the application last said on a TCP flow, kept so the flow can be reset without
+        /// waiting for it to speak again. Its acknowledgement number is its receive-next, the one
+        /// sequence number a stack accepts a reset at (RFC 5961); its next sequence number is what
+        /// the reset acknowledges. Unknown until the application has sent a segment carrying ACK.
+        /// </summary>
+        public bool AppAckKnown { get; private set; }
+
+        public uint AppAck { get; private set; }
+
+        public uint AppSeqNext { get; private set; }
+
+        /// <summary>
+        /// Records where the application is on a TCP flow from a segment it sent. Read from the
+        /// header directly rather than through the parser: this runs on every forwarded packet,
+        /// and a checksum over the whole segment for two numbers would be paid on every one.
+        /// </summary>
+        public void NoteApplicationProgress(byte[] packet)
+        {
+            var ihl = (packet[0] & 0x0f) * 4;
+            if (packet.Length < ihl + 20)
+            {
+                return;
+            }
+            var dataOffset = (packet[ihl + 12] >> 4) * 4;
+            if (dataOffset < 20)
+            {
+                return;
+            }
+            var total = Math.Min((packet[2] << 8) | packet[3], packet.Length);
+            var payload = Math.Max(total - ihl - dataOffset, 0);
+            int flags = packet[ihl + 13];
+            var next = ReadUInt32(packet, ihl + 4) + (uint)payload;
+            if ((flags & PeerEgressSegment.FlagSyn) != 0)
+            {
+                next++;
+            }
+            if ((flags & PeerEgressSegment.FlagFin) != 0)
+            {
+                next++;
+            }
+            AppSeqNext = next;
+            if ((flags & PeerEgressSegment.FlagAck) != 0)
+            {
+                AppAck = ReadUInt32(packet, ihl + 8);
+                AppAckKnown = true;
+            }
+        }
     }
 
     private IReadOnlyList<PeerEgressRule> _rules = [];
@@ -124,6 +173,7 @@ internal sealed class PeerEgressConsumer(
     {
         var purge = new SortedDictionary<long, SortedSet<string>>();
         var dropped = new List<PeerEgressFlowTable.Key>();
+        var resets = new List<byte[]>();
         foreach (var (key, flow) in _flows)
         {
             var match = PeerEgressRules.Match(_rules, Ipv4Cidr.FormatAddress(key.RemoteIp), _meshCidr);
@@ -141,10 +191,20 @@ internal sealed class PeerEgressConsumer(
                 purge[flow.Egress] = destinations;
             }
             destinations.Add(Ipv4Cidr.FormatAddress(key.RemoteIp) + "/32");
+            if (FlowResetPacket(key, flow) is { } reset)
+            {
+                resets.Add(reset);
+            }
         }
         foreach (var key in dropped)
         {
             _flows.Remove(key);
+        }
+        // The application is told each flow is over, so it fails now rather than at its own
+        // timeout; the egress is told through the purge messages returned.
+        foreach (var reset in resets)
+        {
+            toTun?.Invoke(reset);
         }
 
         var result = new Dictionary<long, IReadOnlyList<string>>(purge.Count);
@@ -203,18 +263,28 @@ internal sealed class PeerEgressConsumer(
         if (match.EgressClientId is not { } egress || !_online.GetValueOrDefault(egress))
         {
             RecordBlocked("egress-unavailable");
+            // Answered, not just dropped. The rule is doing what it should, but the application
+            // would only learn that from its own timeout; a reset or an unreachable lets it fail
+            // now and retry when the egress is back. A failed send, by contrast, stays silent:
+            // the session may be re-establishing and the flow may yet recover.
+            if (FailurePacket(packet, protocol) is { } answer)
+            {
+                toTun?.Invoke(answer);
+            }
             return PeerEgressConsumerOutcome.BlockedNoEgress;
         }
 
         if (FlowKeyFor(packet, protocol) is { } key)
         {
-            if (_flows.TryGetValue(key, out var existing))
+            if (!_flows.TryGetValue(key, out var flow))
             {
-                existing.LastSeenMs = nowMs;
+                flow = new Flow(egress, nowMs);
+                _flows[key] = flow;
             }
-            else
+            flow.LastSeenMs = nowMs;
+            if (protocol == PeerEgressSegment.Ipv4ProtocolTcp)
             {
-                _flows[key] = new Flow(egress, nowMs);
+                flow.NoteApplicationProgress(packet);
             }
         }
 
@@ -231,6 +301,37 @@ internal sealed class PeerEgressConsumer(
             return PeerEgressConsumerOutcome.BlockedNoEgress;
         }
         return PeerEgressConsumerOutcome.Forwarded;
+    }
+
+    /// <summary>
+    /// Answers a packet the consumer refused to forward, the way an unreachable host would: a TCP
+    /// reset placed where the application's stack accepts it (RFC 793), or an ICMP host-unreachable
+    /// for a datagram. Null when there is nothing an application could act on. Shared vector:
+    /// <c>protocol/test-vectors/peer-egress-failure-v1.json</c>.
+    /// </summary>
+    public static byte[]? FailurePacket(byte[] packet, int protocol) => protocol switch
+    {
+        PeerEgressSegment.Ipv4ProtocolTcp => PeerEgressSegment.Parse(packet) is { } segment
+            ? PeerEgressSegment.BuildReset(segment)
+            : null,
+        PeerEgressDatagram.Ipv4ProtocolUdp => PeerIpPacket.IcmpHostUnreachableFor(packet),
+        _ => null,
+    };
+
+    /// <summary>
+    /// The reset for a flow the consumer closed, or null when there is none to build: a datagram
+    /// flow, or a TCP flow on which the application has not yet sent an acknowledgement, whose
+    /// retransmitted SYN will be answered when it arrives.
+    /// </summary>
+    private static byte[]? FlowResetPacket(PeerEgressFlowTable.Key key, Flow flow)
+    {
+        if (key.Protocol != PeerEgressSegment.Ipv4ProtocolTcp || !flow.AppAckKnown)
+        {
+            return null;
+        }
+        return PeerEgressSegment.Build(new PeerEgressSegment.Segment(
+            key.RemoteIp, key.ConsumerIp, key.RemotePort, key.ConsumerPort,
+            flow.AppAck, flow.AppSeqNext, PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, 0, 0, []));
     }
 
     /// <summary>

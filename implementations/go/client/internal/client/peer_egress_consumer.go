@@ -55,6 +55,13 @@ type egressConsumerFlow struct {
 	Key      egressFlowKey
 	Egress   int64
 	LastSeen time.Time
+	// What the application last said on a TCP flow, kept so the flow can be reset without waiting
+	// for it to speak again. Its acknowledgement number is its receive-next, the one sequence
+	// number a stack accepts a reset at (RFC 5961); its next sequence number is what the reset
+	// acknowledges. Unknown until the application has sent a segment carrying ACK.
+	AppAckKnown bool
+	AppAck      uint32
+	AppSeqNext  uint32
 }
 
 type egressConsumer struct {
@@ -99,13 +106,16 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 // that is dead at one end and open at the other.
 func (c *egressConsumer) configure(rules []egressRule, meshCIDR string, virtualIP string, now time.Time) map[int64][]string {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.rules = append([]egressRule(nil), rules...)
 	if trimmed := strings.TrimSpace(meshCIDR); trimmed != "" {
 		c.meshCIDR = trimmed
 	}
 	c.virtualIP = strings.TrimSpace(virtualIP)
-	return c.purgeInvalidatedLocked(now)
+	purge, resets := c.purgeInvalidatedLocked(now)
+	toTun := c.toTun
+	c.mu.Unlock()
+	c.writeResets(toTun, resets)
+	return purge
 }
 
 // setEgressOnline records whether an egress peer can take flows.
@@ -114,18 +124,26 @@ func (c *egressConsumer) configure(rules []egressRule, meshCIDR string, virtualI
 // would carry in the meantime is one the rule says must not go out locally.
 func (c *egressConsumer) setEgressOnline(egress int64, online bool, now time.Time) map[int64][]string {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.online[egress] = online
 	if online {
+		c.mu.Unlock()
 		return nil
 	}
-	return c.purgeInvalidatedLocked(now)
+	purge, resets := c.purgeInvalidatedLocked(now)
+	toTun := c.toTun
+	c.mu.Unlock()
+	c.writeResets(toTun, resets)
+	return purge
 }
 
 // purgeInvalidatedLocked drops flows whose rule no longer sends them to the egress they are using,
-// and returns the destinations to purge per egress.
-func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) map[int64][]string {
+// and returns the destinations to purge per egress together with the resets that tell the
+// application each flow is over.
+//
+// The resets are returned rather than written here, so the device is written to with no lock held.
+func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]string, [][]byte) {
 	purge := map[int64][]string{}
+	var resets [][]byte
 	for key, flow := range c.flows {
 		decision := matchEgressRules(c.rules, formatEgressAddress(key.remoteIP), c.meshCIDR)
 		stillOurs := decision.Action == egressActionEgress &&
@@ -137,12 +155,24 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) map[int64][]strin
 		delete(c.flows, key)
 		destination := formatEgressAddress(key.remoteIP) + "/32"
 		purge[flow.Egress] = append(purge[flow.Egress], destination)
+		if reset := egressFlowResetPacket(flow); reset != nil {
+			resets = append(resets, reset)
+		}
 	}
 	_ = now
 	for egress := range purge {
 		purge[egress] = sortedUniqueStrings(purge[egress])
 	}
-	return purge
+	return purge, resets
+}
+
+func (c *egressConsumer) writeResets(toTun func([]byte) error, resets [][]byte) {
+	if toTun == nil {
+		return
+	}
+	for _, reset := range resets {
+		_ = toTun(reset)
+	}
 }
 
 // sortedUniqueStrings orders the destinations and drops repeats.
@@ -202,16 +232,28 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 	}
 	if !c.online[decision.EgressClientID] {
 		c.recordBlockedLocked("egress-unavailable")
+		toTun := c.toTun
 		c.mu.Unlock()
+		// Answered, not just dropped. The rule is doing what it should, but the application
+		// would only learn that from its own timeout; a reset or an unreachable lets it fail now
+		// and retry when the egress is back. A failed send, by contrast, stays silent: the
+		// session may be re-establishing and the flow may yet recover.
+		if answer := egressFailurePacket(packet, protocol); answer != nil && toTun != nil {
+			_ = toTun(answer)
+		}
 		return egressOutcomeBlockedNoEgress
 	}
 
 	key, ok := consumerFlowKeyFor(packet, protocol)
 	if ok {
-		if flow, known := c.flows[key]; known {
-			flow.LastSeen = now
-		} else {
-			c.flows[key] = &egressConsumerFlow{Key: key, Egress: decision.EgressClientID, LastSeen: now}
+		flow, known := c.flows[key]
+		if !known {
+			flow = &egressConsumerFlow{Key: key, Egress: decision.EgressClientID}
+			c.flows[key] = flow
+		}
+		flow.LastSeen = now
+		if protocol == ipv4ProtocolTCP {
+			flow.noteApplicationProgress(packet)
 		}
 	}
 	egress, send := decision.EgressClientID, c.send
