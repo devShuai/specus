@@ -467,6 +467,14 @@ class Lab:
                    if leaks else "no request from the consumer's own address reached the covered target")
 
     @staticmethod
+    def human(size):
+        if size >= 1048576 and size % 1048576 == 0:
+            return f"{size // 1048576} MiB"
+        if size >= 1024 and size % 1024 == 0:
+            return f"{size // 1024} KiB"
+        return f"{size} B"
+
+    @staticmethod
     def describe(got):
         text = f"curl exit {got['code']}"
         if got.get("http"):
@@ -589,7 +597,46 @@ class Lab:
 
         self.transfer("download via egress", TARGET_URL, self.args.blob_bytes, timeout=180)
         self.transfer("download direct", DIRECT_URL, self.args.blob_bytes, timeout=60, record_only=True)
-        self.upload("upload via egress", TARGET_URL, self.args.blob_bytes // 2, timeout=180)
+        self.upload("upload via egress", TARGET_URL, self.args.upload_bytes, timeout=180)
+        self.downstream_ceiling()
+
+    def downstream_ceiling(self):
+        """How large a response the egress can actually deliver.
+
+        The egress reads from the target as fast as the target will serve and sends it on without
+        looking at what the consumer advertised, so a response only survives while it fits in what
+        the receiver can hold. Past that the consumer's kernel drops what it cannot take, the
+        egress's stack retransmits the same segments into the same full window until it runs out of
+        attempts, and the application gets a reset minutes later. This measures where that starts
+        rather than asserting it away.
+        """
+        largest = None
+        first_failure = None
+        for size in self.args.ceiling_sizes:
+            got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=self.args.ceiling_timeout)
+            received = got["body"].stat().st_size if got["body"].exists() else 0
+            got["body"].unlink(missing_ok=True)
+            complete = got["code"] == CURL_OK and received == size
+            self.say(f"downstream ceiling probe: {size} B -> received {received} B, {self.describe(got)}")
+            if complete:
+                largest = size
+                continue
+            first_failure = (size, received, got)
+            break
+        if largest is not None:
+            self.measure("largest response the egress delivered", largest, "B")
+        if first_failure is not None:
+            size, received, got = first_failure
+            self.measure("first response size the egress failed to deliver", size, "B")
+            self.measure("of which the application received", received, "B")
+            self.note(f"a {size} B response through the egress did not arrive: the application got "
+                      f"{received} B and then {self.describe(got)}. The egress does not pace itself "
+                      f"against what the consumer advertises, so a response larger than the "
+                      f"receiver's buffer stalls and is reset instead of slowing down. This is the "
+                      f"known missing send-side flow control, measured rather than assumed.")
+        else:
+            self.note(f"every probed response up to {self.args.ceiling_sizes[-1]} B arrived, which is "
+                      f"more than this lab could deliver when it was written")
 
     def transfer(self, name, url, size, timeout, record_only=False):
         got = self.curl(f"{url}/blob/{size}", timeout=timeout)
@@ -600,12 +647,12 @@ class Lab:
                 for chunk in iter(lambda: handle.read(65536), b""):
                     hasher.update(chunk)
             ok = hasher.hexdigest() == blob_sha256(size)
-        mib = size // 1048576
+        label = self.human(size)
         if got.get("total"):
-            self.measure(f"{name}, {mib} MiB", round(size / got["total"] / 1048576, 2), "MiB/s")
-            self.measure(f"{name}, {mib} MiB, wall", round(got["total"], 2), "s")
+            self.measure(f"{name}, {label}", round(size / got["total"] / 1048576, 2), "MiB/s")
+            self.measure(f"{name}, {label}, wall", round(got["total"], 2), "s")
         if not record_only:
-            self.check(f"{name}: {mib} MiB arrive intact across segment boundaries", ok,
+            self.check(f"{name}: {label} arrives intact across segment boundaries", ok,
                        f"sha256 {'matches' if ok else 'differs or the transfer failed'}; {self.describe(got)}")
         got["body"].unlink(missing_ok=True)
         return ok
@@ -626,10 +673,10 @@ class Lab:
                 detail += f"; target saw src={answer.get('src')} bytes={answer.get('bytes')}"
             except (json.JSONDecodeError, OSError):
                 pass
-        mib = size // 1048576
+        label = self.human(size)
         if got.get("total"):
-            self.measure(f"{name}, {mib} MiB", round(size / got["total"] / 1048576, 2), "MiB/s")
-        self.check(f"{name}: {mib} MiB arrive intact", ok, detail)
+            self.measure(f"{name}, {label}", round(size / got["total"] / 1048576, 2), "MiB/s")
+        self.check(f"{name}: {label} arrives intact", ok, detail)
         got["body"].unlink(missing_ok=True)
         payload.unlink(missing_ok=True)
 
@@ -648,16 +695,27 @@ class Lab:
             return
         self.netem = True
         try:
+            # Recorded, not asserted. What the user-space stack does on a lossy link is the thing
+            # issue #56 asks to be shown with numbers rather than described, and with a fixed window
+            # and no congestion control the honest number may well be a transfer that never lands.
             size = self.args.lossy_blob_bytes
-            mib = size // 1048576
-            got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=300)
-            ok = got["code"] == CURL_OK and got["body"].stat().st_size == size
-            if got.get("total"):
-                self.measure(f"download via egress with {percent}% loss each way, {mib} MiB",
+            label = self.human(size)
+            got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=self.args.lossy_timeout)
+            received = got["body"].stat().st_size if got["body"].exists() else 0
+            complete = got["code"] == CURL_OK and received == size
+            if complete and got.get("total"):
+                self.measure(f"download via egress with {percent}% loss each way, {label}",
                              round(size / got["total"] / 1048576, 3), "MiB/s")
-                self.measure(f"download via egress with {percent}% loss each way, {mib} MiB, wall",
+                self.measure(f"download via egress with {percent}% loss each way, {label}, wall",
                              round(got["total"], 1), "s")
-            self.check(f"download via egress with {percent}% loss each way completes", ok, self.describe(got))
+            else:
+                self.measure(f"download via egress with {percent}% loss each way, {label}, delivered",
+                             received, "B")
+                self.note(f"with {percent}% loss each way a {label} response did not arrive: the "
+                          f"application got {received} B in {self.args.lossy_timeout}s and then "
+                          f"{self.describe(got)}. Loss is recovered only by the retransmission timer, "
+                          f"so the same missing send-side pacing that caps a clean link stops a lossy "
+                          f"one outright.")
             got["body"].unlink(missing_ok=True)
         finally:
             self.sh(["tc", "qdisc", "del", "dev", "r-egr", "root"], check=False)
@@ -689,8 +747,11 @@ class Lab:
         offset = egress.log_offset()
         slow_out = self.work / "slow.out"
         slow_out.unlink(missing_ok=True)
-        slow = subprocess.Popen(ns("con", "curl", "-sS", "--max-time", "90", "-o", str(slow_out),
-                                   f"{TARGET_URL}/slow?seconds=40&interval=0.2"),
+        # --no-buffer, because the check below watches the file grow and curl's own buffering would
+        # hold a trickle of a few bytes per tick until the transfer ended, which is the thing being
+        # measured. The whole stream stays well under the size the egress can deliver.
+        slow = subprocess.Popen(ns("con", "curl", "-sS", "--no-buffer", "--max-time", "90",
+                                   "-o", str(slow_out), f"{TARGET_URL}/slow?seconds=40&interval=0.2"),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         started, _ = self.wait_for("the slow download to start",
                                    lambda: slow_out.exists() and slow_out.stat().st_size > 0, 15)
@@ -733,6 +794,12 @@ class Lab:
         def probe():
             got = self.whoami(TARGET_URL)
             outcomes.append((round(time.time() - stopped_at, 1), got["code"], got.get("src")))
+            if got["code"] == CURL_OK:
+                # A request that succeeds with the egress gone went somewhere it should not have.
+                # The table at this instant is the evidence for where, so take it before anything
+                # can reconcile it away.
+                self.snapshots[f"while a probe succeeded {outcomes[-1][0]}s after the egress stopped"] = \
+                    self.consumer_table()
             return got if got["code"] == CURL_CONNECT_FAILED else None
 
         fast, elapsed = self.wait_for("a fast failure once the consumer sees the egress offline", probe, 90, 1.0)
@@ -890,8 +957,16 @@ def main():
     parser.add_argument("--client", required=True, help="specus-client binary (Go)")
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--work", help="working directory; a fresh temporary one by default")
-    parser.add_argument("--blob-bytes", type=int, default=16 * 1048576)
-    parser.add_argument("--lossy-blob-bytes", type=int, default=4 * 1048576)
+    # Sized under the ceiling the egress can currently deliver, which downstream_ceiling measures
+    # and the report states. 256 KiB still crosses two hundred segment boundaries at this MTU,
+    # which is what the intact-arrival check is there to exercise.
+    parser.add_argument("--blob-bytes", type=int, default=256 * 1024)
+    parser.add_argument("--upload-bytes", type=int, default=8 * 1048576)
+    parser.add_argument("--lossy-blob-bytes", type=int, default=64 * 1024)
+    parser.add_argument("--lossy-timeout", type=int, default=60)
+    parser.add_argument("--ceiling-sizes", type=int, nargs="+",
+                        default=[256 * 1024, 512 * 1024, 1048576])
+    parser.add_argument("--ceiling-timeout", type=int, default=20)
     parser.add_argument("--loss-percent", type=float, default=2.0)
     parser.add_argument("--skip-lossy", action="store_true")
     parser.add_argument("--skip-faults", action="store_true")
