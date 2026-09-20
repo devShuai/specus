@@ -672,6 +672,56 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(PeerMeshService.StatusNegotiating, stored.Status);
     }
 
+    // The sender's key epoch has to survive the relay untouched while its claimed identity does not.
+    // Both peers derive their SPM2 traffic keys from the epoch, so a relay that drops it leaves each
+    // side holding a session it cannot build a codec for, and no peer traffic ever flows -- which is
+    // what this server did until sourceKeyEpoch was added to PeerControlMessage.
+    //
+    // The body is raw JSON rather than a serialized PeerControlMessage on purpose: a field the type
+    // does not carry is exactly the failure being guarded against, and a typed input cannot express
+    // it. Same shape as the Go and C servers' checks.
+    [Fact]
+    public async Task RelayedSignalKeepsTheSenderKeyEpochAndOverwritesItsClaimedIdentity()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(1001, "tenant-a", "alice", "alice-laptop");
+        var target = fixture.AddClient(1002, "tenant-a", "alice", "alice-nas");
+        fixture.AddDevice(source, "100.96.0.10", "source-key");
+        fixture.AddDevice(target, "100.96.0.11", "target-key");
+        await fixture.SaveChangesAsync();
+
+        var sourceWriter = fixture.Bind(source);
+        var targetWriter = fixture.Bind(target);
+        const string signal = """
+            {"type":"candidates","sourceClientId":999,"sourceClientName":"spoofed",
+             "sourceVirtualIp":"100.96.0.99","sourceKeyEpoch":"epoch-a","dataFrameVersion":2,
+             "candidates":[{"type":"host","transport":"udp","address":"192.168.1.10","port":53000}]}
+            """;
+
+        await fixture.Service.HandleSignalAsync(new MessageRequestPacket
+        {
+            ToClientName = target.ClientName,
+            MessageType = MessageType.PeerControl,
+            Message = signal,
+        }, source.ClientName, CancellationToken.None);
+
+        var forwarded = targetWriter.SinglePeerMessage();
+        Assert.Equal("epoch-a", forwarded.SourceKeyEpoch);
+        Assert.Equal(source.Id, forwarded.SourceClientId);
+        Assert.Equal(source.ClientName, forwarded.SourceClientName);
+        Assert.Equal("100.96.0.10", forwarded.SourceVirtualIp);
+
+        var raw = Assert.Single(targetWriter.RawPeerMessages());
+        Assert.DoesNotContain("spoofed", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("100.96.0.99", raw, StringComparison.Ordinal);
+
+        // The grant goes back to the sender and speaks for the server, so it carries no epoch of its
+        // own: the sender already knows its own, and the peer's arrives on the peer's own candidates.
+        var grant = sourceWriter.SinglePeerMessage();
+        Assert.Equal("session-grant", grant.Type);
+        Assert.True(string.IsNullOrEmpty(grant.SourceKeyEpoch));
+    }
+
     [Fact]
     public async Task DisablingDeviceClosesOpenSessionsAndNotifiesBothPeers()
     {
@@ -1381,6 +1431,13 @@ public sealed class PeerMeshServiceTests
                 Assert.False(string.IsNullOrWhiteSpace(response.Message));
                 return JsonSerializer.Deserialize<PeerControlMessage>(response.Message!)!;
             }).ToList();
+        }
+
+        // The wire text rather than the parsed message: a value the server was supposed to drop is
+        // only provably gone when nothing in the bytes still carries it.
+        public List<string> RawPeerMessages()
+        {
+            return _packets.Select(packet => Assert.IsType<MessageResponsePacket>(packet).Message!).ToList();
         }
 
         public void Clear() => _packets.Clear();

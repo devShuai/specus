@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,68 @@ func TestHandleSignalCandidatesCreatesGrantAndForwardsJavaShape(t *testing.T) {
 		sessions[0].SourceClientID != source.ID || sessions[0].TargetClientID != target.ID ||
 		sessions[0].PathType != PathDirect || sessions[0].Status != StatusNegotiating {
 		t.Fatalf("persisted session mismatch: %+v", sessions)
+	}
+}
+
+// The sender's key epoch has to survive the relay untouched while its claimed identity does not.
+// Both peers derive their SPM2 traffic keys from the epoch, so a relay that drops it leaves each
+// side holding a session it cannot build a codec for, and no peer traffic ever flows -- which is
+// what the Go server did until sourceKeyEpoch was added to ControlMessage.
+//
+// The body is raw JSON rather than a marshalled ControlMessage on purpose: a field the struct does
+// not carry is exactly the failure being guarded against, and a typed input cannot express it.
+// Same shape as the C server's check in implementations/c/server/tests/peer_mesh_tests.c.
+func TestRelayedSignalKeepsTheSenderKeyEpochAndOverwritesItsClaimedIdentity(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled:           true,
+		CIDR:              "100.96.0.0/11",
+		PublicAddress:     "203.0.113.10",
+		StunTurnPort:      3478,
+		SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+
+	source := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	target := insertPeerClient(t, db, 1002, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, source, "100.96.0.10", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.11", "target-key")
+
+	sourceSession := &recordingSession{name: source.ClientName}
+	targetSession := &recordingSession{name: target.ClientName}
+	registry.Replace(sourceSession)
+	registry.Replace(targetSession)
+
+	body := `{"type":"candidates","sourceClientId":999,"sourceClientName":"spoofed",` +
+		`"sourceVirtualIp":"100.96.0.99","sourceKeyEpoch":"epoch-a","dataFrameVersion":2,` +
+		`"candidates":[{"type":"host","transport":"udp","address":"192.168.1.10","port":53000}]}`
+	if err := service.HandleSignal(ctx, protocol.MessageRequest{
+		ToClientName: target.ClientName,
+		MessageType:  protocol.MessageTypePeerControl,
+		Message:      string(body),
+	}, source.ClientName); err != nil {
+		t.Fatalf("handle candidates signal: %v", err)
+	}
+
+	forwarded := decodeOnlyPeerMessage(t, targetSession)
+	if forwarded.SourceKeyEpoch != "epoch-a" {
+		t.Fatalf("relayed signal lost the sender's key epoch: %+v", forwarded)
+	}
+	if forwarded.SourceClientID != source.ID || forwarded.SourceClientName != source.ClientName ||
+		forwarded.SourceVirtualIP != "100.96.0.10" {
+		t.Fatalf("relayed signal kept the sender's claimed identity: %+v", forwarded)
+	}
+	raw := targetSession.packets[len(targetSession.packets)-1].(protocol.MessageResponse).Message
+	if strings.Contains(raw, "spoofed") || strings.Contains(raw, "100.96.0.99") {
+		t.Fatalf("relayed signal still carries a spoofed value: %s", raw)
+	}
+
+	// The grant goes back to the sender and speaks for the server, so it carries no epoch of its
+	// own: the sender already knows its own, and the peer's arrives on the peer's own candidates.
+	grant := decodeOnlyPeerMessage(t, sourceSession)
+	if grant.Type != TypeSessionGrant || grant.SourceKeyEpoch != "" {
+		t.Fatalf("session grant should carry no key epoch: %+v", grant)
 	}
 }
 

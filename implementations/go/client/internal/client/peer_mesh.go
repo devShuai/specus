@@ -2174,7 +2174,10 @@ func (mesh *peerMeshClient) applyPeerFromSignal(message peerControlMessage) bool
 	runtimeID := mesh.runtime.PeerMesh.ClientID
 	var peer peerMeshPeer
 	if message.SourceClientID != 0 && message.SourceClientID != runtimeID {
-		peer = peerMeshPeer{ClientID: message.SourceClientID, ClientName: message.SourceClientName, VirtualIP: message.SourceVirtualIP, PublicKey: message.SourcePublicKey, Online: true}
+		// The epoch rides on the signal and nowhere else: the roster the server pushes does not
+		// carry it. Keeping it on the peer is what lets a session minted later pick it up, so a
+		// grant that arrives before the peer's own candidates still ends up with a codec.
+		peer = peerMeshPeer{ClientID: message.SourceClientID, ClientName: message.SourceClientName, VirtualIP: message.SourceVirtualIP, PublicKey: message.SourcePublicKey, KeyEpoch: message.SourceKeyEpoch, Online: true}
 	} else if message.TargetClientID != 0 && message.TargetClientID != runtimeID {
 		peer = peerMeshPeer{ClientID: message.TargetClientID, ClientName: message.TargetClientName, VirtualIP: message.TargetVirtualIP, PublicKey: message.TargetPublicKey, Online: true}
 	}

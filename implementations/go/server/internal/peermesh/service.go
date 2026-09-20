@@ -375,11 +375,16 @@ type Candidate struct {
 }
 
 type ControlMessage struct {
-	Type                 string              `json:"type"`
-	SourceClientID       int64               `json:"sourceClientId,omitempty"`
-	SourceClientName     string              `json:"sourceClientName,omitempty"`
-	SourceVirtualIP      string              `json:"sourceVirtualIp,omitempty"`
-	SourcePublicKey      *string             `json:"sourcePublicKey,omitempty"`
+	Type             string  `json:"type"`
+	SourceClientID   int64   `json:"sourceClientId,omitempty"`
+	SourceClientName string  `json:"sourceClientName,omitempty"`
+	SourceVirtualIP  string  `json:"sourceVirtualIp,omitempty"`
+	SourcePublicKey  *string `json:"sourcePublicKey,omitempty"`
+	// SourceKeyEpoch is the sender's random epoch for this run of its process, relayed verbatim.
+	// The peers derive their SPM2 traffic keys from it, so a signal that arrives without it leaves
+	// the receiver unable to build a codec and the data plane never comes up. The server neither
+	// reads nor rewrites it: fillSource owns the identity fields, this one belongs to the sender.
+	SourceKeyEpoch       string              `json:"sourceKeyEpoch,omitempty"`
 	TargetClientID       int64               `json:"targetClientId,omitempty"`
 	TargetClientName     string              `json:"targetClientName,omitempty"`
 	TargetVirtualIP      string              `json:"targetVirtualIp,omitempty"`
