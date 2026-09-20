@@ -328,7 +328,10 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _observer?.OnControlAuthenticated();
         _activeWriter = controlWriter;
         _peerMesh.ControlRemoteEndPoint = controlConnection.RemoteEndPoint;
-        await _peerMesh.StartAsync(runtime, controlWriter, session).ConfigureAwait(false);
+        // The client's own token, not this session's. The mesh outlives a reconnect now: its
+        // loops, its device and the routes it installed all have to survive the gap, and a token
+        // that dies with the session would take them with it.
+        await _peerMesh.StartAsync(runtime, controlWriter, cancellationToken).ConfigureAwait(false);
 
         await using var dataConnection = await ConnectAsync(runtime, ConnectionRole.Data, session)
             .ConfigureAwait(false);
@@ -391,7 +394,12 @@ public sealed class SpecusControlClient : IAsyncDisposable
             _activeWriter = null;
             _loggedIn = false;
             sessionCts.Cancel();
-            await _peerMesh.DisposeAsync().ConfigureAwait(false);
+            // Suspend, not dispose. This runs on every control session that ends, and almost all
+            // of them end because the next one is about to start. Disposing here withdrew the
+            // egress routes and closed the device for the length of the reconnect, which let
+            // traffic a rule had claimed out of the local default route. DisposeAsync below is
+            // where the client is really finished, and where the routes are supposed to go.
+            _peerMesh.Suspend();
             PublishStatus("SESSION_CLOSED", "控制会话已关闭", running: true, controlConnected: false, loggedIn: false);
             sessionCts.Dispose();
             _sessionCts = null;

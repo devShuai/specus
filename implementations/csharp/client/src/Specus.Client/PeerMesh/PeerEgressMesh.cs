@@ -778,6 +778,28 @@ internal sealed class PeerEgressMesh(
     /// Takes back every route this feature installed and forgets the plan, so the next reconcile
     /// starts from nothing. Safe to call with the mesh's own lock held: nothing here waits on it.
     /// </summary>
+    /// <summary>
+    /// Stops serving other consumers, and leaves everything this node installed for its own
+    /// traffic where it is.
+    /// </summary>
+    /// <remarks>
+    /// For a control connection that has gone away and is about to come back. An egress that
+    /// cannot hear a revocation should not be taking new flows, but the routes this node's own
+    /// rules claimed are still the truth about where that traffic goes, and withdrawing them for
+    /// the length of a reconnect puts it back on the machine's own default route. The loops and
+    /// the queue stay, so the next policy push rebuilds the plane without restarting them.
+    /// </remarks>
+    public void ShutdownServing()
+    {
+        PeerEgressRuntime? plane;
+        lock (_gate)
+        {
+            plane = _runtime;
+            _runtime = null;
+        }
+        plane?.Shutdown(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
+
     public void WithdrawRoutes()
     {
         lock (_planLock)
