@@ -144,6 +144,85 @@ public class PeerEgressConsumerTests
         _sendFails = false;
     }
 
+    /// <summary>
+    /// A connection the egress cannot take fails now rather than after the application's own
+    /// timeout: the SYN is answered with the reset a SYN-SENT socket accepts. A send that failed is
+    /// not answered, because the session may be re-establishing and the flow may yet recover.
+    /// </summary>
+    [Fact]
+    public void AnswersWhatItCannotForward()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool>());
+        var syn = PacketTo("203.0.113.10", 443);
+
+        Assert.Equal(PeerEgressConsumerOutcome.BlockedNoEgress, consumer.HandleOutbound(syn, Epoch));
+        Assert.Single(_toTun);
+        var reset = PeerEgressSegment.Parse(_toTun[0]);
+        Assert.NotNull(reset);
+        Assert.Equal(PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, reset.Flags);
+        Assert.Equal(1001u, reset.Ack);
+        Assert.Equal(Address("203.0.113.10"), reset.SourceIp);
+        Assert.Equal(443, reset.SourcePort);
+        Assert.Equal(40000, reset.DestinationPort);
+
+        consumer.SetEgressOnline(2L, true, Epoch);
+        _sendFails = true;
+        consumer.HandleOutbound(syn, Epoch);
+        Assert.True(_toTun.Count == 1, "a failed send was answered");
+    }
+
+    /// <summary>
+    /// Flows the consumer closes itself are reset from what it remembered: the application's last
+    /// acknowledgement is where its stack accepts a reset. A flow on which the application has
+    /// only sent its SYN has nothing to be reset at, and its retransmitted SYN is answered when it
+    /// comes.
+    /// </summary>
+    [Fact]
+    public void ResetsTheFlowsItPurges()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2L] = true });
+        consumer.HandleOutbound(PacketTo("203.0.113.10", 443), Epoch);
+        consumer.HandleOutbound(PeerEgressSegment.Build(new Segment(
+            Address(VirtualIp), Address("203.0.113.10"), 40000, 443,
+            1001, 700001, PeerEgressSegment.FlagAck, 65535, 0, "GET / "u8.ToArray())), Epoch);
+        // A second flow on which only the SYN went.
+        consumer.HandleOutbound(PacketTo("203.0.113.11", 443), Epoch);
+        Assert.Empty(_toTun);
+
+        consumer.SetEgressOnline(2L, false, Epoch);
+
+        Assert.Single(_toTun);
+        var reset = PeerEgressSegment.Parse(_toTun[0]);
+        Assert.NotNull(reset);
+        Assert.Equal(PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, reset.Flags);
+        Assert.Equal(700001u, reset.Seq);
+        Assert.Equal(1007u, reset.Ack);
+        Assert.Equal(Address("203.0.113.10"), reset.SourceIp);
+        Assert.Equal(Address(VirtualIp), reset.DestinationIp);
+        Assert.Equal(443, reset.SourcePort);
+        Assert.Equal(40000, reset.DestinationPort);
+    }
+
+    /// <summary>A rule change resets the flows it invalidates the same way; a block rule then drops.</summary>
+    [Fact]
+    public void ResetsFlowsARuleChangeInvalidates()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2L] = true });
+        consumer.HandleOutbound(PeerEgressSegment.Build(new Segment(
+            Address(VirtualIp), Address("203.0.113.10"), 40000, 443,
+            1001, 1, PeerEgressSegment.FlagAck, 65535, 0, [])), Epoch);
+
+        consumer.Configure([Rule("203.0.113.0/24", "block")], PeerEgressRules.DefaultMeshCidr, VirtualIp, Epoch);
+
+        Assert.Single(_toTun);
+        var reset = PeerEgressSegment.Parse(_toTun[0]);
+        Assert.NotNull(reset);
+        Assert.Equal(1u, reset.Seq);
+        Assert.Equal(1001u, reset.Ack);
+        consumer.HandleOutbound(PacketTo("203.0.113.10", 443), Epoch);
+        Assert.True(_toTun.Count == 1, "a block rule answered a packet");
+    }
+
     [Fact]
     public void BlocksWhatABlockRuleClaims()
     {

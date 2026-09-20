@@ -11,6 +11,7 @@ internal static class PeerIpPacket
     private const byte IcmpEchoReply = 0;
     private const byte IcmpEchoRequest = 8;
     private const byte IcmpDestinationUnreachable = 3;
+    private const byte IcmpHostUnreachable = 1;
     private const byte IcmpFragmentationNeeded = 4;
 
     public static string DestinationIPv4(ReadOnlySpan<byte> packet)
@@ -143,7 +144,23 @@ internal static class PeerIpPacket
         return packet;
     }
 
-    public static byte[]? IcmpFragmentationNeededFor(ReadOnlySpan<byte> packet, int pathMtu)
+    public static byte[]? IcmpFragmentationNeededFor(ReadOnlySpan<byte> packet, int pathMtu) =>
+        IcmpUnreachableFor(packet, IcmpFragmentationNeeded, checked((ushort)pathMtu));
+
+    /// <summary>
+    /// Answers a packet the consumer refused to forward, so the application's stack reports the
+    /// failure on the socket instead of waiting for a reply that will not come. Shared vector:
+    /// <c>protocol/test-vectors/peer-egress-failure-v1.json</c>.
+    /// </summary>
+    public static byte[]? IcmpHostUnreachableFor(ReadOnlySpan<byte> packet) =>
+        IcmpUnreachableFor(packet, IcmpHostUnreachable, 0);
+
+    /// <summary>
+    /// A destination-unreachable for a packet, addressed back to its sender and quoting its header
+    /// and first eight bytes. The last two bytes of the unused field carry the next-hop MTU when
+    /// the code is fragmentation-needed, and zero otherwise.
+    /// </summary>
+    private static byte[]? IcmpUnreachableFor(ReadOnlySpan<byte> packet, byte code, ushort mtu)
     {
         if (!IsIPv4(packet))
         {
@@ -160,8 +177,8 @@ internal static class PeerIpPacket
         packet.Slice(16, 4).CopyTo(response.AsSpan(12, 4));
         packet.Slice(12, 4).CopyTo(response.AsSpan(16, 4));
         response[20] = IcmpDestinationUnreachable;
-        response[21] = IcmpFragmentationNeeded;
-        BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(26, 2), checked((ushort)pathMtu));
+        response[21] = code;
+        BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(26, 2), mtu);
         packet[..quotedLength].CopyTo(response.AsSpan(28));
         BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(22, 2), Checksum(response.AsSpan(20)));
         BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(10, 2), Checksum(response.AsSpan(0, 20)));

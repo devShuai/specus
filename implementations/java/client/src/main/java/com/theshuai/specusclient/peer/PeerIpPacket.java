@@ -10,6 +10,7 @@ final class PeerIpPacket {
     private static final int ICMP_ECHO_REPLY = 0;
     private static final int ICMP_ECHO_REQUEST = 8;
     private static final int ICMP_DESTINATION_UNREACHABLE = 3;
+    private static final int ICMP_HOST_UNREACHABLE = 1;
     private static final int ICMP_FRAGMENTATION_NEEDED = 4;
 
     private PeerIpPacket() {
@@ -193,6 +194,24 @@ final class PeerIpPacket {
     }
 
     static byte[] icmpFragmentationNeededFor(byte[] packet, int pathMtu) {
+        return icmpUnreachableFor(packet, ICMP_FRAGMENTATION_NEEDED, pathMtu);
+    }
+
+    /**
+     * Answers a packet the consumer refused to forward, so the application's stack reports the
+     * failure on the socket instead of waiting for a reply that will not come. Shared vector:
+     * {@code protocol/test-vectors/peer-egress-failure-v1.json}.
+     */
+    static byte[] icmpHostUnreachableFor(byte[] packet) {
+        return icmpUnreachableFor(packet, ICMP_HOST_UNREACHABLE, 0);
+    }
+
+    /**
+     * A destination-unreachable for a packet, addressed back to its sender and quoting its header
+     * and first eight bytes. The last two bytes of the unused field carry the next-hop MTU when
+     * the code is fragmentation-needed, and zero otherwise.
+     */
+    private static byte[] icmpUnreachableFor(byte[] packet, int code, int mtu) {
         if (!hasValidIpv4Header(packet)) {
             return null;
         }
@@ -209,9 +228,9 @@ final class PeerIpPacket {
         System.arraycopy(packet, 12, response, 16, 4);
         int icmpOffset = 20;
         response[icmpOffset] = ICMP_DESTINATION_UNREACHABLE;
-        response[icmpOffset + 1] = ICMP_FRAGMENTATION_NEEDED;
-        response[icmpOffset + 6] = (byte) (pathMtu >>> 8);
-        response[icmpOffset + 7] = (byte) pathMtu;
+        response[icmpOffset + 1] = (byte) code;
+        response[icmpOffset + 6] = (byte) (mtu >>> 8);
+        response[icmpOffset + 7] = (byte) mtu;
         System.arraycopy(packet, 0, response, icmpOffset + 8, quotedLength);
         int icmpChecksum = checksum(response, icmpOffset, response.length - icmpOffset);
         response[icmpOffset + 2] = (byte) (icmpChecksum >>> 8);
