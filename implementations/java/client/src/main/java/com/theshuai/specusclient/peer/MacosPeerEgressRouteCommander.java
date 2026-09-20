@@ -133,7 +133,14 @@ public final class MacosPeerEgressRouteCommander implements PeerEgressRouteInsta
     }
 
     @Override
+    public PeerEgressRouteInstaller.Table table() throws IOException {
+        return new PeerEgressRouteInstaller.Table(
+                PeerEgressSocketBinding.macosRoutes(run(PeerEgressMacosRouteCommands.showTableArgs()).stdout()), tun);
+    }
+
+    @Override
     public void remove(Route route) throws IOException {
+        hops.remove(route.cidr().endsWith("/32") ? route.cidr().substring(0, route.cidr().length() - 3) : route.cidr());
         apply(PeerEgressMacosRouteCommands.removeArgs(route.cidr()), "remove " + route.cidr());
     }
 

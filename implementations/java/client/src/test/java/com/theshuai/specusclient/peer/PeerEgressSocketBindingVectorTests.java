@@ -218,6 +218,73 @@ class PeerEgressSocketBindingVectorTests {
      * The fallback a commander takes when its query answers with the tunnel: the table with the
      * tunnel left out, and a refusal that says why when nothing else leads there.
      */
+    /** Every sampled table in the vector, as this runtime parses it. */
+    private static Map<String, Map<String, List<PeerEgressSocketBinding.Route>>> tables(JsonNode root) {
+        Map<String, Map<String, List<PeerEgressSocketBinding.Route>>> tables = new HashMap<>();
+        tables.put("linux", new HashMap<>());
+        tables.put("macos", new HashMap<>());
+        tables.put("windows", new HashMap<>());
+        root.path("linux").path("tables").fields().forEachRemaining(table -> tables.get("linux")
+                .put(table.getKey(), PeerEgressRouteCommands.parseRouteTable(table.getValue().asText())));
+        root.path("macos").path("tables").fields().forEachRemaining(table -> tables.get("macos")
+                .put(table.getKey(), PeerEgressSocketBinding.macosRoutes(table.getValue().asText())));
+        JsonNode windows = root.path("windows");
+        List<PeerEgressSocketBinding.WindowsForwardRow> forward = null;
+        List<PeerEgressSocketBinding.WindowsInterfaceRow> interfaces = null;
+        for (JsonNode table : windows.path("forwardTables")) {
+            if (table.path("name").asText().equals(windows.path("routes").path("forward").asText())) {
+                forward = PeerEgressSocketBinding.parseWindowsForwardTable(
+                        HexFormat.of().parseHex(table.path("hex").asText()));
+            }
+        }
+        for (JsonNode table : windows.path("interfaceTables")) {
+            if (table.path("name").asText().equals(windows.path("routes").path("interfaces").asText())) {
+                interfaces = PeerEgressSocketBinding.parseWindowsInterfaceTable(
+                        HexFormat.of().parseHex(table.path("hex").asText()));
+            }
+        }
+        assertNotNull(forward);
+        assertNotNull(interfaces);
+        tables.get("windows").put("typical", PeerEgressSocketBinding.windowsRoutes(forward, interfaces));
+        return tables;
+    }
+
+    /**
+     * What the consumer's own routes look like after a network change, and the repair each needs.
+     * The policy -- a tunnel route on another interface is a conflict, a bypass follows the hop the
+     * table would choose with the owned prefixes left out -- has to be the same in three runtimes.
+     */
+    @Test
+    void driftMatchesTheSharedVector() throws IOException {
+        JsonNode root = vector();
+        Map<String, Map<String, List<PeerEgressSocketBinding.Route>>> tables = tables(root);
+        JsonNode cases = root.path("drift").path("cases");
+        assertTrue(cases.size() > 0, "no drift cases");
+        for (JsonNode testCase : cases) {
+            String name = testCase.path("name").asText();
+            String platform = testCase.path("platform").asText();
+            List<PeerEgressSocketBinding.Route> routes = "inline".equals(platform)
+                    ? routes(testCase.path("routes"))
+                    : tables.get(platform).get(testCase.path("table").asText());
+            List<PeerEgressRoutePlanner.Route> owned = new ArrayList<>();
+            for (JsonNode entry : testCase.path("owned")) {
+                owned.add(new PeerEgressRoutePlanner.Route(entry.path("cidr").asText(),
+                        PeerEgressRoutePlanner.Kind.fromWireName(entry.path("kind").asText()), ""));
+            }
+            List<PeerEgressSocketBinding.Drift> found =
+                    PeerEgressSocketBinding.drifts(owned, routes, testCase.path("tunnel").asText());
+            JsonNode expect = testCase.path("expect");
+            assertEquals(expect.size(), found.size(), name + ": found " + found);
+            for (int index = 0; index < expect.size(); index++) {
+                JsonNode want = expect.get(index);
+                PeerEgressSocketBinding.Drift got = found.get(index);
+                assertEquals(want.path("cidr").asText(), got.route().cidr(), name + ": drift " + index);
+                assertEquals(want.path("reason").asText(), got.reason(), name + ": drift " + index + " reason");
+                assertEquals(want.path("action").asText(), got.action(), name + ": drift " + index + " action");
+            }
+        }
+    }
+
     @Test
     void theHopFromTheTableLeavesTheTunnelOut() throws IOException {
         List<PeerEgressSocketBinding.Route> routes = PeerEgressRouteCommands.parseRouteTable(

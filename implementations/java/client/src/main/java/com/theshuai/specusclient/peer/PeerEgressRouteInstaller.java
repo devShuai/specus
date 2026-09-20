@@ -51,7 +51,39 @@ public final class PeerEgressRouteInstaller {
 
         void install(Route route) throws IOException;
 
+        /**
+         * Takes a route out, and forgets whatever it had learned about where the route went: a
+         * bypass put back after a removal has to have its hop resolved again.
+         */
         void remove(Route route) throws IOException;
+
+        /**
+         * Reads the platform's routing table as the routes this feature reasons about, and says
+         * how the tunnel appears in it: its interface index on Windows, its name elsewhere.
+         *
+         * @throws IOException when the table cannot be read, in which case nothing is repaired
+         */
+        default Table table() throws IOException {
+            throw new IOException("this commander cannot read the routing table");
+        }
+    }
+
+    /** The routing table as read for a repair, and how the tunnel appears in it. */
+    public record Table(List<PeerEgressSocketBinding.Route> routes, String tunnel) {
+    }
+
+    /**
+     * What a repair found and did.
+     *
+     * @param tableError set when the table could not be read, in which case nothing else is
+     * @param repaired the routes put back, with why they had to be
+     * @param lost prefixes that are somebody else's now; no longer owned, so the next apply asks
+     *             for them again and reports the conflict if it is still there
+     * @param error the last reinstall that failed; the route stays owned, so the next repair tries
+     *              again
+     */
+    public record RepairResult(Exception tableError, List<PeerEgressSocketBinding.Drift> repaired,
+            List<RouteConflict> lost, Exception error) {
     }
 
     /** Whether a prefix is already taken, and by what. */
@@ -271,6 +303,70 @@ public final class PeerEgressRouteInstaller {
             forget(route);
         }
         saveQuietly();
+    }
+
+    /**
+     * Reads the table and puts back what it no longer carries.
+     *
+     * <p>A route to reinstall is removed first, whether or not a row is there. The row may be a
+     * stale one naming a gateway that is gone, and the removal is also what makes the commander
+     * resolve the hop again instead of answering from what it learned before the network changed.
+     * Then the same conflict check an install gets: a prefix somebody else took while ours was gone
+     * is theirs.
+     */
+    public RepairResult repair() {
+        if (installed.isEmpty()) {
+            return new RepairResult(null, List.of(), List.of(), null);
+        }
+        Table table;
+        try {
+            table = commander.table();
+        } catch (Exception unreadable) {
+            return new RepairResult(unreadable, List.of(), List.of(), null);
+        }
+        List<PeerEgressSocketBinding.Drift> repaired = new ArrayList<>();
+        List<RouteConflict> lost = new ArrayList<>();
+        Exception error = null;
+        boolean changed = false;
+        for (PeerEgressSocketBinding.Drift drift : PeerEgressSocketBinding.drifts(installed(), table.routes(), table.tunnel())) {
+            Route route = drift.route();
+            if (PeerEgressSocketBinding.DRIFT_CONFLICT.equals(drift.action())) {
+                Conflict conflict = commander.conflict(route);
+                forget(route);
+                changed = true;
+                lost.add(new RouteConflict(route, conflict.present() ? conflict.existing() : drift.existing()));
+                continue;
+            }
+            try {
+                commander.remove(route);
+            } catch (Exception ignored) {
+                // A row that is not there is the common reason, and the point is what follows.
+            }
+            Conflict conflict = commander.conflict(route);
+            if (conflict.present()) {
+                forget(route);
+                changed = true;
+                lost.add(new RouteConflict(route, conflict.existing()));
+                continue;
+            }
+            try {
+                commander.install(route);
+            } catch (Exception failure) {
+                error = failure;
+                continue;
+            }
+            repaired.add(drift);
+        }
+        if (changed) {
+            try {
+                save();
+            } catch (Exception failure) {
+                if (error == null) {
+                    error = failure;
+                }
+            }
+        }
+        return new RepairResult(null, List.copyOf(repaired), List.copyOf(lost), error);
     }
 
     /**

@@ -24,6 +24,10 @@ internal readonly record struct PeerEgressWindowsForwardRow(long InterfaceIndex,
 internal readonly record struct PeerEgressWindowsInterfaceRow(long InterfaceIndex, long Metric, bool Connected,
     bool DisableDefaultRoutes);
 
+/// <summary>One owned route the table no longer carries as installed.</summary>
+/// <param name="Existing">Describes the row that holds the prefix now, for a conflict.</param>
+internal sealed record PeerEgressRouteDrift(PeerEgressRoute Route, string Reason, string Action, string Existing);
+
 /// <summary>
 /// Choosing the interface an egress socket is bound to, and reading the tables that choice is made from.
 /// </summary>
@@ -129,8 +133,86 @@ internal static class PeerEgressSocketBinding
         {
             throw new IOException($"resolve bypass hop for {address} past the tunnel: {failed.Message}", failed);
         }
-        return SelectBypassHop(routes, tunnel, [], address) ?? throw new PeerEgressNoPhysicalRouteException(address);
+        // The bypass's own /32 is left out too. When one is being put back after a network change,
+        // the stale row is still in the table naming the old gateway, and it would win the lookup
+        // for its own address.
+        return SelectBypassHop(routes, tunnel, [address + "/32"], address)
+            ?? throw new PeerEgressNoPhysicalRouteException(address);
     }
+
+    // ---- drift ---------------------------------------------------------------------------------
+    //
+    // Finding the consumer's own routes gone or moved after the machine changed networks. An
+    // interface that goes down takes its routes with it; a machine back from sleep on another
+    // network keeps a bypass naming a gateway that is no longer the way out. The journal still says
+    // the route is there, so the table is read on the consumer's tick and compared with what it
+    // owns. Shared vector: the drift section.
+
+    /// <summary>No row for the prefix that could be ours.</summary>
+    public const string DriftMissing = "missing";
+
+    /// <summary>A row for the prefix exists but is not the one this feature would install now.</summary>
+    public const string DriftMoved = "moved";
+
+    /// <summary>Take the route out and put it back, resolving its hop afresh.</summary>
+    public const string DriftReinstall = "reinstall";
+
+    /// <summary>The prefix is somebody else's now: reported and given up, not taken.</summary>
+    public const string DriftConflict = "conflict";
+
+    /// <summary>
+    /// Compares what this feature owns with the table.
+    /// </summary>
+    /// <remarks>
+    /// A tunnel route is present when a row for its prefix names the tunnel. It cannot change
+    /// interface on its own, so a row on another interface is somebody else's: the prefix is theirs
+    /// now, and it is reported rather than taken.
+    ///
+    /// <para>A bypass is compared with where the table would send the address now, with this
+    /// feature's own routes left out -- the tunnel's and every owned prefix, the bypass itself
+    /// included, or it would choose itself and look right. Absent, or present with a different
+    /// interface or gateway, it is reinstalled. Present with nothing better outside the tunnel, it
+    /// is left: the route that is there is the best there is.</para>
+    /// </remarks>
+    public static IReadOnlyList<PeerEgressRouteDrift> Drifts(
+        IReadOnlyList<PeerEgressRoute> owned, IReadOnlyList<PeerEgressBindRoute> table, string tunnel)
+    {
+        var prefixes = owned.Select(route => route.Cidr).ToList();
+        var found = new List<PeerEgressRouteDrift>();
+        foreach (var route in owned)
+        {
+            var rows = table.Where(row => row.Prefix == route.Cidr).ToList();
+            if (route.Kind == PeerEgressRouteKind.Tun)
+            {
+                if (rows.Any(row => row.Interface == tunnel))
+                {
+                    continue;
+                }
+                found.Add(rows.Count == 0
+                    ? new PeerEgressRouteDrift(route, DriftMissing, DriftReinstall, string.Empty)
+                    : new PeerEgressRouteDrift(route, DriftMoved, DriftConflict, Describe(rows[0])));
+                continue;
+            }
+            var address = route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr;
+            var hop = SelectBypassHop(table, tunnel, prefixes, address);
+            var present = rows.Where(row => row.Interface != tunnel).ToList();
+            if (present.Count == 0)
+            {
+                found.Add(new PeerEgressRouteDrift(route, DriftMissing, DriftReinstall, string.Empty));
+            }
+            else if (hop is { } chosen && (present[0].Interface != chosen.Interface || present[0].Gateway != chosen.Gateway))
+            {
+                found.Add(new PeerEgressRouteDrift(route, DriftMoved, DriftReinstall, string.Empty));
+            }
+        }
+        return found;
+    }
+
+    /// <summary>Renders a row the way an operator would read it in a conflict.</summary>
+    internal static string Describe(PeerEgressBindRoute row) =>
+        row.Gateway.Length == 0
+            ? $"{row.Prefix} dev {row.Interface}"
+            : $"{row.Prefix} via {row.Gateway} dev {row.Interface}";
 
     /// <summary>
     /// The route a packet to <paramref name="destination"/> would take with this feature's own routes

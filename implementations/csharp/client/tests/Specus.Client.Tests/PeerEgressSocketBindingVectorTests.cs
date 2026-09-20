@@ -221,6 +221,66 @@ public class PeerEgressSocketBindingVectorTests
     /// The fallback a commander takes when its query answers with the tunnel: the table with the
     /// tunnel left out, and a refusal that says why when nothing else leads there.
     /// </summary>
+    /// <summary>Every sampled table in the vector, as this runtime parses it.</summary>
+    private static Dictionary<string, Dictionary<string, List<PeerEgressBindRoute>>> Tables(JsonElement root)
+    {
+        var tables = new Dictionary<string, Dictionary<string, List<PeerEgressBindRoute>>>
+        {
+            ["linux"] = root.GetProperty("linux").GetProperty("tables").EnumerateObject()
+                .ToDictionary(table => table.Name, table => PeerEgressRouteCommands.ParseRouteTable(table.Value.GetString())),
+            ["macos"] = root.GetProperty("macos").GetProperty("tables").EnumerateObject()
+                .ToDictionary(table => table.Name, table => PeerEgressSocketBinding.MacosRoutes(table.Value.GetString())),
+        };
+        var windows = root.GetProperty("windows");
+        var forward = windows.GetProperty("forwardTables").EnumerateArray()
+            .Where(table => table.GetProperty("name").GetString() == windows.GetProperty("routes").GetProperty("forward").GetString())
+            .Select(table => PeerEgressSocketBinding.ParseWindowsForwardTable(Convert.FromHexString(table.GetProperty("hex").GetString()!)))
+            .Single();
+        var interfaces = windows.GetProperty("interfaceTables").EnumerateArray()
+            .Where(table => table.GetProperty("name").GetString() == windows.GetProperty("routes").GetProperty("interfaces").GetString())
+            .Select(table => PeerEgressSocketBinding.ParseWindowsInterfaceTable(Convert.FromHexString(table.GetProperty("hex").GetString()!)))
+            .Single();
+        tables["windows"] = new() { ["typical"] = PeerEgressSocketBinding.WindowsRoutes(forward!, interfaces!) };
+        return tables;
+    }
+
+    /// <summary>
+    /// What the consumer's own routes look like after a network change, and the repair each needs.
+    /// The policy -- a tunnel route on another interface is a conflict, a bypass follows the hop the
+    /// table would choose with the owned prefixes left out -- has to be the same in three runtimes.
+    /// </summary>
+    [Fact]
+    public void DriftMatchesTheSharedVector()
+    {
+        using var vector = Vector();
+        var root = vector.RootElement;
+        var tables = Tables(root);
+        var cases = root.GetProperty("drift").GetProperty("cases");
+        Assert.True(cases.GetArrayLength() > 0, "no drift cases");
+        foreach (var testCase in cases.EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString();
+            var platform = testCase.GetProperty("platform").GetString()!;
+            var routes = platform == "inline"
+                ? Routes(testCase.GetProperty("routes"))
+                : tables[platform][testCase.GetProperty("table").GetString()!];
+            var owned = testCase.GetProperty("owned").EnumerateArray()
+                .Select(entry => new PeerEgressRoute(entry.GetProperty("cidr").GetString()!,
+                    PeerEgressRoutePlanner.KindFromWireName(entry.GetProperty("kind").GetString()), string.Empty))
+                .ToList();
+            var found = PeerEgressSocketBinding.Drifts(owned, routes, testCase.GetProperty("tunnel").GetString()!);
+            var expect = testCase.GetProperty("expect").EnumerateArray().ToList();
+            Assert.True(expect.Count == found.Count, $"{name}: found {string.Join(", ", found)}");
+            for (var index = 0; index < expect.Count; index++)
+            {
+                Assert.True(expect[index].GetProperty("cidr").GetString() == found[index].Route.Cidr
+                    && expect[index].GetProperty("reason").GetString() == found[index].Reason
+                    && expect[index].GetProperty("action").GetString() == found[index].Action,
+                    $"{name}: drift {index} = {found[index]}, want {expect[index]}");
+            }
+        }
+    }
+
     [Fact]
     public void TheHopFromTheTableLeavesTheTunnelOut()
     {

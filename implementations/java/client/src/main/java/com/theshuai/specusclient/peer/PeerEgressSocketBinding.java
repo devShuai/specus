@@ -139,11 +139,108 @@ public final class PeerEgressSocketBinding {
             throw new IOException("resolve bypass hop for " + address + " past the tunnel: " + failed.getMessage(),
                     failed);
         }
-        Route hop = selectBypassHop(routes, tunnel, List.of(), address);
+        // The bypass's own /32 is left out too. When one is being put back after a network change,
+        // the stale row is still in the table naming the old gateway, and it would win the lookup
+        // for its own address.
+        Route hop = selectBypassHop(routes, tunnel, List.of(address + "/32"), address);
         if (hop == null) {
             throw new PeerEgressSocketBinder.NoPhysicalRouteException(address);
         }
         return hop;
+    }
+
+    // ---- drift ---------------------------------------------------------------------------------
+    //
+    // Finding the consumer's own routes gone or moved after the machine changed networks. An
+    // interface that goes down takes its routes with it; a machine back from sleep on another
+    // network keeps a bypass naming a gateway that is no longer the way out. The journal still says
+    // the route is there, so the table is read on the consumer's tick and compared with what it
+    // owns. Shared vector: the drift section.
+
+    /** No row for the prefix that could be ours. */
+    public static final String DRIFT_MISSING = "missing";
+    /** A row for the prefix exists but is not the one this feature would install now. */
+    public static final String DRIFT_MOVED = "moved";
+    /** Take the route out and put it back, resolving its hop afresh. */
+    public static final String DRIFT_REINSTALL = "reinstall";
+    /** The prefix is somebody else's now: reported and given up, not taken. */
+    public static final String DRIFT_CONFLICT = "conflict";
+
+    /**
+     * One owned route the table no longer carries as installed.
+     *
+     * @param existing describes the row that holds the prefix now, for a conflict
+     */
+    public record Drift(PeerEgressRoutePlanner.Route route, String reason, String action, String existing) {
+    }
+
+    /**
+     * Compares what this feature owns with the table.
+     *
+     * <p>A tunnel route is present when a row for its prefix names the tunnel. It cannot change
+     * interface on its own, so a row on another interface is somebody else's: the prefix is theirs
+     * now, and it is reported rather than taken.
+     *
+     * <p>A bypass is compared with where the table would send the address now, with this feature's
+     * own routes left out -- the tunnel's and every owned prefix, the bypass itself included, or it
+     * would choose itself and look right. Absent, or present with a different interface or
+     * gateway, it is reinstalled. Present with nothing better outside the tunnel, it is left: the
+     * route that is there is the best there is.
+     */
+    public static List<Drift> drifts(List<PeerEgressRoutePlanner.Route> owned, List<Route> table, String tunnel) {
+        List<String> prefixes = new ArrayList<>();
+        for (PeerEgressRoutePlanner.Route route : owned) {
+            prefixes.add(route.cidr());
+        }
+        List<Drift> found = new ArrayList<>();
+        for (PeerEgressRoutePlanner.Route route : owned) {
+            List<Route> rows = new ArrayList<>();
+            for (Route row : table) {
+                if (row.prefix().equals(route.cidr())) {
+                    rows.add(row);
+                }
+            }
+            if (route.kind() == PeerEgressRoutePlanner.Kind.TUN) {
+                boolean present = false;
+                for (Route row : rows) {
+                    if (row.iface().equals(tunnel)) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (present) {
+                    continue;
+                }
+                found.add(rows.isEmpty()
+                        ? new Drift(route, DRIFT_MISSING, DRIFT_REINSTALL, "")
+                        : new Drift(route, DRIFT_MOVED, DRIFT_CONFLICT, describe(rows.get(0))));
+                continue;
+            }
+            String address = route.cidr().endsWith("/32")
+                    ? route.cidr().substring(0, route.cidr().length() - 3)
+                    : route.cidr();
+            Route hop = selectBypassHop(table, tunnel, prefixes, address);
+            List<Route> present = new ArrayList<>();
+            for (Route row : rows) {
+                if (!row.iface().equals(tunnel)) {
+                    present.add(row);
+                }
+            }
+            if (present.isEmpty()) {
+                found.add(new Drift(route, DRIFT_MISSING, DRIFT_REINSTALL, ""));
+            } else if (hop != null
+                    && (!present.get(0).iface().equals(hop.iface()) || !present.get(0).gateway().equals(hop.gateway()))) {
+                found.add(new Drift(route, DRIFT_MOVED, DRIFT_REINSTALL, ""));
+            }
+        }
+        return found;
+    }
+
+    /** Renders a row the way an operator would read it in a conflict. */
+    static String describe(Route row) {
+        return row.gateway().isEmpty()
+                ? row.prefix() + " dev " + row.iface()
+                : row.prefix() + " via " + row.gateway() + " dev " + row.iface();
     }
 
     /**

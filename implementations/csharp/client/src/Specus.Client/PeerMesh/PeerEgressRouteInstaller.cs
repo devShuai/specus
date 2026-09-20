@@ -44,8 +44,33 @@ internal interface IPeerEgressRouteCommander
 
     void Install(PeerEgressRoute route);
 
+    /// <summary>
+    /// Takes a route out, and forgets whatever it had learned about where the route went: a bypass
+    /// put back after a removal has to have its hop resolved again.
+    /// </summary>
     void Remove(PeerEgressRoute route);
+
+    /// <summary>
+    /// Reads the platform's routing table as the routes this feature reasons about, and says how
+    /// the tunnel appears in it: its interface index on Windows, its name elsewhere. Throws when
+    /// the table cannot be read, in which case nothing is repaired.
+    /// </summary>
+    PeerEgressRouteTable Table() => throw new InvalidOperationException("this commander cannot read the routing table");
 }
+
+/// <summary>The routing table as read for a repair, and how the tunnel appears in it.</summary>
+internal sealed record PeerEgressRouteTable(IReadOnlyList<PeerEgressBindRoute> Routes, string Tunnel);
+
+/// <summary>What a repair found and did.</summary>
+/// <param name="TableError">Set when the table could not be read, in which case nothing else is.</param>
+/// <param name="Repaired">The routes put back, with why they had to be.</param>
+/// <param name="Lost">Prefixes that are somebody else's now. No longer owned, so the next apply asks for them again and reports the conflict if it is still there.</param>
+/// <param name="Error">The last reinstall that failed. The route stays owned, so the next repair tries again.</param>
+internal sealed record PeerEgressRouteRepairResult(
+    Exception? TableError,
+    IReadOnlyList<PeerEgressRouteDrift> Repaired,
+    IReadOnlyList<PeerEgressRouteConflict> Lost,
+    Exception? Error);
 
 /// <summary>
 /// Installing routes without leaving any behind.
@@ -299,6 +324,87 @@ internal sealed class PeerEgressRouteInstaller(IPeerEgressRouteCommander command
     /// Removes every route this feature owns, for shutdown or for a restart that found a journal
     /// from a previous run.
     /// </summary>
+    /// <summary>
+    /// Reads the table and puts back what it no longer carries.
+    /// </summary>
+    /// <remarks>
+    /// A route to reinstall is removed first, whether or not a row is there. The row may be a stale
+    /// one naming a gateway that is gone, and the removal is also what makes the commander resolve
+    /// the hop again instead of answering from what it learned before the network changed. Then the
+    /// same conflict check an install gets: a prefix somebody else took while ours was gone is
+    /// theirs.
+    /// </remarks>
+    public PeerEgressRouteRepairResult Repair()
+    {
+        if (_installed.Count == 0)
+        {
+            return new PeerEgressRouteRepairResult(null, [], [], null);
+        }
+        PeerEgressRouteTable table;
+        try
+        {
+            table = commander.Table();
+        }
+        catch (Exception unreadable)
+        {
+            return new PeerEgressRouteRepairResult(unreadable, [], [], null);
+        }
+        var repaired = new List<PeerEgressRouteDrift>();
+        var lost = new List<PeerEgressRouteConflict>();
+        Exception? error = null;
+        var changed = false;
+        foreach (var drift in PeerEgressSocketBinding.Drifts([.. _installed], table.Routes, table.Tunnel))
+        {
+            var route = drift.Route;
+            if (drift.Action == PeerEgressSocketBinding.DriftConflict)
+            {
+                var held = commander.Conflict(route);
+                Forget(route);
+                changed = true;
+                lost.Add(new PeerEgressRouteConflict(route, held.Present ? held.Existing : drift.Existing));
+                continue;
+            }
+            try
+            {
+                commander.Remove(route);
+            }
+            catch (Exception)
+            {
+                // A row that is not there is the common reason, and the point is what follows.
+            }
+            var conflict = commander.Conflict(route);
+            if (conflict.Present)
+            {
+                Forget(route);
+                changed = true;
+                lost.Add(new PeerEgressRouteConflict(route, conflict.Existing));
+                continue;
+            }
+            try
+            {
+                commander.Install(route);
+            }
+            catch (Exception failure)
+            {
+                error = failure;
+                continue;
+            }
+            repaired.Add(drift);
+        }
+        if (changed)
+        {
+            try
+            {
+                Save();
+            }
+            catch (Exception failure)
+            {
+                error ??= failure;
+            }
+        }
+        return new PeerEgressRouteRepairResult(null, repaired, lost, error);
+    }
+
     public IReadOnlyList<PeerEgressRoute> WithdrawAll()
     {
         var owned = new List<PeerEgressRoute>(_installed);

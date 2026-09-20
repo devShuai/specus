@@ -131,8 +131,14 @@ internal sealed class MacosPeerEgressRouteCommander(string? tun) : IPeerEgressRo
         Apply(command, $"install bypass {route.Cidr}");
     }
 
-    public void Remove(PeerEgressRoute route) =>
+    public void Remove(PeerEgressRoute route)
+    {
+        _hops.Remove(route.Cidr.EndsWith("/32", StringComparison.Ordinal) ? route.Cidr[..^3] : route.Cidr);
         Apply(PeerEgressMacosRouteCommands.RemoveArgs(route.Cidr), $"remove {route.Cidr}");
+    }
+
+    public PeerEgressRouteTable Table() => new(
+        PeerEgressSocketBinding.MacosRoutes(Run(PeerEgressMacosRouteCommands.ShowTableArgs()).Stdout), tun ?? string.Empty);
 
     /// <summary>Runs a mutation and decides whether it worked.</summary>
     /// <remarks>
