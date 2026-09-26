@@ -50,6 +50,9 @@ internal interface IPeerEgressMeshHost
     /// <summary>This node's own consumer rules, fixed for the life of the process.</summary>
     IReadOnlyList<PeerEgressRule> ConsumerRules => [];
 
+    /// <summary>Complete snapshot; omitted peers are offline.</summary>
+    IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
+
     /// <summary>Whether there is an interface to route into: a real device that started.</summary>
     bool DeviceReady => true;
 
@@ -307,9 +310,12 @@ internal sealed class PeerEgressMesh(
             return false;
         }
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        if (_consumer is { } consumerRole && consumerRole.HandleInbound(payload, peerId, nowMs))
+        if (_consumer is { } consumerRole)
         {
-            return true;
+            lock (consumerRole)
+            {
+                if (consumerRole.HandleInbound(payload, peerId, nowMs)) { return true; }
+            }
         }
         if (_runtime is not { } plane)
         {
@@ -343,7 +349,11 @@ internal sealed class PeerEgressMesh(
         {
             return false;
         }
-        var outcome = consumerRole.HandleOutbound(packet, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        PeerEgressConsumerOutcome outcome;
+        lock (consumerRole)
+        {
+            outcome = consumerRole.HandleOutbound(packet, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
         if (outcome == PeerEgressConsumerOutcome.NotMine)
         {
             return false;
@@ -402,7 +412,7 @@ internal sealed class PeerEgressMesh(
         PeerEgressConsumerStatus? consumerStatus = null;
         if (consumerRole is not null)
         {
-            lock (_gate)
+            lock (consumerRole)
             {
                 consumerStatus = consumerRole.StatusSnapshot();
             }
@@ -436,7 +446,12 @@ internal sealed class PeerEgressMesh(
 
     public void Reconcile(IReadOnlyList<PeerEgressRule> rules, long nowMs)
     {
-        IReadOnlyDictionary<long, IReadOnlyList<string>> purge;
+        lock (_gate) { if (_closed) { return; } }
+        // Consumer callbacks may reach the mesh. Do not wait for their lock while
+        // holding _planLock, which mesh shutdown needs when withdrawing routes.
+        var purge = rules.Count == 0
+            ? new Dictionary<long, IReadOnlyList<string>>()
+            : ConfigureConsumer(rules, MeshCidrOrDefault(), nowMs);
         lock (_planLock)
         {
             lock (_gate)
@@ -446,22 +461,18 @@ internal sealed class PeerEgressMesh(
                     return;
                 }
             }
-            purge = ReconcileLocked(rules, nowMs);
+            ReconcileLocked(rules, nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
         DeliverPurges(purge);
+        SyncEgressAvailability(host.EgressAvailability);
     }
 
-    private IReadOnlyDictionary<long, IReadOnlyList<string>> ReconcileLocked(
+    private void ReconcileLocked(
         IReadOnlyList<PeerEgressRule> rules, long nowMs)
     {
         var meshCidr = MeshCidrOrDefault();
-        // The consumer exists only when there are rules for it to apply. Building it for an empty
-        // set would start the threads that carry its work and report a consumer with nothing to do.
-        var purge = rules.Count == 0
-            ? new Dictionary<long, IReadOnlyList<string>>()
-            : ConfigureConsumer(rules, meshCidr, nowMs);
 
         // Without a device there is nothing to route into. A rule's route pointed at an interface
         // that is not there is a black hole rather than the local fallback the user would get with
@@ -490,7 +501,7 @@ internal sealed class PeerEgressMesh(
             {
                 RepairDrift(installer, nowMs);
             }
-            return purge;
+            return;
         }
         var result = installer.Apply(desired);
         _lastPlan = new PeerEgressPlanAttempt(nowMs, desired, result.Conflicts.Count > 0 || result.Error is not null);
@@ -534,7 +545,6 @@ internal sealed class PeerEgressMesh(
             logger?.LogInformation("[peer-egress-consumer] routes added={Added} removed={Removed}",
                 result.Added.Count, result.Removed.Count);
         }
-        return purge;
     }
 
     /// <summary>
@@ -619,12 +629,16 @@ internal sealed class PeerEgressMesh(
         var virtualIp = host.VirtualIp?.Trim() ?? string.Empty;
         var key = meshCidr + "|" + virtualIp + "|" + string.Join("|",
             rules.Select(rule => $"{rule.Match} {rule.Action} {rule.EgressClientId} {rule.Port}"));
-        if (string.Equals(key, _consumerKey, StringComparison.Ordinal))
+        var consumerRole = EnsureConsumer();
+        lock (consumerRole)
         {
-            return new Dictionary<long, IReadOnlyList<string>>();
+            if (string.Equals(key, _consumerKey, StringComparison.Ordinal))
+            {
+                return new Dictionary<long, IReadOnlyList<string>>();
+            }
+            _consumerKey = key;
+            return consumerRole.Configure(rules, meshCidr, virtualIp, nowMs);
         }
-        _consumerKey = key;
-        return EnsureConsumer().Configure(rules, meshCidr, virtualIp, nowMs);
     }
 
     /// <summary>
@@ -731,10 +745,20 @@ internal sealed class PeerEgressMesh(
             return;
         }
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        foreach (var (egress, up) in online)
+        var purge = new Dictionary<long, IReadOnlyList<string>>();
+        lock (consumerRole)
         {
-            DeliverPurges(consumerRole.SetEgressOnline(egress, up, nowMs));
+            var peers = consumerRole.StatusSnapshot().Online.Keys.Concat(online.Keys).Distinct().ToArray();
+            foreach (var peer in peers)
+            {
+                foreach (var (egress, destinations) in consumerRole.SetEgressOnline(peer,
+                             online.TryGetValue(peer, out var up) && up, nowMs))
+                {
+                    purge[egress] = destinations;
+                }
+            }
         }
+        DeliverPurges(purge);
     }
 
     /// <summary>

@@ -100,7 +100,7 @@ class Proc:
             return handle.read().decode("utf-8", "replace")
 
     def wait_log(self, pattern, timeout, since=0):
-        regex = re.compile(pattern)
+        regex = re.compile(pattern, re.IGNORECASE)
         found, _ = self.lab.wait_for(f"{self.label} log /{pattern}/",
                                      lambda: regex.search(self.log_since(since)), timeout)
         return found
@@ -231,8 +231,8 @@ class Lab:
         if table:
             raise LabAbort("the main routing table is not empty; run inside a fresh namespace "
                            "(`sudo unshare -n -m` or `unshare -rnm`), never on a machine's own table:\n" + table)
-        for binary in (self.args.server, self.args.client):
-            if not os.access(binary, os.X_OK):
+        for binary in (self.args.server, self.client_binary("consumer"), self.client_binary("egress")):
+            if not binary or not os.access(binary, os.X_OK):
                 raise LabAbort(f"{binary} is not executable")
         # Mount namespaces isolate mounts, not files: root can otherwise create persistent empty
         # /run/netns handles in the host filesystem. Always use private storage, not just when
@@ -386,9 +386,18 @@ class Lab:
             directory.mkdir(mode=0o700, exist_ok=True)
         return ["env", f"HOME={home}", f"SPECUS_CLI_STATE_DIR={state}"]
 
+    def client_binary(self, role):
+        return getattr(self.args, f"{role}_client", None) or self.args.client
+
+    def client_label(self, role):
+        label = getattr(self.args, f"{role}_implementation", None)
+        if label:
+            return label
+        return "custom" if getattr(self.args, f"{role}_client", None) else "Go"
+
     def start_client(self, role, config_path):
         netns_name = "con" if role == "consumer" else "egr"
-        return self.start(role, ns(netns_name, *self.client_env(role), self.args.client, "run",
+        return self.start(role, ns(netns_name, *self.client_env(role), self.client_binary(role), "run",
                                    "--config", str(config_path), "--no-update-check", "--login-timeout", "60"))
 
     def client_status(self, role, command="egress"):
@@ -396,7 +405,7 @@ class Lab:
         snapshot older than a few seconds is refused."""
         netns_name = "con" if role == "consumer" else "egr"
         for _ in range(6):
-            got = self.sh(ns(netns_name, *self.client_env(role), self.args.client, command,
+            got = self.sh(ns(netns_name, *self.client_env(role), self.client_binary(role), command,
                              "--config", str(self.work / f"{role}.jsonc"), "--json"), check=False)
             if got.returncode == 0:
                 try:
@@ -523,11 +532,6 @@ class Lab:
         self.admin.call("PUT", f"/api/admin/peer-mesh/devices/{self.consumer_id}", {"enabled": True})
         self.say(f"egress clientId={self.egress_id} consumer clientId={self.consumer_id}")
 
-        path = consumer.wait_log(r"Peer Mesh (direct|relay) UDP path active", 90)
-        if not path:
-            raise LabAbort("no peer session between consumer and egress:\n--- consumer\n"
-                           + consumer.log_since()[-3000:] + "\n--- egress\n" + egress.log_since()[-3000:])
-        self.measure("peer path type", path.group(1))
         self.switch(True)
         self.policy([self.consumer_id])
         if not egress.wait_log(r"policy applied enabled=true", 30):
@@ -540,6 +544,11 @@ class Lab:
         if not got:
             raise LabAbort("no request ever went through the egress:\n--- consumer\n" + consumer.log_since()[-3000:]
                            + "\n--- egress\n" + egress.log_since()[-3000:] + "\n--- table\n" + self.consumer_table())
+        # Successful traffic observed at the target is the session gate. Java logs path
+        # selection at DEBUG, so lack of an INFO line is not proof of a failed session.
+        path = re.search(r"Peer Mesh (direct|relay) UDP path active",
+                         consumer.log_since() + egress.log_since(), re.IGNORECASE)
+        self.measure("peer path type", path.group(1).lower() if path else "unreported")
         self.measure("bring-up, consumer start to first request through the egress",
                      round(time.time() - consumer_started, 1), "s")
 
@@ -881,7 +890,7 @@ class Lab:
         consumer = self.procs["consumer"]
         offset = consumer.log_offset()
         self.procs["server"].stop()
-        dropped = consumer.wait_log(r"control connection closed", 30, offset)
+        dropped = consumer.wait_log(r"control connection closed|Control channel session ended|control连接断开", 30, offset)
         self.check("server gone: the consumer notices its control connection is gone", bool(dropped),
                    dropped.group(0) if dropped else "the consumer never logged a lost connection")
 
@@ -903,7 +912,7 @@ class Lab:
         offset = consumer.log_offset()
         if not self.launch_server(self.work / "server.json"):
             raise LabAbort("the server did not come back:\n" + self.procs["server"].log_since()[-3000:])
-        back = consumer.wait_log(r"control connection established", 90, offset)
+        back = consumer.wait_log(r"control connection established|Connected to .*\(awaiting login response\)", 90, offset)
         self.check("server back: the consumer reconnects", bool(back))
         self.check("server back: flows go through the egress again", bool(self.wait_ready()))
         # Whatever the reconnect did to the table, what it ends with is what matters.
@@ -977,7 +986,8 @@ class Lab:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         netem = {None: "the lossy step was not reached", True: "netem available", False: "netem unavailable"}[self.netem]
         lines = ["# Peer egress Linux lab", "",
-                 f"Run {now} on kernel {kernel}; Go consumer and Go egress against the Go server; {netem}.", "",
+                 f"Run {now} on kernel {kernel}; {self.client_label('consumer')} consumer and "
+                 f"{self.client_label('egress')} egress against the Go server; {netem}.", "",
                  "Topology: the router namespace bridges the server (203.0.113.2) and the target (203.0.113.10 under "
                  "the rule, 198.51.100.10 under none); the consumer (10.90.1.2) and the egress (10.90.2.2) sit "
                  "behind it on their own links. Nothing is NATed. The rule sends 203.0.113.0/24 through the egress.",
@@ -1048,7 +1058,11 @@ class Lab:
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--server", required=True, help="specus-server binary (Go)")
-    parser.add_argument("--client", required=True, help="specus-client binary (Go)")
+    parser.add_argument("--client", help="default Go specus-client binary for both roles")
+    parser.add_argument("--consumer-client", help="consumer executable or exec wrapper; overrides --client")
+    parser.add_argument("--egress-client", help="egress executable or exec wrapper; overrides --client")
+    parser.add_argument("--consumer-implementation", choices=["Go", "Java", ".NET"], help="report label")
+    parser.add_argument("--egress-implementation", choices=["Go", "Java", ".NET"], help="report label")
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--work", help="working directory; a fresh temporary one by default")
     # Well beyond the old sub-MiB failure ceiling; a small smoke download would miss regression.
@@ -1068,6 +1082,8 @@ def main():
     parser.add_argument("--switch-off-repetitions", type=int, choices=range(1, 21), default=1,
                         help="repeat established-flow revocation (1-20 rounds)")
     args = parser.parse_args()
+    if not args.client and not (args.consumer_client and args.egress_client):
+        parser.error("provide --client or both --consumer-client and --egress-client")
     return Lab(args).run()
 
 

@@ -1,7 +1,7 @@
 # Peer egress Linux lab
 
-Issue #56's acceptance list, run against real processes on one Linux machine: the Go server, a Go
-consumer with a TUN device and routes of its own, a Go egress, and a target that records who
+Issue #56's acceptance list, run against real processes on one Linux machine: the Go server, a
+consumer with a TUN device and routes of its own, an egress, and a target that records who
 reached it, each in a network namespace behind one router namespace.
 
 ```
@@ -61,6 +61,35 @@ of rearranging its routes. `--skip-faults` and `--skip-lossy` shorten a run whil
 It also requires a private mount namespace and always mounts a private tmpfs over `/run`; a mount
 namespace alone would hide the namespace mounts but still leave their empty handle files on the host.
 
+### Mixed-language clients
+
+`--client` supplies the default Go executable for both roles. Override either role with
+`--consumer-client` or `--egress-client`; both overrides also work without `--client`.
+Each value is a literal executable path, not a shell command. Java needs an executable wrapper
+which forwards arguments and uses `exec`, so shutdown/kill signals reach the JVM:
+
+```sh
+#!/bin/sh
+exec /absolute/path/to/java -jar /absolute/path/to/specus-client-exec.jar "$@"
+```
+
+For example, to exercise a Java consumer against a .NET egress:
+
+```bash
+sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
+  --server /path/to/go-specus-server \
+  --consumer-client /path/to/java-wrapper --consumer-implementation Java \
+  --egress-client /path/to/dotnet-specus-client --egress-implementation .NET \
+  --report-dir /tmp/mixed-lab --switch-off-repetitions 3
+```
+
+Implementation labels only describe the report; they do not change the command. An override
+without a label is reported as `custom`. Every client must implement the shared CLI/config
+contract and support real Linux TUN. Bring-up is gated by a successful request observed from the
+egress address, not an implementation-specific INFO log. Path type is reported as `unreported`
+when neither client logs it; that is not evidence of a direct path. Log evidence is case-insensitive
+to handle Java/.NET formatting, while packet integrity, source addresses and route checks are unchanged.
+
 Use `--switch-off-repetitions 5` to repeat the established-flow revocation regression (#75).
 Each round checks the application's failure, the egress's completed drain (`count > 0`, `active=0`),
 new-flow rejection, no local leak, and recovery after re-enabling. The consumer's refusal evidence
@@ -114,6 +143,38 @@ was observed. The 8 MiB single download was 7.63 MiB/s, upload 6.89 MiB/s; the 5
 download with 2% loss each way matched SHA-256 at 0.155 MiB/s. Route and process cleanup
 also passed. These figures do not prove production-queue saturation occurred: forced
 queue-full behavior is covered deterministically by the admission and one-slot runtime tests.
+
+## Mixed-language acceptance progress (2026-09-26)
+
+Development builds on the same WSL 2 host used the Go server and the default full checks,
+16 concurrent 1 MiB responses, 8 MiB upload/download, 2% bidirectional loss and three revocation
+rounds. The arrow below means consumer → egress, not server implementation parity.
+
+| Client roles | Latest full run | Remaining failure |
+| --- | --- | --- |
+| Go → .NET | 54 passed, 0 failed | None in this run |
+| Java → Go | 54 passed, 0 failed | None in this run |
+| Go → Java | 53 passed, 1 failed | Lossy 512 KiB response stalled at 464308 B and timed out at 60 s |
+| .NET → Go | 53 passed, 1 failed | No recovery within 90 s after egress restart; server restart subsequently restored traffic |
+
+These runs drove fixes for Java/.NET consumer availability synchronization (including removed
+peers), null `publicStunServers` from the Go server, .NET Linux TUN synchronous-handle/unbuffered
+I/O and idle read shutdown, and lost-token refresh after a server restart in all three clients.
+The recoverable data-login/control-login ordering rejection must not terminate the client and
+withdraw its routes. An earlier Java-consumer run did terminate on this rejection and leaked;
+the subsequent 54-check run above retained routes and observed no local-source leaks.
+
+The two failing rows remain open acceptance work under #50/#74. A prior Go → Java run passed
+its loss check, so the later failure must not be hidden by quoting only that earlier pass.
+Windows/macOS, Java↔.NET full fault coverage, repeated reliability runs and adaptive congestion
+control are not established by these results. A separate .NET NAT OPEN/DATA race exposed by
+the existing reconnect integration test is tracked in #77; that test is not included in the
+164 passing targeted egress/configuration/login-classification tests. Java's matching targeted
+suite passed 158 tests, the Go client package tests passed, and the lab harness passed four tests.
+
+After the final consumer-lock ordering adjustment, a Java → .NET smoke run passed all 11 checks
+(TCP/UDP, route shape, 8 MiB each direction and 16 concurrent SHA-256-verified downloads).
+That run explicitly skipped faults and loss; it does not replace a full Java↔.NET matrix.
 
 The server binary needs `implementations/go/server/web/static/` to exist for its embed directive;
 the workflow drops a placeholder there, and so can you.

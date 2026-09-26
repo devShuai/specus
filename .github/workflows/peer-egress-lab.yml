@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Test lab role selection and evidence parsing
+        run: python3 -m unittest discover -s scripts/peer-egress-lab -p test_lab.py
       - uses: actions/setup-go@v5
         with:
           go-version-file: implementations/go/client/go.mod

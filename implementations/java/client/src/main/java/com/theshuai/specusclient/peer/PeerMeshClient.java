@@ -4261,6 +4261,16 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         @Override
+        public Map<Long, Boolean> egressAvailability() {
+            Map<Long, Boolean> online = new HashMap<>();
+            for (PeerInfo peer : peerIndex.byId().values()) {
+                PeerSession session = sessions.get(peer.clientId());
+                online.put(peer.clientId(), running && peer.online() && session != null && session.canSend());
+            }
+            return online;
+        }
+
+        @Override
         public boolean deviceReady() {
             PeerVirtualDevice device = virtualDevice;
             return running && device != null && !(device instanceof NoopPeerVirtualDevice);

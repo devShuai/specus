@@ -111,6 +111,10 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
             throw new InvalidOperationException("peer mesh Linux TUN missing virtualIp/cidr");
         }
         var fd = Open("/dev/net/tun", OpenReadWrite);
+        if (fd < 0)
+        {
+            throw new IOException($"Linux TUN open failed: errno={Marshal.GetLastPInvokeError()}");
+        }
         var ifreq = new byte[40];
         Encoding.ASCII.GetBytes(Name.AsSpan(), ifreq.AsSpan(0, InterfaceNameSize));
         BitConverter.TryWriteBytes(ifreq.AsSpan(InterfaceNameSize, 2), (short)(IffTun | IffNoPi));
@@ -125,8 +129,20 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         }
         Name = ReadInterfaceName(ifreq);
         var handle = new SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream = new FileStream(handle, FileAccess.ReadWrite, 65535, isAsync: true);
-        await ConfigureAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // libc open returns a synchronous handle. Disable buffering as TUN reads/writes
+            // are packet boundaries, and a pending read must not serialize a reverse write.
+            _stream = new FileStream(handle, FileAccess.ReadWrite, 1, isAsync: false);
+            await ConfigureAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            _stream?.Dispose();
+            _stream = null;
+            handle.Dispose();
+            throw;
+        }
         Status = "UP";
         Error = "";
         _readTask = Task.Run(() => ReadLoopAsync(outboundHandler, cancellationToken), CancellationToken.None);
@@ -198,7 +214,13 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         {
             try
             {
-                var read = await _stream!.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                var stream = _stream;
+                if (stream is null) { return; }
+                // A blocking read on an idle character device cannot be cancelled by closing
+                // its SafeHandle while an async read owns a reference. Poll first, bounded to
+                // 100 ms, so shutdown releases both the reader and the TUN even when idle.
+                if (!WaitForPacket(stream.SafeFileHandle)) { continue; }
+                var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
                 if (read > 0)
                 {
                     await outboundHandler(buffer.AsSpan(0, read).ToArray()).ConfigureAwait(false);
@@ -241,6 +263,43 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         }
         return Encoding.ASCII.GetString(ifreq, 0, length);
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PollDescriptor
+    {
+        public int Descriptor;
+        public short Events;
+        public short Returned;
+    }
+
+    internal static bool WaitForPacket(SafeFileHandle handle)
+    {
+        var added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            var descriptor = new PollDescriptor { Descriptor = handle.DangerousGetHandle().ToInt32(), Events = 1 };
+            var result = Poll(ref descriptor, 1, 100);
+            if (result < 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error == 4) { return false; } // EINTR: retry after checking cancellation.
+                throw new IOException($"Linux TUN poll failed: errno={error}");
+            }
+            if ((descriptor.Returned & (8 | 16 | 32)) != 0)
+            {
+                throw new IOException("Linux TUN poll reported a closed or invalid device");
+            }
+            return (descriptor.Returned & 1) != 0;
+        }
+        finally
+        {
+            if (added) { handle.DangerousRelease(); }
+        }
+    }
+
+    [DllImport("libc", EntryPoint = "poll", SetLastError = true)]
+    private static extern int Poll(ref PollDescriptor descriptor, nuint count, int timeout);
 
     [DllImport("libc", EntryPoint = "open", SetLastError = true)]
     private static extern int Open(string pathname, int flags);

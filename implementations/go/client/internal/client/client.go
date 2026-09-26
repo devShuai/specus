@@ -144,10 +144,10 @@ func (err *controlLoginRejectedError) reasonOrDefault() string {
 }
 
 func classifyControlLoginFailure(reason string) controlLoginAction {
-	if strings.Contains(reason, "访问令牌已过期") {
+	if strings.Contains(reason, "访问令牌已过期") || strings.Contains(reason, "访问令牌无效") {
 		return controlLoginRefreshImmediately
 	}
-	if strings.Contains(reason, "服务器繁忙") || strings.Contains(reason, "连接频率超过限制") {
+	if strings.Contains(reason, "服务器繁忙") || strings.Contains(reason, "连接频率超过限制") || strings.Contains(reason, "数据连接要求控制连接先登录") {
 		return controlLoginBackoff
 	}
 	return controlLoginStop

@@ -778,13 +778,15 @@ public sealed class SpecusControlClient : IAsyncDisposable
     internal static ControlLoginFailureAction ClassifyControlLoginFailure(string? reason)
     {
         if (!string.IsNullOrEmpty(reason)
-            && reason.Contains("访问令牌已过期", StringComparison.Ordinal))
+            && (reason.Contains("访问令牌已过期", StringComparison.Ordinal)
+                || reason.Contains("访问令牌无效", StringComparison.Ordinal)))
         {
             return ControlLoginFailureAction.RefreshImmediately;
         }
         if (!string.IsNullOrEmpty(reason)
             && (reason.Contains("服务器繁忙", StringComparison.Ordinal)
-                || reason.Contains("连接频率超过限制", StringComparison.Ordinal)))
+                || reason.Contains("连接频率超过限制", StringComparison.Ordinal)
+                || reason.Contains("数据连接要求控制连接先登录", StringComparison.Ordinal)))
         {
             return ControlLoginFailureAction.Backoff;
         }

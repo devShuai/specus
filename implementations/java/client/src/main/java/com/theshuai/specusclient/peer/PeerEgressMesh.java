@@ -80,6 +80,11 @@ final class PeerEgressMesh implements AutoCloseable {
             return List.of();
         }
 
+        /** Complete snapshot of reachable egress peers; omitted peers are offline. */
+        default Map<Long, Boolean> egressAvailability() {
+            return Map.of();
+        }
+
         /** Whether there is an interface to route into: a real device that started. */
         default boolean deviceReady() {
             return true;
@@ -260,8 +265,10 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         long nowMs = System.currentTimeMillis();
         PeerEgressConsumer consumerRole = consumer;
-        if (consumerRole != null && consumerRole.handleInbound(payload, peerId, nowMs)) {
-            return true;
+        if (consumerRole != null) {
+            synchronized (consumerRole) {
+                if (consumerRole.handleInbound(payload, peerId, nowMs)) { return true; }
+            }
         }
         PeerEgressRuntime plane = runtime;
         if (plane == null) {
@@ -293,8 +300,10 @@ final class PeerEgressMesh implements AutoCloseable {
         if (consumerRole == null) {
             return false;
         }
-        PeerEgressConsumer.Outcome outcome =
-                consumerRole.handleOutbound(packet, System.currentTimeMillis());
+        PeerEgressConsumer.Outcome outcome;
+        synchronized (consumerRole) {
+            outcome = consumerRole.handleOutbound(packet, System.currentTimeMillis());
+        }
         if (outcome == PeerEgressConsumer.Outcome.NOT_MINE) {
             return false;
         }
@@ -334,7 +343,7 @@ final class PeerEgressMesh implements AutoCloseable {
     /**
      * The egress section of the diagnostic snapshot.
      *
-     * <p>The consumer's half is read under this monitor because the consumer has no lock of its
+     * <p>The consumer's half is read under its monitor because the consumer has no lock of its
      * own; the runtime's half takes the runtime's own lock.
      */
     public Map<String, Object> status() {
@@ -343,7 +352,7 @@ final class PeerEgressMesh implements AutoCloseable {
         PeerEgressRuntime plane = runtime;
         PeerEgressStatus.ConsumerSnapshot consumerSnapshot = null;
         if (consumerRole != null) {
-            synchronized (this) {
+            synchronized (consumerRole) {
                 consumerSnapshot = consumerRole.statusSnapshot();
             }
         }
@@ -376,23 +385,25 @@ final class PeerEgressMesh implements AutoCloseable {
     }
 
     void reconcile(List<PeerEgressRule> rules, long nowMs) {
-        Map<Long, List<String>> purge;
+        if (closed.get()) { return; }
+        // Consumer sends can reach the mesh. Never wait for its monitor while holding
+        // planLock: mesh shutdown acquires planLock to withdraw routes.
+        Map<Long, List<String>> purge = rules.isEmpty() ? Map.of()
+                : configureConsumer(rules, meshCidrOrDefault(), nowMs);
         synchronized (planLock) {
             if (closed.get()) {
                 return;
             }
-            purge = reconcileLocked(rules, nowMs);
+            reconcileLocked(rules, nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
         deliverPurges(purge);
+        syncEgressAvailability(host.egressAvailability());
     }
 
-    private Map<Long, List<String>> reconcileLocked(List<PeerEgressRule> rules, long nowMs) {
+    private void reconcileLocked(List<PeerEgressRule> rules, long nowMs) {
         String meshCidr = meshCidrOrDefault();
-        // The consumer exists only when there are rules for it to apply. Building it for an empty
-        // set would report a consumer with nothing to do.
-        Map<Long, List<String>> purge = rules.isEmpty() ? Map.of() : configureConsumer(rules, meshCidr, nowMs);
 
         // Without a device there is nothing to route into. A rule's route pointed at an interface
         // that is not there is a black hole rather than the local fallback the user would get
@@ -417,7 +428,7 @@ final class PeerEgressMesh implements AutoCloseable {
             if (host.deviceReady()) {
                 repairDrift(installer, nowMs);
             }
-            return purge;
+            return;
         }
         PeerEgressRouteInstaller.ApplyResult result = installer.apply(desired);
         lastPlan = new PeerEgressRoutePlanner.PlanAttempt(nowMs, desired,
@@ -461,7 +472,6 @@ final class PeerEgressMesh implements AutoCloseable {
             log.info("[peer-egress-consumer] routes added={} removed={}",
                     result.added().size(), result.removed().size());
         }
-        return purge;
     }
 
     /**
@@ -535,11 +545,12 @@ final class PeerEgressMesh implements AutoCloseable {
             key.append('|').append(rule.getMatch()).append(' ').append(rule.getAction())
                     .append(' ').append(rule.getEgressClientId()).append(' ').append(rule.getPort());
         }
-        if (key.toString().equals(consumerKey)) {
-            return Map.of();
+        PeerEgressConsumer consumerRole = ensureConsumer();
+        synchronized (consumerRole) {
+            if (key.toString().equals(consumerKey)) { return Map.of(); }
+            consumerKey = key.toString();
+            return consumerRole.configure(rules, meshCidr, virtualIp, nowMs);
         }
-        consumerKey = key.toString();
-        return ensureConsumer().configure(rules, meshCidr, virtualIp, nowMs);
     }
 
     /**
@@ -635,10 +646,16 @@ final class PeerEgressMesh implements AutoCloseable {
             return;
         }
         long nowMs = System.currentTimeMillis();
-        for (Map.Entry<Long, Boolean> entry : online.entrySet()) {
-            deliverPurges(consumerRole.setEgressOnline(entry.getKey(),
-                    Boolean.TRUE.equals(entry.getValue()), nowMs));
+        Map<Long, List<String>> purge = new java.util.LinkedHashMap<>();
+        synchronized (consumerRole) {
+            var peers = new java.util.HashSet<>(consumerRole.statusSnapshot().online().keySet());
+            peers.addAll(online.keySet());
+            for (long peer : peers) {
+                purge.putAll(consumerRole.setEgressOnline(peer,
+                        Boolean.TRUE.equals(online.get(peer)), nowMs));
+            }
         }
+        deliverPurges(purge);
     }
 
     /**

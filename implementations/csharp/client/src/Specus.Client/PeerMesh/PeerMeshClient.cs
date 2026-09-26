@@ -290,6 +290,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
 
+        public IReadOnlyDictionary<long, bool> EgressAvailability
+        {
+            get
+            {
+                lock (owner._sync)
+                {
+                    var now = DateTimeOffset.UtcNow;
+                    return owner._peers.ToDictionary(item => item.Key, item => item.Value.Online
+                        && owner._sessions.TryGetValue(item.Key, out var session)
+                        && session.RemoteEndpoint is not null && session.AesKey.Length == 32
+                        && now <= session.ExpiresAt);
+                }
+            }
+        }
+
         public bool DeviceReady
         {
             get
