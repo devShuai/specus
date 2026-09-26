@@ -28,14 +28,14 @@ import (
 var (
 	errNoEgressSession = errors.New("no Peer Mesh session with the egress")
 	errNoEgressDevice  = errors.New("no virtual device to write to")
+	errEgressQueueFull = errors.New("egress send queue is full")
 )
 
 const (
 	peerControlTypeEgressConfig = "egress-config"
 
-	// peerEgressSendQueueDepth bounds frames waiting to be encrypted and sent. A full queue drops,
-	// which is safe here in a way it would not be elsewhere: TCP retransmits what is lost and UDP
-	// is lossy by contract, whereas blocking would stall every flow on the node.
+	// Bounds frames waiting for encryption. TCP keeps rejected payload/FIN in its bounded
+	// state until a writable notification; UDP and untracked control frames remain best effort.
 	peerEgressSendQueueDepth = 512
 
 	// peerEgressTickInterval drives retransmission and idle expiry. Well under the minimum RTO, so
@@ -76,6 +76,7 @@ func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 		select {
 		case queue <- peerEgressOutbound{consumer: consumer, frame: frame}:
 		default:
+			return errEgressQueueFull
 		}
 		return nil
 	}, newEgressDialer(mesh.egressTunnelName))
@@ -114,6 +115,12 @@ func (mesh *peerMeshClient) egressSendLoop(queue chan peerEgressOutbound, done c
 		case <-done:
 			return
 		case outbound = <-queue:
+		}
+		mesh.mu.Lock()
+		runtime := mesh.egress
+		mesh.mu.Unlock()
+		if runtime != nil {
+			runtime.sendReady(time.Now())
 		}
 		mesh.mu.Lock()
 		session := mesh.sessions[outbound.consumer]

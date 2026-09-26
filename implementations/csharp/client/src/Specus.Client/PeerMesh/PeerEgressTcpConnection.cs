@@ -6,9 +6,9 @@ namespace Specus.Client.PeerMesh;
 /// User-space TCP termination for the egress side.
 /// </summary>
 /// <remarks>
-/// A pure state machine: it performs no I/O and reads no clock. Segments and time come in as
-/// arguments, and everything it wants to happen comes back in <see cref="Output"/> for the caller
-/// to perform. Two reasons that shape matters. The conformance suite can drive loss, reordering and
+/// Owns no sockets and reads no clock. Effects come back in <see cref="Output"/>, or through an
+/// optional nonblocking queue-admission callback that must not do network I/O or take a mesh lock.
+/// Rejection leaves data unsent. The conformance suite can drive loss, reordering and
 /// timers deterministically without a network. And the same scenarios run against Go and Java,
 /// where the I/O and scheduling primitives are different but the protocol decisions must not be.
 ///
@@ -32,9 +32,8 @@ internal sealed class PeerEgressTcpConnection
     }
 
     /// <summary>
-    /// The window we advertise. Phase one runs a conservative fixed window rather than a full
-    /// congestion controller; the ceiling plus the existing RTT and path-MTU observations are what
-    /// bound throughput.
+    /// Our advertised receive window, not the downstream send credit. Downstream sends obey the
+    /// peer window and a conservative four-MSS flight limit, not adaptive congestion control.
     /// </summary>
     /// <remarks>
     /// 65535 and not 64 KiB: the header field is sixteen bits and there is no window scaling in this
@@ -134,6 +133,14 @@ internal sealed class PeerEgressTcpConnection
     private uint _sndUna;
     private uint _sndNxt;
     private int _sndWnd;
+    private uint _sndWl1;
+    private uint _sndWl2;
+    private byte[] _pending = [];
+    // Nonblocking admission; null preserves the deterministic output-only model.
+    internal Func<byte[], bool>? TryTransmit { get; set; }
+    internal bool SendBlocked { get; private set; }
+    private long _persistAtMs = -1;
+    internal const int SendBuffer = 65536;
 
     private uint _rcvNxt;
     private readonly uint _rcvWnd;
@@ -170,6 +177,7 @@ internal sealed class PeerEgressTcpConnection
         _sndUna = iss;
         _sndNxt = iss;
         _sndWnd = syn.Window;
+        _sndWl1 = syn.Seq;
         _rcvNxt = syn.Seq + 1;
         _rcvWnd = ReceiveWindow;
         _lastActivityMs = nowMs;
@@ -211,18 +219,30 @@ internal sealed class PeerEgressTcpConnection
     /// Renders one segment, queues it for retransmission when it occupies sequence space, and
     /// advances SND.NXT.
     /// </summary>
-    private void Emit(Output output, int flags, byte[] payload, long nowMs, int mss)
+    private bool Transmit(Output output, byte[] packet)
+    {
+        if (TryTransmit is not null)
+        {
+            var accepted = TryTransmit(packet);
+            SendBlocked = !accepted;
+            return accepted;
+        }
+        output.Send(packet);
+        return true;
+    }
+
+    private bool Emit(Output output, int flags, byte[] payload, long nowMs, int mss)
     {
         var segment = new Segment(
             _localIp, _remoteIp, _localPort, _remotePort,
             _sndNxt, _rcvNxt, flags,
             PeerEgressSegment.AdvertisedWindow(_rcvWnd), mss, payload);
-        output.Send(PeerEgressSegment.Build(segment));
+        if (!Transmit(output, PeerEgressSegment.Build(segment))) { return false; }
 
         var length = segment.SegmentLength();
         if (length == 0)
         {
-            return;
+            return true;
         }
         _retransmit.Add(new RetransmitEntry
         {
@@ -237,6 +257,7 @@ internal sealed class PeerEgressTcpConnection
             _finSent = true;
         }
         _sndNxt += length;
+        return true;
     }
 
     private void Ack(Output output, long nowMs) =>
@@ -257,6 +278,7 @@ internal sealed class PeerEgressTcpConnection
             _sndNxt, 0, PeerEgressSegment.FlagRst, 0, 0, [])));
         _state = State.Closed;
         _retransmit.Clear();
+        _pending = [];
         _reassembly.Clear();
         output.Done = true;
         output.Reset = true;
@@ -289,6 +311,7 @@ internal sealed class PeerEgressTcpConnection
             {
                 _state = State.Closed;
                 _retransmit.Clear();
+                _pending = [];
                 _reassembly.Clear();
                 output.Done = true;
                 output.Reset = true;
@@ -316,22 +339,14 @@ internal sealed class PeerEgressTcpConnection
 
         if (_state == State.SynReceived)
         {
-            if (!segment.Has(PeerEgressSegment.FlagAck))
+            if (!segment.Has(PeerEgressSegment.FlagAck) || _sndUna != _sndNxt)
             {
                 // A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
                 return output;
             }
             _state = State.Established;
-            if (_appClosed)
-            {
-                // The real socket ended while the handshake was still in flight. The FIN could not
-                // be sent then without running ahead of the sequence space, so it is owed now.
-                // Without this the flow sits open until the idle timer collects it, and the
-                // consumer waits on a connection that is already over.
-                Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, [], nowMs, 0);
-                _state = State.FinWait1;
-            }
         }
+        FlushSend(output, nowMs);
 
         // RFC 1122: a keepalive probe re-sends one byte of already acknowledged sequence space to
         // force an acknowledgement. Without answering it, a healthy flow looks dead to the consumer
@@ -362,7 +377,14 @@ internal sealed class PeerEgressTcpConnection
             return;
         }
         _sndUna = ack;
-        _sndWnd = segment.Window;
+        if (PeerEgressSegment.SeqLess(_sndWl1, segment.Seq)
+            || (_sndWl1 == segment.Seq && PeerEgressSegment.SeqLessEqual(_sndWl2, ack)))
+        {
+            _sndWnd = segment.Window;
+            _sndWl1 = segment.Seq;
+            _sndWl2 = ack;
+            if (_sndWnd > 0) { _persistAtMs = -1; }
+        }
 
         for (var index = _retransmit.Count - 1; index >= 0; index--)
         {
@@ -370,6 +392,12 @@ internal sealed class PeerEgressTcpConnection
             var end = entry.Seq + EntryLength(entry);
             if (!PeerEgressSegment.SeqLessEqual(end, ack))
             {
+                if (PeerEgressSegment.SeqLess(entry.Seq, _sndUna) && entry.Payload.Length > 0)
+                {
+                    var skip = Math.Min((int)(_sndUna - entry.Seq), entry.Payload.Length);
+                    entry.Payload = entry.Payload[skip..];
+                    entry.Seq += (uint)skip;
+                }
                 continue;
             }
             if (!entry.Retransmitted)
@@ -576,24 +604,41 @@ internal sealed class PeerEgressTcpConnection
     public Output OnAppData(byte[] data, long nowMs)
     {
         var output = new Output();
-        if (_state != State.Established && _state != State.CloseWait)
+        if (_appClosed || (_state != State.SynReceived && _state != State.Established && _state != State.CloseWait))
         {
             return output;
         }
+        if (data.Length > AppReadCredit()) { ResetFlow(output); return output; }
         _lastActivityMs = nowMs;
-        var offset = 0;
-        while (offset < data.Length)
-        {
-            var size = Math.Min(_sndMss, data.Length - offset);
-            Emit(
-                output,
-                PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh,
-                data[offset..(offset + size)],
-                nowMs,
-                0);
-            offset += size;
-        }
+        var previous = _pending.Length;
+        Array.Resize(ref _pending, previous + data.Length);
+        data.CopyTo(_pending, previous);
+        FlushSend(output, nowMs);
         return output;
+    }
+
+    internal int AppReadCredit()
+    {
+        if (_appClosed || (_state != State.SynReceived && _state != State.Established && _state != State.CloseWait)) { return 0; }
+        return Math.Max(0, SendBuffer - _pending.Length - (int)(_sndNxt - _sndUna));
+    }
+
+    private int SendCredit() => Math.Max(0, Math.Min(_sndWnd, 4 * _sndMss) - (int)(_sndNxt - _sndUna));
+
+    private void FlushSend(Output output, long nowMs)
+    {
+        if (_state != State.Established && _state != State.CloseWait) { return; }
+        while (_pending.Length > 0 && SendCredit() > 0)
+        {
+            var n = Math.Min(_pending.Length, Math.Min(_sndMss, SendCredit()));
+            if (!Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending[..n], nowMs, 0)) { return; }
+            _pending = _pending[n..];
+        }
+        if (_appClosed && _pending.Length == 0 && SendCredit() > 0 && !_finSent)
+        {
+            if (!Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, [], nowMs, 0)) { return; }
+            _state = _state == State.CloseWait ? State.LastAck : State.FinWait1;
+        }
     }
 
     /// <summary>The real socket reached EOF.</summary>
@@ -606,22 +651,7 @@ internal sealed class PeerEgressTcpConnection
         }
         _appClosed = true;
         _lastActivityMs = nowMs;
-        switch (_state)
-        {
-            case State.Established:
-                Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, [], nowMs, 0);
-                _state = State.FinWait1;
-                break;
-            case State.CloseWait:
-                Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, [], nowMs, 0);
-                _state = State.LastAck;
-                break;
-            case State.SynReceived:
-                // Nothing to send yet: a FIN here would sit beyond a sequence space the consumer
-                // has not acknowledged. _appClosed is already set, and OnSegment sends the FIN the
-                // moment the handshake completes.
-                break;
-        }
+        FlushSend(output, nowMs);
         return output;
     }
 
@@ -662,13 +692,44 @@ internal sealed class PeerEgressTcpConnection
             ResetFlow(output);
             return output;
         }
-        if (Keepalive(nowMs, output))
+        FlushSend(output, nowMs);
+        if (_sndWnd == 0 && _state != State.SynReceived
+            && (_pending.Length > 0 || _retransmit.Count > 0 || _appClosed))
+        {
+            if (_persistAtMs < 0) { _persistAtMs = nowMs; return output; }
+            if (nowMs - _persistAtMs < _rtoMs) { return output; }
+            _persistAtMs = nowMs;
+            if (_retransmit.Count == 0 && _pending.Length > 0)
+            {
+                if (Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending[..1], nowMs, 0))
+                {
+                    _pending = _pending[1..];
+                }
+            }
+            else
+            {
+                var seq = _sndNxt - 1;
+                byte[] payload = [];
+                if (_retransmit.Count > 0 && _retransmit[0].Payload.Length > 0)
+                {
+                    var entry = _retransmit[0];
+                    entry.Retransmitted = true;
+                    seq = entry.Seq;
+                    payload = entry.Payload[..1];
+                }
+                Transmit(output, PeerEgressSegment.Build(new Segment(_localIp, _remoteIp, _localPort, _remotePort,
+                    seq, _rcvNxt, PeerEgressSegment.FlagAck, PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, payload)));
+            }
+            return output;
+        }
+        if (_retransmit.Count == 0 && _pending.Length == 0 && Keepalive(nowMs, output))
         {
             return output;
         }
 
-        foreach (var entry in _retransmit)
+        for (var index = 0; index < Math.Min(1, _retransmit.Count); index++)
         {
+            var entry = _retransmit[index];
             if (nowMs - entry.SentAtMs < _rtoMs)
             {
                 continue;
@@ -678,15 +739,18 @@ internal sealed class PeerEgressTcpConnection
                 ResetFlow(output);
                 return output;
             }
+            if (!Transmit(output, PeerEgressSegment.Build(new Segment(
+                _localIp, _remoteIp, _localPort, _remotePort,
+                entry.Seq, _rcvNxt, entry.Flags,
+                PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, _state == State.SynReceived ? entry.Payload
+                    : entry.Payload[..Math.Min(entry.Payload.Length, _sndWnd)]))))
+            {
+                return output;
+            }
             entry.Attempts++;
             entry.Retransmitted = true;
             entry.SentAtMs = nowMs;
-            output.Send(PeerEgressSegment.Build(new Segment(
-                _localIp, _remoteIp, _localPort, _remotePort,
-                entry.Seq, _rcvNxt, entry.Flags,
-                PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, entry.Payload)));
-            // Exponential backoff, capped. Doing this per entry keeps one lost segment from
-            // resetting the estimator for the whole flow.
+            // Back off the connection's RTO once per oldest-segment timeout, capped.
             _rtoMs = Math.Min(_rtoMs * 2, MaxRtoMs);
         }
         return output;

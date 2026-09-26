@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"testing"
@@ -347,8 +348,7 @@ func TestConsumerPurgesFlowsWhenTheEgressGoesOffline(t *testing.T) {
 	}
 }
 
-// A flow-reject is diagnostic, but it does tell the consumer this flow is over, so the entry goes
-// rather than lingering until something else clears it.
+// A rejection must reset the application even when the egress's RST is lost or arrives later.
 func TestConsumerDropsAFlowTheEgressRejected(t *testing.T) {
 	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
 	harness.consumer.handleOutbound(consumerPacket(t, "203.0.113.10", 443), flowEpoch)
@@ -369,6 +369,48 @@ func TestConsumerDropsAFlowTheEgressRejected(t *testing.T) {
 	}
 	if counts := harness.consumer.blockedCounts(); counts["rejected-egress_port_denied"] != 1 {
 		t.Errorf("blocked counts = %v", counts)
+	}
+}
+
+func TestConsumerRejectResetsOnlyTheSendingEgressFlow(t *testing.T) {
+	for _, sender := range []int64{2, 3} {
+		t.Run(fmt.Sprint(sender), func(t *testing.T) {
+			h := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true, 3: true})
+			packet := buildTCPSegment(tcpSegment{
+				SourceIP: testAddr(t, "100.96.0.1"), DestinationIP: testAddr(t, "203.0.113.10"),
+				SourcePort: 40000, DestinationPort: 443, Seq: 1001, Ack: 700001,
+				Flags: tcpFlagACK, Window: 65535, Payload: []byte("hello"),
+			})
+			h.consumer.handleOutbound(packet, flowEpoch)
+			body, err := encodePeerEgressControl(peerEgressControl{
+				Type: peerEgressControlFlowReject, Protocol: "tcp", SourceIP: "100.96.0.1", SourcePort: 40000,
+				DestinationIP: "203.0.113.10", DestinationPort: 443, Code: egressCodeDisabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame := encodePeerEgressFrame(peerEgressTypeControl, false, body)
+			h.consumer.handleInbound(frame, sender, flowEpoch)
+			if sender != 2 {
+				if h.consumer.flowCount() != 1 || len(h.toTun) != 0 || len(h.consumer.blockedCounts()) != 0 {
+					t.Fatal("another egress changed the flow or its rejection counters")
+				}
+				return
+			}
+			if h.consumer.flowCount() != 0 || len(h.toTun) != 1 {
+				t.Fatal("rejection did not reset the application")
+			}
+			reset, ok := parseTCPSegment(h.toTun[0])
+			if !ok || reset.Flags != tcpFlagRST|tcpFlagACK || reset.Seq != 700001 || reset.Ack != 1006 {
+				t.Fatalf("reset = %+v", reset)
+			}
+			// A duplicate rejection and the late remote reset must not notify/count twice.
+			h.consumer.handleInbound(frame, sender, flowEpoch)
+			h.consumer.handleInbound(encodePeerEgressFrame(peerEgressTypeIPPacket, false, h.toTun[0]), sender, flowEpoch)
+			if len(h.toTun) != 1 || h.consumer.blockedCounts()["rejected-egress_disabled"] != 1 {
+				t.Fatal("duplicate rejection was acted on")
+			}
+		})
 	}
 }
 

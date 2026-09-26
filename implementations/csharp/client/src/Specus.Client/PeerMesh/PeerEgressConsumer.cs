@@ -444,22 +444,31 @@ internal sealed class PeerEgressConsumer(
     }
 
     /// <summary>
-    /// Reads a flow-reject. It is diagnostic: the application learns the flow is dead from the reset
-    /// the egress user-space stack sends, and this only supplies a readable reason.
+    /// A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
+    /// the flow, and only accept its actual egress as the sender.
     /// </summary>
     private void HandleFlowReject(PeerEgressFrame.Control control, long fromEgress)
     {
-        RecordBlocked("rejected-" + control.Code.ToLowerInvariant());
-        if (Ipv4Cidr.TryParseAddress(control.DestinationIp, out var remote)
-            && Ipv4Cidr.TryParseAddress(control.SourceIp, out var local))
+        if (!Ipv4Cidr.TryParseAddress(control.DestinationIp, out var remote)
+            || !Ipv4Cidr.TryParseAddress(control.SourceIp, out var local))
         {
-            _flows.Remove(new PeerEgressFlowTable.Key(
-                ProtocolNumberFor(control.Protocol),
-                local, (ushort)control.SourcePort, remote, (ushort)control.DestinationPort));
+            return;
         }
-        logger?.LogInformation(
-            "[peer-egress-consumer] egress={Egress} refused {Destination}:{Port} code={Code}",
-            fromEgress, control.DestinationIp, control.DestinationPort, control.Code);
+        var key = new PeerEgressFlowTable.Key(ProtocolNumberFor(control.Protocol),
+            local, (ushort)control.SourcePort, remote, (ushort)control.DestinationPort);
+        if (!_flows.TryGetValue(key, out var flow) || flow.Egress != fromEgress)
+        {
+            return;
+        }
+        var reset = FlowResetPacket(key, flow);
+        _flows.Remove(key);
+        RecordBlocked("rejected-" + control.Code.ToLowerInvariant());
+        logger?.LogInformation("[peer-egress-consumer] egress={Egress} refused flow code={Code}",
+            fromEgress, control.Code);
+        if (reset is not null)
+        {
+            toTun?.Invoke(reset);
+        }
     }
 
     private static int ProtocolNumberFor(string? name) => name?.Trim().ToLowerInvariant() switch

@@ -62,7 +62,8 @@ jobs:
           sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
             --server "$RUNNER_TEMP/specus-server" \
             --client "$RUNNER_TEMP/specus-client" \
-            --report-dir "$RUNNER_TEMP/lab"
+            --report-dir "$RUNNER_TEMP/lab" \
+            --switch-off-repetitions 3
 
       - name: Report
         if: always()

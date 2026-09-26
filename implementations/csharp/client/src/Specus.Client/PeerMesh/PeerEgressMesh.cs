@@ -97,9 +97,8 @@ internal sealed class PeerEgressMesh(
     Func<string, IPAddress[]>? lookup = null) : IDisposable
 {
     /// <summary>
-    /// Bounds frames waiting to be encrypted and sent. A full queue drops, which is safe here in a
-    /// way it would not be elsewhere: TCP retransmits what is lost and UDP is lossy by contract,
-    /// whereas blocking would stall every flow on the node.
+    /// Bounds frames waiting for encryption. Egress TCP retains rejected payload/FIN until a
+    /// writable notification. UDP and untracked control frames remain best effort; no caller blocks.
     /// </summary>
     private const int SendQueueDepth = 512;
 
@@ -182,11 +181,12 @@ internal sealed class PeerEgressMesh(
             var built = new PeerEgressRuntime(
                 (consumer, frame) =>
                 {
-                    // TryAdd rather than Add: a full queue drops, it never blocks the plane.
+                    // Best effort for untracked control and UDP; TCP data uses TrySend below.
                     _queue.TryAdd((consumer, frame));
                 },
                 dialer ?? new PeerEgressSocketDialer(PeerEgressSocketBinder.ForPlatform(() => host.TunName)),
                 logger: logger);
+            built.TrySend = (consumer, frame) => !_stopping.IsCancellationRequested && _queue.TryAdd((consumer, frame));
             _runtime = built;
             EnsureLoops();
             // The tick only exists for the egress role: retransmission and idle expiry belong to
@@ -219,6 +219,7 @@ internal sealed class PeerEgressMesh(
         {
             foreach (var outbound in _queue.GetConsumingEnumerable(_stopping.Token))
             {
+                _runtime?.SendReady(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 // Blocking on the task is what this thread is for. It is not a pool thread, so
                 // waiting here costs nothing anyone else needs.
                 if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())

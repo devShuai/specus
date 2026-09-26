@@ -33,9 +33,8 @@ import lombok.extern.slf4j.Slf4j;
 final class PeerEgressMesh implements AutoCloseable {
 
     /**
-     * Bounds frames waiting to be encrypted and sent. A full queue drops, which is safe here in a
-     * way it would not be elsewhere: TCP retransmits what is lost and UDP is lossy by contract,
-     * whereas blocking would stall every flow on the node.
+     * Bounds frames waiting for encryption. Egress TCP retains rejected payload/FIN until a
+     * writable notification. UDP and untracked control frames remain best effort; no caller blocks.
      */
     private static final int SEND_QUEUE_DEPTH = 512;
 
@@ -188,6 +187,7 @@ final class PeerEgressMesh implements AutoCloseable {
             PeerEgressRuntime built = new PeerEgressRuntime(
                     (consumerId, frame) -> queue.offer(new Outbound(consumerId, frame)),
                     dialer);
+            built.trySend = (consumerId, frame) -> !closed.get() && queue.offer(new Outbound(consumerId, frame));
             runtime = built;
             startLoops(built);
             return built;
@@ -204,6 +204,7 @@ final class PeerEgressMesh implements AutoCloseable {
                     Thread.currentThread().interrupt();
                     return;
                 }
+                if (outbound != null) { plane.sendReady(System.currentTimeMillis()); }
                 if (outbound != null && !host.sendToPeer(outbound.consumer(), outbound.frame())) {
                     log.debug("Peer Mesh egress send failed: peer={}", outbound.consumer());
                 }
