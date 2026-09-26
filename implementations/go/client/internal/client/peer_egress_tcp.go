@@ -4,8 +4,9 @@ import "time"
 
 // User-space TCP termination for the egress side.
 //
-// This is a pure state machine: it performs no I/O and reads no clock. Segments and time come in as
-// arguments, and everything it wants to happen comes back in tcpOutput for the caller to perform.
+// This state machine owns no sockets and reads no clock. Segments and time come in as arguments;
+// effects come back in tcpOutput, or through an optional nonblocking queue-admission callback.
+// The callback must not do network I/O or acquire a mesh lock. Rejection leaves data unsent.
 // Two reasons that shape matters. The conformance suite can drive loss, reordering and timers
 // deterministically without a network. And P4 has to port this logic to Java and .NET, where the
 // I/O and scheduling primitives are different but the protocol decisions must not be.
@@ -50,14 +51,15 @@ func (s tcpState) String() string {
 }
 
 const (
-	// tcpReceiveWindow is the window we advertise. Phase one runs a conservative fixed window
-	// rather than a full congestion controller; the ceiling plus the existing RTT and path-MTU
-	// observations are what bound throughput. protocol/spec/peer-egress.md records this limit.
+	// tcpReceiveWindow is our advertised receive window, not the downstream send credit.
+	// Downstream sends obey the peer window and a conservative four-MSS flight limit;
+	// this is not an adaptive congestion controller. See protocol/spec/peer-egress.md.
 	//
 	// 65535 and not 64 KiB: the header field is sixteen bits and there is no window scaling in
 	// this version, so a 65536 would go on the wire as a zero window and tell every consumer to
 	// stop sending.
 	tcpReceiveWindow = 65535
+	tcpSendBuffer    = 65536
 
 	tcpInitialRTO = 1 * time.Second
 	tcpMinRTO     = 200 * time.Millisecond
@@ -129,10 +131,18 @@ type tcpConn struct {
 	state tcpState
 
 	// Send sequence space.
-	iss    uint32
-	sndUna uint32
-	sndNxt uint32
-	sndWnd uint32
+	iss     uint32
+	sndUna  uint32
+	sndNxt  uint32
+	sndWnd  uint32
+	sndWL1  uint32
+	sndWL2  uint32
+	pending []byte
+	// Optional nonblocking transport admission. A rejected segment stays in TCP state,
+	// rather than being counted as sent and silently dropped by a full local queue.
+	tryTransmit func([]byte) bool
+	sendBlocked bool
+	persistAt   time.Time
 
 	// Receive sequence space.
 	irs    uint32
@@ -177,6 +187,7 @@ func acceptTCPSyn(syn tcpSegment, iss uint32, pathMTU int, idleTimeout time.Dura
 		sndUna:       iss,
 		sndNxt:       iss,
 		sndWnd:       uint32(syn.Window),
+		sndWL1:       syn.Seq,
 		irs:          syn.Seq,
 		rcvNxt:       syn.Seq + 1,
 		rcvWnd:       tcpReceiveWindow,
@@ -223,7 +234,17 @@ func tcpAdvertisedWindow(window uint32) uint16 {
 
 // emit renders one segment, queues it for retransmission when it occupies sequence space, and
 // advances SND.NXT.
-func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.Time, mss int) {
+func (c *tcpConn) transmit(output *tcpOutput, packet []byte) bool {
+	if c.tryTransmit != nil {
+		accepted := c.tryTransmit(packet)
+		c.sendBlocked = !accepted
+		return accepted
+	}
+	output.send(packet)
+	return true
+}
+
+func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.Time, mss int) bool {
 	segment := tcpSegment{
 		SourceIP:        c.localIP,
 		DestinationIP:   c.remoteIP,
@@ -239,13 +260,15 @@ func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.
 	if flags&tcpFlagACK == 0 && flags&tcpFlagRST == 0 {
 		segment.Ack = 0
 	}
-	output.send(buildTCPSegment(segment))
+	if !c.transmit(output, buildTCPSegment(segment)) {
+		return false
+	}
 
 	length := segment.segmentLength()
 	if length == 0 {
 		// A pure ACK carries no sequence space, so it is never retransmitted; the peer will
 		// re-ask by retransmitting whatever it thinks is missing.
-		return
+		return true
 	}
 	c.retransmit = append(c.retransmit, tcpRetransmitEntry{
 		seq: c.sndNxt, flags: flags, payload: append([]byte(nil), payload...), sentAt: now,
@@ -255,6 +278,7 @@ func (c *tcpConn) emit(output *tcpOutput, flags uint8, payload []byte, now time.
 		c.finSent = true
 	}
 	c.sndNxt += length
+	return true
 }
 
 func (c *tcpConn) ack(output *tcpOutput, now time.Time) {
@@ -270,6 +294,7 @@ func (c *tcpConn) reset(output *tcpOutput) {
 	}))
 	c.state = tcpStateClosed
 	c.retransmit = nil
+	c.pending = nil
 	c.reassembly = nil
 	output.Done = true
 	output.Reset = true
@@ -296,6 +321,7 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 		if seqInWindow(segment.Seq, c.rcvNxt, c.rcvWnd) || segment.Seq == c.rcvNxt {
 			c.state = tcpStateClosed
 			c.retransmit = nil
+			c.pending = nil
 			c.reassembly = nil
 			output.Done = true
 			output.Reset = true
@@ -319,20 +345,13 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 	}
 
 	if c.state == tcpStateSynReceived {
-		if !segment.has(tcpFlagACK) {
+		if !segment.has(tcpFlagACK) || c.sndUna != c.iss+1 {
 			// A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
 			return output
 		}
 		c.state = tcpStateEstablished
-		if c.appClosed {
-			// The real socket ended while the handshake was still in flight. The FIN could not
-			// be sent then without running ahead of the sequence space, so it is owed now.
-			// Without this the flow sits open until the idle timer collects it, and the
-			// consumer waits on a connection that is already over.
-			c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
-			c.state = tcpStateFinWait1
-		}
 	}
+	c.flushSend(&output, now)
 
 	// RFC 1122: a keepalive probe re-sends one byte of already acknowledged sequence space to
 	// force an acknowledgement. Without answering it, a healthy flow looks dead to the consumer
@@ -359,7 +378,14 @@ func (c *tcpConn) processAck(segment tcpSegment, now time.Time, output *tcpOutpu
 	if seqLess(c.sndUna, segment.Ack) {
 		c.sndUna = segment.Ack
 	}
-	c.sndWnd = uint32(segment.Window)
+	// RFC 9293 SND.WL1/WL2: an old window advertisement must not reopen the window.
+	if seqLess(c.sndWL1, segment.Seq) || (c.sndWL1 == segment.Seq && seqLessEqual(c.sndWL2, segment.Ack)) {
+		c.sndWnd = uint32(segment.Window)
+		c.sndWL1, c.sndWL2 = segment.Seq, segment.Ack
+		if c.sndWnd > 0 {
+			c.persistAt = time.Time{}
+		}
+	}
 
 	kept := c.retransmit[:0]
 	for _, entry := range c.retransmit {
@@ -370,6 +396,11 @@ func (c *tcpConn) processAck(segment tcpSegment, now time.Time, output *tcpOutpu
 				c.updateRTO(now.Sub(entry.sentAt))
 			}
 			continue
+		}
+		if seqLess(entry.seq, c.sndUna) && len(entry.payload) > 0 {
+			skip := min(int(c.sndUna-entry.seq), len(entry.payload))
+			entry.payload = entry.payload[skip:]
+			entry.seq += uint32(skip)
 		}
 		kept = append(kept, entry)
 	}
@@ -543,19 +574,53 @@ func (c *tcpConn) enterTimeWait(now time.Time) {
 // onAppData queues payload read from the real socket, split at the negotiated MSS.
 func (c *tcpConn) onAppData(data []byte, now time.Time) tcpOutput {
 	var output tcpOutput
-	if c.state != tcpStateEstablished && c.state != tcpStateCloseWait {
+	if c.appClosed || (c.state != tcpStateSynReceived && c.state != tcpStateEstablished && c.state != tcpStateCloseWait) {
+		return output
+	}
+	if len(data) > c.appReadCredit() {
+		c.reset(&output)
 		return output
 	}
 	c.lastActivity = now
-	for len(data) > 0 {
-		chunk := data
-		if len(chunk) > c.sndMSS {
-			chunk = chunk[:c.sndMSS]
-		}
-		c.emit(&output, tcpFlagACK|tcpFlagPSH, chunk, now, 0)
-		data = data[len(chunk):]
-	}
+	c.pending = append(c.pending, data...)
+	c.flushSend(&output, now)
 	return output
+}
+
+// Credit includes both unsent and unacknowledged bytes: ACKs, not successful queue writes,
+// permit further socket reads. The per-flow flight ceiling is conservative, not full TCP CC.
+func (c *tcpConn) appReadCredit() int {
+	if c.appClosed || (c.state != tcpStateSynReceived && c.state != tcpStateEstablished && c.state != tcpStateCloseWait) {
+		return 0
+	}
+	return max(0, tcpSendBuffer-len(c.pending)-int(c.sndNxt-c.sndUna))
+}
+
+func (c *tcpConn) sendCredit() int {
+	return max(0, min(int(c.sndWnd), 4*c.sndMSS)-int(c.sndNxt-c.sndUna))
+}
+
+func (c *tcpConn) flushSend(output *tcpOutput, now time.Time) {
+	if c.state != tcpStateEstablished && c.state != tcpStateCloseWait {
+		return
+	}
+	for len(c.pending) > 0 && c.sendCredit() > 0 {
+		n := min(len(c.pending), c.sndMSS, c.sendCredit())
+		if !c.emit(output, tcpFlagACK|tcpFlagPSH, c.pending[:n], now, 0) {
+			return
+		}
+		c.pending = c.pending[n:]
+	}
+	if c.appClosed && len(c.pending) == 0 && c.sendCredit() > 0 && !c.finSent {
+		if !c.emit(output, tcpFlagACK|tcpFlagFIN, nil, now, 0) {
+			return
+		}
+		if c.state == tcpStateCloseWait {
+			c.state = tcpStateLastAck
+		} else {
+			c.state = tcpStateFinWait1
+		}
+	}
 }
 
 // onAppClose reports that the real socket reached EOF, so the consumer gets our FIN.
@@ -566,18 +631,7 @@ func (c *tcpConn) onAppClose(now time.Time) tcpOutput {
 	}
 	c.appClosed = true
 	c.lastActivity = now
-	switch c.state {
-	case tcpStateEstablished:
-		c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
-		c.state = tcpStateFinWait1
-	case tcpStateCloseWait:
-		c.emit(&output, tcpFlagACK|tcpFlagFIN, nil, now, 0)
-		c.state = tcpStateLastAck
-	case tcpStateSynReceived:
-		// Nothing to send yet: a FIN here would sit beyond a sequence space the consumer has not
-		// acknowledged. appClosed is already set, and onSegment sends the FIN the moment the
-		// handshake completes.
-	}
+	c.flushSend(&output, now)
 	return output
 }
 
@@ -612,11 +666,41 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 		c.reset(&output)
 		return output
 	}
-	if c.keepalive(now, &output) {
+	c.flushSend(&output, now)
+	if c.sndWnd == 0 && c.state != tcpStateSynReceived && (len(c.pending) > 0 || len(c.retransmit) > 0 || c.appClosed) {
+		// Persist is not a failed transmission. Probe without spending the retry budget; the
+		// resource-policy idle timeout still bounds a peer that never reopens its window.
+		if c.persistAt.IsZero() {
+			c.persistAt = now
+			return output
+		}
+		if now.Sub(c.persistAt) < c.rto {
+			return output
+		}
+		c.persistAt = now
+		if len(c.retransmit) == 0 && len(c.pending) > 0 {
+			if c.emit(&output, tcpFlagACK|tcpFlagPSH, c.pending[:1], now, 0) {
+				c.pending = c.pending[1:]
+			}
+		} else if len(c.retransmit) > 0 && len(c.retransmit[0].payload) > 0 {
+			entry := &c.retransmit[0]
+			entry.retransmitted = true
+			c.transmit(&output, buildTCPSegment(tcpSegment{SourceIP: c.localIP, DestinationIP: c.remoteIP,
+				SourcePort: c.localPort, DestinationPort: c.remotePort, Seq: entry.seq, Ack: c.rcvNxt,
+				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd), Payload: entry.payload[:1]}))
+		} else {
+			c.transmit(&output, buildTCPSegment(tcpSegment{SourceIP: c.localIP, DestinationIP: c.remoteIP,
+				SourcePort: c.localPort, DestinationPort: c.remotePort, Seq: c.sndNxt - 1, Ack: c.rcvNxt,
+				Flags: tcpFlagACK, Window: tcpAdvertisedWindow(c.rcvWnd)}))
+		}
+		return output
+	}
+	if len(c.retransmit) == 0 && len(c.pending) == 0 && c.keepalive(now, &output) {
 		return output
 	}
 
-	for index := range c.retransmit {
+	// One RTO retransmits the oldest outstanding segment, not a burst of the entire flight.
+	for index := 0; index < len(c.retransmit) && index < 1; index++ {
 		entry := &c.retransmit[index]
 		if now.Sub(entry.sentAt) < c.rto {
 			continue
@@ -625,17 +709,22 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 			c.reset(&output)
 			return output
 		}
-		entry.attempts++
-		entry.retransmitted = true
-		entry.sentAt = now
-		output.send(buildTCPSegment(tcpSegment{
+		payload := entry.payload
+		if c.state != tcpStateSynReceived && len(payload) > int(c.sndWnd) {
+			payload = payload[:c.sndWnd]
+		}
+		if !c.transmit(&output, buildTCPSegment(tcpSegment{
 			SourceIP: c.localIP, DestinationIP: c.remoteIP,
 			SourcePort: c.localPort, DestinationPort: c.remotePort,
 			Seq: entry.seq, Ack: c.rcvNxt, Flags: entry.flags,
-			Window: tcpAdvertisedWindow(c.rcvWnd), Payload: entry.payload,
-		}))
-		// Exponential backoff, capped. Doing this per entry keeps one lost segment from resetting
-		// the estimator for the whole flow.
+			Window: tcpAdvertisedWindow(c.rcvWnd), Payload: payload,
+		})) {
+			return output
+		}
+		entry.attempts++
+		entry.retransmitted = true
+		entry.sentAt = now
+		// Back off the connection's RTO once per oldest-segment timeout, capped.
 		c.rto *= 2
 		if c.rto > tcpMaxRTO {
 			c.rto = tcpMaxRTO

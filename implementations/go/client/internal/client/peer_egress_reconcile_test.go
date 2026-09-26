@@ -345,3 +345,88 @@ func TestEgressBypassResolverReadsEveryFormAndCaches(t *testing.T) {
 		t.Errorf("lookups after the TTL: %v", calls)
 	}
 }
+
+// A control connection that drops must not take the routes with it.
+//
+// Almost every control connection that ends is followed by another within seconds. Withdrawing
+// for that gap put every destination a rule had claimed back on the local default route, so the
+// traffic went out of the machine directly instead of being blocked -- silently, and for as long
+// as the reconnect took. Real runs measured about two seconds of it.
+//
+// Stopping is the other case: the client is finished, nothing is coming back, and the routes have
+// to go or they outlive the process that owns them.
+func TestMeshSuspendKeepsTheRoutesAndStopTakesThemBack(t *testing.T) {
+	harness := newReconcileHarness(t,
+		egressRule{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2})
+	harness.tick(0)
+	if _, installed := harness.commander.table["203.0.113.0/24"]; !installed {
+		t.Fatal("the rule installed no route to begin with, so this proves nothing")
+	}
+
+	harness.mesh.suspend()
+
+	if _, installed := harness.commander.table["203.0.113.0/24"]; !installed {
+		t.Error("suspending withdrew the rule's route: its traffic would leave through the machine's own default route")
+	}
+	harness.mesh.mu.Lock()
+	device, installer, conn := harness.mesh.device, harness.mesh.egressRoutes, harness.mesh.conn
+	harness.mesh.mu.Unlock()
+	if device == nil {
+		t.Error("suspending closed the virtual device, and the kernel drops the routes that point into it")
+	}
+	if installer == nil {
+		t.Error("suspending forgot the installer, so the next reconcile would reinstall from nothing")
+	}
+	if conn != nil {
+		t.Error("suspending kept the dead control connection, which the next send would write to")
+	}
+
+	// The maintenance tick keeps running while the connection is down, and must leave the route
+	// alone rather than decide it is no longer wanted.
+	harness.tick(5 * time.Second)
+	if _, installed := harness.commander.table["203.0.113.0/24"]; !installed {
+		t.Error("a reconcile during the suspension withdrew the rule's route")
+	}
+
+	harness.mesh.stop()
+
+	if _, installed := harness.commander.table["203.0.113.0/24"]; installed {
+		t.Error("stopping left the rule's route behind, pointing into a tunnel nothing serves")
+	}
+}
+
+// The address the control connection last used has to stay out of the tunnel while the connection
+// is gone. The routes are no longer withdrawn across a reconnect, so a rule covering the server's
+// own prefix would now capture the reconnect itself and leave the client unable to come back.
+func TestMeshSuspendKeepsTheControlAddressOutOfTheTunnel(t *testing.T) {
+	harness := newReconcileHarness(t,
+		egressRule{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2})
+	harness.mesh.mu.Lock()
+	harness.mesh.conn = &fakeControlConn{remote: "203.0.113.2:7010"}
+	harness.mesh.mu.Unlock()
+	harness.tick(0)
+	if _, installed := harness.commander.table["203.0.113.2/32"]; !installed {
+		t.Fatal("the control address had no bypass to begin with")
+	}
+
+	harness.mesh.suspend()
+	harness.tick(5 * time.Second)
+
+	if _, installed := harness.commander.table["203.0.113.2/32"]; !installed {
+		t.Error("the bypass for the control address went away with the connection, so the reconnect would be routed into the tunnel")
+	}
+}
+
+// fakeControlConn stands in for the control connection where only its remote address matters.
+type fakeControlConn struct {
+	net.Conn
+	remote string
+}
+
+func (c *fakeControlConn) RemoteAddr() net.Addr {
+	address, err := net.ResolveTCPAddr("tcp", c.remote)
+	if err != nil {
+		return nil
+	}
+	return address
+}

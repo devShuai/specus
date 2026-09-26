@@ -290,6 +290,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
 
+        public IReadOnlyDictionary<long, bool> EgressAvailability
+        {
+            get
+            {
+                lock (owner._sync)
+                {
+                    var now = DateTimeOffset.UtcNow;
+                    return owner._peers.ToDictionary(item => item.Key, item => item.Value.Online
+                        && owner._sessions.TryGetValue(item.Key, out var session)
+                        && session.RemoteEndpoint is not null && session.AesKey.Length == 32
+                        && now <= session.ExpiresAt);
+                }
+            }
+        }
+
         public bool DeviceReady
         {
             get
@@ -4601,6 +4616,32 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         lock (_sync)
         {
             return _writer;
+        }
+    }
+
+    /// <summary>
+    /// Gives up the control connection without giving up what the mesh installed.
+    /// </summary>
+    /// <remarks>
+    /// A control connection that drops is routine: a blip, a server restart, a network change, and
+    /// another one follows within seconds. Stopping the mesh for that withdrew every route this
+    /// feature owns and closed the virtual device the rest of them point into, so for the length of
+    /// the reconnect the destinations a rule had claimed left through the machine's own default
+    /// route -- silently, and from this node's own address. That is the one outcome the feature
+    /// exists to prevent, and it is worse than the black hole the withdrawal was guarding against.
+    ///
+    /// So the device, the routes and the peer sessions stay; peer traffic is UDP and never needed
+    /// the server, so flows that were working keep working. Only the serving side stops. The writer
+    /// goes because the session that owned it is being disposed. The remembered control address
+    /// stays, because the routes no longer go away and a rule covering the server's own prefix
+    /// would otherwise capture the reconnect itself.
+    /// </remarks>
+    internal void Suspend()
+    {
+        _egress.ShutdownServing();
+        lock (_sync)
+        {
+            _writer = null;
         }
     }
 

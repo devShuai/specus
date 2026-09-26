@@ -21,6 +21,8 @@ public class SpecusControlClientReconnectTests
 {
     [Theory]
     [InlineData("客户端访问令牌已过期", (int)ControlLoginFailureAction.RefreshImmediately)]
+    [InlineData("客户端访问令牌无效", (int)ControlLoginFailureAction.RefreshImmediately)]
+    [InlineData("数据连接要求控制连接先登录", (int)ControlLoginFailureAction.Backoff)]
     [InlineData("服务器繁忙，请稍后再试", (int)ControlLoginFailureAction.Backoff)]
     [InlineData("连接频率超过限制", (int)ControlLoginFailureAction.Backoff)]
     [InlineData("", (int)ControlLoginFailureAction.Stop)]
@@ -115,6 +117,8 @@ public class SpecusControlClientReconnectTests
                 }, cts.Token);
 
                 var firstReply = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
+                Assert.True(firstReply.NatMessageType is NatMessageType.WindowUpdate or NatMessageType.Data,
+                    $"expected data or credit, got {firstReply.NatMessageType}: {System.Text.Json.JsonSerializer.Serialize(firstReply.MetaData)}");
                 var secondReply = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
                 var update = firstReply.NatMessageType == NatMessageType.WindowUpdate
                     ? firstReply

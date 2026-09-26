@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Specus.Client.Configuration;
 
@@ -214,8 +215,16 @@ public sealed class PeerMeshConfig
     [JsonPropertyName("turnPort")]
     public int TurnPort { get; set; }
 
+    // Go encodes an absent slice as null. Normalize at the JSON boundary so both login
+    // snapshots and pushed peer-config messages expose the same non-null collection.
+    private List<string> _publicStunServers = [];
+    [AllowNull]
     [JsonPropertyName("publicStunServers")]
-    public List<string> PublicStunServers { get; set; } = new();
+    public List<string> PublicStunServers
+    {
+        get => _publicStunServers;
+        set => _publicStunServers = value ?? [];
+    }
 
     [JsonPropertyName("iceUsername")]
     public string? IceUsername { get; set; }

@@ -197,6 +197,37 @@ public sealed class PeerEgressReconcileTests : IDisposable
     }
 
     /// <summary>
+    /// A control connection that drops must not take the routes with it.
+    /// </summary>
+    /// <remarks>
+    /// Almost every control session that ends is followed by another within seconds. Giving up the
+    /// routes for that gap put every destination a rule had claimed back on the machine's own
+    /// default route, so the traffic left directly instead of being blocked, silently and for as
+    /// long as the reconnect took. Serving other consumers is the part that does stop, because a
+    /// revocation cannot reach an egress whose control connection is down.
+    /// </remarks>
+    [Fact]
+    public void ShutdownServingKeepsTheRoutesAndWithdrawTakesThemBack()
+    {
+        var mesh = NewMesh(EgressTo("203.0.113.0/24", 2L));
+        mesh.Reconcile(_host.Rules, _now);
+        Assert.Contains("203.0.113.0/24", _commander.InstallLog);
+
+        mesh.ShutdownServing();
+
+        Assert.DoesNotContain("203.0.113.0/24", _commander.RemoveLog);
+
+        // The tick keeps running while the connection is down and must leave the route alone.
+        _now += 5_000;
+        mesh.Reconcile(_host.Rules, _now);
+        Assert.DoesNotContain("203.0.113.0/24", _commander.RemoveLog);
+
+        mesh.WithdrawRoutes();
+
+        Assert.Contains("203.0.113.0/24", _commander.RemoveLog);
+    }
+
+    /// <summary>
     /// A prefix somebody else owns is asked about again after the interval, not on every tick, and
     /// is installed once the other route is gone.
     /// </summary>

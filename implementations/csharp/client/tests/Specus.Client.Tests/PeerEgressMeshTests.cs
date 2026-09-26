@@ -24,6 +24,7 @@ public class PeerEgressMeshTests : IDisposable
     private readonly List<byte[]> _sentFrames = [];
     private readonly List<byte[]> _toDevice = [];
     private volatile bool _reachable = true;
+    private IReadOnlyDictionary<long, bool> _availableEgresses = new Dictionary<long, bool>();
     private PeerEgressMesh? _mesh;
 
     public PeerEgressMeshTests() => Directory.CreateDirectory(_directory);
@@ -45,6 +46,8 @@ public class PeerEgressMeshTests : IDisposable
     private sealed class FakeHost(PeerEgressMeshTests owner, string directory) : IPeerEgressMeshHost
     {
         public bool CanReach(long peerId) => owner._reachable;
+
+        public IReadOnlyDictionary<long, bool> EgressAvailability => owner._availableEgresses;
 
         public Task<bool> SendToPeerAsync(long peerId, byte[] frame)
         {
@@ -364,6 +367,28 @@ public class PeerEgressMeshTests : IDisposable
                 && control.Type == PeerEgressFrame.ControlFlowPurge
                 && control.Destinations.Contains("203.0.113.10/32");
         }));
+    }
+
+    [Fact]
+    public void RouteReconcileSynchronizesExistingRemovedAndReconnectedPeers()
+    {
+        var wiring = NewMesh();
+        PeerEgressRule[] rules = [Rule("203.0.113.0/24", PeerEgressRules.ActionEgress, 2)];
+        _availableEgresses = new Dictionary<long, bool> { [2] = true };
+        wiring.ApplyRules(rules);
+        Assert.True(wiring.HandleOutbound(PacketTo("203.0.113.10")));
+        WaitFor("connected peer sends", () => Frames().Count == 1);
+
+        _availableEgresses = new Dictionary<long, bool>();
+        wiring.ApplyRules(rules);
+        WaitFor("removed peer purged", () => Frames().Count == 2);
+        Assert.True(wiring.HandleOutbound(PacketTo("203.0.113.10")));
+        Assert.Equal(2, Frames().Count);
+
+        _availableEgresses = new Dictionary<long, bool> { [2] = true };
+        wiring.ApplyRules(rules);
+        Assert.True(wiring.HandleOutbound(PacketTo("203.0.113.10")));
+        WaitFor("reconnected peer sends", () => Frames().Count == 3);
     }
 
     /// <summary>Revocation reaches the plane even though the plane never asks the mesh anything.</summary>

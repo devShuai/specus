@@ -21,6 +21,7 @@ routing. Standard library only.
 """
 
 import argparse
+import concurrent.futures
 import datetime
 import hashlib
 import ipaddress
@@ -34,6 +35,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -98,7 +100,7 @@ class Proc:
             return handle.read().decode("utf-8", "replace")
 
     def wait_log(self, pattern, timeout, since=0):
-        regex = re.compile(pattern)
+        regex = re.compile(pattern, re.IGNORECASE)
         found, _ = self.lab.wait_for(f"{self.label} log /{pattern}/",
                                      lambda: regex.search(self.log_since(since)), timeout)
         return found
@@ -155,6 +157,7 @@ class Lab:
         self.report_dir = Path(args.report_dir)
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.trace = open(self.work / "trace.log", "a", encoding="utf-8")
+        self.trace_lock = threading.Lock()
         self.results = []
         self.measurements = {}
         self.snapshots = {}
@@ -175,17 +178,19 @@ class Lab:
     def say(self, text):
         stamp = f"[{time.time() - self.started:7.1f}s]"
         print(stamp, text, flush=True)
-        self.trace.write(f"{stamp} {text}\n")
-        self.trace.flush()
+        with self.trace_lock:
+            self.trace.write(f"{stamp} {text}\n")
+            self.trace.flush()
 
     def sh(self, args, check=True, timeout=60):
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        self.trace.write(f"$ {' '.join(args)} -> {completed.returncode}\n")
-        if completed.stdout.strip():
-            self.trace.write(completed.stdout.rstrip() + "\n")
-        if completed.stderr.strip():
-            self.trace.write("stderr: " + completed.stderr.rstrip() + "\n")
-        self.trace.flush()
+        with self.trace_lock:
+            self.trace.write(f"$ {' '.join(args)} -> {completed.returncode}\n")
+            if completed.stdout.strip():
+                self.trace.write(completed.stdout.rstrip() + "\n")
+            if completed.stderr.strip():
+                self.trace.write("stderr: " + completed.stderr.rstrip() + "\n")
+            self.trace.flush()
         if check and completed.returncode != 0:
             raise RuntimeError(f"{' '.join(args)} failed ({completed.returncode}): {completed.stderr.strip()}")
         return completed
@@ -226,21 +231,18 @@ class Lab:
         if table:
             raise LabAbort("the main routing table is not empty; run inside a fresh namespace "
                            "(`sudo unshare -n -m` or `unshare -rnm`), never on a machine's own table:\n" + table)
-        for binary in (self.args.server, self.args.client):
-            if not os.access(binary, os.X_OK):
+        for binary in (self.args.server, self.client_binary("consumer"), self.client_binary("egress")):
+            if not binary or not os.access(binary, os.X_OK):
                 raise LabAbort(f"{binary} is not executable")
-        # `ip netns add` keeps its handles under /run/netns. The fake root of a user namespace
-        # cannot create that directory on the host's /run, but it can mount a tmpfs over /run in
-        # the private mount namespace this runs in, which is invisible outside it.
-        try:
-            os.makedirs("/run/netns", exist_ok=True)
-            probe = Path("/run/netns/.lab-probe")
-            probe.touch()
-            probe.unlink()
-        except PermissionError:
-            self.sh(["mount", "-t", "tmpfs", "tmpfs", "/run"])
-            os.makedirs("/run/netns", exist_ok=True)
-            self.note("mounted a private tmpfs over /run so that ip netns can keep its handles there")
+        # Mount namespaces isolate mounts, not files: root can otherwise create persistent empty
+        # /run/netns handles in the host filesystem. Always use private storage, not just when
+        # fake root lacks write access. Refuse an invocation missing the mount namespace first.
+        if os.readlink("/proc/self/ns/mnt") == os.readlink("/proc/1/ns/mnt"):
+            raise LabAbort("a private mount namespace is required; use unshare -n -m")
+        self.sh(["mount", "--make-rprivate", "/"])
+        self.sh(["mount", "-t", "tmpfs", "tmpfs", "/run"])
+        os.makedirs("/run/netns", exist_ok=True)
+        self.note("mounted a private tmpfs over /run so that ip netns leaves no host files")
 
     def build_network(self):
         sh = self.sh
@@ -332,7 +334,7 @@ class Lab:
         }
         path = self.work / "server.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        self.start("server", ns("srv", "env", "SPECUS_ENV=test", self.args.server, "-config", str(path)))
+        self.launch_server(path)
         ready, elapsed = self.wait_for("server admin HTTP",
                                        lambda: self.http_alive(f"http://{SERVER_IP}:{ADMIN_PORT}/"), 60)
         if not ready:
@@ -343,6 +345,23 @@ class Lab:
             self.admin.call("POST", "/api/admin/client-credentials",
                             {"apiKey": f"lab-{role}", "secret": self.secrets[role], "maxOnlineInstances": 2})
         self.say(f"server up in {elapsed:.1f}s, credentials created")
+
+    def restart_server(self):
+        """Takes the server away and brings it back on the same config and database.
+
+        The point is the consumer's control connection: every client loses it and reconnects, which
+        is the routine event that used to withdraw the consumer's routes for the length of the
+        reconnect. Doing it this way makes that window happen on purpose rather than waiting for
+        one to turn up.
+        """
+        self.procs["server"].stop()
+        return self.launch_server(self.work / "server.json")
+
+    def launch_server(self, path):
+        self.start("server", ns("srv", "env", "SPECUS_ENV=test", self.args.server, "-config", str(path)))
+        ready, _ = self.wait_for("the server's admin HTTP",
+                                 lambda: self.http_alive(f"http://{SERVER_IP}:{ADMIN_PORT}/"), 60)
+        return bool(ready)
 
     def client_config(self, role, rules=None):
         config = {
@@ -367,9 +386,18 @@ class Lab:
             directory.mkdir(mode=0o700, exist_ok=True)
         return ["env", f"HOME={home}", f"SPECUS_CLI_STATE_DIR={state}"]
 
+    def client_binary(self, role):
+        return getattr(self.args, f"{role}_client", None) or self.args.client
+
+    def client_label(self, role):
+        label = getattr(self.args, f"{role}_implementation", None)
+        if label:
+            return label
+        return "custom" if getattr(self.args, f"{role}_client", None) else "Go"
+
     def start_client(self, role, config_path):
         netns_name = "con" if role == "consumer" else "egr"
-        return self.start(role, ns(netns_name, *self.client_env(role), self.args.client, "run",
+        return self.start(role, ns(netns_name, *self.client_env(role), self.client_binary(role), "run",
                                    "--config", str(config_path), "--no-update-check", "--login-timeout", "60"))
 
     def client_status(self, role, command="egress"):
@@ -377,7 +405,7 @@ class Lab:
         snapshot older than a few seconds is refused."""
         netns_name = "con" if role == "consumer" else "egr"
         for _ in range(6):
-            got = self.sh(ns(netns_name, *self.client_env(role), self.args.client, command,
+            got = self.sh(ns(netns_name, *self.client_env(role), self.client_binary(role), command,
                              "--config", str(self.work / f"{role}.jsonc"), "--json"), check=False)
             if got.returncode == 0:
                 try:
@@ -504,11 +532,6 @@ class Lab:
         self.admin.call("PUT", f"/api/admin/peer-mesh/devices/{self.consumer_id}", {"enabled": True})
         self.say(f"egress clientId={self.egress_id} consumer clientId={self.consumer_id}")
 
-        path = consumer.wait_log(r"Peer Mesh (direct|relay) UDP path active", 90)
-        if not path:
-            raise LabAbort("no peer session between consumer and egress:\n--- consumer\n"
-                           + consumer.log_since()[-3000:] + "\n--- egress\n" + egress.log_since()[-3000:])
-        self.measure("peer path type", path.group(1))
         self.switch(True)
         self.policy([self.consumer_id])
         if not egress.wait_log(r"policy applied enabled=true", 30):
@@ -521,6 +544,11 @@ class Lab:
         if not got:
             raise LabAbort("no request ever went through the egress:\n--- consumer\n" + consumer.log_since()[-3000:]
                            + "\n--- egress\n" + egress.log_since()[-3000:] + "\n--- table\n" + self.consumer_table())
+        # Successful traffic observed at the target is the session gate. Java logs path
+        # selection at DEBUG, so lack of an INFO line is not proof of a failed session.
+        path = re.search(r"Peer Mesh (direct|relay) UDP path active",
+                         consumer.log_since() + egress.log_since(), re.IGNORECASE)
+        self.measure("peer path type", path.group(1).lower() if path else "unreported")
         self.measure("bring-up, consumer start to first request through the egress",
                      round(time.time() - consumer_started, 1), "s")
 
@@ -601,22 +629,18 @@ class Lab:
         self.downstream_ceiling()
 
     def downstream_ceiling(self):
-        """How large a response the egress can actually deliver.
-
-        The egress reads from the target as fast as the target will serve and sends it on without
-        looking at what the consumer advertised, so a response only survives while it fits in what
-        the receiver can hold. Past that the consumer's kernel drops what it cannot take, the
-        egress's stack retransmits the same segments into the same full window until it runs out of
-        attempts, and the application gets a reset minutes later. This measures where that starts
-        rather than asserting it away.
-        """
+        """Probe response sizes beyond the old receiver-buffer ceiling; every size must pass."""
         largest = None
         first_failure = None
         for size in self.args.ceiling_sizes:
             got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=self.args.ceiling_timeout)
             received = got["body"].stat().st_size if got["body"].exists() else 0
-            got["body"].unlink(missing_ok=True)
             complete = got["code"] == CURL_OK and received == size
+            if complete:
+                with open(got["body"], "rb") as handle:
+                    complete = hashlib.file_digest(handle, "sha256").hexdigest() == blob_sha256(size)
+            got["body"].unlink(missing_ok=True)
+            self.check(f"large response {size} B arrives intact", complete, self.describe(got))
             self.say(f"downstream ceiling probe: {size} B -> received {received} B, {self.describe(got)}")
             if complete:
                 largest = size
@@ -630,13 +654,38 @@ class Lab:
             self.measure("first response size the egress failed to deliver", size, "B")
             self.measure("of which the application received", received, "B")
             self.note(f"a {size} B response through the egress did not arrive: the application got "
-                      f"{received} B and then {self.describe(got)}. The egress does not pace itself "
-                      f"against what the consumer advertises, so a response larger than the "
-                      f"receiver's buffer stalls and is reset instead of slowing down. This is the "
-                      f"known missing send-side flow control, measured rather than assumed.")
+                      f"{received} B and then {self.describe(got)}; investigate the send-window "
+                      f"regression rather than treating this as an acceptable performance ceiling.")
         else:
             self.note(f"every probed response up to {self.args.ceiling_sizes[-1]} B arrived, which is "
                       f"more than this lab could deliver when it was written")
+
+    def concurrent_downloads(self):
+        count, size = self.args.concurrent_flows, self.args.concurrent_bytes
+        if count == 0:
+            return
+        mark = self.target_mark()
+        started = time.monotonic()
+        # Each curl owns a distinct output file. Only the main thread records checks/metrics.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+            futures = [pool.submit(self.curl, f"{TARGET_URL}/blob/{size}", timeout=90)
+                       for _ in range(count)]
+            results = [future.result() for future in futures]
+        elapsed = time.monotonic() - started
+        passed = 0
+        expected = blob_sha256(size)
+        for got in results:
+            complete = got["code"] == CURL_OK and got["body"].exists() and got["body"].stat().st_size == size
+            if complete:
+                with open(got["body"], "rb") as handle:
+                    complete = hashlib.file_digest(handle, "sha256").hexdigest() == expected
+            passed += int(complete)
+            got["body"].unlink(missing_ok=True)
+        self.check(f"{count} concurrent downloads of {self.human(size)} arrive intact",
+                   passed == count, f"{passed}/{count} SHA-256 matched in {elapsed:.2f}s")
+        if passed == count:
+            self.measure("concurrent downstream aggregate", round(count * size / elapsed / 1048576, 2), "MiB/s")
+        self.leak_check("concurrent downloads: no local leak", mark)
 
     def transfer(self, name, url, size, timeout, record_only=False):
         got = self.curl(f"{url}/blob/{size}", timeout=timeout)
@@ -695,14 +744,17 @@ class Lab:
             return
         self.netem = True
         try:
-            # Recorded, not asserted. What the user-space stack does on a lossy link is the thing
-            # issue #56 asks to be shown with numbers rather than described, and with a fixed window
-            # and no congestion control the honest number may well be a transfer that never lands.
+            # Loss recovery is a correctness gate, not only a throughput measurement (#74).
             size = self.args.lossy_blob_bytes
             label = self.human(size)
             got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=self.args.lossy_timeout)
             received = got["body"].stat().st_size if got["body"].exists() else 0
             complete = got["code"] == CURL_OK and received == size
+            if complete:
+                with open(got["body"], "rb") as handle:
+                    complete = hashlib.file_digest(handle, "sha256").hexdigest() == blob_sha256(size)
+            self.check(f"download with {percent}% loss each way: {label} arrives intact",
+                       complete, self.describe(got))
             if complete and got.get("total"):
                 self.measure(f"download via egress with {percent}% loss each way, {label}",
                              round(size / got["total"] / 1048576, 3), "MiB/s")
@@ -713,9 +765,7 @@ class Lab:
                              received, "B")
                 self.note(f"with {percent}% loss each way a {label} response did not arrive: the "
                           f"application got {received} B in {self.args.lossy_timeout}s and then "
-                          f"{self.describe(got)}. Loss is recovered only by the retransmission timer, "
-                          f"so the same missing send-side pacing that caps a clean link stops a lossy "
-                          f"one outright.")
+                          f"{self.describe(got)}; the loss-recovery correctness gate failed.")
             got["body"].unlink(missing_ok=True)
         finally:
             self.sh(["tc", "qdisc", "del", "dev", "r-egr", "root"], check=False)
@@ -733,7 +783,7 @@ class Lab:
                                lambda: (lambda r: r if r["code"] != CURL_OK else None)(self.whoami(TARGET_URL)), 20, 1.0)
         self.check("ACL revoked: a new flow under the rule fails", bool(got),
                    self.describe(got) if got else "requests kept succeeding")
-        reject = consumer.wait_log(rf"refused {re.escape(TARGET_IP)}:80 code=(EGRESS_[A-Z_]+)", 10, offset)
+        reject = consumer.wait_log(r"refused flow code=(EGRESS_[A-Z_]+)", 10, offset)
         self.check("ACL revoked: the consumer receives flow-reject", bool(reject),
                    f"consumer log: {reject.group(0)}" if reject else "no refusal logged by the consumer")
         self.leak_check("ACL revoked: nothing leaked to the target from the consumer's address", mark)
@@ -775,6 +825,9 @@ class Lab:
                        "the stream was still running 35s after the switch went off")
         applied = egress.wait_log(r"policy applied enabled=false", 15, offset)
         self.check("switch off: the egress applied the disabled policy", bool(applied))
+        released = egress.wait_log(r"flows released count=([1-9][0-9]*) active=0", 5, offset)
+        self.check("switch off: the egress released its established flows", bool(released),
+                   released.group(0) if released else "no completed drain logged")
         got = self.whoami(TARGET_URL)
         self.check("switch off: a new flow under the rule fails", got["code"] != CURL_OK, self.describe(got))
         self.leak_check("switch off: nothing leaked to the target from the consumer's address", mark)
@@ -823,6 +876,52 @@ class Lab:
         self.check("egress restarted: flows go through the egress again", bool(got))
         if got:
             self.measure("egress restart to first flow through it again", round(time.time() - restarted_at, 1), "s")
+
+    def fault_server_restart(self):
+        """The control connection going away must not hand the claimed destinations back to the
+        machine's own default route.
+
+        Restarting the server drops every client's control connection at a moment this can watch,
+        instead of waiting for a blip. While it is down the consumer cannot signal, but the routes
+        it installed are still the truth about where that traffic goes: into the tunnel, to be
+        carried or refused. Out of the physical interface is the one answer that is never right.
+        """
+        mark = self.target_mark()
+        consumer = self.procs["consumer"]
+        offset = consumer.log_offset()
+        self.procs["server"].stop()
+        dropped = consumer.wait_log(r"control connection closed|Control channel session ended|control连接断开", 30, offset)
+        self.check("server gone: the consumer notices its control connection is gone", bool(dropped),
+                   dropped.group(0) if dropped else "the consumer never logged a lost connection")
+
+        table = self.consumer_table()
+        self.snapshots["while the control connection was down"] = table
+        held = f"{RULE_CIDR} dev {CONSUMER_TUN}" in table
+        self.check("server gone: the rule's route stays installed while the connection is down",
+                   held, "\n".join(self.lab_routes(table)) or "nothing is installed")
+
+        outcomes = []
+        for _ in range(4):
+            got = self.whoami(TARGET_URL)
+            outcomes.append((got["code"], got.get("src")))
+        direct = [source for _, source in outcomes if source == CONSUMER_IP]
+        self.check("server gone: no request under the rule leaves from the consumer's own address",
+                   not direct, f"{len(direct)} of {len(outcomes)} probes came from the consumer itself")
+        self.leak_check("server gone: nothing leaked to the target from the consumer's address", mark)
+
+        offset = consumer.log_offset()
+        if not self.launch_server(self.work / "server.json"):
+            raise LabAbort("the server did not come back:\n" + self.procs["server"].log_since()[-3000:])
+        back = consumer.wait_log(r"control connection established|Connected to .*\(awaiting login response\)", 90, offset)
+        self.check("server back: the consumer reconnects", bool(back))
+        self.check("server back: flows go through the egress again", bool(self.wait_ready()))
+        # Whatever the reconnect did to the table, what it ends with is what matters.
+        table = self.consumer_table()
+        self.snapshots["after the control connection came back"] = table
+        self.check("server back: the rule's route and the bypass are both in place",
+                   f"{RULE_CIDR} dev {CONSUMER_TUN}" in table
+                   and any(line.startswith(f"{SERVER_IP} via {CONSUMER_GW}") for line in table.splitlines()),
+                   "\n".join(self.lab_routes(table)))
 
     def fault_rule_block(self):
         consumer = self.procs["consumer"]
@@ -887,7 +986,8 @@ class Lab:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         netem = {None: "the lossy step was not reached", True: "netem available", False: "netem unavailable"}[self.netem]
         lines = ["# Peer egress Linux lab", "",
-                 f"Run {now} on kernel {kernel}; Go consumer and Go egress against the Go server; {netem}.", "",
+                 f"Run {now} on kernel {kernel}; {self.client_label('consumer')} consumer and "
+                 f"{self.client_label('egress')} egress against the Go server; {netem}.", "",
                  "Topology: the router namespace bridges the server (203.0.113.2) and the target (203.0.113.10 under "
                  "the rule, 198.51.100.10 under none); the consumer (10.90.1.2) and the egress (10.90.2.2) sit "
                  "behind it on their own links. Nothing is NATed. The rule sends 203.0.113.0/24 through the egress.",
@@ -929,12 +1029,16 @@ class Lab:
             self.start_server()
             self.bring_up()
             self.acceptance()
+            self.concurrent_downloads()
             if not self.args.skip_lossy:
                 self.lossy()
             if not self.args.skip_faults:
                 self.fault_acl_revoked()
-                self.fault_switch_off()
+                for attempt in range(self.args.switch_off_repetitions):
+                    self.say(f"switch-off regression round {attempt + 1}/{self.args.switch_off_repetitions}")
+                    self.fault_switch_off()
                 self.fault_egress_stopped()
+                self.fault_server_restart()
                 self.fault_rule_block()
                 self.fault_kill_9()
         except LabAbort as error:
@@ -954,25 +1058,32 @@ class Lab:
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--server", required=True, help="specus-server binary (Go)")
-    parser.add_argument("--client", required=True, help="specus-client binary (Go)")
+    parser.add_argument("--client", help="default Go specus-client binary for both roles")
+    parser.add_argument("--consumer-client", help="consumer executable or exec wrapper; overrides --client")
+    parser.add_argument("--egress-client", help="egress executable or exec wrapper; overrides --client")
+    parser.add_argument("--consumer-implementation", choices=["Go", "Java", ".NET"], help="report label")
+    parser.add_argument("--egress-implementation", choices=["Go", "Java", ".NET"], help="report label")
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--work", help="working directory; a fresh temporary one by default")
-    # Sized clear of the ceiling the egress can currently deliver, which downstream_ceiling
-    # measures and the report states. That ceiling moves with the receiver's socket buffer, and a
-    # size sitting on it makes this check flap: one CI run had 256 KiB pass the ceiling probe and
-    # fail this check minutes apart. 64 KiB is still fifty-odd segments at this MTU, which is what
-    # the intact-arrival check is there to exercise, and it survives the lossy link too.
-    parser.add_argument("--blob-bytes", type=int, default=64 * 1024)
+    # Well beyond the old sub-MiB failure ceiling; a small smoke download would miss regression.
+    parser.add_argument("--blob-bytes", type=int, default=8 * 1048576)
     parser.add_argument("--upload-bytes", type=int, default=8 * 1048576)
-    parser.add_argument("--lossy-blob-bytes", type=int, default=64 * 1024)
+    parser.add_argument("--concurrent-flows", type=int, choices=range(0, 65), default=16,
+                        help="parallel downstream integrity probes (0 disables, max 64)")
+    parser.add_argument("--concurrent-bytes", type=int, default=1048576)
+    parser.add_argument("--lossy-blob-bytes", type=int, default=512 * 1024)
     parser.add_argument("--lossy-timeout", type=int, default=60)
     parser.add_argument("--ceiling-sizes", type=int, nargs="+",
-                        default=[128 * 1024, 256 * 1024, 512 * 1024, 1048576])
+                        default=[512 * 1024, 1048576, 8 * 1048576])
     parser.add_argument("--ceiling-timeout", type=int, default=20)
     parser.add_argument("--loss-percent", type=float, default=2.0)
     parser.add_argument("--skip-lossy", action="store_true")
     parser.add_argument("--skip-faults", action="store_true")
+    parser.add_argument("--switch-off-repetitions", type=int, choices=range(1, 21), default=1,
+                        help="repeat established-flow revocation (1-20 rounds)")
     args = parser.parse_args()
+    if not args.client and not (args.consumer_client and args.egress_client):
+        parser.error("provide --client or both --consumer-client and --egress-client")
     return Lab(args).run()
 
 

@@ -1,6 +1,9 @@
 package client
 
-import "encoding/hex"
+import (
+	"encoding/hex"
+	"strings"
+)
 
 // The scenarios behind peer-egress-tcp-v1.json.
 //
@@ -48,6 +51,38 @@ type tcpScenario struct {
 
 func tcpVectorScenarios() []tcpScenario {
 	return []tcpScenario{
+		{
+			Name:        "send-window-and-deferred-fin",
+			Description: "小窗口只发允许的字节，ACK 释放待发数据，FIN 不越过数据或窗口",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "segment", Seq: 1001, Ack: 5001, Flags: []string{"ACK"}, Window: 3},
+				{Do: "appData", DataHex: hexOf("abcdef")}, {Do: "appClose"},
+				{Do: "segment", Seq: 1001, Ack: 5004, Flags: []string{"ACK"}, Window: 3},
+				{Do: "segment", Seq: 1001, Ack: 5007, Flags: []string{"ACK"}, Window: 3}},
+		},
+		{
+			Name:        "zero-window-probe-and-reopen",
+			Description: "零窗口暂停数据，定时发送单字节探测，窗口恢复后继续",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "segment", Seq: 1001, Ack: 5001, Flags: []string{"ACK"}, Window: 0},
+				{Do: "appData", DataHex: hexOf("abc")},
+				{Do: "tick"}, {Do: "tick", AdvanceMs: 1000}, {Do: "tick", AdvanceMs: 1000},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK"}, Window: 3}},
+		},
+		{
+			Name:        "bounded-flight-partial-ack-and-shrink",
+			Description: "飞行字节受 4 MSS 上限约束；部分 ACK 裁剪重传，缩窗后只重传最早字节",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "appData", DataHex: hexOf(strings.Repeat("x", 6000))},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK"}, Window: 1},
+				{Do: "tick", AdvanceMs: 1000}},
+		},
+		{
+			Name:        "banner-before-handshake",
+			Description: "目标握手完成前发送的欢迎消息必须暂存，不能丢弃或提前发送",
+			Steps: []tcpVectorStep{synStep(), {Do: "appData", DataHex: hexOf("hello")},
+				{Do: "appClose"}, handshakeAckStep()},
+		},
 		{
 			Name:        "handshake-data-and-orderly-close",
 			Description: "三次握手、双向各一段数据、消费端先关，走到 LAST_ACK 后结束",

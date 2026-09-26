@@ -8,9 +8,9 @@ import java.util.List;
 /**
  * User-space TCP termination for the egress side.
  *
- * <p>A pure state machine: it performs no I/O and reads no clock. Segments and time come in as
- * arguments, and everything it wants to happen comes back in {@link Output} for the caller to
- * perform. Two reasons that shape matters. The conformance suite can drive loss, reordering and
+ * <p>Owns no sockets and reads no clock. Effects come back in {@link Output}, or through an
+ * optional nonblocking queue-admission callback that must not do network I/O or take a mesh lock.
+ * Rejection leaves data unsent. The conformance suite can drive loss, reordering and
  * timers deterministically without a network. And the same scenarios run against Go and .NET, where
  * the I/O and scheduling primitives are different but the protocol decisions must not be.
  *
@@ -33,15 +33,15 @@ final class PeerEgressTcpConnection {
     }
 
     /**
-     * The window we advertise. Phase one runs a conservative fixed window rather than a full
-     * congestion controller; the ceiling plus the existing RTT and path-MTU observations are what
-     * bound throughput.
+     * Our advertised receive window, not the downstream send credit. Downstream sends obey the
+     * peer window and a conservative four-MSS flight limit, not adaptive congestion control.
      *
      * <p>65535 and not 64 KiB: the header field is sixteen bits and there is no window scaling in
      * this version, so a 65536 would go on the wire as a zero window and tell every consumer to
      * stop sending.
      */
     static final int RECEIVE_WINDOW = 65535;
+    static final int SEND_BUFFER = 65536;
 
     static final long INITIAL_RTO_MS = 1000;
     static final long MIN_RTO_MS = 200;
@@ -125,6 +125,13 @@ final class PeerEgressTcpConnection {
     private int sndUna;
     private int sndNxt;
     private int sndWnd;
+    private int sndWl1;
+    private int sndWl2;
+    private byte[] pending = new byte[0];
+    // Nonblocking transport admission; null keeps the deterministic output-only model.
+    java.util.function.Predicate<byte[]> tryTransmit;
+    boolean sendBlocked;
+    private long persistAtMs = -1;
 
     private final int irs;
     private int rcvNxt;
@@ -162,6 +169,7 @@ final class PeerEgressTcpConnection {
         this.sndUna = iss;
         this.sndNxt = iss;
         this.sndWnd = syn.window();
+        this.sndWl1 = syn.seq();
         this.irs = syn.seq();
         this.rcvNxt = syn.seq() + 1;
         this.rcvWnd = RECEIVE_WINDOW;
@@ -206,16 +214,26 @@ final class PeerEgressTcpConnection {
     }
 
     /** Renders one segment, queues it for retransmission when it occupies sequence space, and advances SND.NXT. */
-    private void emit(Output output, int flags, byte[] payload, long nowMs, int mss) {
+    private boolean transmit(Output output, byte[] packet) {
+        if (tryTransmit != null) {
+            boolean accepted = tryTransmit.test(packet);
+            sendBlocked = !accepted;
+            return accepted;
+        }
+        output.send(packet);
+        return true;
+    }
+
+    private boolean emit(Output output, int flags, byte[] payload, long nowMs, int mss) {
         Segment segment = new Segment(
                 localIp, remoteIp, localPort, remotePort,
                 sndNxt, rcvNxt, flags,
                 PeerEgressSegment.advertisedWindow(rcvWnd), mss, payload);
-        output.send(PeerEgressSegment.build(segment));
+        if (!transmit(output, PeerEgressSegment.build(segment))) { return false; }
 
         int length = segment.segmentLength();
         if (length == 0) {
-            return;
+            return true;
         }
         RetransmitEntry entry = new RetransmitEntry();
         entry.seq = sndNxt;
@@ -228,6 +246,7 @@ final class PeerEgressTcpConnection {
             finSent = true;
         }
         sndNxt += length;
+        return true;
     }
 
     private void ack(Output output, long nowMs) {
@@ -247,6 +266,7 @@ final class PeerEgressTcpConnection {
                 sndNxt, 0, PeerEgressSegment.FLAG_RST, 0, 0, new byte[0])));
         state = State.CLOSED;
         retransmit.clear();
+        pending = new byte[0];
         reassembly.clear();
         output.done = true;
         output.reset = true;
@@ -275,6 +295,7 @@ final class PeerEgressTcpConnection {
                     || segment.seq() == rcvNxt) {
                 state = State.CLOSED;
                 retransmit.clear();
+                pending = new byte[0];
                 reassembly.clear();
                 output.done = true;
                 output.reset = true;
@@ -298,21 +319,13 @@ final class PeerEgressTcpConnection {
         }
 
         if (state == State.SYN_RECEIVED) {
-            if (!segment.has(PeerEgressSegment.FLAG_ACK)) {
+            if (!segment.has(PeerEgressSegment.FLAG_ACK) || sndUna != iss + 1) {
                 // A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
                 return output;
             }
             state = State.ESTABLISHED;
-            if (appClosed) {
-                // The real socket ended while the handshake was still in flight. The FIN could not
-                // be sent then without running ahead of the sequence space, so it is owed now.
-                // Without this the flow sits open until the idle timer collects it, and the
-                // consumer waits on a connection that is already over.
-                emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
-                        new byte[0], nowMs, 0);
-                state = State.FIN_WAIT_1;
-            }
         }
+        flushSend(output, nowMs);
 
         // RFC 1122: a keepalive probe re-sends one byte of already acknowledged sequence space to
         // force an acknowledgement. Without answering it, a healthy flow looks dead to the consumer
@@ -340,7 +353,13 @@ final class PeerEgressTcpConnection {
             return;
         }
         sndUna = ack;
-        sndWnd = segment.window();
+        if (PeerEgressSegment.seqLess(sndWl1, segment.seq())
+                || (sndWl1 == segment.seq() && PeerEgressSegment.seqLessEqual(sndWl2, ack))) {
+            sndWnd = segment.window();
+            sndWl1 = segment.seq();
+            sndWl2 = ack;
+            if (sndWnd > 0) { persistAtMs = -1; }
+        }
 
         List<RetransmitEntry> kept = new ArrayList<>(retransmit.size());
         for (RetransmitEntry entry : retransmit) {
@@ -350,6 +369,11 @@ final class PeerEgressTcpConnection {
                     updateRto(nowMs - entry.sentAtMs);
                 }
                 continue;
+            }
+            if (PeerEgressSegment.seqLess(entry.seq, sndUna) && entry.payload.length > 0) {
+                int skip = Math.min(sndUna - entry.seq, entry.payload.length);
+                entry.payload = Arrays.copyOfRange(entry.payload, skip, entry.payload.length);
+                entry.seq += skip;
             }
             kept.add(entry);
         }
@@ -518,18 +542,39 @@ final class PeerEgressTcpConnection {
     /** Data read from the real socket, on its way to the consumer. */
     Output onAppData(byte[] data, long nowMs) {
         Output output = new Output();
-        if (state != State.ESTABLISHED && state != State.CLOSE_WAIT) {
+        if (appClosed || (state != State.SYN_RECEIVED && state != State.ESTABLISHED && state != State.CLOSE_WAIT)) {
             return output;
         }
+        if (data.length > appReadCredit()) { reset(output); return output; }
         lastActivityMs = nowMs;
-        int offset = 0;
-        while (offset < data.length) {
-            int size = Math.min(sndMss, data.length - offset);
-            byte[] chunk = Arrays.copyOfRange(data, offset, offset + size);
-            emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH, chunk, nowMs, 0);
-            offset += size;
-        }
+        int previous = pending.length;
+        pending = Arrays.copyOf(pending, previous + data.length);
+        System.arraycopy(data, 0, pending, previous, data.length);
+        flushSend(output, nowMs);
         return output;
+    }
+
+    /** Both unsent and unacknowledged bytes consume credit; socket readers wait for ACKs. */
+    int appReadCredit() {
+        if (appClosed || (state != State.SYN_RECEIVED && state != State.ESTABLISHED && state != State.CLOSE_WAIT)) { return 0; }
+        return Math.max(0, SEND_BUFFER - pending.length - (sndNxt - sndUna));
+    }
+
+    private int sendCredit() { return Math.max(0, Math.min(sndWnd, 4 * sndMss) - (sndNxt - sndUna)); }
+
+    private void flushSend(Output output, long nowMs) {
+        if (state != State.ESTABLISHED && state != State.CLOSE_WAIT) { return; }
+        while (pending.length > 0 && sendCredit() > 0) {
+            int n = Math.min(pending.length, Math.min(sndMss, sendCredit()));
+            if (!emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
+                    Arrays.copyOf(pending, n), nowMs, 0)) { return; }
+            pending = Arrays.copyOfRange(pending, n, pending.length);
+        }
+        if (appClosed && pending.length == 0 && sendCredit() > 0 && !finSent) {
+            if (!emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
+                    new byte[0], nowMs, 0)) { return; }
+            state = state == State.CLOSE_WAIT ? State.LAST_ACK : State.FIN_WAIT_1;
+        }
     }
 
     /** The real socket reached EOF. */
@@ -540,25 +585,7 @@ final class PeerEgressTcpConnection {
         }
         appClosed = true;
         lastActivityMs = nowMs;
-        switch (state) {
-            case ESTABLISHED -> {
-                emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
-                        new byte[0], nowMs, 0);
-                state = State.FIN_WAIT_1;
-            }
-            case CLOSE_WAIT -> {
-                emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
-                        new byte[0], nowMs, 0);
-                state = State.LAST_ACK;
-            }
-            case SYN_RECEIVED -> {
-                // Nothing to send yet: a FIN here would sit beyond a sequence space the consumer
-                // has not acknowledged. appClosed is already set, and onSegment sends the FIN the
-                // moment the handshake completes.
-            }
-            default -> {
-            }
-        }
+        flushSend(output, nowMs);
         return output;
     }
 
@@ -592,11 +619,37 @@ final class PeerEgressTcpConnection {
             reset(output);
             return output;
         }
-        if (keepalive(nowMs, output)) {
+        flushSend(output, nowMs);
+        if (sndWnd == 0 && state != State.SYN_RECEIVED
+                && (pending.length > 0 || !retransmit.isEmpty() || appClosed)) {
+            if (persistAtMs < 0) { persistAtMs = nowMs; return output; }
+            if (nowMs - persistAtMs < rtoMs) { return output; }
+            persistAtMs = nowMs;
+            if (retransmit.isEmpty() && pending.length > 0) {
+                if (emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
+                        Arrays.copyOf(pending, 1), nowMs, 0)) {
+                    pending = Arrays.copyOfRange(pending, 1, pending.length);
+                }
+            } else {
+                int seq = sndNxt - 1;
+                byte[] payload = new byte[0];
+                if (!retransmit.isEmpty() && retransmit.get(0).payload.length > 0) {
+                    RetransmitEntry entry = retransmit.get(0);
+                    entry.retransmitted = true;
+                    seq = entry.seq;
+                    payload = Arrays.copyOf(entry.payload, 1);
+                }
+                transmit(output, PeerEgressSegment.build(new Segment(localIp, remoteIp, localPort, remotePort,
+                        seq, rcvNxt, PeerEgressSegment.FLAG_ACK, PeerEgressSegment.advertisedWindow(rcvWnd), 0, payload)));
+            }
+            return output;
+        }
+        if (retransmit.isEmpty() && pending.length == 0 && keepalive(nowMs, output)) {
             return output;
         }
 
-        for (RetransmitEntry entry : retransmit) {
+        for (int index = 0; index < Math.min(1, retransmit.size()); index++) {
+            RetransmitEntry entry = retransmit.get(index);
             if (nowMs - entry.sentAtMs < rtoMs) {
                 continue;
             }
@@ -604,15 +657,17 @@ final class PeerEgressTcpConnection {
                 reset(output);
                 return output;
             }
+            if (!transmit(output, PeerEgressSegment.build(new Segment(
+                    localIp, remoteIp, localPort, remotePort,
+                    entry.seq, rcvNxt, entry.flags,
+                    PeerEgressSegment.advertisedWindow(rcvWnd), 0, state == State.SYN_RECEIVED ? entry.payload
+                            : Arrays.copyOf(entry.payload, Math.min(entry.payload.length, sndWnd)))))) {
+                return output;
+            }
             entry.attempts++;
             entry.retransmitted = true;
             entry.sentAtMs = nowMs;
-            output.send(PeerEgressSegment.build(new Segment(
-                    localIp, remoteIp, localPort, remotePort,
-                    entry.seq, rcvNxt, entry.flags,
-                    PeerEgressSegment.advertisedWindow(rcvWnd), 0, entry.payload)));
-            // Exponential backoff, capped. Doing this per entry keeps one lost segment from
-            // resetting the estimator for the whole flow.
+            // Back off the connection's RTO once per oldest-segment timeout, capped.
             rtoMs = Math.min(rtoMs * 2, MAX_RTO_MS);
         }
         return output;

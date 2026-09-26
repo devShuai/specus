@@ -75,6 +75,8 @@ func TestClassifyControlLoginFailureMatchesJava(t *testing.T) {
 		want   controlLoginAction
 	}{
 		{name: "token expired", reason: "客户端访问令牌已过期", want: controlLoginRefreshImmediately},
+		{name: "token lost after restart", reason: "客户端访问令牌无效", want: controlLoginRefreshImmediately},
+		{name: "data raced control reconnect", reason: "数据连接要求控制连接先登录", want: controlLoginBackoff},
 		{name: "busy", reason: "服务器繁忙，请稍后再试", want: controlLoginBackoff},
 		{name: "rate limited", reason: "连接频率超过限制", want: controlLoginBackoff},
 		{name: "blank", reason: "", want: controlLoginStop},

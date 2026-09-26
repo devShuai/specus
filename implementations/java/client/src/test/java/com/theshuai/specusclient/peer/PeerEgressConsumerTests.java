@@ -307,8 +307,7 @@ class PeerEgressConsumerTests {
     }
 
     /**
-     * A flow-reject is diagnostic, but it does tell the consumer this flow is over, so the entry
-     * goes rather than lingering until something else clears it.
+     * A rejection removes the matching flow rather than leaving it to expire.
      */
     @Test
     void dropsAFlowTheEgressRejected() {
@@ -322,6 +321,34 @@ class PeerEgressConsumerTests {
 
         assertEquals(0, consumer.flowCount(), "a flow survived a flow-reject");
         assertEquals(1L, consumer.blockedCounts().get("rejected-egress_port_denied"));
+    }
+
+    @Test
+    void rejectionResetsOnlyTheSendingEgressFlowEvenWithoutRemoteReset() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true, 3L, true));
+        consumer.handleOutbound(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                address(VIRTUAL_IP), address("203.0.113.10"), 40000, 443,
+                1001, 700001, PeerEgressSegment.FLAG_ACK, 65535, 0,
+                "hello".getBytes(StandardCharsets.US_ASCII))), EPOCH);
+        byte[] frame = PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
+                        "tcp", VIRTUAL_IP, 40000, "203.0.113.10", 443, PeerEgressCodes.DISABLED)));
+        consumer.handleInbound(frame, 3, EPOCH);
+        assertEquals(1, consumer.flowCount());
+        assertTrue(toTun.isEmpty());
+        assertTrue(consumer.blockedCounts().isEmpty());
+        consumer.handleInbound(frame, 2, EPOCH);
+        assertEquals(0, consumer.flowCount());
+        assertEquals(1, toTun.size());
+        var reset = PeerEgressSegment.parse(toTun.get(0));
+        assertNotNull(reset);
+        assertEquals(PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_ACK, reset.flags());
+        assertEquals(700001, reset.seq());
+        assertEquals(1006, reset.ack());
+        consumer.handleInbound(frame, 2, EPOCH);
+        consumer.handleInbound(PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, toTun.get(0)), 2, EPOCH);
+        assertEquals(1, toTun.size());
+        assertEquals(1L, consumer.blockedCounts().get("rejected-egress_disabled"));
     }
 
     /**
