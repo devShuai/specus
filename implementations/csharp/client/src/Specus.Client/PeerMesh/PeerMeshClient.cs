@@ -299,8 +299,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     var now = DateTimeOffset.UtcNow;
                     return owner._peers.ToDictionary(item => item.Key, item => item.Value.Online
                         && owner._sessions.TryGetValue(item.Key, out var session)
-                        && session.RemoteEndpoint is not null && session.AesKey.Length == 32
-                        && now <= session.ExpiresAt);
+                        && session.CanCarryEgress(now));
                 }
             }
         }
@@ -5233,6 +5232,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             string.Equals(PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
             && LastDirectSuccess != default
             && now - LastDirectSuccess <= TimeSpan.FromSeconds(45);
+
+        public bool CanCarryEgress(DateTimeOffset now) =>
+            AesKey.Length == 32 && now <= ExpiresAt
+            // The sender chooses relay whenever an allocation is nominated. A cached
+            // allocation alone does not prove the peer is still alive after it stops.
+            && (!string.IsNullOrWhiteSpace(RelayTargetAllocationId)
+                ? LastRelaySuccess != default && now - LastRelaySuccess <= TimeSpan.FromSeconds(45)
+                : RemoteEndpoint is not null && HasHealthyDirect(now));
     }
 
     private sealed record PeerMeshPeer(

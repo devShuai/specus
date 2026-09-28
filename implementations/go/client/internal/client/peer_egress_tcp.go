@@ -433,8 +433,13 @@ func tcpEntryLength(entry tcpRetransmitEntry) uint32 {
 // updateRTO is Jacobson/Karels: smooth the round-trip estimate and its variance, then set the
 // timeout well clear of normal jitter so a slow path does not look like loss.
 func (c *tcpConn) updateRTO(sample time.Duration) {
-	if sample <= 0 {
+	if sample < 0 {
 		return
+	}
+	// Keep same-tick clean ACKs as a minimum-resolution sample, matching the
+	// millisecond clocks in Java/.NET instead of retaining stale RTO backoff.
+	if sample < time.Millisecond {
+		sample = time.Millisecond
 	}
 	if c.srtt == 0 {
 		c.srtt = sample

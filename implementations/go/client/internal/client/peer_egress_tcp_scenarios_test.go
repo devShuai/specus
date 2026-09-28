@@ -52,6 +52,19 @@ type tcpScenario struct {
 func tcpVectorScenarios() []tcpScenario {
 	return []tcpScenario{
 		{
+			Name:        "same-tick-clean-ack-collapses-backoff",
+			Description: "同一时钟刻度内的干净 ACK 仍为有效 RTT 样本；恢复丢包退避且不提前重传",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "appData", DataHex: hexOf("a")},
+				{Do: "tick", AdvanceMs: 200},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "appData", DataHex: hexOf("b")},
+				{Do: "segment", Seq: 1001, Ack: 5003, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "appData", DataHex: hexOf("c")},
+				{Do: "tick", AdvanceMs: 199},
+				{Do: "tick", AdvanceMs: 1}},
+		},
+		{
 			Name:        "send-window-and-deferred-fin",
 			Description: "小窗口只发允许的字节，ACK 释放待发数据，FIN 不越过数据或窗口",
 			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),

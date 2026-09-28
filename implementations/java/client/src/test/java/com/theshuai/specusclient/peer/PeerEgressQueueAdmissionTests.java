@@ -46,7 +46,7 @@ class PeerEgressQueueAdmissionTests {
         assertEquals(PeerEgressTcpConnection.State.ESTABLISHED, connection.state());
         assertEquals(1, sent.size());
         assertEquals(5001, sent.get(0).seq());
-        // The zero-time handshake supplies no RTT sample: first accepted retry backs 1 s off to 2 s.
+        // A rejected retry did not consume the budget; another admitted retry remains possible.
         sent.clear();
         connection.onTick(12000);
         assertEquals(1, sent.size());

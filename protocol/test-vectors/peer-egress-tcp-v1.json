@@ -21,6 +21,178 @@
   },
   "cases": [
     {
+      "name": "same-tick-clean-ack-collapses-backoff",
+      "description": "同一时钟刻度内的干净 ACK 仍为有效 RTT 样本；恢复丢包退避且不提前重传",
+      "steps": [
+        {
+          "do": "segment",
+          "seq": 1000,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "mss": 1200,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "SYN",
+                  "ACK"
+                ],
+                "seq": 5000,
+                "ack": 1001,
+                "window": 65535,
+                "mss": 1240
+              }
+            ],
+            "state": "SYN_RECEIVED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "61",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "61"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 200,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "61"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5002,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "62",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "62"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5003,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "63",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5003,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "63"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 199,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 1,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5003,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "63"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        }
+      ]
+    },
+    {
       "name": "send-window-and-deferred-fin",
       "description": "小窗口只发允许的字节，ACK 释放待发数据，FIN 不越过数据或窗口",
       "steps": [

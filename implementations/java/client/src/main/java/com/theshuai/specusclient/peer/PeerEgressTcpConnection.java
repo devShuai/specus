@@ -407,9 +407,12 @@ final class PeerEgressTcpConnection {
 
     /** Jacobson/Karels, with the floor and ceiling the constants name. */
     private void updateRto(long sampleMs) {
-        if (sampleMs <= 0) {
+        if (sampleMs < 0) {
             return;
         }
+        // A clean ACK in the same clock tick is a sub-millisecond RTT, not a missing
+        // sample. Keep one tick so clean traffic can collapse retransmission backoff.
+        sampleMs = Math.max(1, sampleMs);
         if (srttMs == 0) {
             srttMs = sampleMs;
             rttvarMs = sampleMs / 2;

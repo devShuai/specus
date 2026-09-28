@@ -124,8 +124,9 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         }
         if (Ioctl(fd, TunSetIff, ifreq) < 0)
         {
+            var error = Marshal.GetLastPInvokeError();
             _ = Close(fd);
-            throw new InvalidOperationException($"Linux TUN TUNSETIFF failed: errno={Marshal.GetLastPInvokeError()}");
+            throw new InvalidOperationException($"Linux TUN TUNSETIFF failed: errno={error}");
         }
         Name = ReadInterfaceName(ifreq);
         var handle = new SafeFileHandle(new IntPtr(fd), ownsHandle: true);

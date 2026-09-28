@@ -554,6 +554,57 @@ public sealed class PeerMeshCryptoTests
         Assert.Empty(candidates);
     }
 
+    [Theory]
+    [InlineData(true, false, true, false, true, true)]
+    [InlineData(false, true, true, false, true, true)]
+    [InlineData(true, true, true, false, true, true)]
+    [InlineData(false, false, true, false, true, false)]
+    [InlineData(false, true, false, false, true, false)]
+    [InlineData(false, true, true, true, true, false)]
+    [InlineData(false, true, true, false, false, false)]
+    public void EgressAvailabilityAcceptsRelayWithoutDirectEndpoint(
+        bool direct, bool relay, bool online, bool expired, bool validKey, bool expected)
+    {
+        var client = new PeerMeshClient(new SpecusClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var peer = NewNested(typeof(PeerMeshClient), "PeerMeshPeer", 2L, "peer", "100.96.0.2",
+            "public-key", online, false, false, false, false, 0L, null);
+        PrivateField<IDictionary>(client, "_peers").Add(2L, peer);
+        var session = NewPeerMeshSession(1001, 2, "token",
+            new IPEndPoint(IPAddress.Loopback, 51000), relay ? "relay-allocation" : "",
+            relay ? "RELAY" : "DIRECT", DateTimeOffset.UtcNow);
+        if (!direct) { SetProperty(session, "RemoteEndpoint", null); }
+        if (relay) { SetProperty(session, "LastRelaySuccess", DateTimeOffset.UtcNow); }
+        if (expired) { SetProperty(session, "ExpiresAt", DateTimeOffset.UtcNow.AddMinutes(-1)); }
+        if (!validKey) { SetProperty(session, "AesKey", Array.Empty<byte>()); }
+        PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
+        var host = Assert.IsAssignableFrom<IPeerEgressMeshHost>(
+            NewNested(typeof(PeerMeshClient), "EgressHost", client));
+
+        Assert.Equal(expected, host.EgressAvailability[2L]);
+        SetProperty(session, "LastDirectSuccess", DateTimeOffset.UtcNow.AddMinutes(-1));
+        SetProperty(session, "LastRelaySuccess", DateTimeOffset.UtcNow.AddMinutes(-1));
+        Assert.False(host.EgressAvailability[2L]);
+        PrivateField<IDictionary>(client, "_sessions").Clear();
+        Assert.False(host.EgressAvailability[2L]);
+    }
+
+    [Fact]
+    public void EgressAvailabilityUsesTheNominatedPathHealth()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var session = NewPeerMeshSession(1001, 2, "token",
+            new IPEndPoint(IPAddress.Loopback, 51000), "relay-allocation", "DIRECT", now);
+        var canCarry = session.GetType().GetMethod("CanCarryEgress")!;
+        // A healthy direct path cannot validate the relay selected by the actual sender.
+        Assert.False((bool)canCarry.Invoke(session, [now])!);
+        SetProperty(session, "LastRelaySuccess", now);
+        Assert.True((bool)canCarry.Invoke(session, [now])!);
+        SetProperty(session, "LastDirectSuccess", now.AddMinutes(-1));
+        Assert.True((bool)canCarry.Invoke(session, [now])!);
+        SetProperty(session, "RelayTargetAllocationId", "");
+        Assert.False((bool)canCarry.Invoke(session, [now])!);
+    }
+
     private static string InvokeNatType(PeerMeshClient client)
         => (string)typeof(PeerMeshClient)
             .GetMethod("NatType", BindingFlags.Instance | BindingFlags.NonPublic)!

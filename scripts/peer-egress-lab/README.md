@@ -178,3 +178,38 @@ That run explicitly skipped faults and loss; it does not replace a full Java↔.
 
 The server binary needs `implementations/go/server/web/static/` to exist for its embed directive;
 the workflow drops a placeholder there, and so can you.
+
+## RTT and relay follow-up (2026-09-29, Asia/Shanghai)
+
+Go, Java and .NET now retain clean ACK samples that arrive in the same millisecond as the send,
+using a 1 ms minimum sample rather than discarding zero. Discarding these samples could leave
+exponential retransmission backoff in place on a fast path. A new shared TCP vector and focused
+tests check backoff recovery, no early retransmission, and continued exclusion of ambiguous ACKs
+for retransmitted segments (Karn). The existing 200 ms minimum RTO and retry limits are unchanged.
+
+.NET's availability predicate now accepts a nominated relay without a direct endpoint and checks
+the selected path's recent success, key and expiry. A cached relay allocation alone is not proof
+of reachability. This fixes the relay rejection in the predicate, but does not by itself guarantee
+that the consumer's cached availability gets refreshed; the remaining real-network failure below
+is important.
+
+| Client roles / scope | Observed result |
+| --- | --- |
+| Go → Java, full default checks and three revocation rounds | 54 passed, 0 failed; lossy 512 KiB in 2.5 s |
+| Go → Java, additional transfer-only runs (faults skipped, loss retained) | Repeated passes; independently retained reports include 12/12 with lossy transfer in 1.7 s and 12/12 in 1.8 s |
+| .NET → Go, two full default runs and three revocation rounds each | Each 53 passed, 1 failed: offline fast refusal still timed out; egress restart recovered in 1.0 s in both runs |
+| .NET → Go, one revocation round, loss skipped | 39 passed, 2 failed: server-restart flow recovery and route restoration; offline refusal passed in 7.1 s and egress restart recovered in 5.1 s |
+
+All these runs used the Go server, real Linux TUN in isolated WSL network/mount namespaces,
+8 MiB upload/download and 16 concurrent 1 MiB SHA-256 checks. The .NET failures are not waived:
+an additional full-run offline-failure snapshot still showed `online=true` more than 90 seconds
+after the egress stopped, despite the selected-path health predicate. The failed server-restart
+run logged `TUNSETIFF` failure on TUN recreation; its errno had been overwritten by closing the
+descriptor, so that diagnostic now preserves the original ioctl error. That diagnostic change
+does not fix the TUN lifecycle failure. No local-source leak was observed in these runs.
+
+The harness saves consumer status on offline-refusal failure before restarting the egress.
+Unit validation passed: all Go client packages, 154 Java `PeerEgress*Tests`, 200 .NET
+egress/mesh-crypto tests, and five harness tests. This is not the full .NET suite (#77 remains
+separate), a completed repeated-reliability matrix, or Windows/macOS real-TUN acceptance.
+#50/#74 remain open; Java/.NET server combinations and the remaining .NET failures still need work.

@@ -442,10 +442,13 @@ internal sealed class PeerEgressTcpConnection
     /// <summary>Jacobson/Karels, with the floor and ceiling the constants name.</summary>
     private void UpdateRto(long sampleMs)
     {
-        if (sampleMs <= 0)
+        if (sampleMs < 0)
         {
             return;
         }
+        // Same-clock-tick clean ACKs are valid sub-ms samples. Dropping all of them
+        // can leave a low-latency connection stuck at an exponentially backed-off RTO.
+        sampleMs = Math.Max(1, sampleMs);
         if (_srttMs == 0)
         {
             _srttMs = sampleMs;

@@ -865,6 +865,11 @@ class Lab:
         if fast:
             self.measure("egress process gone to refused-at-once", round(elapsed, 1), "s")
         self.leak_check("egress stopped: nothing leaked to the target from the consumer's address", mark)
+        if not fast:
+            status = self.client_status("consumer")
+            if status:
+                self.snapshots["consumer status after offline refusal timed out"] = json.dumps(
+                    status.get("data", status), indent=2)
 
         restarted_at = time.time()
         egress = self.start_client("egress", self.work / "egress.jsonc")
