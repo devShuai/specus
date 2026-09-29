@@ -872,6 +872,34 @@ class Lab:
         got["body"].unlink(missing_ok=True)
         return ok, got
 
+    STALL_SECONDS = 15
+
+    def watched_download(self, size, timeout, label):
+        """verified_download, and if it is still running after STALL_SECONDS, a record of where it
+        waits taken while it waits: both ends' TCP state and what the consumer says about its egress.
+
+        A lossy download once stopped 688 bytes short of the end and waited out curl's timeout, and
+        nothing afterwards could say which side still held those bytes."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.verified_download, size, timeout)
+            try:
+                return pending.result(timeout=self.STALL_SECONDS)
+            except concurrent.futures.TimeoutError:
+                pass
+            lines = [f"{label} still running after {self.STALL_SECONDS} s:"]
+            for name in ("con", "egr", "tgt"):
+                sockets = self.sh(ns(name, "ss", "-tin"), check=False, quiet=True).stdout.strip()
+                lines.append(f"[{name}] ss -tin\n{sockets or '(nothing)'}")
+            status = self.client_status("consumer")
+            consumer = [((instance.get("egress") or {}).get("consumer") or {})
+                        for instance in (status or {}).get("data", {}).get("instances", [])]
+            lines.append("consumer egress status: " + json.dumps(
+                [{key: section.get(key) for key in ("flows", "blocked", "peers")} for section in consumer]))
+            self.snapshots[f"{label}, stalled"] = "\n".join(lines)
+            self.note(f"{label} was still running after {self.STALL_SECONDS} s; the snapshot '{label}, stalled' "
+                      "records both ends while it waited")
+            return pending.result()
+
     def verified_upload(self, size, timeout):
         payload = self.work / f"upload-{size}.bin"
         if not payload.exists():
@@ -962,8 +990,8 @@ class Lab:
                 self.check(title, False, "netem is not available, so the gate could not be measured")
                 return
             walls, intact = [], True
-            for _ in range(GATE_REPEATS):
-                ok, got = self.verified_download(GATE_LOSSY_BYTES, timeout=60)
+            for attempt in range(GATE_REPEATS):
+                ok, got = self.watched_download(GATE_LOSSY_BYTES, 60, f"lossy gate run {attempt + 1}")
                 intact = intact and ok
                 if ok and got.get("total"):
                     walls.append(got["total"])
