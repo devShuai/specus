@@ -106,6 +106,57 @@ class EgressStartupTests {
     }
 
     /**
+     * Phase two's switch and pool are known fields that reach the running client, off and on the
+     * default pool when the file says nothing. With the switch on, a domain rule is judged as the
+     * running client would judge it rather than warned about as unsupported, and an address rule
+     * inside the pool is refused.
+     */
+    @Test
+    void phaseTwoSettingsAreReadAndJudgeTheRules() throws Exception {
+        ClientStartupConfig defaults = ClientCli.parse(CONFIG, ignored -> { });
+        assertThat(defaults.isPeerEgressDnsTakeover()).isFalse();
+        assertThat(defaults.getPeerEgressFakeIpCidr()).isEqualTo("198.18.0.0/15");
+
+        List<String> warnings = new ArrayList<>();
+        ClientStartupConfig config = ClientCli.parse("""
+                {
+                  "serverBaseUrl": "https://example.invalid",
+                  "apiKey": "key",
+                  "secret": "secret",
+                  "peerEgressEnabled": true,
+                  "peerEgressDnsTakeover": true,
+                  "peerEgressFakeIpCidr": "10.64.0.0/16",
+                  "peerEgressRules": [
+                    {"match": "*.example.com", "action": "egress", "egressClientId": 42},
+                    {"match": "10.64.1.0/24", "action": "block"}
+                  ]
+                }
+                """, warnings::add);
+        assertThat(warnings).containsExactly("peerEgressRules[1] is not in force: EGRESS_RULE_FAKE_IP_OVERLAP");
+        SpecusBean bean = new SpecusBean();
+        SpecusClientApplication.copyLocalSettings(config, bean);
+        assertThat(bean.isPeerEgressDnsTakeover()).isTrue();
+        assertThat(bean.getPeerEgressFakeIpCidr()).isEqualTo("10.64.0.0/16");
+
+        warnings.clear();
+        ClientCli.parse("""
+                {
+                  "serverBaseUrl": "https://example.invalid",
+                  "apiKey": "key",
+                  "secret": "secret",
+                  "peerEgressEnabled": true,
+                  "peerEgressDnsTakeover": true,
+                  "peerEgressFakeIpCidr": "198.18.0.0/25",
+                  "peerEgressRules": [{"match": "example.com", "action": "direct"}]
+                }
+                """, warnings::add);
+        // An unusable pool stops phase two alone, and the domain rule reads as it does in phase one.
+        assertThat(warnings).containsExactly(
+                "peerEgressFakeIpCidr is not usable: EGRESS_FAKE_IP_POOL_INVALID; domain rules are not in force",
+                "peerEgressRules[0] is not in force: EGRESS_RULE_DOMAIN_UNSUPPORTED");
+    }
+
+    /**
      * The login environment announces egress, in the field all four servers read.
      *
      * <p>Asserted on the serialised JSON rather than on the bean, because the wire names are what

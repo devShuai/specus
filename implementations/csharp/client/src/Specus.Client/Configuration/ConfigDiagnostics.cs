@@ -37,13 +37,20 @@ internal static class ConfigDiagnostics
         // about: it is out of force because they asked.
         if (rules.Count > 0 && !effective.PeerEgressEnabled)
             warning($"peerEgressRules has {rules.Count} rule(s) but peerEgressEnabled is false: none is in force");
+        // Phase two as a rule's own problem, told apart from the master switch as above: with the
+        // switch on, would the pool let domain rules into force? Only the pool itself is checked
+        // here; its overlap with this device's interfaces is found at startup.
+        var phaseTwo = Specus.Protocol.PeerEgress.PeerEgressRules.PhaseTwo(true, effective.PeerEgressDnsTakeover,
+            effective.PeerEgressFakeIpCidr, Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr);
+        if (phaseTwo.Code is { } poolCode)
+            warning($"peerEgressFakeIpCidr is not usable: {poolCode}; domain rules are not in force");
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
             var code = rule is null
                 ? Specus.Protocol.PeerEgress.PeerEgressCodes.RuleMalformed
                 : Specus.Protocol.PeerEgress.PeerEgressRules.Validate(rule,
-                    Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr);
+                    Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr, phaseTwo.RunningPool);
             if (code is not null && code != Specus.Protocol.PeerEgress.PeerEgressCodes.RuleDisabled)
                 warning($"peerEgressRules[{index}] is not in force: {code}");
         }

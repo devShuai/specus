@@ -119,6 +119,34 @@ internal static class PeerEgressEndpoints
         return networks;
     }
 
+    /// <summary>
+    /// The IPv4 addresses of this host's own interfaces: the sources a query from this machine can
+    /// carry, for the DNS responder's check that it answers only this machine.
+    /// </summary>
+    public static IReadOnlyList<string> LocalInterfaceAddresses()
+    {
+        var addresses = new List<string>();
+        try
+        {
+            foreach (var device in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                foreach (var address in device.GetIPProperties().UnicastAddresses)
+                {
+                    if (address.Address.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        addresses.Add(address.Address.ToString());
+                    }
+                }
+            }
+        }
+        catch (NetworkInformationException)
+        {
+            // Without the list only the mesh address counts as local, which errs on refusing.
+            return [];
+        }
+        return addresses;
+    }
+
     /// <summary>Masks an address down to its network and renders it as a prefix.</summary>
     public static string NetworkOf(uint address, int prefixLength)
     {

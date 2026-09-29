@@ -69,6 +69,13 @@ final class PeerEgressFlowTable {
         boolean lingering;
 
         /**
+         * The (normalised) name the consumer had bound to the remote address when this flow was
+         * opened, or null for a flow to the address itself. A name-bind that says otherwise closes
+         * the flow: it went somewhere other than where the name now says.
+         */
+        String name;
+
+        /**
          * Whatever the caller attached: a connection, a socket, a cancellation handle. Stored so
          * that everything needed to tear a flow down travels with the entry that authorises it, and
          * never read here.
@@ -267,6 +274,19 @@ final class PeerEgressFlowTable {
             }
             return false;
         });
+    }
+
+    /**
+     * Closes every flow of one consumer to one address that was not opened for this name, which
+     * serves name-bind (protocol/spec/peer-egress-dns.md). A flow opened before the name arrived
+     * went to the fake address itself and can never work, yet the consumer's retransmitted SYN or
+     * next datagram would be taken as part of it; closed, the next packet opens a flow by name. A
+     * flow opened for another name goes with it when the address is bound to a new one. The same
+     * name bound again closes nothing.
+     */
+    List<Flow> closeUnbound(long consumer, int address, String name) {
+        return reap(flow -> flow.consumer == consumer && flow.key.remoteIp() == address
+                && !java.util.Objects.equals(flow.name, name));
     }
 
     /**

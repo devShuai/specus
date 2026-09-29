@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.bean;
 
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.specusclient.client.ClientAuthRefresher;
 import com.theshuai.specusclient.peer.PeerVirtualDeviceOptions;
@@ -28,6 +29,9 @@ public class SpecusBean {
     private List<PeerEgressRule> peerEgressRules = List.of();
     /** The consumer's master switch, from the local configuration. */
     private boolean peerEgressEnabled;
+    /** Phase two's switch and fake-IP pool, from the local configuration. */
+    private boolean peerEgressDnsTakeover;
+    private String peerEgressFakeIpCidr = PeerEgressDns.DEFAULT_FAKE_IP_CIDR;
     private String peerMeshDevice = "noop";
     private String peerMeshTunName = "specus0";
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;

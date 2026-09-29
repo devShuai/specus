@@ -2,6 +2,7 @@ package com.theshuai.specusclient.cli;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
 import com.theshuai.common.peeregress.PeerEgressCodes;
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import com.theshuai.specusclient.bean.ClientStartupConfig;
@@ -101,15 +102,24 @@ public final class EgressEdit {
         return value == null ? 0L : value;
     }
 
-    /** Why a rule is not in force as configured, or null; the master switch is not part of it. */
-    static String ruleCode(PeerEgressRule rule) {
-        return PeerEgressRules.validate(rule, PeerEgressRules.DEFAULT_MESH_CIDR);
+    /**
+     * Why a rule is not in force as configured, or null; the master switch is not part of it. Judged
+     * against the fake-IP pool when phase two is asked for over a usable one, as the running client
+     * would judge it.
+     */
+    static String ruleCode(ClientStartupConfig config, PeerEgressRule rule) {
+        return PeerEgressRules.validate(rule, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config));
+    }
+
+    /** The pool phase two would run with as configured, or null. */
+    private static String pool(ClientStartupConfig config) {
+        return PeerEgressDns.configuredPool(config.isPeerEgressDnsTakeover(), config.getPeerEgressFakeIpCidr());
     }
 
     /** The code a rule reports in status: the master switch off names itself unless the rule was switched off. */
-    static String statusCode(boolean enabled, PeerEgressRule rule) {
-        if (!enabled && !rule.switchedOff()) return PeerEgressCodes.CONSUMER_DISABLED;
-        return ruleCode(rule);
+    static String statusCode(ClientStartupConfig config, PeerEgressRule rule) {
+        if (!config.isPeerEgressEnabled() && !rule.switchedOff()) return PeerEgressCodes.CONSUMER_DISABLED;
+        return ruleCode(config, rule);
     }
 
     /** One line a person can act on for a rule's code, in the words the Go and .NET clients use too. */
@@ -120,6 +130,7 @@ public final class EgressEdit {
             case PeerEgressCodes.RULE_MALFORMED -> "not an IPv4 address or CIDR range with zero host bits, or an unknown action";
             case PeerEgressCodes.RULE_DEFAULT_ROUTE -> "0.0.0.0/0 would take over the default route, which is not allowed";
             case PeerEgressCodes.RULE_MESH_OVERLAP -> "overlaps the Peer Mesh network";
+            case PeerEgressCodes.RULE_FAKE_IP_OVERLAP -> "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out";
             case PeerEgressCodes.RULE_PORT_UNSUPPORTED -> "a rule cannot be limited to a port; port limits belong on the egress policy";
             case PeerEgressCodes.RULE_MISSING_TARGET -> "an egress rule needs a positive egress device id";
             case PeerEgressCodes.RULE_DISABLED -> "switched off";
@@ -139,14 +150,14 @@ public final class EgressEdit {
         var views = new ArrayList<Map<String, Object>>();
         for (int index = 0; index < rules.size(); index++) {
             PeerEgressRule rule = rules.get(index);
-            String status = statusCode(enabled, rule);
+            String status = statusCode(config, rule);
             // The rule's own problem, told apart from being off: worth fixing before takeover is on.
             var content = new PeerEgressRule();
             content.setMatch(rule.getMatch());
             content.setAction(rule.getAction());
             content.setEgressClientId(rule.getEgressClientId());
             content.setPort(rule.getPort());
-            String refusal = ruleCode(content);
+            String refusal = ruleCode(config, content);
             var view = new LinkedHashMap<String, Object>();
             view.put("index", index);
             view.put("match", trim(rule.getMatch()));
@@ -218,7 +229,7 @@ public final class EgressEdit {
                 if (change.egressClientId() != 0) rule.setEgressClientId(change.egressClientId());
                 // Refused rules are allowed in the file, where they are warned about, but an edit
                 // that adds one on request would only be writing a rule that steers nothing.
-                String code = ruleCode(rule);
+                String code = ruleCode(config, rule);
                 if (code != null) throw new PlanFailure("Rule not added: " + code + " (" + explanation(code) + ")");
                 if (change.disabled()) rule.setEnabled(false);
                 int at = count;
@@ -390,7 +401,7 @@ public final class EgressEdit {
     /** What the configured rules decide for one IPv4 address, and what takeover being on would change. */
     private static LinkedHashMap<String, Object> preview(Path path, ClientStartupConfig config, String address, List<String> lines) {
         var rules = rules(config);
-        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR);
+        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config));
         int matched = match.matched() ? match.matchedRuleIndex() : -1;
         boolean takeover = config.isPeerEgressEnabled();
         var data = new LinkedHashMap<String, Object>();

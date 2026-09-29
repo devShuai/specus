@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressFrame;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
@@ -9,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import lombok.extern.slf4j.Slf4j;
@@ -21,6 +23,11 @@ import lombok.extern.slf4j.Slf4j;
  * flow cannot be opened, the packet is dropped. Falling back to the local stack would send the
  * user's traffic from the address they arranged for it not to come from, which is worse than the
  * connection failing, because it fails silently and in the direction they were guarding against.
+ *
+ * <p>While phase two runs (protocol/spec/peer-egress-dns.md) a destination inside the fake-IP pool
+ * is decided by the name it stands for, by domain rules only, and goes to its egress preceded by a
+ * name-bind; everything outside the pool is decided as in phase one. Shared cases: the
+ * {@code steering} section of {@code peer-egress-dns-v1.json}.
  *
  * <p>Time arrives as an argument. Not safe for concurrent use on its own; the caller serialises
  * access the same way the Go consumer's mutex does.
@@ -41,7 +48,16 @@ final class PeerEgressConsumer {
         /** A rule that says egress, for an egress that cannot take it. */
         BLOCKED_NO_EGRESS,
         /** A packet this version cannot carry, such as IPv6 or ICMP. */
-        UNSUPPORTED;
+        UNSUPPORTED,
+        /**
+         * Phase two: a packet to a fake address that stands for no name, or for a name no rule
+         * sends anywhere any more.
+         */
+        BLOCKED_FAKE_IP,
+        /** A DNS query to the responder, which took it. */
+        DNS,
+        /** A DNS query to the responder from an address that is not this machine's: dropped. */
+        BLOCKED_NOT_LOCAL;
 
         @Override
         public String toString() {
@@ -50,6 +66,9 @@ final class PeerEgressConsumer {
                 case BLOCKED_BY_RULE -> "blocked-by-rule";
                 case BLOCKED_NO_EGRESS -> "blocked-no-egress";
                 case UNSUPPORTED -> "unsupported";
+                case BLOCKED_FAKE_IP -> "blocked-fake-ip";
+                case DNS -> "dns";
+                case BLOCKED_NOT_LOCAL -> "blocked-not-local";
                 default -> "not-mine";
             };
         }
@@ -124,6 +143,12 @@ final class PeerEgressConsumer {
         boolean appAckKnown;
         int appAck;
         int appSeqNext;
+        /**
+         * Whether the egress has answered this flow at all. Until it has, every datagram of a UDP
+         * flow to a fake address carries a name-bind: UDP has no retransmitted SYN to repair a lost
+         * one with.
+         */
+        boolean replied;
 
         Flow(int protocol, long egress, long registration, long nowMs) {
             this.protocol = protocol;
@@ -226,6 +251,24 @@ final class PeerEgressConsumer {
     private long lastSweepMs;
     private final Map<String, Long> blocked = new TreeMap<>();
 
+    /**
+     * Phase two (protocol/spec/peer-egress-dns.md): the fake-IP pool while it runs, null while it
+     * does not. A destination inside it is steered by the name it was handed out for.
+     */
+    private PeerEgressFakeIpPool fakeIps;
+    /** The egresses the catalogue says resolve names; any other gets no traffic for a name. */
+    private Set<Long> domainCapable = Set.of();
+    /** Phase two's DNS responder, which takes port 53 of the pool's listen address; or null. */
+    private PeerEgressDnsResponder dnsResponder;
+    /** This node's mesh address, parsed: the source a local DNS query normally has. */
+    private Integer virtualAddress;
+    /**
+     * Whether an address is one of this machine's interfaces', the other source a local query may
+     * have. Supplied by the mesh, which caches the interface list; only this node's mesh address
+     * counts without it.
+     */
+    private java.util.function.IntPredicate localAddress = address -> false;
+
     PeerEgressConsumer(Sender sender, TunWriter tunWriter) {
         this(sender, tunWriter, DEFAULT_FLOW_CAPACITY);
     }
@@ -251,13 +294,16 @@ final class PeerEgressConsumer {
         for (Flow flow : flows.values()) {
             byEgress.merge(flow.egress, 1, Integer::sum);
         }
+        PeerEgressFakeIpPool pool = fakeIps;
         return new PeerEgressStatus.ConsumerSnapshot(List.copyOf(rules), meshCidr,
                 new java.util.LinkedHashMap<>(online), flows.size(),
-                new java.util.TreeMap<>(blocked), byEgress, Map.of());
+                new java.util.TreeMap<>(blocked), byEgress, Map.of(),
+                pool == null ? null : pool.cidr(), domainCapable,
+                pool == null ? 0 : pool.mappings(), pool == null ? 0 : pool.quarantined(nowMs));
     }
 
     /**
-     * Installs a rule set and closes the flows it invalidates.
+     * Installs a rule set and closes the flows it invalidates, with phase two not running.
      *
      * <p>Established flows survive a rule change unless their rule stopped saying egress or stopped
      * matching. The returned purge messages tell each affected egress to close its side; without
@@ -266,12 +312,54 @@ final class PeerEgressConsumer {
      */
     Map<Long, List<String>> configure(
             List<PeerEgressRule> newRules, String newMeshCidr, String newVirtualIp, long nowMs) {
+        return configure(newRules, newMeshCidr, newVirtualIp, null, nowMs);
+    }
+
+    /**
+     * As above, with the fake-IP pool while phase two runs, or null. The rules are validated against
+     * it, which is what puts domain rules in force and takes address rules reaching into it out.
+     */
+    Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
+            String newVirtualIp, PeerEgressFakeIpPool pool, long nowMs) {
+        return configure(newRules, newMeshCidr, newVirtualIp, pool, null, nowMs);
+    }
+
+    /** As above, with the DNS responder that answers from the pool (step four), or null. */
+    Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
+            String newVirtualIp, PeerEgressFakeIpPool pool, PeerEgressDnsResponder responder, long nowMs) {
         rules = newRules == null ? List.of() : List.copyOf(newRules);
         if (newMeshCidr != null && !newMeshCidr.trim().isEmpty()) {
             meshCidr = newMeshCidr.trim();
         }
         virtualIp = newVirtualIp == null ? "" : newVirtualIp.trim();
+        virtualAddress = Ipv4Cidr.parseAddress(virtualIp);
+        fakeIps = pool;
+        dnsResponder = pool == null ? null : responder;
         return purgeInvalidated(nowMs);
+    }
+
+    /** How to tell this machine's interface addresses, for the DNS responder's source check. */
+    void setLocalAddresses(java.util.function.IntPredicate addresses) {
+        localAddress = addresses == null ? address -> false : addresses;
+    }
+
+    /**
+     * Records which egresses the catalogue says resolve names, and closes the flows to a fake
+     * address whose egress no longer does. A flow to an address is unaffected: it asks the egress
+     * for nothing but the address.
+     */
+    Map<Long, List<String>> setDomainCapable(Set<Long> capable, long nowMs) {
+        Set<Long> next = capable == null ? Set.of() : Set.copyOf(capable);
+        if (next.equals(domainCapable)) {
+            return Map.of();
+        }
+        domainCapable = next;
+        return purgeInvalidated(nowMs);
+    }
+
+    /** The pool phase two runs with, or null; the DNS responder answers from the same one. */
+    PeerEgressFakeIpPool fakeIpPool() {
+        return fakeIps;
     }
 
     /**
@@ -300,15 +388,29 @@ final class PeerEgressConsumer {
         Map<Long, TreeSet<String>> purge = new TreeMap<>();
         List<PeerEgressFlowTable.Key> dropped = new ArrayList<>();
         List<byte[]> resets = new ArrayList<>();
+        PeerEgressFakeIpPool pool = fakeIps;
         for (Map.Entry<PeerEgressFlowTable.Key, Flow> entry : flows.entrySet()) {
             PeerEgressFlowTable.Key key = entry.getKey();
             Flow flow = entry.getValue();
-            PeerEgressRules.Match match =
-                    PeerEgressRules.match(rules, Ipv4Cidr.format(key.remoteIp()), meshCidr);
-            boolean stillOurs = PeerEgressRule.ACTION_EGRESS.equals(match.action())
-                    && match.egressClientId() != null
-                    && match.egressClientId() == flow.egress
-                    && Boolean.TRUE.equals(online.get(flow.egress));
+            boolean stillOurs;
+            if (pool != null && pool.contains(key.remoteIp())) {
+                // The same decision a packet gets, from the name the address stands for, but
+                // without refreshing the mapping: a rule change is not traffic.
+                String name = pool.nameOf(key.remoteIp());
+                PeerEgressRule rule = name == null ? null : domainRuleFor(name);
+                stillOurs = rule != null
+                        && PeerEgressRule.ACTION_EGRESS.equals(actionOf(rule))
+                        && Long.valueOf(flow.egress).equals(rule.getEgressClientId())
+                        && Boolean.TRUE.equals(online.get(flow.egress))
+                        && domainCapable.contains(flow.egress);
+            } else {
+                PeerEgressRules.Match match = PeerEgressRules.match(
+                        rules, Ipv4Cidr.format(key.remoteIp()), meshCidr, poolCidr());
+                stillOurs = PeerEgressRule.ACTION_EGRESS.equals(match.action())
+                        && match.egressClientId() != null
+                        && match.egressClientId() == flow.egress
+                        && Boolean.TRUE.equals(online.get(flow.egress));
+            }
             if (stillOurs) {
                 continue;
             }
@@ -358,18 +460,64 @@ final class PeerEgressConsumer {
             return Outcome.NOT_MINE;
         }
 
-        PeerEgressRules.Match match = PeerEgressRules.match(rules, destination, meshCidr);
-        if (!match.matched()
-                || (!PeerEgressRule.ACTION_EGRESS.equals(match.action())
-                        && !PeerEgressRule.ACTION_BLOCK.equals(match.action()))) {
-            return Outcome.NOT_MINE;
+        int protocol = PeerIpPacket.protocol(packet);
+        int address = readInt(packet, 16);
+        PeerEgressFakeIpPool pool = fakeIps;
+        PeerEgressDnsResponder responder = dnsResponder;
+        if (responder != null && address == responder.listenAddress() && isDnsPort(packet, protocol)) {
+            // The responder's own port, ahead of any steering. Only this machine is answered: a
+            // query from anywhere else means this node is forwarding for somebody, and phase two
+            // resolves for nobody but itself. Other ports of the listen address fall through to
+            // the pool, which has no mapping for it.
+            int source = readInt(packet, 12);
+            if ((virtualAddress == null || source != virtualAddress) && !localAddress.test(source)) {
+                recordBlocked("dns-not-local");
+                return Outcome.BLOCKED_NOT_LOCAL;
+            }
+            responder.handle(packet, protocol, rules, meshCidr, nowMs);
+            return Outcome.DNS;
         }
-        if (PeerEgressRule.ACTION_BLOCK.equals(match.action())) {
-            recordBlocked("rule");
-            return Outcome.BLOCKED_BY_RULE;
+        // The name a fake address stands for, when the destination is one; null for an address.
+        String name = null;
+        Long egress;
+        if (pool != null && pool.contains(address)) {
+            // Steered by the name the address was handed out for, never by an address rule:
+            // validation keeps address rules out of the pool. The responder's own address, the
+            // network and the broadcast address are never mapped, so they land in the first case;
+            // the responder claims its own port 53 before this is reached (step four).
+            name = pool.traffic(address, nowMs);
+            if (name == null) {
+                // The one real leak point of fake-IP. An address that stands for no name has no
+                // right destination: sent to an egress or let out locally, the traffic would go
+                // where no rule said.
+                return refuseAnswered(packet, protocol, "fake-ip-unmapped", Outcome.BLOCKED_FAKE_IP);
+            }
+            PeerEgressRule rule = domainRuleFor(name);
+            if (rule == null || PeerEgressRule.ACTION_DIRECT.equals(actionOf(rule))) {
+                // The name was handed out under rules that no longer claim it. Its real address is
+                // unknown here, so the only choices are to block or to guess; answered, the
+                // application asks again, and the fresh query goes where the rules now say.
+                return refuseAnswered(packet, protocol, "fake-ip-stale", Outcome.BLOCKED_FAKE_IP);
+            }
+            if (PeerEgressRule.ACTION_BLOCK.equals(actionOf(rule))) {
+                recordBlocked("rule");
+                return Outcome.BLOCKED_BY_RULE;
+            }
+            egress = rule.getEgressClientId();
+        } else {
+            PeerEgressRules.Match match = PeerEgressRules.match(rules, destination, meshCidr, poolCidr());
+            if (!match.matched()
+                    || (!PeerEgressRule.ACTION_EGRESS.equals(match.action())
+                            && !PeerEgressRule.ACTION_BLOCK.equals(match.action()))) {
+                return Outcome.NOT_MINE;
+            }
+            if (PeerEgressRule.ACTION_BLOCK.equals(match.action())) {
+                recordBlocked("rule");
+                return Outcome.BLOCKED_BY_RULE;
+            }
+            egress = match.egressClientId();
         }
 
-        int protocol = PeerIpPacket.protocol(packet);
         if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP
                 && protocol != PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
             // ICMP and anything else this version does not carry. The rule says this destination
@@ -377,25 +525,27 @@ final class PeerEgressConsumer {
             recordBlocked("unsupported-protocol");
             return Outcome.UNSUPPORTED;
         }
-        Long egress = match.egressClientId();
         if (egress == null || !Boolean.TRUE.equals(online.get(egress))) {
-            recordBlocked("egress-unavailable");
             // Answered, not just dropped. The rule is doing what it should, but the application
             // would only learn that from its own timeout; a reset or an unreachable lets it fail
             // now and retry when the egress is back. A failed send, by contrast, stays silent:
             // the session may be re-establishing and the flow may yet recover.
-            byte[] answer = failurePacket(packet, protocol);
-            if (answer != null && tunWriter != null) {
-                tunWriter.write(answer);
-            }
-            return Outcome.BLOCKED_NO_EGRESS;
+            return refuseAnswered(packet, protocol, "egress-unavailable", Outcome.BLOCKED_NO_EGRESS);
+        }
+        if (name != null && !domainCapable.contains(egress)) {
+            // Online, but the catalogue does not say it resolves names: a name sent to it would be
+            // refused there. Not resolved locally instead, which would be the leak. Usually the
+            // moment between the egress coming online and its catalogue entry arriving.
+            return refuseAnswered(packet, protocol, "egress-no-domain", Outcome.BLOCKED_NO_EGRESS);
         }
 
         PeerEgressFlowTable.Key key = flowKeyFor(packet, protocol);
+        int tcpFlags = tcpFlags(packet);
+        boolean fresh = false;
+        Flow flow = null;
         if (key != null) {
             sweepIfDue(nowMs);
-            int tcpFlags = tcpFlags(packet);
-            Flow flow = liveFlow(key, nowMs);
+            flow = liveFlow(key, nowMs);
             if (flow != null && flow.closed
                     && (tcpFlags & (PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK))
                             == PeerEgressSegment.FLAG_SYN) {
@@ -408,6 +558,7 @@ final class PeerEgressConsumer {
             if (flow == null) {
                 makeRoom(nowMs);
                 flow = new Flow(protocol, egress, ++registrations, nowMs);
+                fresh = true;
             }
             touch(key, flow, tcpFlags, true, nowMs);
             if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
@@ -418,6 +569,16 @@ final class PeerEgressConsumer {
         if (sender == null) {
             return Outcome.BLOCKED_NO_EGRESS;
         }
+        if (name != null && needsNameBind(protocol, tcpFlags, fresh, flow)
+                && !sender.send(egress, PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                        PeerEgressFrame.encodeControl(PeerEgressFrame.Control.nameBind(destination, name))))) {
+            // Ahead of the packet, so the egress knows the name when the flow reaches it. One that
+            // did not go takes the packet with it: sent anyway, the egress could only open a flow to
+            // the fake address itself. Silent, like any failed send; the flow stays registered, so
+            // the retransmitted SYN or the next datagram carries a name-bind again.
+            recordBlocked("send-failed");
+            return Outcome.BLOCKED_NO_EGRESS;
+        }
         // hop stays clear: this node is acting as a consumer, not forwarding on behalf of another
         // egress. An egress that receives it set refuses, which is what stops multi-hop chains.
         byte[] frame = PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet);
@@ -426,6 +587,66 @@ final class PeerEgressConsumer {
             return Outcome.BLOCKED_NO_EGRESS;
         }
         return Outcome.FORWARDED;
+    }
+
+    /**
+     * Whether a packet to a fake address goes with a name-bind: it opened a flow here, it is a TCP
+     * SYN without ACK (a retransmitted one included), or its UDP flow has not heard from the egress
+     * yet. Control messages are unreliable, so one is not enough; TCP repairs a lost one with the
+     * SYN the application retransmits, and UDP, which retransmits nothing of its own, with every
+     * datagram until the egress answers. A packet whose flow cannot be tracked carries one too.
+     */
+    private static boolean needsNameBind(int protocol, int tcpFlags, boolean fresh, Flow flow) {
+        if (fresh || flow == null) {
+            return true;
+        }
+        if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            return (tcpFlags & (PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK))
+                    == PeerEgressSegment.FLAG_SYN;
+        }
+        return !flow.replied;
+    }
+
+    /** Whether a TCP or UDP packet is addressed to port 53. */
+    private static boolean isDnsPort(byte[] packet, int protocol) {
+        if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP && protocol != PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            return false;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        return ihl >= IPV4_MIN_HEADER_BYTES && packet.length >= ihl + 4
+                && readShort(packet, ihl + 2) == PeerEgressDnsResponder.PORT;
+    }
+
+    /**
+     * Counts a refusal and answers it the way an unreachable host would, so the application fails
+     * now instead of at its own timeout.
+     */
+    private Outcome refuseAnswered(byte[] packet, int protocol, String reason, Outcome outcome) {
+        recordBlocked(reason);
+        byte[] answer = failurePacket(packet, protocol);
+        if (answer != null && tunWriter != null) {
+            tunWriter.write(answer);
+        }
+        return outcome;
+    }
+
+    /**
+     * The domain rule that claims a name, or null. A rule whose egress cannot resolve names still
+     * claims its names; the traffic then counts as egress-no-domain rather than going local.
+     */
+    private PeerEgressRule domainRuleFor(String name) {
+        Integer index = PeerEgressDns.selectDomainRule(rules, name, meshCidr, poolCidr());
+        return index == null ? null : rules.get(index);
+    }
+
+    /** The pool phase two runs with, as text, or null while it does not. */
+    private String poolCidr() {
+        PeerEgressFakeIpPool pool = fakeIps;
+        return pool == null ? null : pool.cidr();
+    }
+
+    private static String actionOf(PeerEgressRule rule) {
+        return rule.getAction() == null ? "" : rule.getAction().trim();
     }
 
     /**
@@ -651,6 +872,8 @@ final class PeerEgressConsumer {
         if (flow == null || flow.egress != fromEgress) {
             return false;
         }
+        // The egress has the flow, so it had the name: a datagram after this needs no name-bind.
+        flow.replied = true;
         touch(key, flow, tcpFlags(packet), false, nowMs);
         return true;
     }

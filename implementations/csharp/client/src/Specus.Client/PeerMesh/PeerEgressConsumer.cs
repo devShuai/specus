@@ -21,7 +21,19 @@ internal enum PeerEgressConsumerOutcome
     BlockedNoEgress,
 
     /// <summary>A packet this version cannot carry, such as IPv6 or ICMP.</summary>
-    Unsupported
+    Unsupported,
+
+    /// <summary>
+    /// Sent into the fake-IP pool at an address no rule steers now: one with no mapping, or one
+    /// whose name no rule claims any more or <c>direct</c> claims.
+    /// </summary>
+    BlockedFakeIp,
+
+    /// <summary>A DNS query to the listen address, taken by the responder.</summary>
+    DnsQuery,
+
+    /// <summary>A DNS query to the listen address from a source that is not this machine.</summary>
+    BlockedDnsNotLocal
 }
 
 /// <summary>
@@ -33,6 +45,12 @@ internal enum PeerEgressConsumerOutcome
 /// flow cannot be opened, the packet is dropped. Falling back to the local stack would send the
 /// user's traffic from the address they arranged for it not to come from, which is worse than the
 /// connection failing, because it fails silently and in the direction they were guarding against.
+///
+/// <para>Phase two (protocol/spec/peer-egress-dns.md) adds a second way in. A destination inside the
+/// fake-IP pool is decided by the name it was handed out for, never by an address rule, and every
+/// refusal on that path is answered, because the application asked a name and must be sent back to
+/// ask again rather than left to time out. Before a packet to a pool address goes out, the egress is
+/// told which name the address stands for.</para>
 ///
 /// <para>Time arrives as an argument. Not safe for concurrent use on its own; the caller serialises
 /// access the same way the Go consumer's mutex does.</para>
@@ -96,6 +114,13 @@ internal sealed class PeerEgressConsumer(
         public long Registered { get; }
 
         public long LastSeenMs { get; set; }
+
+        /// <summary>
+        /// Whether a packet from the egress has been accepted on this flow. Until one has, every
+        /// datagram of a UDP flow to a pool address carries its name-bind: UDP retransmits nothing
+        /// on its own, so a lost binding would otherwise never be repeated.
+        /// </summary>
+        public bool Replied { get; set; }
 
         public bool IsTcp => Key.Protocol == PeerEgressSegment.Ipv4ProtocolTcp;
 
@@ -203,6 +228,21 @@ internal sealed class PeerEgressConsumer(
     private readonly Dictionary<long, bool> _online = [];
 
     /// <summary>
+    /// Which egress peers resolve names, from the last <c>egress-catalog</c>. Absent means no: an
+    /// egress the catalogue does not list is not sent names.
+    /// </summary>
+    private readonly Dictionary<long, bool> _capable = [];
+
+    /// <summary>The fake-IP pool while phase two runs; null otherwise, which is phase one exactly.</summary>
+    private PeerEgressFakeIpPool? _pool;
+
+    /// <summary>
+    /// The DNS responder, which queries to port 53 of the pool's listen address go to while phase
+    /// two runs. Set by the caller under the same serialisation as every other call.
+    /// </summary>
+    public PeerEgressDnsResponder? DnsResponder { get; set; }
+
+    /// <summary>
     /// The flows this node remembers, bounded by time and by count (protocol/spec/peer-egress.md,
     /// shared vector <c>peer-egress-consumer-flows-v1.json</c>). Unbounded, every flow ever made
     /// stayed here, and the status's active flows only ever grew.
@@ -238,7 +278,11 @@ internal sealed class PeerEgressConsumer(
         return new(
             _rules.ToList(), _meshCidr, new Dictionary<long, bool>(_online), _flows.Count,
             new Dictionary<string, long>(_blocked),
-            _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()));
+            _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()))
+        {
+            Capable = new Dictionary<long, bool>(_capable),
+            FakeIpPool = _pool?.Cidr,
+        };
     }
 
     /// <summary>
@@ -249,9 +293,14 @@ internal sealed class PeerEgressConsumer(
     /// matching. The returned purge messages tell each affected egress to close its side; without
     /// them the egress would hold the socket until its own idle timer, and the user would see a
     /// connection that is dead at one end and open at the other.
+    ///
+    /// <para><paramref name="fakeIpPool"/> is the pool while phase two runs and null while it does
+    /// not. The pool is the caller's and outlives a reconfiguration: its mappings are answers
+    /// applications already hold, and a rule change is no reason to take them back.</para>
     /// </remarks>
     public IReadOnlyDictionary<long, IReadOnlyList<string>> Configure(
-        IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs)
+        IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs,
+        PeerEgressFakeIpPool? fakeIpPool = null)
     {
         _rules = rules ?? [];
         if (!string.IsNullOrWhiteSpace(meshCidr))
@@ -259,6 +308,26 @@ internal sealed class PeerEgressConsumer(
             _meshCidr = meshCidr.Trim();
         }
         _virtualIp = virtualIp?.Trim() ?? string.Empty;
+        _pool = fakeIpPool;
+        return PurgeInvalidated(nowMs);
+    }
+
+    /// <summary>
+    /// Records which egresses resolve names, as the last accepted <c>egress-catalog</c> says, and
+    /// closes the flows to pool addresses that an egress can no longer take.
+    /// </summary>
+    /// <remarks>
+    /// The whole set is replaced, the way the catalogue replaces it. A flow to an address outside
+    /// the pool does not depend on this and is left alone.
+    /// </remarks>
+    public IReadOnlyDictionary<long, IReadOnlyList<string>> SetEgressCapabilities(
+        IReadOnlyDictionary<long, bool> domainTargetCapable, long nowMs)
+    {
+        _capable.Clear();
+        foreach (var (egress, capable) in domainTargetCapable)
+        {
+            _capable[egress] = capable;
+        }
         return PurgeInvalidated(nowMs);
     }
 
@@ -297,11 +366,7 @@ internal sealed class PeerEgressConsumer(
         var resets = new List<byte[]>();
         foreach (var (key, flow) in _flows)
         {
-            var match = PeerEgressRules.Match(_rules, Ipv4Cidr.FormatAddress(key.RemoteIp), _meshCidr);
-            var stillOurs = match.Action == PeerEgressRules.ActionEgress
-                && match.EgressClientId == flow.Egress
-                && _online.GetValueOrDefault(flow.Egress);
-            if (stillOurs)
+            if (StillOurs(key.RemoteIp, flow.Egress))
             {
                 continue;
             }
@@ -337,6 +402,41 @@ internal sealed class PeerEgressConsumer(
     }
 
     /// <summary>
+    /// Whether a flow's destination still goes to the egress carrying it, by the same decision a new
+    /// packet would get.
+    /// </summary>
+    /// <remarks>
+    /// A pool address is decided by its name, looked up without refreshing the mapping: a rule
+    /// change, an egress going offline or a new catalogue is not traffic, and counting it as use
+    /// would keep alive a mapping nobody is using. The purge then names the fake address itself,
+    /// because that is what the egress keeps in its flow key.
+    /// </remarks>
+    private bool StillOurs(uint remote, long egress)
+    {
+        if (_pool is { } pool && pool.Contains(remote))
+        {
+            if (pool.NameFor(remote) is not { } name)
+            {
+                return false;
+            }
+            var index = PeerEgressRules.SelectDomainRule(_rules, name, _meshCidr, pool.Cidr);
+            if (index < 0)
+            {
+                return false;
+            }
+            var rule = _rules[index];
+            return (rule.Action?.Trim() ?? string.Empty) == PeerEgressRules.ActionEgress
+                && rule.EgressClientId == egress
+                && _online.GetValueOrDefault(egress)
+                && _capable.GetValueOrDefault(egress);
+        }
+        var match = PeerEgressRules.Match(_rules, Ipv4Cidr.FormatAddress(remote), _meshCidr, _pool?.Cidr);
+        return match.Action == PeerEgressRules.ActionEgress
+            && match.EgressClientId == egress
+            && _online.GetValueOrDefault(egress);
+    }
+
+    /// <summary>
     /// Decides what happens to one packet read from the TUN.
     /// </summary>
     /// <remarks>
@@ -360,20 +460,74 @@ internal sealed class PeerEgressConsumer(
         {
             return PeerEgressConsumerOutcome.NotMine;
         }
-
-        var match = PeerEgressRules.Match(_rules, destination, _meshCidr);
-        if (!match.Matched
-            || match.Action is not (PeerEgressRules.ActionEgress or PeerEgressRules.ActionBlock))
-        {
-            return PeerEgressConsumerOutcome.NotMine;
-        }
-        if (match.Action == PeerEgressRules.ActionBlock)
-        {
-            RecordBlocked("rule");
-            return PeerEgressConsumerOutcome.BlockedByRule;
-        }
-
         int protocol = packet[9];
+        var address = ReadUInt32(packet, 16);
+
+        long egress;
+        // The name a pool address stands for; null for every destination outside the pool.
+        string? name = null;
+        if (_pool is { } pool && pool.Contains(address))
+        {
+            if (address == pool.Listen && IsDnsQuery(packet, protocol))
+            {
+                // Port 53 of the listen address belongs to the responder, ahead of any steering;
+                // anything else sent to the listen address is refused below as unmapped.
+                if (DnsResponder is not { } responder)
+                {
+                    return PeerEgressConsumerOutcome.NotMine;
+                }
+                if (responder.Handle(packet, nowMs) == PeerEgressDnsIntake.NotLocal)
+                {
+                    // Dropped unanswered: this machine is routing somebody else's query, and phase
+                    // two does not resolve names on anybody else's behalf.
+                    RecordBlocked("dns-not-local");
+                    return PeerEgressConsumerOutcome.BlockedDnsNotLocal;
+                }
+                return PeerEgressConsumerOutcome.DnsQuery;
+            }
+            // Using the address keeps its mapping alive, whatever is decided next.
+            name = pool.Use(address, nowMs);
+            if (name is null)
+            {
+                // The one real leak of the fake-IP scheme. Sent to the egress or let out locally,
+                // this traffic would go wherever the address happens to lead rather than where a
+                // rule said; it can only be refused.
+                return Refuse(packet, protocol, "fake-ip-unmapped", PeerEgressConsumerOutcome.BlockedFakeIp);
+            }
+            var index = PeerEgressRules.SelectDomainRule(_rules, name, _meshCidr, pool.Cidr);
+            var action = index < 0 ? PeerEgressRules.ActionDirect : _rules[index].Action?.Trim() ?? string.Empty;
+            if (action == PeerEgressRules.ActionDirect)
+            {
+                // Handed out under rules that no longer claim the name. Its real address is not
+                // known here, so letting it out would mean guessing; answered, the application asks
+                // again, and the fresh query goes wherever the rules say now.
+                return Refuse(packet, protocol, "fake-ip-stale", PeerEgressConsumerOutcome.BlockedFakeIp);
+            }
+            if (action == PeerEgressRules.ActionBlock)
+            {
+                RecordBlocked("rule");
+                return PeerEgressConsumerOutcome.BlockedByRule;
+            }
+            egress = _rules[index].EgressClientId ?? 0;
+        }
+        else
+        {
+            // Address rules only. With phase two running, one reaching into the pool was refused
+            // in validation, so no pool address is ever decided here.
+            var match = PeerEgressRules.Match(_rules, destination, _meshCidr, _pool?.Cidr);
+            if (!match.Matched
+                || match.Action is not (PeerEgressRules.ActionEgress or PeerEgressRules.ActionBlock))
+            {
+                return PeerEgressConsumerOutcome.NotMine;
+            }
+            if (match.Action == PeerEgressRules.ActionBlock)
+            {
+                RecordBlocked("rule");
+                return PeerEgressConsumerOutcome.BlockedByRule;
+            }
+            egress = match.EgressClientId ?? 0;
+        }
+
         if (protocol != PeerEgressSegment.Ipv4ProtocolTcp && protocol != PeerEgressDatagram.Ipv4ProtocolUdp)
         {
             // ICMP and anything else this version does not carry. The rule says this destination
@@ -381,18 +535,19 @@ internal sealed class PeerEgressConsumer(
             RecordBlocked("unsupported-protocol");
             return PeerEgressConsumerOutcome.Unsupported;
         }
-        if (match.EgressClientId is not { } egress || !_online.GetValueOrDefault(egress))
+        if (egress <= 0 || !_online.GetValueOrDefault(egress))
         {
-            RecordBlocked("egress-unavailable");
             // Answered, not just dropped. The rule is doing what it should, but the application
             // would only learn that from its own timeout; a reset or an unreachable lets it fail
             // now and retry when the egress is back. A failed send, by contrast, stays silent:
             // the session may be re-establishing and the flow may yet recover.
-            if (FailurePacket(packet, protocol) is { } answer)
-            {
-                toTun?.Invoke(answer);
-            }
-            return PeerEgressConsumerOutcome.BlockedNoEgress;
+            return Refuse(packet, protocol, "egress-unavailable", PeerEgressConsumerOutcome.BlockedNoEgress);
+        }
+        if (name is not null && !_capable.GetValueOrDefault(egress))
+        {
+            // Online, but the catalogue does not say it resolves names: sending it a name-bind
+            // would be refused, and the packet would open a flow to the fake address itself.
+            return Refuse(packet, protocol, "egress-no-domain", PeerEgressConsumerOutcome.BlockedNoEgress);
         }
 
         if (FlowKeyFor(packet, protocol) is { } key)
@@ -406,17 +561,36 @@ internal sealed class PeerEgressConsumer(
                 Forget(flow);
                 flow = null;
             }
+            var fresh = flow is null;
             flow ??= Register(key, egress, nowMs);
             Touch(flow, packet, outbound: true, nowMs);
             if (protocol == PeerEgressSegment.Ipv4ProtocolTcp)
             {
                 flow.NoteApplicationProgress(packet);
             }
+            if (name is not null && !NeedsNameBind(flow, fresh, packet, protocol))
+            {
+                // The egress already has the name for this flow; only the packet goes.
+                name = null;
+            }
         }
 
         if (send is null)
         {
             return PeerEgressConsumerOutcome.BlockedNoEgress;
+        }
+        if (name is not null)
+        {
+            // Ahead of the packet on the same queue, so the egress knows the name before the packet
+            // opens anything. Not sent at all when it cannot be: the packet would open a flow to the
+            // fake address, which is worse than the retransmission this costs.
+            var binding = PeerEgressFrame.EncodeControl(
+                PeerEgressFrame.Control.NameBind(Ipv4Cidr.FormatAddress(address), name));
+            if (!send(egress, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, binding)))
+            {
+                RecordBlocked("send-failed");
+                return PeerEgressConsumerOutcome.BlockedNoEgress;
+            }
         }
         // hop stays clear: this node is acting as a consumer, not forwarding on behalf of another
         // egress. An egress that receives it set refuses, which is what stops multi-hop chains.
@@ -427,6 +601,49 @@ internal sealed class PeerEgressConsumer(
             return PeerEgressConsumerOutcome.BlockedNoEgress;
         }
         return PeerEgressConsumerOutcome.Forwarded;
+    }
+
+    /// <summary>
+    /// Counts a refusal and answers the application with <see cref="FailurePacket"/>, so it fails
+    /// now rather than at its own timeout. The four refusals that are answered -- no egress, an
+    /// egress that does not resolve names, an unmapped and a stale pool address -- all come here and
+    /// are answered alike.
+    /// </summary>
+    private PeerEgressConsumerOutcome Refuse(byte[] packet, int protocol, string reason, PeerEgressConsumerOutcome outcome)
+    {
+        RecordBlocked(reason);
+        if (FailurePacket(packet, protocol) is { } answer)
+        {
+            toTun?.Invoke(answer);
+        }
+        return outcome;
+    }
+
+    /// <summary>
+    /// Whether a packet to a pool address has to be preceded by its name-bind
+    /// (protocol/spec/peer-egress-dns.md, vector <c>steering</c>): it opened a new flow, it is a TCP
+    /// SYN without ACK, retransmissions included, or its UDP flow has had no reply yet.
+    /// </summary>
+    /// <remarks>
+    /// Control messages are not delivered reliably, so one binding per flow is not enough. TCP
+    /// repeats its SYN until the egress answers, and each repeat carries the binding again; UDP
+    /// repeats nothing, so every datagram carries it until the egress has spoken on the flow. After
+    /// that the egress plainly has the name, and repeating it would only cost bandwidth.
+    /// </remarks>
+    private static bool NeedsNameBind(Flow flow, bool fresh, byte[] packet, int protocol) =>
+        fresh
+        || (protocol == PeerEgressSegment.Ipv4ProtocolTcp && IsBareSyn(packet))
+        || (protocol == PeerEgressDatagram.Ipv4ProtocolUdp && !flow.Replied);
+
+    /// <summary>Whether a TCP or UDP packet is addressed to port 53.</summary>
+    private static bool IsDnsQuery(byte[] packet, int protocol)
+    {
+        if (protocol != PeerEgressSegment.Ipv4ProtocolTcp && protocol != PeerEgressDatagram.Ipv4ProtocolUdp)
+        {
+            return false;
+        }
+        var ihl = (packet[0] & 0x0f) * 4;
+        return packet.Length >= ihl + 4 && ReadUInt16(packet, ihl + 2) == 53;
     }
 
     /// <summary>
@@ -712,6 +929,8 @@ internal sealed class PeerEgressConsumer(
         // Replies count as activity and carry the remote's FIN or RST, both of which decide when
         // the flow is forgotten.
         Touch(flow, packet, outbound: false, nowMs);
+        // The egress has answered on this flow, which ends the per-datagram name-bind of a UDP flow.
+        flow.Replied = true;
         return true;
     }
 

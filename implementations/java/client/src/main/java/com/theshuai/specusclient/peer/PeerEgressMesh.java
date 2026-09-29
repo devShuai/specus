@@ -1,8 +1,10 @@
 package com.theshuai.specusclient.peer;
 
+import com.theshuai.common.peeregress.Ipv4Cidr;
 import com.theshuai.common.peeregress.PeerEgressAuthorization;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressConfigMessage;
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressFrame;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
@@ -21,7 +23,8 @@ import lombok.extern.slf4j.Slf4j;
  *
  * <p>Three joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
  * {@code egress-config} becomes the policy the plane enforces, and a closing session revokes that
- * peer's flows.
+ * peer's flows. For the consumer's phase two it also reads the pushed {@code egress-catalog} and
+ * owns the fake-IP pool.
  *
  * <p>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and the
  * egress plane takes its own, and the plane holds its lock while emitting frames. So frames are
@@ -88,6 +91,44 @@ final class PeerEgressMesh implements AutoCloseable {
             return true;
         }
 
+        /**
+         * {@code peerEgressDnsTakeover}, the switch for phase two (protocol/spec/peer-egress-dns.md).
+         * Off by default; phase one is then exactly as it was.
+         */
+        default boolean dnsTakeover() {
+            return false;
+        }
+
+        /** {@code peerEgressFakeIpCidr}, the fake-IP pool phase two hands addresses out of. */
+        default String fakeIpCidr() {
+            return PeerEgressDns.DEFAULT_FAKE_IP_CIDR;
+        }
+
+        /**
+         * The networks of this device's interfaces, which the pool must stay clear of: an address
+         * handed out for a name would otherwise shadow a real host on an attached network.
+         */
+        default List<String> localInterfaceCidrs() {
+            return PeerEgressEndpoints.localInterfaceCidrs();
+        }
+
+        /**
+         * This device's own interface addresses: besides the mesh address, the only sources the DNS
+         * responder answers.
+         */
+        default List<String> localInterfaceAddresses() {
+            return PeerEgressEndpoints.localInterfaceAddresses();
+        }
+
+        /**
+         * The upstreams the DNS responder forwards to, in order: literal addresses with an optional
+         * port. Step five supplies the ones it recorded; until then none, and a forwarded query is
+         * answered SERVFAIL.
+         */
+        default List<String> dnsUpstreams() {
+            return List.of();
+        }
+
         /** Complete snapshot of reachable egress peers; omitted peers are offline. */
         default Map<Long, Boolean> egressAvailability() {
             return Map.of();
@@ -151,6 +192,42 @@ final class PeerEgressMesh implements AutoCloseable {
      * because somebody else already owned them, and whether the plan had to be rolled back.
      */
     private volatile PeerEgressStatus.ApplyOutcome applied = PeerEgressStatus.ApplyOutcome.none();
+
+    /** What the server's egress-catalog said about which egresses resolve names. */
+    private final PeerEgressCatalog catalog = new PeerEgressCatalog();
+    /**
+     * The fake-IP pool while phase two runs and there is a consumer to steer by it; null
+     * otherwise. Owned here rather than by the consumer so that the mappings outlive a
+     * reconfiguration, and so the DNS responder (step four) answers from the same pool.
+     */
+    private volatile PeerEgressFakeIpPool fakeIps;
+    /** The DNS responder over that pool, started and stopped with it. */
+    private volatile PeerEgressDnsResponder responder;
+    /**
+     * How the responder reaches its upstreams. Replaceable before the first reconcile, so a test
+     * forwards to a fake instead of the network.
+     */
+    PeerEgressDnsResponder.Forwarder dnsForwarder = new PeerEgressDnsForwarder();
+    /** What every responder of this process did, which the status reports running or not. */
+    private final PeerEgressDnsResponder.Counters dnsCounters = new PeerEgressDnsResponder.Counters();
+    /**
+     * This device's interface addresses, for the responder's source check. Read at most every few
+     * seconds: the check runs on the TUN read path, and enumerating interfaces per query would put
+     * a system call behind every lookup that does not come from the mesh address.
+     */
+    private final Object localAddressLock = new Object();
+    private java.util.Set<Integer> localAddresses = java.util.Set.of();
+    private long localAddressesAtMillis;
+    private boolean localAddressesLoaded;
+    private static final long LOCAL_ADDRESSES_TTL_MILLIS = 5_000L;
+    /**
+     * The pool checked against this device's interfaces, once: the check is made at startup, not on
+     * every tick, and a pool only changes with the configuration.
+     */
+    private final Object phaseLock = new Object();
+    private String interfacesCheckedFor;
+    private boolean interfacesOverlap;
+    private String phaseLogged = "";
 
     /**
      * The consumer's route plan, kept true on the mesh's own tick. Guarded by {@link #planLock},
@@ -258,7 +335,9 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         synchronized (this) {
             if (consumer == null) {
-                consumer = new PeerEgressConsumer(host::sendToPeer, host::writeToDevice);
+                PeerEgressConsumer built = new PeerEgressConsumer(host::sendToPeer, host::writeToDevice);
+                built.setLocalAddresses(this::isLocalAddress);
+                consumer = built;
             }
             return consumer;
         }
@@ -323,7 +402,7 @@ final class PeerEgressMesh implements AutoCloseable {
         if (outcome == PeerEgressConsumer.Outcome.NOT_MINE) {
             return false;
         }
-        if (outcome != PeerEgressConsumer.Outcome.FORWARDED) {
+        if (outcome != PeerEgressConsumer.Outcome.FORWARDED && outcome != PeerEgressConsumer.Outcome.DNS) {
             // Logged without the destination: a per-destination record of what a user was blocked
             // from reaching is their own browsing history.
             log.debug("[peer-egress-consumer] packet not forwarded: {}", outcome);
@@ -347,13 +426,179 @@ final class PeerEgressMesh implements AutoCloseable {
         if (!plane.acceptRevision(message.revision())) {
             return;
         }
+        List<String> denied = new ArrayList<>(host.deploymentDenyCidrs());
+        // An egress whose own configuration runs phase two refuses to dial its own pool: such a
+        // flow would be routed into this node's tunnel and steered by this node's own names. Judged
+        // from the configuration and the mesh rather than the last reconcile, which may not have
+        // run when the policy arrives.
+        String ownPool = PeerEgressDns.effectivePool(host.fakeIpCidr());
+        if (PeerEgressDns.phaseTwo(host.consumerEnabled(), host.dnsTakeover(), ownPool, meshCidrOrDefault()).active()) {
+            denied.add(ownPool);
+        }
         PeerEgressAuthorization.Context context = new PeerEgressAuthorization.Context(
-                meshCidrOrDefault(), List.copyOf(host.deploymentDenyCidrs()));
+                meshCidrOrDefault(), List.copyOf(denied));
         plane.setLocalInterfaceCidrs(PeerEgressEndpoints.localInterfaceCidrs());
         plane.applyPolicy(message.policy(), context, System.currentTimeMillis());
         log.info("[peer-egress] policy applied enabled={} revision={} rules={}",
                 message.policy().isEnabled(), message.revision(),
                 message.policy().getDestinationRules().size());
+    }
+
+    /**
+     * Takes a pushed {@code egress-catalog}: which egresses resolve names. A domain rule sends
+     * nothing to an egress that does not, so a change here can end flows to fake addresses, and
+     * their egresses are told to close their side.
+     *
+     * <p>Kept even while no consumer exists, so the one built later starts from what the server
+     * last said rather than from nothing.
+     */
+    void applyEgressCatalog(String payload) {
+        if (!catalog.read(payload)) {
+            log.debug("[peer-egress-consumer] egress-catalog ignored: unreadable or not newer");
+            return;
+        }
+        log.info("[peer-egress-consumer] egress catalogue applied revision={} domainTargetCapable={}",
+                catalog.revision(), catalog.domainCapableIds());
+        PeerEgressConsumer consumerRole = consumer;
+        if (consumerRole == null) {
+            return;
+        }
+        Map<Long, List<String>> purge;
+        synchronized (consumerRole) {
+            // Read inside the monitor, so of two racing updates the later one is the one applied.
+            purge = consumerRole.setDomainCapable(catalog.domainCapable(), System.currentTimeMillis());
+        }
+        deliverPurges(purge);
+    }
+
+    /**
+     * A new control session: the server numbers its catalogues afresh. Only the revision floor is
+     * reset; what the last catalogue said stands until the next one replaces it.
+     */
+    void newControlSession() {
+        catalog.newSession();
+    }
+
+    /** The pool phase two answers from, or null while it does not run; for the DNS responder. */
+    PeerEgressFakeIpPool fakeIpPool() {
+        return fakeIps;
+    }
+
+    /** The egresses the last accepted catalogue says resolve names, sorted. */
+    List<Long> domainCapableEgresses() {
+        return catalog.domainCapableIds();
+    }
+
+    /**
+     * Whether phase two runs, from the configuration, the actual mesh network and, once, this
+     * device's interfaces. An unusable pool stops phase two alone and is said once.
+     */
+    PeerEgressDns.PhaseTwo phaseTwo() {
+        String cidr = PeerEgressDns.effectivePool(host.fakeIpCidr());
+        PeerEgressDns.PhaseTwo phase = PeerEgressDns.phaseTwo(
+                host.consumerEnabled(), host.dnsTakeover(), cidr, meshCidrOrDefault());
+        synchronized (phaseLock) {
+            if (phase.active() && overlapsInterface(cidr)) {
+                phase = new PeerEgressDns.PhaseTwo(false, PeerEgressCodes.FAKE_IP_POOL_INVALID);
+            }
+            String state = phase.active() + "|" + phase.code() + "|" + cidr;
+            if (host.dnsTakeover() && !state.equals(phaseLogged)) {
+                phaseLogged = state;
+                // Without the pool itself: configuration values stay out of the log, as a rule's
+                // match does.
+                if (phase.active()) {
+                    log.info("[peer-egress-consumer] phase two running");
+                } else if (phase.code() != null) {
+                    // Phase one carries on; domain rules read as though takeover were off.
+                    log.warn("[peer-egress-consumer] phase two not started: {} (peerEgressFakeIpCidr must be"
+                            + " an IPv4 /8 to /24 clear of the Peer Mesh network and of this device's networks)",
+                            phase.code());
+                }
+            }
+        }
+        return phase;
+    }
+
+    /** Whether the pool overlaps a network of this device's own, checked once per pool. */
+    private boolean overlapsInterface(String cidr) {
+        if (!cidr.equals(interfacesCheckedFor)) {
+            interfacesCheckedFor = cidr;
+            interfacesOverlap = false;
+            Ipv4Cidr pool = Ipv4Cidr.parse(cidr);
+            List<String> networks = host.localInterfaceCidrs();
+            for (String network : networks == null ? List.<String>of() : networks) {
+                Ipv4Cidr parsed = Ipv4Cidr.parse(network);
+                if (pool != null && parsed != null && parsed.overlaps(pool)) {
+                    interfacesOverlap = true;
+                    break;
+                }
+            }
+        }
+        return interfacesOverlap;
+    }
+
+    /**
+     * The pool for a usable CIDR, kept across calls so its mappings survive a reconfiguration, and
+     * the DNS responder that answers from it, started with it.
+     */
+    private PeerEgressFakeIpPool poolFor(String cidr) {
+        Ipv4Cidr parsed = Ipv4Cidr.parse(cidr.trim());
+        synchronized (phaseLock) {
+            PeerEgressFakeIpPool existing = fakeIps;
+            if (existing != null && existing.cidr().equals(parsed.toString())) {
+                return existing;
+            }
+            PeerEgressFakeIpPool created = new PeerEgressFakeIpPool(parsed);
+            PeerEgressDnsResponder previous = responder;
+            responder = PeerEgressDnsResponder.start(created, dnsForwarder, host::writeToDevice, dnsCounters);
+            fakeIps = created;
+            if (previous != null) {
+                previous.close();
+            }
+            return created;
+        }
+    }
+
+    /** Phase two is not running: no pool, and no responder answering from one. */
+    private void stopPhaseTwo() {
+        synchronized (phaseLock) {
+            fakeIps = null;
+            PeerEgressDnsResponder previous = responder;
+            responder = null;
+            if (previous != null) {
+                previous.close();
+            }
+        }
+    }
+
+    /** The DNS responder while phase two runs, or null. */
+    PeerEgressDnsResponder dnsResponder() {
+        return responder;
+    }
+
+    /**
+     * Whether an address is one of this device's own, from an interface list at most a few seconds
+     * old.
+     */
+    private boolean isLocalAddress(int address) {
+        long now = System.currentTimeMillis();
+        synchronized (localAddressLock) {
+            if (!localAddressesLoaded || now - localAddressesAtMillis >= LOCAL_ADDRESSES_TTL_MILLIS
+                    || now < localAddressesAtMillis) {
+                java.util.Set<Integer> fresh = new java.util.HashSet<>();
+                List<String> listed = host.localInterfaceAddresses();
+                for (String text : listed == null ? List.<String>of() : listed) {
+                    Integer parsed = Ipv4Cidr.parseAddress(text);
+                    if (parsed != null) {
+                        fresh.add(parsed);
+                    }
+                }
+                localAddresses = java.util.Set.copyOf(fresh);
+                localAddressesAtMillis = now;
+                localAddressesLoaded = true;
+            }
+            return localAddresses.contains(address);
+        }
     }
 
     /**
@@ -375,9 +620,25 @@ final class PeerEgressMesh implements AutoCloseable {
         if (consumerSnapshot != null) {
             consumerSnapshot = consumerSnapshot.withPaths(host.egressPaths());
         }
+        PeerEgressStatus.Dns dns = null;
+        if (host.dnsTakeover()) {
+            PeerEgressDns.PhaseTwo phase = phaseTwo();
+            PeerEgressDnsResponder answering = responder;
+            List<String> upstreams = new ArrayList<>();
+            List<String> configured = host.dnsUpstreams();
+            for (String text : configured == null ? List.<String>of() : configured) {
+                if (PeerEgressDnsForwarder.parseUpstream(text) != null) {
+                    upstreams.add(text.trim());
+                }
+            }
+            dns = new PeerEgressStatus.Dns(PeerEgressDns.effectivePool(host.fakeIpCidr()), phase.active(), phase.code(),
+                    phase.active() && answering != null ? Ipv4Cidr.format(answering.listenAddress()) : null,
+                    List.copyOf(upstreams), dnsCounters.answered(), dnsCounters.forwarded(), dnsCounters.failed());
+        }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,
-                plane == null ? null : plane.statusSnapshot(), host.consumerEnabled(), host.consumerRules());
+                plane == null ? null : plane.statusSnapshot(), host.consumerEnabled(), host.consumerRules(),
+                dns);
     }
 
     /**
@@ -407,15 +668,34 @@ final class PeerEgressMesh implements AutoCloseable {
 
     void reconcile(List<PeerEgressRule> rules, long nowMs) {
         if (closed.get()) { return; }
+        // While phase two runs the pool is routed and the consumer exists whether or not there are
+        // rules: an address in the pool has to reach something that answers it, even if all it can
+        // be told is that the address stands for nothing.
+        PeerEgressDns.PhaseTwo phase = phaseTwo();
+        PeerEgressFakeIpPool pool = null;
+        PeerEgressDnsResponder dns = null;
+        if (phase.active()) {
+            pool = poolFor(PeerEgressDns.effectivePool(host.fakeIpCidr()));
+            dns = responder;
+            if (dns != null) {
+                dns.setUpstreams(host.dnsUpstreams());
+            }
+        } else {
+            stopPhaseTwo();
+        }
         // Consumer sends can reach the mesh. Never wait for its monitor while holding
         // planLock: mesh shutdown acquires planLock to withdraw routes.
-        Map<Long, List<String>> purge = rules.isEmpty() ? Map.of()
-                : configureConsumer(rules, meshCidrOrDefault(), nowMs);
+        //
+        // A consumer that exists is reconfigured even with nothing left for it to do: phase two
+        // stopping (the mesh network moving over the pool, say) with no rules would otherwise leave
+        // it holding the pool and a stopped responder, steering by a pool nothing routes any more.
+        Map<Long, List<String>> purge = rules.isEmpty() && pool == null && consumer == null ? Map.of()
+                : configureConsumer(rules, meshCidrOrDefault(), pool, dns, nowMs);
         synchronized (planLock) {
             if (closed.get()) {
                 return;
             }
-            reconcileLocked(rules, nowMs);
+            reconcileLocked(rules, pool == null ? null : pool.cidr(), nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
@@ -423,7 +703,8 @@ final class PeerEgressMesh implements AutoCloseable {
         syncEgressAvailability(host.egressAvailability());
     }
 
-    private void reconcileLocked(List<PeerEgressRule> rules, long nowMs) {
+    /** @param fakeIpCidr the pool phase two runs with, whose route the plan then carries; or null */
+    private void reconcileLocked(List<PeerEgressRule> rules, String fakeIpCidr, long nowMs) {
         String meshCidr = meshCidrOrDefault();
 
         // Without a device there is nothing to route into. A rule's route pointed at an interface
@@ -434,10 +715,10 @@ final class PeerEgressMesh implements AutoCloseable {
         if (host.deviceReady()) {
             deviceWaitLogged = false;
             PeerEgressRoutePlanner.Plan plan =
-                    PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs), meshCidr);
+                    PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs), meshCidr, fakeIpCidr);
             logRefusals(plan.refused());
             desired = plan.routes();
-        } else if (!rules.isEmpty() && !deviceWaitLogged) {
+        } else if ((!rules.isEmpty() || fakeIpCidr != null) && !deviceWaitLogged) {
             deviceWaitLogged = true;
             log.warn("[peer-egress-consumer] routes not installed: virtual device is {}",
                     host.deviceStatus());
@@ -559,19 +840,44 @@ final class PeerEgressMesh implements AutoCloseable {
      * is every flow being re-examined for nothing on every tick; with a change of virtual IP it is
      * what has to happen.
      */
-    private Map<Long, List<String>> configureConsumer(List<PeerEgressRule> rules, String meshCidr, long nowMs) {
+    private Map<Long, List<String>> configureConsumer(List<PeerEgressRule> rules, String meshCidr,
+            PeerEgressFakeIpPool pool, PeerEgressDnsResponder dns, long nowMs) {
         String virtualIp = host.virtualIp() == null ? "" : host.virtualIp().trim();
-        StringBuilder key = new StringBuilder(meshCidr).append('|').append(virtualIp);
+        StringBuilder key = new StringBuilder(meshCidr).append('|').append(virtualIp)
+                .append('|').append(pool == null ? "" : pool.cidr())
+                .append('|').append(dns == null ? 0 : System.identityHashCode(dns));
         for (PeerEgressRule rule : rules) {
             key.append('|').append(rule.getMatch()).append(' ').append(rule.getAction())
                     .append(' ').append(rule.getEgressClientId()).append(' ').append(rule.getPort());
         }
         PeerEgressConsumer consumerRole = ensureConsumer();
         synchronized (consumerRole) {
-            if (key.toString().equals(consumerKey)) { return Map.of(); }
+            // A consumer built after the catalogue arrived starts from it. Cheap when nothing
+            // changed, and read inside the monitor like every other update of it.
+            Map<Long, List<String>> purge = consumerRole.setDomainCapable(catalog.domainCapable(), nowMs);
+            if (key.toString().equals(consumerKey)) { return purge; }
             consumerKey = key.toString();
-            return consumerRole.configure(rules, meshCidr, virtualIp, nowMs);
+            return mergePurges(purge, consumerRole.configure(rules, meshCidr, virtualIp, pool, dns, nowMs));
         }
+    }
+
+    /** Two sets of purges as one, each egress's destinations once and in order. */
+    private static Map<Long, List<String>> mergePurges(Map<Long, List<String>> first,
+            Map<Long, List<String>> second) {
+        if (first.isEmpty()) {
+            return second;
+        }
+        if (second.isEmpty()) {
+            return first;
+        }
+        Map<Long, java.util.TreeSet<String>> merged = new java.util.TreeMap<>();
+        for (Map<Long, List<String>> part : List.of(first, second)) {
+            part.forEach((egress, destinations) ->
+                    merged.computeIfAbsent(egress, unused -> new java.util.TreeSet<>()).addAll(destinations));
+        }
+        Map<Long, List<String>> out = new java.util.LinkedHashMap<>();
+        merged.forEach((egress, destinations) -> out.put(egress, List.copyOf(destinations)));
+        return out;
     }
 
     /**
@@ -748,6 +1054,7 @@ final class PeerEgressMesh implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        stopPhaseTwo();
         PeerEgressRuntime plane = runtime;
         if (plane != null) {
             plane.shutdown(System.currentTimeMillis());
