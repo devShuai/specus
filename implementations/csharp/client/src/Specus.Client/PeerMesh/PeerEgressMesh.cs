@@ -56,6 +56,21 @@ internal interface IPeerEgressMeshHost
     /// </summary>
     bool ConsumerEnabled => true;
 
+    /// <summary>
+    /// Phase two's switch, <c>peerEgressDnsTakeover</c>: domain rules through the fake-IP pool.
+    /// Off by default, which is phase one exactly.
+    /// </summary>
+    bool DnsTakeover => false;
+
+    /// <summary>The fake-IP pool as configured, <c>peerEgressFakeIpCidr</c>.</summary>
+    string FakeIpCidr => PeerEgressRules.DefaultFakeIpCidr;
+
+    /// <summary>
+    /// The IPv4 networks of this device's own interfaces, which the pool must stay clear of. Read
+    /// once, when phase two first starts.
+    /// </summary>
+    IReadOnlyList<string> LocalInterfaceNetworks() => PeerEgressEndpoints.LocalInterfaceCidrs();
+
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
 
@@ -83,9 +98,10 @@ internal interface IPeerEgressMeshHost
 /// Wiring the egress data plane into Peer Mesh.
 /// </summary>
 /// <remarks>
-/// Three joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
-/// <c>egress-config</c> becomes the policy the plane enforces, and a closing session revokes that
-/// peer's flows.
+/// Four joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
+/// <c>egress-config</c> becomes the policy the plane enforces, the pushed <c>egress-catalog</c>
+/// says which egresses the consumer may send names to, and a closing session revokes that peer's
+/// flows.
 ///
 /// <para>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and
 /// the egress plane takes its own, and the plane holds its lock while emitting frames. So frames
@@ -173,6 +189,29 @@ internal sealed class PeerEgressMesh(
     private long _repairAtMillis;
     private bool _repairTroubled;
     private string _tableErrorLogged = "";
+
+    /// <summary>Which egresses resolve names, from <c>egress-catalog</c>; locked on its own.</summary>
+    private readonly PeerEgressCatalog _catalog = new();
+
+    /// <summary>
+    /// Guards phase two's state below. Never held while anything that can wait on the mesh runs.
+    /// </summary>
+    private readonly object _phaseLock = new();
+
+    /// <summary>
+    /// The fake-IP pool, built the first time phase two runs and kept from then on. Its mappings
+    /// are answers applications hold, so a reconcile that finds phase two still running must hand
+    /// the consumer the same pool rather than a fresh one.
+    /// </summary>
+    private PeerEgressFakeIpPool? _fakeIpPool;
+
+    /// <summary>The last decision on phase two, for the status; null before the first.</summary>
+    private PeerEgressPhaseTwo? _phaseTwo;
+
+    /// <summary>The pool whose overlap with this device's interfaces was checked, and the answer.</summary>
+    private string? _interfacesCheckedFor;
+    private bool _clearOfInterfaces;
+    private string _phaseTwoLogged = "";
 
     /// <summary>
     /// Builds the plane and the threads that carry its frames and its clock, on first use.
@@ -417,10 +456,11 @@ internal sealed class PeerEgressMesh(
         {
             return;
         }
+        var meshCidr = MeshCidrOrDefault();
         var context = new PeerEgressContext
         {
-            MeshCidr = MeshCidrOrDefault(),
-            DeploymentDenyCidrs = host.DeploymentDenyCidrs(),
+            MeshCidr = meshCidr,
+            DeploymentDenyCidrs = [.. host.DeploymentDenyCidrs(), .. OwnFakeIpPool(meshCidr)],
         };
         plane.SetLocalInterfaceCidrs(PeerEgressEndpoints.LocalInterfaceCidrs());
         plane.ApplyPolicy(message.Policy, context, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -428,6 +468,63 @@ internal sealed class PeerEgressMesh(
             "[peer-egress] policy applied enabled={Enabled} revision={Revision} rules={Rules}",
             message.Policy.Enabled, message.Revision, message.Policy.DestinationRules.Count);
     }
+
+    /// <summary>
+    /// This node's own fake-IP pool when its configuration runs phase two, for the egress role's
+    /// forced-deny list (protocol/spec/peer-egress-dns.md, section five). A consumer's flow dialled
+    /// into it would be routed into this node's own tunnel and steered by this node's own names.
+    /// </summary>
+    /// <remarks>
+    /// Judged from the configuration and the mesh prefix rather than from the last reconcile, which
+    /// may not have run when the policy arrives; denying a range that turns out not to be routed
+    /// here costs a destination nobody should be dialling anyway.
+    /// </remarks>
+    private IEnumerable<string> OwnFakeIpPool(string meshCidr)
+    {
+        var phase = PeerEgressRules.PhaseTwo(host.ConsumerEnabled, host.DnsTakeover, host.FakeIpCidr, meshCidr);
+        return phase.Active ? [phase.Pool.ToString()] : [];
+    }
+
+    /// <summary>
+    /// Takes a pushed <c>egress-catalog</c>: which egresses resolve names.
+    /// </summary>
+    /// <remarks>
+    /// Its revision is guarded as <c>egress-config</c>'s is, per control session. An accepted
+    /// catalogue can take away an egress's capability, and the flows to pool addresses it carried
+    /// are then closed at once rather than left to fail: the consumer re-decides them and the purges
+    /// go out here.
+    /// </remarks>
+    public void ApplyEgressCatalog(string? payload)
+    {
+        if (!_catalog.Read(payload))
+        {
+            logger?.LogDebug("[peer-egress-consumer] egress-catalog ignored: unreadable, or not newer than the last one");
+            return;
+        }
+        logger?.LogInformation(
+            "[peer-egress-consumer] egress catalog applied revision={Revision} domainTargetCapable=[{Capable}]",
+            _catalog.Revision, string.Join(",", _catalog.CapableIds()));
+        if (_consumer is not { } consumerRole)
+        {
+            // Nothing built yet; the consumer reads the catalogue when it is.
+            return;
+        }
+        IReadOnlyDictionary<long, IReadOnlyList<string>> purge;
+        lock (consumerRole)
+        {
+            // Read inside the consumer's lock, as ConfigureConsumer reads it, so whichever of the two
+            // runs last hands the consumer the newest catalogue.
+            purge = consumerRole.SetEgressCapabilities(_catalog.Capabilities(),
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+        DeliverPurges(purge);
+    }
+
+    /// <summary>
+    /// A new control session is starting: the next <c>egress-catalog</c> is accepted whatever its
+    /// revision, since the revision counts within one session. What the last one said is kept.
+    /// </summary>
+    public void NewControlSession() => _catalog.NewSession();
 
     /// <summary>The egress section of the diagnostic snapshot.</summary>
     /// <remarks>
@@ -439,17 +536,117 @@ internal sealed class PeerEgressMesh(
         var consumerRole = _consumer;
         var installer = _routes;
         var plane = _runtime;
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         PeerEgressConsumerStatus? consumerStatus = null;
         if (consumerRole is not null)
         {
             lock (consumerRole)
             {
-                consumerStatus = consumerRole.StatusSnapshot(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                consumerStatus = consumerRole.StatusSnapshot(nowMs);
             }
         }
         if (consumerStatus is not null) consumerStatus = consumerStatus with { Paths = host.EgressPaths };
         return PeerEgressStatus.Section(consumerStatus,
-            installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules);
+            installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules,
+            DnsStatus(nowMs));
+    }
+
+    /// <summary>
+    /// <c>consumer.dns</c>, only while <c>peerEgressDnsTakeover</c> is on. The counts are taken now
+    /// rather than remembered, so an address whose rest ended a minute ago is not reported resting.
+    /// </summary>
+    private PeerEgressDnsStatus? DnsStatus(long nowMs)
+    {
+        if (!host.DnsTakeover)
+        {
+            return null;
+        }
+        PeerEgressPhaseTwo phase;
+        PeerEgressFakeIpPool? pool;
+        lock (_phaseLock)
+        {
+            phase = _phaseTwo ?? DecidePhaseTwoLocked(MeshCidrOrDefault()).Phase;
+            pool = phase.Active ? _fakeIpPool : null;
+        }
+        return new PeerEgressDnsStatus(phase.Active, host.FakeIpCidr?.Trim() ?? string.Empty,
+            pool?.Mappings ?? 0, pool?.Quarantined(nowMs) ?? 0, phase.Code);
+    }
+
+    /// <summary>
+    /// Whether phase two runs now, and the pool it runs over.
+    /// </summary>
+    /// <remarks>
+    /// Decided on every reconcile, because one of its inputs moves: the mesh prefix arrives from the
+    /// server and a pool that overlaps it stops phase two. The overlap with this device's own
+    /// interfaces is checked once, when the pool is first considered: the spec makes it a startup
+    /// check, and following every address change is step five's work, together with the system DNS
+    /// it has to hand back. An unusable pool stops phase two alone; phase one carries on.
+    /// </remarks>
+    private (PeerEgressPhaseTwo Phase, PeerEgressFakeIpPool? Pool) DecidePhaseTwo(string meshCidr)
+    {
+        lock (_phaseLock)
+        {
+            return DecidePhaseTwoLocked(meshCidr);
+        }
+    }
+
+    private (PeerEgressPhaseTwo Phase, PeerEgressFakeIpPool? Pool) DecidePhaseTwoLocked(string meshCidr)
+    {
+        var phase = PeerEgressRules.PhaseTwo(host.ConsumerEnabled, host.DnsTakeover, host.FakeIpCidr, meshCidr);
+        var reason = phase.Code is null ? "" : "peerEgressFakeIpCidr is not an IPv4 prefix of /8 to /24 clear of the mesh";
+        if (phase.Active && !ClearOfInterfacesLocked(phase.Pool))
+        {
+            phase = new PeerEgressPhaseTwo(false, PeerEgressCodes.FakeIpPoolInvalid, default);
+            reason = "peerEgressFakeIpCidr overlaps a network of this device's own interfaces";
+        }
+        _phaseTwo = phase;
+        var said = phase.Active ? "on" : phase.Code ?? "off";
+        if (!string.Equals(said, _phaseTwoLogged, StringComparison.Ordinal))
+        {
+            _phaseTwoLogged = said;
+            if (phase.Active)
+            {
+                logger?.LogInformation("[peer-egress-consumer] phase two running: domain rules steer through the fake-IP pool");
+            }
+            else if (phase.Code is not null)
+            {
+                // The reason and not the value, as for rules: configuration stays out of the log.
+                logger?.LogWarning("[peer-egress-consumer] phase two not started: {Code} ({Reason}); phase one carries on",
+                    phase.Code, reason);
+            }
+        }
+        if (!phase.Active)
+        {
+            return (phase, null);
+        }
+        if (_fakeIpPool is null || _fakeIpPool.Cidr != phase.Pool)
+        {
+            _fakeIpPool = new PeerEgressFakeIpPool(phase.Pool, logger: logger);
+        }
+        return (phase, _fakeIpPool);
+    }
+
+    /// <summary>Whether the pool is clear of this device's own interface networks, asked once per pool.</summary>
+    private bool ClearOfInterfacesLocked(Ipv4Cidr pool)
+    {
+        var key = pool.ToString();
+        if (string.Equals(_interfacesCheckedFor, key, StringComparison.Ordinal))
+        {
+            return _clearOfInterfaces;
+        }
+        _interfacesCheckedFor = key;
+        _clearOfInterfaces = true;
+        foreach (var text in host.LocalInterfaceNetworks())
+        {
+            if (Ipv4Cidr.TryParse(text, out var network) && network.Overlaps(pool))
+            {
+                // A pool route over a network this device is on would take part of that network
+                // away from it, and an address handed out there could be a real neighbour's.
+                _clearOfInterfaces = false;
+                break;
+            }
+        }
+        return _clearOfInterfaces;
     }
 
     /// <summary>
@@ -480,11 +677,16 @@ internal sealed class PeerEgressMesh(
     public void Reconcile(IReadOnlyList<PeerEgressRule> rules, long nowMs)
     {
         lock (_gate) { if (_closed) { return; } }
+        var meshCidr = MeshCidrOrDefault();
+        // Phase two needs the consumer even with no rules yet: the pool's route sends its addresses
+        // into the TUN, and whatever arrives there is refused as unmapped rather than dropped
+        // unaccounted for by the mesh path.
+        var (_, pool) = DecidePhaseTwo(meshCidr);
         // Consumer callbacks may reach the mesh. Do not wait for their lock while
         // holding _planLock, which mesh shutdown needs when withdrawing routes.
-        var purge = rules.Count == 0
+        var purge = rules.Count == 0 && pool is null
             ? new Dictionary<long, IReadOnlyList<string>>()
-            : ConfigureConsumer(rules, MeshCidrOrDefault(), nowMs);
+            : ConfigureConsumer(rules, meshCidr, pool, nowMs);
         lock (_planLock)
         {
             lock (_gate)
@@ -494,7 +696,7 @@ internal sealed class PeerEgressMesh(
                     return;
                 }
             }
-            ReconcileLocked(rules, nowMs);
+            ReconcileLocked(rules, pool?.Cidr, nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
@@ -503,7 +705,7 @@ internal sealed class PeerEgressMesh(
     }
 
     private void ReconcileLocked(
-        IReadOnlyList<PeerEgressRule> rules, long nowMs)
+        IReadOnlyList<PeerEgressRule> rules, Ipv4Cidr? fakeIpPool, long nowMs)
     {
         var meshCidr = MeshCidrOrDefault();
 
@@ -515,11 +717,11 @@ internal sealed class PeerEgressMesh(
         if (host.DeviceReady)
         {
             _deviceWaitLogged = false;
-            var plan = PeerEgressRoutePlanner.Plan(rules, BypassAddresses(nowMs), meshCidr);
+            var plan = PeerEgressRoutePlanner.Plan(rules, BypassAddresses(nowMs), meshCidr, fakeIpPool);
             LogRefusals(plan.Refused);
             desired = plan.Routes;
         }
-        else if (rules.Count > 0 && !_deviceWaitLogged)
+        else if ((rules.Count > 0 || fakeIpPool is not null) && !_deviceWaitLogged)
         {
             _deviceWaitLogged = true;
             logger?.LogWarning("[peer-egress-consumer] routes not installed: virtual device is {Status}",
@@ -657,10 +859,12 @@ internal sealed class PeerEgressMesh(
     /// what has to happen.
     /// </remarks>
     private IReadOnlyDictionary<long, IReadOnlyList<string>> ConfigureConsumer(
-        IReadOnlyList<PeerEgressRule> rules, string meshCidr, long nowMs)
+        IReadOnlyList<PeerEgressRule> rules, string meshCidr, PeerEgressFakeIpPool? fakeIpPool, long nowMs)
     {
         var virtualIp = host.VirtualIp?.Trim() ?? string.Empty;
-        var key = meshCidr + "|" + virtualIp + "|" + string.Join("|",
+        // Phase two starting or stopping changes which rules are in force, so it is part of what
+        // makes a configuration distinct.
+        var key = meshCidr + "|" + virtualIp + "|" + (fakeIpPool?.Cidr.ToString() ?? "-") + "|" + string.Join("|",
             rules.Select(rule => $"{rule.Match} {rule.Action} {rule.EgressClientId} {rule.Port}"));
         var consumerRole = EnsureConsumer();
         lock (consumerRole)
@@ -670,8 +874,27 @@ internal sealed class PeerEgressMesh(
                 return new Dictionary<long, IReadOnlyList<string>>();
             }
             _consumerKey = key;
-            return consumerRole.Configure(rules, meshCidr, virtualIp, nowMs);
+            // A consumer built after the catalogue arrived has not heard it yet. Read inside the
+            // consumer's lock, as ApplyEgressCatalog reads it, so the newest catalogue wins.
+            var purge = Merge(
+                consumerRole.SetEgressCapabilities(_catalog.Capabilities(), nowMs),
+                consumerRole.Configure(rules, meshCidr, virtualIp, nowMs, fakeIpPool));
+            return purge;
         }
+    }
+
+    /// <summary>Two sets of purges as one, a destination named by both sent once.</summary>
+    private static Dictionary<long, IReadOnlyList<string>> Merge(
+        IReadOnlyDictionary<long, IReadOnlyList<string>> first, IReadOnlyDictionary<long, IReadOnlyList<string>> second)
+    {
+        var merged = new Dictionary<long, IReadOnlyList<string>>();
+        foreach (var (egress, destinations) in first.Concat(second))
+        {
+            merged[egress] = merged.TryGetValue(egress, out var known)
+                ? known.Union(destinations, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList()
+                : destinations;
+        }
+        return merged;
     }
 
     /// <summary>
@@ -811,9 +1034,28 @@ internal sealed class PeerEgressMesh(
             {
                 continue;
             }
-            var body = PeerEgressFrame.EncodeControl(
-                PeerEgressFrame.Control.FlowPurge(destinations, PeerEgressCodes.Disabled));
-            _queue.TryAdd((egress, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, body)));
+            _queue.TryAdd((egress, PurgeFrame(destinations)));
+        }
+    }
+
+    /// <summary>The flow-purge frame sent to an egress for these destinations.</summary>
+    internal static byte[] PurgeFrame(IReadOnlyList<string> destinations) =>
+        PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, PeerEgressFrame.EncodeControl(
+            PeerEgressFrame.Control.FlowPurge(destinations, PeerEgressCodes.Disabled)));
+
+    /// <summary>
+    /// The fake-IP pool while phase two runs, null otherwise. The DNS responder (step four of
+    /// protocol/spec/peer-egress-dns.md) answers from it: <see cref="PeerEgressFakeIpPool.Query(string)"/>
+    /// for a name, <see cref="PeerEgressFakeIpPool.NameFor"/> for a reverse lookup.
+    /// </summary>
+    internal PeerEgressFakeIpPool? FakeIpPool
+    {
+        get
+        {
+            lock (_phaseLock)
+            {
+                return _phaseTwo is { Active: true } ? _fakeIpPool : null;
+            }
         }
     }
 
