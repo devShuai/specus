@@ -440,8 +440,23 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	if meshCIDR == "" {
 		meshCIDR = egressDefaultMeshCIDR
 	}
+	// Built on the first reconcile whatever the configuration, like the route installer, so that a
+	// takeover a killed process left is given back even when this run no longer asks for one.
+	takeover := mesh.ensureEgressDNSTakeover()
+	if mesh.config.PeerEgressEnabled && mesh.config.PeerEgressDNSTakeover && takeover.networkChanged(now) {
+		// Given back first and taken again below, so the new network's DNS is read afresh rather
+		// than queries going on to the last network's resolver; and the pool is checked against
+		// the new network's addresses, which may now overlap it.
+		mesh.logger.Printf("[peer-egress-consumer] the network changed; giving the system DNS back to take it again")
+		takeover.release("the network changed")
+		takeover.forgetAttempt()
+		mesh.egressPoolCheckedFor = ""
+	}
 	// Phase two needs the master switch too, so with it off this is never running either.
 	phase := mesh.egressPhaseTwoFor(meshCIDR)
+	// Last, whichever way the route work below ends: the takeover follows the pool's route, so it
+	// is decided once the route has been applied or checked.
+	defer mesh.reconcileEgressDNSTakeover(takeover, phase, meshCIDR, device, now)
 
 	// The consumer is built only when it has something to do: rules to apply, or phase two's pool to
 	// own. Building it for nothing would start the threads that carry its work and report a
@@ -763,7 +778,14 @@ func (mesh *peerMeshClient) withdrawEgressRoutes() {
 	mesh.mu.Lock()
 	installer := mesh.egressRoutes
 	mesh.egressRoutes = nil
+	takeover := mesh.egressDNS
 	mesh.mu.Unlock()
+	// The system DNS goes back first, while the pool's route and the responder behind it are still
+	// there: a system pointed at an address nothing answers has no DNS at all.
+	if takeover != nil {
+		takeover.release("the client is stopping or restarting the mesh")
+		takeover.forgetAttempt()
+	}
 	mesh.egressPlan = nil
 	mesh.egressRepairAt, mesh.egressRepairTroubled = time.Time{}, false
 	// What was logged belongs to the routes that are going; the next start says its own.

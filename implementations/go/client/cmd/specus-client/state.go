@@ -103,25 +103,26 @@ func publishState(config string, snapshot func() map[string]any) (func(), error)
 	}()
 	return func() { close(stop); <-done; _ = os.Remove(path) }, nil
 }
-func queryState(options cliOptions, config string) int {
+
+// freshStates reads the state every running instance for a config published: owner-only files,
+// written in the last five seconds by a process still alive. code is non-zero with a message when
+// the state could not be read at all: 5 when there is none, 2 when it is not safe to read.
+func freshStates(config string) ([]map[string]any, int, string) {
 	root, err := checkedStateRoot(false)
-	unavailable := func(message string) int {
-		return resultOutput(options.json, options.command, 5, map[string]any{"instances": []any{}}, message)
-	}
 	if os.IsNotExist(err) {
-		return unavailable("No running CLI instance for this config. Start it with run --config PATH.")
+		return nil, 5, "No running CLI instance for this config. Start it with run --config PATH."
 	}
 	if err != nil {
-		return resultOutput(options.json, options.command, 2, nil, "Unsafe or unreadable local state directory. Use an owner-only local directory via SPECUS_CLI_STATE_DIR.")
+		return nil, 2, "Unsafe or unreadable local state directory. Use an owner-only local directory via SPECUS_CLI_STATE_DIR."
 	}
 	paths, err := filepath.Glob(filepath.Join(root, statePrefix(config)+"*.json"))
 	if err != nil || len(paths) > 256 {
-		return unavailable("Local state unavailable; too many instances or invalid directory.")
+		return nil, 5, "Local state unavailable; too many instances or invalid directory."
 	}
-	instances := []any{}
+	var states []map[string]any
 	for _, path := range paths {
 		if err = checkPrivate(path, false); err != nil {
-			return resultOutput(options.json, options.command, 2, nil, "Unsafe local state file; refusing to read it.")
+			return nil, 2, "Unsafe local state file; refusing to read it."
 		}
 		info, e := os.Stat(path)
 		if e != nil || info.Size() > 1024*1024 {
@@ -145,6 +146,25 @@ func queryState(options cliOptions, config string) int {
 		if !ok || !pidOK || !controlOK || !readyOK || age < 0 || age > 5000 || !processAlive(int(pid)) || !matches || data["schemaVersion"] != float64(1) {
 			continue
 		}
+		states = append(states, data)
+	}
+	return states, 0, ""
+}
+
+func queryState(options cliOptions, config string) int {
+	unavailable := func(message string) int {
+		return resultOutput(options.json, options.command, 5, map[string]any{"instances": []any{}}, message)
+	}
+	states, code, problem := freshStates(config)
+	if code == 5 {
+		return unavailable(problem)
+	}
+	if code != 0 {
+		return resultOutput(options.json, options.command, code, nil, problem)
+	}
+	instances := []any{}
+	for _, data := range states {
+		pid := data["pid"]
 		if options.command != "status" {
 			data = map[string]any{"pid": pid, "phase": data["phase"], "catalogAvailable": data["controlAuthenticated"], options.command: data[options.command]}
 		}

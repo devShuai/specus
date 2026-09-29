@@ -41,6 +41,10 @@ func runEgressCommand(options cliOptions, path string) int {
 		return egressTest(options, path)
 	case "egress enable", "egress disable":
 		return egressSwitch(options, path)
+	case "egress dns status":
+		return egressDNSStatus(options, path)
+	case "egress dns restore":
+		return egressDNSRestore(options)
 	default:
 		return egressRuleEdit(options, path)
 	}
