@@ -99,9 +99,43 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	mesh.mu.Unlock()
 
 	status := map[string]any{}
-	status["consumer"] = consumerStatusJSON(consumer, installer, outcome)
+	section := consumerStatusJSON(consumer, installer, outcome)
+	section["enabled"] = mesh.config.PeerEgressEnabled
+	if !mesh.config.PeerEgressEnabled && len(mesh.config.PeerEgressRules) > 0 {
+		// The switch off builds no consumer, so the rules come from the configuration. They are
+		// listed all the same: "kept but not taking anything over" is a state to show, not to hide.
+		section["rules"] = switchedOffRulesJSON(mesh.config.PeerEgressRules)
+	}
+	status["consumer"] = section
 	status["egress"] = egressRoleStatusJSON(runtime)
 	return status
+}
+
+// switchedOffRulesJSON lists configured rules while the master switch is off. None is in force; a
+// rule the user switched off says so itself, the rest name the master switch.
+func switchedOffRulesJSON(configured []egressRule) []map[string]any {
+	rules := make([]map[string]any, 0, len(configured))
+	for index, rule := range configured {
+		code := egressCodeConsumerDisabled
+		if rule.switchedOff() {
+			code = egressCodeRuleDisabled
+		}
+		entry := map[string]any{
+			"index":   index,
+			"match":   strings.TrimSpace(rule.Match),
+			"action":  strings.TrimSpace(rule.Action),
+			"inForce": false,
+			"code":    code,
+		}
+		if rule.EgressClientID != 0 {
+			entry["egressClientId"] = rule.EgressClientID
+		}
+		if rule.Port != 0 {
+			entry["port"] = rule.Port
+		}
+		rules = append(rules, entry)
+	}
+	return rules
 }
 
 func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstaller,

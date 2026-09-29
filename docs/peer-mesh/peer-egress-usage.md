@@ -75,7 +75,9 @@ Content-Type: application/json
 
 ## 二、消费端：写规则
 
-在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。列表非空即启用，没有单独的开关。
+在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。**规则写好只是保存，还要把 `peerEgressEnabled` 设为 `true` 才会接管流量**：保存规则与启用系统接管是两步，默认关闭。
+
+开关关闭而规则不为空时，`config validate` 和每次启动都会提示 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，`specus-client egress` 显示 `consumer: takeover off`，每条规则的状态是 `EGRESS_CONSUMER_DISABLED`。启用前请确认：客户端需要创建虚拟网卡与安装路由的权限（`peerMeshDevice` 不能是 `noop`）；只有命中规则的目标会被接管，其余流量保持本地直连；命中 `egress` 规则而出口不可用时流量被阻断，不会改走本机。
 
 ```jsonc
 {
@@ -83,13 +85,17 @@ Content-Type: application/json
   "apiKey": "env:SPECUS_API_KEY",
   "secret": "env:SPECUS_SECRET",
   "peerMeshDevice": "auto",
+  // 启用系统接管；不写或写 false 时规则只保存、不生效
+  "peerEgressEnabled": true,
   "peerEgressRules": [
     // 这个网段经 2 号设备访问
     {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
     // 其中这一台仍然本地直连
     {"match": "203.0.113.10", "action": "direct"},
     // 这个网段一律不通
-    {"match": "198.51.100.0/24", "action": "block"}
+    {"match": "198.51.100.0/24", "action": "block"},
+    // 暂时停用的规则：留在列表里，不参与匹配
+    {"match": "192.0.2.0/24", "action": "egress", "egressClientId": 2, "enabled": false}
   ]
 }
 ```
@@ -116,6 +122,8 @@ Content-Type: application/json
 | `EGRESS_RULE_MESH_OVERLAP` | 与 Peer Mesh 虚拟网段重叠 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 规则里写了 `port`。端口限制只在出口策略里配置 |
 | `EGRESS_RULE_MISSING_TARGET` | `action` 是 `egress` 但没有有效的 `egressClientId` |
+
+规则写 `"enabled": false` 即停用：它留在列表里但不参与匹配、不安装路由，状态里显示 `EGRESS_RULE_DISABLED`。停用是用户的选择，`config validate` 不为它告警。
 
 ## 三、确认规则生效
 

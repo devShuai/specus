@@ -428,6 +428,8 @@ class Lab:
         }
         if rules is not None:
             config["peerEgressRules"] = rules
+            # Rules are only saved until the master switch is on (#49).
+            config["peerEgressEnabled"] = True
         path = self.work / f"{role}.jsonc"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path

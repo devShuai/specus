@@ -54,11 +54,60 @@ internal static class PeerEgressStatus
     /// <summary>The whole section, assembled for the state file.</summary>
     public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
-        PeerEgressRuntimeStatus? runtime) => new()
+        PeerEgressRuntimeStatus? runtime) => Section(consumer, installed, outcome, runtime, true, []);
+
+    /// <summary>
+    /// The section with the consumer's master switch. Off, no consumer is built, so the rules come
+    /// from the configuration; they are listed all the same, because "kept but not taking anything
+    /// over" is a state to show rather than to hide.
+    /// </summary>
+    public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
+        IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
+        PeerEgressRuntimeStatus? runtime, bool enabled, IReadOnlyList<PeerEgressRule>? configured)
+    {
+        var consumerSection = ConsumerSection(consumer, installed, outcome);
+        consumerSection["enabled"] = enabled;
+        if (!enabled && configured is { Count: > 0 })
         {
-            ["consumer"] = ConsumerSection(consumer, installed, outcome),
+            consumerSection["rules"] = SwitchedOffRules(configured);
+        }
+        return new()
+        {
+            ["consumer"] = consumerSection,
             ["egress"] = EgressSection(runtime),
         };
+    }
+
+    /// <summary>
+    /// Configured rules while the master switch is off. None is in force; a rule the user switched
+    /// off says so itself, the rest name the master switch.
+    /// </summary>
+    internal static List<Dictionary<string, object?>> SwitchedOffRules(IReadOnlyList<PeerEgressRule> configured)
+    {
+        var rules = new List<Dictionary<string, object?>>(configured.Count);
+        for (var index = 0; index < configured.Count; index++)
+        {
+            var rule = configured[index];
+            var entry = new Dictionary<string, object?>
+            {
+                ["index"] = index,
+                ["match"] = rule.Match?.Trim() ?? string.Empty,
+                ["action"] = rule.Action?.Trim() ?? string.Empty,
+                ["inForce"] = false,
+                ["code"] = rule.SwitchedOff ? PeerEgressCodes.RuleDisabled : PeerEgressCodes.ConsumerDisabled,
+            };
+            if (rule.EgressClientId is { } egress and not 0)
+            {
+                entry["egressClientId"] = egress;
+            }
+            if (rule.Port is { } port and not 0)
+            {
+                entry["port"] = port;
+            }
+            rules.Add(entry);
+        }
+        return rules;
+    }
 
     private static Dictionary<string, object?> ConsumerSection(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome)

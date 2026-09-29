@@ -50,6 +50,12 @@ internal interface IPeerEgressMeshHost
     /// <summary>This node's own consumer rules, fixed for the life of the process.</summary>
     IReadOnlyList<PeerEgressRule> ConsumerRules => [];
 
+    /// <summary>
+    /// The consumer's master switch, <c>peerEgressEnabled</c>. Off, the rules are kept and none is
+    /// applied. True by default so a host built only to drive the plane applies what it is given.
+    /// </summary>
+    bool ConsumerEnabled => true;
+
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
 
@@ -436,7 +442,7 @@ internal sealed class PeerEgressMesh(
             }
         }
         return PeerEgressStatus.Section(consumerStatus,
-            installer?.Installed ?? [], _applied, plane?.StatusSnapshot());
+            installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules);
     }
 
     /// <summary>
@@ -460,7 +466,9 @@ internal sealed class PeerEgressMesh(
     /// drop, the relay is reassigned, the control connection is re-established.
     /// </remarks>
     public void ReconcileRoutes() =>
-        Reconcile(host.ConsumerRules, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // With the master switch off nothing is taken over. The plan is then empty, which withdraws
+        // whatever a previous run left installed, and the consumer is not built.
+        Reconcile(host.ConsumerEnabled ? host.ConsumerRules : [], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
     public void Reconcile(IReadOnlyList<PeerEgressRule> rules, long nowMs)
     {

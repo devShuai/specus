@@ -39,6 +39,15 @@ public final class EgressView {
     }
 
     private static List<String> consumerLines(JsonNode consumer) {
+        // Rules saved with the master switch off are a state of their own, and the one where
+        // nothing is in force by design; said as such rather than folded into "not configured". A
+        // state file from a build without the switch has no such field and reads as before.
+        JsonNode enabled = consumer.path("enabled");
+        JsonNode configured = consumer.path("rules");
+        if (enabled.isBoolean() && !enabled.asBoolean() && configured.isArray() && configured.size() > 0) {
+            return List.of("  consumer: takeover off | " + configured.size()
+                    + " rules saved, none in force (peerEgressEnabled is false)");
+        }
         if (!consumer.path("active").asBoolean(false)) {
             return List.of("  consumer: not configured (no rules have been applied)");
         }

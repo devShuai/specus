@@ -301,7 +301,12 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	mesh.egressPlanMu.Lock()
 	defer mesh.egressPlanMu.Unlock()
 
-	rules := mesh.config.PeerEgressRules
+	// With the master switch off nothing is taken over. The plan is then empty, which withdraws
+	// whatever a previous run left installed, and the consumer is not built.
+	var rules []egressRule
+	if mesh.config.PeerEgressEnabled {
+		rules = mesh.config.PeerEgressRules
+	}
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	device := mesh.device

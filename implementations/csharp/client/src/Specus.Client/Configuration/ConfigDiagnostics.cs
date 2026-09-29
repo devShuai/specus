@@ -32,6 +32,11 @@ internal static class ConfigDiagnostics
     private static void EgressRules(SpecusClientConfig effective, Action<string> warning)
     {
         var rules = effective.PeerEgressRules ?? [];
+        // Kept with the master switch off is the one state where nothing is in force by design,
+        // said once rather than left to be discovered. A rule the user switched off is not warned
+        // about: it is out of force because they asked.
+        if (rules.Count > 0 && !effective.PeerEgressEnabled)
+            warning($"peerEgressRules has {rules.Count} rule(s) but peerEgressEnabled is false: none is in force");
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
@@ -39,7 +44,7 @@ internal static class ConfigDiagnostics
                 ? Specus.Protocol.PeerEgress.PeerEgressCodes.RuleMalformed
                 : Specus.Protocol.PeerEgress.PeerEgressRules.Validate(rule,
                     Specus.Protocol.PeerEgress.PeerEgressRules.DefaultMeshCidr);
-            if (code is not null)
+            if (code is not null && code != Specus.Protocol.PeerEgress.PeerEgressCodes.RuleDisabled)
                 warning($"peerEgressRules[{index}] is not in force: {code}");
         }
     }

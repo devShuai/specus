@@ -36,6 +36,17 @@ internal static class EgressView
 
     private static List<string> ConsumerLines(JsonElement? consumer)
     {
+        // Rules saved with the master switch off are a state of their own, and the one where nothing
+        // is in force by design; said as such rather than folded into "not configured". A state file
+        // from a build without the switch has no such field and reads as before.
+        if (consumer is { } switched
+            && switched.ValueKind == JsonValueKind.Object
+            && switched.TryGetProperty("enabled", out var enabled) && enabled.ValueKind == JsonValueKind.False
+            && switched.TryGetProperty("rules", out var configured) && configured.ValueKind == JsonValueKind.Array
+            && configured.GetArrayLength() > 0)
+        {
+            return [$"  consumer: takeover off | {configured.GetArrayLength()} rules saved, none in force (peerEgressEnabled is false)"];
+        }
         if (consumer is not { } present || !Flag(present, "active"))
         {
             return ["  consumer: not configured (no rules have been applied)"];

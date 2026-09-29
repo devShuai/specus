@@ -143,7 +143,7 @@ public class NettyClient {
         // The control endpoint and the consumer's own rules come from local configuration rather
         // than from the mesh config the server pushes, so they arrive separately.
         this.peerMeshClient.configureEgress(specusBean.getRemoteAddress(), specusBean.getRemotePort(),
-                specusBean.getPeerEgressRules(), () -> {
+                specusBean.getPeerEgressRules(), specusBean.isPeerEgressEnabled(), () -> {
                     // The live address, which is what a bypass has to pin: the configured
                     // name may resolve to several.
                     Channel channel = controlChannel.get();

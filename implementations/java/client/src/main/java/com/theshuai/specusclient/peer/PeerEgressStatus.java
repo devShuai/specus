@@ -65,10 +65,53 @@ public final class PeerEgressStatus {
     public static Map<String, Object> section(ConsumerSnapshot consumer,
             List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
             RuntimeSnapshot runtime) {
+        return section(consumer, installed, outcome, runtime, true, List.of());
+    }
+
+    /**
+     * The section with the consumer's master switch. Off, no consumer is built, so the rules come
+     * from the configuration; they are listed all the same, because "kept but not taking anything
+     * over" is a state to show rather than to hide.
+     */
+    public static Map<String, Object> section(ConsumerSnapshot consumer,
+            List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
+            RuntimeSnapshot runtime, boolean enabled, List<PeerEgressRule> configured) {
         Map<String, Object> status = new LinkedHashMap<>();
-        status.put("consumer", consumerSection(consumer, installed, outcome));
+        Map<String, Object> consumerSection = consumerSection(consumer, installed, outcome);
+        consumerSection.put("enabled", enabled);
+        if (!enabled && configured != null && !configured.isEmpty()) {
+            consumerSection.put("rules", switchedOffRules(configured));
+        }
+        status.put("consumer", consumerSection);
         status.put("egress", egressSection(runtime));
         return status;
+    }
+
+    /**
+     * Configured rules while the master switch is off. None is in force; a rule the user switched
+     * off says so itself, the rest name the master switch.
+     */
+    static List<Map<String, Object>> switchedOffRules(List<PeerEgressRule> configured) {
+        List<Map<String, Object>> rules = new ArrayList<>();
+        for (int index = 0; index < configured.size(); index++) {
+            PeerEgressRule rule = configured.get(index);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("index", index);
+            entry.put("match", rule.getMatch() == null ? "" : rule.getMatch().trim());
+            entry.put("action", rule.getAction() == null ? "" : rule.getAction().trim());
+            entry.put("inForce", false);
+            entry.put("code", rule.switchedOff()
+                    ? com.theshuai.common.peeregress.PeerEgressCodes.RULE_DISABLED
+                    : com.theshuai.common.peeregress.PeerEgressCodes.CONSUMER_DISABLED);
+            if (rule.getEgressClientId() != null && rule.getEgressClientId() != 0) {
+                entry.put("egressClientId", rule.getEgressClientId());
+            }
+            if (rule.getPort() != null && rule.getPort() != 0) {
+                entry.put("port", rule.getPort());
+            }
+            rules.add(entry);
+        }
+        return rules;
     }
 
     private static Map<String, Object> consumerSection(ConsumerSnapshot consumer,

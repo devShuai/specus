@@ -85,7 +85,8 @@ java -jar specus-client-exec.jar --config "/etc/specus/client.jsonc"
 - 未知字段继续兼容性忽略，但提示字段名称；包括 `controlTls` 等当前实现支持的嵌套对象。
 - 明确配置的 `peerMeshMtu` 或 `updateCheckIntervalHours` 被修正时，提示最终数值。默认 MTU 1280、范围 576–1280；默认更新间隔 24 小时、范围 1–168 小时。
 - Go 不使用 `openUpdatePage`；.NET 不使用 `upstreamTls` / `openUpdatePage`，出现时提示跨端差异。Java 接受 `autoUpdate: true`，但明确提示仅通知、不自动安装。
-- `peerEgressRules` 中不会生效的规则逐条提示 `peerEgressRules[<序号>] is not in force: <错误码>`，三端逐字一致；不打印规则内容，也不导致校验失败——运行时同样跳过被拒的规则、其余照常生效。重叠检查按默认组网网段 `100.96.0.0/11`，与服务端自定义网段的重叠要连上后才发现。
+- 配置了 `peerEgressRules` 而 `peerEgressEnabled` 不是 `true` 时提示一次 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，三端逐字一致；规则只保存，不接管任何流量。
+- `peerEgressRules` 中不会生效的规则逐条提示 `peerEgressRules[<序号>] is not in force: <错误码>`，三端逐字一致；不打印规则内容，也不导致校验失败——运行时同样跳过被拒的规则、其余照常生效。用户写了 `"enabled": false` 停用的规则不提示。重叠检查按默认组网网段 `100.96.0.0/11`，与服务端自定义网段的重叠要连上后才发现。
 - 警告不打印配置值或解析后的密钥。`config show` 将 apiKey、secret（包括引用文本）整体替换为 `<redacted>`，删除 serverBaseUrl 的用户名、密码、查询串和片段；不修改源配置。`controlTls.enabled: null` 表示登录后再按服务端 TLS 标记解析，不代表已确认禁用 TLS。
 
 ## 首次 HTTP 登录与重连

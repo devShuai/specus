@@ -153,6 +153,8 @@ class Matrix:
             dict(match="2001:db8::/32", action="egress", egressClientId=42),
             dict(match="100.96.0.0/12", action="egress", egressClientId=42),
             dict(match="198.51.100.0/24", action="egress"),
+            # Switched off by the user: out of force by choice, so never warned about.
+            dict(match="192.0.2.0/24", action="block", enabled=False),
         ]
         path = self.directory / "egress rules.jsonc"
         path.write_text(json.dumps(dict(serverBaseUrl=url, apiKey="CLI_TEST_KEY_MUST_NOT_LEAK",
@@ -161,7 +163,9 @@ class Matrix:
                                 env=self.env, capture_output=True, timeout=20)
         err = result.stderr.decode("utf-8", "replace")
         assert result.returncode == 0, ("a refused egress rule failed the whole configuration", err)
-        expected = ["peerEgressRules[1] is not in force: EGRESS_RULE_DEFAULT_ROUTE",
+        # No peerEgressEnabled in this file, so the switch is off: said once, by count.
+        expected = ["peerEgressRules has 7 rule(s) but peerEgressEnabled is false: none is in force",
+                    "peerEgressRules[1] is not in force: EGRESS_RULE_DEFAULT_ROUTE",
                     "peerEgressRules[2] is not in force: EGRESS_RULE_DOMAIN_UNSUPPORTED",
                     "peerEgressRules[3] is not in force: EGRESS_RULE_IPV6_UNSUPPORTED",
                     "peerEgressRules[4] is not in force: EGRESS_RULE_MESH_OVERLAP",
@@ -169,6 +173,8 @@ class Matrix:
         for line in expected:
             assert line in err, ("missing egress rule warning", line, err)
         assert "peerEgressRules[0]" not in err, ("a usable rule was warned about", err)
+        assert "peerEgressRules[6]" not in err and "EGRESS_RULE_DISABLED" not in err, (
+            "a rule the user switched off was warned about", err)
         assert "Unknown configuration field" not in err, ("peerEgressRules treated as unknown", err)
         for match in ("example.com", "2001:db8", "100.96.0.0/12"):
             assert match not in err, ("a configuration value was printed in a warning", match)

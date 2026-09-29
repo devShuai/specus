@@ -290,6 +290,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
 
+        public bool ConsumerEnabled => owner._config.PeerEgressEnabled;
+
         public IReadOnlyDictionary<long, bool> EgressAvailability
         {
             get

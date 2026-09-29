@@ -63,6 +63,9 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile String controlEndpoint = "";
     /** This node's own consumer rules, from local configuration; empty when it is not a consumer. */
     private volatile List<PeerEgressRule> egressRules = List.of();
+    // The consumer's master switch. True until configured, so a mesh built without a local
+    // configuration behaves as it did before the switch existed.
+    private volatile boolean egressEnabled = true;
     /** The control connection's live remote address, for the bypass that keeps it out of the tunnel. */
     private volatile Supplier<SocketAddress> controlRemote;
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
@@ -4165,6 +4168,13 @@ public class PeerMeshClient implements AutoCloseable {
      */
     public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules,
             Supplier<SocketAddress> controlRemote) {
+        configureEgress(controlHost, controlPort, rules, true, controlRemote);
+    }
+
+    /** As above, with the consumer's master switch; off, the rules are kept and none is applied. */
+    public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules,
+            boolean enabled, Supplier<SocketAddress> controlRemote) {
+        egressEnabled = enabled;
         controlEndpoint = StringUtils.hasText(controlHost)
                 ? controlHost.trim() + (controlPort > 0 ? ":" + controlPort : "")
                 : "";
@@ -4258,6 +4268,11 @@ public class PeerMeshClient implements AutoCloseable {
         @Override
         public List<PeerEgressRule> consumerRules() {
             return egressRules;
+        }
+
+        @Override
+        public boolean consumerEnabled() {
+            return egressEnabled;
         }
 
         @Override

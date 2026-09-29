@@ -31,6 +31,7 @@ class EgressStartupTests {
               "serverBaseUrl": "https://example.invalid",
               "apiKey": "key",
               "secret": "secret",
+              "peerEgressEnabled": true,
               "peerEgressRules": [
                 {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 42},
                 {"match": "198.51.100.0/24", "action": "direct"},
@@ -63,6 +64,31 @@ class EgressStartupTests {
 
         assertThat(bean.getPeerEgressRules()).hasSize(2);
         assertThat(bean.getPeerEgressRules().get(0).getMatch()).isEqualTo("203.0.113.0/24");
+        assertThat(bean.isPeerEgressEnabled()).isTrue();
+    }
+
+    /**
+     * Rules kept with the master switch off are warned about once, by count, in the words the Go and
+     * .NET clients use; a rule the user switched off is not warned about.
+     */
+    @Test
+    void rulesKeptWithTheSwitchOffAreWarnedAboutOnce() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        ClientStartupConfig config = ClientCli.parse("""
+                {
+                  "serverBaseUrl": "https://example.invalid",
+                  "apiKey": "key",
+                  "secret": "secret",
+                  "peerEgressRules": [
+                    {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 42},
+                    {"match": "198.51.100.0/24", "action": "block", "enabled": false}
+                  ]
+                }
+                """, warnings::add);
+
+        assertThat(config.isPeerEgressEnabled()).isFalse();
+        assertThat(warnings).containsExactly(
+                "peerEgressRules has 2 rule(s) but peerEgressEnabled is false: none is in force");
     }
 
     /** A configuration that leaves the field out, or sets it to null, yields no rules rather than a failure. */

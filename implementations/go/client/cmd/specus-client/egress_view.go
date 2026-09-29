@@ -26,6 +26,15 @@ func egressLines(section map[string]any) []string {
 }
 
 func consumerLines(consumer map[string]any) []string {
+	// Rules saved with the master switch off are a state of their own, and the one where nothing is
+	// in force by design; said as such rather than folded into "not configured". A state file from
+	// a build without the switch has no such field and reads as before.
+	if enabled, present := consumer["enabled"].(bool); present && !enabled {
+		if rules := listAt(consumer, "rules"); len(rules) > 0 {
+			return []string{fmt.Sprintf(
+				"  consumer: takeover off | %d rules saved, none in force (peerEgressEnabled is false)", len(rules))}
+		}
+	}
 	if consumer == nil || !boolAt(consumer, "active") {
 		return []string{"  consumer: not configured (no rules have been applied)"}
 	}

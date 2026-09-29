@@ -80,6 +80,14 @@ final class PeerEgressMesh implements AutoCloseable {
             return List.of();
         }
 
+        /**
+         * The consumer's master switch, {@code peerEgressEnabled}. Off, the rules are kept and none
+         * is applied. True by default so a host built only to drive the plane applies what it is given.
+         */
+        default boolean consumerEnabled() {
+            return true;
+        }
+
         /** Complete snapshot of reachable egress peers; omitted peers are offline. */
         default Map<Long, Boolean> egressAvailability() {
             return Map.of();
@@ -358,7 +366,7 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,
-                plane == null ? null : plane.statusSnapshot());
+                plane == null ? null : plane.statusSnapshot(), host.consumerEnabled(), host.consumerRules());
     }
 
     /**
@@ -381,7 +389,9 @@ final class PeerEgressMesh implements AutoCloseable {
      * drop, the relay is reassigned, the control connection is re-established.
      */
     void reconcileRoutes() {
-        reconcile(host.consumerRules(), System.currentTimeMillis());
+        // With the master switch off nothing is taken over. The plan is then empty, which withdraws
+        // whatever a previous run left installed, and the consumer is not built.
+        reconcile(host.consumerEnabled() ? host.consumerRules() : List.of(), System.currentTimeMillis());
     }
 
     void reconcile(List<PeerEgressRule> rules, long nowMs) {

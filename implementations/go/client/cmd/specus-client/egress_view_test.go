@@ -165,3 +165,30 @@ func TestEgressViewDoesNotCountRefusedRulesAsInForce(t *testing.T) {
 		t.Errorf("the summary miscounts the offline peer:\n%s", output)
 	}
 }
+
+// Rules saved with the switch off read as a state of their own, never as "not configured": the
+// person who wrote the rules and did not turn them on needs to be told that nothing is in force.
+func TestEgressViewSaysRulesAreSavedButNotTakingOver(t *testing.T) {
+	lines := egressLines(egressSection(t, `{
+  "consumer": {
+    "enabled": false, "active": false,
+    "rules": [
+      {"index": 0, "match": "203.0.113.0/24", "action": "egress", "egressClientId": 42,
+       "inForce": false, "code": "EGRESS_CONSUMER_DISABLED"},
+      {"index": 1, "match": "198.51.100.0/24", "action": "block",
+       "inForce": false, "code": "EGRESS_RULE_DISABLED"}
+    ],
+    "routes": [], "peers": [], "flows": 0, "blocked": {}
+  },
+  "egress": {"active": false}
+}`))
+	want := "  consumer: takeover off | 2 rules saved, none in force (peerEgressEnabled is false)"
+	if len(lines) == 0 || lines[0] != want {
+		t.Fatalf("first line = %q, want %q", strings.Join(lines, "\n"), want)
+	}
+	// Off with nothing saved is simply not configured.
+	lines = egressLines(egressSection(t, `{"consumer": {"enabled": false, "active": false, "rules": []}}`))
+	if lines[0] != "  consumer: not configured (no rules have been applied)" {
+		t.Fatalf("empty switched-off consumer = %q", lines[0])
+	}
+}

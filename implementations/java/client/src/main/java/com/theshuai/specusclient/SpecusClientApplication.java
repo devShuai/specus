@@ -293,6 +293,7 @@ public class SpecusClientApplication {
         specusBean.setPeerMeshMtu(startupConfig.getPeerMeshMtu());
         specusBean.setPeerEgressRules(startupConfig.getPeerEgressRules() == null
                 ? java.util.List.of() : java.util.List.copyOf(startupConfig.getPeerEgressRules()));
+        specusBean.setPeerEgressEnabled(startupConfig.isPeerEgressEnabled());
     }
 
     static ClientEnvironmentInfo collectEnvironment() {
