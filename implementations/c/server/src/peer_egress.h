@@ -35,6 +35,10 @@
 #define ST_EGRESS_CODE_RULE_MESH_OVERLAP "EGRESS_RULE_MESH_OVERLAP"
 #define ST_EGRESS_CODE_RULE_DEFAULT_ROUTE "EGRESS_RULE_DEFAULT_ROUTE"
 #define ST_EGRESS_CODE_RULE_PORT_UNSUPPORTED "EGRESS_RULE_PORT_UNSUPPORTED"
+/* A rule the user switched off: kept in the list, out of force. */
+#define ST_EGRESS_CODE_RULE_DISABLED "EGRESS_RULE_DISABLED"
+/* The consumer's master switch is off: rules are kept and nothing is taken over. */
+#define ST_EGRESS_CODE_CONSUMER_DISABLED "EGRESS_CONSUMER_DISABLED"
 
 /* SPEG1 frame decoding. */
 #define ST_EGRESS_CODE_FRAME_BAD_MAGIC "EGRESS_FRAME_BAD_MAGIC"
@@ -122,6 +126,9 @@ typedef struct {
     /* Present only so a configuration carrying it can be rejected with a specific code. */
     int port;
     int has_port;
+    /* Set only by an explicit "enabled": false. A switched-off rule stays in the list, takes no
+     * part in matching and installs no route. */
+    int switched_off;
 } st_egress_rule;
 
 /* The outcome of evaluating a destination against an ordered rule list. */

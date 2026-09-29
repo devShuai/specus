@@ -32,6 +32,10 @@ public static class PeerEgressCodes
     public const string RuleMeshOverlap = "EGRESS_RULE_MESH_OVERLAP";
     public const string RuleDefaultRoute = "EGRESS_RULE_DEFAULT_ROUTE";
     public const string RulePortUnsupported = "EGRESS_RULE_PORT_UNSUPPORTED";
+    /// <summary>A rule the user switched off: kept in the list, out of force.</summary>
+    public const string RuleDisabled = "EGRESS_RULE_DISABLED";
+    /// <summary>The consumer's master switch is off: rules are kept and nothing is taken over.</summary>
+    public const string ConsumerDisabled = "EGRESS_CONSUMER_DISABLED";
 
     // SPEG1 frame decoding.
     public const string FrameBadMagic = "EGRESS_FRAME_BAD_MAGIC";
@@ -56,7 +60,7 @@ public static class PeerEgressCodes
         HopNotAllowed, Disabled, PeerAclDenied, ConsumerDenied, ForbiddenDestination,
         ScopeDenied, DestinationDenied, ProtocolDenied, PortDenied, LimitExceeded,
         RuleDomainUnsupported, RuleIpv6Unsupported, RuleMalformed, RuleMissingTarget,
-        RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported,
+        RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported, RuleDisabled, ConsumerDisabled,
         FrameBadMagic, FrameUnknownType, FrameReservedSet, FrameTruncated,
         FrameTrailingBytes, Ipv6Unsupported, FrameMalformedControl, ControlUnsupported,
     };

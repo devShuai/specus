@@ -32,6 +32,10 @@ public final class PeerEgressCodes {
     public static final String RULE_MESH_OVERLAP = "EGRESS_RULE_MESH_OVERLAP";
     public static final String RULE_DEFAULT_ROUTE = "EGRESS_RULE_DEFAULT_ROUTE";
     public static final String RULE_PORT_UNSUPPORTED = "EGRESS_RULE_PORT_UNSUPPORTED";
+    /** A rule the user switched off: kept in the list, out of force. */
+    public static final String RULE_DISABLED = "EGRESS_RULE_DISABLED";
+    /** The consumer's master switch is off: rules are kept and nothing is taken over. */
+    public static final String CONSUMER_DISABLED = "EGRESS_CONSUMER_DISABLED";
 
     // SPEG1 frame decoding.
     public static final String FRAME_BAD_MAGIC = "EGRESS_FRAME_BAD_MAGIC";
@@ -54,7 +58,8 @@ public final class PeerEgressCodes {
             HOP_NOT_ALLOWED, DISABLED, PEER_ACL_DENIED, CONSUMER_DENIED, FORBIDDEN_DESTINATION,
             SCOPE_DENIED, DEST_DENIED, PROTOCOL_DENIED, PORT_DENIED, LIMIT_EXCEEDED,
             RULE_DOMAIN_UNSUPPORTED, RULE_IPV6_UNSUPPORTED, RULE_MALFORMED, RULE_MISSING_TARGET,
-            RULE_MESH_OVERLAP, RULE_DEFAULT_ROUTE, RULE_PORT_UNSUPPORTED,
+            RULE_MESH_OVERLAP, RULE_DEFAULT_ROUTE, RULE_PORT_UNSUPPORTED, RULE_DISABLED,
+            CONSUMER_DISABLED,
             FRAME_BAD_MAGIC, FRAME_UNKNOWN_TYPE, FRAME_RESERVED_SET, FRAME_TRUNCATED,
             FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED);
 

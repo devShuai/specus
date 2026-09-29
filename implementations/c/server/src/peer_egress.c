@@ -43,7 +43,8 @@ const char *const ST_EGRESS_ALL_CODES[] = {
     ST_EGRESS_CODE_RULE_DOMAIN_UNSUPPORTED, ST_EGRESS_CODE_RULE_IPV6_UNSUPPORTED,
     ST_EGRESS_CODE_RULE_MALFORMED, ST_EGRESS_CODE_RULE_MISSING_TARGET,
     ST_EGRESS_CODE_RULE_MESH_OVERLAP, ST_EGRESS_CODE_RULE_DEFAULT_ROUTE,
-    ST_EGRESS_CODE_RULE_PORT_UNSUPPORTED,
+    ST_EGRESS_CODE_RULE_PORT_UNSUPPORTED, ST_EGRESS_CODE_RULE_DISABLED,
+    ST_EGRESS_CODE_CONSUMER_DISABLED,
     ST_EGRESS_CODE_FRAME_BAD_MAGIC, ST_EGRESS_CODE_FRAME_UNKNOWN_TYPE,
     ST_EGRESS_CODE_FRAME_RESERVED_SET, ST_EGRESS_CODE_FRAME_TRUNCATED,
     ST_EGRESS_CODE_FRAME_TRAILING_BYTES, ST_EGRESS_CODE_IPV6_UNSUPPORTED,
@@ -285,6 +286,11 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
 {
     if (rule == NULL) {
         return ST_EGRESS_CODE_RULE_MALFORMED;
+    }
+    /* Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
+     * should not have to be fixed before it may sit in the list. */
+    if (rule->switched_off) {
+        return ST_EGRESS_CODE_RULE_DISABLED;
     }
     char match[sizeof(rule->match)];
     trim_into(match, sizeof(match), rule->match);

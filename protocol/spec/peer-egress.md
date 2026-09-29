@@ -46,9 +46,18 @@
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| `peerEgressRules` | 空 | 有序规则列表，语义见下节。**没有单独的总开关**：列表非空即启用消费端，空或缺省即不启用 |
+| `peerEgressEnabled` | `false` | 消费端总开关，即「启用系统接管」。只有为 `true` 时才应用规则、安装路由；为 `false` 时规则只保存、不接管任何流量 |
+| `peerEgressRules` | 空 | 有序规则列表，语义见下节。每条规则可带 `enabled`（缺省 `true`），`false` 的规则留在列表里但不参与匹配 |
 
-设计阶段写过 `egressEnabled` 与 `egressRules` 两个字段，实现时没有采用：多一个开关就多一种「规则写了但没打开」的状态，而那恰好是本功能要防的静默不生效。
+一期最初没有总开关，列表非空即启用：多一个开关就多一种「规则写了但没打开」的状态，而那恰好是本功能要防的静默不生效。P6（#49）要求把「保存配置」与「启用系统接管」分开，并在首次启用时说明需要的权限、会接管的流量和失败时的行为，所以加入了 `peerEgressEnabled`，默认关闭。
+
+关闭状态因此必须是响亮的，而不是静默的：
+
+- `config validate` 与每次启动加载配置时，对「配置了规则但总开关关闭」写一条告警 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，三端逐字一致；
+- 状态查询里 `consumer.enabled` 为 `false`，每条规则 `inForce: false`、错误码 `EGRESS_CONSUMER_DISABLED`；
+- CLI、本地管理页与桌面端都把「已保存、未启用」作为一种状态显示出来。
+
+单条规则的 `enabled: false` 是用户的明确选择，不是配置错误：它不产生告警，只在状态里以 `inForce: false`、`EGRESS_RULE_DISABLED` 列出。
 
 出口端不在客户端本地配置授权。出口由服务端两级开关控制——租户级总开关与每台设备的出口策略，**两者都开**这台设备才会作为出口——持久化后通过 `egress-config` 下发，避免出口设备本地被改写后绕过租户策略。管理接口见 [出口分流使用说明](../../docs/peer-mesh/peer-egress-usage.md)。客户端本地只保留一个只读的当前生效视图。
 
@@ -73,6 +82,7 @@
 
 配置校验顺序固定，实现必须按此顺序返回第一个命中的错误码。一条规则可能同时违反多项，顺序不固定则各语言会对同一条规则报出不同的码，而共享向量目前没有同时违反两项的用例，无法靠它兜住：
 
+0. `EGRESS_RULE_DISABLED` —— `enabled` 显式为 `false`。排在所有内容检查之前：停用是用户的选择，一条停用的规则不必先修好才能留在列表里
 1. `EGRESS_RULE_MALFORMED` —— `match` 为空
 2. `EGRESS_RULE_IPV6_UNSUPPORTED` —— `match` 含冒号
 3. `EGRESS_RULE_DOMAIN_UNSUPPORTED` —— `match` 是域名或域名后缀
@@ -559,6 +569,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_RULE_MESH_OVERLAP` | 配置校验：规则覆盖 Peer Mesh 虚拟网段 |
 | `EGRESS_RULE_DEFAULT_ROUTE` | 配置校验：一期不接管默认路由 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 配置校验：消费端规则不支持端口维度 |
+| `EGRESS_RULE_DISABLED` | 配置校验：规则被用户停用（`enabled: false`），不参与匹配 |
+| `EGRESS_CONSUMER_DISABLED` | 状态：消费端总开关 `peerEgressEnabled` 关闭，规则只保存、不接管 |
 | `EGRESS_FRAME_BAD_MAGIC` | 帧 magic 不是 `SPEG1` |
 | `EGRESS_FRAME_UNKNOWN_TYPE` | 未定义的 `type` |
 | `EGRESS_FRAME_RESERVED_SET` | `reserved` 字节或保留 flag 位非零 |
@@ -579,6 +591,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 ```json
 {
   "consumer": {
+    "enabled": true,
     "active": true,
     "appliedAtUnixMs": 1757000000000,
     "rules": [
@@ -606,6 +619,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 几条要求：
 
 **`inForce` 是这一节存在的理由。** 一条配置了但被拒的规则读出来是 `false` 并带着它的错误码。这是「这条规则在保护我」和「这条规则是文件里的一段文字」之间的区别。被拒的规则**必须列出来**，不能省掉：只列生效规则的状态，会让写下那条规则的人无从发现它没生效。
+
+**总开关关闭时这一节照样出现。** 只要配置了规则，`consumer` 就在，`enabled: false`、`active: false`，每条规则 `inForce: false` 并带 `EGRESS_CONSUMER_DISABLED`（本身停用的规则仍报 `EGRESS_RULE_DISABLED`），不列路由也不列出口对端。没有配置规则时这一节缺省，与之前相同。
 
 **没装上的路由必须列出来**，带 `installed: false` 和占用者的描述。省掉它会让状态看起来干干净净，而它本该捕获的流量正从物理网卡出去。
 

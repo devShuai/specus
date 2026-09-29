@@ -28,6 +28,10 @@ const (
 	egressCodeRuleMeshOverlap       = "EGRESS_RULE_MESH_OVERLAP"
 	egressCodeRuleDefaultRoute      = "EGRESS_RULE_DEFAULT_ROUTE"
 	egressCodeRulePortUnsupported   = "EGRESS_RULE_PORT_UNSUPPORTED"
+	// A rule the user switched off. Not a configuration error: it stays in the list, out of force.
+	egressCodeRuleDisabled = "EGRESS_RULE_DISABLED"
+	// The consumer's master switch is off, so rules are kept but nothing is taken over.
+	egressCodeConsumerDisabled = "EGRESS_CONSUMER_DISABLED"
 
 	// SPEG1 frame decoding.
 	egressCodeFrameBadMagic         = "EGRESS_FRAME_BAD_MAGIC"

@@ -198,6 +198,21 @@ for entry in rules["refusedRules"]:
 for case in authz["cases"] + authz["policyVariantCases"]:
     used.add(case["expect"]["code"])
 
+# The master switch off: every rule is out of force, a rule's own switch still names itself, and
+# nothing matches. Checked against the rule list itself so the section cannot drift from it.
+disabled = rules["consumerDisabled"]
+codes_by_index = {entry["index"]: entry["code"] for entry in disabled["ruleCodes"]}
+check(set(codes_by_index) == {rule["index"] for rule in rules["rules"]},
+      "rules/consumerDisabled: ruleCodes must name every rule exactly once")
+for rule in rules["rules"]:
+    want = "EGRESS_RULE_DISABLED" if rule.get("enabled") is False else "EGRESS_CONSUMER_DISABLED"
+    check(codes_by_index.get(rule["index"]) == want,
+          f"rules/consumerDisabled: rule {rule['index']} should report {want}")
+for case in disabled["cases"]:
+    check(case["expect"] == {"action": "direct", "matchedRuleIndex": None, "reason": "default"},
+          f"rules/consumerDisabled/{case['destination']}: nothing may match with the switch off")
+used.update(codes_by_index.values())
+
 undocumented = used - table_codes
 uncovered = table_codes - used
 check(not undocumented, f"codes used in vectors but missing from the spec table: {sorted(undocumented)}")

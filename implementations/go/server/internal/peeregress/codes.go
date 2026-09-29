@@ -28,6 +28,8 @@ const (
 	CodeRuleMeshOverlap       = "EGRESS_RULE_MESH_OVERLAP"
 	CodeRuleDefaultRoute      = "EGRESS_RULE_DEFAULT_ROUTE"
 	CodeRulePortUnsupported   = "EGRESS_RULE_PORT_UNSUPPORTED"
+	// CodeRuleDisabled is a rule the user switched off: kept in the list, out of force.
+	CodeRuleDisabled = "EGRESS_RULE_DISABLED"
 
 	// SPEG1 frame decoding.
 	CodeFrameBadMagic      = "EGRESS_FRAME_BAD_MAGIC"
