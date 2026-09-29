@@ -55,6 +55,22 @@ final class PeerEgressRuntime {
         /** Returns the byte count, or -1 at end of stream. */
         int read(byte[] buffer) throws IOException;
 
+        /**
+         * Reads at most {@code length} bytes into the start of {@code buffer}. The real sockets read
+         * straight into it; this default is for the test doubles.
+         */
+        default int read(byte[] buffer, int length) throws IOException {
+            if (length >= buffer.length) {
+                return read(buffer);
+            }
+            byte[] part = new byte[length];
+            int read = read(part);
+            if (read > 0) {
+                System.arraycopy(part, 0, buffer, 0, read);
+            }
+            return read;
+        }
+
         void write(byte[] data) throws IOException;
 
         /**
@@ -467,22 +483,25 @@ final class PeerEgressRuntime {
     /** Pumps the real socket into the state machine. Called with the lock held. */
     private void startTcpReader(long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle) {
         executor.run(() -> {
+            // One buffer for the life of the flow, read into up to the credit. The credit changes on
+            // nearly every read, and sizing a new buffer to it each time allocated up to this much
+            // per read.
             byte[] buffer = new byte[TCP_READ_BUFFER];
             while (true) {
+                int size;
                 lock.lock();
                 try {
                     while (flows.lookup(flow.key) == flow && handle.connection().appReadCredit() == 0) {
                         handle.wake().awaitUninterruptibly();
                     }
                     if (flows.lookup(flow.key) != flow) { return; }
-                    int size = Math.min(TCP_READ_BUFFER, handle.connection().appReadCredit());
-                    if (buffer.length != size) { buffer = new byte[size]; }
+                    size = Math.min(TCP_READ_BUFFER, handle.connection().appReadCredit());
                 } finally {
                     lock.unlock();
                 }
                 int read;
                 try {
-                    read = handle.socket().read(buffer);
+                    read = handle.socket().read(buffer, size);
                 } catch (IOException error) {
                     finishTcpReader(consumer, flow, handle, false);
                     return;
