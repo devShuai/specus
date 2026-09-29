@@ -116,6 +116,45 @@ class PeerMeshRelayFollowTests {
         assertThat((String) get("relayTargetAllocationId")).isEqualTo("allocation-1");
     }
 
+    /**
+     * A peer that restarted answers from a new socket. What this side learned about the old one must
+     * not keep the session on a socket whose process is gone, whether the new process is heard
+     * direct or over the relay first.
+     */
+    @Test
+    void aPeerRestartLetsItsNewEndpointTakeOver() throws Exception {
+        long now = System.currentTimeMillis();
+        set("lastDirectSuccessMillis", now);
+        set("endpointSuccessMillis", now);
+        set("endpointRtt", 1L);
+        set("currentPathType", "DIRECT");
+        assertThat(session.applyRemoteKeyEpoch("epoch-restarted")).as("a second epoch is a restart").isTrue();
+
+        InetSocketAddress fresh = new InetSocketAddress("203.0.113.9", 43000);
+        markPathFromInboundCheck(fresh, null);
+
+        assertThat((InetSocketAddress) get("remoteEndpoint")).isEqualTo(fresh);
+    }
+
+    @Test
+    void aPeerRestartLetsItsRelayCheckTakeOver() throws Exception {
+        long now = System.currentTimeMillis();
+        set("lastDirectSuccessMillis", now);
+        set("endpointSuccessMillis", now);
+        session.applyRemoteKeyEpoch("epoch-restarted");
+
+        markPathFromInboundCheck("allocation-9");
+
+        assertThat((String) get("relayTargetAllocationId")).isEqualTo("allocation-9");
+    }
+
+    private void markPathFromInboundCheck(InetSocketAddress remote, String relayFrom) throws Exception {
+        Method method = PeerMeshClient.class.getDeclaredMethod(
+                "markPathFromInboundCheck", PeerMeshClient.PeerSession.class, InetSocketAddress.class, String.class);
+        method.setAccessible(true);
+        method.invoke(client, session, remote, relayFrom);
+    }
+
     private void receiveFrame(String relayFrom) throws Exception {
         byte[] frame = PeerDataFrameCodec.encode(
                 session.inboundTrafficKey(LOCAL_ID), SESSION_ID, ++sequence, new byte[] {1, 2, 3, 4});
