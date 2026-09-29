@@ -32,6 +32,7 @@ public class PeerMeshEgressPolicy {
     /** Cap on the serialised destination rule list; enforced before persisting. */
     public static final int MAX_DESTINATION_RULES_BYTES = 4096;
     public static final int MAX_DESTINATION_RULES = 64;
+    public static final int MAX_PORT_RANGES_PER_RULE = 32;
 
     @Id
     private Long id;
