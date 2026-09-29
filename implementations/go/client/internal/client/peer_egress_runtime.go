@@ -239,9 +239,15 @@ func (r *egressRuntime) handleControl(consumer int64, frame peerEgressFrame, now
 	if control.Type == peerEgressControlNameBind {
 		// Validated with the frame; the address parses and the name is well formed.
 		address, _ := parseEgressAddress(control.Address)
+		name := normalizeEgressName(control.Name)
 		r.mu.Lock()
-		r.names.bind(consumer, address, normalizeEgressName(control.Name))
-		r.mu.Unlock()
+		defer r.mu.Unlock()
+		r.names.bind(consumer, address, name)
+		// Flows to this address that were not opened for this name go, the way revoked flows go:
+		// a TCP flow with a state machine is reset, and every socket is closed. No flow-reject
+		// follows, because nothing was refused: the consumer's next packet is meant to reopen the
+		// flow by name, and a rejection arriving after it would take down the flow just reopened.
+		r.releaseAll(egressRevocationsFor(r.flows.closeNotNamed(consumer, address, name), ""), now)
 		return
 	}
 	// flow-reject travels egress to consumer. Receiving one means the peer is confused about
@@ -304,7 +310,7 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 // charged for the whole attempt, not only after it succeeds; a consumer opening a thousand flows to
 // a black hole would otherwise pass every limit check.
 func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSegment, now time.Time) {
-	destination, code, proceed := r.resolveDestination(consumer, key)
+	destination, name, code, proceed := r.resolveDestination(consumer, key)
 	if !proceed {
 		// A retransmitted SYN while the name is still resolving; the first one is opening the flow.
 		return
@@ -315,6 +321,12 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		return
 	}
 	r.mu.Lock()
+	if r.bindingMovedLocked(consumer, key, name) {
+		// Rebound while this SYN was resolving. Its retransmission opens the flow for the name
+		// the address stands for now.
+		r.mu.Unlock()
+		return
+	}
 	flow, code, opened := r.reserveTo(consumer, key, destination, now)
 	if code != egressCodeAllowed {
 		r.mu.Unlock()
@@ -330,6 +342,7 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		r.mu.Unlock()
 		return
 	}
+	flow.Name = name
 	address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 	dial, mtu := r.dial, r.pathMTU
 	r.mu.Unlock()
@@ -480,7 +493,7 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 	flow, known := r.flows.lookup(key)
 	if !known {
 		r.mu.Unlock()
-		destination, code, proceed := r.resolveDestination(consumer, key)
+		destination, name, code, proceed := r.resolveDestination(consumer, key)
 		if !proceed {
 			return
 		}
@@ -489,6 +502,12 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 			return
 		}
 		r.mu.Lock()
+		if r.bindingMovedLocked(consumer, key, name) {
+			// Rebound while this datagram was resolving; the consumer's next one carries the new
+			// name, as every datagram does until the egress answers.
+			r.mu.Unlock()
+			return
+		}
 		reserved, code, opened := r.reserveTo(consumer, key, destination, now)
 		if code != egressCodeAllowed {
 			r.mu.Unlock()
@@ -501,6 +520,7 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 			r.mu.Unlock()
 			return
 		}
+		reserved.Name = name
 		address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 		dial := r.dial
 		r.mu.Unlock()
@@ -686,18 +706,19 @@ func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destinati
 // leaves no window between the check and the connect. Called with no lock held; the lookup can take
 // as long as egressNameResolveTimeout.
 //
-// proceed is false for a second packet of a flow whose name is still resolving: the first one is
-// opening it. A non-empty code refuses the flow.
-func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (destination uint32, code string, proceed bool) {
+// name is the name the flow is opened for, "" for a flow to the address itself. proceed is false for
+// a second packet of a flow whose name is still resolving: the first one is opening it. A non-empty
+// code refuses the flow.
+func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (destination uint32, name string, code string, proceed bool) {
 	r.mu.Lock()
 	name, bound := r.names.lookup(consumer, key.remoteIP)
 	if !bound {
 		r.mu.Unlock()
-		return key.remoteIP, "", true
+		return key.remoteIP, "", "", true
 	}
 	if _, busy := r.resolving[key]; busy {
 		r.mu.Unlock()
-		return 0, "", false
+		return 0, "", "", false
 	}
 	r.resolving[key] = struct{}{}
 	resolve := r.resolve
@@ -718,9 +739,17 @@ func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (d
 		return r.authorizeTo(consumer, key, address)
 	})
 	if decision != egressCodeAllowed {
-		return 0, decision, true
+		return 0, name, decision, true
 	}
-	return chosen, "", true
+	return chosen, name, "", true
+}
+
+// bindingMovedLocked reports whether the consumer's binding for a flow's address is no longer the
+// name the flow was resolved for. Checked under the same lock as the reservation, so a name-bind
+// either closes the flow it makes stale or is in place before the flow opens, never in between.
+func (r *egressRuntime) bindingMovedLocked(consumer int64, key egressFlowKey, name string) bool {
+	current, _ := r.names.lookup(consumer, key.remoteIP)
+	return current != name
 }
 
 // refuse records a refusal and tells the consumer why. Called with no lock held.

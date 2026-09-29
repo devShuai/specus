@@ -47,6 +47,11 @@ type egressFlow struct {
 	// the limits, but the entry stays until the timer so a retransmitted FIN is still answered.
 	Lingering bool
 
+	// Name is the name the consumer had bound to the flow's address when the flow opened, and ""
+	// for a flow dialled to the address itself. A later name-bind for the address closes the flows
+	// not opened for that name.
+	Name string
+
 	// Handle is whatever the caller attached: a tcpConn, a UDP socket, a cancel function. The
 	// table stores it so that everything needed to tear a flow down travels with the entry that
 	// authorises it, and never reads it.
@@ -211,6 +216,18 @@ func (t *egressFlowTable) purgeConsumerDestinations(consumer int64, destinations
 			}
 		}
 		return false
+	})
+}
+
+// closeNotNamed closes a consumer's flows to an address that were not opened for the given name,
+// for the moment that consumer binds the address to it (protocol/spec/peer-egress-dns.md, the
+// nameBindClosesFlows cases). A flow opened before its name arrived was dialled to the fake address
+// itself and will never work, and the consumer's next SYN or datagram would be taken as part of it;
+// closed, that next packet opens the flow by name. A flow opened for another name is closed as well,
+// since the address now stands for a different destination.
+func (t *egressFlowTable) closeNotNamed(consumer int64, address uint32, name string) []*egressFlow {
+	return t.reap(func(flow *egressFlow) bool {
+		return flow.Consumer == consumer && flow.Key.remoteIP == address && flow.Name != name
 	})
 }
 

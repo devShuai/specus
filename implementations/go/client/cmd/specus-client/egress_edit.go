@@ -80,10 +80,10 @@ func egressListing(path string, config client.Config) (map[string]any, []string)
 	}
 	views := make([]map[string]any, 0, len(rules))
 	for index, rule := range rules {
-		status := client.EgressRuleStatusCode(config.PeerEgressEnabled, rule)
+		status := client.EgressRuleStatusCode(config, rule)
 		switchedOff := client.EgressRuleSwitchedOff(rule)
 		// The rule's own problem, told apart from being off: worth fixing before takeover is on.
-		content := client.EgressRuleCode(client.EgressRule{
+		content := client.EgressRuleCode(config, client.EgressRule{
 			Match: rule.Match, Action: rule.Action, EgressClientID: rule.EgressClientID, Port: rule.Port,
 		})
 		view := map[string]any{
@@ -186,7 +186,7 @@ func egressPlan(config client.Config, change egressChange) (egressPlanned, strin
 			Action: strings.TrimSpace(change.Action), EgressClientID: change.EgressClientID}
 		// Refused rules are allowed in the file, where they are warned about, but an edit that adds
 		// one on request would only be writing a rule that steers nothing.
-		if code := client.EgressRuleCode(rule); code != "" {
+		if code := client.EgressRuleCode(config, rule); code != "" {
 			return egressPlanned{}, fmt.Sprintf("Rule not added: %s (%s)", code, client.EgressCodeExplanation(code))
 		}
 		if change.Disabled {
