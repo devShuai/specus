@@ -336,6 +336,11 @@ func (session *peerMeshSession) ensureTrafficCodecs(localClientID int64) error {
 // applyRemoteKeyEpoch resets the inbound decryption state when the peer restarts with a new
 // epoch. The peer restarts its sequence at 1, so the old replay window would reject every
 // new frame and the cached inbound codec would fail to decrypt.
+//
+// A new epoch also means the process behind the old endpoint is gone, so what this side learned
+// about the path to it is forgotten too. Kept, the endpoint would stay sticky and the direct path
+// healthy for up to 45 s after the last answer from a dead socket: every frame would go to it, and
+// the new process's checks, direct or over the relay, would not be allowed to move the session.
 func (session *peerMeshSession) applyRemoteKeyEpoch(epoch string) bool {
 	if session == nil || strings.TrimSpace(epoch) == "" || epoch == session.RemoteKeyEpoch {
 		return false
@@ -344,6 +349,11 @@ func (session *peerMeshSession) applyRemoteKeyEpoch(epoch string) bool {
 	session.RemoteKeyEpoch = epoch
 	session.InboundCodec = nil
 	session.Replay = peerReplayWindow{}
+	if changed {
+		session.EndpointSuccess = time.Time{}
+		session.EndpointRTT = peerRttUnsetMillis
+		session.LastDirectSuccess = time.Time{}
+	}
 	return changed
 }
 
