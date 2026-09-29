@@ -52,6 +52,12 @@ type authzVector struct {
 type rulesVector struct {
 	MeshCIDR string `json:"meshCidr"`
 	Rules    []Rule `json:"rules"`
+	// RefusedRules names the rules in the list above that must fail validation, and with which
+	// code. They are there so matching can be shown to leave them out.
+	RefusedRules []struct {
+		Index int    `json:"index"`
+		Code  string `json:"code"`
+	} `json:"refusedRules"`
 	Cases    []struct {
 		Name        string `json:"name"`
 		Destination string `json:"destination"`
@@ -189,7 +195,7 @@ func TestRuleMatchingMatchesSharedVector(t *testing.T) {
 		t.Fatal("rules vector carried no rules")
 	}
 	for _, testCase := range vector.Cases {
-		match := MatchRules(vector.Rules, testCase.Destination)
+		match := MatchRules(vector.Rules, testCase.Destination, vector.MeshCIDR)
 		if match.Action != testCase.Expect.Action {
 			t.Errorf("%s: action = %s, want %s", testCase.Name, match.Action, testCase.Expect.Action)
 		}
@@ -218,9 +224,16 @@ func TestRuleValidationMatchesSharedVector(t *testing.T) {
 	if mesh == "" {
 		mesh = DefaultMeshCIDR
 	}
-	for _, rule := range vector.Rules {
-		if code := ValidateRule(rule, mesh); code != "" {
-			t.Errorf("rule %s must pass validation, got %s", rule.Match, code)
+	refused := make(map[int]string, len(vector.RefusedRules))
+	for _, entry := range vector.RefusedRules {
+		refused[entry.Index] = entry.Code
+	}
+	if len(refused) == 0 {
+		t.Fatal("rules vector carried no refusedRules")
+	}
+	for index, rule := range vector.Rules {
+		if code := ValidateRule(rule, mesh); code != refused[index] {
+			t.Errorf("rule %d (%s): code = %q, want %q", index, rule.Match, code, refused[index])
 		}
 	}
 	if len(vector.ConfigValidation) == 0 {
