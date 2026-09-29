@@ -1565,16 +1565,21 @@
       {
         "closed": [
           "early"
-        ]
+        ],
+        "reset": []
       },
       {
         "name": "example.com"
       },
       {
-        "closed": []
+        "closed": [],
+        "reset": []
       },
       {
         "closed": [
+          "bound"
+        ],
+        "reset": [
           "bound"
         ]
       }
