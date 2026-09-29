@@ -610,6 +610,71 @@ public sealed class PeerMeshServiceTests
         Assert.All(catalogs, catalog => Assert.Equal(expectedServices, catalog.Services?.Count ?? 0));
     }
 
+    // A device that leaves has to be announced as gone, the way a device that arrives is announced as
+    // here. Rosters were pushed on login and never on logout, so a consumer kept an egress that had
+    // stopped as online and went on sending it flows that nothing would ever answer.
+    [Fact]
+    public async Task PushOnLogoutTellsTenantPeersTheDeviceIsOffline()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1201, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1202, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.20", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.21", "egress-key");
+        await fixture.SaveChangesAsync();
+        var consumerWriter = fixture.Bind(consumer);
+        fixture.Bind(egress);
+
+        fixture.Unbind(egress);
+        await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
+
+        var roster = Assert.Single(consumerWriter.PeerMessages(), message => message.Type == "roster");
+        var departed = Assert.Single(roster.Peers!, peer => peer.ClientId == egress.Id);
+        Assert.False(departed.Online, "the roster still counts the departed device as online");
+    }
+
+    // A device already back on a newer connection when the old one is torn down was announced by
+    // that login; a logout push would announce it as gone while it is not.
+    [Fact]
+    public async Task PushOnLogoutIsSilentForADeviceThatIsAlreadyBack()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1203, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1204, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.22", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.23", "egress-key");
+        await fixture.SaveChangesAsync();
+        var consumerWriter = fixture.Bind(consumer);
+        fixture.Bind(egress);
+
+        await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
+
+        Assert.Empty(consumerWriter.PeerMessages());
+    }
+
+    // A signal whose target is not there is undeliverable, which the sender could not have avoided,
+    // and not a protocol violation. The dispatcher tells the two apart by this exception and keeps
+    // the sender connected for it.
+    [Fact]
+    public async Task SignalToAnOfflinePeerIsUndeliverable()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1205, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1206, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.24", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.25", "egress-key");
+        await fixture.SaveChangesAsync();
+        fixture.Bind(consumer);
+
+        await Assert.ThrowsAsync<PeerSignalUndeliverableException>(() => fixture.Service.HandleSignalAsync(
+            new MessageRequestPacket
+            {
+                ToClientName = egress.ClientName,
+                MessageType = MessageType.PeerControl,
+                Message = JsonSerializer.Serialize(new PeerControlMessage { Type = "candidates" }),
+            }, consumer.ClientName, CancellationToken.None));
+    }
+
     [Fact]
     public async Task CandidatesSignalCreatesSessionGrantAndForwardsJavaShape()
     {
@@ -670,6 +735,56 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(target.Id, stored.TargetClientId);
         Assert.Equal(PeerMeshService.PathDirect, stored.PathType);
         Assert.Equal(PeerMeshService.StatusNegotiating, stored.Status);
+    }
+
+    // The sender's key epoch has to survive the relay untouched while its claimed identity does not.
+    // Both peers derive their SPM2 traffic keys from the epoch, so a relay that drops it leaves each
+    // side holding a session it cannot build a codec for, and no peer traffic ever flows -- which is
+    // what this server did until sourceKeyEpoch was added to PeerControlMessage.
+    //
+    // The body is raw JSON rather than a serialized PeerControlMessage on purpose: a field the type
+    // does not carry is exactly the failure being guarded against, and a typed input cannot express
+    // it. Same shape as the Go and C servers' checks.
+    [Fact]
+    public async Task RelayedSignalKeepsTheSenderKeyEpochAndOverwritesItsClaimedIdentity()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(1001, "tenant-a", "alice", "alice-laptop");
+        var target = fixture.AddClient(1002, "tenant-a", "alice", "alice-nas");
+        fixture.AddDevice(source, "100.96.0.10", "source-key");
+        fixture.AddDevice(target, "100.96.0.11", "target-key");
+        await fixture.SaveChangesAsync();
+
+        var sourceWriter = fixture.Bind(source);
+        var targetWriter = fixture.Bind(target);
+        const string signal = """
+            {"type":"candidates","sourceClientId":999,"sourceClientName":"spoofed",
+             "sourceVirtualIp":"100.96.0.99","sourceKeyEpoch":"epoch-a","dataFrameVersion":2,
+             "candidates":[{"type":"host","transport":"udp","address":"192.168.1.10","port":53000}]}
+            """;
+
+        await fixture.Service.HandleSignalAsync(new MessageRequestPacket
+        {
+            ToClientName = target.ClientName,
+            MessageType = MessageType.PeerControl,
+            Message = signal,
+        }, source.ClientName, CancellationToken.None);
+
+        var forwarded = targetWriter.SinglePeerMessage();
+        Assert.Equal("epoch-a", forwarded.SourceKeyEpoch);
+        Assert.Equal(source.Id, forwarded.SourceClientId);
+        Assert.Equal(source.ClientName, forwarded.SourceClientName);
+        Assert.Equal("100.96.0.10", forwarded.SourceVirtualIp);
+
+        var raw = Assert.Single(targetWriter.RawPeerMessages());
+        Assert.DoesNotContain("spoofed", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("100.96.0.99", raw, StringComparison.Ordinal);
+
+        // The grant goes back to the sender and speaks for the server, so it carries no epoch of its
+        // own: the sender already knows its own, and the peer's arrives on the peer's own candidates.
+        var grant = sourceWriter.SinglePeerMessage();
+        Assert.Equal("session-grant", grant.Type);
+        Assert.True(string.IsNullOrEmpty(grant.SourceKeyEpoch));
     }
 
     [Fact]
@@ -1346,6 +1461,15 @@ public sealed class PeerMeshServiceTests
             return writer;
         }
 
+        // Takes a bound client off the registry, as its control connection closing does.
+        public void Unbind(ClientAccount account)
+        {
+            if (Registry.Find(account.ClientName) is { } context)
+            {
+                Registry.Unbind(account.ClientName, context);
+            }
+        }
+
         public Task SaveChangesAsync() => Db.SaveChangesAsync();
 
         public async ValueTask DisposeAsync()
@@ -1381,6 +1505,13 @@ public sealed class PeerMeshServiceTests
                 Assert.False(string.IsNullOrWhiteSpace(response.Message));
                 return JsonSerializer.Deserialize<PeerControlMessage>(response.Message!)!;
             }).ToList();
+        }
+
+        // The wire text rather than the parsed message: a value the server was supposed to drop is
+        // only provably gone when nothing in the bytes still carries it.
+        public List<string> RawPeerMessages()
+        {
+            return _packets.Select(packet => Assert.IsType<MessageResponsePacket>(packet).Message!).ToList();
         }
 
         public void Clear() => _packets.Clear();

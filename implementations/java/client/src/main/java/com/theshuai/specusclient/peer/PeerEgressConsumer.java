@@ -444,20 +444,28 @@ final class PeerEgressConsumer {
     }
 
     /**
-     * Reads a flow-reject. It is diagnostic: the application learns the flow is dead from the reset
-     * the egress user-space stack sends, and this only supplies a readable reason.
+     * A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
+     * the flow, and only accept its actual egress as the sender.
      */
     private void handleFlowReject(PeerEgressFrame.Control control, long fromEgress) {
-        recordBlocked("rejected-" + control.code().toLowerCase(Locale.ROOT));
         Integer remote = Ipv4Cidr.parseAddress(control.destinationIp());
         Integer local = Ipv4Cidr.parseAddress(control.sourceIp());
-        if (remote != null && local != null) {
-            flows.remove(new PeerEgressFlowTable.Key(
-                    protocolNumberFor(control.protocol()),
-                    local, control.sourcePort(), remote, control.destinationPort()));
+        if (remote == null || local == null) {
+            return;
         }
-        log.info("[peer-egress-consumer] egress={} refused {}:{} code={}",
-                fromEgress, control.destinationIp(), control.destinationPort(), control.code());
+        var key = new PeerEgressFlowTable.Key(protocolNumberFor(control.protocol()),
+                local, control.sourcePort(), remote, control.destinationPort());
+        Flow flow = flows.get(key);
+        if (flow == null || flow.egress != fromEgress) {
+            return;
+        }
+        byte[] reset = flowResetPacket(key, flow);
+        flows.remove(key);
+        recordBlocked("rejected-" + control.code().toLowerCase(Locale.ROOT));
+        if (reset != null && tunWriter != null) {
+            tunWriter.write(reset);
+        }
+        log.info("[peer-egress-consumer] egress={} refused flow code={}", fromEgress, control.code());
     }
 
     private static int protocolNumberFor(String name) {

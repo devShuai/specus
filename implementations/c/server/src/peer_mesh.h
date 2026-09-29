@@ -48,6 +48,9 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
                                 const char *message);
 int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
                                const char *client_name);
+/* Tell the tenant's online peers that a client has left; call after it is no longer active. */
+int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
+                                const char *client_name);
 /* Rebuild config/roster and re-publish active catalogues after an admin mutation. */
 int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
                                 const char *tenant_id);

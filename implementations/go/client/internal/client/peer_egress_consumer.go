@@ -371,34 +371,37 @@ func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, fromEgress i
 	return true
 }
 
-// handleInboundControl reads a flow-reject. It is diagnostic: the application learns the flow is
-// dead from the reset the egress user-space stack sends, and this only supplies a readable reason.
+// A flow-reject can overtake (or survive loss of) the remote RST on the UDP peer path.
+// Reset locally before forgetting the flow, and only accept its actual egress as the sender.
 func (c *egressConsumer) handleInboundControl(frame peerEgressFrame, fromEgress int64, now time.Time) {
 	control, ok := decodePeerEgressControl(frame.Body)
 	if !ok || control.Type != peerEgressControlFlowReject {
 		return
 	}
-	c.mu.Lock()
-	c.recordBlockedLocked("rejected-" + strings.ToLower(control.Code))
-	if remote, parsedRemote := parseEgressAddress(control.DestinationIP); parsedRemote {
-		local, parsedLocal := parseEgressAddress(control.SourceIP)
-		if parsedLocal {
-			delete(c.flows, egressFlowKey{
-				protocol:     protocolNumberForEgressName(control.Protocol),
-				consumerIP:   local,
-				consumerPort: uint16(control.SourcePort),
-				remoteIP:     remote,
-				remotePort:   uint16(control.DestinationPort),
-			})
-		}
+	remote, remoteOK := parseEgressAddress(control.DestinationIP)
+	local, localOK := parseEgressAddress(control.SourceIP)
+	if !remoteOK || !localOK {
+		return
 	}
-	logger := c.logger
+	key := egressFlowKey{protocol: protocolNumberForEgressName(control.Protocol),
+		consumerIP: local, consumerPort: uint16(control.SourcePort),
+		remoteIP: remote, remotePort: uint16(control.DestinationPort)}
+	c.mu.Lock()
+	flow, known := c.flows[key]
+	if !known || flow.Egress != fromEgress {
+		c.mu.Unlock()
+		return
+	}
+	reset := egressFlowResetPacket(flow)
+	delete(c.flows, key)
+	c.recordBlockedLocked("rejected-" + strings.ToLower(control.Code))
+	toTun := c.toTun
 	c.mu.Unlock()
 	_ = now
-	if logger != nil {
-		logger.Printf("[peer-egress-consumer] egress=%d refused %s:%d code=%s",
-			fromEgress, control.DestinationIP, control.DestinationPort, control.Code)
+	if reset != nil && toTun != nil {
+		_ = toTun(reset)
 	}
+	c.logger.Printf("[peer-egress-consumer] egress=%d refused flow code=%s", fromEgress, control.Code)
 }
 
 func protocolNumberForEgressName(name string) int {

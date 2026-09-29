@@ -59,6 +59,20 @@ class LoginResponseHandlerTests {
     }
 
     @Test
+    void dataLoginRacingControlReconnectDoesNotStopClient() {
+        NettyClient client = nettyClient();
+        EmbeddedChannel channel = new EmbeddedChannel(new LoginResponseHandler(
+                client, com.theshuai.common.protocol.ConnectionRole.DATA));
+        try {
+            channel.writeInbound(failure("数据连接要求控制连接先登录"));
+            assertFalse(client.isReconnectSuppressed());
+            assertFalse(channel.isActive());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
     void duplicateLoginResponseClosesAuthenticatedConnection() {
         LoginRecordingNettyClient client = new LoginRecordingNettyClient();
         EmbeddedChannel channel = new EmbeddedChannel(new LoginResponseHandler(client));
@@ -70,6 +84,19 @@ class LoginResponseHandlerTests {
 
             assertFalse(channel.isActive());
             org.junit.jupiter.api.Assertions.assertEquals(1, client.successCount);
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void tokenLostOnServerRestartRefreshesCredentials() {
+        RefreshRecordingNettyClient client = new RefreshRecordingNettyClient();
+        EmbeddedChannel channel = new EmbeddedChannel(new LoginResponseHandler(client));
+        try {
+            channel.writeInbound(failure("客户端访问令牌无效"));
+            assertTrue(client.refreshRequested);
+            assertFalse(client.isReconnectSuppressed());
         } finally {
             channel.finishAndReleaseAll();
         }

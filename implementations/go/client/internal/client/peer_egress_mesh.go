@@ -28,14 +28,14 @@ import (
 var (
 	errNoEgressSession = errors.New("no Peer Mesh session with the egress")
 	errNoEgressDevice  = errors.New("no virtual device to write to")
+	errEgressQueueFull = errors.New("egress send queue is full")
 )
 
 const (
 	peerControlTypeEgressConfig = "egress-config"
 
-	// peerEgressSendQueueDepth bounds frames waiting to be encrypted and sent. A full queue drops,
-	// which is safe here in a way it would not be elsewhere: TCP retransmits what is lost and UDP
-	// is lossy by contract, whereas blocking would stall every flow on the node.
+	// Bounds frames waiting for encryption. TCP keeps rejected payload/FIN in its bounded
+	// state until a writable notification; UDP and untracked control frames remain best effort.
 	peerEgressSendQueueDepth = 512
 
 	// peerEgressTickInterval drives retransmission and idle expiry. Well under the minimum RTO, so
@@ -76,6 +76,7 @@ func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 		select {
 		case queue <- peerEgressOutbound{consumer: consumer, frame: frame}:
 		default:
+			return errEgressQueueFull
 		}
 		return nil
 	}, newEgressDialer(mesh.egressTunnelName))
@@ -114,6 +115,12 @@ func (mesh *peerMeshClient) egressSendLoop(queue chan peerEgressOutbound, done c
 		case <-done:
 			return
 		case outbound = <-queue:
+		}
+		mesh.mu.Lock()
+		runtime := mesh.egress
+		mesh.mu.Unlock()
+		if runtime != nil {
+			runtime.sendReady(time.Now())
 		}
 		mesh.mu.Lock()
 		session := mesh.sessions[outbound.consumer]
@@ -570,6 +577,7 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	conn := mesh.conn
+	lastControlRemote := mesh.lastControlRemote
 	relay := mesh.relay
 	peers := make([]string, 0, len(mesh.sessions))
 	for _, session := range mesh.sessions {
@@ -582,6 +590,10 @@ func (mesh *peerMeshClient) egressBypassAddresses(now time.Time) []string {
 	hosts := make([]string, 0, 8)
 	if conn != nil && conn.RemoteAddr() != nil {
 		hosts = append(hosts, conn.RemoteAddr().String())
+	} else if lastControlRemote != "" {
+		// Suspended: the connection is gone but the routes are not, so the address it used still
+		// has to stay out of the tunnel or the reconnect that restores it cannot get through.
+		hosts = append(hosts, lastControlRemote)
 	}
 	hosts = append(hosts, mesh.config.ServerBaseURL, runtime.PeerMesh.StunHost, runtime.PeerMesh.TurnHost)
 	hosts = append(hosts, runtime.PeerMesh.PublicStunServers...)

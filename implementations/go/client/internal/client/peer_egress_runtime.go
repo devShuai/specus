@@ -14,7 +14,7 @@ import (
 
 // The egress data plane: the only place authorization turns into a connect().
 //
-// Everything under it is pure. The TCP state machine, the datagram codec, the judgment layer and
+// The TCP state machine (with injected nonblocking queue admission), datagram codec, judgment layer and
 // the flow table hold no sockets and read no clock. This file is where they meet real ones, so it
 // is also where every resource is acquired and released, and the reason the layers below could stay
 // testable without a network.
@@ -49,6 +49,14 @@ const (
 type egressTCPFlow struct {
 	conn   *tcpConn
 	socket net.Conn
+	wake   chan struct{}
+}
+
+func (h *egressTCPFlow) wakeReader() {
+	select {
+	case h.wake <- struct{}{}:
+	default:
+	}
 }
 
 type egressUDPFlow struct {
@@ -91,8 +99,9 @@ type egressRuntime struct {
 	rejections *egressRejectionLog
 	stats      egressStats
 
-	dial egressDialFunc
-	send egressSendFunc
+	dial       egressDialFunc
+	send       egressSendFunc
+	sendCursor int
 
 	closed bool
 }
@@ -318,7 +327,10 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 	}
 
 	conn, output := acceptTCPSyn(syn, newEgressISS(), mtu, r.flows.idleTimeout, now)
-	handle := &egressTCPFlow{conn: conn, socket: socket}
+	conn.tryTransmit = func(packet []byte) bool {
+		return r.send == nil || r.send(consumer, encodePeerEgressFrame(peerEgressTypeIPPacket, false, packet)) == nil
+	}
+	handle := &egressTCPFlow{conn: conn, socket: socket, wake: make(chan struct{}, 1)}
 	flow.Handle = handle
 	r.stats.TotalFlows++
 	r.applyTCPOutput(consumer, flow, handle, output, now)
@@ -331,7 +343,18 @@ func (r *egressRuntime) startTCPReader(consumer int64, flow *egressFlow, handle 
 	go func() {
 		buffer := make([]byte, 32*1024)
 		for {
-			read, err := handle.socket.Read(buffer)
+			r.mu.Lock()
+			if current, still := r.flows.lookup(flow.Key); !still || current != flow {
+				r.mu.Unlock()
+				return
+			}
+			credit := min(len(buffer), handle.conn.appReadCredit())
+			r.mu.Unlock()
+			if credit == 0 {
+				<-handle.wake
+				continue
+			}
+			read, err := handle.socket.Read(buffer[:credit])
 			if read > 0 {
 				r.mu.Lock()
 				if current, still := r.flows.lookup(flow.Key); !still || current != flow {
@@ -375,6 +398,7 @@ func (r *egressRuntime) startTCPReader(consumer int64, flow *egressFlow, handle 
 // applyTCPOutput performs everything the state machine asked for. Called with the lock held.
 func (r *egressRuntime) applyTCPOutput(consumer int64, flow *egressFlow, handle *egressTCPFlow,
 	output tcpOutput, now time.Time) {
+	defer handle.wakeReader()
 	for _, packet := range output.Segments {
 		r.emitSegment(consumer, packet)
 	}
@@ -530,6 +554,28 @@ func (r *egressRuntime) onTick(now time.Time) {
 	r.releaseAll(egressRevocationsFor(r.flows.expire(now), ""), now)
 }
 
+// sendReady is called without the mesh lock after the bounded send queue drains.
+// Only backpressured flows need work; the ordinary tick is a fallback for missed notifications.
+func (r *egressRuntime) sendReady(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	snapshot := r.flowSnapshot()
+	if len(snapshot) == 0 {
+		return
+	}
+	start := r.sendCursor % len(snapshot)
+	r.sendCursor = (start + 1) % len(snapshot)
+	for i := range snapshot {
+		flow := snapshot[(start+i)%len(snapshot)]
+		if handle, ok := flow.Handle.(*egressTCPFlow); ok && handle.conn.sendBlocked {
+			r.applyTCPOutput(flow.Consumer, flow, handle, handle.conn.onTick(now), now)
+		}
+	}
+}
+
 // flowSnapshot copies the live flows so a tick can release entries while iterating.
 func (r *egressRuntime) flowSnapshot() []*egressFlow {
 	snapshot := make([]*egressFlow, 0, len(r.flows.flows))
@@ -668,11 +714,15 @@ func (r *egressRuntime) releaseAll(revoked []egressRevocation, now time.Time) {
 			r.emitFrame(flow.Consumer, peerEgressTypeControl, body)
 		}
 	}
+	if len(revoked) > 0 {
+		r.logger.Printf("[peer-egress] flows released count=%d active=%d", len(revoked), r.flows.size())
+	}
 }
 
 func closeEgressHandle(handle any) {
 	switch typed := handle.(type) {
 	case *egressTCPFlow:
+		typed.wakeReader()
 		if typed.socket != nil {
 			_ = typed.socket.Close()
 		}

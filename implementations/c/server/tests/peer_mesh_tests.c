@@ -308,6 +308,40 @@ int main(void)
         return 1;
     }
 
+    /* A device that leaves is announced to its online peers, with itself offline. Rosters used to
+     * be pushed on login only, so a consumer kept a stopped egress as online. */
+    context.count = 0;
+    context.target_online = 0;
+    if (st_peer_mesh_push_on_logout(&runtime, target.client_name) != 0) {
+        fprintf(stderr, "peer mesh logout push failed\n");
+        return 1;
+    }
+    int announced = 0;
+    for (size_t i = 0; i < context.count; ++i) {
+        if (strcmp(context.signals[i].target, source.client_name) == 0
+            && contains(context.signals[i].message, "\"type\":\"roster\"")) {
+            const char *entry = strstr(context.signals[i].message, "\"clientName\":\"peer-target\"");
+            const char *online = entry == NULL ? NULL : strstr(entry, "\"online\":");
+            announced = online != NULL && strncmp(online, "\"online\":false", 14) == 0;
+        }
+        if (strcmp(context.signals[i].target, target.client_name) == 0) {
+            fprintf(stderr, "peer mesh logout push reached the departed client\n");
+            return 1;
+        }
+    }
+    if (!announced) {
+        fprintf(stderr, "peer mesh logout did not tell the peer the device is offline\n");
+        return 1;
+    }
+
+    /* A device already back on a newer session was announced by that login. */
+    context.count = 0;
+    context.target_online = 1;
+    if (st_peer_mesh_push_on_logout(&runtime, target.client_name) != 0 || context.count != 0) {
+        fprintf(stderr, "peer mesh logout announced a device that is still online\n");
+        return 1;
+    }
+
     unlink(path);
     printf("peer mesh tests passed\n");
     return 0;

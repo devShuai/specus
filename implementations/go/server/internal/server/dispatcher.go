@@ -31,6 +31,7 @@ type Dispatcher struct {
 	onLoginSuccess    func(conn *control.Conn)
 	onDataLogin       func(conn *control.Conn)
 	onDisconnect      func(conn *control.Conn)
+	onControlGone     func(conn *control.Conn)
 	onConnectionEvent func(eventType string, record store.ConnectionRecord)
 }
 
@@ -53,6 +54,11 @@ func (d *Dispatcher) SetOnDataLoginSuccess(hook func(conn *control.Conn)) { d.on
 
 // SetOnDisconnect installs a connection-teardown hook, e.g. to release NAT state (G3).
 func (d *Dispatcher) SetOnDisconnect(hook func(conn *control.Conn)) { d.onDisconnect = hook }
+
+// SetOnControlGone installs a hook fired once an authenticated control connection has been
+// unbound: the point from which everyone else sees that client as offline. The teardown hook
+// above runs for the data connection and before any unbinding, so it cannot say that.
+func (d *Dispatcher) SetOnControlGone(hook func(conn *control.Conn)) { d.onControlGone = hook }
 
 // SetPeerControlHandler installs the Peer Mesh control-plane signal handler.
 func (d *Dispatcher) SetPeerControlHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
@@ -185,6 +191,9 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 			d.logger.Error("mark client session disconnected failed", "session", sessionID, "err", err)
 		}
 		cancel()
+	}
+	if d.onControlGone != nil && conn.ClientName() != "" {
+		d.onControlGone(conn)
 	}
 	recordID := conn.ConnectionRecordID()
 	if recordID == 0 {

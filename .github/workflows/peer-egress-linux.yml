@@ -17,6 +17,9 @@ on:
       - 'tools/protocol/generate_peer_egress_socket_binding_vectors.py'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
       - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/go/client/internal/client/peer_device_linux*'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerVirtualDevice.cs'
+      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDeviceTests.cs'
   push:
     branches: [main]
     paths:
@@ -24,6 +27,9 @@ on:
       - 'protocol/test-vectors/peer-egress-socket-binding-v1.json'
       - 'implementations/go/client/internal/client/peer_egress_route_*'
       - 'implementations/go/client/internal/client/peer_egress_bind*'
+      - 'implementations/go/client/internal/client/peer_device_linux*'
+      - 'implementations/csharp/client/src/Specus.Client/PeerMesh/PeerVirtualDevice.cs'
+      - 'implementations/csharp/client/tests/Specus.Client.Tests/LinuxTunDeviceTests.cs'
   workflow_dispatch:
 
 permissions:
@@ -40,27 +46,48 @@ jobs:
         with:
           go-version-file: implementations/go/client/go.mod
           cache-dependency-path: implementations/go/client/go.sum
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
 
       # Compiled first and then run under sudo, rather than running the whole suite elevated, so
       # nothing else leaves root-owned files behind in a build cache.
       #
       # The output is searched for the tests by name, because they skip themselves when the
       # namespace is not theirs and a skipped test leaves this step green.
-      - name: Install bypass routes under the tunnel's own routes
+      - name: Install bypass routes under the tunnel's own routes, and read from a real TUN
         working-directory: implementations/go/client
         run: |
           set -o pipefail
           go test -c -o "$RUNNER_TEMP/client.test" ./internal/client
           cd "$GITHUB_WORKSPACE"
           sudo -n unshare -n env SPECUS_ROUTE_MUTATION_TEST=1 "$RUNNER_TEMP/client.test" \
-            -test.run 'TestLinuxCommander' -test.v | tee "$RUNNER_TEMP/linux.log"
-          for name in InstallsABypassUnderItsOwnTunnelRoute RefusesABypassOnlyABlackholeWouldCarry \
-              RepairsARouteTheTableLost; do
-            if ! grep -q "^--- PASS: TestLinuxCommander$name" "$RUNNER_TEMP/linux.log"; then
-              echo "TestLinuxCommander$name did not run against a real routing table"
+            -test.run 'TestLinuxCommander|TestLinuxTunDevice' -test.v | tee "$RUNNER_TEMP/linux.log"
+          for name in TestLinuxCommanderInstallsABypassUnderItsOwnTunnelRoute \
+              TestLinuxCommanderRefusesABypassOnlyABlackholeWouldCarry \
+              TestLinuxCommanderRepairsARouteTheTableLost \
+              TestLinuxTunDeviceDeliversWhatTheKernelWritesIntoIt; do
+            if ! grep -q "^--- PASS: $name" "$RUNNER_TEMP/linux.log"; then
+              echo "$name did not run against a real interface"
               exit 1
             fi
           done
+
+      # The .NET TUN device the same way: built as the runner user, run as root in a namespace of
+      # its own, and searched for by name afterwards. Loopback comes up first because the test host
+      # talks to its runner over it; the test itself refuses a namespace whose main table is not
+      # empty.
+      - name: Replace a real .NET TUN device under the same name
+        run: |
+          set -o pipefail
+          project=implementations/csharp/client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj
+          dotnet build "$project" -c Release -v quiet
+          sudo -n unshare -n env SPECUS_ROUTE_MUTATION_TEST=1 DOTNET_NOLOGO=1               DOTNET_CLI_HOME="$RUNNER_TEMP/dotnet-home" DOTNET_ROOT="$DOTNET_ROOT"               NUGET_PACKAGES="$HOME/.nuget/packages"               sh -c 'ip link set lo up && exec "$0" test "$1" -c Release --no-build                 --filter FullyQualifiedName~LinuxTunDeviceTests --logger "console;verbosity=normal"'               "$(command -v dotnet)" "$project" | tee "$RUNNER_TEMP/dotnet-tun.log"
+          name=Specus.Client.Tests.LinuxTunDeviceTests.ADeviceReplacedUnderTheSameNameStartsEveryTime
+          if ! grep -q "Passed $name" "$RUNNER_TEMP/dotnet-tun.log"; then
+            echo "$name did not run against a real interface"
+            exit 1
+          fi
 
       # The namespace is gone with the process, so nothing can be left in the runner's own table.
       # Checked anyway: a test that wrote to the wrong namespace would show up here.

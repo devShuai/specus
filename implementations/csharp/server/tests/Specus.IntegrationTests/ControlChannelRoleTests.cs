@@ -53,4 +53,21 @@ public sealed class ControlChannelRoleTests
         Assert.All(rejected, packet =>
             Assert.False(ControlChannelDispatcher.PacketAllowedForRole(ConnectionRole.Data, packet)));
     }
+
+    // The read loop closes a connection on any exception the dispatcher lets through. A signal to a
+    // peer that has just gone must not be one: every client still signalling it was disconnected.
+    [Fact]
+    public async Task UndeliverablePeerSignalDoesNotCloseTheSender()
+    {
+        var logger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
+        await ControlChannelDispatcher.RoutePeerSignalAsync(
+            () => throw new Specus.Server.PeerMesh.PeerSignalUndeliverableException("target peer is offline: gone"),
+            logger, "channel-1", "gone");
+
+        var violation = new ArgumentException("toClientName is required");
+        var thrown = await Assert.ThrowsAsync<ArgumentException>(() => ControlChannelDispatcher.RoutePeerSignalAsync(
+            () => throw violation, logger, "channel-1", null));
+        Assert.Same(violation, thrown);
+    }
 }
