@@ -538,6 +538,38 @@ public sealed class PeerMeshCryptoTests
         Assert.Equal(expectedRelayTarget, Property<string>(session, "RelayTargetAllocationId"));
     }
 
+    // A peer that restarted answers from a new socket. What this side learned about the old one, a
+    // sticky endpoint and a direct path still counted healthy, must not keep the session on a socket
+    // whose process is gone, whether the new process is heard direct or over the relay first.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APeerRestartLetsItsNewProcessTakeOver(bool overRelay)
+    {
+        var client = new PeerMeshClient(new SpecusClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_runtime", new SpecusRuntimeState { PeerMesh = new PeerMeshConfig { Cidr = "100.96.0.0/11" } });
+        var session = NewPeerMeshSession(1001, 2, "token",
+            new IPEndPoint(IPAddress.Parse("192.0.2.10"), 51000), "", "DIRECT", DateTimeOffset.UtcNow);
+        SetProperty(session, "EndpointSuccess", DateTimeOffset.UtcNow);
+        SetProperty(session, "EndpointRttMillis", 1L);
+        PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
+        var restarted = (bool)session.GetType().GetMethod("ApplyRemoteKeyEpoch")!.Invoke(session, ["epoch-restarted"])!;
+        Assert.True(restarted);
+
+        var fresh = new IPEndPoint(IPAddress.Parse("192.0.2.10"), 52000);
+        await InvokePrivateAsync(client, "MarkPathFromInboundCheckAsync", session, fresh, overRelay ? "alloc-9" : "");
+
+        if (overRelay)
+        {
+            Assert.Equal("RELAY", Property<string>(session, "PathType"));
+            Assert.Equal("alloc-9", Property<string>(session, "RelayTargetAllocationId"));
+        }
+        else
+        {
+            Assert.Equal(fresh, Property<IPEndPoint>(session, "RemoteEndpoint"));
+        }
+    }
+
     [Fact]
     public async Task DirectKeepaliveUsesNominatedEndpointLikeJava()
     {
