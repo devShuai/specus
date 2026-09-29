@@ -42,6 +42,13 @@ const (
 	egressCodeIPv6Unsupported       = "EGRESS_IPV6_UNSUPPORTED"
 	egressCodeFrameMalformedControl = "EGRESS_FRAME_MALFORMED_CONTROL"
 	egressCodeControlUnsupported    = "EGRESS_CONTROL_UNSUPPORTED"
+
+	// Phase two, domain rules (protocol/spec/peer-egress-dns.md).
+	egressCodeNameUnresolved     = "EGRESS_NAME_UNRESOLVED"
+	egressCodeNameUnsupported    = "EGRESS_NAME_UNSUPPORTED"
+	egressCodeRuleFakeIPOverlap  = "EGRESS_RULE_FAKE_IP_OVERLAP"
+	egressCodeFakeIPPoolInvalid  = "EGRESS_FAKE_IP_POOL_INVALID"
+	egressCodeRuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN"
 )
 
 // Policy scopes. Public and LAN access are authorised separately; neither implies the other.

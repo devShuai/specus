@@ -325,8 +325,10 @@ public class SpecusClientApplication {
                 com.theshuai.specusclient.peer.PeerEgressRouteCommanders.takeoverSupported());
         // An egress needs nothing but ordinary sockets.
         egress.setEgressCapable(true);
-        // Phase one carries address targets only.
-        egress.setDomainTargetCapable(false);
+        // The egress resolves names consumers bind (protocol/spec/peer-egress-dns.md). IPv6 targets are
+        // not announced: the outbound socket binding that keeps forwarded traffic out of this device's
+        // own tunnel is IPv4 only.
+        egress.setDomainTargetCapable(true);
         egress.setIpv6TargetCapable(false);
         info.setClientEgressCapabilities(egress);
         return info;

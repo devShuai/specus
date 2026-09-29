@@ -109,6 +109,13 @@ flow_purge = {
     "destinations": ["203.0.113.0/24", "198.51.100.50/32"],
     "code": "EGRESS_RULE_REVOKED",
 }
+# Phase two (protocol/spec/peer-egress-dns.md): a consumer binds one of its fake addresses to the name
+# a flow to it should reach.
+name_bind = {
+    "type": "name-bind",
+    "address": "198.18.0.5",
+    "name": "example.com",
+}
 
 accept = [
     {
@@ -177,6 +184,17 @@ accept = [
         "flags": 0,
         "controlJson": flow_purge,
         "controlCanonicalUtf8Hex": canonical_json(flow_purge).hex(),
+    },
+    {
+        "name": "control-name-bind",
+        "direction": "consumer-to-egress",
+        "description": "二期：把消费端的 fake-IP 绑定到域名；出口据此解析、按解析结果授权并建连",
+        "frameHex": speg1(TYPE_CONTROL, canonical_json(name_bind)).hex(),
+        "frameLength": len(speg1(TYPE_CONTROL, canonical_json(name_bind))),
+        "type": TYPE_CONTROL,
+        "flags": 0,
+        "controlJson": name_bind,
+        "controlCanonicalUtf8Hex": canonical_json(name_bind).hex(),
     },
 ]
 
@@ -251,9 +269,22 @@ reject = [
     },
     {
         "name": "control-unknown-type",
-        "frameHex": speg1(TYPE_CONTROL, canonical_json({"type": "name-bind"})).hex(),
-        "reason": "name-bind 为二期域名分流保留；一期收到必须拒绝，不得当作已实现",
+        "frameHex": speg1(TYPE_CONTROL, canonical_json({"type": "route-hint"})).hex(),
+        "reason": "未定义的控制类型必须拒绝，不得当作已实现",
         "code": "EGRESS_CONTROL_UNSUPPORTED",
+    },
+    {
+        "name": "control-name-bind-without-fields",
+        "frameHex": speg1(TYPE_CONTROL, canonical_json({"type": "name-bind"})).hex(),
+        "reason": "name-bind 必须带合法的 IPv4 address 与域名 name，缺字段不得登记",
+        "code": "EGRESS_FRAME_MALFORMED_CONTROL",
+    },
+    {
+        "name": "control-name-bind-wildcard-name",
+        "frameHex": speg1(TYPE_CONTROL, canonical_json({"type": "name-bind", "address": "198.18.0.5",
+                                                        "name": "*.example.com"})).hex(),
+        "reason": "name-bind 绑定的是一个具体名字，通配写法只属于规则",
+        "code": "EGRESS_FRAME_MALFORMED_CONTROL",
     },
 ]
 

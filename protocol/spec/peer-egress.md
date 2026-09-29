@@ -8,7 +8,8 @@
 
 ## 一期边界
 
-本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级：
+本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级。其中域名规则、DNS 接管与 IPv6 目标由二期规范
+[peer-egress-dns.md](peer-egress-dns.md) 定义，默认关闭；未开启 `peerEgressDnsTakeover` 时下表照旧成立：
 
 | 不支持 | 行为 |
 | --- | --- |
@@ -374,12 +375,12 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | --- | --- |
 | `version` | 当前为 `1`。`0` 或缺省表示不支持出口 |
 | `consumerCapable` / `egressCapable` | 该客户端能否作为消费端 / 出口端 |
-| `domainTargetCapable` | 是否支持域名目标。一期固定为 `false` |
+| `domainTargetCapable` | 是否支持域名目标，即接受 `name-bind` 并在出口侧解析（[二期](peer-egress-dns.md)） |
 | `ipv6TargetCapable` | 是否支持 IPv6 目标。一期固定为 `false` |
 
 服务端**不得**向 `version` 为 `0` 或缺省的客户端下发 `egress-config` 或 `egress-catalog`。四个服务端都按这条门控。
 
-设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 与 `ipv6TargetCapable` 为 `false`。
+设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 为 `true`（出口侧二期已交付），`ipv6TargetCapable` 为 `false`。
 
 > 在 P8 审计之前，三个客户端**都没有上报**这个对象（Java 上报了但 `version` 为默认的 `0`），于是没有任何服务端向任何客户端下发过 `egress-config`：真实部署里没有设备能被启用为出口，出口数据面只在直接喂策略的测试里跑过。修复见 `fix(peer-egress): make the feature reachable outside its own tests`。
 
@@ -543,7 +544,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口关闭匹配这些目标的全部已建流。
 
-`name-bind` 为二期域名分流保留。一期收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。
+`name-bind` 属于二期域名分流，定义见 [peer-egress-dns.md](peer-egress-dns.md)。声明 `domainTargetCapable` 的出口接受它；不支持二期的出口收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。其他未定义的控制类型一律返回 `EGRESS_CONTROL_UNSUPPORTED`。
 
 固定向量：`protocol/test-vectors/peer-egress-frame-v1.json`。
 
@@ -579,6 +580,11 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_IPV6_UNSUPPORTED` | 数据面收到 IPv6 packet |
 | `EGRESS_FRAME_MALFORMED_CONTROL` | `type=2` 的 body 不是 UTF-8 JSON object |
 | `EGRESS_CONTROL_UNSUPPORTED` | 控制消息类型未在本版本实现 |
+| `EGRESS_NAME_UNRESOLVED` | 二期：出口解析名字失败或没有可用地址 |
+| `EGRESS_NAME_UNSUPPORTED` | 二期：出口不支持域名目标（未声明 `domainTargetCapable`）却收到 `name-bind` |
+| `EGRESS_RULE_FAKE_IP_OVERLAP` | 二期配置校验：IP/CIDR 规则与 fake-IP 池重叠 |
+| `EGRESS_FAKE_IP_POOL_INVALID` | 二期配置校验：`peerEgressFakeIpCidr` 不合法，或与 Peer Mesh 网段、本机接口地址重叠 |
+| `EGRESS_RULE_EGRESS_NO_DOMAIN` | 二期配置校验：域名规则指向的出口未声明 `domainTargetCapable` |
 
 ## 状态查询
 
@@ -604,7 +610,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
       {"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24",
        "installed": false, "conflict": "203.0.113.0/24 via 192.0.2.1 dev eth0"}
     ],
-    "peers": [{"clientId": 42, "online": true}],
+    "peers": [{"clientId": 42, "online": true, "path": "direct", "flows": 3}],
     "flows": 3,
     "blocked": {"egress-unavailable": 7},
     "routeError": "",
@@ -625,6 +631,10 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 **没装上的路由必须列出来**，带 `installed: false` 和占用者的描述。省掉它会让状态看起来干干净净，而它本该捕获的流量正从物理网卡出去。
 
 **两个字段是现算的，两个是记下来的。** 规则是否生效每次取快照时用与 `matchEgressRules` 相同的校验重算，这样状态不会与真正的导流决定漂移；路由是否装上算不出来——那个答案来自下发那一刻的系统路由表——所以记下来。记下来的只有冲突：已装的在安装记录里，而安装记录才是重启后被接管的东西。
+
+**每个出口对端说明当前走哪条路径、承载多少流。** `path` 取 `direct`（发往对端的直连端点）、`relay`（经服务端中继）或 `none`（两者都还没有），按发送时的选择读取：已指定中继目标即为 `relay`，否则有直连端点即为 `direct`。`flows` 是本机发往该出口的活动流数。出口慢时人们先问的就是走的直连还是中继；在线却 `none` 的出口，规则已生效却无处可发，与离线同属问题。
+
+**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
 
 **被拒的规则不贡献 `peers` 条目。** 否则状态会报告一个本节点永远不会发往的出口，看起来像一条生效规则有个健康的目的地。
 
@@ -656,12 +666,19 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口不得成为开放代理。上限四端取一致口径，并在成功、失败、超时和取消路径全部释放：
 
-- 全进程活动流上限、每出口策略上限、每消费设备上限
+- 全进程活动流上限、每出口策略上限、每消费设备上限。**处于 TIME_WAIT 的 TCP 流不计入**：出口先关的流
+  进入 TIME_WAIT 时，两个方向都已结束，出口立即关闭其上游 socket，条目只为回应重传的 FIN 保留到 10 s
+  计时结束。计入的话，一个刚完成 64 条短连接的消费端在之后 10 s 内新建的连接会被 `EGRESS_LIMIT_EXCEEDED`
+  拒绝（#88）。状态里的 `flows` 同样只计活动流
 - TCP connect timeout、双向 idle timeout
 - UDP 来源映射 idle TTL
 - 速率限制——**尚未实现**，见当前限制
 
-拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。
+拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。具体到三端的出口日志：
+
+- 出口拒绝一条流：`[peer-egress] refused consumer=<id> protocol=<tcp|udp> code=<码>`（限频时附 `suppressed=<n>`），不写目标地址与端口；目标随拒绝控制消息告诉消费端本身。
+- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。
+- 消费端运行时跳过被拒的规则：`[peer-egress-consumer] rule <序号> refused: <码>`，不写 `match`，与离线校验的告警同一约定。
 
 ## 对系统的改动
 

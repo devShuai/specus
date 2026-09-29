@@ -184,7 +184,8 @@ public class PeerEgressFrameVectorTests
             var control = new PeerEgressFrame.Control(
                 Text(json, "type"), Text(json, "protocol"), Text(json, "sourceIp"),
                 Number(json, "sourcePort"), Text(json, "destinationIp"),
-                Number(json, "destinationPort"), destinations, Text(json, "code"));
+                Number(json, "destinationPort"), destinations, Text(json, "code"),
+                Text(json, "address"), Text(json, "name"));
 
             var body = PeerEgressFrame.EncodeControl(control);
             Assert.True(canonical == HexOf(body), $"{name}: canonical body was {HexOf(body)}");

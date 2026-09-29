@@ -58,13 +58,14 @@ public final class EgressView {
         long notInstalled =
                 routes.stream().filter(route -> !route.path("installed").asBoolean(false)).count();
         long offline = peers.stream().filter(peer -> !peer.path("online").asBoolean(false)).count();
+        long relayed = peers.stream().filter(peer -> "relay".equals(peer.path("path").asText(""))).count();
 
         List<String> lines = new ArrayList<>();
         lines.add(String.format(
                 "  consumer: %d rules (%d not in force) | %d routes (%d not installed) | %d flows"
-                        + " | %d egress peers (%d offline)",
+                        + " | %d egress peers (%d offline, %d via relay)",
                 rules.size(), refused, routes.size(), notInstalled,
-                consumer.path("flows").asLong(0), peers.size(), offline));
+                consumer.path("flows").asLong(0), peers.size(), offline, relayed));
 
         // Then the problems, one line each, in the order an operator would act on them: a rule
         // that is not in force steers nothing at all, a route that is not installed means the
@@ -85,25 +86,47 @@ public final class EgressView {
             lines.add(String.format("    route %s (%s): NOT INSTALLED, already present: %s",
                     route.path("cidr").asText(""), route.path("origin").asText(""),
                     route.path("conflict").asText("")));
+            lines.add("      fix: remove or narrow that route, or change the rule; the client retries every 60 s");
         }
+        // Each problem is followed by what to do about it, in the same words in every runtime and
+        // on the local page. A peer that is online with no path yet is a problem too: its rules are
+        // in force and have nowhere to send.
         for (JsonNode peer : peers) {
-            if (peer.path("online").asBoolean(false)) {
-                continue;
+            long id = peer.path("clientId").asLong(0);
+            if (!peer.path("online").asBoolean(false)) {
+                lines.add(String.format("    egress peer %d: offline, so its rules have nowhere to send", id));
+                lines.add(String.format("      fix: start egress device %d or restore its connection;"
+                        + " until then its destinations are blocked, not sent locally", id));
+            } else if ("none".equals(peer.path("path").asText(""))) {
+                lines.add(String.format("    egress peer %d: online but no path to it yet", id));
+                lines.add("      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP");
             }
-            lines.add(String.format(
-                    "    egress peer %d: offline, so its rules have nowhere to send",
-                    peer.path("clientId").asLong(0)));
         }
         String error = consumer.path("routeError").asText("");
         if (!error.isEmpty()) {
             lines.add(String.format("    route install failed: %s (rolledBack=%s)", error,
                     consumer.path("rolledBack").asBoolean(false)));
+            lines.add("      fix: " + routeErrorFix(error));
         }
         Map<String, Long> blocked = counts(consumer.path("blocked"));
         if (!blocked.isEmpty()) {
             lines.add("    blocked: " + join(blocked));
         }
         return lines;
+    }
+
+    /**
+     * What to do about a failed route install. A refused permission is the common case and has one
+     * answer; anything else is in the log line of the command that failed.
+     */
+    static String routeErrorFix(String message) {
+        String lower = message.toLowerCase(java.util.Locale.ROOT);
+        for (String hint : List.of("permission", "denied", "not permitted", "elevat", "access")) {
+            if (lower.contains(hint)) {
+                return "run the client as administrator or root, with peerMeshDevice set to auto";
+            }
+        }
+        return "the client log names the route command that failed; fix what it reports and restart the client";
     }
 
     private static List<String> egressLines(JsonNode egress) {

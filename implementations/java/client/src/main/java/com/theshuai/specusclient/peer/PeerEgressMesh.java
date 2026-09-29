@@ -93,6 +93,14 @@ final class PeerEgressMesh implements AutoCloseable {
             return Map.of();
         }
 
+        /**
+         * What carries frames to each peer now: {@code direct}, {@code relay}, or absent when
+         * there is neither. Read for status only.
+         */
+        default Map<Long, String> egressPaths() {
+            return Map.of();
+        }
+
         /** Whether there is an interface to route into: a real device that started. */
         default boolean deviceReady() {
             return true;
@@ -364,6 +372,9 @@ final class PeerEgressMesh implements AutoCloseable {
                 consumerSnapshot = consumerRole.statusSnapshot();
             }
         }
+        if (consumerSnapshot != null) {
+            consumerSnapshot = consumerSnapshot.withPaths(host.egressPaths());
+        }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,
                 plane == null ? null : plane.statusSnapshot(), host.consumerEnabled(), host.consumerRules());
@@ -578,8 +589,9 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         refusalsLogged = joined;
         for (PeerEgressRoutePlanner.Refusal refusal : refused) {
-            log.warn("[peer-egress-consumer] rule {} ({}) refused: {}",
-                    refusal.index(), refusal.match(), refusal.code());
+            // The index and the code, not the match: configuration values stay out of the log.
+            log.warn("[peer-egress-consumer] rule {} refused: {}",
+                    refusal.index(), refusal.code());
         }
     }
 
