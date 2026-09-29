@@ -218,6 +218,10 @@ _dns_cases = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding
 for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgress", "egressChoice", "phaseTwo",
                 "ruleStatus"):
     used.update(case["code"] for case in _dns_cases[section] if case["code"])
+# Step five's refusal is exercised by the takeover vector; a failed takeover has no pure case.
+_takeover_cases = json.loads((VECTORS / "peer-egress-dns-takeover-v1.json").read_text(encoding="utf-8"))
+used.update(case["code"] for case in _takeover_cases["upstreams"] if case["code"])
+used.add("EGRESS_DNS_TAKEOVER_FAILED")
 
 undocumented = used - table_codes
 uncovered = table_codes - used
@@ -949,6 +953,13 @@ _dns_spec.loader.exec_module(_dns_module)
 dns_vector = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
 if dns_vector != _dns_module.build():
     failures.append("peer-egress-dns-v1.json differs from what its generator produces; regenerate it")
+_takeover_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_dns_takeover_vectors",
+    Path(__file__).with_name("generate_peer_egress_dns_takeover_vectors.py"))
+_takeover_module = importlib.util.module_from_spec(_takeover_spec)
+_takeover_spec.loader.exec_module(_takeover_module)
+if _takeover_cases != _takeover_module.build():
+    failures.append("peer-egress-dns-takeover-v1.json differs from what its generator produces; regenerate it")
 _management_spec = importlib.util.spec_from_file_location(
     "generate_peer_egress_management_vectors", Path(__file__).with_name("generate_peer_egress_management_vectors.py"))
 _management_module = importlib.util.module_from_spec(_management_spec)

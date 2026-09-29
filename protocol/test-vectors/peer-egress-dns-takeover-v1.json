@@ -1,0 +1,533 @@
+{
+  "description": "Phase two, step five: reading each platform's DNS settings, deciding whether they can be taken over and which upstreams to forward to, the commands that take over and give back, and rollback over someone else's change. See protocol/spec/peer-egress-dns.md.",
+  "meshCidr": "100.96.0.0/11",
+  "fakeIpCidr": "198.18.0.0/15",
+  "listen": "198.18.0.1",
+  "nrptComment": "specus-peer-egress",
+  "resolvConfWritten": "# Written by specus for peer egress DNS takeover. The original is kept in the journal\n# and is put back when the client stops or when `egress dns restore` runs.\nnameserver 198.18.0.1\n",
+  "resolvedStubs": [
+    "127.0.0.53",
+    "127.0.0.54"
+  ],
+  "windowsReadServers": "$up = @(Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | Select-Object -ExpandProperty InterfaceIndex); ConvertTo-Json -Compress -Depth 3 -InputObject @(Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $up -contains $_.InterfaceIndex } | Select-Object InterfaceAlias,InterfaceIndex,ServerAddresses)",
+  "windowsReadNrpt": "ConvertTo-Json -Compress -Depth 3 -InputObject @(Get-DnsClientNrptRule | Select-Object Namespace,Comment,NameServers)",
+  "parseResolvectl": [
+    {
+      "name": "links-and-global",
+      "output": "Global: 1.1.1.1\nLink 2 (eth0): 192.168.1.1 fe80::1%eth0\nLink 3 (specus0): 198.18.0.1\nLink 4 (wlan0):\n",
+      "tunnel": "specus0",
+      "servers": [
+        "1.1.1.1",
+        "192.168.1.1",
+        "fe80::1"
+      ]
+    },
+    {
+      "name": "empty-global-and-tls-names",
+      "output": "Global:\nLink 2 (enp3s0): 9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net\n",
+      "tunnel": "specus0",
+      "servers": [
+        "9.9.9.9",
+        "149.112.112.112"
+      ]
+    },
+    {
+      "name": "only-our-link",
+      "output": "Global:\nLink 7 (specus0): 198.18.0.1\n",
+      "tunnel": "specus0",
+      "servers": []
+    }
+  ],
+  "parseResolvConf": [
+    {
+      "name": "stub",
+      "text": "# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan\n",
+      "servers": [
+        "127.0.0.53"
+      ]
+    },
+    {
+      "name": "plain",
+      "text": "nameserver 192.168.1.1 ; router\n# nameserver 8.8.8.8\nnameserver 2001:db8::53\n",
+      "servers": [
+        "192.168.1.1",
+        "2001:db8::53"
+      ]
+    },
+    {
+      "name": "tabs-and-junk",
+      "text": "domain lan\nnameserver\t10.0.0.2\nnameserver\n",
+      "servers": [
+        "10.0.0.2"
+      ]
+    }
+  ],
+  "parseMacServices": {
+    "output": "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*Bluetooth PAN\nThunderbolt Bridge\nUSB 10/100/1000 LAN\n",
+    "services": [
+      "Wi-Fi",
+      "Thunderbolt Bridge",
+      "USB 10/100/1000 LAN"
+    ]
+  },
+  "parseMacDnsServers": [
+    {
+      "name": "none-set",
+      "output": "There aren't any DNS Servers set on Wi-Fi.\n",
+      "servers": [
+        "Empty"
+      ]
+    },
+    {
+      "name": "two-set",
+      "output": "1.1.1.1\n2606:4700:4700::1111\n",
+      "servers": [
+        "1.1.1.1",
+        "2606:4700:4700::1111"
+      ]
+    }
+  ],
+  "parseScutil": [
+    {
+      "name": "default-resolver-first",
+      "output": "DNS configuration\n\nresolver #1\n  search domain[0] : lan\n  nameserver[0] : 192.168.1.1\n  nameserver[1] : 192.168.1.2\n  if_index : 6 (en0)\n  flags    : Request A records\n  reach    : 0x00020002 (Reachable,Directly Reachable Address)\n\nresolver #2\n  domain   : local\n  options  : mdns\n  timeout  : 5\n  order    : 300000\n\nDNS configuration (for scoped queries)\n\nresolver #1\n  nameserver[0] : 10.9.9.9\n  if_index : 6 (en0)\n",
+      "servers": [
+        "192.168.1.1",
+        "192.168.1.2"
+      ]
+    },
+    {
+      "name": "domain-resolver-skipped",
+      "output": "DNS configuration\n\nresolver #1\n  domain   : corp.example\n  nameserver[0] : 10.1.1.1\n\nresolver #2\n  nameserver[0] : 8.8.8.8\n",
+      "servers": [
+        "8.8.8.8"
+      ]
+    },
+    {
+      "name": "nothing",
+      "output": "DNS configuration\n\nDNS configuration (for scoped queries)\n",
+      "servers": []
+    }
+  ],
+  "parseWindowsServers": [
+    {
+      "name": "array",
+      "json": "[{\"InterfaceAlias\":\"Ethernet\",\"InterfaceIndex\":12,\"ServerAddresses\":[\"192.168.1.1\",\"8.8.8.8\"]},{\"InterfaceAlias\":\"specus\",\"InterfaceIndex\":17,\"ServerAddresses\":[\"198.18.0.1\"]},{\"InterfaceAlias\":\"Wi-Fi\",\"InterfaceIndex\":9,\"ServerAddresses\":\"192.168.1.1\"}]",
+      "tunnelIndex": 17,
+      "servers": [
+        "192.168.1.1",
+        "8.8.8.8",
+        "192.168.1.1"
+      ]
+    },
+    {
+      "name": "single-object",
+      "json": "{\"InterfaceAlias\":\"Ethernet\",\"InterfaceIndex\":12,\"ServerAddresses\":[\"10.0.0.53\"]}",
+      "tunnelIndex": 17,
+      "servers": [
+        "10.0.0.53"
+      ]
+    },
+    {
+      "name": "no-servers",
+      "json": "[{\"InterfaceAlias\":\"Ethernet\",\"InterfaceIndex\":12,\"ServerAddresses\":null},{\"InterfaceAlias\":\"Wi-Fi\",\"InterfaceIndex\":9}]",
+      "tunnelIndex": 17,
+      "servers": []
+    },
+    {
+      "name": "nothing-connected",
+      "json": "",
+      "tunnelIndex": 17,
+      "servers": []
+    }
+  ],
+  "parseWindowsNrpt": [
+    {
+      "name": "none",
+      "json": "",
+      "foreignRoot": false
+    },
+    {
+      "name": "ours-only",
+      "json": "[{\"Namespace\":[\".\"],\"Comment\":\"specus-peer-egress\",\"NameServers\":[\"198.18.0.1\"]}]",
+      "foreignRoot": false
+    },
+    {
+      "name": "someone-else-owns-the-root",
+      "json": "{\"Namespace\":\".\",\"Comment\":\"\",\"NameServers\":\"10.0.0.1\"}",
+      "foreignRoot": true
+    },
+    {
+      "name": "other-namespace-only",
+      "json": "[{\"Namespace\":[\".corp.example\"],\"Comment\":\"\",\"NameServers\":[\"10.0.0.1\"]}]",
+      "foreignRoot": false
+    }
+  ],
+  "linuxMode": [
+    {
+      "name": "resolved-through-its-stub",
+      "resolvectlOk": true,
+      "resolvConfServers": [
+        "127.0.0.53"
+      ],
+      "resolvConfIsSymlink": true,
+      "mode": "resolved",
+      "reason": null
+    },
+    {
+      "name": "resolved-running-but-bypassed",
+      "resolvectlOk": true,
+      "resolvConfServers": [
+        "192.168.1.1"
+      ],
+      "resolvConfIsSymlink": false,
+      "mode": "resolvconf",
+      "reason": null
+    },
+    {
+      "name": "resolved-uplink-mode-symlink",
+      "resolvectlOk": true,
+      "resolvConfServers": [
+        "192.168.1.1"
+      ],
+      "resolvConfIsSymlink": true,
+      "mode": null,
+      "reason": "resolv-conf-managed"
+    },
+    {
+      "name": "no-resolved-plain-file",
+      "resolvectlOk": false,
+      "resolvConfServers": [
+        "192.168.1.1"
+      ],
+      "resolvConfIsSymlink": false,
+      "mode": "resolvconf",
+      "reason": null
+    },
+    {
+      "name": "no-resolved-symlink",
+      "resolvectlOk": false,
+      "resolvConfServers": [
+        "192.168.1.1"
+      ],
+      "resolvConfIsSymlink": true,
+      "mode": null,
+      "reason": "resolv-conf-managed"
+    }
+  ],
+  "upstreams": [
+    {
+      "name": "plain",
+      "servers": [
+        "192.168.1.1",
+        "8.8.8.8"
+      ],
+      "virtualAddresses": [],
+      "code": null,
+      "upstreams": [
+        "192.168.1.1",
+        "8.8.8.8"
+      ]
+    },
+    {
+      "name": "dedupe-keep-order",
+      "servers": [
+        "192.168.1.1",
+        "8.8.8.8",
+        "192.168.1.1"
+      ],
+      "virtualAddresses": [],
+      "code": null,
+      "upstreams": [
+        "192.168.1.1",
+        "8.8.8.8"
+      ]
+    },
+    {
+      "name": "ipv6-ignored",
+      "servers": [
+        "2001:db8::53",
+        "9.9.9.9"
+      ],
+      "virtualAddresses": [],
+      "code": null,
+      "upstreams": [
+        "9.9.9.9"
+      ]
+    },
+    {
+      "name": "only-ipv6",
+      "servers": [
+        "2001:db8::53"
+      ],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "no-upstream"
+    },
+    {
+      "name": "loopback-refused",
+      "servers": [
+        "127.0.0.1",
+        "8.8.8.8"
+      ],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "system-dns-loopback"
+    },
+    {
+      "name": "ipv6-loopback-refused",
+      "servers": [
+        "::1"
+      ],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "system-dns-loopback"
+    },
+    {
+      "name": "pool-refused",
+      "servers": [
+        "8.8.8.8",
+        "198.18.0.2"
+      ],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "system-dns-virtual"
+    },
+    {
+      "name": "mesh-refused",
+      "servers": [
+        "100.96.0.1"
+      ],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "system-dns-virtual"
+    },
+    {
+      "name": "tunnel-address-refused",
+      "servers": [
+        "10.8.0.1"
+      ],
+      "virtualAddresses": [
+        "10.8.0.1"
+      ],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "system-dns-virtual"
+    },
+    {
+      "name": "unspecified-ignored",
+      "servers": [
+        "0.0.0.0",
+        "1.1.1.1"
+      ],
+      "virtualAddresses": [],
+      "code": null,
+      "upstreams": [
+        "1.1.1.1"
+      ]
+    },
+    {
+      "name": "nothing",
+      "servers": [],
+      "virtualAddresses": [],
+      "code": "EGRESS_DNS_TAKEOVER_REFUSED",
+      "reason": "no-upstream"
+    }
+  ],
+  "plan": [
+    {
+      "platform": "linux-resolved",
+      "listen": "198.18.0.1",
+      "tunnel": "specus0",
+      "apply": [
+        [
+          "resolvectl",
+          "dns",
+          "specus0",
+          "198.18.0.1"
+        ],
+        [
+          "resolvectl",
+          "domain",
+          "specus0",
+          "~."
+        ],
+        [
+          "resolvectl",
+          "flush-caches"
+        ]
+      ],
+      "revert": [
+        [
+          "resolvectl",
+          "revert",
+          "specus0"
+        ],
+        [
+          "resolvectl",
+          "flush-caches"
+        ]
+      ]
+    },
+    {
+      "platform": "linux-resolvconf",
+      "listen": "198.18.0.1",
+      "apply": [
+        {
+          "write": "/etc/resolv.conf",
+          "content": "# Written by specus for peer egress DNS takeover. The original is kept in the journal\n# and is put back when the client stops or when `egress dns restore` runs.\nnameserver 198.18.0.1\n"
+        }
+      ],
+      "revert": [
+        {
+          "restore": "/etc/resolv.conf"
+        }
+      ]
+    },
+    {
+      "platform": "macos",
+      "listen": "198.18.0.1",
+      "services": [
+        "Wi-Fi",
+        "Thunderbolt Bridge",
+        "USB 10/100/1000 LAN"
+      ],
+      "apply": [
+        [
+          "networksetup",
+          "-setdnsservers",
+          "Wi-Fi",
+          "198.18.0.1"
+        ],
+        [
+          "networksetup",
+          "-setdnsservers",
+          "Thunderbolt Bridge",
+          "198.18.0.1"
+        ],
+        [
+          "networksetup",
+          "-setdnsservers",
+          "USB 10/100/1000 LAN",
+          "198.18.0.1"
+        ],
+        [
+          "dscacheutil",
+          "-flushcache"
+        ],
+        [
+          "killall",
+          "-HUP",
+          "mDNSResponder"
+        ]
+      ],
+      "revert": [
+        {
+          "restore-service": "Wi-Fi"
+        },
+        {
+          "restore-service": "Thunderbolt Bridge"
+        },
+        {
+          "restore-service": "USB 10/100/1000 LAN"
+        },
+        [
+          "dscacheutil",
+          "-flushcache"
+        ],
+        [
+          "killall",
+          "-HUP",
+          "mDNSResponder"
+        ]
+      ]
+    },
+    {
+      "platform": "windows",
+      "listen": "198.18.0.1",
+      "apply": [
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "Add-DnsClientNrptRule -Namespace '.' -NameServers '198.18.0.1' -Comment 'specus-peer-egress'; Clear-DnsClientCache"
+        ]
+      ],
+      "revert": [
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'specus-peer-egress' } | Remove-DnsClientNrptRule -Force; Clear-DnsClientCache"
+        ]
+      ]
+    }
+  ],
+  "revertResolvConf": [
+    {
+      "name": "still-ours",
+      "current": "# Written by specus for peer egress DNS takeover. The original is kept in the journal\n# and is put back when the client stops or when `egress dns restore` runs.\nnameserver 198.18.0.1\n",
+      "original": "nameserver 192.168.1.1\n",
+      "action": "restore",
+      "content": "nameserver 192.168.1.1\n"
+    },
+    {
+      "name": "rewritten-by-someone",
+      "current": "nameserver 10.0.0.1\n",
+      "original": "nameserver 192.168.1.1\n",
+      "action": "keep",
+      "warning": "resolv-conf-changed"
+    }
+  ],
+  "revertMacService": [
+    {
+      "name": "still-ours-dhcp",
+      "service": "Wi-Fi",
+      "current": [
+        "198.18.0.1"
+      ],
+      "original": [
+        "Empty"
+      ],
+      "action": "restore",
+      "command": [
+        "networksetup",
+        "-setdnsservers",
+        "Wi-Fi",
+        "Empty"
+      ]
+    },
+    {
+      "name": "still-ours-manual",
+      "service": "Wi-Fi",
+      "current": [
+        "198.18.0.1"
+      ],
+      "original": [
+        "1.1.1.1",
+        "8.8.8.8"
+      ],
+      "action": "restore",
+      "command": [
+        "networksetup",
+        "-setdnsservers",
+        "Wi-Fi",
+        "1.1.1.1",
+        "8.8.8.8"
+      ]
+    },
+    {
+      "name": "changed-by-someone",
+      "service": "Wi-Fi",
+      "current": [
+        "9.9.9.9"
+      ],
+      "original": [
+        "Empty"
+      ],
+      "action": "keep",
+      "warning": "service-dns-changed"
+    }
+  ]
+}
