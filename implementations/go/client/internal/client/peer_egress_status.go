@@ -52,6 +52,8 @@ type consumerStatusSnapshot struct {
 func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Only flows still remembered as of the newest packet count as active.
+	c.sweepLocked(c.latest)
 	online := make(map[int64]bool, len(c.online))
 	for id, up := range c.online {
 		online[id] = up

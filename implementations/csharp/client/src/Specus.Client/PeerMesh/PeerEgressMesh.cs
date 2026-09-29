@@ -444,7 +444,7 @@ internal sealed class PeerEgressMesh(
         {
             lock (consumerRole)
             {
-                consumerStatus = consumerRole.StatusSnapshot();
+                consumerStatus = consumerRole.StatusSnapshot(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             }
         }
         if (consumerStatus is not null) consumerStatus = consumerStatus with { Paths = host.EgressPaths };
@@ -782,7 +782,7 @@ internal sealed class PeerEgressMesh(
         var purge = new Dictionary<long, IReadOnlyList<string>>();
         lock (consumerRole)
         {
-            var peers = consumerRole.StatusSnapshot().Online.Keys.Concat(online.Keys).Distinct().ToArray();
+            var peers = consumerRole.StatusSnapshot(nowMs).Online.Keys.Concat(online.Keys).Distinct().ToArray();
             foreach (var peer in peers)
             {
                 foreach (var (egress, destinations) in consumerRole.SetEgressOnline(peer,
