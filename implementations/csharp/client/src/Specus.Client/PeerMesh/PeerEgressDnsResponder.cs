@@ -120,6 +120,18 @@ internal sealed class PeerEgressDnsResponder
         }
     }
 
+    /// <summary>
+    /// Where forwarded queries go from now on: the resolvers the system DNS takeover recorded while
+    /// it holds, the caller's otherwise. A forward already under way finishes with the list it had.
+    /// </summary>
+    public void SetUpstreams(IReadOnlyList<PeerEgressDnsUpstream> upstreams)
+    {
+        lock (_gate)
+        {
+            _upstreams = upstreams;
+        }
+    }
+
     /// <summary>The listen address, or null before a pool is configured.</summary>
     public uint? Listen
     {

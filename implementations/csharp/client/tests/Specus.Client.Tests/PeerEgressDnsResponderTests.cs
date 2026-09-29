@@ -1122,7 +1122,7 @@ public class PeerEgressDnsResponderTests
 
             var consumer = JsonSerializer.SerializeToElement(mesh.Status()).GetProperty("consumer");
             var dns = consumer.GetProperty("dns");
-            Assert.Equal(["takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "queries"],
+            Assert.Equal(["active", "takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "journal", "queries"],
                 dns.EnumerateObject().Select(field => field.Name));
             Assert.Equal(Listen, dns.GetProperty("listen").GetString());
             Assert.Equal(["127.0.0.1:5353"], dns.GetProperty("upstreams").EnumerateArray().Select(item => item.GetString()));

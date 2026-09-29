@@ -3,7 +3,7 @@ namespace Specus.Client.Cli;
 /// <summary>The egress editing commands' flags; -1 marks an index that was not given.</summary>
 internal sealed record EgressCliOptions(string Address = "", string Match = "", string Action = "",
     long EgressClientId = 0, int At = -1, int Index = -1, int To = -1, bool Disabled = false, bool Yes = false,
-    int Connect = 0);
+    int Connect = 0, bool Force = false);
 
 internal sealed record ClientCliOptions(string? ConfigPath, string Command,
     bool Help, bool Version, bool AutoUpdate, bool NoUpdate, bool Debug, bool Json, bool Probe, int LoginTimeout,
@@ -21,9 +21,11 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
         ["egress rule move"] = ["index", "to"],
         ["egress enable"] = ["yes"],
         ["egress test"] = ["connect"],
+        ["egress dns restore"] = ["force"],
+        ["egress dns enable"] = ["yes"],
     };
     private static readonly string[] EgressFlagOrder =
-        ["match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect"];
+        ["match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect", "force"];
 
     internal const string HelpText = """
         Usage: specus-client [run] [options]
@@ -39,6 +41,10 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
                specus-client egress enable --config PATH [--yes] [--json]
                specus-client egress disable --config PATH [--json]
                specus-client egress test ADDRESS --config PATH [--connect PORT] [--json]
+               specus-client egress dns enable --config PATH [--yes] [--json]
+               specus-client egress dns disable --config PATH [--json]
+               specus-client egress dns status --config PATH [--json]
+               specus-client egress dns restore [--force] [--json]
 
         Options:
           -h, --help            Show help without loading configuration or connecting
@@ -58,6 +64,11 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
         separate: rules take nothing over until egress enable. egress test previews what the rules
         decide for an IPv4 address; only --connect PORT makes a connection, and that shows
         reachability, not the path taken.
+
+        egress dns enable|disable sets peerEgressDnsTakeover, which lets domain rules take effect by
+        pointing the system DNS at this client while it runs. egress dns status reports whether it is
+        taken over; egress dns restore gives back a takeover a stopped or killed client left behind,
+        and refuses while that client still runs unless --force is given. Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules.
 
         Examples:
           specus-client --config "/path with spaces/client.jsonc"
@@ -97,6 +108,10 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
                     if (args.Length < 3 || args[2] is not ("add" or "remove" or "move" or "enable" or "disable"))
                         throw new ArgumentException("expected: egress rule add|remove|move|enable|disable --config PATH");
                     command = "egress rule " + args[2]; i = 3; break;
+                case "dns":
+                    if (args.Length < 3 || args[2] is not ("status" or "restore" or "enable" or "disable"))
+                        throw new ArgumentException("expected: egress dns status|restore|enable|disable");
+                    command = "egress dns " + args[2]; i = 3; break;
                 default:
                     throw new ArgumentException("unknown egress command; see --help");
             }
@@ -124,6 +139,7 @@ internal sealed record ClientCliOptions(string? ConfigPath, string Command,
                 case "--no-open": noOpen = true; break;
                 case "--disabled": egress = egress with { Disabled = true }; given.Add("disabled"); break;
                 case "--yes": egress = egress with { Yes = true }; given.Add("yes"); break;
+                case "--force": egress = egress with { Force = true }; given.Add("force"); break;
                 case "--match" or "--action" or "--egress-client-id" or "--at" or "--index" or "--to" or "--connect":
                     var name = arg[2..];
                     if (++i >= args.Length) throw new ArgumentException(arg + " requires a value");

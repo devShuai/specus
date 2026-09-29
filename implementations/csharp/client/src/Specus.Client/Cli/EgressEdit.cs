@@ -51,6 +51,7 @@ internal static class EgressEdit
                 "egress rules" => List(options, path),
                 "egress test" => Test(options, path),
                 "egress enable" or "egress disable" => Toggle(options, path),
+                "egress dns enable" or "egress dns disable" => DnsToggle(options, path),
                 _ => EditRule(options, path),
             };
         }
@@ -328,6 +329,66 @@ internal static class EgressEdit
 
     private static int Write(ClientCliOptions options, string path, Loaded loaded, string key, string value, IReadOnlyList<string> preface)
     {
+        var config = Save(options, path, loaded, key, value);
+        var lines = new List<string>();
+        var data = Listing(path, config, lines);
+        data["saved"] = true;
+        var message = new List<string>(preface) { $"Saved {path}. {RestartNote}" };
+        message.AddRange(lines);
+        return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", message));
+    }
+
+    /// <summary>What turning DNS takeover on means, printed every time it is turned on (protocol/spec/peer-egress-dns.md, 命令).</summary>
+    internal static readonly string[] DnsEnableNotice =
+    [
+        "Turning on DNS takeover for domain rules:",
+        "  - points the system DNS at this client while it runs and gives it back when it stops (resolvectl or /etc/resolv.conf on Linux, networksetup on macOS, an NRPT rule on Windows)",
+        "  - keeps a journal in ~/.specus, so a change left by a killed client is undone at its next start or by egress dns restore",
+        "  - domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules",
+    ];
+
+    /// <summary>
+    /// <c>egress dns enable|disable</c>: sets <c>peerEgressDnsTakeover</c> the way <c>egress
+    /// enable|disable</c> sets the master switch, the change stated every time it is turned on.
+    /// </summary>
+    private static int DnsToggle(ClientCliOptions options, string path)
+    {
+        var loaded = Load(options, path);
+        var config = loaded.Config;
+        var on = options.Command == "egress dns enable";
+        if (config.PeerEgressDnsTakeover == on)
+        {
+            return CliOutput.Result(options.Json, options.Command, 0, DnsData(path, config),
+                $"DNS takeover is already {(on ? "on" : "off")}; nothing was changed.\n{DnsLine(config)}");
+        }
+        if (on && !options.Egress.Yes)
+            throw Fail(options, string.Join("\n", DnsEnableNotice) + "\nNot changed. Re-run with --yes to confirm.");
+        var message = new List<string>();
+        if (on)
+        {
+            message.AddRange(DnsEnableNotice);
+            if (!config.PeerEgressEnabled)
+                message.Add("Warning: peerEgressEnabled is false, so domain rules take effect only after egress enable.");
+        }
+        var saved = Save(options, path, loaded, "peerEgressDnsTakeover", on ? "true" : "false");
+        message.Add($"Saved {path}. {RestartNote}");
+        message.Add(DnsLine(saved));
+        return CliOutput.Result(options.Json, options.Command, 0, DnsData(path, saved), string.Join("\n", message));
+    }
+
+    private static string DnsLine(SpecusClientConfig config) =>
+        config.PeerEgressDnsTakeover ? $"dns takeover: on (pool {config.PeerEgressFakeIpCidr})" : "dns takeover: off";
+
+    private static Dictionary<string, object?> DnsData(string path, SpecusClientConfig config) => new()
+    {
+        ["configPath"] = path,
+        ["dnsTakeover"] = config.PeerEgressDnsTakeover,
+        ["pool"] = config.PeerEgressFakeIpCidr,
+    };
+
+    /// <summary>Writes one top-level value into the file, refusing an edit that would not load, and returns what it now says.</summary>
+    private static SpecusClientConfig Save(ClientCliOptions options, string path, Loaded loaded, string key, string value)
+    {
         byte[] patched;
         try
         {
@@ -358,12 +419,7 @@ internal static class EgressEdit
         {
             throw Fail(options, $"Cannot write {path}: {error.Message}");
         }
-        var lines = new List<string>();
-        var data = Listing(path, config, lines);
-        data["saved"] = true;
-        var message = new List<string>(preface) { $"Saved {path}. {RestartNote}" };
-        message.AddRange(lines);
-        return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", message));
+        return config;
     }
 
     /// <summary>Why an address cannot be previewed, or null when it can.</summary>
@@ -620,11 +676,11 @@ internal static class EgressEdit
 
     /// <summary>
     /// Replaces or adds one top-level value the egress commands own, with the encoded JSON given. Only
-    /// peerEgressEnabled and peerEgressRules; everything else goes through the local page's checks.
+    /// peerEgressEnabled, peerEgressRules and peerEgressDnsTakeover; everything else goes through the local page's checks.
     /// </summary>
     internal static byte[] Patch(byte[] bytes, string key, string value)
     {
-        if (key is not ("peerEgressRules" or "peerEgressEnabled")) throw UiConfig.Invalid();
+        if (key is not ("peerEgressRules" or "peerEgressEnabled" or "peerEgressDnsTakeover")) throw UiConfig.Invalid();
         var doc = UiConfig.Parse(bytes);
         // A differently cased duplicate would leave two readings of the same switch.
         if (doc.Spans.Keys.Any(existing => existing.Equals(key, StringComparison.OrdinalIgnoreCase) && existing != key))

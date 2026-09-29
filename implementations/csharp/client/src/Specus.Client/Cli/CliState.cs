@@ -163,33 +163,52 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         _stop.Cancel(); _publisher.GetAwaiter().GetResult(); _stop.Dispose();
         try { File.Delete(_path); } catch (IOException) { }
     }
+    /// <summary>
+    /// The state of every running client of this configuration that published within the last five
+    /// seconds. Throws <see cref="IOException"/> or <see cref="UnauthorizedAccessException"/> when the
+    /// state directory is not safe to read.
+    /// </summary>
+    internal static List<JsonElement> Fresh(string config)
+    {
+        var fresh = new List<JsonElement>();
+        if (!Directory.Exists(Root)) return fresh;
+        CheckPrivate(Root);
+        var paths = Directory.GetFiles(Root, Prefix(config) + "*.json");
+        if (paths.Length > 256) return fresh;
+        foreach (var path in paths)
+        {
+            if (!File.Exists(path)) continue;
+            CheckPrivate(path);
+            if (new FileInfo(path).Length > 1024 * 1024) continue;
+            try
+            {
+                using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
+                long age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.GetProperty("updatedAtUnixMs").GetInt64();
+                int pid = data.GetProperty("pid").GetInt32();
+                if (age is < 0 or > 5000 || !string.Equals(data.GetProperty("configPath").GetString(),config,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) || data.GetProperty("schemaVersion").GetInt32() != 1) continue;
+                using var process = Process.GetProcessById(pid); if (process.HasExited) continue;
+                fresh.Add(data.Clone());
+            }
+            catch (Exception e) when (e is JsonException or ArgumentException or InvalidOperationException or KeyNotFoundException or FileNotFoundException) { }
+        }
+        return fresh;
+    }
+
     internal static int Query(string config, ClientCliOptions options)
     {
         try
         {
-            if (!Directory.Exists(Root)) return Missing();
-            CheckPrivate(Root);
-            var paths = Directory.GetFiles(Root, Prefix(config) + "*.json");
-            if (paths.Length > 256) return Missing();
             var instances = new List<object>();
-            foreach (var path in paths)
+            foreach (var data in Fresh(config))
             {
-                if (!File.Exists(path)) continue;
-                CheckPrivate(path);
-                if (new FileInfo(path).Length > 1024 * 1024) continue;
                 try
                 {
-                    using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
-                    long age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.GetProperty("updatedAtUnixMs").GetInt64();
-                    int pid = data.GetProperty("pid").GetInt32();
-                    if (age is < 0 or > 5000 || !string.Equals(data.GetProperty("configPath").GetString(),config,
-                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) || data.GetProperty("schemaVersion").GetInt32() != 1) continue;
-                    using var process = Process.GetProcessById(pid); if (process.HasExited) continue;
-                    if (options.Command == "status") instances.Add(data.Clone());
-                    else instances.Add(new Dictionary<string, object> { ["pid"] = pid, ["phase"] = data.GetProperty("phase").Clone(),
+                    if (options.Command == "status") instances.Add(data);
+                    else instances.Add(new Dictionary<string, object> { ["pid"] = data.GetProperty("pid").GetInt32(), ["phase"] = data.GetProperty("phase").Clone(),
                         ["catalogAvailable"] = data.GetProperty("controlAuthenticated").Clone(), [options.Command] = data.GetProperty(options.Command).Clone() });
                 }
-                catch (Exception e) when (e is JsonException or ArgumentException or InvalidOperationException or KeyNotFoundException or FileNotFoundException) { }
+                catch (Exception e) when (e is InvalidOperationException or KeyNotFoundException) { }
             }
             if (instances.Count == 0) return Missing();
             var result = new { instances };

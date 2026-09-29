@@ -249,12 +249,15 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
 
         var consumer = Consumer(mesh);
         var dns = consumer.GetProperty("dns");
-        Assert.True(dns.GetProperty("takeover").GetBoolean());
+        Assert.True(dns.GetProperty("active").GetBoolean());
+        // This host offers no system DNS to change, so nothing is taken over and nothing refused.
+        Assert.False(dns.GetProperty("takeover").GetBoolean());
+        Assert.Equal("none", dns.GetProperty("journal").GetString());
         Assert.Equal("198.18.0.0/15", dns.GetProperty("pool").GetString());
         Assert.Equal(1, dns.GetProperty("mappings").GetInt32());
         Assert.Equal(0, dns.GetProperty("quarantined").GetInt32());
         Assert.False(dns.TryGetProperty("code", out _));
-        Assert.Equal(["takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "queries"],
+        Assert.Equal(["active", "takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "journal", "queries"],
             dns.EnumerateObject().Select(field => field.Name));
         var route = consumer.GetProperty("routes").EnumerateArray().Single();
         Assert.Equal("198.18.0.0/15", route.GetProperty("cidr").GetString());

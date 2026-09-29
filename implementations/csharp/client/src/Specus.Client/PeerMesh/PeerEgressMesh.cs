@@ -78,11 +78,20 @@ internal interface IPeerEgressMeshHost
     IReadOnlyList<string> LocalInterfaceAddresses() => PeerEgressEndpoints.LocalInterfaceAddresses();
 
     /// <summary>
-    /// Where the DNS responder forwards what it does not answer itself: addresses, each with an
-    /// optional port. Step five records the system's own resolvers here; until then it is empty,
-    /// and every forwarded query is answered SERVFAIL.
+    /// Where the DNS responder forwards what it does not answer itself while the system's DNS is not
+    /// taken over: addresses, each with an optional port. While it is, the resolvers the takeover
+    /// recorded are used instead. Empty, a forwarded query is answered SERVFAIL.
     /// </summary>
     IReadOnlyList<string> DnsUpstreams => [];
+
+    /// <summary>
+    /// The machine whose DNS the takeover changes, or null for a host that never changes it. Null by
+    /// default, so no host built for a test can touch the DNS of the machine it runs on.
+    /// </summary>
+    IPeerEgressDnsHost? DnsSystem => null;
+
+    /// <summary>Where the takeover journal lives, or null for <c>~/.specus/egress-dns-journal.json</c>.</summary>
+    string? DnsJournalPath => null;
 
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
@@ -244,6 +253,11 @@ internal sealed class PeerEgressMesh(
     private PeerEgressDnsResponder? _dnsResponder;
     private Timer? _dnsTick;
     private string _upstreamsRefusedLogged = "";
+
+    /// <summary>
+    /// The system DNS takeover (step five). Built on the first reconcile; driven under the plan lock.
+    /// </summary>
+    private PeerEgressDnsTakeover? _dnsTakeover;
 
     /// <summary>
     /// The pool the consumer was last configured with, so a reconcile that finds phase two stopped
@@ -616,12 +630,20 @@ internal sealed class PeerEgressMesh(
         {
             upstreams = [.. DnsUpstreams().Select(upstream => upstream.ToString())];
         }
-        return new PeerEgressDnsStatus(phase.Active, host.FakeIpCidr?.Trim() ?? string.Empty,
-            pool?.Mappings ?? 0, pool?.Quarantined(nowMs) ?? 0, phase.Code)
+        // takeover is the system's DNS pointing here, which only a committed journal says. A pool
+        // that is not usable is phase two's own code; otherwise the takeover's refusal or failure.
+        var takeover = _dnsTakeover?.Status ?? PeerEgressDnsTakeoverStatus.Idle;
+        var poolCode = !phase.Active ? phase.Code : null;
+        return new PeerEgressDnsStatus(takeover.Takeover, host.FakeIpCidr?.Trim() ?? string.Empty,
+            pool?.Mappings ?? 0, pool?.Quarantined(nowMs) ?? 0, poolCode ?? takeover.Code)
         {
+            Active = phase.Active,
             Listen = pool is not null && responder is not null ? Ipv4Cidr.FormatAddress(pool.Listen) : null,
             Upstreams = upstreams,
+            Journal = takeover.Journal,
             Queries = responder?.Counters ?? new PeerEgressDnsCounters(0, 0, 0),
+            Reason = poolCode is null ? takeover.Reason : null,
+            Error = poolCode is null ? takeover.Error : null,
         };
     }
 
@@ -731,6 +753,7 @@ internal sealed class PeerEgressMesh(
     {
         lock (_gate) { if (_closed) { return; } }
         var meshCidr = MeshCidrOrDefault();
+        CheckNetwork(nowMs);
         // Phase two needs the consumer even with no rules yet: the pool's route sends its addresses
         // into the TUN, and whatever arrives there is refused as unmapped rather than dropped
         // unaccounted for by the mesh path.
@@ -744,6 +767,7 @@ internal sealed class PeerEgressMesh(
         var purge = rules.Count == 0 && pool is null && _consumerPool is null
             ? new Dictionary<long, IReadOnlyList<string>>()
             : ConfigureConsumer(rules, meshCidr, pool, responder, nowMs);
+        List<PeerEgressDnsUpstream> upstreams;
         lock (_planLock)
         {
             lock (_gate)
@@ -754,11 +778,88 @@ internal sealed class PeerEgressMesh(
                 }
             }
             ReconcileLocked(rules, pool?.Cidr, nowMs);
+            // After the routes: whether the pool's route went in decides whether the system's DNS
+            // can be pointed at the responder at all.
+            TakeOverDnsLocked(pool, meshCidr, nowMs);
+            lock (_phaseLock)
+            {
+                upstreams = DnsUpstreams();
+            }
         }
+        // The responder forwards to what the takeover recorded as the system's own resolvers.
+        responder?.SetUpstreams(upstreams);
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
         DeliverPurges(purge);
         SyncEgressAvailability(host.EgressAvailability);
+    }
+
+    /// <summary>
+    /// The system DNS takeover, built on the first reconcile, when the journal a previous run left is
+    /// given back before anything else is decided. Null on a host that offers no DNS system to change.
+    /// Called under the plan lock.
+    /// </summary>
+    private PeerEgressDnsTakeover? DnsTakeoverLocked()
+    {
+        if (_dnsTakeover is not null || host.DnsSystem is not { } system)
+        {
+            return _dnsTakeover;
+        }
+        _dnsTakeover = new PeerEgressDnsTakeover(system, host.DnsJournalPath ?? PeerEgressDnsJournal.DefaultPath, logger);
+        // Whatever the configuration says now: a takeover a killed process left is given back
+        // either way, and one still wanted is taken again from clean.
+        _dnsTakeover.RecoverLeftover();
+        return _dnsTakeover;
+    }
+
+    /// <summary>
+    /// Points the system's DNS at the responder while phase two runs, and gives it back when it
+    /// stops. Called under the plan lock, after the routes.
+    /// </summary>
+    private void TakeOverDnsLocked(PeerEgressFakeIpPool? pool, string meshCidr, long nowMs)
+    {
+        if (DnsTakeoverLocked() is not { } takeover)
+        {
+            return;
+        }
+        if (pool is null || !host.DnsTakeover || !Ipv4Cidr.TryParse(meshCidr, out var mesh))
+        {
+            takeover.Idle("phase two is not running");
+            return;
+        }
+        var poolRoute = pool.Cidr.ToString();
+        var installed = _routes?.Installed.Any(route =>
+            route.Origin == PeerEgressRoutePlanner.FakeIpPoolOrigin && route.Cidr == poolRoute) == true;
+        takeover.Engage(new PeerEgressDnsTakeoverRequest(Ipv4Cidr.FormatAddress(pool.Listen), host.TunName, pool.Cidr,
+            mesh, installed), nowMs);
+    }
+
+    /// <summary>
+    /// Compares the network with the one the takeover was made on, every ten seconds while the
+    /// switch is on. On a change the takeover is given back first and taken again from what the new
+    /// network's DHCP handed out, rather than forwarding to the last network's router; and the pool
+    /// is checked against the new interfaces again, so one that now overlaps stops phase two.
+    /// </summary>
+    private void CheckNetwork(long nowMs)
+    {
+        if (!host.DnsTakeover)
+        {
+            return;
+        }
+        lock (_planLock)
+        {
+            if (DnsTakeoverLocked() is not { } takeover || !takeover.NetworkChanged(host.TunName, nowMs))
+            {
+                return;
+            }
+            logger?.LogInformation("[peer-egress-dns] the network changed; system DNS is given back and taken again");
+            takeover.Release("the network changed");
+            takeover.ForgetAttempt();
+        }
+        lock (_phaseLock)
+        {
+            _interfacesCheckedFor = null;
+        }
     }
 
     private void ReconcileLocked(
@@ -981,6 +1082,19 @@ internal sealed class PeerEgressMesh(
     private List<PeerEgressDnsUpstream> DnsUpstreams()
     {
         var upstreams = new List<PeerEgressDnsUpstream>();
+        if (_dnsTakeover?.RecordedUpstreams is { } recorded)
+        {
+            // What the system's DNS pointed at before the takeover is where queries go: set when
+            // the journal commits, and kept after giving back for DNS pointed here by hand.
+            foreach (var text in recorded)
+            {
+                if (PeerEgressDnsUpstream.TryParse(text, out var upstream))
+                {
+                    upstreams.Add(upstream);
+                }
+            }
+            return upstreams;
+        }
         var refused = 0;
         foreach (var text in host.DnsUpstreams)
         {
@@ -1237,6 +1351,9 @@ internal sealed class PeerEgressMesh(
     {
         lock (_planLock)
         {
+            // The system's DNS goes back before the pool's route does: pointed at an address that
+            // no longer reaches anything, every name on the machine would stop resolving.
+            _dnsTakeover?.Release("the client is stopping");
             PeerEgressRouteInstaller? installer;
             lock (_gate)
             {
