@@ -244,12 +244,15 @@ type ClientSession struct {
 	// ClientEgressVersion is the peer egress split routing version the client announced.
 	// 0 or absent means it cannot take part, and the server must not push egress payloads to it.
 	ClientEgressVersion int
-	HTTPLoginAt         time.Time
-	NettyConnectedAt    *time.Time
-	DisconnectedAt      *time.Time
-	ExpiresAt           time.Time
-	ChannelID           *string
-	RemoteAddress       *string
+	// ClientEgressDomainTargets is whether the client, as an egress, resolves domain targets itself
+	// (clientEgressCapabilities.domainTargetCapable). The catalogue passes it on to consumers.
+	ClientEgressDomainTargets bool
+	HTTPLoginAt               time.Time
+	NettyConnectedAt          *time.Time
+	DisconnectedAt            *time.Time
+	ExpiresAt                 time.Time
+	ChannelID                 *string
+	RemoteAddress             *string
 }
 
 // PeerMeshDevice mirrors peer_mesh_device.

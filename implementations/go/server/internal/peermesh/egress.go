@@ -112,6 +112,20 @@ func NormalizeEgressVersion(version int) int {
 	return version
 }
 
+// EgressDomainTargets is the domainTargetCapable a login is stored with. It means nothing from a
+// client that does not take part in egress at all, so such a client is stored as unable.
+func EgressDomainTargets(version int, declared bool) bool {
+	return NormalizeEgressVersion(version) >= 1 && declared
+}
+
+// egressDomainTargetsOf reads, from the egress's current online session, whether it said at login
+// that it resolves domain targets. Offline, or no such declaration, is false: a consumer must not
+// send a name to an egress that cannot resolve it.
+func (s *Service) egressDomainTargetsOf(ctx context.Context, tenantID string, egressClientID int64) bool {
+	online, err := s.db.GetOnlineClientSession(ctx, tenantID, egressClientID, auth.StatusNettyOnline)
+	return err == nil && online != nil && online.ClientEgressVersion >= 1 && online.ClientEgressDomainTargets
+}
+
 // egressCapabilitiesFor reads what the client announced at login. A client with no online session,
 // or one that announced nothing, gets no egress payloads at all.
 func (s *Service) egressCapabilitiesFor(ctx context.Context, account store.ClientAccount) *EgressCapabilities {
@@ -371,14 +385,14 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, policy.EgressClientID)
 		online := err == nil && device != nil && device.Enabled
 		message.Egresses = append(message.Egresses, EgressCatalogEntry{
-			ClientID:   policy.EgressClientID,
-			ClientName: policy.EgressClientName,
-			Online:     online,
-			Scope:      policy.Scope,
-			Protocols:  egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
-			// Both stay false until domain rules and an IPv6 data plane ship.
-			DomainTargetCapable: false,
-			IPv6TargetCapable:   false,
+			ClientID:            policy.EgressClientID,
+			ClientName:          policy.EgressClientName,
+			Online:              online,
+			Scope:               policy.Scope,
+			Protocols:           egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
+			DomainTargetCapable: s.egressDomainTargetsOf(ctx, account.TenantID, policy.EgressClientID),
+			// No client declares IPv6 targets yet; the data plane carries IPv4 only.
+			IPv6TargetCapable: false,
 		})
 	}
 	return message, nil
