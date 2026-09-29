@@ -33,6 +33,8 @@ const (
 	// egressOutcomeBlockedFakeIP is a packet to a fake address that no name, or no rule, stands
 	// behind any more (phase two).
 	egressOutcomeBlockedFakeIP
+	// egressOutcomeDNS is a packet for the DNS responder, handled whatever became of it.
+	egressOutcomeDNS
 )
 
 func (o egressConsumerOutcome) String() string {
@@ -47,6 +49,8 @@ func (o egressConsumerOutcome) String() string {
 		return "unsupported"
 	case egressOutcomeBlockedFakeIP:
 		return "blocked-fake-ip"
+	case egressOutcomeDNS:
+		return "dns"
 	default:
 		return "not-mine"
 	}
@@ -93,9 +97,27 @@ type egressConsumer struct {
 	fakeIPCIDR string
 	fakeIP     *egressFakeIPPool
 	capable    map[int64]bool
-	// clock is what the status reads the pool's counts at; the data plane takes time as an
-	// argument, like everything else here.
+	// clock is what the status reads the pool's counts at, and what the responder's timers and
+	// forwards read when they fire; the data plane takes time as an argument, like everything else
+	// here.
 	clock func() time.Time
+
+	// The DNS responder (step four, peer_egress_dns.go): its counters, the upstreams it forwards
+	// to, how long each gets, how many forwards are waiting, and this device's own addresses for
+	// the source check.
+	dnsQueries        egressDNSQueries
+	dnsUpstreams      []string
+	dnsForwardTimeout time.Duration
+	dnsForwarding     int
+	dnsLocal          map[uint32]bool
+	dnsLocalAt        time.Time
+	dnsLocalAddresses func() []uint32
+	// The responder's TCP connections (peer_egress_dns_tcp.go), and the timer that drives their
+	// retransmission and idle close while any exist. A zero interval leaves the ticking to the
+	// caller, which is how tests drive time.
+	dnsConns        map[egressDNSConnKey]*egressDNSConn
+	dnsTickInterval time.Duration
+	dnsTickArmed    bool
 
 	// online is which egress peers can currently take a flow. Absent means no.
 	online map[int64]bool
@@ -123,8 +145,13 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 		meshCIDR: egressDefaultMeshCIDR,
 		capable:  map[int64]bool{},
 		clock:    time.Now,
-		online:   map[int64]bool{},
-		flows:    map[egressFlowKey]*egressConsumerFlow{},
+
+		dnsForwardTimeout: egressDNSForwardTimeout,
+		dnsConns:          map[egressDNSConnKey]*egressDNSConn{},
+		dnsTickInterval:   egressDNSTickInterval,
+
+		online: map[int64]bool{},
+		flows:  map[egressFlowKey]*egressConsumerFlow{},
 
 		flowCapacity: egressConsumerFlowCapacity,
 		send:         send,
@@ -159,6 +186,10 @@ func (c *egressConsumer) configureIn(rules []egressRule, meshCIDR, virtualIP, fa
 		c.fakeIPCIDR, c.fakeIP = "", nil
 		if pool, ok := parseEgressCIDR(fakeIPCIDR); ok {
 			c.fakeIPCIDR, c.fakeIP = fakeIPCIDR, newEgressFakeIPPool(pool)
+		}
+		// The responder's connections were to the old pool's listen address.
+		for _, conn := range c.dnsConns {
+			c.dropDNSConnLocked(conn)
 		}
 	}
 	purge, resets := c.purgeInvalidatedLocked(now)
@@ -197,6 +228,14 @@ func (c *egressConsumer) assignFakeIP(name string, now time.Time) (assignment eg
 	if pool == nil {
 		return egressFakeIPAssignment{}, false
 	}
+	c.logFakeIPAssignment(assignment)
+	return assignment, true
+}
+
+// logFakeIPAssignment says what an assignment cost: a line per evicted mapping and one for an
+// exhausted pool. Both are rare enough to be said under the consumer's lock when that is where the
+// assignment happened.
+func (c *egressConsumer) logFakeIPAssignment(assignment egressFakeIPAssignment) {
 	for _, evicted := range assignment.Evicted {
 		c.logger.Printf("[peer-egress-consumer] fake-IP mapping %s evicted after %s unused",
 			formatEgressAddress(evicted.Address), egressFakeIPMinLifetime)
@@ -204,7 +243,6 @@ func (c *egressConsumer) assignFakeIP(name string, now time.Time) (assignment eg
 	if assignment.Exhausted {
 		c.logger.Printf("[peer-egress-consumer] fake-IP pool exhausted; the query is answered SERVFAIL")
 	}
-	return assignment, true
 }
 
 // fakeIPName is the name a pool address was handed out for, for the responder's reverse answers.
@@ -372,6 +410,13 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 	protocol := peerPacketProtocol(packet)
 
 	c.mu.Lock()
+	// The responder's port comes before steering: the listen address is in the pool and never
+	// mapped, so steering would block its queries as unmapped.
+	if c.isDNSQueryPacketLocked(packet, destination, protocol) {
+		c.mu.Unlock()
+		c.handleDNSPacket(packet, protocol, now)
+		return egressOutcomeDNS
+	}
 	steering := c.steerLocked(destination, now, true)
 	if !steering.claimed {
 		c.mu.Unlock()

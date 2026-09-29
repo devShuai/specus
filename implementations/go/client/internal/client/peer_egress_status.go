@@ -53,6 +53,11 @@ type consumerStatusSnapshot struct {
 	Capable     map[int64]bool
 	Mappings    int
 	Quarantined int
+	// The responder: where it listens ("" while phase two does not run), what it forwards to, and
+	// its counters.
+	Listen     string
+	Upstreams  []string
+	DNSQueries egressDNSQueries
 }
 
 func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
@@ -85,10 +90,13 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 		Blocked:       blocked,
 		FakeIPCIDR:    c.fakeIPCIDR,
 		Capable:       capable,
+		Upstreams:     append([]string{}, c.dnsUpstreams...),
+		DNSQueries:    c.dnsQueries,
 	}
 	if c.fakeIP != nil {
 		// Counted at the moment of asking: a quarantine that ended an hour ago is not one.
 		snapshot.Mappings, snapshot.Quarantined = c.fakeIP.counts(c.clock())
+		snapshot.Listen = formatEgressAddress(c.fakeIP.listen)
 	}
 	return snapshot
 }
@@ -156,12 +164,17 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	return status
 }
 
-// egressDNSStatusJSON is consumer.dns: whether phase two is running and what its pool holds. Only
-// written when peerEgressDnsTakeover is on, so a node that never asked for phase two reads exactly
-// as before. listen and upstreams belong to the responder and journal to the system DNS takeover,
-// which are later steps; a field that is not delivered yet is left out rather than faked.
+// egressDNSStatusJSON is consumer.dns: whether phase two is running, what its pool holds, and what
+// the responder is doing. Only written when peerEgressDnsTakeover is on, so a node that never asked
+// for phase two reads exactly as before. listen is there only while the responder answers on it;
+// journal belongs to the system DNS takeover, a later step, and a field not delivered yet is left
+// out rather than faked.
 func (mesh *peerMeshClient) egressDNSStatusJSON(consumer *egressConsumer) map[string]any {
 	phase := mesh.currentEgressPhaseTwo()
+	mesh.mu.Lock()
+	upstreams := append([]string{}, mesh.egressDNSUpstreams...)
+	mesh.mu.Unlock()
+	var queries egressDNSQueries
 	dns := map[string]any{
 		"takeover":    phase.Active,
 		"pool":        phase.CIDR,
@@ -171,9 +184,21 @@ func (mesh *peerMeshClient) egressDNSStatusJSON(consumer *egressConsumer) map[st
 	if phase.Code != "" {
 		dns["code"] = phase.Code
 	}
-	if consumer != nil && phase.Active {
+	if consumer != nil {
 		snapshot := consumer.statusSnapshot()
-		dns["mappings"], dns["quarantined"] = snapshot.Mappings, snapshot.Quarantined
+		upstreams, queries = snapshot.Upstreams, snapshot.DNSQueries
+		if phase.Active {
+			dns["mappings"], dns["quarantined"] = snapshot.Mappings, snapshot.Quarantined
+			if snapshot.Listen != "" {
+				dns["listen"] = snapshot.Listen
+			}
+		}
+	}
+	dns["upstreams"] = upstreams
+	// Totals since start, split the way they are read: built here, relayed from an upstream,
+	// and failed.
+	dns["queries"] = map[string]int64{
+		"answered": queries.Answered, "forwarded": queries.Forwarded, "failed": queries.Failed,
 	}
 	return dns
 }
