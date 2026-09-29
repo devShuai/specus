@@ -129,7 +129,8 @@ jobs:
       - name: GC logs
         if: always()
         run: |
-          sudo sh -c 'cp /tmp/gc-*.log "$RUNNER_TEMP/lab/" 2>/dev/null; chmod a+r "$RUNNER_TEMP"/lab/gc-*.log 2>/dev/null' || true
+          sudo sh -c "cp /tmp/gc-*.log '$RUNNER_TEMP/lab/'; chmod a+r '$RUNNER_TEMP'/lab/gc-*.log" || true
+          sudo ls -la /tmp | grep gc || true
           ls -la "$RUNNER_TEMP/lab" | grep gc || true
       - name: Report
         if: always()
