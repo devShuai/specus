@@ -282,10 +282,18 @@ Windows 接口类型为 53（虚拟）或 131（隧道）的接口。本客户�
 - **先落盘再改系统**：检查通过后以 `state: "pending"` 写日志，再按向量 `plan` 的 `apply` 顺序执行，全部成功后改写为 `committed`。
   任一步失败：完整执行一遍 `revert`（它对执行到哪一步都安全），删日志，状态写 `EGRESS_DNS_TAKEOVER_FAILED`，
   `error` 是失败命令输出的第一行。
-- **回滚**按日志执行 `revert`，成功后删日志；某一步失败则保留日志，留给下次启动或 `egress dns restore` 再试，并记日志。
+- 读原值或上游的命令失败时（这时还什么都没改）同样报 `EGRESS_DNS_TAKEOVER_FAILED`，不写日志。
+- **回滚**按日志执行 `revert`，成功后删日志；某一步失败时照样执行完其余各步，报第一个失败的步骤，保留日志，
+  留给下次启动或 `egress dns restore` 再试，并记日志。接管失败后的回滚也失败时同样保留日志（`journal: pending`）：
+  它是原值唯一的记录，下一次接管之前先按它回滚，绝不覆盖。
+- `linux-resolved` 回滚时 TUN 链路已经不存在（客户端没在运行），跳过 `resolvectl revert`：链路设置随链路一起消失了；
+  清缓存照做。否则客户端不在时 `egress dns restore` 永远不会成功。
+- PowerShell 退出码为 0、标准错误却有输出，也按失败处理：`A; Clear-DnsClientCache` 的退出码只反映最后一条语句。
+- 被拒或失败后 60 秒再重新读取系统；网络指纹、监听地址、TUN 或池变化时立即重试。`pool-route-not-installed`
+  不执行任何命令，每次协调都重新看。
 - 进程启动时若发现事务日志，不论 `pending` 还是 `committed`，**先按日志回滚**，再按当前配置决定是否重新接管。
 - 正常退出回滚；被强杀后的回滚在下次启动时完成，或由 `egress dns restore` 完成。
-- 应答者转发用的上游就是日志里的 `upstreams`。
+- 应答者转发用的上游就是日志里的 `upstreams`，在日志提交时设置；系统 DNS 交还之后保留，手动把 DNS 指向监听地址的用法照样能转发。
 
 ### 网络切换
 
@@ -314,10 +322,33 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 ### 命令
 
+三端输出逐字一致，由 `scripts/test-cli-matrix.py` 校验。
+
+- `egress dns enable [--yes] --config PATH`、`egress dns disable --config PATH`：设置 `peerEgressDnsTakeover`，
+  写法与 `egress enable|disable` 相同（保留注释与换行风格，运行中的客户端重启后生效）。开启**每次**先说明这一改动：
+
+  ```text
+  Turning on DNS takeover for domain rules:
+    - points the system DNS at this client while it runs and gives it back when it stops (resolvectl or /etc/resolv.conf on Linux, networksetup on macOS, an NRPT rule on Windows)
+    - keeps a journal in ~/.specus, so a change left by a killed client is undone at its next start or by egress dns restore
+    - domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules
+  ```
+
+  缺 `--yes` 时这几行写到标准错误，再写 `Not changed. Re-run with --yes to confirm.`，以 2 退出，不改文件。
+  带 `--yes` 时这几行写到标准输出；`peerEgressEnabled` 为 `false` 时接着写
+  `Warning: peerEgressEnabled is false, so domain rules take effect only after egress enable.`；
+  然后是 `Saved <path>. A running client applies the change after a restart.` 与 `dns takeover: on (pool <peerEgressFakeIpCidr 的实际值>)`。
+  关闭写 `Saved …` 与 `dns takeover: off`。`--json` 的 `data` 为 `{"configPath": …, "dnsTakeover": true|false, "pool": …}`。
+- CLI 帮助里的「可识别边界」写作英文：`Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules.`
 - `egress dns status --config PATH`：是否接管、原因、上游、事务日志状态、映射数与池使用率。读状态文件与日志，不需要客户端在运行。
-- `egress dns restore`：按事务日志回滚，不需要客户端在运行。日志不存在时说明没有需要恢复的内容并以 0 退出。
-  日志里记的 `pid` 仍在运行时拒绝并以 1 退出，提示先停止客户端或关闭 `peerEgressDnsTakeover`；`--force` 跳过这一检查
-  （进程号可能被别的进程重用）。回滚成功以 0 退出，某一步失败以 1 退出并说明是哪一步。
+  以 0 退出（状态目录不安全时以 2 退出）。`--json` 的 `data` 为 `{"configPath": …, "instances": [{"pid": …, "dns": {…}}], "journal": {"path": …, "state": "none"|"pending"|"committed", …}}`。
+  没有在跑的客户端时写 `No running client for this config.`；没有日志时日志一行写 `journal: none (the system DNS is not taken over)`。
+- `egress dns restore [--force]`：按事务日志回滚，不需要客户端在运行。
+  - 日志不存在：`No DNS takeover journal at <path>; there is nothing to restore.`，以 0 退出。
+  - 日志里记的 `pid` 仍在运行：`The client that took over the system DNS (PID <pid>) is still running, and gives it back itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another process.`，以 1 退出。
+  - 某一步失败：`Giving the system DNS back failed at <step>. The journal is kept; fix what the step reports and run egress dns restore again.`，以 1 退出。
+  - 成功：`System DNS given back (<platform>, taken over by PID <pid>); journal removed.`，以 0 退出。
+  - `--json` 的 `data` 至少含 `journal`（路径）与 `restored`。
 
 ## 七、状态查询增量
 
