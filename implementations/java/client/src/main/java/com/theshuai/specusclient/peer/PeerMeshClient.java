@@ -139,6 +139,12 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long MAX_SESSION_REFRESH_WINDOW_MILLIS = 120_000;
     private static final long MIN_SESSION_REFRESH_WINDOW_MILLIS = 10_000;
     private static final long DIRECT_STALE_MILLIS = 45_000;
+    /**
+     * How long a session must have heard nothing direct from its peer before a data frame arriving
+     * over the relay moves this side's sending to the relay. Frames already in flight on the two
+     * paths otherwise flip each side back and forth, and under load the two sides never settle.
+     */
+    static final long RELAY_FOLLOW_QUIET_MILLIS = 3_000;
     private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
     /** S4.1 RTT 滞回阈值：避免 direct/relay 频繁切换 */
     private static final long RTT_HYSTERESIS_MS = 100;
@@ -2488,9 +2494,13 @@ public class PeerMeshClient implements AutoCloseable {
             dataDecryptRejected.incrementAndGet();
             return;
         }
+        long nowMillis = System.currentTimeMillis();
         if (StringUtils.hasText(relayFromAllocationId)) {
-            session.remoteEndpoint = relayEndpoint();
-            session.relayTargetAllocationId = relayFromAllocationId;
+            session.lastRelaySuccessMillis = nowMillis;
+            if (!session.heardDirectWithin(nowMillis, RELAY_FOLLOW_QUIET_MILLIS) || shouldAvoidDirectPath()) {
+                session.remoteEndpoint = relayEndpoint();
+                session.relayTargetAllocationId = relayFromAllocationId;
+            }
         } else {
             if (shouldAvoidDirectPath()) {
                 logDirectSuppressed("drop-direct-data-frame");
@@ -2498,6 +2508,9 @@ public class PeerMeshClient implements AutoCloseable {
             }
             session.remoteEndpoint = observedRemote;
             session.relayTargetAllocationId = null;
+            // A direct frame proves the direct path as well as a keepalive answer does, and under
+            // load it is what keeps arriving when a keepalive answer is lost.
+            session.lastDirectSuccessMillis = nowMillis;
             session.addDirectBytes(raw.length);
         }
         log.trace("Peer mesh encrypted frame 收到: session={}, from={}, bytes={}",
@@ -2790,6 +2803,12 @@ public class PeerMeshClient implements AutoCloseable {
         }
         long now = System.currentTimeMillis();
         if (StringUtils.hasText(relayFromAllocationId)) {
+            session.lastRelaySuccessMillis = now;
+            if (session.hasHealthyDirect(now) && !shouldAvoidDirectPath()) {
+                // The peer checks its relay the whole time a direct path works. The reply goes
+                // back over the relay; this side's data stays on the direct path.
+                return;
+            }
             session.remoteEndpoint = relayEndpoint();
             session.relayTargetAllocationId = relayFromAllocationId;
             session.markPath("RELAY", now);
@@ -4512,6 +4531,11 @@ public class PeerMeshClient implements AutoCloseable {
                 lastRelaySuccessMillis = nowMillis;
             }
             currentPathType = pathType;
+        }
+
+        /** Whether anything authenticated arrived from the peer over the direct path in the window. */
+        boolean heardDirectWithin(long nowMillis, long windowMillis) {
+            return lastDirectSuccessMillis > 0 && nowMillis - lastDirectSuccessMillis <= windowMillis;
         }
 
         boolean hasHealthyDirect(long nowMillis) {
