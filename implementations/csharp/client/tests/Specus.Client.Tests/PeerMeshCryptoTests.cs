@@ -513,7 +513,10 @@ public sealed class PeerMeshCryptoTests
 
         await InvokePrivateAsync(client, "KeepaliveDirectPathsAsync");
 
-        var payloads = await ReadUdpPayloadsAsync(direct, 3);
+        // The two repeats of the burst are sent from the thread pool 30 and 60 ms after the first.
+        // On a loaded runner that can take far longer than the short gap used to prove silence
+        // below, so collecting them gets a wide window; it returns as soon as all three are in.
+        var payloads = await ReadUdpPayloadsAsync(direct, 3, TimeSpan.FromSeconds(2));
         Assert.Equal(3, payloads.Count);
         var payload = payloads[0];
         using var json = JsonDocument.Parse(payload);
@@ -741,12 +744,13 @@ public sealed class PeerMeshCryptoTests
         return messages;
     }
 
-    private static async Task<List<byte[]>> ReadUdpPayloadsAsync(UdpClient socket, int max)
+    // Reads up to max datagrams, giving up once none arrives for idle (150 ms unless given).
+    private static async Task<List<byte[]>> ReadUdpPayloadsAsync(UdpClient socket, int max, TimeSpan? idle = null)
     {
         var messages = new List<byte[]>();
         for (var i = 0; i < max; i++)
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+            using var cts = new CancellationTokenSource(idle ?? TimeSpan.FromMilliseconds(150));
             try
             {
                 var result = await socket.ReceiveAsync(cts.Token);

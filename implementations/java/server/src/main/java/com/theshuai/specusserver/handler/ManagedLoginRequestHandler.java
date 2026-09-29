@@ -181,6 +181,12 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             SessionUtil.closeDataSession(session.getClientName());
         }
         SessionUtil.unBindSession(ctx.channel());
+        if (!dataConnection && session != null && StringUtils.hasText(session.getClientName())) {
+            // Submitted after the unbind, not with the tasks above: the executor can run before this
+            // thread reaches the unbind, and a roster built then would still count it as online.
+            String departed = session.getClientName();
+            submit(() -> peerSignalService.pushOnLogout(departed));
+        }
         super.channelInactive(ctx);
     }
 
