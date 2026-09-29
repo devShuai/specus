@@ -63,7 +63,17 @@ internal sealed class PeerEgressRuntime
     private const int TcpReadBuffer = 32 * 1024;
     private const int UdpReadBuffer = 65535;
 
-    private sealed record TcpFlow(PeerEgressTcpConnection Connection, IPeerEgressSocket Socket);
+    private sealed record TcpFlow(PeerEgressTcpConnection Connection, IPeerEgressSocket Socket)
+    {
+        /// <summary>
+        /// Wakes this flow's reader and no other. Readers used to wait on the plane's lock and every
+        /// state machine output pulsed all of them, so each ACK and each tick roused every reader to
+        /// find the credit was someone else's; with sixty-four flows that herd, not the network, set
+        /// the pace. Set with the lock held after anything that may have given this flow credit or
+        /// ended it; reset by the reader, under the lock, only when it has found none.
+        /// </summary>
+        public ManualResetEventSlim Wake { get; } = new(false);
+    }
 
     private sealed record UdpFlow(IPeerEgressSocket Socket);
 
@@ -74,6 +84,8 @@ internal sealed class PeerEgressRuntime
     // Set before publication. Admission must not block or acquire the mesh lock.
     internal Func<long, byte[], bool>? TrySend { get; set; }
     private int _sendCursor;
+    // Whether any flow has had a transmission refused since the last scan of blocked flows.
+    private bool _sendBlocked;
     private readonly IPeerEgressDialer _dialer;
     private readonly Action<Action> _executor;
     private readonly Func<long> _clock;
@@ -432,8 +444,17 @@ internal sealed class PeerEgressRuntime
                 syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output);
             if (TrySend is not null)
             {
-                connection.TryTransmit = packet => TrySend(consumer,
-                    PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
+                connection.TryTransmit = packet =>
+                {
+                    var accepted = TrySend(consumer,
+                        PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
+                    if (!accepted)
+                    {
+                        // Transmission runs inside the state machine, under the lock.
+                        Volatile.Write(ref _sendBlocked, true);
+                    }
+                    return accepted;
+                };
             }
             var handle = new TcpFlow(connection, socket);
             flow.Handle = handle;
@@ -455,16 +476,24 @@ internal sealed class PeerEgressRuntime
             var buffer = new byte[TcpReadBuffer];
             while (true)
             {
+                int size;
                 lock (_lock)
                 {
-                    while (ReferenceEquals(_flows.Lookup(flow.Key), flow) && handle.Connection.AppReadCredit() == 0)
-                    {
-                        Monitor.Wait(_lock);
-                    }
                     if (!ReferenceEquals(_flows.Lookup(flow.Key), flow)) { return; }
-                    var size = Math.Min(TcpReadBuffer, handle.Connection.AppReadCredit());
-                    if (buffer.Length != size) { buffer = new byte[size]; }
+                    size = Math.Min(TcpReadBuffer, handle.Connection.AppReadCredit());
+                    if (size == 0)
+                    {
+                        // Reset under the lock that every credit change is made under, so a Set that
+                        // follows the change cannot come before this and be lost.
+                        handle.Wake.Reset();
+                    }
                 }
+                if (size == 0)
+                {
+                    handle.Wake.Wait();
+                    continue;
+                }
+                if (buffer.Length != size) { buffer = new byte[size]; }
                 int read;
                 try
                 {
@@ -525,7 +554,7 @@ internal sealed class PeerEgressRuntime
     private void ApplyTcpOutput(
         long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle, PeerEgressTcpConnection.Output output)
     {
-        Monitor.PulseAll(_lock);
+        handle.Wake.Set();
         foreach (var packet in output.Segments)
         {
             EmitSegment(consumer, packet);
@@ -730,9 +759,19 @@ internal sealed class PeerEgressRuntime
     /// <summary>Called without the mesh lock when the bounded outbound queue frees a slot.</summary>
     internal void SendReady(long nowMs)
     {
+        // Every frame the send loop takes out of the queue lands here, and on most of them no flow
+        // is waiting for room. Scanning and sorting every flow under the plane's lock for each one
+        // anyway put the send loop in line behind every reader, so the scan only runs once a
+        // transmission has actually been refused. A refusal means the queue was full, so the frames
+        // that follow it are enough to bring the scan round.
+        if (!Volatile.Read(ref _sendBlocked))
+        {
+            return;
+        }
         lock (_lock)
         {
             if (_closed) { return; }
+            _sendBlocked = false;
             var snapshot = FlowSnapshot();
             if (snapshot.Count == 0) { return; }
             var start = _sendCursor % snapshot.Count;
@@ -743,6 +782,10 @@ internal sealed class PeerEgressRuntime
                 if (flow.Handle is TcpFlow handle && handle.Connection.SendBlocked)
                 {
                     ApplyTcpOutput(flow.Consumer, flow, handle, handle.Connection.OnTick(nowMs));
+                    if (handle.Connection.SendBlocked)
+                    {
+                        _sendBlocked = true;
+                    }
                 }
             }
         }
@@ -845,7 +888,6 @@ internal sealed class PeerEgressRuntime
     /// <summary>Closes one flow's socket and drops its table entry. Called with the lock held.</summary>
     private void Release(PeerEgressFlowTable.Flow flow)
     {
-        Monitor.PulseAll(_lock);
         if (_flows.Lookup(flow.Key) is null)
         {
             return;
@@ -856,7 +898,6 @@ internal sealed class PeerEgressRuntime
 
     private void ReleaseKey(PeerEgressFlowTable.Key key)
     {
-        Monitor.PulseAll(_lock);
         if (_flows.Close(key) is { } flow)
         {
             CloseHandle(flow.Handle);
@@ -872,7 +913,6 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private void ReleaseAll(IReadOnlyList<PeerEgressFlowTable.Revocation> revoked, long nowMs)
     {
-        Monitor.PulseAll(_lock);
         foreach (var entry in revoked)
         {
             var flow = entry.Flow;
@@ -910,6 +950,8 @@ internal sealed class PeerEgressRuntime
         {
             case TcpFlow tcp:
                 tcp.Socket.Dispose();
+                // Its reader may be waiting for credit that will now never come.
+                tcp.Wake.Set();
                 break;
             case UdpFlow udp:
                 udp.Socket.Dispose();
