@@ -59,6 +59,12 @@ internal interface IPeerEgressMeshHost
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
 
+    /// <summary>
+    /// What carries frames to each peer now: <c>direct</c>, <c>relay</c>, or absent when there is
+    /// neither. Read for status only.
+    /// </summary>
+    IReadOnlyDictionary<long, string> EgressPaths => new Dictionary<long, string>();
+
     /// <summary>Whether there is an interface to route into: a real device that started.</summary>
     bool DeviceReady => true;
 
@@ -441,6 +447,7 @@ internal sealed class PeerEgressMesh(
                 consumerStatus = consumerRole.StatusSnapshot();
             }
         }
+        if (consumerStatus is not null) consumerStatus = consumerStatus with { Paths = host.EgressPaths };
         return PeerEgressStatus.Section(consumerStatus,
             installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules);
     }

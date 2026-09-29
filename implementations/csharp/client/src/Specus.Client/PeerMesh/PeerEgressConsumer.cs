@@ -130,7 +130,8 @@ internal sealed class PeerEgressConsumer(
     /// </remarks>
     public PeerEgressConsumerStatus StatusSnapshot() => new(
         _rules.ToList(), _meshCidr, new Dictionary<long, bool>(_online), _flows.Count,
-        new Dictionary<string, long>(_blocked));
+        new Dictionary<string, long>(_blocked),
+        _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()));
 
     public IReadOnlyDictionary<long, IReadOnlyList<string>> Configure(
         IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs)

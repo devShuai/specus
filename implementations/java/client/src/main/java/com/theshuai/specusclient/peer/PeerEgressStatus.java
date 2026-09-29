@@ -53,8 +53,22 @@ public final class PeerEgressStatus {
 
     /** The consumer's own view, taken under its lock. */
     public record ConsumerSnapshot(List<PeerEgressRule> rules, String meshCidr,
-            Map<Long, Boolean> online, int flows, Map<String, Long> blocked) {
+            Map<Long, Boolean> online, int flows, Map<String, Long> blocked,
+            Map<Long, Integer> flowsByEgress, Map<Long, String> paths) {
+
+        /**
+         * The same view with the path each egress peer's traffic takes now, which the mesh knows
+         * and the consumer does not.
+         */
+        public ConsumerSnapshot withPaths(Map<Long, String> paths) {
+            return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths);
+        }
     }
+
+    /** The values of a peer entry's path: what carries frames to that egress now. */
+    public static final String PATH_DIRECT = "direct";
+    public static final String PATH_RELAY = "relay";
+    public static final String PATH_NONE = "none";
 
     /** The egress role's own view, taken under its lock. */
     public record RuntimeSnapshot(boolean enabled, long revision, int flows,
@@ -168,7 +182,14 @@ public final class PeerEgressStatus {
 
         List<Map<String, Object>> peerEntries = new ArrayList<>();
         for (Map.Entry<Long, Boolean> peer : peers.entrySet()) {
-            peerEntries.add(Map.of("clientId", peer.getKey(), "online", peer.getValue()));
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("clientId", peer.getKey());
+            entry.put("online", peer.getValue());
+            String path = consumer.paths() == null ? null : consumer.paths().get(peer.getKey());
+            entry.put("path", path == null ? PATH_NONE : path);
+            Integer flowCount = consumer.flowsByEgress() == null ? null : consumer.flowsByEgress().get(peer.getKey());
+            entry.put("flows", flowCount == null ? 0 : flowCount);
+            peerEntries.add(entry);
         }
         section.put("peers", peerEntries);
         section.put("flows", consumer.flows());

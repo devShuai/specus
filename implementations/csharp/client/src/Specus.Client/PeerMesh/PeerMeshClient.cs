@@ -307,6 +307,27 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
         }
 
+        // Read the way SendEncryptedPayloadAsync chooses: a nominated relay first, then the direct
+        // endpoint; a peer with neither has no entry.
+        public IReadOnlyDictionary<long, string> EgressPaths
+        {
+            get
+            {
+                var paths = new Dictionary<long, string>();
+                var now = DateTimeOffset.UtcNow;
+                lock (owner._sync)
+                {
+                    foreach (var (peerId, session) in owner._sessions)
+                    {
+                        if (now > session.ExpiresAt) continue;
+                        if (!string.IsNullOrWhiteSpace(session.RelayTargetAllocationId)) paths[peerId] = PeerEgressStatus.PathRelay;
+                        else if (session.RemoteEndpoint is not null) paths[peerId] = PeerEgressStatus.PathDirect;
+                    }
+                }
+                return paths;
+            }
+        }
+
         public bool DeviceReady
         {
             get

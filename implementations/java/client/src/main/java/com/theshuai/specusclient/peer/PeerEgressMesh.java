@@ -93,6 +93,14 @@ final class PeerEgressMesh implements AutoCloseable {
             return Map.of();
         }
 
+        /**
+         * What carries frames to each peer now: {@code direct}, {@code relay}, or absent when
+         * there is neither. Read for status only.
+         */
+        default Map<Long, String> egressPaths() {
+            return Map.of();
+        }
+
         /** Whether there is an interface to route into: a real device that started. */
         default boolean deviceReady() {
             return true;
@@ -363,6 +371,9 @@ final class PeerEgressMesh implements AutoCloseable {
             synchronized (consumerRole) {
                 consumerSnapshot = consumerRole.statusSnapshot();
             }
+        }
+        if (consumerSnapshot != null) {
+            consumerSnapshot = consumerSnapshot.withPaths(host.egressPaths());
         }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,

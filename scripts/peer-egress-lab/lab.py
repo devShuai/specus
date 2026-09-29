@@ -648,6 +648,14 @@ class Lab:
         status = self.client_status("consumer")
         if status:
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
+            # Every runtime says which path carries each egress peer's traffic and how many flows it
+            # has; a lab consumer that just reached its egress is on one path or the other.
+            peers = [peer for instance in status.get("data", {}).get("instances", [])
+                     for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])]
+            self.check("status names the path to the egress and its flow count",
+                       bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
+                                           for peer in peers),
+                       json.dumps(peers))
 
         # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
         # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
