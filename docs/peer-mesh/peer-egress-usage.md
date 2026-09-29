@@ -247,7 +247,15 @@ ip rule add fwmark 0x5350 table 100
 
 ### 打开二期
 
-要让应用的查询到达本功能，只能修改系统 DNS 设置，**这是整个功能里唯一修改用户系统配置的地方**，所以默认关闭，需要同时打开两个开关：
+要让应用的查询到达本功能，只能修改系统 DNS 设置，**这是整个功能里唯一修改用户系统配置的地方**，所以默认关闭，需要同时打开两个开关。可以用命令设置，开启时每次先说明这一改动，确认后才写入：
+
+```sh
+specus-client egress enable --config ./client.jsonc --yes
+specus-client egress dns enable --config ./client.jsonc --yes
+specus-client egress dns disable --config ./client.jsonc
+```
+
+与 `egress enable` 一样只改配置文件里的这一个值，注释与换行风格保留，运行中的客户端重启后生效。也可以直接编辑配置：
 
 ```jsonc
 {

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -220,6 +221,7 @@ func egressDNSLinesForTest(t *testing.T) []string {
 func TestEgressDNSCommandsParse(t *testing.T) {
 	for _, args := range [][]string{
 		{"egress", "dns"}, {"egress", "dns", "flush"}, {"egress", "dns", "status", "--force"},
+		{"egress", "dns", "disable", "--yes"}, {"egress", "dns", "enable", "--force"},
 	} {
 		if _, err := parseCLI(args); err == nil {
 			t.Errorf("%q accepted", args)
@@ -228,7 +230,137 @@ func TestEgressDNSCommandsParse(t *testing.T) {
 	if o, err := parseCLI([]string{"egress", "dns", "restore", "--force"}); err != nil || o.command != "egress dns restore" || !o.egressForce {
 		t.Errorf("restore --force: %+v %v", o, err)
 	}
-	if !strings.Contains(cliHelp, "egress dns restore") || !strings.Contains(cliHelp, "hard-coded IP") {
-		t.Error("the help leaves out the DNS commands or the recognisable boundary")
+	if o, err := parseCLI([]string{"egress", "dns", "enable", "--yes", "--config", "c.jsonc"}); err != nil ||
+		o.command != "egress dns enable" || !o.egressYes {
+		t.Errorf("enable --yes: %+v %v", o, err)
+	}
+	for _, want := range []string{"egress dns enable", "egress dns disable", "egress dns status", "egress dns restore"} {
+		if !strings.Contains(cliHelp, want) {
+			t.Errorf("the help leaves out %s", want)
+		}
+	}
+	// The pinned sentence, checked the way the CLI matrix checks it: whitespace normalised.
+	boundary := "Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or " +
+		"connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules."
+	if !strings.Contains(strings.Join(strings.Fields(cliHelp), " "), boundary) {
+		t.Error("the help leaves out the recognisable-boundary sentence")
+	}
+}
+
+// The lines restore and status print are the spec's, word for word: the CLI matrix holds all three
+// clients to them.
+func TestEgressDNSMessagesMatchThePinnedText(t *testing.T) {
+	host, path := dnsCLI(t)
+	config := filepath.Join(t.TempDir(), "client.jsonc")
+	code, stdout, _ := runCapturedText(t, "egress", "dns", "restore")
+	if code != 0 || stdout != "No DNS takeover journal at "+path+"; there is nothing to restore.\n" {
+		t.Errorf("no journal: %d %q", code, stdout)
+	}
+	code, stdout, _ = runCapturedText(t, "egress", "dns", "status", "--config", config)
+	if code != 0 || stdout != "No running client for this config.\njournal: none (the system DNS is not taken over)\n" {
+		t.Errorf("status: %d %q", code, stdout)
+	}
+
+	writeTestJournal(t, path, resolvConfJournal(os.Getppid()))
+	code, _, stderr := runCapturedText(t, "egress", "dns", "restore")
+	want := fmt.Sprintf("The client that took over the system DNS (PID %d) is still running, and gives it back itself when it "+
+		"stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID "+
+		"now belongs to another process.\n", os.Getppid())
+	if code != 1 || stderr != want {
+		t.Errorf("still running: %d %q", code, stderr)
+	}
+	code, stdout, _ = runCapturedText(t, "egress", "dns", "restore", "--force")
+	if code != 0 || stdout != fmt.Sprintf("System DNS given back (linux-resolvconf, taken over by PID %d); journal removed.\n", os.Getppid()) {
+		t.Errorf("restored: %d %q", code, stdout)
+	}
+
+	host.fail["resolvectl revert specus0"] = "Failed to revert interface configuration: Access denied"
+	writeTestJournal(t, path, client.EgressDNSJournal{Version: 1, State: "committed", Platform: "linux-resolved",
+		PID: deadPID(t), Listen: "198.18.0.1", Tunnel: "specus0", Upstreams: []string{"1.1.1.1"}})
+	code, _, stderr = runCapturedText(t, "egress", "dns", "restore")
+	if code != 1 || !strings.HasPrefix(stderr, "Giving the system DNS back failed at resolvectl revert specus0: ") ||
+		!strings.HasSuffix(stderr, ". The journal is kept; fix what the step reports and run egress dns restore again.\n") {
+		t.Errorf("failed step: %d %q", code, stderr)
+	}
+}
+
+// runCapturedText runs the CLI in this process and returns its exit code, standard output and
+// standard error.
+func runCapturedText(t *testing.T, args ...string) (int, string, string) {
+	t.Helper()
+	outReader, outWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errReader, errWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outWriter, errWriter
+	code := runCLI(args)
+	os.Stdout, os.Stderr = stdout, stderr
+	outWriter.Close()
+	errWriter.Close()
+	out, _ := io.ReadAll(outReader)
+	errText, _ := io.ReadAll(errReader)
+	return code, string(out), string(errText)
+}
+
+const dnsSwitchConfig = "{\r\n  // the server this client logs in to\r\n  \"serverBaseUrl\": \"http://127.0.0.1:1\",\r\n" +
+	"  \"apiKey\": \"k\",\r\n  \"secret\": \"s\"\r\n}\r\n"
+
+// egress dns enable says what it changes every time, changes nothing without --yes, and writes the
+// one value in place, comments and line breaks kept; disable writes it back off.
+func TestEgressDNSEnableAndDisable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.jsonc")
+	if err := os.WriteFile(path, []byte(dnsSwitchConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notice := strings.Join(egressDNSEnableNotice, "\n")
+
+	code, stdout, stderr := runCapturedText(t, "egress", "dns", "enable", "--config", path)
+	if code != 2 || stdout != "" || stderr != notice+"\nNot changed. Re-run with --yes to confirm.\n" {
+		t.Fatalf("without --yes: code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != dnsSwitchConfig {
+		t.Fatal("enable without --yes changed the file")
+	}
+
+	code, stdout, stderr = runCapturedText(t, "egress", "dns", "enable", "--yes", "--config", path)
+	want := notice + "\nWarning: peerEgressEnabled is false, so domain rules take effect only after egress enable.\n" +
+		"Saved " + path + ". A running client applies the change after a restart.\ndns takeover: on (pool 198.18.0.0/15)\n"
+	if code != 0 || stdout != want || stderr != "" {
+		t.Fatalf("enable --yes: code %d\nstdout %q\nwant   %q\nstderr %q", code, stdout, want, stderr)
+	}
+	raw, _ := os.ReadFile(path)
+	text := string(raw)
+	if !strings.Contains(text, "\"peerEgressDnsTakeover\": true") || !strings.Contains(text, "// the server this client logs in to") ||
+		strings.Count(text, "\n") != strings.Count(text, "\r\n") {
+		t.Fatalf("the file after enable: %q", text)
+	}
+
+	code, document := runCaptured(t, "egress", "dns", "disable", "--config", path)
+	data, _ := document["data"].(map[string]any)
+	if code != 0 || data["dnsTakeover"] != false || data["pool"] != "198.18.0.0/15" || data["configPath"] != path {
+		t.Fatalf("disable: code %d %v", code, document)
+	}
+	if raw, _ := os.ReadFile(path); !strings.Contains(string(raw), "\"peerEgressDnsTakeover\": false") {
+		t.Fatalf("the file after disable: %q", raw)
+	}
+	code, stdout, _ = runCapturedText(t, "egress", "dns", "disable", "--config", path)
+	if code != 0 || !strings.HasSuffix(stdout, "A running client applies the change after a restart.\ndns takeover: off\n") {
+		t.Fatalf("disable: code %d stdout %q", code, stdout)
+	}
+
+	// With takeover on and a pool of its own: no warning, and the pool named is the one in use.
+	custom := strings.Replace(dnsSwitchConfig, "\"secret\": \"s\"", "\"secret\": \"s\",\r\n  \"peerEgressEnabled\": true,\r\n"+
+		"  \"peerEgressFakeIpCidr\": \"10.200.0.0/16\"", 1)
+	if err := os.WriteFile(path, []byte(custom), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, _ = runCapturedText(t, "egress", "dns", "enable", "--yes", "--config", path)
+	if code != 0 || strings.Contains(stdout, "Warning:") || !strings.HasSuffix(stdout, "dns takeover: on (pool 10.200.0.0/16)\n") {
+		t.Fatalf("enable with its own pool: code %d stdout %q", code, stdout)
 	}
 }

@@ -19,6 +19,61 @@ import (
 // run changes the DNS of the machine they run on.
 var newEgressDNSHost = client.NewEgressDNSSystemHost
 
+// egressDNSEnableNotice is what turning the DNS takeover on means, said every time it is turned on:
+// it is the one change this feature makes to the system's own settings. The same lines in every
+// runtime (protocol/spec/peer-egress-dns.md, 命令).
+var egressDNSEnableNotice = []string{
+	"Turning on DNS takeover for domain rules:",
+	"  - points the system DNS at this client while it runs and gives it back when it stops (resolvectl or /etc/resolv.conf on Linux, networksetup on macOS, an NRPT rule on Windows)",
+	"  - keeps a journal in ~/.specus, so a change left by a killed client is undone at its next start or by egress dns restore",
+	"  - domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules",
+}
+
+// egressDNSSwitch is `egress dns enable|disable`: set peerEgressDnsTakeover the way egress
+// enable|disable sets peerEgressEnabled, the one value replaced in place and everything else in the
+// file -- comments, line breaks -- kept. Turning it on needs --yes after the notice, every time.
+func egressDNSSwitch(options cliOptions, path string) int {
+	data, revision, config, failed := loadEgressConfig(options, path)
+	if failed >= 0 {
+		return failed
+	}
+	enable := options.command == "egress dns enable"
+	var lines []string
+	value := "false"
+	if enable {
+		if !options.egressYes {
+			return resultOutput(options.json, options.command, 2, nil,
+				strings.Join(egressDNSEnableNotice, "\n")+"\nNot changed. Re-run with --yes to confirm.")
+		}
+		lines = append(lines, egressDNSEnableNotice...)
+		if !config.PeerEgressEnabled {
+			lines = append(lines, "Warning: peerEgressEnabled is false, so domain rules take effect only after egress enable.")
+		}
+		value = "true"
+	}
+	patched, err := uiPatchRawConfig(data, map[string][]byte{"peerEgressDnsTakeover": []byte(value)})
+	if err != nil {
+		return resultOutput(options.json, options.command, 2, nil, err.Error())
+	}
+	edited, err := client.ParseConfigWithDiagnostics(patched, func(string) {})
+	if err != nil {
+		return resultOutput(options.json, options.command, 2, nil,
+			fmt.Sprintf("the edited configuration would not load (%v); nothing was written", err))
+	}
+	if err := uiWriteConfig(path, revision, patched); err != nil {
+		return resultOutput(options.json, options.command, 2, nil, err.Error())
+	}
+	lines = append(lines, "Saved "+path+". "+egressRestartNote)
+	if enable {
+		lines = append(lines, "dns takeover: on (pool "+edited.PeerEgressFakeIPCIDR+")")
+	} else {
+		lines = append(lines, "dns takeover: off")
+	}
+	return resultOutput(options.json, options.command, 0,
+		map[string]any{"configPath": path, "dnsTakeover": enable, "pool": edited.PeerEgressFakeIPCIDR},
+		strings.Join(lines, "\n"))
+}
+
 // egressDNSJournalView is what the commands say about the journal.
 func egressDNSJournalView() (map[string]any, string, error) {
 	path := client.EgressDNSJournalPath()
