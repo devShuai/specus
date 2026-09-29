@@ -1812,8 +1812,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 return true;
             }
         }
-        var useRelay = !string.IsNullOrWhiteSpace(session.RelayTargetAllocationId);
-        if (!useRelay && (session.RemoteEndpoint is null || avoidDirect || IsMeshEndpoint(session.RemoteEndpoint)))
+        // Each read once. Path maintenance clears and replaces the endpoint and the relay target on
+        // other threads, so a null check followed by a second read of the field could send to a
+        // null endpoint; with dozens of flows sending, that window was hit and the egress's send
+        // loop died with the process.
+        var relayTarget = session.RelayTargetAllocationId;
+        var remote = session.RemoteEndpoint;
+        var useRelay = !string.IsNullOrWhiteSpace(relayTarget);
+        if (!useRelay && (remote is null || avoidDirect || IsMeshEndpoint(remote)))
         {
             return false;
         }
@@ -1835,9 +1841,18 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         var frame = outboundCodec.Encode(session.Id, sequence, payload);
         if (useRelay)
         {
-            return await SendRelayPayloadAsync(session.RelayTargetAllocationId, frame).ConfigureAwait(false);
+            return await SendRelayPayloadAsync(relayTarget, frame).ConfigureAwait(false);
         }
-        await SendPeerUdpAsync(udp, frame, session.RemoteEndpoint!).ConfigureAwait(false);
+        try
+        {
+            await SendPeerUdpAsync(udp, frame, remote!).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // A mesh restart closed the socket after it was read above; the frame is lost the way
+            // any datagram can be, and the caller's own retransmission covers it.
+            return false;
+        }
         lock (_sync)
         {
             if (_sessions.TryGetValue(peerId, out var current))
@@ -4991,7 +5006,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     }
 
     private static Task<int> SendPeerUdpAsync(UdpClient udp, byte[] payload, IPEndPoint endpoint)
-        => udp.SendAsync(payload, payload.Length, EndpointForSocket(udp, endpoint));
+    {
+        // Disposing a UdpClient leaves Client null rather than making it throw, so a socket closed
+        // under a sender is named here instead of surfacing as a null reference further down.
+        if (udp.Client is null)
+        {
+            throw new ObjectDisposedException(nameof(UdpClient));
+        }
+        return udp.SendAsync(payload, payload.Length, EndpointForSocket(udp, endpoint));
+    }
 
     private static IPEndPoint EndpointForSocket(UdpClient udp, IPEndPoint endpoint)
     {

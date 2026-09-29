@@ -222,12 +222,22 @@ internal sealed class PeerEgressMesh(
         {
             foreach (var outbound in _queue.GetConsumingEnumerable(_stopping.Token))
             {
-                _runtime?.SendReady(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                // Blocking on the task is what this thread is for. It is not a pool thread, so
-                // waiting here costs nothing anyone else needs.
-                if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())
+                // One frame that fails to go out is a lost datagram. Letting its exception leave
+                // this loop ended the thread and, unobserved on a thread of its own, the process:
+                // every flow of every consumer went with it.
+                try
                 {
-                    logger?.LogDebug("Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
+                    _runtime?.SendReady(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    // Blocking on the task is what this thread is for. It is not a pool thread, so
+                    // waiting here costs nothing anyone else needs.
+                    if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())
+                    {
+                        logger?.LogDebug("Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
+                    }
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or StackOverflowException))
+                {
+                    logger?.LogDebug(ex, "Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
                 }
             }
         });
@@ -235,7 +245,15 @@ internal sealed class PeerEgressMesh(
         {
             foreach (var packet in _deviceQueue.GetConsumingEnumerable(_stopping.Token))
             {
-                host.WriteToDeviceAsync(packet).GetAwaiter().GetResult();
+                // As above: one packet the device would not take must not end the loop.
+                try
+                {
+                    host.WriteToDeviceAsync(packet).GetAwaiter().GetResult();
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or StackOverflowException))
+                {
+                    logger?.LogDebug(ex, "Peer Mesh egress device write failed");
+                }
             }
         });
     }
