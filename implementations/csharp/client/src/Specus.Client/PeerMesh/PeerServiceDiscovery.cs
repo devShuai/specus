@@ -56,9 +56,24 @@ internal static class PeerServiceDiscovery
         }
         try
         {
-            using var client = new TcpClient();
-            var task = client.ConnectAsync(target, port);
-            return task.Wait(Math.Max(50, timeoutMillis)) && client.Connected;
+            // A non-blocking connect bounded by Poll, like Java's Socket.connect(timeout) and Go's
+            // DialTimeout. Waiting on ConnectAsync needs a thread-pool thread to complete the task,
+            // so a starved pool reported a listening target as unreachable, and ApplyConfig then
+            // left its bridge unbound until the next probe tick 15 seconds later.
+            using var socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            socket.Blocking = false;
+            try
+            {
+                socket.Connect(target, port);
+                return true;
+            }
+            catch (SocketException exception)
+                when (exception.SocketErrorCode is SocketError.WouldBlock or SocketError.InProgress)
+            {
+            }
+            // A failed connect is writable on Linux too, so only SO_ERROR tells the two apart.
+            return socket.Poll(TimeSpan.FromMilliseconds(Math.Max(50, timeoutMillis)), SelectMode.SelectWrite)
+                && socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) is 0;
         }
         catch
         {
