@@ -71,6 +71,9 @@ internal sealed class PeerEgressRuntime
     // before dialling and take it again afterwards, which needs Monitor.Enter and Monitor.Exit.
     private readonly object _lock = new();
     private readonly Action<long, byte[]>? _send;
+    // Set before publication. Admission must not block or acquire the mesh lock.
+    internal Func<long, byte[], bool>? TrySend { get; set; }
+    private int _sendCursor;
     private readonly IPeerEgressDialer _dialer;
     private readonly Action<Action> _executor;
     private readonly Func<long> _clock;
@@ -427,6 +430,11 @@ internal sealed class PeerEgressRuntime
             var output = new PeerEgressTcpConnection.Output();
             var connection = PeerEgressTcpConnection.Accept(
                 syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output);
+            if (TrySend is not null)
+            {
+                connection.TryTransmit = packet => TrySend(consumer,
+                    PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
+            }
             var handle = new TcpFlow(connection, socket);
             flow.Handle = handle;
             _totalFlows++;
@@ -447,6 +455,16 @@ internal sealed class PeerEgressRuntime
             var buffer = new byte[TcpReadBuffer];
             while (true)
             {
+                lock (_lock)
+                {
+                    while (ReferenceEquals(_flows.Lookup(flow.Key), flow) && handle.Connection.AppReadCredit() == 0)
+                    {
+                        Monitor.Wait(_lock);
+                    }
+                    if (!ReferenceEquals(_flows.Lookup(flow.Key), flow)) { return; }
+                    var size = Math.Min(TcpReadBuffer, handle.Connection.AppReadCredit());
+                    if (buffer.Length != size) { buffer = new byte[size]; }
+                }
                 int read;
                 try
                 {
@@ -507,6 +525,7 @@ internal sealed class PeerEgressRuntime
     private void ApplyTcpOutput(
         long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle, PeerEgressTcpConnection.Output output)
     {
+        Monitor.PulseAll(_lock);
         foreach (var packet in output.Segments)
         {
             EmitSegment(consumer, packet);
@@ -708,6 +727,27 @@ internal sealed class PeerEgressRuntime
         }
     }
 
+    /// <summary>Called without the mesh lock when the bounded outbound queue frees a slot.</summary>
+    internal void SendReady(long nowMs)
+    {
+        lock (_lock)
+        {
+            if (_closed) { return; }
+            var snapshot = FlowSnapshot();
+            if (snapshot.Count == 0) { return; }
+            var start = _sendCursor % snapshot.Count;
+            _sendCursor = (start + 1) % snapshot.Count;
+            for (var i = 0; i < snapshot.Count; i++)
+            {
+                var flow = snapshot[(start + i) % snapshot.Count];
+                if (flow.Handle is TcpFlow handle && handle.Connection.SendBlocked)
+                {
+                    ApplyTcpOutput(flow.Consumer, flow, handle, handle.Connection.OnTick(nowMs));
+                }
+            }
+        }
+    }
+
     /// <summary>Copies the live flows so a tick can release entries while iterating.</summary>
     private List<PeerEgressFlowTable.Flow> FlowSnapshot()
     {
@@ -805,6 +845,7 @@ internal sealed class PeerEgressRuntime
     /// <summary>Closes one flow's socket and drops its table entry. Called with the lock held.</summary>
     private void Release(PeerEgressFlowTable.Flow flow)
     {
+        Monitor.PulseAll(_lock);
         if (_flows.Lookup(flow.Key) is null)
         {
             return;
@@ -815,6 +856,7 @@ internal sealed class PeerEgressRuntime
 
     private void ReleaseKey(PeerEgressFlowTable.Key key)
     {
+        Monitor.PulseAll(_lock);
         if (_flows.Close(key) is { } flow)
         {
             CloseHandle(flow.Handle);
@@ -830,6 +872,7 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private void ReleaseAll(IReadOnlyList<PeerEgressFlowTable.Revocation> revoked, long nowMs)
     {
+        Monitor.PulseAll(_lock);
         foreach (var entry in revoked)
         {
             var flow = entry.Flow;
@@ -853,6 +896,11 @@ internal sealed class PeerEgressRuntime
                     flow.Key.ProtocolName(), Ipv4Cidr.FormatAddress(flow.Key.ConsumerIp),
                     flow.Key.ConsumerPort, Ipv4Cidr.FormatAddress(flow.Key.RemoteIp),
                     flow.Key.RemotePort, entry.Code)));
+        }
+        if (revoked.Count > 0)
+        {
+            _logger?.LogInformation("[peer-egress] flows released count={Count} active={Active}",
+                revoked.Count, _flows.Count);
         }
     }
 

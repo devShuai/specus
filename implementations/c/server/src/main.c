@@ -3867,6 +3867,11 @@ static void *client_thread(void *arg)
                 fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
                         session->config.client_name);
             }
+            /* After active_session_remove_locked above, so the rosters count it as offline. */
+            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
+                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
+                        session->config.client_name);
+            }
         }
         if (session->config.database_path[0] != '\0'
             && session->config.client_session_db_backed

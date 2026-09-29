@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Test lab role selection and evidence parsing
+        run: python3 -m unittest discover -s scripts/peer-egress-lab -p test_lab.py
       - uses: actions/setup-go@v5
         with:
           go-version-file: implementations/go/client/go.mod
@@ -62,7 +64,8 @@ jobs:
           sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
             --server "$RUNNER_TEMP/specus-server" \
             --client "$RUNNER_TEMP/specus-client" \
-            --report-dir "$RUNNER_TEMP/lab"
+            --report-dir "$RUNNER_TEMP/lab" \
+            --switch-off-repetitions 3
 
       - name: Report
         if: always()

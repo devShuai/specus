@@ -35,9 +35,15 @@ class PeerEgressMeshTests {
     private final List<long[]> sentTo = new ArrayList<>();
     private final List<byte[]> sentFrames = new ArrayList<>();
     private final List<byte[]> toDevice = new ArrayList<>();
+    private Map<Long, Boolean> availableEgresses = Map.of();
     private PeerEgressMesh mesh;
 
     private final class FakeHost implements PeerEgressMesh.Host {
+        @Override
+        public Map<Long, Boolean> egressAvailability() {
+            return availableEgresses;
+        }
+
         @Override
         public boolean sendToPeer(long peerId, byte[] frame) {
             synchronized (PeerEgressMeshTests.this) {
@@ -343,6 +349,31 @@ class PeerEgressMeshTests {
                     && PeerEgressFrame.CONTROL_FLOW_PURGE.equals(control.type())
                     && control.destinations().contains("203.0.113.10/32");
         }), "no flow-purge reached the egress");
+    }
+
+    @Test
+    void routeReconcileSynchronizesExistingAndRemovedEgressPeers() {
+        PeerEgressMesh wiring = newMesh();
+        var rules = List.of(rule("203.0.113.0/24", PeerEgressRule.ACTION_EGRESS, 2L));
+        availableEgresses = Map.of(2L, true);
+        wiring.applyRules(rules);
+        byte[] packet = PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                address(VIRTUAL_IP), address("203.0.113.10"), 40000, 443,
+                1000, 0, PeerEgressSegment.FLAG_SYN, 65535, 0, new byte[0]));
+        assertTrue(wiring.handleOutbound(packet));
+        assertEquals(1, frames().size(), "a peer connected before consumer creation must be usable");
+
+        availableEgresses = Map.of();
+        wiring.applyRules(rules);
+        int afterPurge = frames().size();
+        assertEquals(2, afterPurge, "a removed peer must have its old flow purged");
+        assertTrue(wiring.handleOutbound(packet));
+        assertEquals(afterPurge, frames().size(), "a removed peer must not remain online");
+
+        availableEgresses = Map.of(2L, true);
+        wiring.applyRules(rules);
+        assertTrue(wiring.handleOutbound(packet));
+        assertEquals(afterPurge + 1, frames().size(), "reconnection must re-enable new flows");
     }
 
     /** Revocation reaches the plane even though the plane never asks the mesh anything. */

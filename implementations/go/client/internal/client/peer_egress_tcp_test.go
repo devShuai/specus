@@ -420,7 +420,7 @@ func TestTCPRetransmitsAndEventuallyGivesUp(t *testing.T) {
 	original := h.expectOne(sent, "data segment")
 
 	// Nothing acknowledges it; the first tick before the RTO must stay quiet.
-	quiet := h.conn.onTick(h.now.Add(tcpInitialRTO / 2))
+	quiet := h.conn.onTick(h.now.Add(h.conn.rto / 2))
 	if len(quiet.Segments) != 0 {
 		t.Fatal("retransmitted before the RTO elapsed")
 	}
@@ -471,6 +471,27 @@ func TestTCPKarnIgnoresAmbiguousRoundTripSamples(t *testing.T) {
 	if clean == 0 {
 		t.Error("expected a usable RTO from the clean sample")
 	}
+}
+
+func TestTCPSameTickCleanAckCollapsesBackoff(t *testing.T) {
+	h := newTCPHarness(t)
+	h.conn.onAppData([]byte("a"), h.now)
+	h.advance(tcpMinRTO)
+	h.expectOne(h.conn.onTick(h.now), "retry")
+	h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5002, Flags: tcpFlagACK})
+	if h.conn.rto != 2*tcpMinRTO {
+		t.Fatal("ambiguous ACK changed backoff")
+	}
+	h.conn.onAppData([]byte("b"), h.now)
+	h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5003, Flags: tcpFlagACK})
+	if h.conn.rto != tcpMinRTO {
+		t.Fatalf("clean same-tick ACK left RTO at %v", h.conn.rto)
+	}
+	h.conn.onAppData([]byte("c"), h.now)
+	if len(h.conn.onTick(h.now.Add(tcpMinRTO-time.Millisecond)).Segments) != 0 {
+		t.Fatal("early retry")
+	}
+	h.expectOne(h.conn.onTick(h.now.Add(tcpMinRTO)), "retry at learned RTO")
 }
 
 // A reset inside the window ends the flow; one outside it is ignored, which is what stops a blind

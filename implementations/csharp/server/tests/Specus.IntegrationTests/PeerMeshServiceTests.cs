@@ -610,6 +610,71 @@ public sealed class PeerMeshServiceTests
         Assert.All(catalogs, catalog => Assert.Equal(expectedServices, catalog.Services?.Count ?? 0));
     }
 
+    // A device that leaves has to be announced as gone, the way a device that arrives is announced as
+    // here. Rosters were pushed on login and never on logout, so a consumer kept an egress that had
+    // stopped as online and went on sending it flows that nothing would ever answer.
+    [Fact]
+    public async Task PushOnLogoutTellsTenantPeersTheDeviceIsOffline()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1201, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1202, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.20", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.21", "egress-key");
+        await fixture.SaveChangesAsync();
+        var consumerWriter = fixture.Bind(consumer);
+        fixture.Bind(egress);
+
+        fixture.Unbind(egress);
+        await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
+
+        var roster = Assert.Single(consumerWriter.PeerMessages(), message => message.Type == "roster");
+        var departed = Assert.Single(roster.Peers!, peer => peer.ClientId == egress.Id);
+        Assert.False(departed.Online, "the roster still counts the departed device as online");
+    }
+
+    // A device already back on a newer connection when the old one is torn down was announced by
+    // that login; a logout push would announce it as gone while it is not.
+    [Fact]
+    public async Task PushOnLogoutIsSilentForADeviceThatIsAlreadyBack()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1203, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1204, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.22", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.23", "egress-key");
+        await fixture.SaveChangesAsync();
+        var consumerWriter = fixture.Bind(consumer);
+        fixture.Bind(egress);
+
+        await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
+
+        Assert.Empty(consumerWriter.PeerMessages());
+    }
+
+    // A signal whose target is not there is undeliverable, which the sender could not have avoided,
+    // and not a protocol violation. The dispatcher tells the two apart by this exception and keeps
+    // the sender connected for it.
+    [Fact]
+    public async Task SignalToAnOfflinePeerIsUndeliverable()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var consumer = fixture.AddClient(1205, "tenant-a", "alice", "alice-laptop");
+        var egress = fixture.AddClient(1206, "tenant-a", "alice", "office-gateway");
+        fixture.AddDevice(consumer, "100.96.0.24", "consumer-key");
+        fixture.AddDevice(egress, "100.96.0.25", "egress-key");
+        await fixture.SaveChangesAsync();
+        fixture.Bind(consumer);
+
+        await Assert.ThrowsAsync<PeerSignalUndeliverableException>(() => fixture.Service.HandleSignalAsync(
+            new MessageRequestPacket
+            {
+                ToClientName = egress.ClientName,
+                MessageType = MessageType.PeerControl,
+                Message = JsonSerializer.Serialize(new PeerControlMessage { Type = "candidates" }),
+            }, consumer.ClientName, CancellationToken.None));
+    }
+
     [Fact]
     public async Task CandidatesSignalCreatesSessionGrantAndForwardsJavaShape()
     {
@@ -1394,6 +1459,15 @@ public sealed class PeerMeshServiceTests
             context.OnLoginSuccess(account.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             Registry.Replace(account.ClientName, context);
             return writer;
+        }
+
+        // Takes a bound client off the registry, as its control connection closing does.
+        public void Unbind(ClientAccount account)
+        {
+            if (Registry.Find(account.ClientName) is { } context)
+            {
+                Registry.Unbind(account.ClientName, context);
+            }
         }
 
         public Task SaveChangesAsync() => Db.SaveChangesAsync();

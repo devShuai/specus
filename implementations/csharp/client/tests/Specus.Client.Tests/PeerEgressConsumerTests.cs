@@ -319,8 +319,7 @@ public class PeerEgressConsumerTests
     }
 
     /// <summary>
-    /// A flow-reject is diagnostic, but it does tell the consumer this flow is over, so the entry
-    /// goes rather than lingering until something else clears it.
+    /// A rejection removes the matching flow rather than leaving it to expire.
     /// </summary>
     [Fact]
     public void DropsAFlowTheEgressRejected()
@@ -334,6 +333,34 @@ public class PeerEgressConsumerTests
 
         Assert.True(consumer.FlowCount == 0, "a flow survived a flow-reject");
         Assert.Equal(1, consumer.BlockedCounts()["rejected-egress_port_denied"]);
+    }
+
+    [Fact]
+    public void RejectionResetsOnlyTheSendingEgressFlowEvenWithoutRemoteReset()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2] = true, [3] = true });
+        consumer.HandleOutbound(PeerEgressSegment.Build(new Segment(
+            Address(VirtualIp), Address("203.0.113.10"), 40000, 443,
+            1001, 700001, PeerEgressSegment.FlagAck, 65535, 0, "hello"u8.ToArray())), Epoch);
+        var frame = PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false,
+            PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
+                "tcp", VirtualIp, 40000, "203.0.113.10", 443, PeerEgressCodes.Disabled)));
+        consumer.HandleInbound(frame, 3, Epoch);
+        Assert.Equal(1, consumer.FlowCount);
+        Assert.Empty(_toTun);
+        Assert.Empty(consumer.BlockedCounts());
+        consumer.HandleInbound(frame, 2, Epoch);
+        Assert.Equal(0, consumer.FlowCount);
+        Assert.Single(_toTun);
+        var reset = PeerEgressSegment.Parse(_toTun[0]);
+        Assert.NotNull(reset);
+        Assert.Equal(PeerEgressSegment.FlagRst | PeerEgressSegment.FlagAck, reset.Flags);
+        Assert.Equal(700001u, reset.Seq);
+        Assert.Equal(1006u, reset.Ack);
+        consumer.HandleInbound(frame, 2, Epoch);
+        consumer.HandleInbound(PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, _toTun[0]), 2, Epoch);
+        Assert.Single(_toTun);
+        Assert.Equal(1, consumer.BlockedCounts()["rejected-egress_disabled"]);
     }
 
     /// <summary>

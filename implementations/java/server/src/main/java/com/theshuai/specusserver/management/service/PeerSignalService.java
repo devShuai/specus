@@ -207,6 +207,30 @@ public class PeerSignalService {
         return closedSessions;
     }
 
+    /**
+     * Tells a departed client's peers that it is gone.
+     *
+     * <p>Rosters were pushed when a client arrived and never when it left, so the peers of a
+     * device that disconnected kept it as online until something else in the tenant logged in. A
+     * consumer whose egress had stopped went on sending flows into a session nobody answered.
+     *
+     * <p>Must run after the client's control channel is unbound, so the roster built here counts it
+     * as offline. A client already back on a newer channel was announced by that login and is left
+     * alone -- which is also what keeps this safe if it ever ran early.
+     */
+    public void pushOnLogout(String clientName) {
+        if (!peerMeshService.isEnabled() || !StringUtils.hasText(clientName)
+                || SessionUtil.getChannel(clientName) != null) {
+            return;
+        }
+        clientAccountService.findClientByName(clientName).ifPresent(account -> {
+            for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
+                pushRoster(target);
+                pushEgress(target);
+            }
+        });
+    }
+
     public void onClientDisconnected(Long sessionId) {
         if (sessionId == null || sessionId <= 0) {
             return;

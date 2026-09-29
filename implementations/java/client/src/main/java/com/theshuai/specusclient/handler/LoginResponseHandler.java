@@ -45,8 +45,8 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
             // we are literally trying to use.
         } else {
             String reason = loginResponsePacket.getReason();
-            if (isTokenExpired(reason)) {
-                log.warn("[{}]登录失败,原因:{} —— 访问令牌过期，刷新后重连", clientName, reason);
+            if (needsTokenRefresh(reason)) {
+                log.warn("[{}]登录失败,原因:{} —— 访问令牌失效，刷新后重连", clientName, reason);
                 nettyClient.refreshCredentialsAndReconnect(reason);
             } else if (isRetryable(reason)) {
                 log.warn("[{}]登录失败,原因:{} —— 主动关闭连接进入重连退避", clientName, reason);
@@ -58,15 +58,18 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
         }
     }
 
-    private boolean isTokenExpired(String reason) {
-        return reason != null && reason.contains("访问令牌已过期");
+    private boolean needsTokenRefresh(String reason) {
+        // Go's in-memory token store is lost on server restart. Reauthenticate with the
+        // configured API credentials; policy/credential rejection still stops separately.
+        return reason != null && (reason.contains("访问令牌已过期") || reason.contains("访问令牌无效"));
     }
 
     private boolean isRetryable(String reason) {
         if (reason == null || reason.isBlank()) {
             return false;
         }
-        return reason.contains("服务器繁忙") || reason.contains("连接频率超过限制");
+        return reason.contains("服务器繁忙") || reason.contains("连接频率超过限制")
+                || reason.contains("数据连接要求控制连接先登录");
     }
 
     @Override
