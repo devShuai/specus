@@ -179,71 +179,124 @@ public final class EgressEdit {
         return CliOutput.result(options.json(), options.command(), 0, data, String.join("\n", lines));
     }
 
-    private static int editRule(ClientCli.Options options) {
-        Loaded loaded = load(options);
-        var egress = options.egress();
-        var rules = new ArrayList<>(rules(loaded.config()));
-        int count = rules.size();
-        String command = options.command();
-        if (command.equals("egress rule add")) {
-            var rule = new PeerEgressRule();
-            rule.setMatch(trim(egress.match()));
-            rule.setAction(trim(egress.action()));
-            if (egress.egressClientId() != 0) rule.setEgressClientId(egress.egressClientId());
-            // Refused rules are allowed in the file, where they are warned about, but a command
-            // that adds one on request would only be writing a rule that steers nothing.
-            String code = ruleCode(rule);
-            if (code != null) return fail(options, "Rule not added: " + code + " (" + explanation(code) + ")");
-            if (egress.disabled()) rule.setEnabled(false);
-            int at = count;
-            if (egress.at() >= 0) {
-                if (egress.at() > count) return fail(options, "--at " + egress.at() + " is past the end; there are " + count + " rule(s).");
-                at = egress.at();
-            }
-            rules.add(at, rule);
-        } else {
-            requireIndex(options, egress.index(), count);
-            switch (command) {
-                case "egress rule remove" -> rules.remove(egress.index());
-                case "egress rule move" -> {
-                    requireIndex(options, egress.to(), count);
-                    rules.add(egress.to(), rules.remove(egress.index()));
-                }
-                case "egress rule enable" -> rules.get(egress.index()).setEnabled(null);
-                default -> rules.get(egress.index()).setEnabled(false);
-            }
-        }
-        return write(options, loaded, "peerEgressRules", encodeRules(rules), List.of());
+    /** One edit to the rules or the switch, as the commands and the local page ask for it. */
+    record Change(String op, String match, String action, long egressClientId, int at, int index, int to,
+                  boolean disabled, boolean enabled, boolean confirmed) { }
+
+    /**
+     * What a change writes: one top-level value, already encoded, and what to say before the save.
+     * Unchanged means the file already says what was asked; needsConfirmation means takeover was asked
+     * for without the notice being accepted.
+     */
+    record Planned(String key, String value, List<String> preface, boolean unchanged, boolean needsConfirmation) { }
+
+    /** A change that cannot be made, with a message a person can act on. */
+    static final class PlanFailure extends RuntimeException {
+        PlanFailure(String message) { super(message, null, false, false); }
     }
 
-    private static void requireIndex(ClientCli.Options options, int index, int count) {
+    /** Works out a change against the configuration as loaded, the same way in every runtime. */
+    static Planned plan(ClientStartupConfig config, Change change) {
+        var rules = new ArrayList<PeerEgressRule>();
+        for (PeerEgressRule rule : rules(config)) rules.add(copy(rule));
+        int count = rules.size();
+        switch (change.op()) {
+            case "takeover" -> {
+                if (change.enabled() == config.isPeerEgressEnabled()) return new Planned(null, null, List.of(), true, false);
+                if (!change.enabled()) return new Planned("peerEgressEnabled", "false", List.of(), false, false);
+                var preface = new ArrayList<>(ENABLE_NOTICE);
+                if (!change.confirmed()) return new Planned(null, null, preface, false, true);
+                String device = trim(config.getPeerMeshDevice());
+                if (device.isEmpty() || device.equalsIgnoreCase("noop"))
+                    preface.add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
+                return new Planned("peerEgressEnabled", "true", preface, false, false);
+            }
+            case "add" -> {
+                var rule = new PeerEgressRule();
+                rule.setMatch(trim(change.match()));
+                rule.setAction(trim(change.action()));
+                if (change.egressClientId() != 0) rule.setEgressClientId(change.egressClientId());
+                // Refused rules are allowed in the file, where they are warned about, but an edit
+                // that adds one on request would only be writing a rule that steers nothing.
+                String code = ruleCode(rule);
+                if (code != null) throw new PlanFailure("Rule not added: " + code + " (" + explanation(code) + ")");
+                if (change.disabled()) rule.setEnabled(false);
+                int at = count;
+                if (change.at() >= 0) {
+                    if (change.at() > count) throw new PlanFailure("--at " + change.at() + " is past the end; there are " + count + " rule(s).");
+                    at = change.at();
+                }
+                rules.add(at, rule);
+            }
+            case "remove", "move", "enable", "disable" -> {
+                requireIndex(change.index(), count);
+                switch (change.op()) {
+                    case "remove" -> rules.remove(change.index());
+                    case "move" -> {
+                        requireIndex(change.to(), count);
+                        rules.add(change.to(), rules.remove(change.index()));
+                    }
+                    case "enable" -> rules.get(change.index()).setEnabled(null);
+                    default -> rules.get(change.index()).setEnabled(false);
+                }
+            }
+            default -> throw new PlanFailure("unknown egress change: " + change.op());
+        }
+        return new Planned("peerEgressRules", encodeRules(rules), List.of(), false, false);
+    }
+
+    private static PeerEgressRule copy(PeerEgressRule rule) {
+        var copy = new PeerEgressRule();
+        copy.setMatch(rule.getMatch());
+        copy.setAction(rule.getAction());
+        copy.setEgressClientId(rule.getEgressClientId());
+        copy.setPort(rule.getPort());
+        copy.setEnabled(rule.getEnabled());
+        return copy;
+    }
+
+    private static void requireIndex(int index, int count) {
         if (index < 0 || index >= count)
-            fail(options, "No rule at index " + index + "; there are " + count + " rule(s). List them with egress rules.");
+            throw new PlanFailure("No rule at index " + index + "; there are " + count + " rule(s). List them with egress rules.");
+    }
+
+    /** The change an editing command asks for. */
+    private static Change change(ClientCli.Options options) {
+        var egress = options.egress();
+        String command = options.command();
+        boolean takeover = command.equals("egress enable") || command.equals("egress disable");
+        return new Change(takeover ? "takeover" : command.substring("egress rule ".length()), egress.match(), egress.action(),
+                egress.egressClientId(), egress.at(), egress.index(), egress.to(), egress.disabled(),
+                command.equals("egress enable"), egress.yes());
+    }
+
+    private static int editRule(ClientCli.Options options) {
+        Loaded loaded = load(options);
+        Planned planned;
+        try {
+            planned = plan(loaded.config(), change(options));
+        } catch (PlanFailure failure) {
+            return fail(options, failure.getMessage());
+        }
+        return write(options, loaded, planned.key(), planned.value(), planned.preface());
     }
 
     private static int toggle(ClientCli.Options options) {
         Loaded loaded = load(options);
         ClientStartupConfig config = loaded.config();
-        boolean turningOn = options.command().equals("egress enable");
-        if (turningOn == config.isPeerEgressEnabled()) {
+        Planned planned = plan(config, change(options));
+        if (planned.unchanged()) {
             var lines = new ArrayList<String>();
             var data = listing(options.config(), config, lines);
             return CliOutput.result(options.json(), options.command(), 0, data,
-                    "Takeover is already " + (turningOn ? "on" : "off") + "; nothing was changed.\n" + String.join("\n", lines));
+                    "Takeover is already " + (config.isPeerEgressEnabled() ? "on" : "off") + "; nothing was changed.\n" + String.join("\n", lines));
         }
-        var preface = new ArrayList<String>();
-        if (turningOn) {
-            preface.addAll(ENABLE_NOTICE);
-            // Confirmed by a flag rather than a prompt: whether a prompt could be answered depends
-            // on a terminal the three runtimes cannot all detect the same way, and a command that
-            // waits in one of them and fails in another is not the same command.
-            if (!options.egress().yes())
-                return fail(options, String.join("\n", ENABLE_NOTICE) + "\nNot changed. Re-run with --yes to confirm.");
-            String device = trim(config.getPeerMeshDevice());
-            if (device.isEmpty() || device.equalsIgnoreCase("noop"))
-                preface.add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
-        }
-        return write(options, loaded, "peerEgressEnabled", turningOn ? "true" : "false", preface);
+        // Confirmed by a flag rather than a prompt: whether a prompt could be answered depends on a
+        // terminal the three runtimes cannot all detect the same way, and a command that waits in one
+        // of them and fails in another is not the same command.
+        if (planned.needsConfirmation())
+            return fail(options, String.join("\n", planned.preface()) + "\nNot changed. Re-run with --yes to confirm.");
+        return write(options, loaded, planned.key(), planned.value(), planned.preface());
     }
 
     private static int write(ClientCli.Options options, Loaded loaded, String key, String value, List<String> preface) {
@@ -276,57 +329,21 @@ public final class EgressEdit {
         return CliOutput.result(options.json(), options.command(), 0, data, String.join("\n", message));
     }
 
+    /** Why an address cannot be previewed, or null when it can. */
+    static String addressProblem(String address) {
+        if (Ipv4Cidr.parseAddress(address) != null && !address.contains("/")) return null;
+        return looksLikeDomain(address) && !address.contains(":")
+                ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
+                : "ADDRESS must be an IPv4 address.";
+    }
+
     private static int test(ClientCli.Options options) {
         String address = trim(options.egress().address());
-        if (Ipv4Cidr.parseAddress(address) == null || address.contains("/")) {
-            boolean domain = looksLikeDomain(address) && !address.contains(":");
-            return fail(options, domain
-                    ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-                    : "ADDRESS must be an IPv4 address.");
-        }
+        String problem = addressProblem(address);
+        if (problem != null) return fail(options, problem);
         Loaded loaded = load(options);
-        ClientStartupConfig config = loaded.config();
-        var rules = rules(config);
-        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR);
-        int matched = match.matched() ? match.matchedRuleIndex() : -1;
-        boolean takeover = config.isPeerEgressEnabled();
-        var data = new LinkedHashMap<String, Object>();
-        data.put("configPath", options.config().toString());
-        data.put("address", address);
-        data.put("takeover", takeover);
-        data.put("matchedRuleIndex", matched);
         var lines = new ArrayList<String>();
-        lines.add("Preview for " + address + " from the configuration (no connection is made; --connect PORT tests one)");
-        lines.add(takeover ? "  takeover: on" : "  takeover: off");
-        String would = "stays local (direct)";
-        String result = "direct";
-        if (matched < 0) {
-            lines.add("  rule: none");
-            would = "not covered by any rule; stays local (direct)";
-        } else {
-            String action = trim(match.action());
-            var line = new StringBuilder("  rule: [").append(matched).append("] ")
-                    .append(trim(rules.get(matched).getMatch())).append(' ').append(action);
-            if (id(match.egressClientId()) != 0) line.append(' ').append(match.egressClientId());
-            lines.add(line.toString());
-            data.put("ruleAction", action);
-            if (action.equals(PeerEgressRule.ACTION_EGRESS)) {
-                would = "through egress " + id(match.egressClientId());
-                result = "egress";
-                data.put("egressClientId", id(match.egressClientId()));
-            } else if (action.equals(PeerEgressRule.ACTION_BLOCK)) {
-                would = "blocked";
-                result = "block";
-            }
-        }
-        if (takeover || matched < 0) {
-            lines.add("  result: " + would);
-            data.put("result", result);
-        } else {
-            lines.add("  result: takeover is off, so it stays local (direct); with takeover on: " + would);
-            data.put("result", "direct");
-            data.put("resultWithTakeover", result);
-        }
+        var data = preview(options.config(), loaded.config(), address, lines);
         int code = 0;
         int port = options.egress().connect();
         if (port > 0) {
@@ -358,6 +375,124 @@ public final class EgressEdit {
             return CliOutput.result(false, options.command(), code, null, last);
         }
         return CliOutput.result(options.json(), options.command(), 0, data, String.join("\n", lines));
+    }
+
+    /** What the configured rules decide for one IPv4 address, and what takeover being on would change. */
+    private static LinkedHashMap<String, Object> preview(Path path, ClientStartupConfig config, String address, List<String> lines) {
+        var rules = rules(config);
+        var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR);
+        int matched = match.matched() ? match.matchedRuleIndex() : -1;
+        boolean takeover = config.isPeerEgressEnabled();
+        var data = new LinkedHashMap<String, Object>();
+        data.put("configPath", path.toString());
+        data.put("address", address);
+        data.put("takeover", takeover);
+        data.put("matchedRuleIndex", matched);
+        lines.add("Preview for " + address + " from the configuration (no connection is made; --connect PORT tests one)");
+        lines.add(takeover ? "  takeover: on" : "  takeover: off");
+        String would = "stays local (direct)";
+        String result = "direct";
+        if (matched < 0) {
+            lines.add("  rule: none");
+            would = "not covered by any rule; stays local (direct)";
+        } else {
+            String action = trim(match.action());
+            var line = new StringBuilder("  rule: [").append(matched).append("] ")
+                    .append(trim(rules.get(matched).getMatch())).append(' ').append(action);
+            if (id(match.egressClientId()) != 0) line.append(' ').append(match.egressClientId());
+            lines.add(line.toString());
+            data.put("ruleAction", action);
+            if (action.equals(PeerEgressRule.ACTION_EGRESS)) {
+                would = "through egress " + id(match.egressClientId());
+                result = "egress";
+                data.put("egressClientId", id(match.egressClientId()));
+            } else if (action.equals(PeerEgressRule.ACTION_BLOCK)) {
+                would = "blocked";
+                result = "block";
+            }
+        }
+        if (takeover || matched < 0) {
+            lines.add("  result: " + would);
+            data.put("result", result);
+        } else {
+            lines.add("  result: takeover is off, so it stays local (direct); with takeover on: " + would);
+            data.put("result", "direct");
+            data.put("resultWithTakeover", result);
+        }
+        return data;
+    }
+
+    // The local page's egress editor: the same changes through plan, written the same way, with the
+    // revision the page was showing checked first so an edit is never applied to a file that moved.
+    // The Go and .NET management pages serve the same routes with the same answers.
+
+    private static Loaded uiLoad(Path path) throws Exception {
+        var snapshot = UiConfig.read(path);
+        if (snapshot.revision().equals("missing")) throw new LocalUi.Failure(422, "配置文件不存在；请先在「连接设置」保存配置");
+        try {
+            return new Loaded(snapshot, ClientCli.parse(snapshot.text(), ignored -> { }));
+        } catch (Exception error) {
+            throw new LocalUi.Failure(422, "配置无法加载（" + error.getMessage() + "）；请先修正后再编辑出口规则");
+        }
+    }
+
+    static Map<String, Object> uiRules(Path path) throws Exception {
+        Loaded loaded = uiLoad(path);
+        var data = listing(path, loaded.config(), new ArrayList<>());
+        data.put("schemaVersion", 1);
+        data.put("revision", loaded.snapshot().revision());
+        return data;
+    }
+
+    private static int index(com.fasterxml.jackson.databind.JsonNode body, String field) {
+        return body.path(field).isIntegralNumber() ? body.path(field).asInt() : -1;
+    }
+
+    static Map<String, Object> uiChange(Path path, com.fasterxml.jackson.databind.JsonNode body) throws Exception {
+        Loaded loaded = uiLoad(path);
+        UiConfig.checkRevision(loaded.snapshot(), body.path("revision").asText());
+        Planned planned;
+        try {
+            planned = plan(loaded.config(), new Change(body.path("op").asText(), body.path("match").asText(""),
+                    body.path("action").asText(""), body.path("egressClientId").asLong(0), index(body, "at"),
+                    index(body, "index"), index(body, "to"), body.path("disabled").asBoolean(false),
+                    body.path("enabled").asBoolean(false), body.path("confirmed").asBoolean(false)));
+        } catch (PlanFailure failure) {
+            throw new LocalUi.Failure(422, failure.getMessage());
+        }
+        if (planned.needsConfirmation()) throw new LocalUi.Failure(422, "开启接管前需要确认其影响；未做任何修改");
+        if (planned.unchanged()) {
+            var data = listing(path, loaded.config(), new ArrayList<>());
+            data.put("schemaVersion", 1);
+            data.put("revision", loaded.snapshot().revision());
+            data.put("saved", false);
+            return data;
+        }
+        String patched = patch(loaded.snapshot().text(), planned.key(), planned.value());
+        ClientStartupConfig edited;
+        try {
+            edited = ClientCli.parse(patched, ignored -> { });
+        } catch (Exception error) {
+            throw new LocalUi.Failure(422, "修改后的配置无法加载（" + error.getMessage() + "）；未写入");
+        }
+        UiConfig.save(path, loaded.snapshot().revision(), patched);
+        var data = listing(path, edited, new ArrayList<>());
+        data.put("schemaVersion", 1);
+        data.put("revision", UiConfig.read(path).revision());
+        data.put("saved", true);
+        // Only what the page does not already say itself: the notice is shown before it asks.
+        data.put("warnings", planned.preface().stream().filter(line -> line.startsWith("Warning: ")).toList());
+        return data;
+    }
+
+    static Map<String, Object> uiTest(Path path, com.fasterxml.jackson.databind.JsonNode body) throws Exception {
+        String address = trim(body.path("address").asText(""));
+        String problem = addressProblem(address);
+        if (problem != null) throw new LocalUi.Failure(422, problem);
+        Loaded loaded = uiLoad(path);
+        var data = preview(path, loaded.config(), address, new ArrayList<>());
+        data.put("schemaVersion", 1);
+        return data;
     }
 
     private static boolean looksLikeDomain(String value) {

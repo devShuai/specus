@@ -132,67 +132,131 @@ func egressList(options cliOptions, path string) int {
 	return resultOutput(options.json, options.command, 0, data, strings.Join(lines, "\n"))
 }
 
+// egressChange is one edit to the rules or the switch, as the commands and the local page ask for it.
+type egressChange struct {
+	Op             string // add, remove, move, enable, disable, takeover
+	Match          string
+	Action         string
+	EgressClientID int64
+	At             int // -1: at the end
+	Index          int
+	To             int
+	Disabled       bool
+	Enabled        bool // takeover: the state asked for
+	Confirmed      bool // takeover on: the notice was shown and accepted
+}
+
+// egressPlanned is what a change writes: one top-level value, already encoded, and what to say before
+// the save. Unchanged means the file already says what was asked; NeedsConfirmation means takeover
+// was asked for without the notice being accepted.
+type egressPlanned struct {
+	Key               string
+	Value             []byte
+	Preface           []string
+	Unchanged         bool
+	NeedsConfirmation bool
+}
+
+// egressPlan works out a change against the configuration as loaded. A failure is a message a person
+// can act on, the same in every runtime and on both surfaces.
+func egressPlan(config client.Config, change egressChange) (egressPlanned, string) {
+	rules := append([]client.EgressRule(nil), config.PeerEgressRules...)
+	noRule := func(index int) string {
+		return fmt.Sprintf("No rule at index %d; there are %d rule(s). List them with egress rules.", index, len(rules))
+	}
+	indexOK := func(index int) bool { return index >= 0 && index < len(rules) }
+	switch change.Op {
+	case "takeover":
+		if change.Enabled == config.PeerEgressEnabled {
+			return egressPlanned{Unchanged: true}, ""
+		}
+		if !change.Enabled {
+			return egressPlanned{Key: "peerEgressEnabled", Value: []byte("false")}, ""
+		}
+		preface := append([]string(nil), egressEnableNotice...)
+		if !change.Confirmed {
+			return egressPlanned{Preface: preface, NeedsConfirmation: true}, ""
+		}
+		if strings.TrimSpace(config.PeerMeshDevice) == "" || strings.EqualFold(strings.TrimSpace(config.PeerMeshDevice), "noop") {
+			preface = append(preface, "Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.")
+		}
+		return egressPlanned{Key: "peerEgressEnabled", Value: []byte("true"), Preface: preface}, ""
+	case "add":
+		rule := client.EgressRule{Match: strings.TrimSpace(change.Match),
+			Action: strings.TrimSpace(change.Action), EgressClientID: change.EgressClientID}
+		// Refused rules are allowed in the file, where they are warned about, but an edit that adds
+		// one on request would only be writing a rule that steers nothing.
+		if code := client.EgressRuleCode(rule); code != "" {
+			return egressPlanned{}, fmt.Sprintf("Rule not added: %s (%s)", code, client.EgressCodeExplanation(code))
+		}
+		if change.Disabled {
+			off := false
+			rule.Enabled = &off
+		}
+		at := len(rules)
+		if change.At >= 0 {
+			if change.At > len(rules) {
+				return egressPlanned{}, fmt.Sprintf("--at %d is past the end; there are %d rule(s).", change.At, len(rules))
+			}
+			at = change.At
+		}
+		rules = append(rules[:at], append([]client.EgressRule{rule}, rules[at:]...)...)
+	case "remove":
+		if !indexOK(change.Index) {
+			return egressPlanned{}, noRule(change.Index)
+		}
+		rules = append(rules[:change.Index], rules[change.Index+1:]...)
+	case "move":
+		if !indexOK(change.Index) {
+			return egressPlanned{}, noRule(change.Index)
+		}
+		if !indexOK(change.To) {
+			return egressPlanned{}, noRule(change.To)
+		}
+		moved := rules[change.Index]
+		rules = append(rules[:change.Index], rules[change.Index+1:]...)
+		rules = append(rules[:change.To], append([]client.EgressRule{moved}, rules[change.To:]...)...)
+	case "enable", "disable":
+		if !indexOK(change.Index) {
+			return egressPlanned{}, noRule(change.Index)
+		}
+		if change.Op == "enable" {
+			rules[change.Index].Enabled = nil
+		} else {
+			off := false
+			rules[change.Index].Enabled = &off
+		}
+	default:
+		return egressPlanned{}, "unknown egress change: " + change.Op
+	}
+	return egressPlanned{Key: "peerEgressRules", Value: encodeEgressRules(rules)}, ""
+}
+
+// egressChangeFromOptions is the change an editing command asks for.
+func egressChangeFromOptions(options cliOptions) egressChange {
+	change := egressChange{Match: options.egressMatch, Action: options.egressAction,
+		EgressClientID: options.egressClientID, At: options.egressAt, Index: options.egressIndex,
+		To: options.egressTo, Disabled: options.egressDisabled, Confirmed: options.egressYes}
+	switch options.command {
+	case "egress enable", "egress disable":
+		change.Op = "takeover"
+		change.Enabled = options.command == "egress enable"
+	default:
+		change.Op = strings.TrimPrefix(options.command, "egress rule ")
+	}
+	return change
+}
+
 func egressRuleEdit(options cliOptions, path string) int {
 	data, revision, config, failed := loadEgressConfig(options, path)
 	if failed >= 0 {
 		return failed
 	}
-	rules := append([]client.EgressRule(nil), config.PeerEgressRules...)
-	indexOK := func(index int) bool { return index >= 0 && index < len(rules) }
-	noRule := func(index int) int {
-		return resultOutput(options.json, options.command, 2, nil,
-			fmt.Sprintf("No rule at index %d; there are %d rule(s). List them with egress rules.", index, len(rules)))
+	planned, failure := egressPlan(config, egressChangeFromOptions(options))
+	if failure != "" {
+		return resultOutput(options.json, options.command, 2, nil, failure)
 	}
-	switch options.command {
-	case "egress rule add":
-		rule := client.EgressRule{Match: strings.TrimSpace(options.egressMatch),
-			Action: strings.TrimSpace(options.egressAction), EgressClientID: options.egressClientID}
-		// Refused rules are allowed in the file, where they are warned about, but a command that
-		// adds one on request would only be writing a rule that steers nothing.
-		if code := client.EgressRuleCode(rule); code != "" {
-			return resultOutput(options.json, options.command, 2, nil,
-				fmt.Sprintf("Rule not added: %s (%s)", code, client.EgressCodeExplanation(code)))
-		}
-		if options.egressDisabled {
-			off := false
-			rule.Enabled = &off
-		}
-		at := len(rules)
-		if options.egressAt >= 0 {
-			if options.egressAt > len(rules) {
-				return resultOutput(options.json, options.command, 2, nil,
-					fmt.Sprintf("--at %d is past the end; there are %d rule(s).", options.egressAt, len(rules)))
-			}
-			at = options.egressAt
-		}
-		rules = append(rules[:at], append([]client.EgressRule{rule}, rules[at:]...)...)
-	case "egress rule remove":
-		if !indexOK(options.egressIndex) {
-			return noRule(options.egressIndex)
-		}
-		rules = append(rules[:options.egressIndex], rules[options.egressIndex+1:]...)
-	case "egress rule move":
-		if !indexOK(options.egressIndex) {
-			return noRule(options.egressIndex)
-		}
-		if !indexOK(options.egressTo) {
-			return noRule(options.egressTo)
-		}
-		moved := rules[options.egressIndex]
-		rules = append(rules[:options.egressIndex], rules[options.egressIndex+1:]...)
-		rules = append(rules[:options.egressTo], append([]client.EgressRule{moved}, rules[options.egressTo:]...)...)
-	case "egress rule enable", "egress rule disable":
-		if !indexOK(options.egressIndex) {
-			return noRule(options.egressIndex)
-		}
-		if options.command == "egress rule enable" {
-			rules[options.egressIndex].Enabled = nil
-		} else {
-			off := false
-			rules[options.egressIndex].Enabled = &off
-		}
-	}
-	return writeEgress(options, path, data, revision, map[string][]byte{"peerEgressRules": encodeEgressRules(rules)}, nil)
+	return writeEgress(options, path, data, revision, map[string][]byte{planned.Key: planned.Value}, planned.Preface)
 }
 
 func egressSwitch(options cliOptions, path string) int {
@@ -200,35 +264,24 @@ func egressSwitch(options cliOptions, path string) int {
 	if failed >= 0 {
 		return failed
 	}
-	turningOn := options.command == "egress enable"
-	if turningOn == config.PeerEgressEnabled {
+	planned, _ := egressPlan(config, egressChangeFromOptions(options))
+	switch {
+	case planned.Unchanged:
 		state := "off"
-		if turningOn {
+		if config.PeerEgressEnabled {
 			state = "on"
 		}
 		listing, lines := egressListing(path, config)
 		return resultOutput(options.json, options.command, 0, listing,
 			"Takeover is already "+state+"; nothing was changed.\n"+strings.Join(lines, "\n"))
-	}
-	var preface []string
-	if turningOn {
-		preface = append(preface, egressEnableNotice...)
+	case planned.NeedsConfirmation:
 		// Confirmed by a flag rather than a prompt: whether a prompt could be answered depends on a
 		// terminal the three runtimes cannot all detect the same way, and a command that waits in
 		// one of them and fails in another is not the same command.
-		if !options.egressYes {
-			return resultOutput(options.json, options.command, 2, nil, strings.Join(egressEnableNotice, "\n")+
-				"\nNot changed. Re-run with --yes to confirm.")
-		}
-		if strings.TrimSpace(config.PeerMeshDevice) == "" || strings.EqualFold(strings.TrimSpace(config.PeerMeshDevice), "noop") {
-			preface = append(preface, "Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.")
-		}
+		return resultOutput(options.json, options.command, 2, nil, strings.Join(planned.Preface, "\n")+
+			"\nNot changed. Re-run with --yes to confirm.")
 	}
-	value := []byte("false")
-	if turningOn {
-		value = []byte("true")
-	}
-	return writeEgress(options, path, data, revision, map[string][]byte{"peerEgressEnabled": value}, preface)
+	return writeEgress(options, path, data, revision, map[string][]byte{planned.Key: planned.Value}, planned.Preface)
 }
 
 func writeEgress(options cliOptions, path string, data []byte, revision string, values map[string][]byte, preface []string) int {
@@ -250,19 +303,59 @@ func writeEgress(options cliOptions, path string, data []byte, revision string, 
 	return resultOutput(options.json, options.command, 0, listing, strings.Join(append(message, lines...), "\n"))
 }
 
+// egressAddressProblem says why an address cannot be previewed, or "" when it can.
+func egressAddressProblem(address string) string {
+	valid, domain := client.ValidEgressAddress(address)
+	switch {
+	case valid:
+		return ""
+	case domain:
+		return "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
+	default:
+		return "ADDRESS must be an IPv4 address."
+	}
+}
+
 func egressTest(options cliOptions, path string) int {
 	address := strings.TrimSpace(options.egressAddress)
-	if valid, domain := client.ValidEgressAddress(address); !valid {
-		message := "ADDRESS must be an IPv4 address."
-		if domain {
-			message = "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-		}
-		return resultOutput(options.json, options.command, 2, nil, message)
+	if problem := egressAddressProblem(address); problem != "" {
+		return resultOutput(options.json, options.command, 2, nil, problem)
 	}
 	_, _, config, failed := loadEgressConfig(options, path)
 	if failed >= 0 {
 		return failed
 	}
+	data, lines := egressPreview(path, config, address)
+	code := 0
+	if options.egressConnect > 0 {
+		target := net.JoinHostPort(address, strconv.Itoa(options.egressConnect))
+		started := time.Now()
+		connection, err := net.DialTimeout("tcp", target, 5*time.Second)
+		elapsed := time.Since(started).Milliseconds()
+		probe := map[string]any{"port": options.egressConnect, "ok": err == nil, "millis": elapsed}
+		if err != nil {
+			probe["error"] = err.Error()
+			lines = append(lines, fmt.Sprintf("Connection test to %s: failed (%v)", target, err))
+			code = 4
+		} else {
+			connection.Close()
+			lines = append(lines, fmt.Sprintf("Connection test to %s: connected in %d ms. This shows the address is reachable, not which path carried it.", target, elapsed))
+		}
+		data["connect"] = probe
+	}
+	if code != 0 && options.json {
+		return resultOutput(true, options.command, code, data, lines[len(lines)-1])
+	}
+	if code != 0 {
+		fmt.Println(strings.Join(lines[:len(lines)-1], "\n"))
+		return resultOutput(false, options.command, code, nil, lines[len(lines)-1])
+	}
+	return resultOutput(options.json, options.command, 0, data, strings.Join(lines, "\n"))
+}
+
+// egressPreview is what the configured rules decide for one IPv4 address, and what takeover being
+// on would change. No connection is made.
+func egressPreview(path string, config client.Config, address string) (map[string]any, []string) {
 	preview := client.PreviewEgressDestination(config.PeerEgressRules, address)
 	data := map[string]any{
 		"configPath": path, "address": address, "takeover": config.PeerEgressEnabled,
@@ -305,31 +398,7 @@ func egressTest(options cliOptions, path string) int {
 		data["result"] = "direct"
 		data["resultWithTakeover"] = result
 	}
-	code := 0
-	if options.egressConnect > 0 {
-		target := net.JoinHostPort(address, strconv.Itoa(options.egressConnect))
-		started := time.Now()
-		connection, err := net.DialTimeout("tcp", target, 5*time.Second)
-		elapsed := time.Since(started).Milliseconds()
-		probe := map[string]any{"port": options.egressConnect, "ok": err == nil, "millis": elapsed}
-		if err != nil {
-			probe["error"] = err.Error()
-			lines = append(lines, fmt.Sprintf("Connection test to %s: failed (%v)", target, err))
-			code = 4
-		} else {
-			connection.Close()
-			lines = append(lines, fmt.Sprintf("Connection test to %s: connected in %d ms. This shows the address is reachable, not which path carried it.", target, elapsed))
-		}
-		data["connect"] = probe
-	}
-	if code != 0 && options.json {
-		return resultOutput(true, options.command, code, data, lines[len(lines)-1])
-	}
-	if code != 0 {
-		fmt.Println(strings.Join(lines[:len(lines)-1], "\n"))
-		return resultOutput(false, options.command, code, nil, lines[len(lines)-1])
-	}
-	return resultOutput(options.json, options.command, 0, data, strings.Join(lines, "\n"))
+	return data, lines
 }
 
 // encodeEgressRules writes the rule list the same way in every runtime: one rule per line, fields in

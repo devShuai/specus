@@ -227,7 +227,14 @@ func (u *localUI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		uiJSON(w, 200, map[string]any{"schemaVersion": 1, "accepted": true})
-	case r.URL.Path == "/api/config" || r.URL.Path == "/api/status" || r.URL.Path == "/api/config/save" || r.URL.Path == "/api/config/validate" || r.URL.Path == "/api/connection":
+	case r.Method == http.MethodGet && r.URL.Path == "/api/egress":
+		u.egressRules(w)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/egress/change":
+		u.egressChange(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/egress/test":
+		u.egressTest(w, r)
+	case r.URL.Path == "/api/config" || r.URL.Path == "/api/status" || r.URL.Path == "/api/config/save" || r.URL.Path == "/api/config/validate" || r.URL.Path == "/api/connection" ||
+		r.URL.Path == "/api/egress" || r.URL.Path == "/api/egress/change" || r.URL.Path == "/api/egress/test":
 		uiError(w, 405, "此接口不支持该方法")
 	default:
 		uiError(w, 404, "接口不存在")
