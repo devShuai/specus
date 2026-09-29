@@ -849,3 +849,43 @@ func TestEgressRuntimeRefusesProtocolsItDoesNotCarry(t *testing.T) {
 		t.Errorf("reject codes = %v", codes)
 	}
 }
+
+// The egress closed first and the consumer answered with its own FIN: the flow is in TIME_WAIT. Its
+// socket is closed and its quota is free at once; the entry stays to answer a retransmitted FIN.
+func TestEgressRuntimeFreesTheQuotaOfAFlowInTimeWait(t *testing.T) {
+	harness := newEgressHarness(t)
+	syn := egressSyn(t, "100.96.0.1", 40000, "203.0.113.10", 443)
+	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+	harness.waitFor("the flow to open", func() bool { return harness.runtime.flows.size() == 1 })
+	harness.completeHandshake(7, syn)
+	harness.reset()
+
+	harness.socket(0).readErr <- io.EOF
+	harness.waitFor("a FIN for the consumer", harness.sawFin)
+	var fin tcpSegment
+	for _, segment := range harness.segments() {
+		if segment.has(tcpFlagFIN) {
+			fin = segment
+		}
+	}
+	harness.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(tcpSegment{
+		SourceIP: syn.SourceIP, DestinationIP: syn.DestinationIP,
+		SourcePort: syn.SourcePort, DestinationPort: syn.DestinationPort,
+		Seq: syn.Seq + 1, Ack: fin.Seq + 1, Flags: tcpFlagACK | tcpFlagFIN, Window: 65535,
+	})), flowEpoch)
+
+	harness.runtime.mu.Lock()
+	forConsumer, total := harness.runtime.flows.counts(7)
+	_, present := harness.runtime.flows.lookup(egressFlowKey{protocol: ipv4ProtocolTCP,
+		consumerIP: syn.SourceIP, consumerPort: syn.SourcePort, remoteIP: syn.DestinationIP, remotePort: syn.DestinationPort})
+	harness.runtime.mu.Unlock()
+	if forConsumer != 0 || total != 0 {
+		t.Errorf("a flow in TIME_WAIT still counts: %d of %d", forConsumer, total)
+	}
+	if !present {
+		t.Error("the TIME_WAIT entry went before its timer, so a retransmitted FIN would go unanswered")
+	}
+	if !harness.socket(0).isClosed() {
+		t.Error("the socket of a finished flow was kept open through TIME_WAIT")
+	}
+}

@@ -1,0 +1,804 @@
+{
+  "description": "Phase two of peer egress: domain rules, the DNS responder, the fake-IP pool, name-bind and the egress's choice of address. See protocol/spec/peer-egress-dns.md.",
+  "meshCidr": "100.96.0.0/11",
+  "fakeIpCidr": "198.18.0.0/15",
+  "minLifetimeSeconds": 21600,
+  "quarantineSeconds": 1800,
+  "rules": [
+    {
+      "match": "example.com",
+      "action": "egress",
+      "egressClientId": 2
+    },
+    {
+      "match": "*.example.com",
+      "action": "egress",
+      "egressClientId": 3
+    },
+    {
+      "match": "*.cdn.example.com",
+      "action": "block"
+    },
+    {
+      "match": "direct.example.com",
+      "action": "direct"
+    },
+    {
+      "match": "*.example.com",
+      "action": "block"
+    },
+    {
+      "match": "*.corp.test",
+      "action": "egress",
+      "egressClientId": 2,
+      "enabled": false
+    },
+    {
+      "match": "203.0.113.0/24",
+      "action": "egress",
+      "egressClientId": 2
+    }
+  ],
+  "validation": [
+    {
+      "name": "exact-name",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "code": null
+    },
+    {
+      "name": "suffix",
+      "rule": {
+        "match": "*.example.com",
+        "action": "block"
+      },
+      "takeover": true,
+      "code": null
+    },
+    {
+      "name": "trailing-dot-and-case",
+      "rule": {
+        "match": "Example.COM.",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": null
+    },
+    {
+      "name": "punycode",
+      "rule": {
+        "match": "xn--fiqs8s.example",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": null
+    },
+    {
+      "name": "off-without-takeover",
+      "rule": {
+        "match": "example.com",
+        "action": "direct"
+      },
+      "takeover": false,
+      "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+    },
+    {
+      "name": "unicode-refused",
+      "rule": {
+        "match": "中国.example",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "wildcard-inside",
+      "rule": {
+        "match": "a.*.example.com",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "bare-wildcard",
+      "rule": {
+        "match": "*",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "single-label",
+      "rule": {
+        "match": "localhost",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "label-too-long",
+      "rule": {
+        "match": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "leading-hyphen",
+      "rule": {
+        "match": "-bad.example",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "underscore",
+      "rule": {
+        "match": "_srv.example.com",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MALFORMED"
+    },
+    {
+      "name": "domain-with-port",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2,
+        "port": 443
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_PORT_UNSUPPORTED"
+    },
+    {
+      "name": "domain-missing-target",
+      "rule": {
+        "match": "example.com",
+        "action": "egress"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_MISSING_TARGET"
+    },
+    {
+      "name": "disabled-first",
+      "rule": {
+        "match": "中国.example",
+        "action": "forward",
+        "enabled": false
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_DISABLED"
+    },
+    {
+      "name": "cidr-overlaps-pool",
+      "rule": {
+        "match": "198.18.0.0/16",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_FAKE_IP_OVERLAP"
+    },
+    {
+      "name": "cidr-overlaps-pool-only-with-takeover",
+      "rule": {
+        "match": "198.18.0.0/16",
+        "action": "direct"
+      },
+      "takeover": false,
+      "code": null
+    },
+    {
+      "name": "ipv6-still-refused",
+      "rule": {
+        "match": "2001:db8::/32",
+        "action": "direct"
+      },
+      "takeover": true,
+      "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+    }
+  ],
+  "poolConfig": [
+    {
+      "name": "default",
+      "cidr": "198.18.0.0/15",
+      "code": null
+    },
+    {
+      "name": "narrowest",
+      "cidr": "198.18.5.0/24",
+      "code": null
+    },
+    {
+      "name": "widest",
+      "cidr": "10.0.0.0/8",
+      "code": null
+    },
+    {
+      "name": "too-narrow",
+      "cidr": "198.18.0.0/25",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "too-wide",
+      "cidr": "198.0.0.0/7",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "host-bits-set",
+      "cidr": "198.18.0.1/15",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "ipv6",
+      "cidr": "fd00::/64",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "overlaps-mesh",
+      "cidr": "100.96.0.0/16",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "not-a-cidr",
+      "cidr": "fake-ip",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    }
+  ],
+  "egressCapability": [
+    {
+      "name": "domain-to-capable-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": true,
+      "code": null
+    },
+    {
+      "name": "domain-to-incapable-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "suffix-to-incapable-egress",
+      "rule": {
+        "match": "*.example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "domain-block-needs-no-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "block"
+      },
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "address-rule-to-incapable-egress",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "disabled-still-first",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2,
+        "enabled": false
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_DISABLED"
+    }
+  ],
+  "selection": [
+    {
+      "name": "exact-beats-suffix",
+      "query": "example.com",
+      "ruleIndex": 0
+    },
+    {
+      "name": "suffix-covers-subdomain",
+      "query": "www.example.com",
+      "ruleIndex": 1
+    },
+    {
+      "name": "suffix-not-apex",
+      "query": "example.com",
+      "ruleIndex": 0
+    },
+    {
+      "name": "longer-suffix-wins",
+      "query": "img.cdn.example.com",
+      "ruleIndex": 2
+    },
+    {
+      "name": "exact-direct-beats-suffix",
+      "query": "direct.example.com",
+      "ruleIndex": 3
+    },
+    {
+      "name": "earlier-of-equal-suffixes",
+      "query": "a.b.example.com",
+      "ruleIndex": 1
+    },
+    {
+      "name": "trailing-dot-and-case",
+      "query": "WWW.Example.com.",
+      "ruleIndex": 1
+    },
+    {
+      "name": "switched-off-rule-ignored",
+      "query": "host.corp.test",
+      "ruleIndex": null
+    },
+    {
+      "name": "unrelated",
+      "query": "example.org",
+      "ruleIndex": null
+    },
+    {
+      "name": "suffix-needs-a-dot",
+      "query": "badexample.com",
+      "ruleIndex": null
+    }
+  ],
+  "answers": [
+    {
+      "name": "egress-a",
+      "query": "www.example.com",
+      "type": "A",
+      "answer": "fake",
+      "ruleIndex": 1
+    },
+    {
+      "name": "egress-aaaa-nodata",
+      "query": "www.example.com",
+      "type": "AAAA",
+      "answer": "nodata",
+      "ruleIndex": 1
+    },
+    {
+      "name": "egress-https-nodata",
+      "query": "www.example.com",
+      "type": "HTTPS",
+      "answer": "nodata",
+      "ruleIndex": 1
+    },
+    {
+      "name": "egress-svcb-nodata",
+      "query": "www.example.com",
+      "type": "SVCB",
+      "answer": "nodata",
+      "ruleIndex": 1
+    },
+    {
+      "name": "egress-mx-forwarded",
+      "query": "www.example.com",
+      "type": "MX",
+      "answer": "forward",
+      "ruleIndex": 1
+    },
+    {
+      "name": "block-a",
+      "query": "img.cdn.example.com",
+      "type": "A",
+      "answer": "fake",
+      "ruleIndex": 2
+    },
+    {
+      "name": "direct-forwarded",
+      "query": "direct.example.com",
+      "type": "A",
+      "answer": "forward",
+      "ruleIndex": 3
+    },
+    {
+      "name": "unmatched-forwarded",
+      "query": "example.org",
+      "type": "A",
+      "answer": "forward",
+      "ruleIndex": null
+    }
+  ],
+  "pool": [
+    {
+      "name": "same-name-same-address-and-refresh",
+      "cidr": "198.18.0.0/29",
+      "events": [
+        {
+          "at": 0,
+          "query": "a.example.com"
+        },
+        {
+          "at": 5,
+          "query": "b.example.com"
+        },
+        {
+          "at": 10,
+          "query": "A.example.com."
+        },
+        {
+          "at": 20,
+          "traffic": "198.18.0.3"
+        },
+        {
+          "at": 30,
+          "traffic": "198.18.0.6"
+        }
+      ],
+      "results": [
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.3",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "name": "b.example.com"
+        },
+        {
+          "blocked": "fake-ip-unmapped"
+        }
+      ]
+    },
+    {
+      "name": "exhausted-while-every-mapping-is-recent",
+      "cidr": "198.18.0.0/29",
+      "events": [
+        {
+          "at": 0,
+          "query": "n1.example"
+        },
+        {
+          "at": 1,
+          "query": "n2.example"
+        },
+        {
+          "at": 2,
+          "query": "n3.example"
+        },
+        {
+          "at": 3,
+          "query": "n4.example"
+        },
+        {
+          "at": 4,
+          "query": "n5.example"
+        },
+        {
+          "at": 5,
+          "query": "n6.example"
+        }
+      ],
+      "results": [
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.3",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.4",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.5",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.6",
+          "evicted": []
+        },
+        {
+          "exhausted": true,
+          "evicted": []
+        }
+      ]
+    },
+    {
+      "name": "idle-mappings-evicted-and-quarantined",
+      "cidr": "198.18.0.0/29",
+      "events": [
+        {
+          "at": 0,
+          "query": "n1.example"
+        },
+        {
+          "at": 0,
+          "query": "n2.example"
+        },
+        {
+          "at": 0,
+          "query": "n3.example"
+        },
+        {
+          "at": 0,
+          "query": "n4.example"
+        },
+        {
+          "at": 0,
+          "query": "n5.example"
+        },
+        {
+          "at": 10800,
+          "traffic": "198.18.0.3"
+        },
+        {
+          "at": 21601,
+          "query": "n6.example"
+        },
+        {
+          "at": 21602,
+          "traffic": "198.18.0.2"
+        },
+        {
+          "at": 22200,
+          "query": "n7.example"
+        },
+        {
+          "at": 23460,
+          "query": "n7.example"
+        }
+      ],
+      "results": [
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.3",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.4",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.5",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.6",
+          "evicted": []
+        },
+        {
+          "name": "n2.example"
+        },
+        {
+          "exhausted": true,
+          "evicted": [
+            "n1.example",
+            "n3.example",
+            "n4.example",
+            "n5.example"
+          ]
+        },
+        {
+          "blocked": "fake-ip-unmapped"
+        },
+        {
+          "exhausted": true,
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        }
+      ]
+    },
+    {
+      "name": "quarantine-ends",
+      "cidr": "198.18.0.0/30",
+      "events": [
+        {
+          "at": 0,
+          "query": "only.example"
+        },
+        {
+          "at": 21600,
+          "query": "next.example"
+        },
+        {
+          "at": 23400,
+          "query": "next.example"
+        },
+        {
+          "at": 23401,
+          "traffic": "198.18.0.2"
+        }
+      ],
+      "results": [
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "exhausted": true,
+          "evicted": [
+            "only.example"
+          ]
+        },
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "name": "next.example"
+        }
+      ]
+    }
+  ],
+  "nameBind": [
+    {
+      "name": "plain",
+      "address": "198.18.0.5",
+      "domain": "example.com",
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.5\",\"name\":\"example.com\"}"
+    },
+    {
+      "name": "normalised",
+      "address": "198.18.0.6",
+      "domain": "WWW.Example.com.",
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.6\",\"name\":\"www.example.com\"}"
+    }
+  ],
+  "nameBindAtEgress": [
+    {
+      "name": "capable-egress-binds",
+      "domainTargetCapable": true,
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.5\",\"name\":\"example.com\"}",
+      "code": null
+    },
+    {
+      "name": "incapable-egress-refuses",
+      "domainTargetCapable": false,
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.5\",\"name\":\"example.com\"}",
+      "code": "EGRESS_NAME_UNSUPPORTED"
+    }
+  ],
+  "egressChoice": [
+    {
+      "name": "first-allowed-a",
+      "a": [
+        "203.0.113.10",
+        "203.0.113.11"
+      ],
+      "aaaa": [],
+      "ipv6TargetCapable": false,
+      "decisions": {
+        "203.0.113.10": "EGRESS_ALLOWED",
+        "203.0.113.11": "EGRESS_ALLOWED"
+      },
+      "address": "203.0.113.10",
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "skips-a-denied-address",
+      "a": [
+        "127.0.0.1",
+        "203.0.113.11"
+      ],
+      "aaaa": [],
+      "ipv6TargetCapable": false,
+      "decisions": {
+        "127.0.0.1": "EGRESS_FORBIDDEN_DESTINATION",
+        "203.0.113.11": "EGRESS_ALLOWED"
+      },
+      "address": "203.0.113.11",
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "rebinding-to-loopback-refused",
+      "a": [
+        "127.0.0.1"
+      ],
+      "aaaa": [],
+      "ipv6TargetCapable": false,
+      "decisions": {
+        "127.0.0.1": "EGRESS_FORBIDDEN_DESTINATION"
+      },
+      "address": null,
+      "code": "EGRESS_FORBIDDEN_DESTINATION"
+    },
+    {
+      "name": "all-denied-reports-the-first",
+      "a": [
+        "10.0.0.5",
+        "198.51.100.9"
+      ],
+      "aaaa": [],
+      "ipv6TargetCapable": false,
+      "decisions": {
+        "10.0.0.5": "EGRESS_SCOPE_DENIED",
+        "198.51.100.9": "EGRESS_DEST_DENIED"
+      },
+      "address": null,
+      "code": "EGRESS_SCOPE_DENIED"
+    },
+    {
+      "name": "a-preferred-over-aaaa",
+      "a": [
+        "203.0.113.10"
+      ],
+      "aaaa": [
+        "2001:db8::10"
+      ],
+      "ipv6TargetCapable": true,
+      "decisions": {
+        "203.0.113.10": "EGRESS_ALLOWED",
+        "2001:db8::10": "EGRESS_ALLOWED"
+      },
+      "address": "203.0.113.10",
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "aaaa-when-no-a-and-capable",
+      "a": [],
+      "aaaa": [
+        "2001:db8::10"
+      ],
+      "ipv6TargetCapable": true,
+      "decisions": {
+        "2001:db8::10": "EGRESS_ALLOWED"
+      },
+      "address": "2001:db8::10",
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "aaaa-ignored-when-not-capable",
+      "a": [],
+      "aaaa": [
+        "2001:db8::10"
+      ],
+      "ipv6TargetCapable": false,
+      "decisions": {
+        "2001:db8::10": "EGRESS_ALLOWED"
+      },
+      "address": null,
+      "code": "EGRESS_NAME_UNRESOLVED"
+    },
+    {
+      "name": "nothing-resolved",
+      "a": [],
+      "aaaa": [],
+      "ipv6TargetCapable": true,
+      "decisions": {},
+      "address": null,
+      "code": "EGRESS_NAME_UNRESOLVED"
+    }
+  ]
+}

@@ -35,11 +35,14 @@ public final class PeerEgressFrame {
     /** Control message types this version understands. */
     public static final String CONTROL_FLOW_REJECT = "flow-reject";
 
-    /**
-     * Reserved for phase two domain routing. Receiving it must be refused now rather than treated
-     * as implemented, or a phase-one egress would look like it honours domain rules it does not.
-     */
+    /** Consumer to egress: close the established flows to these destinations. */
     public static final String CONTROL_FLOW_PURGE = "flow-purge";
+
+    /**
+     * Phase two: a consumer binds one of its fake addresses to the name a flow to it should reach
+     * (protocol/spec/peer-egress-dns.md).
+     */
+    public static final String CONTROL_NAME_BIND = "name-bind";
 
     private static final byte[] MAGIC = "SPEG1".getBytes(StandardCharsets.US_ASCII);
     private static final int IPV4_MIN_HEADER_BYTES = 20;
@@ -187,8 +190,13 @@ public final class PeerEgressFrame {
         if (CONTROL_FLOW_REJECT.equals(type) || CONTROL_FLOW_PURGE.equals(type)) {
             return null;
         }
-        // Includes name-bind, which phase two defines. Refusing keeps a phase-one egress from
-        // looking like it honours domain rules it does not implement.
+        if (CONTROL_NAME_BIND.equals(type)) {
+            // Both fields, both well formed: a binding the egress cannot resolve or dial is refused
+            // here rather than stored.
+            return Ipv4Cidr.parseAddress(node.path("address").asText("")) != null
+                    && PeerEgressNames.valid(node.path("name").asText(""))
+                    ? null : PeerEgressCodes.FRAME_MALFORMED_CONTROL;
+        }
         return PeerEgressCodes.CONTROL_UNSUPPORTED;
     }
 
@@ -206,19 +214,27 @@ public final class PeerEgressFrame {
             String destinationIp,
             int destinationPort,
             List<String> destinations,
-            String code) {
+            String code,
+            String address,
+            String name) {
 
         /** A flow-reject: the reason one flow was refused, for the consumer to display. */
         public static Control flowReject(String protocol, String sourceIp, int sourcePort,
                 String destinationIp, int destinationPort, String code) {
             return new Control(CONTROL_FLOW_REJECT, protocol, sourceIp, sourcePort,
-                    destinationIp, destinationPort, List.of(), code);
+                    destinationIp, destinationPort, List.of(), code, "", "");
         }
 
         /** A flow-purge: the destinations whose established flows the egress should close. */
         public static Control flowPurge(List<String> destinations, String code) {
             return new Control(CONTROL_FLOW_PURGE, "", "", 0, "", 0,
-                    destinations == null ? List.of() : List.copyOf(destinations), code);
+                    destinations == null ? List.of() : List.copyOf(destinations), code, "", "");
+        }
+
+        /** A name-bind: the name a fake address stands for, normalised. */
+        public static Control nameBind(String address, String name) {
+            return new Control(CONTROL_NAME_BIND, "", "", 0, "", 0, List.of(), "", address,
+                    PeerEgressNames.normalize(name));
         }
     }
 
@@ -249,6 +265,8 @@ public final class PeerEgressFrame {
             text.append(']');
         }
         appendString(text, "code", control.code(), false);
+        appendString(text, "address", control.address(), false);
+        appendString(text, "name", control.name(), false);
         return text.append('}').toString().getBytes(StandardCharsets.UTF_8);
     }
 
@@ -300,7 +318,9 @@ public final class PeerEgressFrame {
                     node.path("destinationIp").asText(""),
                     node.path("destinationPort").asInt(0),
                     List.copyOf(destinations),
-                    node.path("code").asText(""));
+                    node.path("code").asText(""),
+                    node.path("address").asText(""),
+                    node.path("name").asText(""));
         } catch (IOException unreadable) {
             return null;
         }

@@ -8,7 +8,8 @@
 
 ## 一期边界
 
-本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级：
+本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级。其中域名规则、DNS 接管与 IPv6 目标由二期规范
+[peer-egress-dns.md](peer-egress-dns.md) 定义，默认关闭；未开启 `peerEgressDnsTakeover` 时下表照旧成立：
 
 | 不支持 | 行为 |
 | --- | --- |
@@ -374,12 +375,12 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | --- | --- |
 | `version` | 当前为 `1`。`0` 或缺省表示不支持出口 |
 | `consumerCapable` / `egressCapable` | 该客户端能否作为消费端 / 出口端 |
-| `domainTargetCapable` | 是否支持域名目标。一期固定为 `false` |
+| `domainTargetCapable` | 是否支持域名目标，即接受 `name-bind` 并在出口侧解析（[二期](peer-egress-dns.md)） |
 | `ipv6TargetCapable` | 是否支持 IPv6 目标。一期固定为 `false` |
 
 服务端**不得**向 `version` 为 `0` 或缺省的客户端下发 `egress-config` 或 `egress-catalog`。四个服务端都按这条门控。
 
-设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 与 `ipv6TargetCapable` 为 `false`。
+设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 为 `true`（出口侧二期已交付），`ipv6TargetCapable` 为 `false`。
 
 > 在 P8 审计之前，三个客户端**都没有上报**这个对象（Java 上报了但 `version` 为默认的 `0`），于是没有任何服务端向任何客户端下发过 `egress-config`：真实部署里没有设备能被启用为出口，出口数据面只在直接喂策略的测试里跑过。修复见 `fix(peer-egress): make the feature reachable outside its own tests`。
 
@@ -543,7 +544,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口关闭匹配这些目标的全部已建流。
 
-`name-bind` 为二期域名分流保留。一期收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。
+`name-bind` 属于二期域名分流，定义见 [peer-egress-dns.md](peer-egress-dns.md)。声明 `domainTargetCapable` 的出口接受它；不支持二期的出口收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。其他未定义的控制类型一律返回 `EGRESS_CONTROL_UNSUPPORTED`。
 
 固定向量：`protocol/test-vectors/peer-egress-frame-v1.json`。
 
@@ -579,6 +580,11 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_IPV6_UNSUPPORTED` | 数据面收到 IPv6 packet |
 | `EGRESS_FRAME_MALFORMED_CONTROL` | `type=2` 的 body 不是 UTF-8 JSON object |
 | `EGRESS_CONTROL_UNSUPPORTED` | 控制消息类型未在本版本实现 |
+| `EGRESS_NAME_UNRESOLVED` | 二期：出口解析名字失败或没有可用地址 |
+| `EGRESS_NAME_UNSUPPORTED` | 二期：出口不支持域名目标（未声明 `domainTargetCapable`）却收到 `name-bind` |
+| `EGRESS_RULE_FAKE_IP_OVERLAP` | 二期配置校验：IP/CIDR 规则与 fake-IP 池重叠 |
+| `EGRESS_FAKE_IP_POOL_INVALID` | 二期配置校验：`peerEgressFakeIpCidr` 不合法，或与 Peer Mesh 网段、本机接口地址重叠 |
+| `EGRESS_RULE_EGRESS_NO_DOMAIN` | 二期配置校验：域名规则指向的出口未声明 `domainTargetCapable` |
 
 ## 状态查询
 
@@ -660,7 +666,10 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口不得成为开放代理。上限四端取一致口径，并在成功、失败、超时和取消路径全部释放：
 
-- 全进程活动流上限、每出口策略上限、每消费设备上限
+- 全进程活动流上限、每出口策略上限、每消费设备上限。**处于 TIME_WAIT 的 TCP 流不计入**：出口先关的流
+  进入 TIME_WAIT 时，两个方向都已结束，出口立即关闭其上游 socket，条目只为回应重传的 FIN 保留到 10 s
+  计时结束。计入的话，一个刚完成 64 条短连接的消费端在之后 10 s 内新建的连接会被 `EGRESS_LIMIT_EXCEEDED`
+  拒绝（#88）。状态里的 `flows` 同样只计活动流
 - TCP connect timeout、双向 idle timeout
 - UDP 来源映射 idle TTL
 - 速率限制——**尚未实现**，见当前限制

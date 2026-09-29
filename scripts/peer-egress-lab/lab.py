@@ -992,6 +992,21 @@ class Lab:
                        f"resident set {baseline[role] / 1024:.0f} MiB before, peak {peak[role] / 1024:.0f} MiB")
         self.leak_check("performance gate: no local leak under concurrency", mark)
 
+        # The same set again at once. The flows just finished linger in TIME_WAIT for ten seconds,
+        # and while they counted against maxFlowsPerConsumer (#88) the second set was refused until
+        # they expired: every flow completed, eleven seconds late.
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=flows) as pool:
+            results = list(pool.map(lambda _: self.verified_download(size, 90), range(flows)))
+        elapsed = time.monotonic() - started
+        intact = sum(1 for ok, _ in results if ok)
+        aggregate = flows * size / elapsed / 1048576
+        self.measure(f"gate: {flows} concurrent flows again at once, aggregate", round(aggregate, 2), "MiB/s")
+        self.check(f"performance gate: {flows} concurrent flows again at once, all intact, "
+                   f"aggregate >= {GATE_CONCURRENT_MIBPS:g} MiB/s (finished flows do not hold the limit)",
+                   intact == flows and aggregate >= GATE_CONCURRENT_MIBPS,
+                   f"{intact}/{flows} intact, {aggregate:.2f} MiB/s in {elapsed:.2f} s")
+
     # -- fault injection --------------------------------------------------------------------------
 
     def fault_acl_revoked(self):
