@@ -17,6 +17,7 @@ func configWarnings(data []byte, config Config, warn func(string)) {
 	// configuration that used the field was told "Unknown configuration field; ignored" -- a warning
 	// saying the operator's egress rules were thrown away, while the client was in fact applying
 	// them.
+	// peerEgressDnsTakeover and peerEgressFakeIpCidr carry no omitempty for the same reason.
 	shape, _ := json.Marshal(Config{PeerEgressRules: []egressRule{{}}})
 	_ = json.Unmarshal(shape, &known)
 	warnUnknownConfig(raw, known, "", warn)
@@ -43,12 +44,23 @@ func configWarnings(data []byte, config Config, warn func(string)) {
 // Rules kept with the master switch off are the one state where nothing is in force by design, and
 // that is said once rather than left to be discovered. A rule the user switched off is not warned
 // about: it is out of force because they asked, which is not a problem with the configuration.
+//
+// Domain rules are judged as phase two would judge them with the master switch on: accepted when
+// peerEgressDnsTakeover is on and the pool is usable against the default mesh network, refused as
+// in phase one otherwise. A pool that is not usable is said once, in the words the Java and .NET
+// clients use, since otherwise the operator sees only the domain rules refused and not why. What the
+// pool overlaps on this device is only known when phase two starts.
 func warnEgressRules(config Config, warn func(string)) {
 	rules := config.PeerEgressRules
 	if len(rules) > 0 && !config.PeerEgressEnabled {
 		warn(fmt.Sprintf("peerEgressRules has %d rule(s) but peerEgressEnabled is false: none is in force", len(rules)))
 	}
-	for _, refused := range validateEgressRuleSet(rules, egressDefaultMeshCIDR) {
+	if config.PeerEgressDNSTakeover {
+		if code := validateEgressFakeIPPool(effectiveEgressFakeIPCIDR(config.PeerEgressFakeIPCIDR), egressDefaultMeshCIDR); code != "" {
+			warn("peerEgressFakeIpCidr is not usable: " + code + "; domain rules are not in force")
+		}
+	}
+	for _, refused := range validateEgressRuleSetIn(rules, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config)) {
 		if refused.Code == egressCodeRuleDisabled {
 			continue
 		}

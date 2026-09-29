@@ -193,9 +193,107 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	consumer := newEgressConsumer(mesh.logger,
 		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
 		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
+	// A catalogue that arrived before the consumer was built still says which egresses resolve
+	// names; nothing else will repeat it until the server has a reason to.
+	if mesh.egressCatalog != nil {
+		consumer.capable = mesh.egressCatalog.domainCapable()
+	}
 	mesh.egressConsumer = consumer
 	mesh.mu.Unlock()
 	return consumer
+}
+
+// applyEgressCatalog reads a pushed egress-catalog and gives the consumer the capabilities it lists.
+// A change can close flows: a flow to a name stops the moment its egress is no longer said to
+// resolve names. Called with no mesh lock held.
+func (mesh *peerMeshClient) applyEgressCatalog(payload string) {
+	mesh.mu.Lock()
+	if mesh.egressCatalog == nil {
+		mesh.egressCatalog = newEgressCatalogReader()
+	}
+	accepted := mesh.egressCatalog.read([]byte(payload))
+	capable := mesh.egressCatalog.domainCapable()
+	ids := mesh.egressCatalog.capableIDs()
+	consumer := mesh.egressConsumer
+	mesh.mu.Unlock()
+	if !accepted {
+		// A stale revision is ordinary after a reorder and says nothing worth a line; a malformed
+		// catalogue is the server's to fix, and the known capabilities stand either way.
+		return
+	}
+	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses resolving names: %v", ids)
+	if consumer != nil {
+		mesh.deliverEgressPurges(consumer.setDomainCapable(capable, time.Now()))
+	}
+}
+
+// newEgressCatalogSessionLocked resets the catalogue's revision floor for a new control session.
+// Called with the mesh lock held.
+func (mesh *peerMeshClient) newEgressCatalogSessionLocked() {
+	if mesh.egressCatalog != nil {
+		mesh.egressCatalog.newSession()
+	}
+}
+
+// egressPhaseTwoFor evaluates phase two against the mesh network the server gave, and, the first
+// time phase two would run with a pool, against the networks this device sits on. Called under
+// egressPlanMu with no mesh lock held.
+//
+// The device check is done once and kept. It answers whether the pool can be routed into the tunnel
+// at all, and phase two starting and stopping as interfaces come and go would hand the same names
+// out of a pool that is sometimes there; a network change is the system DNS takeover's to handle.
+func (mesh *peerMeshClient) egressPhaseTwoFor(meshCIDR string) egressPhaseTwo {
+	cidr := effectiveEgressFakeIPCIDR(mesh.config.PeerEgressFakeIPCIDR)
+	active, code := evaluateEgressPhaseTwo(mesh.config.PeerEgressEnabled, mesh.config.PeerEgressDNSTakeover, cidr, meshCIDR)
+	if active {
+		if mesh.egressPoolCheckedFor != cidr {
+			networks := mesh.egressLocalNetworks
+			if networks == nil {
+				networks = localInterfaceCIDRs
+			}
+			mesh.egressPoolCheckedFor = cidr
+			mesh.egressPoolOverlapsLocal = egressFakeIPPoolOverlapsLocal(cidr, networks())
+		}
+		if mesh.egressPoolOverlapsLocal {
+			active, code = false, egressCodeFakeIPPoolInvalid
+		}
+	}
+	phase := egressPhaseTwo{CIDR: cidr, Active: active, Code: code}
+	if logged := fmt.Sprintf("%v|%s|%s", phase.Active, phase.CIDR, phase.Code); mesh.config.PeerEgressDNSTakeover &&
+		logged != mesh.egressPhaseLogged {
+		mesh.egressPhaseLogged = logged
+		// Without the pool itself: configuration values stay out of the log, as a rule's match does.
+		switch {
+		case phase.Active:
+			mesh.logger.Printf("[peer-egress-consumer] phase two running")
+		case phase.Code != "":
+			mesh.logger.Printf("[peer-egress-consumer] phase two not started: %s "+
+				"(peerEgressFakeIpCidr must be an IPv4 /8 to /24 clear of the Peer Mesh network and of this device's networks)",
+				phase.Code)
+		}
+	}
+	mesh.mu.Lock()
+	mesh.egressPhase, mesh.egressPhaseEvaluated = phase, true
+	mesh.mu.Unlock()
+	return phase
+}
+
+// currentEgressPhaseTwo is phase two as the last reconcile found it. Before the first one it is
+// evaluated from the configuration alone, which cannot yet say it is running.
+func (mesh *peerMeshClient) currentEgressPhaseTwo() egressPhaseTwo {
+	mesh.mu.Lock()
+	phase, evaluated := mesh.egressPhase, mesh.egressPhaseEvaluated
+	meshCIDR := strings.TrimSpace(mesh.runtime.PeerMesh.CIDR)
+	mesh.mu.Unlock()
+	if evaluated {
+		return phase
+	}
+	if meshCIDR == "" {
+		meshCIDR = egressDefaultMeshCIDR
+	}
+	cidr := effectiveEgressFakeIPCIDR(mesh.config.PeerEgressFakeIPCIDR)
+	_, code := evaluateEgressPhaseTwo(mesh.config.PeerEgressEnabled, mesh.config.PeerEgressDNSTakeover, cidr, meshCIDR)
+	return egressPhaseTwo{CIDR: cidr, Code: code}
 }
 
 // sendEgressFrameToPeer carries one frame to the egress peer.
@@ -267,6 +365,15 @@ func (mesh *peerMeshClient) syncEgressAvailability(online map[int64]bool) {
 // the flow on its own idle timer regardless, so a purge that cannot be delivered delays cleanup
 // rather than losing it.
 func (mesh *peerMeshClient) deliverEgressPurges(purge map[int64][]string) {
+	for egress, frame := range egressFlowPurgeFrames(purge) {
+		_ = mesh.sendEgressFrameToPeer(egress, frame)
+	}
+}
+
+// egressFlowPurgeFrames encodes one flow-purge frame per egress with anything to purge. A flow to a
+// fake address is purged by that address as a /32, which is what the egress keyed the flow on.
+func egressFlowPurgeFrames(purge map[int64][]string) map[int64][]byte {
+	frames := make(map[int64][]byte, len(purge))
 	for egress, destinations := range purge {
 		if len(destinations) == 0 {
 			continue
@@ -277,8 +384,9 @@ func (mesh *peerMeshClient) deliverEgressPurges(purge map[int64][]string) {
 		if err != nil {
 			continue
 		}
-		_ = mesh.sendEgressFrameToPeer(egress, encodePeerEgressFrame(peerEgressTypeControl, false, body))
+		frames[egress] = encodePeerEgressFrame(peerEgressTypeControl, false, body)
 	}
+	return frames
 }
 
 // Keeping the routes true while the process runs.
@@ -315,11 +423,14 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	if meshCIDR == "" {
 		meshCIDR = egressDefaultMeshCIDR
 	}
+	// Phase two needs the master switch too, so with it off this is never running either.
+	phase := mesh.egressPhaseTwoFor(meshCIDR)
 
-	// The consumer exists only when there are rules for it to apply. Building it for an empty
-	// set would start the threads that carry its work and report a consumer with nothing to do.
-	if len(rules) > 0 {
-		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, now)
+	// The consumer exists only when it has something to do: rules to apply, or phase two's pool to
+	// own. Building it for nothing would start the threads that carry its work and report a
+	// consumer with nothing to do.
+	if len(rules) > 0 || phase.Active {
+		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, phase.pool(), now)
 	}
 
 	// Without a device there is nothing to route into. A rule's route pointed at an interface
@@ -330,9 +441,9 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 		mesh.egressDeviceWaitLogged = false
 		bypass := mesh.egressBypassAddresses(now)
 		var refused []egressRuleSetError
-		desired, refused = planEgressRoutes(rules, bypass, meshCIDR)
+		desired, refused = planEgressRoutesIn(rules, bypass, meshCIDR, phase.pool())
 		mesh.logEgressRefusals(refused)
-	} else if len(rules) > 0 && !mesh.egressDeviceWaitLogged {
+	} else if (len(rules) > 0 || phase.Active) && !mesh.egressDeviceWaitLogged {
 		mesh.egressDeviceWaitLogged = true
 		mesh.logger.Printf("[peer-egress-consumer] routes not installed: virtual device is %s",
 			egressDeviceStatus(device))
@@ -478,14 +589,14 @@ func mergeEgressConflicts(existing, more []egressRouteConflict) []egressRouteCon
 // Reconfiguring purges the flows the new rules no longer cover, and with the same rules that is
 // every flow being re-examined for nothing on every tick; with a change of virtual IP it is what
 // has to happen.
-func (mesh *peerMeshClient) configureEgressConsumer(rules []egressRule, meshCIDR, virtualIP string, now time.Time) {
-	key := fmt.Sprintf("%s|%s|%+v", meshCIDR, strings.TrimSpace(virtualIP), rules)
+func (mesh *peerMeshClient) configureEgressConsumer(rules []egressRule, meshCIDR, virtualIP, fakeIPPool string, now time.Time) {
+	key := fmt.Sprintf("%s|%s|%s|%+v", meshCIDR, strings.TrimSpace(virtualIP), fakeIPPool, rules)
 	if key == mesh.egressConsumerKey {
 		return
 	}
 	mesh.egressConsumerKey = key
 	consumer := mesh.ensureEgressConsumer()
-	mesh.deliverEgressPurges(consumer.configure(rules, meshCIDR, virtualIP, now))
+	mesh.deliverEgressPurges(consumer.configureIn(rules, meshCIDR, virtualIP, fakeIPPool, now))
 }
 
 // logEgressRefusals reports the rules that were thrown out, once per distinct set. The rules do not
@@ -655,7 +766,7 @@ func (mesh *peerMeshClient) applyEgressControl(payload string) {
 		return
 	}
 	context := newEgressContext()
-	context.DeploymentDenyCIDRs = mesh.deploymentDenyCIDRs()
+	context.DeploymentDenyCIDRs = append(mesh.deploymentDenyCIDRs(), mesh.egressOwnFakeIPPool()...)
 	runtime.setLocalInterfaceCIDRs(localInterfaceCIDRs())
 	runtime.applyPolicy(policy, context, time.Now())
 	mesh.logger.Printf("[peer-egress] policy applied enabled=%v revision=%d rules=%d",
@@ -720,6 +831,26 @@ func (mesh *peerMeshClient) shutdownEgress() {
 	if done != nil {
 		close(done)
 	}
+}
+
+// egressOwnFakeIPPool is this node's own fake-IP pool when its configuration runs phase two, for the
+// egress role's forced-deny list (protocol/spec/peer-egress-dns.md, 五). A consumer's flow dialled
+// into it would be routed into this node's own tunnel and steered by this node's own names.
+//
+// Read from the configuration and the mesh network rather than from the last reconcile, which may
+// not have run yet when the policy arrives.
+func (mesh *peerMeshClient) egressOwnFakeIPPool() []string {
+	mesh.mu.Lock()
+	meshCIDR := strings.TrimSpace(mesh.runtime.PeerMesh.CIDR)
+	mesh.mu.Unlock()
+	if meshCIDR == "" {
+		meshCIDR = egressDefaultMeshCIDR
+	}
+	cidr := effectiveEgressFakeIPCIDR(mesh.config.PeerEgressFakeIPCIDR)
+	if active, _ := evaluateEgressPhaseTwo(mesh.config.PeerEgressEnabled, mesh.config.PeerEgressDNSTakeover, cidr, meshCIDR); !active {
+		return nil
+	}
+	return []string{cidr}
 }
 
 // deploymentDenyCIDRs are this deployment's control, STUN and TURN endpoints. Forwarding a
