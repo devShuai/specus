@@ -69,7 +69,7 @@ class PeerEgressPhaseTwoTests {
 
         @Override
         public String meshCidr() {
-            return "100.96.0.0/11";
+            return meshCidr;
         }
 
         @Override
@@ -116,6 +116,43 @@ class PeerEgressPhaseTwoTests {
         public List<String> localInterfaceCidrs() {
             return interfaces;
         }
+
+        @Override
+        public List<String> localInterfaceAddresses() {
+            return List.of("192.168.1.20");
+        }
+
+        @Override
+        public List<String> dnsUpstreams() {
+            return upstreams;
+        }
+    }
+
+    private List<String> upstreams = List.of();
+    private String meshCidr = "100.96.0.0/11";
+
+    /**
+     * Phase two stopping with no rules -- here because the mesh network the server gives moves over
+     * the pool -- still reaches the consumer: it lets go of the pool and the responder, the pool
+     * route comes out, and the listen address is nobody's any more.
+     */
+    @Test
+    void phaseTwoStoppingWithNoRulesLetsGoOfThePool() {
+        newMesh().applyRules(List.of());
+        assertTrue(installedCidrs.contains(POOL));
+        assertTrue(mesh.handleOutbound(dnsQueryFrom(VIRTUAL_IP, "example.com")), "the responder did not answer");
+
+        meshCidr = "198.18.0.0/16";
+        mesh.applyRules(List.of());
+
+        assertFalse(installedCidrs.contains(POOL), "the pool route outlived phase two");
+        assertNull(mesh.dnsResponder());
+        assertFalse(mesh.handleOutbound(dnsQueryFrom(VIRTUAL_IP, "example.com")),
+                "the consumer still steers by a pool phase two let go of");
+        JsonNode consumer = consumerStatus();
+        assertFalse(consumer.path("dns").path("takeover").asBoolean());
+        assertEquals(PeerEgressCodes.FAKE_IP_POOL_INVALID, consumer.path("dns").path("code").asText());
+        assertNull(route(consumer, POOL));
     }
 
     /** A routing table that records what it was asked to install and can refuse one prefix. */
@@ -392,6 +429,52 @@ class PeerEgressPhaseTwoTests {
         mesh.applyEgressCatalog(catalogue(2, false));
         mesh.syncEgressAvailability(available);
         assertTrue(consumerStatus().path("rules").get(0).path("inForce").asBoolean());
+    }
+
+    private static byte[] dnsQueryFrom(String source, String name) {
+        return PeerEgressDatagram.build(new PeerEgressDatagram.Datagram(Ipv4Cidr.parseAddress(source),
+                Ipv4Cidr.parseAddress("198.18.0.1"), 5353, 53,
+                PeerEgressDnsWireVectorTests.query(0x1234, name, PeerEgressDnsMessage.TYPE_A)));
+    }
+
+    /**
+     * While phase two runs the status says where the responder listens, whom it forwards to and
+     * what it answered; a query from this node's mesh address or one of its interfaces is answered,
+     * one from anywhere else is dropped and counted in blocked.
+     */
+    @Test
+    void theStatusReportsTheResponder() {
+        upstreams = List.of("192.0.2.53", " 127.0.0.1:5353", "resolver.example");
+        newMesh();
+        mesh.dnsForwarder = (query, tcp, targets) -> null;
+        mesh.applyRules(rules());
+
+        JsonNode dns = consumerStatus().path("dns");
+        assertEquals("198.18.0.1", dns.path("listen").asText());
+        assertEquals("[\"192.0.2.53\",\"127.0.0.1:5353\"]", dns.path("upstreams").toString(),
+                "upstreams that are not literal addresses are listed");
+        assertEquals("{\"answered\":0,\"forwarded\":0,\"failed\":0}", dns.path("queries").toString());
+
+        assertTrue(mesh.handleOutbound(dnsQueryFrom(VIRTUAL_IP, "example.com")));
+        assertTrue(mesh.handleOutbound(dnsQueryFrom("192.168.1.20", "example.com")));
+        assertTrue(mesh.handleOutbound(dnsQueryFrom("203.0.113.9", "example.com")), "a query from elsewhere was handed back");
+        JsonNode consumer = consumerStatus();
+        assertEquals(2, consumer.path("dns").path("queries").path("answered").asLong());
+        assertEquals(1, consumer.path("dns").path("mappings").asLong());
+        assertEquals(1, consumer.path("blocked").path("dns-not-local").asLong());
+    }
+
+    /** Takeover asked for over an unusable pool: no listen address, but upstreams and counts stay. */
+    @Test
+    void theStatusKeepsUpstreamsAndCountsWhilePhaseTwoIsStopped() {
+        fakeIpCidr = "198.18.0.0/25";
+        newMesh().applyRules(rules());
+
+        JsonNode dns = consumerStatus().path("dns");
+        assertTrue(dns.path("listen").isMissingNode(), "a listen address while phase two is stopped");
+        assertEquals("[]", dns.path("upstreams").toString());
+        assertEquals("{\"answered\":0,\"forwarded\":0,\"failed\":0}", dns.path("queries").toString());
+        assertNull(mesh.dnsResponder(), "a responder without phase two");
     }
 
     /** An unusable pool stops phase two alone: phase one's rules stay in force, domain rules do not. */

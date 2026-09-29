@@ -53,7 +53,11 @@ final class PeerEgressConsumer {
          * Phase two: a packet to a fake address that stands for no name, or for a name no rule
          * sends anywhere any more.
          */
-        BLOCKED_FAKE_IP;
+        BLOCKED_FAKE_IP,
+        /** A DNS query to the responder, which took it. */
+        DNS,
+        /** A DNS query to the responder from an address that is not this machine's: dropped. */
+        BLOCKED_NOT_LOCAL;
 
         @Override
         public String toString() {
@@ -63,6 +67,8 @@ final class PeerEgressConsumer {
                 case BLOCKED_NO_EGRESS -> "blocked-no-egress";
                 case UNSUPPORTED -> "unsupported";
                 case BLOCKED_FAKE_IP -> "blocked-fake-ip";
+                case DNS -> "dns";
+                case BLOCKED_NOT_LOCAL -> "blocked-not-local";
                 default -> "not-mine";
             };
         }
@@ -252,6 +258,16 @@ final class PeerEgressConsumer {
     private PeerEgressFakeIpPool fakeIps;
     /** The egresses the catalogue says resolve names; any other gets no traffic for a name. */
     private Set<Long> domainCapable = Set.of();
+    /** Phase two's DNS responder, which takes port 53 of the pool's listen address; or null. */
+    private PeerEgressDnsResponder dnsResponder;
+    /** This node's mesh address, parsed: the source a local DNS query normally has. */
+    private Integer virtualAddress;
+    /**
+     * Whether an address is one of this machine's interfaces', the other source a local query may
+     * have. Supplied by the mesh, which caches the interface list; only this node's mesh address
+     * counts without it.
+     */
+    private java.util.function.IntPredicate localAddress = address -> false;
 
     PeerEgressConsumer(Sender sender, TunWriter tunWriter) {
         this(sender, tunWriter, DEFAULT_FLOW_CAPACITY);
@@ -305,13 +321,26 @@ final class PeerEgressConsumer {
      */
     Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
             String newVirtualIp, PeerEgressFakeIpPool pool, long nowMs) {
+        return configure(newRules, newMeshCidr, newVirtualIp, pool, null, nowMs);
+    }
+
+    /** As above, with the DNS responder that answers from the pool (step four), or null. */
+    Map<Long, List<String>> configure(List<PeerEgressRule> newRules, String newMeshCidr,
+            String newVirtualIp, PeerEgressFakeIpPool pool, PeerEgressDnsResponder responder, long nowMs) {
         rules = newRules == null ? List.of() : List.copyOf(newRules);
         if (newMeshCidr != null && !newMeshCidr.trim().isEmpty()) {
             meshCidr = newMeshCidr.trim();
         }
         virtualIp = newVirtualIp == null ? "" : newVirtualIp.trim();
+        virtualAddress = Ipv4Cidr.parseAddress(virtualIp);
         fakeIps = pool;
+        dnsResponder = pool == null ? null : responder;
         return purgeInvalidated(nowMs);
+    }
+
+    /** How to tell this machine's interface addresses, for the DNS responder's source check. */
+    void setLocalAddresses(java.util.function.IntPredicate addresses) {
+        localAddress = addresses == null ? address -> false : addresses;
     }
 
     /**
@@ -434,6 +463,20 @@ final class PeerEgressConsumer {
         int protocol = PeerIpPacket.protocol(packet);
         int address = readInt(packet, 16);
         PeerEgressFakeIpPool pool = fakeIps;
+        PeerEgressDnsResponder responder = dnsResponder;
+        if (responder != null && address == responder.listenAddress() && isDnsPort(packet, protocol)) {
+            // The responder's own port, ahead of any steering. Only this machine is answered: a
+            // query from anywhere else means this node is forwarding for somebody, and phase two
+            // resolves for nobody but itself. Other ports of the listen address fall through to
+            // the pool, which has no mapping for it.
+            int source = readInt(packet, 12);
+            if ((virtualAddress == null || source != virtualAddress) && !localAddress.test(source)) {
+                recordBlocked("dns-not-local");
+                return Outcome.BLOCKED_NOT_LOCAL;
+            }
+            responder.handle(packet, protocol, rules, meshCidr, nowMs);
+            return Outcome.DNS;
+        }
         // The name a fake address stands for, when the destination is one; null for an address.
         String name = null;
         Long egress;
@@ -562,6 +605,16 @@ final class PeerEgressConsumer {
                     == PeerEgressSegment.FLAG_SYN;
         }
         return !flow.replied;
+    }
+
+    /** Whether a TCP or UDP packet is addressed to port 53. */
+    private static boolean isDnsPort(byte[] packet, int protocol) {
+        if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP && protocol != PeerEgressDatagram.IPV4_PROTOCOL_UDP) {
+            return false;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        return ihl >= IPV4_MIN_HEADER_BYTES && packet.length >= ihl + 4
+                && readShort(packet, ihl + 2) == PeerEgressDnsResponder.PORT;
     }
 
     /**
