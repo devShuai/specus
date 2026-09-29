@@ -414,7 +414,9 @@ class Matrix:
                     assert isinstance(capabilities, dict),                         f"login announced no clientEgressCapabilities (POST paths seen: {getattr(http, 'post_paths', [])}, "                         f"environment keys: {sorted(((getattr(http, 'last_login', None) or {}).get('environment') or {}).keys())})"
                     assert isinstance(capabilities.get("version"), int) and capabilities["version"] >= 1,                         f"login announced egress version {capabilities.get('version')!r}; servers skip egress-config below 1"
                     assert capabilities.get("egressCapable") is True, "login did not announce egressCapable"
-                    assert capabilities.get("domainTargetCapable") is False and capabilities.get("ipv6TargetCapable") is False,                         "phase one must not announce domain or IPv6 targets"
+                    # The egress side of phase two resolves names (peer-egress-dns.md); IPv6 targets are not carried.
+                    assert capabilities.get("domainTargetCapable") is True, "login did not announce domain targets"
+                    assert capabilities.get("ipv6TargetCapable") is False, "IPv6 targets must not be announced"
                     self.checks += 1
                     self.checks += 1
                     control.data_delay = 0

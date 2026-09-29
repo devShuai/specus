@@ -10,7 +10,7 @@
 </section>
 <div id="workspace" class="workspace" hidden>
   <aside><div class="brand">specus <span>LOCAL</span></div><p class="aside-caption">本机连接工作台</p>
-    <nav aria-label="工作台页面"><button data-view="overview" aria-current="page">连接与服务</button><button data-view="settings">连接设置<span id="dirty-dot" hidden> · 未保存</span></button></nav>
+    <nav aria-label="工作台页面"><button data-view="overview" aria-current="page">连接与服务</button><button data-view="settings">连接设置<span id="dirty-dot" hidden> · 未保存</span></button><button data-view="rules">出口规则</button></nav>
     <div class="local-boundary"><span class="boundary-dot"></span><strong>仅本机访问</strong><p>关闭网页不停止隧道。<br>终端 Ctrl+C 退出管理，<br>并断开本页拥有的连接。</p><code id="implementation">Specus CLI</code></div>
   </aside>
   <main><header><div><p class="eyebrow">LOCAL CONNECTION / 本机管理</p><h1 id="page-title">连接与服务</h1></div><span class="local-tag">回环访问 · 会话授权</span></header>
@@ -39,6 +39,30 @@
         <p class="save-boundary">只保存本次改动；保留注释、未知字段及未修改的密钥引用。凭据留空表示保留，保存成功不代表已经连接或已应用。</p>
         <div class="form-actions"><button id="validate" type="button">离线校验</button><button id="save" type="submit" class="primary">保存配置</button><span id="edit-state" class="muted">没有未保存修改</span></div>
       </form></section></section>
+    <section id="rules" class="view" hidden>
+      <section class="panel rules-panel" aria-labelledby="takeover-title"><div class="section-heading"><h2 id="takeover-title">系统接管</h2><span id="takeover-state" class="count">—</span></div>
+        <p id="takeover-detail" class="muted">读取配置…</p>
+        <div class="form-actions"><button id="takeover" type="button" class="primary" disabled>开启接管</button><button id="rules-reload" type="button">重新载入</button></div>
+        <p class="save-boundary">保存规则与启用系统接管是两步：接管关闭时规则只保存，不装路由、不接管任何流量。这里只修改配置文件中的 peerEgressRules 与 peerEgressEnabled，文件其余内容与注释原样保留；运行中的连接需重新连接后才应用。</p>
+      </section>
+      <section class="panel rules-panel" aria-labelledby="rules-title"><div class="section-heading"><h2 id="rules-title">分流规则</h2><span id="rules-count" class="count">0</span></div>
+        <p class="muted">前缀更长的规则优先，同样长时靠前的优先；未命中任何规则的流量本地直连。</p>
+        <ul id="rules-list" class="catalog rules" aria-label="分流规则"></ul>
+        <form id="rule-form" autocomplete="off"><h3>添加规则</h3>
+          <div class="form-grid"><div><label for="rule-match">目标地址或网段</label><input id="rule-match" placeholder="203.0.113.0/24" required spellcheck="false"></div>
+            <div><label for="rule-action">动作</label><select id="rule-action"><option value="egress">经出口设备访问</option><option value="direct">本地直连</option><option value="block">阻断</option></select></div></div>
+          <div class="form-grid"><div id="rule-target-field"><label for="rule-target">出口设备 ID</label><input id="rule-target" inputmode="numeric" placeholder="例如 2" spellcheck="false"></div>
+            <div><label for="rule-position">位置</label><select id="rule-position"><option value="end">加到末尾</option><option value="start">加到最前</option></select></div></div>
+          <label class="check"><input id="rule-disabled" type="checkbox"> 以停用状态加入</label>
+          <div class="form-actions"><button type="submit" class="primary">添加规则</button><span class="muted">只接受 IPv4 地址或网段；会被拒绝的规则不会写入。</span></div>
+        </form>
+      </section>
+      <section class="panel rules-panel" aria-labelledby="preview-title"><div class="section-heading"><h2 id="preview-title">预演</h2></div>
+        <p class="muted">按配置判断一个 IPv4 地址会命中哪条规则、去向如何。不建立任何连接，也不代表出口设备在线。</p>
+        <form id="preview-form" class="inline-form" autocomplete="off"><input id="preview-address" placeholder="203.0.113.5" aria-label="要预演的 IPv4 地址" required spellcheck="false"><button type="submit">预演</button></form>
+        <p id="preview-result" role="status"></p>
+      </section>
+    </section>
     <footer><span id="freshness">等待状态</span><span>管理页不替代服务端后台</span></footer>
   </main>
 </div>

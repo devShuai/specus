@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -103,6 +105,12 @@ type egressRuntime struct {
 	send       egressSendFunc
 	sendCursor int
 
+	// Phase two: the names consumers bound to their fake addresses, how they are resolved, and
+	// which new flows are waiting on a lookup.
+	names     *egressNameTable
+	resolve   egressResolveFunc
+	resolving map[egressFlowKey]struct{}
+
 	closed bool
 }
 
@@ -122,6 +130,9 @@ func newEgressRuntime(logger *log.Logger, send egressSendFunc, dial egressDialFu
 		rejections: newEgressRejectionLog(),
 		dial:       dial,
 		send:       send,
+		names:      newEgressNameTable(),
+		resolve:    defaultEgressResolve,
+		resolving:  map[egressFlowKey]struct{}{},
 	}
 }
 
@@ -225,6 +236,14 @@ func (r *egressRuntime) handleControl(consumer int64, frame peerEgressFrame, now
 	if !ok {
 		return
 	}
+	if control.Type == peerEgressControlNameBind {
+		// Validated with the frame; the address parses and the name is well formed.
+		address, _ := parseEgressAddress(control.Address)
+		r.mu.Lock()
+		r.names.bind(consumer, address, normalizeEgressName(control.Name))
+		r.mu.Unlock()
+		return
+	}
 	// flow-reject travels egress to consumer. Receiving one means the peer is confused about
 	// which end it is, and acting on it would let a consumer close flows by assertion.
 	if control.Type != peerEgressControlFlowPurge {
@@ -285,8 +304,18 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 // charged for the whole attempt, not only after it succeeds; a consumer opening a thousand flows to
 // a black hole would otherwise pass every limit check.
 func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSegment, now time.Time) {
+	destination, code, proceed := r.resolveDestination(consumer, key)
+	if !proceed {
+		// A retransmitted SYN while the name is still resolving; the first one is opening the flow.
+		return
+	}
+	if code != "" {
+		r.refuse(consumer, key, code, now)
+		r.emitSegment(consumer, buildTCPReset(syn))
+		return
+	}
 	r.mu.Lock()
-	flow, code, opened := r.reserve(consumer, key, now)
+	flow, code, opened := r.reserveTo(consumer, key, destination, now)
 	if code != egressCodeAllowed {
 		r.mu.Unlock()
 		r.refuse(consumer, key, code, now)
@@ -301,7 +330,7 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		r.mu.Unlock()
 		return
 	}
-	address := net.JoinHostPort(formatEgressAddress(key.remoteIP), strconv.Itoa(int(key.remotePort)))
+	address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 	dial, mtu := r.dial, r.pathMTU
 	r.mu.Unlock()
 
@@ -424,6 +453,15 @@ func (r *egressRuntime) applyTCPOutput(consumer int64, flow *egressFlow, handle 
 	}
 	if output.Done || output.Reset {
 		r.release(flow)
+		return
+	}
+	if handle.conn.state == tcpStateTimeWait && !flow.Lingering {
+		// Both directions are finished: the socket goes now, and the entry stays only to answer a
+		// retransmitted FIN, outside the limits.
+		if handle.socket != nil {
+			_ = handle.socket.Close()
+		}
+		r.flows.linger(flow)
 	}
 }
 
@@ -441,7 +479,17 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 	r.mu.Lock()
 	flow, known := r.flows.lookup(key)
 	if !known {
-		reserved, code, opened := r.reserve(consumer, key, now)
+		r.mu.Unlock()
+		destination, code, proceed := r.resolveDestination(consumer, key)
+		if !proceed {
+			return
+		}
+		if code != "" {
+			r.refuse(consumer, key, code, now)
+			return
+		}
+		r.mu.Lock()
+		reserved, code, opened := r.reserveTo(consumer, key, destination, now)
 		if code != egressCodeAllowed {
 			r.mu.Unlock()
 			r.refuse(consumer, key, code, now)
@@ -453,7 +501,7 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 			r.mu.Unlock()
 			return
 		}
-		address := net.JoinHostPort(formatEgressAddress(key.remoteIP), strconv.Itoa(int(key.remotePort)))
+		address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 		dial := r.dial
 		r.mu.Unlock()
 
@@ -593,8 +641,24 @@ func (r *egressRuntime) flowSnapshot() []*egressFlow {
 // same four-tuple arriving while the first is still connecting finds the reservation already there,
 // and must not dial again.
 func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time) (*egressFlow, string, bool) {
+	return r.reserveTo(consumer, key, key.remoteIP, now)
+}
+
+// reserveTo is reserve for a flow whose socket goes to destination, which differs from the key's
+// remote address only for a flow to a name: the key keeps the consumer's fake address, so replies
+// come back from it, and the authorization is of the address actually dialled.
+func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination uint32, now time.Time) (*egressFlow, string, bool) {
+	if code := r.authorizeTo(consumer, key, destination); code != egressCodeAllowed {
+		return nil, code, false
+	}
+	flow, opened := r.flows.open(key, consumer, now)
+	return flow, egressCodeAllowed, opened
+}
+
+// authorizeTo runs the judgment layer for a flow dialled to destination. Called with the lock held.
+func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destination uint32) string {
 	if r.closed || !r.enabled {
-		return nil, egressCodeDisabled, false
+		return egressCodeDisabled
 	}
 	peerAllowed := true
 	if r.peerACLAllows != nil {
@@ -603,7 +667,7 @@ func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time
 	forConsumer, total := r.flows.counts(consumer)
 	decision := authorizeEgressFlow(egressRequest{
 		ConsumerClientID:       consumer,
-		DestinationIP:          formatEgressAddress(key.remoteIP),
+		DestinationIP:          formatEgressAddress(destination),
 		DestinationPort:        int(key.remotePort),
 		Protocol:               key.protocolName(),
 		ActiveFlowsForConsumer: forConsumer,
@@ -611,10 +675,52 @@ func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time
 		LocalInterfaceCIDRs:    r.localInterfaceCIDRs(),
 	}, r.policy, peerAllowed, r.context)
 	if !decision.Allowed {
-		return nil, decision.Code, false
+		return decision.Code
 	}
-	flow, opened := r.flows.open(key, consumer, now)
-	return flow, egressCodeAllowed, opened
+	return egressCodeAllowed
+}
+
+// resolveDestination decides where a new flow's socket goes. Most flows go where the packet says.
+// A flow to an address the consumer bound to a name goes to the first address the name resolves
+// to that the policy allows: resolving here and dialling that address, with no second lookup,
+// leaves no window between the check and the connect. Called with no lock held; the lookup can take
+// as long as egressNameResolveTimeout.
+//
+// proceed is false for a second packet of a flow whose name is still resolving: the first one is
+// opening it. A non-empty code refuses the flow.
+func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (destination uint32, code string, proceed bool) {
+	r.mu.Lock()
+	name, bound := r.names.lookup(consumer, key.remoteIP)
+	if !bound {
+		r.mu.Unlock()
+		return key.remoteIP, "", true
+	}
+	if _, busy := r.resolving[key]; busy {
+		r.mu.Unlock()
+		return 0, "", false
+	}
+	r.resolving[key] = struct{}{}
+	resolve := r.resolve
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.resolving, key)
+		r.mu.Unlock()
+	}()
+
+	addresses, err := resolve(name)
+	if err != nil {
+		addresses = nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	chosen, decision := chooseEgressAddress(addresses, func(address uint32) string {
+		return r.authorizeTo(consumer, key, address)
+	})
+	if decision != egressCodeAllowed {
+		return 0, decision, true
+	}
+	return chosen, "", true
 }
 
 // refuse records a refusal and tells the consumer why. Called with no lock held.
@@ -627,13 +733,14 @@ func (r *egressRuntime) refuse(consumer int64, key egressFlowKey, code string, n
 	logger := r.logger
 	r.mu.Unlock()
 
+	// Who and why, never where: a line per refused destination would be the consumer's browsing
+	// history kept in this device's log. The consumer is told the destination in the control message.
 	if write && logger != nil {
 		if suppressed > 0 {
-			logger.Printf("[peer-egress] refused consumer=%d protocol=%s destination=%s:%d code=%s suppressed=%d",
-				consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, code, suppressed)
+			logger.Printf("[peer-egress] refused consumer=%d protocol=%s code=%s suppressed=%d",
+				consumer, key.protocolName(), code, suppressed)
 		} else {
-			logger.Printf("[peer-egress] refused consumer=%d protocol=%s destination=%s:%d code=%s",
-				consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, code)
+			logger.Printf("[peer-egress] refused consumer=%d protocol=%s code=%s", consumer, key.protocolName(), code)
 		}
 	}
 	body, err := encodePeerEgressControl(peerEgressControl{
@@ -663,9 +770,39 @@ func (r *egressRuntime) unreachable(consumer int64, key egressFlowKey, cause err
 	logger := r.logger
 	r.mu.Unlock()
 	if logger != nil {
-		logger.Printf("[peer-egress] connect failed consumer=%d protocol=%s destination=%s:%d err=%v",
-			consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, cause)
+		logger.Printf("[peer-egress] connect failed consumer=%d protocol=%s reason=%s",
+			consumer, key.protocolName(), egressConnectReason(cause))
 	}
+}
+
+// egressConnectReason names why a dial failed without the addresses the error text carries, so the
+// log keeps no record of where consumers were going. The same words in every runtime.
+func egressConnectReason(err error) string {
+	var timeout interface{ Timeout() bool }
+	switch {
+	case err == nil:
+		return "no socket"
+	case errors.Is(err, errEgressNoPhysicalRoute):
+		return "no route outside the tunnel"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "unreachable"
+	case errors.As(err, &timeout) && timeout.Timeout():
+		return "timed out"
+	}
+	// Windows reports these under its own error numbers. The innermost error's text names the
+	// cause and, unlike the dial error around it, no address.
+	var dial *net.OpError
+	if errors.As(err, &dial) && dial.Err != nil {
+		switch text := strings.ToLower(dial.Err.Error()); {
+		case strings.Contains(text, "refused"):
+			return "refused"
+		case strings.Contains(text, "unreachable"):
+			return "unreachable"
+		}
+	}
+	return "error"
 }
 
 // release closes one flow's socket and drops its table entry. Called with the lock held.

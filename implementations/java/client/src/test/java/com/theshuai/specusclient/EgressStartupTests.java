@@ -124,9 +124,9 @@ class EgressStartupTests {
         assertThat(capabilities.path("egressCapable").asBoolean()).isTrue();
         assertThat(capabilities.path("consumerCapable").asBoolean())
                 .isEqualTo(PeerEgressRouteCommanders.takeoverSupported());
-        // Phase one carries address targets only.
+        // The egress honours name-bind; IPv6 targets are not claimed.
         assertThat(capabilities.path("domainTargetCapable").isBoolean()).isTrue();
-        assertThat(capabilities.path("domainTargetCapable").asBoolean()).isFalse();
+        assertThat(capabilities.path("domainTargetCapable").asBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").isBoolean()).isTrue();
         assertThat(capabilities.path("ipv6TargetCapable").asBoolean()).isFalse();
     }

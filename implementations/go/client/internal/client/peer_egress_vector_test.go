@@ -56,6 +56,8 @@ type egressFrameVector struct {
 			DestinationIP   string   `json:"destinationIp"`
 			DestinationPort int      `json:"destinationPort"`
 			Destinations    []string `json:"destinations"`
+			Address         string   `json:"address"`
+			Name            string   `json:"name"`
 			Code            string   `json:"code"`
 		} `json:"controlJson"`
 		ControlCanonicalUTF8Hex string `json:"controlCanonicalUtf8Hex"`
@@ -268,6 +270,8 @@ func TestEgressControlEncodingMatchesSharedVector(t *testing.T) {
 			DestinationPort: testCase.ControlJSON.DestinationPort,
 			Destinations:    testCase.ControlJSON.Destinations,
 			Code:            testCase.ControlJSON.Code,
+			Address:         testCase.ControlJSON.Address,
+			Name:            testCase.ControlJSON.Name,
 		}
 		body, err := encodePeerEgressControl(control)
 		if err != nil {

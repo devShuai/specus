@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json.Nodes;
 using Specus.Client.Configuration;
 using Specus.Protocol.PeerEgress;
 
@@ -159,92 +160,139 @@ internal static class EgressEdit
         return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", lines));
     }
 
+    /// <summary>One edit to the rules or the switch, as the commands and the local page ask for it.</summary>
+    internal sealed record Change(string Op, string Match = "", string Action = "", long EgressClientId = 0,
+        int At = -1, int Index = -1, int To = -1, bool Disabled = false, bool Enabled = false, bool Confirmed = false);
+
+    /// <summary>
+    /// What a change writes: one top-level value, already encoded, and what to say before the save.
+    /// Unchanged means the file already says what was asked; NeedsConfirmation means takeover was asked
+    /// for without the notice being accepted.
+    /// </summary>
+    internal sealed record Planned(string? Key, string? Value, IReadOnlyList<string> Preface, bool Unchanged = false,
+        bool NeedsConfirmation = false);
+
+    /// <summary>A change that cannot be made, with a message a person can act on.</summary>
+    internal sealed class PlanFailure(string message) : Exception(message);
+
+    /// <summary>Works out a change against the configuration as loaded, the same way in every runtime.</summary>
+    internal static Planned Plan(SpecusClientConfig config, Change change)
+    {
+        var rules = config.PeerEgressRules.ToList();
+        var count = rules.Count;
+        switch (change.Op)
+        {
+            case "takeover":
+            {
+                if (change.Enabled == config.PeerEgressEnabled) return new Planned(null, null, [], Unchanged: true);
+                if (!change.Enabled) return new Planned("peerEgressEnabled", "false", []);
+                var preface = new List<string>(EnableNotice);
+                if (!change.Confirmed) return new Planned(null, null, preface, NeedsConfirmation: true);
+                var device = config.PeerMeshDevice.Trim();
+                if (device.Length == 0 || device.Equals("noop", StringComparison.OrdinalIgnoreCase))
+                    preface.Add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
+                return new Planned("peerEgressEnabled", "true", preface);
+            }
+            case "add":
+            {
+                var rule = new PeerEgressRule
+                {
+                    Match = change.Match.Trim(),
+                    Action = change.Action.Trim(),
+                    EgressClientId = change.EgressClientId != 0 ? change.EgressClientId : null,
+                };
+                // Refused rules are allowed in the file, where they are warned about, but an edit that
+                // adds one on request would only be writing a rule that steers nothing.
+                if (RuleCode(rule) is { } code) throw new PlanFailure($"Rule not added: {code} ({Explanation(code)})");
+                if (change.Disabled) rule = rule with { Enabled = false };
+                var at = count;
+                if (change.At >= 0)
+                {
+                    if (change.At > count) throw new PlanFailure($"--at {change.At} is past the end; there are {count} rule(s).");
+                    at = change.At;
+                }
+                rules.Insert(at, rule);
+                break;
+            }
+            case "remove" or "move" or "enable" or "disable":
+                RequireIndex(change.Index, count);
+                switch (change.Op)
+                {
+                    case "remove":
+                        rules.RemoveAt(change.Index);
+                        break;
+                    case "move":
+                        RequireIndex(change.To, count);
+                        var moved = rules[change.Index];
+                        rules.RemoveAt(change.Index);
+                        rules.Insert(change.To, moved);
+                        break;
+                    case "enable":
+                        rules[change.Index] = rules[change.Index] with { Enabled = null };
+                        break;
+                    default:
+                        rules[change.Index] = rules[change.Index] with { Enabled = false };
+                        break;
+                }
+                break;
+            default:
+                throw new PlanFailure("unknown egress change: " + change.Op);
+        }
+        return new Planned("peerEgressRules", EncodeRules(rules), []);
+    }
+
+    private static void RequireIndex(int index, int count)
+    {
+        if (index < 0 || index >= count)
+            throw new PlanFailure($"No rule at index {index}; there are {count} rule(s). List them with egress rules.");
+    }
+
+    /// <summary>The change an editing command asks for.</summary>
+    private static Change ChangeFrom(ClientCliOptions options)
+    {
+        var egress = options.Egress;
+        var takeover = options.Command is "egress enable" or "egress disable";
+        return new Change(takeover ? "takeover" : options.Command["egress rule ".Length..], egress.Match, egress.Action,
+            egress.EgressClientId, egress.At, egress.Index, egress.To, egress.Disabled,
+            options.Command == "egress enable", egress.Yes);
+    }
+
     private static int EditRule(ClientCliOptions options, string path)
     {
         var loaded = Load(options, path);
-        var egress = options.Egress;
-        var rules = loaded.Config.PeerEgressRules.ToList();
-        var count = rules.Count;
-        if (options.Command == "egress rule add")
+        Planned planned;
+        try
         {
-            var rule = new PeerEgressRule
-            {
-                Match = egress.Match.Trim(),
-                Action = egress.Action.Trim(),
-                EgressClientId = egress.EgressClientId != 0 ? egress.EgressClientId : null,
-            };
-            // Refused rules are allowed in the file, where they are warned about, but a command that
-            // adds one on request would only be writing a rule that steers nothing.
-            if (RuleCode(rule) is { } code) throw Fail(options, $"Rule not added: {code} ({Explanation(code)})");
-            if (egress.Disabled) rule = rule with { Enabled = false };
-            var at = count;
-            if (egress.At >= 0)
-            {
-                if (egress.At > count) throw Fail(options, $"--at {egress.At} is past the end; there are {count} rule(s).");
-                at = egress.At;
-            }
-            rules.Insert(at, rule);
+            planned = Plan(loaded.Config, ChangeFrom(options));
         }
-        else
+        catch (PlanFailure failure)
         {
-            RequireIndex(options, egress.Index, count);
-            switch (options.Command)
-            {
-                case "egress rule remove":
-                    rules.RemoveAt(egress.Index);
-                    break;
-                case "egress rule move":
-                    RequireIndex(options, egress.To, count);
-                    var moved = rules[egress.Index];
-                    rules.RemoveAt(egress.Index);
-                    rules.Insert(egress.To, moved);
-                    break;
-                case "egress rule enable":
-                    rules[egress.Index] = rules[egress.Index] with { Enabled = null };
-                    break;
-                default:
-                    rules[egress.Index] = rules[egress.Index] with { Enabled = false };
-                    break;
-            }
+            throw Fail(options, failure.Message);
         }
-        return Write(options, path, loaded, "peerEgressRules", EncodeRules(rules), []);
-    }
-
-    private static void RequireIndex(ClientCliOptions options, int index, int count)
-    {
-        if (index < 0 || index >= count)
-            throw Fail(options, $"No rule at index {index}; there are {count} rule(s). List them with egress rules.");
+        return Write(options, path, loaded, planned.Key!, planned.Value!, planned.Preface);
     }
 
     private static int Toggle(ClientCliOptions options, string path)
     {
         var loaded = Load(options, path);
         var config = loaded.Config;
-        var turningOn = options.Command == "egress enable";
-        if (turningOn == config.PeerEgressEnabled)
+        var planned = Plan(config, ChangeFrom(options));
+        if (planned.Unchanged)
         {
             var lines = new List<string>();
             var data = Listing(path, config, lines);
             return CliOutput.Result(options.Json, options.Command, 0, data,
-                $"Takeover is already {(turningOn ? "on" : "off")}; nothing was changed.\n" + string.Join("\n", lines));
+                $"Takeover is already {(config.PeerEgressEnabled ? "on" : "off")}; nothing was changed.\n" + string.Join("\n", lines));
         }
-        var preface = new List<string>();
-        if (turningOn)
-        {
-            preface.AddRange(EnableNotice);
-            // Confirmed by a flag rather than a prompt: whether a prompt could be answered depends on
-            // a terminal the three runtimes cannot all detect the same way, and a command that waits
-            // in one of them and fails in another is not the same command.
-            if (!options.Egress.Yes)
-                throw Fail(options, string.Join("\n", EnableNotice) + "\nNot changed. Re-run with --yes to confirm.");
-            var device = config.PeerMeshDevice.Trim();
-            if (device.Length == 0 || device.Equals("noop", StringComparison.OrdinalIgnoreCase))
-                preface.Add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
-        }
-        return Write(options, path, loaded, "peerEgressEnabled", turningOn ? "true" : "false", preface);
+        // Confirmed by a flag rather than a prompt: whether a prompt could be answered depends on a
+        // terminal the three runtimes cannot all detect the same way, and a command that waits in one of
+        // them and fails in another is not the same command.
+        if (planned.NeedsConfirmation)
+            throw Fail(options, string.Join("\n", planned.Preface) + "\nNot changed. Re-run with --yes to confirm.");
+        return Write(options, path, loaded, planned.Key!, planned.Value!, planned.Preface);
     }
 
-    private static int Write(ClientCliOptions options, string path, Loaded loaded, string key, string value, List<string> preface)
+    private static int Write(ClientCliOptions options, string path, Loaded loaded, string key, string value, IReadOnlyList<string> preface)
     {
         byte[] patched;
         try
@@ -284,18 +332,63 @@ internal static class EgressEdit
         return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", message));
     }
 
+    /// <summary>Why an address cannot be previewed, or null when it can.</summary>
+    internal static string? AddressProblem(string address)
+    {
+        if (Ipv4Cidr.TryParseAddress(address, out _) && !address.Contains('/')) return null;
+        return LooksLikeDomain(address) && !address.Contains(':')
+            ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
+            : "ADDRESS must be an IPv4 address.";
+    }
+
     private static int Test(ClientCliOptions options, string path)
     {
         var address = options.Egress.Address.Trim();
-        if (!Ipv4Cidr.TryParseAddress(address, out _) || address.Contains('/'))
-        {
-            var domain = LooksLikeDomain(address) && !address.Contains(':');
-            throw Fail(options, domain
-                ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-                : "ADDRESS must be an IPv4 address.");
-        }
+        if (AddressProblem(address) is { } problem) throw Fail(options, problem);
         var loaded = Load(options, path);
-        var config = loaded.Config;
+        var lines = new List<string>();
+        var data = Preview(path, loaded.Config, address, lines);
+        var code = 0;
+        var port = options.Egress.Connect;
+        if (port > 0)
+        {
+            var target = $"{address}:{port}";
+            var watch = Stopwatch.StartNew();
+            var probe = new Dictionary<string, object?> { ["port"] = port };
+            try
+            {
+                using var client = new TcpClient();
+                if (!client.ConnectAsync(address, port).Wait(TimeSpan.FromSeconds(5)))
+                    throw new TimeoutException("timed out after 5 s");
+                var elapsed = watch.ElapsedMilliseconds;
+                probe["ok"] = true;
+                probe["millis"] = elapsed;
+                lines.Add($"Connection test to {target}: connected in {elapsed} ms. This shows the address is reachable, not which path carried it.");
+            }
+            catch (Exception error)
+            {
+                var reason = error is AggregateException aggregate && aggregate.InnerException is { } inner ? inner.Message : error.Message;
+                probe["ok"] = false;
+                probe["millis"] = watch.ElapsedMilliseconds;
+                probe["error"] = reason;
+                lines.Add($"Connection test to {target}: failed ({reason})");
+                code = 4;
+            }
+            data["connect"] = probe;
+        }
+        var last = lines[^1];
+        if (code != 0 && options.Json) return CliOutput.Result(true, options.Command, code, data, last);
+        if (code != 0)
+        {
+            Console.WriteLine(string.Join("\n", lines.Take(lines.Count - 1)));
+            return CliOutput.Result(false, options.Command, code, null, last);
+        }
+        return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", lines));
+    }
+
+    /// <summary>What the configured rules decide for one IPv4 address, and what takeover being on would change.</summary>
+    private static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines)
+    {
         var rules = config.PeerEgressRules;
         var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr);
         var matched = match.Matched ? match.MatchedRuleIndex : -1;
@@ -304,11 +397,8 @@ internal static class EgressEdit
         {
             ["configPath"] = path, ["address"] = address, ["takeover"] = takeover, ["matchedRuleIndex"] = matched,
         };
-        var lines = new List<string>
-        {
-            $"Preview for {address} from the configuration (no connection is made; --connect PORT tests one)",
-            takeover ? "  takeover: on" : "  takeover: off",
-        };
+        lines.Add($"Preview for {address} from the configuration (no connection is made; --connect PORT tests one)");
+        lines.Add(takeover ? "  takeover: on" : "  takeover: off");
         var would = "stays local (direct)";
         var result = "direct";
         if (matched < 0)
@@ -346,42 +436,96 @@ internal static class EgressEdit
             data["result"] = "direct";
             data["resultWithTakeover"] = result;
         }
-        var code = 0;
-        var port = options.Egress.Connect;
-        if (port > 0)
+        return data;
+    }
+
+    // The local page's egress editor: the same changes through Plan, written the same way, with the
+    // revision the page was showing checked first so an edit is never applied to a file that moved.
+    // The Go and Java management pages serve the same routes with the same answers.
+
+    private static Loaded UiLoad(string path)
+    {
+        var snapshot = UiConfig.Read(path);
+        if (snapshot.Revision == "missing") throw new LocalUi.Failure(422, "配置文件不存在；请先在「连接设置」保存配置");
+        try
         {
-            var target = $"{address}:{port}";
-            var watch = Stopwatch.StartNew();
-            var probe = new Dictionary<string, object?> { ["port"] = port };
-            try
-            {
-                using var client = new TcpClient();
-                if (!client.ConnectAsync(address, port).Wait(TimeSpan.FromSeconds(5)))
-                    throw new TimeoutException("timed out after 5 s");
-                var elapsed = watch.ElapsedMilliseconds;
-                probe["ok"] = true;
-                probe["millis"] = elapsed;
-                lines.Add($"Connection test to {target}: connected in {elapsed} ms. This shows the address is reachable, not which path carried it.");
-            }
-            catch (Exception error)
-            {
-                var reason = error is AggregateException aggregate && aggregate.InnerException is { } inner ? inner.Message : error.Message;
-                probe["ok"] = false;
-                probe["millis"] = watch.ElapsedMilliseconds;
-                probe["error"] = reason;
-                lines.Add($"Connection test to {target}: failed ({reason})");
-                code = 4;
-            }
-            data["connect"] = probe;
+            return new Loaded(snapshot, SpecusClientConfigLoader.Parse(new UTF8Encoding(false, true).GetString(snapshot.Bytes), path, _ => { }));
         }
-        var last = lines[^1];
-        if (code != 0 && options.Json) return CliOutput.Result(true, options.Command, code, data, last);
-        if (code != 0)
+        catch (Exception error)
         {
-            Console.WriteLine(string.Join("\n", lines.Take(lines.Count - 1)));
-            return CliOutput.Result(false, options.Command, code, null, last);
+            throw new LocalUi.Failure(422, $"配置无法加载（{error.Message}）；请先修正后再编辑出口规则");
         }
-        return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", lines));
+    }
+
+    internal static Dictionary<string, object?> UiRules(string path)
+    {
+        var loaded = UiLoad(path);
+        var data = Listing(path, loaded.Config, []);
+        data["schemaVersion"] = 1;
+        data["revision"] = loaded.Snapshot.Revision;
+        return data;
+    }
+
+    private static int UiIndex(JsonObject body, string field) =>
+        body[field] is JsonValue value && value.TryGetValue<int>(out var index) ? index : -1;
+
+    private static T UiValue<T>(JsonObject body, string field, T fallback) =>
+        body[field] is JsonValue value && value.TryGetValue<T>(out var result) ? result : fallback;
+
+    internal static Dictionary<string, object?> UiChange(string path, JsonObject body)
+    {
+        var loaded = UiLoad(path);
+        UiConfig.CheckRevision(loaded.Snapshot, UiValue(body, "revision", ""));
+        Planned planned;
+        try
+        {
+            planned = Plan(loaded.Config, new Change(UiValue(body, "op", ""), UiValue(body, "match", ""),
+                UiValue(body, "action", ""), UiValue(body, "egressClientId", 0L), UiIndex(body, "at"),
+                UiIndex(body, "index"), UiIndex(body, "to"), UiValue(body, "disabled", false),
+                UiValue(body, "enabled", false), UiValue(body, "confirmed", false)));
+        }
+        catch (PlanFailure failure)
+        {
+            throw new LocalUi.Failure(422, failure.Message);
+        }
+        if (planned.NeedsConfirmation) throw new LocalUi.Failure(422, "开启接管前需要确认其影响；未做任何修改");
+        Dictionary<string, object?> data;
+        if (planned.Unchanged)
+        {
+            data = Listing(path, loaded.Config, []);
+            data["schemaVersion"] = 1;
+            data["revision"] = loaded.Snapshot.Revision;
+            data["saved"] = false;
+            return data;
+        }
+        var patched = Patch(loaded.Snapshot.Bytes, planned.Key!, planned.Value!);
+        SpecusClientConfig edited;
+        try
+        {
+            edited = SpecusClientConfigLoader.Parse(new UTF8Encoding(false, true).GetString(patched), path, _ => { });
+        }
+        catch (Exception error)
+        {
+            throw new LocalUi.Failure(422, $"修改后的配置无法加载（{error.Message}）；未写入");
+        }
+        UiConfig.Save(path, loaded.Snapshot.Revision, patched);
+        data = Listing(path, edited, []);
+        data["schemaVersion"] = 1;
+        data["revision"] = UiConfig.Read(path).Revision;
+        data["saved"] = true;
+        // Only what the page does not already say itself: the notice is shown before it asks.
+        data["warnings"] = planned.Preface.Where(line => line.StartsWith("Warning: ", StringComparison.Ordinal)).ToList();
+        return data;
+    }
+
+    internal static Dictionary<string, object?> UiTest(string path, JsonObject body)
+    {
+        var address = UiValue(body, "address", "").Trim();
+        if (AddressProblem(address) is { } problem) throw new LocalUi.Failure(422, problem);
+        var loaded = UiLoad(path);
+        var data = Preview(path, loaded.Config, address, []);
+        data["schemaVersion"] = 1;
+        return data;
     }
 
     private static bool LooksLikeDomain(string value) =>
