@@ -318,7 +318,8 @@ class Matrix:
         assert ("Rule not added: EGRESS_RULE_FAKE_IP_OVERLAP (overlaps the fake-IP pool (peerEgressFakeIpCidr), "
                 "whose addresses only domain rules hand out)") in err, err
         listing = self.run(["egress", "rules"] + cfg)["data"]
-        assert [rule.get("kind") for rule in listing["rules"]] == ["domain"], listing
+        # Out of force only because peerEgressEnabled is off: as a domain rule it is valid now.
+        assert [rule.get("code") for rule in listing["rules"]] == ["EGRESS_CONSUMER_DISABLED"], listing
 
         out, _ = self.run_text(["egress", "dns", "status"] + cfg)
         assert "No running client for this config." in out.split("\n"), out
