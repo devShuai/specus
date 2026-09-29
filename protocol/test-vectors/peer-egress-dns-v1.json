@@ -800,5 +800,784 @@
       "address": null,
       "code": "EGRESS_NAME_UNRESOLVED"
     }
-  ]
+  ],
+  "phaseTwo": [
+    {
+      "name": "off-by-default",
+      "consumerEnabled": true,
+      "takeover": false,
+      "cidr": "198.18.0.0/15",
+      "active": false,
+      "code": null
+    },
+    {
+      "name": "on",
+      "consumerEnabled": true,
+      "takeover": true,
+      "cidr": "198.18.0.0/15",
+      "active": true,
+      "code": null
+    },
+    {
+      "name": "needs-phase-one",
+      "consumerEnabled": false,
+      "takeover": true,
+      "cidr": "198.18.0.0/15",
+      "active": false,
+      "code": null
+    },
+    {
+      "name": "unusable-pool-stops-phase-two",
+      "consumerEnabled": true,
+      "takeover": true,
+      "cidr": "198.18.0.0/25",
+      "active": false,
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "pool-over-the-mesh",
+      "consumerEnabled": true,
+      "takeover": true,
+      "cidr": "100.96.0.0/16",
+      "active": false,
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    }
+  ],
+  "ruleStatus": [
+    {
+      "name": "domain-to-online-capable",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": true,
+      "code": null
+    },
+    {
+      "name": "domain-to-online-incapable",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "suffix-to-online-incapable",
+      "rule": {
+        "match": "*.example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "domain-to-offline-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "egressOnline": false,
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "domain-block-with-incapable-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "block"
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "address-to-online-incapable",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "domain-without-phase-two",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "takeover": false,
+      "egressOnline": true,
+      "egressDomainTargetCapable": true,
+      "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED"
+    },
+    {
+      "name": "disabled-first",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2,
+        "enabled": false
+      },
+      "takeover": true,
+      "egressOnline": true,
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_DISABLED"
+    }
+  ],
+  "catalog": [
+    {
+      "name": "first",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":4,\"egresses\":[{\"clientId\":2,\"clientName\":\"office-gateway\",\"online\":true,\"scope\":\"PUBLIC\",\"protocols\":[\"tcp\"],\"domainTargetCapable\":true,\"ipv6TargetCapable\":false},{\"clientId\":3,\"clientName\":\"home-gateway\",\"online\":true,\"scope\":\"PUBLIC\",\"protocols\":[\"tcp\"],\"domainTargetCapable\":false,\"ipv6TargetCapable\":false}]}",
+      "accepted": true,
+      "domainTargetCapable": [
+        2
+      ]
+    },
+    {
+      "name": "same-revision-ignored",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":4,\"egresses\":[{\"clientId\":3,\"domainTargetCapable\":true}]}",
+      "accepted": false,
+      "domainTargetCapable": [
+        2
+      ]
+    },
+    {
+      "name": "older-revision-ignored",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":3,\"egresses\":[{\"clientId\":3,\"domainTargetCapable\":true}]}",
+      "accepted": false,
+      "domainTargetCapable": [
+        2
+      ]
+    },
+    {
+      "name": "newer-replaces-everything",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":5,\"egresses\":[{\"clientId\":3,\"domainTargetCapable\":true}]}",
+      "accepted": true,
+      "domainTargetCapable": [
+        3
+      ]
+    },
+    {
+      "name": "not-a-catalogue",
+      "json": "{\"type\":\"egress-config\",\"revision\":9,\"enabled\":false}",
+      "accepted": false,
+      "domainTargetCapable": [
+        3
+      ]
+    },
+    {
+      "name": "only-json-true-counts",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":6,\"egresses\":[{\"clientId\":2,\"domainTargetCapable\":\"true\"},{\"clientId\":3,\"domainTargetCapable\":1}],\"createdAtMillis\":1757000000000}",
+      "accepted": true,
+      "domainTargetCapable": []
+    },
+    {
+      "name": "absent-list-is-empty",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":7}",
+      "accepted": true,
+      "domainTargetCapable": []
+    },
+    {
+      "name": "revision-must-be-a-number",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":\"8\",\"egresses\":[{\"clientId\":2,\"domainTargetCapable\":true}]}",
+      "accepted": false,
+      "domainTargetCapable": []
+    },
+    {
+      "name": "list-must-be-a-list",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":8,\"egresses\":{\"clientId\":2,\"domainTargetCapable\":true}}",
+      "accepted": false,
+      "domainTargetCapable": []
+    },
+    {
+      "name": "new-session",
+      "newSession": true,
+      "domainTargetCapable": []
+    },
+    {
+      "name": "floor-reset-by-the-new-session",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":1,\"egresses\":[{\"clientId\":2,\"domainTargetCapable\":true}]}",
+      "accepted": true,
+      "domainTargetCapable": [
+        2
+      ]
+    },
+    {
+      "name": "entries-without-a-usable-id-skipped",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":2,\"egresses\":[{\"clientId\":0,\"domainTargetCapable\":true},{\"clientId\":-3,\"domainTargetCapable\":true},{\"clientId\":\"2\",\"domainTargetCapable\":true},{\"clientId\":true,\"domainTargetCapable\":true},\"gateway\",{\"clientId\":4,\"domainTargetCapable\":true}]}",
+      "accepted": true,
+      "domainTargetCapable": [
+        4
+      ]
+    },
+    {
+      "name": "not-json",
+      "json": "{\"type\":\"egress-catalog\",",
+      "accepted": false,
+      "domainTargetCapable": [
+        4
+      ]
+    }
+  ],
+  "steering": [
+    {
+      "name": "consumer-steering",
+      "cidr": "198.18.0.0/29",
+      "rules": [
+        {
+          "match": "example.com",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        {
+          "match": "*.example.com",
+          "action": "egress",
+          "egressClientId": 3
+        },
+        {
+          "match": "*.ads.example.com",
+          "action": "block"
+        },
+        {
+          "match": "direct.example.com",
+          "action": "direct"
+        },
+        {
+          "match": "203.0.113.0/24",
+          "action": "egress",
+          "egressClientId": 2
+        }
+      ],
+      "events": [
+        {
+          "at": 0,
+          "online": {
+            "2": true,
+            "3": true
+          },
+          "catalog": {
+            "2": true,
+            "3": false
+          }
+        },
+        {
+          "at": 1,
+          "map": "example.com"
+        },
+        {
+          "at": 2,
+          "map": "www.example.com"
+        },
+        {
+          "at": 3,
+          "map": "x.ads.example.com"
+        },
+        {
+          "at": 4,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 5,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 6,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "A"
+          }
+        },
+        {
+          "at": 7,
+          "packet": {
+            "protocol": "udp",
+            "sourcePort": 50000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443
+          }
+        },
+        {
+          "at": 8,
+          "packet": {
+            "protocol": "udp",
+            "sourcePort": 50000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443
+          }
+        },
+        {
+          "at": 9,
+          "reply": {
+            "protocol": "udp",
+            "sourcePort": 50000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443
+          }
+        },
+        {
+          "at": 10,
+          "packet": {
+            "protocol": "udp",
+            "sourcePort": 50000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443
+          }
+        },
+        {
+          "at": 11,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40001,
+            "destination": "198.18.0.3",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 12,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40002,
+            "destination": "198.18.0.4",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 13,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40003,
+            "destination": "198.18.0.5",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 14,
+          "packet": {
+            "protocol": "icmp",
+            "destination": "198.18.0.2"
+          }
+        },
+        {
+          "at": 15,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40004,
+            "destination": "203.0.113.10",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 16,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40005,
+            "destination": "192.0.2.1",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 17,
+          "catalog": {
+            "2": true,
+            "3": true
+          }
+        },
+        {
+          "at": 18,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40001,
+            "destination": "198.18.0.3",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 19,
+          "catalog": {
+            "2": false,
+            "3": true
+          }
+        },
+        {
+          "at": 20,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40000,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "A"
+          }
+        },
+        {
+          "at": 21,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40004,
+            "destination": "203.0.113.10",
+            "destinationPort": 443,
+            "flags": "A"
+          }
+        },
+        {
+          "at": 22,
+          "catalog": {
+            "2": true,
+            "3": true
+          }
+        },
+        {
+          "at": 23,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40006,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        },
+        {
+          "at": 24,
+          "rules": [
+            {
+              "match": "example.com",
+              "action": "block"
+            },
+            {
+              "match": "*.example.com",
+              "action": "egress",
+              "egressClientId": 3
+            },
+            {
+              "match": "*.ads.example.com",
+              "action": "block"
+            },
+            {
+              "match": "direct.example.com",
+              "action": "direct"
+            },
+            {
+              "match": "203.0.113.0/24",
+              "action": "egress",
+              "egressClientId": 2
+            }
+          ]
+        },
+        {
+          "at": 25,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40006,
+            "destination": "198.18.0.2",
+            "destinationPort": 443,
+            "flags": "A"
+          }
+        },
+        {
+          "at": 26,
+          "online": {
+            "3": false
+          }
+        },
+        {
+          "at": 27,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40001,
+            "destination": "198.18.0.3",
+            "destinationPort": 443,
+            "flags": "A"
+          }
+        },
+        {
+          "at": 28,
+          "rules": [
+            {
+              "match": "example.com",
+              "action": "block"
+            },
+            {
+              "match": "*.ads.example.com",
+              "action": "block"
+            },
+            {
+              "match": "direct.example.com",
+              "action": "direct"
+            },
+            {
+              "match": "203.0.113.0/24",
+              "action": "egress",
+              "egressClientId": 2
+            }
+          ]
+        },
+        {
+          "at": 29,
+          "packet": {
+            "protocol": "tcp",
+            "sourcePort": 40007,
+            "destination": "198.18.0.3",
+            "destinationPort": 443,
+            "flags": "S"
+          }
+        }
+      ],
+      "results": [
+        {
+          "purge": {}
+        },
+        {
+          "address": "198.18.0.2",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.3",
+          "evicted": []
+        },
+        {
+          "address": "198.18.0.4",
+          "evicted": []
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": {
+            "address": "198.18.0.2",
+            "name": "example.com"
+          }
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": {
+            "address": "198.18.0.2",
+            "name": "example.com"
+          }
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": null
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": {
+            "address": "198.18.0.2",
+            "name": "example.com"
+          }
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": {
+            "address": "198.18.0.2",
+            "name": "example.com"
+          }
+        },
+        {
+          "accepted": true
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": null
+        },
+        {
+          "outcome": "blocked",
+          "reason": "egress-no-domain",
+          "answered": true
+        },
+        {
+          "outcome": "blocked",
+          "reason": "rule",
+          "answered": false
+        },
+        {
+          "outcome": "blocked",
+          "reason": "fake-ip-unmapped",
+          "answered": true
+        },
+        {
+          "outcome": "blocked",
+          "reason": "unsupported-protocol",
+          "answered": false
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": null
+        },
+        {
+          "outcome": "not-mine"
+        },
+        {
+          "purge": {}
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 3,
+          "nameBind": {
+            "address": "198.18.0.3",
+            "name": "www.example.com"
+          }
+        },
+        {
+          "purge": {
+            "2": [
+              "198.18.0.2/32"
+            ]
+          }
+        },
+        {
+          "outcome": "blocked",
+          "reason": "egress-no-domain",
+          "answered": true
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": null
+        },
+        {
+          "purge": {}
+        },
+        {
+          "outcome": "forwarded",
+          "egressClientId": 2,
+          "nameBind": {
+            "address": "198.18.0.2",
+            "name": "example.com"
+          }
+        },
+        {
+          "purge": {
+            "2": [
+              "198.18.0.2/32"
+            ]
+          }
+        },
+        {
+          "outcome": "blocked",
+          "reason": "rule",
+          "answered": false
+        },
+        {
+          "purge": {
+            "3": [
+              "198.18.0.3/32"
+            ]
+          }
+        },
+        {
+          "outcome": "blocked",
+          "reason": "egress-unavailable",
+          "answered": true
+        },
+        {
+          "purge": {}
+        },
+        {
+          "outcome": "blocked",
+          "reason": "fake-ip-stale",
+          "answered": true
+        }
+      ]
+    }
+  ],
+  "nameBindClosesFlows": {
+    "events": [
+      {
+        "open": "early",
+        "consumer": 1,
+        "address": "198.18.0.5"
+      },
+      {
+        "open": "other-consumer",
+        "consumer": 7,
+        "address": "198.18.0.5"
+      },
+      {
+        "nameBind": "example.com",
+        "consumer": 1,
+        "address": "198.18.0.5"
+      },
+      {
+        "open": "bound",
+        "consumer": 1,
+        "address": "198.18.0.5"
+      },
+      {
+        "nameBind": "Example.COM.",
+        "consumer": 1,
+        "address": "198.18.0.5"
+      },
+      {
+        "nameBind": "www.example.com",
+        "consumer": 1,
+        "address": "198.18.0.5"
+      }
+    ],
+    "results": [
+      {
+        "name": null
+      },
+      {
+        "name": null
+      },
+      {
+        "closed": [
+          "early"
+        ]
+      },
+      {
+        "name": "example.com"
+      },
+      {
+        "closed": []
+      },
+      {
+        "closed": [
+          "bound"
+        ]
+      }
+    ]
+  }
 }

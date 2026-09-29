@@ -33,6 +33,11 @@
 
 池的校验见共享向量的 `poolConfig` 用例；与本机接口地址的重叠在启动时检查，不入向量。
 
+**二期何时运行**（向量 `phaseTwo`）：`peerEgressEnabled` 与 `peerEgressDnsTakeover` 都为 `true`，且池可用。
+池不可用只停二期：一期照常运行，规则按接管关闭来校验（域名规则报 `EGRESS_RULE_DOMAIN_UNSUPPORTED`），
+状态的 `dns` 一节写明 `EGRESS_FAKE_IP_POOL_INVALID`。二期运行时，池段作为一条 TUN 路由安装，
+`origin` 为 `fake-ip-pool`，与规则路由一样记录冲突、一样由安装器回滚。
+
 ### 域名规则的写法与校验
 
 | `match` 写法 | 含义 |
@@ -56,7 +61,8 @@
 - IP/CIDR 规则只看地址，域名规则只看 DNS 查询的名字，两者**不互相竞争**：池内地址不会命中 IP 规则（重叠已在校验时拒绝），
   池外地址不会命中域名规则。
 - 多条域名规则同时命中一个名字时：**精确匹配优先于后缀**；后缀之间标签更多者优先；再相同则靠前者优先。
-  被拒（不在生效中）的规则不参与，与一期一致。
+  被拒（不在生效中）的规则不参与，与一期一致。唯一的例外是 `EGRESS_RULE_EGRESS_NO_DOMAIN`（见「能力协商」）：
+  它是出口此刻的状况，不是规则写错了，所以这条规则照样认领它匹配的名字，名字不会因此落回本地解析。
 - 命中 `direct` 的名字**不接管**：查询原样转发给原上游，应用拿到真实地址，之后照常受 IP/CIDR 规则约束。
 - 命中 `egress` 或 `block` 的名字返回 fake-IP；之后到达该地址的流量按该规则处理：`egress` 发往出口，`block` 本地阻断。
 
@@ -89,6 +95,28 @@
 - **到达池内但没有映射的地址一律阻断**，计入 `blocked` 的 `fake-ip-unmapped`。这是 fake-IP 方案唯一真正的泄漏点：
   放行到出口或回退本地，都会让流量去向与规则不符。
 
+### 池内流量怎么走
+
+二期运行时，消费端对每个发往池内地址的包按下面的顺序决定（向量 `steering`）；池外地址仍按一期的地址规则。
+应答者地址的 53 端口归应答者处理（第四步），其余发往应答者地址、网络地址、广播地址的包都按「无映射」处理。
+
+1. 地址没有映射：阻断，`fake-ip-unmapped`。
+2. 有映射：先刷新这个映射的最近使用时间，再用映射的**名字**选域名规则（与应答时同一套选择）。
+   没有规则认领这个名字，或认领它的是 `direct`：阻断，`fake-ip-stale`。名字是在另一套规则下发出去的，
+   它的真实地址这里不知道，放行只能靠猜；阻断并应答，应用会重新查询，新查询按现在的规则走。
+3. 规则是 `block`：阻断，`rule`，与一期相同。
+4. 规则是 `egress`：协议不承载（如 ICMP）阻断，`unsupported-protocol`；出口不在线阻断，`egress-unavailable`；
+   出口在线却没有声明 `domainTargetCapable`，阻断，`egress-no-domain`。都通过则发往该出口。
+
+`fake-ip-unmapped`、`fake-ip-stale`、`egress-unavailable`、`egress-no-domain` 四种阻断都**应答**应用，
+方式与一期的 `egress-unavailable` 相同（TCP 回 RST，UDP 回 ICMP 不可达，见失败向量）：应用立刻失败并重试，
+而不是等到自己超时。`rule` 与 `unsupported-protocol` 与一期一样静默丢弃。
+
+发往池内地址的流也登记进消费端流表（键里是 fake-IP），回程包的源地址是同一个 fake-IP，照常按流表放行。
+规则变更、出口离线、目录里出口的能力变化时，已建的 fake-IP 流用同一套判定重算（**不刷新**映射：规则变了不是流量）；
+不再发往原出口的流立即断开，向原出口发送 `flow-purge`，目标写 `<fake-IP>/32`。出口的流键保留的就是 fake-IP，
+所以按这个目标能关到对应连接。
+
 共享向量 `peer-egress-dns-v1.json` 的 `pool` 用例给出一串带时间的查询与流量事件，以及每一步应得的映射，
 三端逐步比对。
 
@@ -102,11 +130,17 @@
 {"type":"name-bind","address":"198.18.0.5","name":"example.com"}
 ```
 
-- 消费端在向某个出口发出**发往 fake-IP 的新流**的第一个包之前，发送该地址的 `name-bind`；同一流的后续包不再发送。
-  控制消息不可靠，所以不只发一次：之后每个发往该地址的新流都先发一次。
+- 消费端在向出口发出发往 fake-IP 的包之前，满足下面任一条时先发送该地址的 `name-bind`（向量 `steering`）：
+  这个包在流表里登记了一条新流；它是 TCP 的 SYN（不带 ACK），**包括重传的 SYN**；它属于一条还没收到过出口回包的 UDP 流。
+  其他包不再发送。控制消息不可靠，所以不只发一次：TCP 靠应用自己重传的 SYN 补发，UDP 没有重传，
+  就在出口回话之前每个数据报都带一条。
 - 出口按 `(消费端, address)` 登记，登记本身按最近使用保留、上限与流表同级，不另设 TTL。
 - 出口收到发往某地址的新流、但该 `(消费端, address)` 没有登记时，按一期的地址流处理（通常因目标不可达而失败）；
-  不得猜测名字。消费端会在重传前再发 `name-bind`，所以控制消息的丢失只让建流慢一个重传周期。
+  不得猜测名字。
+- 出口收到 `name-bind` 时，关闭该消费端发往这个地址、却不是按这个名字建立的全部流（向量 `nameBindClosesFlows`），
+  关闭方式与撤销授权相同。名字到达之前建立的流连向的是 fake-IP 本身，永远不会通，而新到的 SYN 重传或数据报
+  又会被当成这条流的后续包；关掉它，下一个包才会按名字重新建流。控制消息的丢失因此只让建流慢一个重传周期。
+  同一名字重复绑定不关任何流；地址改绑到另一个名字时，旧名字的流一并关闭。
 
 ### 出口：先解析，再授权，最后用已授权的地址连接
 
@@ -128,10 +162,26 @@
 
 ### 能力协商
 
-出口的能力上报把 `domainTargetCapable` 置为 `true`（只在它实现了本节时）。消费端只对声明了该能力的出口使用域名规则：
+出口的能力上报把 `domainTargetCapable` 置为 `true`（只在它实现了本节时）。服务端把它转进 `egress-catalog`
+（[peer-egress.md](peer-egress.md#egress-catalog)），消费端从目录里读。消费端只对声明了该能力的出口使用域名规则：
 指向不支持的出口的域名规则不在生效中，报 `EGRESS_RULE_EGRESS_NO_DOMAIN`，不降级为本地解析。
 共享向量的 `egressCapability` 用例给出规则与出口能力的组合，`nameBindAtEgress` 给出出口对 `name-bind` 的答复，
 `egressChoice` 给出解析结果与逐地址授权下应拨的地址。
+
+**消费端读目录**（向量 `catalog`）：只读每个出口的 `domainTargetCapable`，别的字段目前不影响行为。
+`revision` 与 `egress-config` 同规则：同一控制 session 内单调递增，小于或等于上次接受值的忽略，新 session 重新计。
+`type` 不是 `egress-catalog`、`revision` 不是正整数、`egresses` 存在却不是数组的消息整条拒收，已知的能力不变。
+`egresses` 缺失按空数组处理。接受的目录**整体替换**已知能力：没列出的出口视为不能解析域名。
+`clientId` 不是正整数的条目跳过；`domainTargetCapable` 只有 JSON `true` 算数，字符串 `"true"`、数字 `1` 都是否。
+不认识的键忽略。新 session 只重置 `revision` 的下限，已知能力保留到下一份目录替换它。
+
+**只对在线的出口判能力**（向量 `ruleStatus`）：服务端对不在线的出口一律写 `false`，这时规则是对的、在等出口，
+状态里仍算生效，流量按一期计 `egress-unavailable`；出口在线而目录说它不能解析域名，才报 `EGRESS_RULE_EGRESS_NO_DOMAIN`。
+出口刚上线、新目录还没到的那一小段时间里，规则会短暂显示 `EGRESS_RULE_EGRESS_NO_DOMAIN`、流量计 `egress-no-domain`，
+目录一到即恢复。
+
+`EGRESS_RULE_EGRESS_NO_DOMAIN` 的规则不贡献状态里的 `peers` 条目，与其他被拒的规则一致；
+但它仍认领匹配的名字（见「规则裁决」），落到它名下的流量阻断并计 `egress-no-domain`。
 
 ## 六、系统 DNS 接管
 
@@ -170,11 +220,16 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 ```json
 {"takeover": true, "listen": "198.18.0.1", "pool": "198.18.0.0/15", "mappings": 42,
- "quarantined": 0, "upstreams": ["192.0.2.53"], "journal": "committed",
- "blocked": {"fake-ip-unmapped": 0}}
+ "quarantined": 0, "upstreams": ["192.0.2.53"], "journal": "committed"}
 ```
 
-规则条目增加 `kind`：`"cidr"` 或 `"domain"`。
+- 开了 `peerEgressDnsTakeover` 这一节才出现。`takeover` 是二期此刻是否在运行；池不可用时为 `false`，
+  并带 `"code": "EGRESS_FAKE_IP_POOL_INVALID"`。
+- `mappings` 是存活的映射数，`quarantined` 是还在隔离期的地址数，都在取快照时按当时的时间现算。
+- `listen`、`upstreams` 由第四步填，`journal` 由第五步填；还没交付的字段不输出。
+- 与 fake-IP 有关的阻断计入 `consumer.blocked`，不在这里另记一份：`fake-ip-unmapped`、`fake-ip-stale`、`egress-no-domain`。
+
+规则条目增加 `kind`：`"cidr"` 或 `"domain"`。二期运行时，池段那条路由出现在 `consumer.routes` 里，`origin` 为 `fake-ip-pool`。
 
 ## 八、实现分期
 
@@ -182,9 +237,13 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 2. 出口侧：`name-bind` 登记、解析、逐地址授权、能力上报。三端，已交付。
    IPv6 目标连接暂不交付：出站 socket 绑定物理网卡的实现只有 IPv4，三端都不声明 `ipv6TargetCapable`，
    解析只取 A 记录；按上文规则，只有 AAAA 的名字报 `EGRESS_NAME_UNRESOLVED`。
-3. 消费端数据面：fake-IP 池与映射、池内无映射阻断、`name-bind` 发送、池段路由。三端。
+3. 消费端数据面：二期开关与池校验、读 `egress-catalog`、带接管与能力的规则校验、fake-IP 池与映射、
+   池内流量的判定与应答、`name-bind` 发送、fake-IP 流的清除、池段路由、状态。三端。
+   出口侧补一条：收到 `name-bind` 时关闭名字到达之前按地址建立的流。
    四个服务端在 `egress-catalog` 里如实转发出口登录时声明的 `domainTargetCapable`（此前固定为 `false`，
    服务端只保存了能力的 `version`），消费端据此判定 `EGRESS_RULE_EGRESS_NO_DOMAIN`。
+   这一步之后映射只能由第四步的应答者创建，所以单开这一步的开关，域名规则显示生效，却还没有流量会落进池里；
+   用户文档在第五步交付之前不介绍这个开关。
 4. 消费端 DNS 应答者与转发。三端。
 5. 系统 DNS 接管、事务日志、回滚与 `egress dns restore`，三平台。
 6. 实验室：Linux 命名空间里完整跑通（resolv.conf 方式），并增加「池内无映射」与「接管后强杀再启动」用例。

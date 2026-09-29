@@ -452,7 +452,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 出口下线、设备停用、ACL 撤销或总开关关闭时立即下发 `egresses: []`。`egress-catalog` 只能由服务端发出；客户端上报该类型必须拒绝。
 
-**客户端目前不处理这条消息。** 四个服务端都会下发，三个客户端都没有解码器。消费端判断出口是否可用，用的是 Peer Mesh 自己的对端在线状态，而不是目录；因此目录里的 `scope`、`protocols` 等能力信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
+**客户端只从这条消息里读 `domainTargetCapable`**，供二期的域名规则使用，解码规则见 [peer-egress-dns.md](peer-egress-dns.md#能力协商)（向量 `peer-egress-dns-v1.json` 的 `catalog`）。消费端判断出口是否可用，用的仍是 Peer Mesh 自己的对端在线状态，而不是目录的 `online`；目录里的 `scope`、`protocols` 等信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
 
 ### `egress-report`
 
@@ -655,6 +655,9 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `return-mesh-source` | 回程包的源地址落在 Peer Mesh 网段内，拒收 |
 | `return-no-flow` | 回程包找不到本机发起过的存活流，拒收 |
 | `rejected-<错误码小写>` | 出口用 `flow-reject` 拒绝了这个流，如 `rejected-egress_dest_denied` |
+| `fake-ip-unmapped` | 二期：发往 fake-IP 池内、却没有映射的地址 |
+| `fake-ip-stale` | 二期：fake-IP 映射的名字已没有规则认领，或改由 `direct` 认领 |
+| `egress-no-domain` | 二期：域名规则指向的出口在线，却没有声明 `domainTargetCapable` |
 
 **`blocked` 与 `refused` 按原因/错误码分别计数，不汇总。** 「没有出口在线」与「被出口拒绝」数字一样大，却是完全不同的两个问题。计数为零的不输出：一排零会把真正发生过的那一条埋掉。
 
