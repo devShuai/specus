@@ -243,11 +243,32 @@ func (r *egressRuntime) handleControl(consumer int64, frame peerEgressFrame, now
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.names.bind(consumer, address, name)
-		// Flows to this address that were not opened for this name go, the way revoked flows go:
-		// a TCP flow with a state machine is reset, and every socket is closed. No flow-reject
-		// follows, because nothing was refused: the consumer's next packet is meant to reopen the
-		// flow by name, and a rejection arriving after it would take down the flow just reopened.
-		r.releaseAll(egressRevocationsFor(r.flows.closeNotNamed(consumer, address, name), ""), now)
+		// Flows to this address that were not opened for this name go, and none of them is
+		// answered with a flow-reject: nothing was refused, the consumer's next packet is meant to
+		// reopen the flow by name, and a rejection arriving after it would take down the flow just
+		// reopened.
+		//
+		// A flow opened before any name arrived is closed silently, on this side only. What follows
+		// a name-bind is usually the application's own retransmitted SYN, and a reset sent now
+		// would refuse the very connection the name-bind came to rescue. A flow opened for another
+		// name was a real connection to somewhere the address no longer means, and is reset the
+		// way a revoked flow is.
+		var unnamed, renamed []*egressFlow
+		for _, flow := range r.flows.closeNotNamed(consumer, address, name) {
+			if flow.Name == "" {
+				unnamed = append(unnamed, flow)
+			} else {
+				renamed = append(renamed, flow)
+			}
+		}
+		for _, flow := range unnamed {
+			closeEgressHandle(flow.Handle)
+		}
+		r.releaseAll(egressRevocationsFor(renamed, ""), now)
+		if len(unnamed) > 0 {
+			r.logger.Printf("[peer-egress] flows opened before their name closed count=%d active=%d",
+				len(unnamed), r.flows.size())
+		}
 		return
 	}
 	// flow-reject travels egress to consumer. Receiving one means the peer is confused about

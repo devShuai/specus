@@ -47,11 +47,18 @@ func configWarnings(data []byte, config Config, warn func(string)) {
 //
 // Domain rules are judged as phase two would judge them with the master switch on: accepted when
 // peerEgressDnsTakeover is on and the pool is usable against the default mesh network, refused as
-// in phase one otherwise. What the pool overlaps on this device is only known when it starts.
+// in phase one otherwise. A pool that is not usable is said once, in the words the Java and .NET
+// clients use, since otherwise the operator sees only the domain rules refused and not why. What the
+// pool overlaps on this device is only known when phase two starts.
 func warnEgressRules(config Config, warn func(string)) {
 	rules := config.PeerEgressRules
 	if len(rules) > 0 && !config.PeerEgressEnabled {
 		warn(fmt.Sprintf("peerEgressRules has %d rule(s) but peerEgressEnabled is false: none is in force", len(rules)))
+	}
+	if config.PeerEgressDNSTakeover {
+		if code := validateEgressFakeIPPool(effectiveEgressFakeIPCIDR(config.PeerEgressFakeIPCIDR), egressDefaultMeshCIDR); code != "" {
+			warn("peerEgressFakeIpCidr is not usable: " + code + "; domain rules are not in force")
+		}
 	}
 	for _, refused := range validateEgressRuleSetIn(rules, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config)) {
 		if refused.Code == egressCodeRuleDisabled {

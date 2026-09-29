@@ -528,8 +528,10 @@ func normalizeJSON(t *testing.T, value map[string]any) map[string]any {
 	return out
 }
 
-// Which flows a name-bind closes, through the real egress runtime: flows are opened with real
-// datagrams, and a flow the vector names is closed when its table entry and socket are gone.
+// Which flows a name-bind closes and which of those it resets, through the real egress runtime.
+// Every flow is a TCP connection taken through its handshake, so each has a state machine that could
+// send a reset: a flow is closed when its table entry and socket are gone, and reset when an RST
+// went back to its consumer port.
 func TestEgressNameBindClosesFlowsMatchesTheSharedVector(t *testing.T) {
 	vector := loadDNSPhaseTwoVector(t)
 	cases := vector.NameBindClosesFlows
@@ -553,13 +555,11 @@ func TestEgressNameBindClosesFlowsMatchesTheSharedVector(t *testing.T) {
 	for index, event := range cases.Events {
 		var got map[string]any
 		if event.Open != nil {
-			key := egressFlowKey{protocol: ipv4ProtocolUDP,
+			key := egressFlowKey{protocol: ipv4ProtocolTCP,
 				consumerIP:   testAddr(t, fmt.Sprintf("100.96.0.%d", event.Consumer)),
 				consumerPort: uint16(40000 + index), remoteIP: testAddr(t, event.Address), remotePort: 443}
 			keys[*event.Open] = key
-			datagram := buildUDPDatagram(udpDatagram{SourceIP: key.consumerIP, DestinationIP: key.remoteIP,
-				SourcePort: key.consumerPort, DestinationPort: key.remotePort, Payload: []byte("q")})
-			harness.runtime.handleFrame(event.Consumer, egressFrameFor(datagram), flowEpoch)
+			openEstablishedEgressFlow(t, harness, event.Consumer, key)
 			harness.runtime.mu.Lock()
 			flow, opened := harness.runtime.flows.lookup(key)
 			harness.runtime.mu.Unlock()
@@ -580,20 +580,31 @@ func TestEgressNameBindClosesFlowsMatchesTheSharedVector(t *testing.T) {
 				}
 			}
 			harness.runtime.mu.Unlock()
+			segmentsBefore := len(harness.segments())
 			bindName(t, harness, event.Consumer, event.Address, *event.NameBind)
-			closed := []string{}
+			answered := harness.segments()[segmentsBefore:]
+			closed, reset := []string{}, []string{}
 			harness.runtime.mu.Lock()
 			for id, flow := range open {
-				if _, present := harness.runtime.flows.lookup(keys[id]); !present {
-					closed = append(closed, id)
-					if socket, ok := flow.Handle.(*egressUDPFlow); !ok || !socket.socket.(*fakeEgressConn).isClosed() {
-						t.Errorf("event %d: flow %s left the table with its socket open", index, id)
+				if _, present := harness.runtime.flows.lookup(keys[id]); present {
+					continue
+				}
+				closed = append(closed, id)
+				if handle, ok := flow.Handle.(*egressTCPFlow); !ok || !handle.socket.(*fakeEgressConn).isClosed() {
+					t.Errorf("event %d: flow %s left the table with its socket open", index, id)
+				}
+				for _, segment := range answered {
+					if segment.has(tcpFlagRST) && segment.DestinationIP == keys[id].consumerIP &&
+						segment.DestinationPort == keys[id].consumerPort {
+						reset = append(reset, id)
+						break
 					}
 				}
 			}
 			harness.runtime.mu.Unlock()
 			sort.Strings(closed)
-			got = map[string]any{"closed": closed}
+			sort.Strings(reset)
+			got = map[string]any{"closed": closed, "reset": reset}
 		}
 		if want := cases.Results[index]; !reflect.DeepEqual(normalizeJSON(t, got), want) {
 			t.Errorf("event %d: %v, want %v", index, got, want)
@@ -603,4 +614,25 @@ func TestEgressNameBindClosesFlowsMatchesTheSharedVector(t *testing.T) {
 	if codes := harness.rejectCodes(); len(codes) != 0 {
 		t.Errorf("closing flows for a name-bind sent flow-reject %v", codes)
 	}
+}
+
+// openEstablishedEgressFlow opens a TCP flow at the egress and completes its handshake, answering
+// the SYN-ACK sent to this flow's own consumer port.
+func openEstablishedEgressFlow(t *testing.T, harness *egressHarness, consumer int64, key egressFlowKey) {
+	t.Helper()
+	syn := tcpSegment{SourceIP: key.consumerIP, DestinationIP: key.remoteIP, SourcePort: key.consumerPort,
+		DestinationPort: key.remotePort, Seq: 1000, Flags: tcpFlagSYN, Window: 65535, MSS: 1360}
+	harness.runtime.handleFrame(consumer, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+	for _, segment := range harness.segments() {
+		if segment.has(tcpFlagSYN) && segment.has(tcpFlagACK) && segment.DestinationPort == key.consumerPort &&
+			segment.DestinationIP == key.consumerIP {
+			harness.runtime.handleFrame(consumer, egressFrameFor(buildTCPSegment(tcpSegment{
+				SourceIP: syn.SourceIP, DestinationIP: syn.DestinationIP,
+				SourcePort: syn.SourcePort, DestinationPort: syn.DestinationPort,
+				Seq: syn.Seq + 1, Ack: segment.Seq + 1, Flags: tcpFlagACK, Window: 65535,
+			})), flowEpoch)
+			return
+		}
+	}
+	t.Fatalf("no SYN-ACK for consumer port %d", key.consumerPort)
 }

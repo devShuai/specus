@@ -388,3 +388,90 @@ func TestConfigKnowsThePhaseTwoKeys(t *testing.T) {
 		}
 	}
 }
+
+// An unusable pool is said in so many words, the same in all three clients, whenever phase two is
+// asked for: judged with the master switch on and against the default mesh network, like the rules.
+func TestConfigWarnsOfAnUnusablePool(t *testing.T) {
+	const warning = "peerEgressFakeIpCidr is not usable: EGRESS_FAKE_IP_POOL_INVALID; domain rules are not in force"
+	cases := []struct {
+		name, fields string
+		warned       bool
+	}{
+		{"too narrow", `"peerEgressDnsTakeover":true,"peerEgressFakeIpCidr":"198.18.0.0/25"`, true},
+		{"over the default mesh", `"peerEgressDnsTakeover":true,"peerEgressFakeIpCidr":"100.96.0.0/16"`, true},
+		{"not a prefix", `"peerEgressDnsTakeover":true,"peerEgressFakeIpCidr":"fake-ip"`, true},
+		{"with the master switch off", `"peerEgressEnabled":false,"peerEgressDnsTakeover":true,"peerEgressFakeIpCidr":"198.18.0.0/25"`, true},
+		{"usable", `"peerEgressDnsTakeover":true,"peerEgressFakeIpCidr":"10.200.0.0/16"`, false},
+		{"default", `"peerEgressDnsTakeover":true`, false},
+		{"takeover off", `"peerEgressFakeIpCidr":"198.18.0.0/25"`, false},
+	}
+	for _, c := range cases {
+		data := []byte(`{"serverBaseUrl":"http://127.0.0.1:1","apiKey":"k","secret":"s",` + c.fields + `}`)
+		var warnings []string
+		if _, err := ParseConfigWithDiagnostics(data, func(w string) { warnings = append(warnings, w) }); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		count := 0
+		for _, got := range warnings {
+			if got == warning {
+				count++
+			}
+		}
+		if want := map[bool]int{true: 1, false: 0}[c.warned]; count != want {
+			t.Errorf("%s: warnings %q, want the pool warning %d time(s)", c.name, warnings, want)
+		}
+	}
+}
+
+// A name-bind closes both kinds of flow it makes stale, and resets only the one that was a real
+// connection. The flow opened before any name was dialled to the fake address; the application's
+// retransmitted SYN is right behind the name-bind, and a reset would refuse it. The flow opened for
+// another name did reach somewhere, and is told it is over.
+func TestEgressNameBindResetsOnlyAFlowOpenedForAnotherName(t *testing.T) {
+	harness := newEgressHarness(t, "198.18.0.0/15", "203.0.113.0/24")
+	harness.runtime.resolve = resolvingTo("203.0.113.10")
+	consumerIP := testAddr(t, "100.96.0.1")
+	key := func(port uint16) egressFlowKey {
+		return egressFlowKey{protocol: ipv4ProtocolTCP, consumerIP: consumerIP, consumerPort: port,
+			remoteIP: testAddr(t, "198.18.0.5"), remotePort: 443}
+	}
+	resetTo := func(port uint16, from int) bool {
+		for _, segment := range harness.segments()[from:] {
+			if segment.has(tcpFlagRST) && segment.DestinationIP == consumerIP && segment.DestinationPort == port {
+				return true
+			}
+		}
+		return false
+	}
+	gone := func(port uint16) bool {
+		harness.runtime.mu.Lock()
+		defer harness.runtime.mu.Unlock()
+		_, present := harness.runtime.flows.lookup(key(port))
+		return !present
+	}
+
+	// Opened with no name: established with the fake address itself, then closed silently.
+	openEstablishedEgressFlow(t, harness, 7, key(40000))
+	before := len(harness.segments())
+	bindName(t, harness, 7, "198.18.0.5", "example.com")
+	if !gone(40000) || !harness.socket(0).isClosed() {
+		t.Fatal("the flow opened before its name survived the name-bind")
+	}
+	if resetTo(40000, before) {
+		t.Error("the flow opened before its name was reset, refusing the SYN the name-bind came to rescue")
+	}
+
+	// Opened for example.com, then the address is bound to another name: reset.
+	openEstablishedEgressFlow(t, harness, 7, key(40001))
+	before = len(harness.segments())
+	bindName(t, harness, 7, "198.18.0.5", "www.example.com")
+	if !gone(40001) || !harness.socket(1).isClosed() {
+		t.Fatal("the flow opened for the old name survived the rebinding")
+	}
+	if !resetTo(40001, before) {
+		t.Error("the flow opened for the old name was closed without a reset")
+	}
+	if codes := harness.rejectCodes(); len(codes) != 0 {
+		t.Errorf("the name-binds sent flow-reject %v", codes)
+	}
+}

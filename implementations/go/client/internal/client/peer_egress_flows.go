@@ -224,7 +224,8 @@ func (t *egressFlowTable) purgeConsumerDestinations(consumer int64, destinations
 // nameBindClosesFlows cases). A flow opened before its name arrived was dialled to the fake address
 // itself and will never work, and the consumer's next SYN or datagram would be taken as part of it;
 // closed, that next packet opens the flow by name. A flow opened for another name is closed as well,
-// since the address now stands for a different destination.
+// since the address now stands for a different destination. Which of them the consumer is told
+// about is the caller's decision: each flow still carries the name it was opened for.
 func (t *egressFlowTable) closeNotNamed(consumer int64, address uint32, name string) []*egressFlow {
 	return t.reap(func(flow *egressFlow) bool {
 		return flow.Consumer == consumer && flow.Key.remoteIP == address && flow.Name != name
