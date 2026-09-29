@@ -1120,3 +1120,85 @@ func (s *recordingSession) peerMessages(t *testing.T) []ControlMessage {
 	}
 	return messages
 }
+
+// A device that leaves has to be announced as gone, the way a device that arrives is announced as
+// here. Rosters were pushed on login and never on logout, so a consumer kept an egress that had
+// stopped as online and went on sending it flows that nothing would ever answer.
+func TestPushOnLogoutTellsTenantPeersTheDeviceIsOffline(t *testing.T) {
+	ctx := context.Background()
+	service, registry, _, egress, consumerSession, egressSession := newLogoutFixture(t)
+
+	registry.Unbind(egress.ClientName, egressSession)
+	service.PushOnLogout(ctx, egress.ClientName)
+
+	var roster *ControlMessage
+	for _, message := range consumerSession.peerMessages(t) {
+		if message.Type == TypeRoster {
+			current := message
+			roster = &current
+		}
+	}
+	if roster == nil {
+		t.Fatal("the consumer was not sent a roster when its peer left")
+	}
+	if !rosterContains(roster.Peers, egress.ID, egress.ClientName, false) {
+		t.Fatalf("the roster still counts the departed device as online: %+v", roster.Peers)
+	}
+}
+
+// A device already back on a newer connection when the old one is torn down has been announced by
+// that login; a logout push would announce it as gone while it is not.
+func TestPushOnLogoutIsSilentForADeviceThatIsAlreadyBack(t *testing.T) {
+	ctx := context.Background()
+	service, _, _, egress, consumerSession, _ := newLogoutFixture(t)
+
+	service.PushOnLogout(ctx, egress.ClientName)
+
+	if messages := consumerSession.peerMessages(t); len(messages) != 0 {
+		t.Fatalf("a device that is still bound was announced: %+v", messages)
+	}
+}
+
+// A signal whose target is not there is undeliverable, which the sender could not have avoided,
+// and not a protocol violation. The route above tells the two apart by this error.
+func TestSignalToAnOfflinePeerIsUndeliverable(t *testing.T) {
+	ctx := context.Background()
+	service, registry, consumer, egress, _, egressSession := newLogoutFixture(t)
+	registry.Unbind(egress.ClientName, egressSession)
+
+	body, err := json.Marshal(ControlMessage{Type: TypeCandidates})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = service.HandleSignal(ctx, protocol.MessageRequest{
+		ToClientName: egress.ClientName,
+		MessageType:  protocol.MessageTypePeerControl,
+		Message:      string(body),
+	}, consumer.ClientName)
+	if !errors.Is(err, ErrUndeliverable) {
+		t.Fatalf("a signal to an offline peer returned %v, want an undeliverable error", err)
+	}
+}
+
+func newLogoutFixture(t *testing.T) (*Service, *session.Registry, store.ClientAccount, store.ClientAccount,
+	*recordingSession, *recordingSession) {
+	t.Helper()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled:           true,
+		CIDR:              "100.96.0.0/11",
+		PublicAddress:     "203.0.113.10",
+		StunTurnPort:      3478,
+		SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+	consumer := insertPeerClient(t, db, 1201, "tenant-a", "alice", "alice-laptop")
+	egress := insertPeerClient(t, db, 1202, "tenant-a", "alice", "office-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.20", "consumer-key")
+	insertPeerDevice(t, db, egress, "100.96.0.21", "egress-key")
+	consumerSession := &recordingSession{name: consumer.ClientName}
+	egressSession := &recordingSession{name: egress.ClientName}
+	registry.Replace(consumerSession)
+	registry.Replace(egressSession)
+	return service, registry, consumer, egress, consumerSession, egressSession
+}

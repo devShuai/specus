@@ -978,18 +978,21 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		return errors.New("toClientName is required")
 	}
 	target, err := s.db.FindClientByName(ctx, targetName)
-	if err != nil || target == nil {
-		return fmt.Errorf("target client not found: %s", targetName)
+	if err != nil {
+		return err
+	}
+	if target == nil {
+		return fmt.Errorf("%w: target client not found: %s", ErrUndeliverable, targetName)
 	}
 	if ok, err := s.CanPeer(ctx, *source, *target); err != nil || !ok {
 		if err != nil {
 			return err
 		}
-		return errors.New("peer access denied")
+		return fmt.Errorf("%w: peer access denied", ErrUndeliverable)
 	}
 	targetSession, ok := s.sessions.Find(target.ClientName)
 	if !ok || targetSession == nil {
-		return fmt.Errorf("target peer is offline: %s", target.ClientName)
+		return fmt.Errorf("%w: target peer is offline: %s", ErrUndeliverable, target.ClientName)
 	}
 	if err := s.enrichTarget(ctx, &signal, *target); err != nil {
 		return err
@@ -1005,8 +1008,20 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		signal.ExpiresAt = grant.session.ExpiresAt
 		s.sendSessionGrant(*source, *target, grant)
 	}
-	return s.sendSignal(targetSession, source.ClientName, target.ClientName, signal)
+	if err := s.sendSignal(targetSession, source.ClientName, target.ClientName, signal); err != nil {
+		// The target's connection went away between the lookup and the write.
+		return fmt.Errorf("%w: %v", ErrUndeliverable, err)
+	}
+	return nil
 }
+
+// ErrUndeliverable marks a peer signal that could not reach its target for a reason the sender
+// could not have avoided: the target went offline, is gone, or lost the sender's grant while the
+// signal was on its way. It is not a protocol violation and must not be answered as one. The read
+// loop closes a connection on any handler error, so returning it bare disconnected every client
+// that signalled a device in the seconds after that device left -- which in turn made a consumer
+// withdraw its routes and reconnect.
+var ErrUndeliverable = errors.New("peer signal undeliverable")
 
 func validateServiceReportEnvelope(request protocol.MessageRequest) error {
 	if len([]byte(request.Message)) > 16*1024 {
@@ -1078,6 +1093,32 @@ func (s *Service) PushOnLogin(ctx context.Context, account store.ClientAccount) 
 	}
 	// A device coming online changes which egresses its peers see as reachable, so the whole
 	// tenant is refreshed rather than only the device that just logged in.
+	s.pushTenantEgress(ctx, account.TenantID)
+}
+
+// PushOnLogout tells a departed client's peers that it is gone.
+//
+// Rosters were pushed when a client arrived and never when it left, so the peers of a device that
+// disconnected kept it as online until something else in the tenant logged in. A consumer whose
+// egress had stopped went on sending flows into a session nobody answered, and learned otherwise
+// only if its own control connection happened to reconnect and fetch a fresh roster.
+//
+// Called once the client's control session is unbound, so the roster built here counts it as
+// offline. If it is already back on a newer connection, its login pushed what the peers need.
+func (s *Service) PushOnLogout(ctx context.Context, clientName string) {
+	if !s.Enabled() || strings.TrimSpace(clientName) == "" {
+		return
+	}
+	if _, bound := s.sessions.Find(clientName); bound {
+		return
+	}
+	account, err := s.db.FindClientByName(ctx, clientName)
+	if err != nil || account == nil {
+		return
+	}
+	for _, target := range s.rosterRefreshTargets(ctx, *account) {
+		s.PushRoster(ctx, target)
+	}
 	s.pushTenantEgress(ctx, account.TenantID)
 }
 
