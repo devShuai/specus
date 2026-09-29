@@ -213,6 +213,11 @@ for case in disabled["cases"]:
           f"rules/consumerDisabled/{case['destination']}: nothing may match with the switch off")
 used.update(codes_by_index.values())
 
+# Phase two's codes are exercised by its own vector (protocol/spec/peer-egress-dns.md).
+_dns_cases = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
+for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgress", "egressChoice"):
+    used.update(case["code"] for case in _dns_cases[section] if case["code"])
+
 undocumented = used - table_codes
 uncovered = table_codes - used
 check(not undocumented, f"codes used in vectors but missing from the spec table: {sorted(undocumented)}")

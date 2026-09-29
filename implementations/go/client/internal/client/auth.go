@@ -70,8 +70,8 @@ type clientEgressCapabilities struct {
 	Version         int  `json:"version"`
 	ConsumerCapable bool `json:"consumerCapable"`
 	EgressCapable   bool `json:"egressCapable"`
-	// Phase one carries address targets only. Announced separately from the version so a later
-	// release with domain or IPv6 targets can coexist with this one.
+	// Announced separately from the version so builds with and without domain or IPv6 targets can
+	// coexist. A domain-capable egress honours name-bind (protocol/spec/peer-egress-dns.md).
 	DomainTargetCapable bool `json:"domainTargetCapable"`
 	IPv6TargetCapable   bool `json:"ipv6TargetCapable"`
 }
@@ -88,6 +88,9 @@ func currentEgressCapabilities() clientEgressCapabilities {
 		Version:         egressProtocolVersion,
 		ConsumerCapable: egressRouteTakeoverSupported,
 		EgressCapable:   true,
+		// The egress resolves names consumers bind. IPv6 targets are not announced: the outbound
+		// socket binding that keeps forwarded traffic out of this device's own tunnel is IPv4 only.
+		DomainTargetCapable: true,
 	}
 }
 

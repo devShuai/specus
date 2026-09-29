@@ -31,6 +31,8 @@
 
 `peerEgressDnsTakeover` 关闭时，域名规则仍报 `EGRESS_RULE_DOMAIN_UNSUPPORTED`，与一期逐字一致。
 
+池的校验见共享向量的 `poolConfig` 用例；与本机接口地址的重叠在启动时检查，不入向量。
+
 ### 域名规则的写法与校验
 
 | `match` 写法 | 含义 |
@@ -128,6 +130,8 @@
 
 出口的能力上报把 `domainTargetCapable` 置为 `true`（只在它实现了本节时）。消费端只对声明了该能力的出口使用域名规则：
 指向不支持的出口的域名规则不在生效中，报 `EGRESS_RULE_EGRESS_NO_DOMAIN`，不降级为本地解析。
+共享向量的 `egressCapability` 用例给出规则与出口能力的组合，`nameBindAtEgress` 给出出口对 `name-bind` 的答复，
+`egressChoice` 给出解析结果与逐地址授权下应拨的地址。
 
 ## 六、系统 DNS 接管
 
@@ -174,9 +178,13 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 ## 八、实现分期
 
-1. 规范、共享向量（名字校验与匹配、DNS 应答判定、映射寿命与隔离、`name-bind` 编解码、出口解析后的授权）。
-2. 出口侧：`name-bind` 登记、解析、逐地址授权、IPv6 目标连接、能力上报。三端。
+1. 规范、共享向量（名字校验与匹配、DNS 应答判定、映射寿命与隔离、`name-bind` 编解码、出口解析后的授权）。已交付。
+2. 出口侧：`name-bind` 登记、解析、逐地址授权、能力上报。三端，已交付。
+   IPv6 目标连接暂不交付：出站 socket 绑定物理网卡的实现只有 IPv4，三端都不声明 `ipv6TargetCapable`，
+   解析只取 A 记录；按上文规则，只有 AAAA 的名字报 `EGRESS_NAME_UNRESOLVED`。
 3. 消费端数据面：fake-IP 池与映射、池内无映射阻断、`name-bind` 发送、池段路由。三端。
+   四个服务端在 `egress-catalog` 里如实转发出口登录时声明的 `domainTargetCapable`（此前固定为 `false`，
+   服务端只保存了能力的 `version`），消费端据此判定 `EGRESS_RULE_EGRESS_NO_DOMAIN`。
 4. 消费端 DNS 应答者与转发。三端。
 5. 系统 DNS 接管、事务日志、回滚与 `egress dns restore`，三平台。
 6. 实验室：Linux 命名空间里完整跑通（resolv.conf 方式），并增加「池内无映射」与「接管后强杀再启动」用例。

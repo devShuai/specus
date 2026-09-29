@@ -33,8 +33,8 @@ public class ClientEgressCapabilitiesTests
         Assert.True(capabilities.GetProperty("egressCapable").GetBoolean());
         Assert.Equal(PeerEgressRouteCommanders.TakeoverSupported(),
             capabilities.GetProperty("consumerCapable").GetBoolean());
-        // Phase one carries address targets only.
-        Assert.False(capabilities.GetProperty("domainTargetCapable").GetBoolean());
+        // The egress honours name-bind; IPv6 targets are not claimed.
+        Assert.True(capabilities.GetProperty("domainTargetCapable").GetBoolean());
         Assert.False(capabilities.GetProperty("ipv6TargetCapable").GetBoolean());
     }
 }
