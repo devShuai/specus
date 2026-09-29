@@ -4512,6 +4512,14 @@ public class PeerMeshClient implements AutoCloseable {
             inboundTrafficKey = null;
             // 对端从 sequence=1 重新开始，旧窗口会把新帧全部当作重放拒绝
             inboundReplayWindow = new PeerReplayWindow();
+            if (changed) {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                endpointSuccessMillis = 0;
+                endpointRtt = Long.MAX_VALUE;
+                lastDirectSuccessMillis = 0;
+            }
             return changed;
         }
 

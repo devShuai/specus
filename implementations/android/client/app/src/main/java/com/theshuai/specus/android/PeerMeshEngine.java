@@ -3679,6 +3679,14 @@ final class PeerMeshEngine implements Closeable {
             remoteKeyEpoch = epoch;
             inboundCodec = null;
             replay = new ReplayWindow();
+            if (changed) {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                endpointSuccessMillis = 0L;
+                endpointRtt = Long.MAX_VALUE;
+                lastDirectSuccessMillis = 0L;
+            }
             return changed;
         }
 

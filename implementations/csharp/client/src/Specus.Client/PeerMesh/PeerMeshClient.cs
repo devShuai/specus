@@ -5248,6 +5248,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             InboundCodec?.Dispose();
             InboundCodec = null;
             Replay = new PeerReplayWindow();
+            if (changed)
+            {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                EndpointSuccess = default;
+                EndpointRttMillis = long.MaxValue;
+                LastDirectSuccess = default;
+            }
             return changed;
         }
 
