@@ -642,3 +642,69 @@ func TestClientMessageCapabilitySQLUsesPostgresBooleanValuesAndPredicate(t *test
 		t.Fatalf("SQLite receive predicate = %q", got)
 	}
 }
+
+// A database from v1.2.6 has the session table without the egress column added after it. The
+// startup pass has to add it, or every login fails writing the session.
+func TestStartupMigrationAddsTheClientEgressVersionColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-session.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE specus_client_session (
+		  id INTEGER PRIMARY KEY,
+		  tenant_id TEXT NOT NULL,
+		  credential_id INTEGER NOT NULL,
+		  identity_id INTEGER NOT NULL,
+		  client_id INTEGER NOT NULL,
+		  client_name TEXT NOT NULL,
+		  token_hash TEXT NOT NULL UNIQUE,
+		  status TEXT NOT NULL,
+		  machine_fingerprint TEXT NOT NULL,
+		  os_user TEXT NOT NULL,
+		  hostname TEXT,
+		  os_name TEXT,
+		  os_version TEXT,
+		  os_arch TEXT,
+		  client_version TEXT,
+		  java_version TEXT,
+		  local_addresses TEXT,
+		  message_send_capable INTEGER NOT NULL DEFAULT 0,
+		  message_receive_capable INTEGER NOT NULL DEFAULT 0,
+		  message_attachments_capable INTEGER NOT NULL DEFAULT 0,
+		  message_media_preview_capable INTEGER NOT NULL DEFAULT 0,
+		  message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,
+		  peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,
+		  peer_service_applications TEXT,
+		  http_login_at TEXT NOT NULL,
+		  netty_connected_at TEXT,
+		  disconnected_at TEXT,
+		  expires_at TEXT NOT NULL,
+		  channel_id TEXT,
+		  remote_address TEXT
+		);`)
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare legacy schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open and migrate legacy database: %v", err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(context.Background(), ClientSession{
+		ID: 7, TenantID: "tenant-a", ClientID: 11, ClientName: "legacy", TokenHash: "legacy-token",
+		Status: "HTTP_AUTHENTICATED", MachineFingerprint: "machine", OSUser: "user",
+		ClientEgressVersion: 1, HTTPLoginAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("a login on a migrated database failed: %v", err)
+	}
+	session, err := db.GetClientSession(context.Background(), 7)
+	if err != nil || session == nil || session.ClientEgressVersion != 1 {
+		t.Fatalf("read session: %+v err=%v", session, err)
+	}
+}

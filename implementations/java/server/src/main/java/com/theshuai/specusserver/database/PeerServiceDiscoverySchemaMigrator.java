@@ -38,6 +38,10 @@ public class PeerServiceDiscoverySchemaMigrator {
         }
         ensureColumn("specus_client_session", "peer_service_discovery_version", dialect.intDefaultZero());
         ensureColumn("specus_client_session", "peer_service_applications", dialect.varchar(160));
+        // Added with peer egress after v1.2.6. Hibernate's own update adds it as NOT NULL without a
+        // default, which SQLite and a non-empty PostgreSQL table refuse, and then every login fails
+        // writing a column that is not there.
+        ensureColumn("specus_client_session", "client_egress_version", dialect.intDefaultZero());
         ensureColumn("peer_mesh_shared_service", "allowed_client_ids", dialect.varchar(512));
         ensureColumn("peer_mesh_service_sharing", "mdns_import_enabled", dialect.boolNotNullFalse());
         int sharingForcedOff = 0;
