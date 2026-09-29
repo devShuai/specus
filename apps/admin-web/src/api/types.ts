@@ -527,6 +527,76 @@ export interface PeerMeshAcl {
   updatedAt: string;
 }
 
+/** The tenant's peer egress switch (/peer-mesh/egress/switch). */
+export interface PeerEgressSwitch {
+  /** Peer Mesh enabled on this deployment; the switch cannot take effect without it. */
+  deploymentEnabled: boolean;
+  configuredEnabled: boolean;
+  /** deploymentEnabled && configuredEnabled. */
+  effectiveEnabled: boolean;
+  protocolVersion: number;
+  enabledPolicyCount: number;
+  /** null (Java, C#) or "" (Go, C) when the switch has never been set. */
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+/**
+ * One destination the egress may reach: an IPv4 CIDR, the protocols and the inclusive port ranges.
+ * An empty portRanges denies every port. Go may return null for an omitted list.
+ */
+export interface PeerEgressDestinationRule {
+  cidr: string;
+  protocols: ("tcp" | "udp" | string)[] | null;
+  portRanges: number[][] | null;
+}
+
+/** A device authorised as an egress, as the management API returns it. Limits are flat fields. */
+export interface PeerEgressPolicy {
+  id: number;
+  egressClientId: number;
+  egressClientName: string;
+  enabled: boolean;
+  /** One value; PUBLIC and LAN do not imply each other. */
+  scope: "PUBLIC" | "LAN" | string;
+  /** As configured. Empty grants nobody, unlike peer services. */
+  allowedConsumerClientIds: number[] | null;
+  /** The configured consumers the Peer ACL also allows; empty while the policy is off. */
+  effectiveConsumerClientIds: number[] | null;
+  destinationRules: PeerEgressDestinationRule[] | null;
+  maxConcurrentFlows: number;
+  maxFlowsPerConsumer: number;
+  idleTimeoutSeconds: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Creates or updates the policy of egressClientId; omitted fields keep their stored values. */
+export interface PeerEgressPolicyMutation {
+  egressClientId: number;
+  enabled?: boolean;
+  scope?: "PUBLIC" | "LAN";
+  allowedConsumerClientIds?: number[];
+  destinationRules?: { cidr: string; protocols: string[]; portRanges: number[][] }[];
+  maxConcurrentFlows?: number;
+  maxFlowsPerConsumer?: number;
+  idleTimeoutSeconds?: number;
+}
+
+/** What an egress last reported about itself. */
+export interface PeerEgressActivity {
+  egressClientId: number;
+  egressClientName: string;
+  online: boolean;
+  revision: number;
+  activeFlows: number;
+  totalFlows: number;
+  rejectedFlows: Record<string, number> | null;
+  bytesIn: number;
+  bytesOut: number;
+  reportedAt: string | null;
+}
+
 export interface PeerMeshAclMutation {
   sourceClientId: number;
   targetClientId: number;

@@ -30,6 +30,7 @@ import { MobileListCard, MobileListCardList } from "../../components/MobileListC
 import { EmptyState } from "../../components/EmptyState";
 import { useNowTick } from "../../hooks/useNowTick";
 import { PeerMeshServicesTab } from "./PeerMeshServicesTab";
+import { PeerMeshEgressTab } from "./PeerMeshEgressTab";
 import {
   NAT_BEHAVIOR_AXES,
   natBehaviorDiscoveryLabel,
@@ -49,7 +50,7 @@ const peerNatFilterOptions = [
 ] as const;
 
 type PeerNatFilterKey = (typeof peerNatFilterOptions)[number]["key"];
-type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat" | "services";
+type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat" | "services" | "egress";
 const SESSION_PAGE_SIZE = 20;
 const PEER_SESSION_FRESH_MILLIS = 120_000;
 
@@ -357,6 +358,7 @@ export function PeerMeshPanel() {
       >
         <Tab key="devices" title="设备拓扑" />
         <Tab key="services" title="服务" />
+        <Tab key="egress" title="出口分流" />
         <Tab key="sessions" title={`活跃会话 ${globalActiveSessions}`} />
         <Tab key="acl" title={`ACL ${acls.length}`} />
         <Tab key="nat" title="NAT 诊断" />
@@ -365,6 +367,8 @@ export function PeerMeshPanel() {
       {peerView === "services" && (
         <PeerMeshServicesTab deploymentEnabled={Boolean(status?.enabled)} devices={devices} />
       )}
+
+      {peerView === "egress" && <PeerMeshEgressTab devices={devices} />}
 
       {peerView === "nat" && (
       <PeerNatInsight
