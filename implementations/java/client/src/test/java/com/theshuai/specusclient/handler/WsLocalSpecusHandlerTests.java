@@ -7,17 +7,24 @@ import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import com.theshuai.specusclient.bean.SpecusBean;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class WsLocalSpecusHandlerTests {
 
@@ -100,7 +107,66 @@ class WsLocalSpecusHandlerTests {
         }
     }
 
+    @Test
+    void returnsCreditOnlyOnceTheFrameReachesTheLocalSocket() {
+        HeldWrites held = new HeldWrites();
+        Fixture fixture = fixture(5_000, held);
+        try {
+            byte[] payload = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_TEXT, true, 0, 0,
+                    "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8)).encode();
+            fixture.handler().writeFrame(fixture.localContext(), payload);
+            fixture.control.runPendingTasks();
+
+            assertNull(fixture.control.readOutbound(),
+                    "credit returned before the local write lets the server run ahead of a slow socket");
+
+            held.completeAll();
+            fixture.control.runPendingTasks();
+            NatMessagePacket credit = fixture.control.readOutbound();
+            assertEquals(NatMessageType.WINDOW_UPDATE, credit.getNatMessageType());
+            assertEquals(17, credit.getStreamId());
+            assertEquals(payload.length, credit.getValue());
+        } finally {
+            held.releaseAll();
+            fixture.close();
+        }
+    }
+
+    @Test
+    void resetsTheStreamWhenTheServerOverrunsTheReceiveWindow() {
+        HeldWrites held = new HeldWrites();
+        Fixture fixture = fixture(5_000, held);
+        try {
+            byte[] payload = new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_BINARY, true, 0, 0,
+                    new byte[WebSocketSpecusFrame.MAX_PAYLOAD_BYTES]).encode();
+            long window = StreamFlowController.INITIAL_WINDOW_BYTES;
+            for (long sent = 0; sent < window; sent += payload.length) {
+                fixture.handler().writeFrame(fixture.localContext(), payload);
+            }
+            fixture.control.runPendingTasks();
+            assertNull(fixture.control.readOutbound(), "a full window is still within the rules");
+            assertTrue(fixture.local.isActive());
+
+            fixture.handler().writeFrame(fixture.localContext(), payload);
+            fixture.control.runPendingTasks();
+
+            NatMessagePacket reset = fixture.control.readOutbound();
+            assertEquals(NatMessageType.RST, reset.getNatMessageType());
+            assertEquals(8, reset.getValue());
+            assertEquals("pending local WebSocket data exceeds receive window",
+                    reset.getMetaData().get("reason"));
+            assertFalse(fixture.local.isActive());
+        } finally {
+            held.releaseAll();
+            fixture.close();
+        }
+    }
+
     private static Fixture fixture(long closeTimeoutMillis) {
+        return fixture(closeTimeoutMillis, null);
+    }
+
+    private static Fixture fixture(long closeTimeoutMillis, ChannelOutboundHandlerAdapter localSocket) {
         SpecusBean bean = new SpecusBean();
         bean.setClientName("client");
         bean.setRemoteAddress("127.0.0.1");
@@ -108,9 +174,33 @@ class WsLocalSpecusHandlerTests {
         bean.setHttpSpecusConfigList(List.of());
         NatClientHandler nat = new NatClientHandler(bean);
         EmbeddedChannel control = new EmbeddedChannel(nat);
-        EmbeddedChannel local = new EmbeddedChannel(
-                new WsLocalSpecusHandler(nat, 17, "remote", closeTimeoutMillis));
+        WsLocalSpecusHandler handler = new WsLocalSpecusHandler(nat, 17, "remote", closeTimeoutMillis);
+        EmbeddedChannel local = localSocket == null
+                ? new EmbeddedChannel(handler)
+                : new EmbeddedChannel(localSocket, handler);
         return new Fixture(control, local);
+    }
+
+    /** Stands in for a local socket that has not yet taken the bytes written to it. */
+    private static final class HeldWrites extends ChannelOutboundHandlerAdapter {
+        private final List<ChannelPromise> promises = new ArrayList<>();
+        private final List<Object> messages = new ArrayList<>();
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            messages.add(msg);
+            promises.add(promise);
+        }
+
+        void completeAll() {
+            promises.forEach(ChannelPromise::trySuccess);
+            promises.clear();
+        }
+
+        void releaseAll() {
+            messages.forEach(ReferenceCountUtil::release);
+            messages.clear();
+        }
     }
 
     private static void drain(EmbeddedChannel channel) {
@@ -120,6 +210,14 @@ class WsLocalSpecusHandlerTests {
     }
 
     private record Fixture(EmbeddedChannel control, EmbeddedChannel local) {
+        WsLocalSpecusHandler handler() {
+            return local.pipeline().get(WsLocalSpecusHandler.class);
+        }
+
+        ChannelHandlerContext localContext() {
+            return local.pipeline().context(WsLocalSpecusHandler.class);
+        }
+
         void close() {
             local.finishAndReleaseAll();
             control.finishAndReleaseAll();

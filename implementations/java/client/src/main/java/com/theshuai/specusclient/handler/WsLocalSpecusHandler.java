@@ -38,6 +38,7 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
     private final String remoteChannelId;
     private final long closeCreditTimeoutMillis;
     private final AtomicBoolean terminationStarted = new AtomicBoolean();
+    private final StreamReceiveWindow receiveWindow = new StreamReceiveWindow();
     private volatile boolean registered;
 
     public WsLocalSpecusHandler(NatClientHandler specusHandler, int streamId, String remoteChannelId) {
@@ -58,7 +59,6 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
             registered = specusHandler.registerWsLocalChannel(streamId, ctx);
             if (registered) {
                 StreamFlowController.get(specusHandler.getCtx().channel()).open(streamId, ctx.channel());
-                specusHandler.syncLocalReadWithControl(ctx.channel());
             } else {
                 // 控制连接已断开，关掉本地 WS
                 ctx.close();
@@ -118,14 +118,23 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    @Override
-    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
-        specusHandler.updateControlAutoReadForLocalWritability();
-        super.channelWritabilityChanged(ctx);
-    }
-
-    /** 由 {@link NatClientHandler#processData} 调用：服务端回送的 DATA 帧还原成 WS 帧写本地 Channel。 */
+    /**
+     * 由 {@link NatClientHandler#processData} 调用：服务端回送的 DATA 帧还原成 WS 帧写本地 Channel。
+     * The stream's credit goes back only once the frame reaches the local socket.
+     */
     public void writeFrame(ChannelHandlerContext localCtx, byte[] payload) {
+        if (!receiveWindow.reserve(payload.length)) {
+            if (terminationStarted.compareAndSet(false, true)) {
+                ChannelHandlerContext controlCtx = specusHandler.getCtx();
+                if (controlCtx != null) {
+                    StreamFlowController.get(controlCtx.channel())
+                            .reset(streamId, 8, "pending local WebSocket data exceeds receive window");
+                }
+                specusHandler.removeWsLocalHandler(streamId, this);
+            }
+            localCtx.close();
+            return;
+        }
         try {
             WebSocketSpecusFrame specusFrame = WebSocketSpecusFrame.decode(payload);
             ByteBuf buf = localCtx.alloc().buffer(specusFrame.payload().length);
@@ -149,7 +158,10 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
             localCtx.writeAndFlush(frame).addListener(future -> {
                 if (!future.isSuccess()) {
                     localCtx.close();
+                    return;
                 }
+                receiveWindow.release(payload.length);
+                specusHandler.sendStreamWindowUpdate(streamId, payload.length);
             });
         } catch (RuntimeException error) {
             localCtx.close();
