@@ -178,21 +178,33 @@ internal static class EgressEdit
     /// <summary>Works out a change against the configuration as loaded, the same way in every runtime.</summary>
     internal static Planned Plan(SpecusClientConfig config, Change change)
     {
-        var rules = config.PeerEgressRules.ToList();
+        if (change.Op == "takeover")
+        {
+            if (change.Enabled == config.PeerEgressEnabled) return new Planned(null, null, [], Unchanged: true);
+            if (!change.Enabled) return new Planned("peerEgressEnabled", "false", []);
+            var preface = new List<string>(EnableNotice);
+            if (!change.Confirmed) return new Planned(null, null, preface, NeedsConfirmation: true);
+            if (NoDevice(config.PeerMeshDevice))
+                preface.Add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
+            return new Planned("peerEgressEnabled", "true", preface);
+        }
+        return new Planned("peerEgressRules", EncodeRules(ApplyRules(config.PeerEgressRules, change)), []);
+    }
+
+    /// <summary>Whether a peerMeshDevice value leaves takeover no interface to route into.</summary>
+    internal static bool NoDevice(string device) =>
+        device.Trim().Length == 0 || device.Trim().Equals("noop", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The rule list after one edit. The commands and the local page write it into the configuration
+    /// file; the desktop page keeps it in its own settings. Either way the same edits are refused.
+    /// </summary>
+    internal static List<PeerEgressRule> ApplyRules(IReadOnlyList<PeerEgressRule> current, Change change)
+    {
+        var rules = current.ToList();
         var count = rules.Count;
         switch (change.Op)
         {
-            case "takeover":
-            {
-                if (change.Enabled == config.PeerEgressEnabled) return new Planned(null, null, [], Unchanged: true);
-                if (!change.Enabled) return new Planned("peerEgressEnabled", "false", []);
-                var preface = new List<string>(EnableNotice);
-                if (!change.Confirmed) return new Planned(null, null, preface, NeedsConfirmation: true);
-                var device = config.PeerMeshDevice.Trim();
-                if (device.Length == 0 || device.Equals("noop", StringComparison.OrdinalIgnoreCase))
-                    preface.Add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
-                return new Planned("peerEgressEnabled", "true", preface);
-            }
             case "add":
             {
                 var rule = new PeerEgressRule
@@ -238,7 +250,7 @@ internal static class EgressEdit
             default:
                 throw new PlanFailure("unknown egress change: " + change.Op);
         }
-        return new Planned("peerEgressRules", EncodeRules(rules), []);
+        return rules;
     }
 
     private static void RequireIndex(int index, int count)
@@ -387,7 +399,7 @@ internal static class EgressEdit
     }
 
     /// <summary>What the configured rules decide for one IPv4 address, and what takeover being on would change.</summary>
-    private static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines)
+    internal static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines)
     {
         var rules = config.PeerEgressRules;
         var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr);
