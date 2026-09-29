@@ -115,6 +115,21 @@
         "code": "EGRESS_RULE_REVOKED"
       },
       "controlCanonicalUtf8Hex": "7b2274797065223a22666c6f772d7075726765222c2264657374696e6174696f6e73223a5b223230332e302e3131332e302f3234222c223139382e35312e3130302e35302f3332225d2c22636f6465223a224547524553535f52554c455f5245564f4b4544227d"
+    },
+    {
+      "name": "control-name-bind",
+      "direction": "consumer-to-egress",
+      "description": "二期：把消费端的 fake-IP 绑定到域名；出口据此解析、按解析结果授权并建连",
+      "frameHex": "53504547310200007b2274797065223a226e616d652d62696e64222c2261646472657373223a223139382e31382e302e35222c226e616d65223a226578616d706c652e636f6d227d",
+      "frameLength": 72,
+      "type": 2,
+      "flags": 0,
+      "controlJson": {
+        "type": "name-bind",
+        "address": "198.18.0.5",
+        "name": "example.com"
+      },
+      "controlCanonicalUtf8Hex": "7b2274797065223a226e616d652d62696e64222c2261646472657373223a223139382e31382e302e35222c226e616d65223a226578616d706c652e636f6d227d"
     }
   ],
   "reject": [
@@ -186,9 +201,21 @@
     },
     {
       "name": "control-unknown-type",
-      "frameHex": "53504547310200007b2274797065223a226e616d652d62696e64227d",
-      "reason": "name-bind 为二期域名分流保留；一期收到必须拒绝，不得当作已实现",
+      "frameHex": "53504547310200007b2274797065223a22726f7574652d68696e74227d",
+      "reason": "未定义的控制类型必须拒绝，不得当作已实现",
       "code": "EGRESS_CONTROL_UNSUPPORTED"
+    },
+    {
+      "name": "control-name-bind-without-fields",
+      "frameHex": "53504547310200007b2274797065223a226e616d652d62696e64227d",
+      "reason": "name-bind 必须带合法的 IPv4 address 与域名 name，缺字段不得登记",
+      "code": "EGRESS_FRAME_MALFORMED_CONTROL"
+    },
+    {
+      "name": "control-name-bind-wildcard-name",
+      "frameHex": "53504547310200007b2274797065223a226e616d652d62696e64222c2261646472657373223a223139382e31382e302e35222c226e616d65223a222a2e6578616d706c652e636f6d227d",
+      "reason": "name-bind 绑定的是一个具体名字，通配写法只属于规则",
+      "code": "EGRESS_FRAME_MALFORMED_CONTROL"
     }
   ]
 }

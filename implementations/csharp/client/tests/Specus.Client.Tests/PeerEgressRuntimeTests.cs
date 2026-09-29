@@ -159,6 +159,18 @@ public class PeerEgressRuntimeTests
             }
         }
 
+        /// <summary>Every host:port dialled, in order.</summary>
+        public IReadOnlyList<string> Dialed
+        {
+            get
+            {
+                lock (_dialed)
+                {
+                    return [.. _dialed];
+                }
+            }
+        }
+
         public FakeSocket Socket(int index)
         {
             lock (_sockets)
@@ -765,5 +777,98 @@ public class PeerEgressRuntimeTests
 
         harness.Gate.Set();
         first.Join(TimeSpan.FromSeconds(2));
+    }
+
+    private static void BindName(Harness harness, long consumer, string address, string name) =>
+        harness.Runtime.HandleFrame(consumer, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false,
+            PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.NameBind(address, name))), Epoch);
+
+    private static Func<string, IReadOnlyList<uint>> ResolvingTo(params string[] addresses) =>
+        _ => addresses.Select(Address).ToList();
+
+    /// <summary>
+    /// A flow to a bound address is dialled to what the name resolves to, and the flow keeps the
+    /// fake address, so the replies come back from the address the consumer's application connected to.
+    /// </summary>
+    [Fact]
+    public void DialsTheResolvedAddressOfABoundName()
+    {
+        var harness = new Harness();
+        harness.Runtime.Resolve = ResolvingTo("127.0.0.1", "203.0.113.10");
+        BindName(harness, 7, "198.18.0.5", "example.com");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.Equal(["203.0.113.10:443"], harness.Dialed);
+        var segments = harness.Segments();
+        Assert.True(segments.Count > 0 && segments[0].SourceIp == Address("198.18.0.5"),
+            "the SYN-ACK did not come from the fake address");
+    }
+
+    /// <summary>
+    /// A name that resolves only to what the policy forbids is refused, which is where DNS rebinding
+    /// is stopped: nothing is dialled.
+    /// </summary>
+    [Fact]
+    public void RefusesANameThatResolvesToAForbiddenAddress()
+    {
+        var harness = new Harness();
+        harness.Runtime.Resolve = ResolvingTo("127.0.0.1");
+        BindName(harness, 7, "198.18.0.5", "rebind.example");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.True(harness.DialCount == 0, "a name resolving to loopback was dialled");
+        Assert.True(harness.SawReset(), "the refused flow was not reset");
+        Assert.Equal([PeerEgressCodes.ForbiddenDestination], harness.RejectCodes());
+    }
+
+    [Fact]
+    public void RefusesANameThatDoesNotResolve()
+    {
+        var harness = new Harness();
+        harness.Runtime.Resolve = _ => throw new System.Net.Sockets.SocketException();
+        BindName(harness, 7, "198.18.0.5", "nowhere.example");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.True(harness.DialCount == 0, "an unresolved name was dialled");
+        Assert.Equal([PeerEgressCodes.NameUnresolved], harness.RejectCodes());
+    }
+
+    /// <summary>
+    /// Bindings are per consumer: one consumer's name for an address says nothing about another's
+    /// flows to the same address.
+    /// </summary>
+    [Fact]
+    public void KeepsBindingsPerConsumer()
+    {
+        var harness = new Harness();
+        harness.Runtime.Resolve = ResolvingTo("203.0.113.10");
+        BindName(harness, 9, "198.18.0.5", "example.com");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.True(harness.DialCount == 0, "consumer 7's flow used consumer 9's binding");
+        Assert.True(harness.SawReset(), "the unbound fake address was not refused");
+    }
+
+    /// <summary>A UDP session to a bound address goes to the resolved address too.</summary>
+    [Fact]
+    public void CarriesAUdpSessionToABoundName()
+    {
+        var harness = new Harness();
+        harness.Runtime.Resolve = ResolvingTo("203.0.113.53");
+        BindName(harness, 7, "198.18.0.9", "dns.example");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(
+            Address("100.96.0.1"), Address("198.18.0.9"), 50000, 53, Encoding.ASCII.GetBytes("query")))), Epoch);
+
+        WaitFor("the datagram to reach the socket", () => harness.DialCount == 1 && harness.Socket(0).Written.Count > 0);
+        Assert.Equal(["203.0.113.53:53"], harness.Dialed);
     }
 }
