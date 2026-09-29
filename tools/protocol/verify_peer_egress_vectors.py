@@ -934,6 +934,13 @@ print(f"failure purge={len(failure['resetOnPurge']['cases'])} packet={len(failur
 # Phase two (#52). The generator holds the reference implementation and checks every case against it,
 # so the file on disk has to be exactly what the generator produces now.
 import importlib.util
+_flows_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_consumer_flow_vectors", Path(__file__).with_name("generate_peer_egress_consumer_flow_vectors.py"))
+_flows_module = importlib.util.module_from_spec(_flows_spec)
+_flows_spec.loader.exec_module(_flows_module)
+if json.loads((VECTORS / "peer-egress-consumer-flows-v1.json").read_text(encoding="utf-8")) != _flows_module.build():
+    failures.append("peer-egress-consumer-flows-v1.json differs from what its generator produces; regenerate it")
+
 _dns_spec = importlib.util.spec_from_file_location(
     "generate_peer_egress_dns_vectors", Path(__file__).with_name("generate_peer_egress_dns_vectors.py"))
 _dns_module = importlib.util.module_from_spec(_dns_spec)

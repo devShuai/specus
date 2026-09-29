@@ -1,0 +1,315 @@
+{
+  "description": "When a consumer forgets a flow it steered to an egress. Events are packets out of the TUN ('out', with protocol and TCP flags) and back from the egress ('in'), a question whether a flow is still known ('known') or how many are ('count'). See protocol/spec/peer-egress.md.",
+  "udpIdleSeconds": 180,
+  "tcpIdleSeconds": 7200,
+  "tcpClosedLingerSeconds": 120,
+  "consumer": "100.96.0.2",
+  "remote": "203.0.113.10:443",
+  "cases": [
+    {
+      "name": "udp-forgotten-after-idle",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 5000,
+          "protocol": "udp"
+        },
+        {
+          "at": 100,
+          "in": 5000
+        },
+        {
+          "at": 279,
+          "known": 5000
+        },
+        {
+          "at": 280,
+          "known": 5000
+        },
+        {
+          "at": 281,
+          "in": 5000
+        },
+        {
+          "at": 282,
+          "count": true
+        }
+      ],
+      "results": [
+        "forwarded",
+        "delivered",
+        true,
+        false,
+        "return-no-flow",
+        0
+      ]
+    },
+    {
+      "name": "tcp-closed-by-fin-both-ways",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 6000,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 1,
+          "in": 6000,
+          "flags": "SA"
+        },
+        {
+          "at": 2,
+          "out": 6000,
+          "protocol": "tcp",
+          "flags": "A"
+        },
+        {
+          "at": 10,
+          "in": 6000,
+          "flags": "FA"
+        },
+        {
+          "at": 11,
+          "out": 6000,
+          "protocol": "tcp",
+          "flags": "FA"
+        },
+        {
+          "at": 12,
+          "in": 6000,
+          "flags": "A"
+        },
+        {
+          "at": 130,
+          "known": 6000
+        },
+        {
+          "at": 131,
+          "known": 6000
+        }
+      ],
+      "results": [
+        "forwarded",
+        "delivered",
+        "forwarded",
+        "delivered",
+        "forwarded",
+        "delivered",
+        true,
+        false
+      ]
+    },
+    {
+      "name": "tcp-closed-by-reset",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 6100,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 1,
+          "in": 6100,
+          "flags": "R"
+        },
+        {
+          "at": 60,
+          "in": 6100,
+          "flags": "A"
+        },
+        {
+          "at": 120,
+          "known": 6100
+        },
+        {
+          "at": 121,
+          "known": 6100
+        }
+      ],
+      "results": [
+        "forwarded",
+        "delivered",
+        "delivered",
+        true,
+        false
+      ]
+    },
+    {
+      "name": "tcp-half-closed-stays",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 6200,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 5,
+          "out": 6200,
+          "protocol": "tcp",
+          "flags": "FA"
+        },
+        {
+          "at": 1000,
+          "known": 6200
+        },
+        {
+          "at": 7204,
+          "known": 6200
+        },
+        {
+          "at": 7205,
+          "known": 6200
+        }
+      ],
+      "results": [
+        "forwarded",
+        "forwarded",
+        true,
+        true,
+        false
+      ]
+    },
+    {
+      "name": "tcp-idle-established-forgotten-after-two-hours",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 6300,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 3600,
+          "in": 6300,
+          "flags": "A"
+        },
+        {
+          "at": 10799,
+          "known": 6300
+        },
+        {
+          "at": 10800,
+          "known": 6300
+        }
+      ],
+      "results": [
+        "forwarded",
+        "delivered",
+        true,
+        false
+      ]
+    },
+    {
+      "name": "port-reuse-after-close-starts-a-new-flow",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "out": 6400,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 1,
+          "in": 6400,
+          "flags": "R"
+        },
+        {
+          "at": 30,
+          "out": 6400,
+          "protocol": "tcp",
+          "flags": "S"
+        },
+        {
+          "at": 200,
+          "known": 6400
+        }
+      ],
+      "results": [
+        "forwarded",
+        "delivered",
+        "forwarded",
+        true
+      ]
+    },
+    {
+      "name": "capacity-evicts-the-least-recently-seen",
+      "capacity": 3,
+      "events": [
+        {
+          "at": 0,
+          "out": 7001,
+          "protocol": "udp"
+        },
+        {
+          "at": 1,
+          "out": 7002,
+          "protocol": "udp"
+        },
+        {
+          "at": 2,
+          "out": 7003,
+          "protocol": "udp"
+        },
+        {
+          "at": 3,
+          "in": 7001
+        },
+        {
+          "at": 4,
+          "out": 7004,
+          "protocol": "udp"
+        },
+        {
+          "at": 5,
+          "known": 7002
+        },
+        {
+          "at": 5,
+          "known": 7001
+        },
+        {
+          "at": 5,
+          "count": true
+        }
+      ],
+      "results": [
+        "forwarded",
+        "forwarded",
+        "forwarded",
+        "delivered",
+        "forwarded",
+        false,
+        true,
+        3
+      ]
+    },
+    {
+      "name": "unknown-return-is-dropped",
+      "capacity": 16,
+      "events": [
+        {
+          "at": 0,
+          "in": 8000,
+          "flags": "A"
+        },
+        {
+          "at": 0,
+          "count": true
+        }
+      ],
+      "results": [
+        "return-no-flow",
+        0
+      ]
+    }
+  ]
+}
