@@ -21,6 +21,10 @@ MESH_CIDR = "100.96.0.0/11"
 
 def validate_rule(rule, mesh_cidr=MESH_CIDR):
     """Returns the failing code, or None. The fixed order from the spec."""
+    # Only an explicit false switches a rule off, and it is checked before anything else: a
+    # switched-off rule installs no route whatever its content.
+    if rule.get("enabled") is False:
+        return "EGRESS_RULE_DISABLED"
     match = (rule.get("match") or "").strip()
     if not match:
         return "EGRESS_RULE_MALFORMED"
