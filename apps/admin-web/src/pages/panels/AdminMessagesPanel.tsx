@@ -616,7 +616,7 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
   return (
     <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
       <div className={[
-        "max-w-[min(680px,92%)] rounded-md border px-3 py-2 shadow-sm",
+        "max-w-[min(680px,92%)] rounded-md border px-3 py-2 shadow-xs",
         mine
           ? "border-primary-200 bg-primary-50 text-primary-950 dark:border-primary-400/30 dark:bg-primary-400/10 dark:text-primary-50"
           : "border-default-200 bg-content1 text-foreground",
@@ -631,7 +631,7 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
             </Button>
           )}
         </div>
-        {message.body && <div className="whitespace-pre-wrap break-words text-small leading-6">{message.body}</div>}
+        {message.body && <div className="whitespace-pre-wrap break-words text-small">{message.body}</div>}
         {attachment && (
           <div className="mt-2 rounded-md border border-default-200 bg-background/70 p-2">
             <div className="flex min-w-0 items-center justify-between gap-2">
@@ -648,10 +648,10 @@ function MessageBubble({ message, downloading, onDownload, onResend }: {
               )}
             </div>
             {message.previewUrl && attachment.mimeType?.startsWith("image/") && (
-              <img className="mt-2 max-h-64 w-full rounded object-contain" src={message.previewUrl} alt={attachment.fileName || "attachment"} />
+              <img className="mt-2 max-h-64 w-full rounded-sm object-contain" src={message.previewUrl} alt={attachment.fileName || "attachment"} />
             )}
             {message.previewUrl && attachment.mimeType?.startsWith("video/") && (
-              <video className="mt-2 max-h-64 w-full rounded bg-black object-contain" src={message.previewUrl} controls />
+              <video className="mt-2 max-h-64 w-full rounded-sm bg-black object-contain" src={message.previewUrl} controls />
             )}
             {message.downloadUrl && message.downloadExpiresAt && (
               <div className="mt-2 text-tiny text-default-500">

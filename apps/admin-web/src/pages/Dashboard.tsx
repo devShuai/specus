@@ -136,7 +136,7 @@ function DashboardContent() {
         />
       </aside>
       <div className="flex min-w-0 flex-1 flex-col lg:ml-56">
-        <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur lg:hidden">
+        <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur-sm lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
             <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
@@ -144,7 +144,7 @@ function DashboardContent() {
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
-        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-2 pb-7 pt-5 outline-none sm:px-3 lg:px-5">
+        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-2 pb-7 pt-5 outline-hidden sm:px-3 lg:px-5">
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
               <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={requestInitializeDatabase} />
@@ -188,7 +188,7 @@ function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { op
   }, [open, triggerRef]);
 
   return (<>
-    <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
+    <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-xs transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
     <aside
       ref={panelRef}
       aria-hidden={!open}

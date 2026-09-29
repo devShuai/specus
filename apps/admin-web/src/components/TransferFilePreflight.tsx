@@ -46,7 +46,7 @@ export function TransferFilePreflight(props: Props) {
             <p><strong>设备传输：</strong>每个文件最多 {input.memoryLimitBytes / (1024 * 1024)} MiB，直连和 TURN 中继共享此上限；接收文件暂存在浏览器内存，请及时保存。实际可接收量还受对方内存影响。</p>
             <p><strong>本次方式：</strong>{input.mode === "link" ? "上传到服务端配置的临时存储，生成文件链接；接收方需登录并持有链接和访问口令。" : cloud ? "优先直连 → TURN 中继；都失败后允许上传临时存储，对方需要登录下载。" : "直连 → TURN 中继；不会上传临时存储，失败后保留任务供重试。"}</p>
             {input.mode === "device" && canOfferCloudFallback ? <Checkbox isSelected={allowCloud} onValueChange={onAllowCloud}>设备连接失败时，允许将这些文件上传临时存储</Checkbox> : null}
-            {cloud ? <div data-testid="transfer-cloud-quota" className="rounded-md border border-default-200 bg-default-50/30 p-3 text-tiny leading-5">
+            {cloud ? <div data-testid="transfer-cloud-quota" className="rounded-md border border-default-200 bg-default-50/30 p-3 text-tiny">
               {props.capabilities.snapshot ? <>
                 <p className="font-semibold">{props.capabilities.snapshot.storageEnabled ? "临时存储已配置 · 额度快照" : "此服务端未启用临时存储"}</p>
                 <dl className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">

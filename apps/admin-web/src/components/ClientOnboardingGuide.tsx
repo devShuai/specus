@@ -22,7 +22,7 @@ export function ClientOnboardingGuide({ loading, error, online, registered, cred
     <ol id="client-onboarding-steps" className={showSteps ? "mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" : "hidden"}>
       {CLIENT_ONBOARDING_STEPS.map((step, index) => <li key={step.title} className="min-w-0 border-l-2 border-primary-200 pl-3">
         <h3 className="text-small font-semibold"><span className="mr-2 font-mono text-primary">{index + 1}</span>{step.title}</h3>
-        <p className="my-2 text-tiny leading-5 text-default-500">{step.detail}</p>
+        <p className="my-2 text-tiny text-default-500">{step.detail}</p>
         <a className="inline-flex min-h-11 items-center text-small text-primary underline underline-offset-4 focus-visible:outline-primary" href={step.href}>{step.action}</a>
         {index === 3 ? <a className="ml-3 inline-flex min-h-11 items-center text-small text-primary underline underline-offset-4" href="#/specusMappings">端口映射</a> : null}
       </li>)}

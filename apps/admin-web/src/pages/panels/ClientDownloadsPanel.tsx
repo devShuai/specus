@@ -113,7 +113,7 @@ export function ClientDownloadsPanel() {
 function DownloadCard({ link }: { link: ClientDownloadLink }) {
   return (
     <a
-      className="group block rounded-md border border-default-200 bg-content1 p-3 transition hover:border-primary hover:shadow-sm"
+      className="group block rounded-md border border-default-200 bg-content1 p-3 transition hover:border-primary hover:shadow-xs"
       href={link.downloadUrl}
       rel="noopener noreferrer"
       target="_blank"

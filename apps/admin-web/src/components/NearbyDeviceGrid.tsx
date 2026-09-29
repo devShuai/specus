@@ -62,7 +62,7 @@ export function NearbyDeviceGrid({
         {connecting ? <span className="nearby-radar" aria-hidden="true" /> : null}
         <div>
           <div className="text-small font-medium text-zinc-700 dark:text-zinc-200">{connecting ? "正在连接设备发现服务…" : failed ? "暂时无法发现设备" : "还没有可用设备"}</div>
-          <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+          <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
             {failed ? "请检查网络或邀请是否有效，然后重试。" : "让对方也打开互传页面；未自动出现时，可发送邀请或输入配对码。"}
           </p>
         </div>
@@ -113,7 +113,7 @@ export function NearbyDeviceGrid({
               {device.displayName}
             </span>
             {device.sameLan ? (
-              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-200">
+              <span className="rounded-sm bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-200">
                 自动发现
               </span>
             ) : null}

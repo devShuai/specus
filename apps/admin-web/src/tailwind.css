@@ -1,0 +1,240 @@
+/*
+ * Tailwind CSS 4 entry point. HeroUI 2.8's theme targets Tailwind 4: its plugin is configured in
+ * ../hero.ts and its component class strings are scanned from @heroui/theme's dist below.
+ */
+@import "tailwindcss" source(none);
+
+/*
+ * The hand-written stylesheet. Tailwind 3 emitted it unlayered after the plain utilities and before
+ * the variant utilities (which it appends to the end of the stylesheet), so it contested both by
+ * specificity. Left unlayered here it would beat every layered utility outright; appended to the
+ * utilities layer it keeps that contest, except that it now also wins ties against variants. The
+ * few rules that relied on losing such a tie are adjusted in index.css or in the markup.
+ */
+@import "./index.css" layer(utilities);
+
+@plugin "../hero.ts";
+
+/* The files the Tailwind 3 config listed under `content`; automatic detection would add public/. */
+@source "../index.html";
+@source "./**/*.{js,ts,jsx,tsx}";
+@source "../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}";
+/* npm can keep HeroUI's theme package nested under @heroui/react. */
+@source "../node_modules/@heroui/react/node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}";
+
+/* Dark mode follows the .dark class ThemeContext.tsx sets on <html> (darkMode: "class" before). */
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  /* A ring without a color class was blue-500 at half opacity, not currentColor. */
+  --default-ring-color: rgb(59 130 246 / 0.5);
+
+  /* Inter variable font with CJK system fallbacks (Chinese uses the system font; no bundled CJK font). */
+  --font-sans:
+    "Inter Variable", "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+    "Noto Sans SC", system-ui, sans-serif;
+
+  /* Display sizes keep natural letter spacing, as in the diagram editor. */
+  --text-display-xl: 3rem;
+  --text-display-xl--line-height: 1.05;
+  --text-display-xl--letter-spacing: 0;
+  --text-display-lg: 2rem;
+  --text-display-lg--line-height: 1.1;
+  --text-display-lg--letter-spacing: 0;
+  --text-display-md: 1.5rem;
+  --text-display-md--line-height: 1.15;
+  --text-display-md--letter-spacing: 0;
+  --text-display-sm: 1.25rem;
+  --text-display-sm--line-height: 1.2;
+  --text-display-sm--letter-spacing: 0;
+
+  /*
+   * Older pages still use cyan-* utilities; 50–900 map to the editor blue (appleBlueScale in
+   * ../hero.ts) so their state selectors keep working, and 950 keeps Tailwind 3's value.
+   */
+  --color-cyan-50: #f0f7ff;
+  --color-cyan-100: #e1efff;
+  --color-cyan-200: #bfddff;
+  --color-cyan-300: #8ec4ff;
+  --color-cyan-400: #5aa8ff;
+  --color-cyan-500: #2997ff;
+  --color-cyan-600: #0077ed;
+  --color-cyan-700: #0066cc;
+  --color-cyan-800: #0055aa;
+  --color-cyan-900: #00447f;
+  --color-cyan-950: #083344;
+
+  /*
+   * Tailwind 4 redefined its default palette in OKLCH. These are the Tailwind 3 sRGB values of the
+   * families the app uses, so existing screens render the colors they were designed with.
+   */
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+  --color-slate-800: #1e293b;
+  --color-slate-900: #0f172a;
+  --color-slate-950: #020617;
+
+  --color-zinc-50: #fafafa;
+  --color-zinc-100: #f4f4f5;
+  --color-zinc-200: #e4e4e7;
+  --color-zinc-300: #d4d4d8;
+  --color-zinc-400: #a1a1aa;
+  --color-zinc-500: #71717a;
+  --color-zinc-600: #52525b;
+  --color-zinc-700: #3f3f46;
+  --color-zinc-800: #27272a;
+  --color-zinc-900: #18181b;
+  --color-zinc-950: #09090b;
+
+  --color-amber-50: #fffbeb;
+  --color-amber-100: #fef3c7;
+  --color-amber-200: #fde68a;
+  --color-amber-300: #fcd34d;
+  --color-amber-400: #fbbf24;
+  --color-amber-500: #f59e0b;
+  --color-amber-600: #d97706;
+  --color-amber-700: #b45309;
+  --color-amber-800: #92400e;
+  --color-amber-900: #78350f;
+  --color-amber-950: #451a03;
+
+  --color-rose-50: #fff1f2;
+  --color-rose-100: #ffe4e6;
+  --color-rose-200: #fecdd3;
+  --color-rose-300: #fda4af;
+  --color-rose-400: #fb7185;
+  --color-rose-500: #f43f5e;
+  --color-rose-600: #e11d48;
+  --color-rose-700: #be123c;
+  --color-rose-800: #9f1239;
+  --color-rose-900: #881337;
+  --color-rose-950: #4c0519;
+
+  --color-emerald-50: #ecfdf5;
+  --color-emerald-100: #d1fae5;
+  --color-emerald-200: #a7f3d0;
+  --color-emerald-300: #6ee7b7;
+  --color-emerald-400: #34d399;
+  --color-emerald-500: #10b981;
+  --color-emerald-600: #059669;
+  --color-emerald-700: #047857;
+  --color-emerald-800: #065f46;
+  --color-emerald-900: #064e3b;
+  --color-emerald-950: #022c22;
+
+  --color-teal-50: #f0fdfa;
+  --color-teal-100: #ccfbf1;
+  --color-teal-200: #99f6e4;
+  --color-teal-300: #5eead4;
+  --color-teal-400: #2dd4bf;
+  --color-teal-500: #14b8a6;
+  --color-teal-600: #0d9488;
+  --color-teal-700: #0f766e;
+  --color-teal-800: #115e59;
+  --color-teal-900: #134e4a;
+  --color-teal-950: #042f2e;
+
+  --color-blue-50: #eff6ff;
+  --color-blue-100: #dbeafe;
+  --color-blue-200: #bfdbfe;
+  --color-blue-300: #93c5fd;
+  --color-blue-400: #60a5fa;
+  --color-blue-500: #3b82f6;
+  --color-blue-600: #2563eb;
+  --color-blue-700: #1d4ed8;
+  --color-blue-800: #1e40af;
+  --color-blue-900: #1e3a8a;
+  --color-blue-950: #172554;
+
+  --color-violet-50: #f5f3ff;
+  --color-violet-100: #ede9fe;
+  --color-violet-200: #ddd6fe;
+  --color-violet-300: #c4b5fd;
+  --color-violet-400: #a78bfa;
+  --color-violet-500: #8b5cf6;
+  --color-violet-600: #7c3aed;
+  --color-violet-700: #6d28d9;
+  --color-violet-800: #5b21b6;
+  --color-violet-900: #4c1d95;
+  --color-violet-950: #2e1065;
+}
+
+/* Tailwind 3 preflight defaults that Tailwind 4 changed and the existing screens rely on. */
+@layer base {
+  /* Borders drawn with only a width took gray-200 rather than currentColor. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: #e5e7eb;
+  }
+
+  /* Placeholders were gray-400 rather than half the text color. */
+  input::placeholder,
+  textarea::placeholder {
+    color: #9ca3af;
+  }
+
+  /* Buttons showed a pointer, except when disabled. */
+  button,
+  [role="button"] {
+    cursor: pointer;
+  }
+
+  :disabled {
+    cursor: default;
+  }
+
+  /* Form fields kept the browser's background, corners and opacity; only buttons were cleared. */
+  input:where(:not([type="button"], [type="reset"], [type="submit"])),
+  select,
+  optgroup,
+  textarea {
+    background-color: revert;
+    border-radius: revert;
+    opacity: revert;
+  }
+
+  /* Table cells kept the browser's 1px padding; Tailwind 4 zeroes padding on every element. */
+  td,
+  th {
+    padding: 1px;
+  }
+
+  /* Date and time fields kept the browser's own inner layout, which Tailwind 4 now normalizes. */
+  ::-webkit-date-and-time-value {
+    min-height: revert;
+    text-align: revert;
+  }
+
+  ::-webkit-datetime-edit {
+    display: revert;
+  }
+
+  ::-webkit-datetime-edit-fields-wrapper {
+    padding: revert;
+  }
+
+  ::-webkit-datetime-edit,
+  ::-webkit-datetime-edit-year-field,
+  ::-webkit-datetime-edit-month-field,
+  ::-webkit-datetime-edit-day-field,
+  ::-webkit-datetime-edit-hour-field,
+  ::-webkit-datetime-edit-minute-field,
+  ::-webkit-datetime-edit-second-field,
+  ::-webkit-datetime-edit-millisecond-field,
+  ::-webkit-datetime-edit-meridiem-field {
+    padding-block: revert;
+  }
+
+  ::-webkit-calendar-picker-indicator {
+    line-height: revert;
+  }
+}

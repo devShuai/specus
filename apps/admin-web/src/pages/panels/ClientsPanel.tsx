@@ -278,7 +278,7 @@ export function ClientsPanel() {
       <ClientOnboardingGuide loading={loadingClients || loadingCredentials} error={clientsLoadError || credentialsLoadError}
         online={clients.filter((client) => client.enabled && client.online).length} registered={clients.length} credentials={credentials.length}
         onRefresh={() => void load()} />
-      <section className="min-w-0 space-y-3">
+      <section className="flex min-w-0 flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
@@ -389,7 +389,7 @@ export function ClientsPanel() {
         {credentialPagination.pager}
       </section>
 
-      <section className="min-w-0 space-y-3">
+      <section className="flex min-w-0 flex-col gap-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">客户端实例</h2>
           <p className="text-small text-default-500">实例首次登录后自动注册并生成名称；可在编辑窗口中自定义，名称在全局范围内不可重复。</p>

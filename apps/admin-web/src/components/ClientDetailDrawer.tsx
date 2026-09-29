@@ -14,7 +14,7 @@ export function ClientDetailDrawer({ client, open, onClose }: { client: Client |
 
   return (
     <>
-      <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
+      <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-xs transition-opacity duration-200 ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
       <aside className={`fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l border-divider bg-background shadow-2xl transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}>
         <div className="flex items-center justify-between gap-2 border-b border-divider px-4 py-3">
           <h2 className="text-base font-semibold">{client?.clientName ?? "\u5BA2\u6237\u7AEF\u8BE6\u60C5"}</h2>

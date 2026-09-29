@@ -501,7 +501,7 @@ class MediaCaptureLoadBoundary extends Component<
         <p className="text-small font-medium text-danger">媒体采集模块加载失败</p>
         <p className="mt-1 text-tiny text-default-500">网络可能中断，或站点刚刚完成版本更新。</p>
         <button
-          className="mt-3 rounded-medium bg-danger px-3 py-2 text-small font-medium text-danger-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
+          className="mt-3 rounded-medium bg-danger px-3 py-2 text-small font-medium text-danger-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-danger"
           type="button"
           onClick={() => window.location.reload()}
         >
@@ -1338,7 +1338,7 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                     {row.statusCode}
                   </Chip>
                   <span
-                    className="max-h-16 min-w-0 overflow-y-auto break-all pr-1 font-mono text-small leading-relaxed"
+                    className="max-h-16 min-w-0 overflow-y-auto break-all pr-1 font-mono text-small"
                     title={httpPath(row)}
                   >
                     {httpPath(row)}
@@ -1479,7 +1479,7 @@ function HttpMessagePanel({
       <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2">
         {bodyDisplay.message && (
           <div
-            className={`max-h-20 overflow-y-auto rounded-small border p-2 text-tiny leading-relaxed ${
+            className={`max-h-20 overflow-y-auto rounded-small border p-2 text-tiny ${
               bodyDisplay.status === "failed" || bodyDisplay.status === "unsupported"
                 ? "border-warning-200 bg-warning-50 text-warning-700"
                 : "border-primary-100 bg-primary-50 text-primary-700"
@@ -1566,7 +1566,7 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
               )}
               {target.decodeMessage && (
                 <div
-                  className={`rounded-small border p-2 text-tiny font-normal leading-relaxed ${
+                  className={`rounded-small border p-2 text-tiny font-normal ${
                     target.decodeStatus === "failed" || target.decodeStatus === "unsupported"
                       ? "border-warning-200 bg-warning-50 text-warning-700"
                       : "border-primary-100 bg-primary-50 text-primary-700"
@@ -2056,7 +2056,7 @@ function TextPreview({ content, maxHeightClass }: { content: string; maxHeightCl
 function JsonHighlightedPreview({ content, maxHeightClass }: { content: string; maxHeightClass: string }) {
   return (
     <pre
-      className={`${maxHeightClass} overflow-auto rounded-small border border-default-200 bg-default-50 p-3 font-mono text-tiny leading-relaxed`}
+      className={`${maxHeightClass} overflow-auto rounded-small border border-default-200 bg-default-50 p-3 font-mono text-tiny`}
     >
       <code className="block min-w-max">{highlightJson(content)}</code>
     </pre>
@@ -2783,7 +2783,7 @@ function HeaderBlock({ content }: { content: string | null }) {
                   <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="break-all font-mono text-tiny font-semibold">{row.name}</div>
-                      <div className="mt-1 text-tiny leading-relaxed text-default-500">{row.info.summary}</div>
+                      <div className="mt-1 text-tiny text-default-500">{row.info.summary}</div>
                     </div>
                     {row.info.links.length > 0 && (
                       <div className="flex shrink-0 flex-wrap gap-1">
@@ -2804,7 +2804,7 @@ function HeaderBlock({ content }: { content: string | null }) {
                   <pre className="max-h-28 min-w-0 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-[11px] leading-relaxed">
                     {row.value || "-"}
                   </pre>
-                  <p className="text-tiny leading-relaxed text-default-500">{row.info.details}</p>
+                  <p className="text-tiny text-default-500">{row.info.details}</p>
                 </div>
               ))
             )}

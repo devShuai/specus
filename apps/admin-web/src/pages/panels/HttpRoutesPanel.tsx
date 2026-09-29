@@ -664,10 +664,14 @@ function HttpRouteAuthChip({ enabled }: { enabled: boolean }) {
   );
 }
 
+// HeroUI's md radio puts both ml-1 and ms-2 on the label wrapper. Tailwind 3 happened to emit ms-2
+// last and Tailwind 4 emits ml-1 last; ml-2 keeps the 8px gap the form was laid out with.
+const radioClassNames = { labelWrapper: "ml-2" };
+
 function HttpRouteAccessChoice({ enabled, onChange }: { enabled: boolean; onChange: (enabled: boolean) => void }) {
   return <RadioGroup label="访问范围" orientation="horizontal" value={enabled ? "protected" : "public"} onValueChange={(value) => onChange(value === "protected")}>
-    <Radio value="protected">受保护访问（用户名与密码）</Radio>
-    <Radio value="public">公开访问（无需认证）</Radio>
+    <Radio classNames={radioClassNames} value="protected">受保护访问（用户名与密码）</Radio>
+    <Radio classNames={radioClassNames} value="public">公开访问（无需认证）</Radio>
   </RadioGroup>;
 }
 
