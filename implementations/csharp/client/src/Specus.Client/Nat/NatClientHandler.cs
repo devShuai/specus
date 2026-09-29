@@ -331,15 +331,26 @@ internal sealed class NatClientHandler : IAsyncDisposable
                     }
                 });
             channel.SetControlWritable(_controlWritable);
-            if (!TryActivateTcpStream(streamId, pending, channel, out var bufferedPackets))
+            tcp = null; // ownership transferred to LocalSpecusChannel
+            bool live;
+            try
+            {
+                live = await HandOffAsync(streamId, pending,
+                    buffered => buffered.NatMessageType == NatMessageType.Fin
+                        ? DeliverTcpFinAsync(channel, streamId)
+                        : DeliverTcpDataAsync(channel, buffered),
+                    () => _channels.TryAdd(streamId, channel)).ConfigureAwait(false);
+            }
+            catch
+            {
+                MarkStreamClosed(streamId);
+                await channel.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+            if (!live)
             {
                 await channel.DisposeAsync().ConfigureAwait(false);
                 return;
-            }
-            tcp = null; // ownership transferred to LocalSpecusChannel
-            foreach (var buffered in bufferedPackets)
-            {
-                await HandleBufferedPacketAsync(buffered).ConfigureAwait(false);
             }
             _ = Task.Run(async () =>
             {
@@ -478,16 +489,34 @@ internal sealed class NatClientHandler : IAsyncDisposable
                     }
                 });
             channel.SetControlWritable(_controlWritable);
-            if (!TryActivateWebSocketStream(
-                    packet.StreamId, pending, channel, out var bufferedPackets))
+            socket = null; // ownership transferred to WebSocketSpecusChannel
+            bool live;
+            try
+            {
+                live = await HandOffAsync(packet.StreamId, pending,
+                    async buffered =>
+                    {
+                        if (buffered.NatMessageType == NatMessageType.Fin)
+                        {
+                            // A FIN ends a WebSocket stream outright, as it does once live.
+                            channel.Close();
+                            return false;
+                        }
+                        await DeliverWebSocketDataAsync(channel, buffered).ConfigureAwait(false);
+                        return true;
+                    },
+                    () => _wsChannels.TryAdd(packet.StreamId, channel)).ConfigureAwait(false);
+            }
+            catch
+            {
+                MarkStreamClosed(packet.StreamId);
+                await channel.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+            if (!live)
             {
                 await channel.DisposeAsync().ConfigureAwait(false);
                 return;
-            }
-            socket = null; // ownership transferred to WebSocketSpecusChannel
-            foreach (var buffered in bufferedPackets)
-            {
-                await HandleBufferedPacketAsync(buffered).ConfigureAwait(false);
             }
             _logger.LogInformation("[ws-specus][client] ws handshake ok channelId={channelId} route={route} target={target}",
                 channelId, route, target.GetLeftPart(UriPartial.Path));
@@ -558,12 +587,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
         if (_wsChannels.TryGetValue(packet.StreamId, out var wsChannel))
         {
-            if (packet.Data is null || packet.Data.Length == 0)
-            {
-                return;
-            }
-            await wsChannel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
-            await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
+            await DeliverWebSocketDataAsync(wsChannel, packet).ConfigureAwait(false);
             return;
         }
         if (IsClosedStream(packet.StreamId))
@@ -574,33 +598,23 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
         if (_channels.TryGetValue(packet.StreamId, out var channel))
         {
-            var data = packet.Data ?? [];
-            if (data.Length > 0)
-            {
-                var result = await channel.WriteAsync(data, _cancellationToken).ConfigureAwait(false);
-                if (result == LocalSpecusWriteResult.DataAfterFin)
-                {
-                    channel.Reset();
-                    await SendResetAsync(packet.StreamId, 7, "TCP DATA after FIN")
-                        .ConfigureAwait(false);
-                    return;
-                }
-                if (result == LocalSpecusWriteResult.Reset)
-                {
-                    await SendResetAsync(packet.StreamId, 7, "local TCP write failed").ConfigureAwait(false);
-                    return;
-                }
-                await SendWindowUpdateAsync(packet.StreamId, data.Length).ConfigureAwait(false);
-            }
-            if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
-            {
-                await HandleRemoteFinAsync(packet.StreamId).ConfigureAwait(false);
-            }
+            await DeliverTcpDataAsync(channel, packet).ConfigureAwait(false);
             return;
+        }
+        if (AfterLiveLookupMissForTests is { } afterMiss)
+        {
+            await afterMiss(packet.StreamId).ConfigureAwait(false);
         }
         var pendingResult = TryBufferPendingPacket(packet);
         if (pendingResult == PendingBufferResult.Buffered)
         {
+            return;
+        }
+        if (pendingResult == PendingBufferResult.Live)
+        {
+            // Published between the lookups above and that one. A stream is published only once
+            // nothing is left buffered for it, so delivering this now cannot overtake anything.
+            await HandleDataAsync(packet).ConfigureAwait(false);
             return;
         }
         if (pendingResult == PendingBufferResult.Overflow)
@@ -628,34 +642,88 @@ internal sealed class NatClientHandler : IAsyncDisposable
             await WriteResetPacketAsync(streamId, 7, "FIN for closed stream").ConfigureAwait(false);
             return;
         }
-        if (!_channels.TryGetValue(streamId, out var channel))
+        if (_channels.TryGetValue(streamId, out var channel))
         {
-            var pendingResult = TryBufferPendingPacket(new NatMessagePacket
-            {
-                NatMessageType = NatMessageType.Fin,
-                StreamId = streamId,
-            });
-            if (pendingResult == PendingBufferResult.Buffered)
-            {
-                return;
-            }
-            CancelPendingStream(streamId);
-            RememberClosedStream(streamId);
-            await WriteResetPacketAsync(streamId, 7, "FIN for unknown TCP stream").ConfigureAwait(false);
+            await DeliverTcpFinAsync(channel, streamId).ConfigureAwait(false);
             return;
         }
+        if (AfterLiveLookupMissForTests is { } afterMiss)
+        {
+            await afterMiss(streamId).ConfigureAwait(false);
+        }
+        var pendingResult = TryBufferPendingPacket(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Fin,
+            StreamId = streamId,
+        });
+        if (pendingResult == PendingBufferResult.Buffered)
+        {
+            return;
+        }
+        if (pendingResult == PendingBufferResult.Live)
+        {
+            await HandleRemoteFinAsync(streamId).ConfigureAwait(false);
+            return;
+        }
+        CancelPendingStream(streamId);
+        RememberClosedStream(streamId);
+        await WriteResetPacketAsync(streamId, 7, "FIN for unknown TCP stream").ConfigureAwait(false);
+    }
 
+    // Hands one DATA to a TCP channel. False when the stream ended here; the reset has been sent.
+    private async Task<bool> DeliverTcpDataAsync(LocalSpecusChannel channel, NatMessagePacket packet)
+    {
+        var data = packet.Data ?? [];
+        if (data.Length > 0)
+        {
+            var result = await channel.WriteAsync(data, _cancellationToken).ConfigureAwait(false);
+            if (result == LocalSpecusWriteResult.DataAfterFin)
+            {
+                channel.Reset();
+                await SendResetAsync(packet.StreamId, 7, "TCP DATA after FIN").ConfigureAwait(false);
+                return false;
+            }
+            if (result == LocalSpecusWriteResult.Reset)
+            {
+                await SendResetAsync(packet.StreamId, 7, "local TCP write failed").ConfigureAwait(false);
+                return false;
+            }
+            await SendWindowUpdateAsync(packet.StreamId, data.Length).ConfigureAwait(false);
+        }
+        if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
+        {
+            return await DeliverTcpFinAsync(channel, packet.StreamId).ConfigureAwait(false);
+        }
+        return true;
+    }
+
+    // Hands the remote's FIN to a TCP channel, half-closing the local socket's write side. False when
+    // that ended the stream; the reset has been sent.
+    private async Task<bool> DeliverTcpFinAsync(LocalSpecusChannel channel, uint streamId)
+    {
         var result = channel.FinishRemoteDirection();
         if (result == LocalSpecusRemoteFinResult.Invalid)
         {
             channel.Reset();
             await SendResetAsync(streamId, 7, "duplicate TCP FIN").ConfigureAwait(false);
-            return;
+            return false;
         }
         if (result == LocalSpecusRemoteFinResult.Reset)
         {
             await SendResetAsync(streamId, 8, "local TCP shutdown failed").ConfigureAwait(false);
+            return false;
         }
+        return true;
+    }
+
+    private async Task DeliverWebSocketDataAsync(WebSocketSpecusChannel channel, NatMessagePacket packet)
+    {
+        if (packet.Data is null || packet.Data.Length == 0)
+        {
+            return;
+        }
+        await channel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
+        await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
     }
 
     private void HandleReset(uint streamId)
@@ -900,55 +968,69 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
     }
 
-    private bool TryActivateTcpStream(uint streamId, PendingOpen pending,
-        LocalSpecusChannel channel, out IReadOnlyList<NatMessagePacket> bufferedPackets)
+    // Moves a stream from pending to live without losing or reordering what arrived meanwhile.
+    //
+    // Packets for a stream were buffered while its local side was being dialled. They have to reach
+    // the local socket before anything that arrives after them, and no packet may find the stream in
+    // neither place. So the stream stays pending while its buffer is delivered -- the reader keeps
+    // appending to the same buffer -- and is published as live only in the locked step that finds
+    // the buffer empty. Delivery goes straight to the channel, which is in no live table yet.
+    //
+    // False when the stream ended during the hand-off: reset or cancelled by the remote, a delivery
+    // that ended it, or a publish that could not happen. The caller then disposes the channel.
+    private async Task<bool> HandOffAsync(uint streamId, PendingOpen pending,
+        Func<NatMessagePacket, Task<bool>> deliver, Func<bool> publish)
     {
-        bufferedPackets = [];
-        lock (_stateLock)
+        while (true)
         {
-            if (!_pendingStreams.TryGetValue(streamId, out var current)
-                || !ReferenceEquals(current, pending)
-                || !_openStreamIds.Contains(streamId))
+            IReadOnlyList<NatMessagePacket> batch;
+            lock (_stateLock)
             {
-                return false;
+                if (!IsCurrentPendingLocked(streamId, pending))
+                {
+                    return false;
+                }
+                batch = pending.TakeBufferedPackets();
+                if (batch.Count == 0)
+                {
+                    _pendingStreams.Remove(streamId);
+                    if (publish())
+                    {
+                        return true;
+                    }
+                    _openStreamIds.Remove(streamId);
+                    RememberClosedStream(streamId);
+                    return false;
+                }
             }
-            _pendingStreams.Remove(streamId);
-            if (!_channels.TryAdd(streamId, channel))
+            if (BeforeBufferedDeliveryForTests is { } beforeDelivery)
             {
-                _openStreamIds.Remove(streamId);
-                RememberClosedStream(streamId);
-                return false;
+                await beforeDelivery(streamId).ConfigureAwait(false);
             }
-            bufferedPackets = pending.TakeBufferedPackets();
+            lock (_stateLock)
+            {
+                // A reset that arrived since the batch was taken ends the stream before any more of
+                // it reaches the local socket.
+                if (!IsCurrentPendingLocked(streamId, pending))
+                {
+                    return false;
+                }
+            }
+            foreach (var buffered in batch)
+            {
+                if (!await deliver(buffered).ConfigureAwait(false))
+                {
+                    MarkStreamClosed(streamId);
+                    return false;
+                }
+            }
         }
-        pending.Dispose();
-        return true;
     }
 
-    private bool TryActivateWebSocketStream(uint streamId, PendingOpen pending,
-        WebSocketSpecusChannel channel, out IReadOnlyList<NatMessagePacket> bufferedPackets)
-    {
-        bufferedPackets = [];
-        lock (_stateLock)
-        {
-            if (!_pendingStreams.TryGetValue(streamId, out var current)
-                || !ReferenceEquals(current, pending)
-                || !_openStreamIds.Contains(streamId))
-            {
-                return false;
-            }
-            _pendingStreams.Remove(streamId);
-            if (!_wsChannels.TryAdd(streamId, channel))
-            {
-                _openStreamIds.Remove(streamId);
-                RememberClosedStream(streamId);
-                return false;
-            }
-            bufferedPackets = pending.TakeBufferedPackets();
-        }
-        pending.Dispose();
-        return true;
-    }
+    private bool IsCurrentPendingLocked(uint streamId, PendingOpen pending) =>
+        _pendingStreams.TryGetValue(streamId, out var current)
+        && ReferenceEquals(current, pending)
+        && _openStreamIds.Contains(streamId);
 
     private bool FailPendingStream(uint streamId, PendingOpen expected)
     {
@@ -978,23 +1060,16 @@ internal sealed class NatClientHandler : IAsyncDisposable
         {
             if (!_pendingStreams.TryGetValue(packet.StreamId, out var pending))
             {
-                return PendingBufferResult.NotPending;
+                // Checked under the same lock the hand-off publishes under, so a stream is always in
+                // exactly one of the two places here. Checking the live tables only before taking the
+                // lock left a window where it was in neither, which is #77.
+                return _channels.ContainsKey(packet.StreamId) || _wsChannels.ContainsKey(packet.StreamId)
+                    ? PendingBufferResult.Live
+                    : PendingBufferResult.NotPending;
             }
             return pending.TryBufferPacket(packet, MaximumPendingStreamBytes)
                 ? PendingBufferResult.Buffered
                 : PendingBufferResult.Overflow;
-        }
-    }
-
-    private async Task HandleBufferedPacketAsync(NatMessagePacket packet)
-    {
-        if (packet.NatMessageType == NatMessageType.Data)
-        {
-            await HandleDataAsync(packet).ConfigureAwait(false);
-        }
-        else if (packet.NatMessageType == NatMessageType.Fin)
-        {
-            await HandleRemoteFinAsync(packet.StreamId).ConfigureAwait(false);
         }
     }
 
@@ -1056,6 +1131,13 @@ internal sealed class NatClientHandler : IAsyncDisposable
     }
 
     internal bool HasTcpStream(uint streamId) => _channels.ContainsKey(streamId);
+
+    // Test seams for the hand-off from a pending stream to a live one; null in production. The first
+    // runs after a packet has missed every live channel and before it looks for a pending stream,
+    // which is the window an activation can land in. The second runs once activation holds the
+    // packets that were buffered while the local dial was in flight, before it delivers them.
+    internal Func<uint, Task>? AfterLiveLookupMissForTests { get; set; }
+    internal Func<uint, Task>? BeforeBufferedDeliveryForTests { get; set; }
 
     private static async Task<TcpClient> ConnectLocalTcpAsync(
         string address, int port, CancellationToken cancellationToken)
@@ -1206,6 +1288,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
         NotPending,
         Buffered,
         Overflow,
+        // Not pending any more because the hand-off published it in the meantime.
+        Live,
     }
 
     private sealed class PendingOpen : IDisposable
