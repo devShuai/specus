@@ -57,12 +57,6 @@ class PeerEgressLossSimulationTests {
         int read = 0;
         boolean closed = false;
 
-        java.util.function.BiConsumer<Boolean, byte[]> send = (toEgress, packet) -> {
-            if (random.nextDouble() < loss) {
-                return;
-            }
-            link.add(new Packet(0, 0, toEgress, packet));
-        };
         List<byte[]> pendingOut = new ArrayList<>(first.segments);
         long nextTick = TICK_MS;
         while (now < 120_000) {
@@ -131,7 +125,6 @@ class PeerEgressLossSimulationTests {
                 boolean advanced = true;
                 while (advanced) {
                     advanced = false;
-                    var entry = receiver.outOfOrder.floorEntry(receiver.rcvNxt);
                     for (var candidate : new ArrayList<>(receiver.outOfOrder.entrySet())) {
                         int start = candidate.getKey();
                         byte[] bytesAt = candidate.getValue();
@@ -145,9 +138,6 @@ class PeerEgressLossSimulationTests {
                         } else if (PeerEgressSegment.seqLessEqual(end, receiver.rcvNxt)) {
                             receiver.outOfOrder.remove(start);
                         }
-                    }
-                    if (entry == null && !advanced) {
-                        break;
                     }
                 }
                 if (receiver.finAt != null && receiver.finAt == receiver.rcvNxt) {
