@@ -177,11 +177,14 @@ internal static class PeerEgressDnsWire
             return Forwarded;
         }
         uint address = 0;
-        // Reversed: the first label is the address's last octet.
+        // Reversed: the first label is the address's last octet. Only the canonical spelling is
+        // ours -- decimal, no leading zeros, as every resolver writes it; any other is some other
+        // name and goes upstream.
         for (var index = 3; index >= 0; index--)
         {
             var octet = octets[index];
-            if (octet.Length is 0 or > 3 || !octet.All(char.IsAsciiDigit) || int.Parse(octet) > 255)
+            if (octet.Length is 0 or > 3 || !octet.All(char.IsAsciiDigit) || (octet.Length > 1 && octet[0] == '0')
+                || int.Parse(octet) > 255)
             {
                 return Forwarded;
             }

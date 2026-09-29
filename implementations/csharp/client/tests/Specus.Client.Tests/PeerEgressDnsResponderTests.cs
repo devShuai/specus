@@ -874,6 +874,8 @@ public class PeerEgressDnsResponderTests
         var acked = Assert.Single(client.Segments());
         Assert.Empty(acked.Payload);
         Assert.Equal(client.Next, acked.Ack);
+        // The forward starts on a task of its own.
+        Until(() => forwarder.Calls.Count == 1, "the forward");
         Assert.Equal(forwardedQuery, Assert.Single(forwarder.Calls).Query);
         Assert.True(forwarder.Calls[0].Tcp);
 

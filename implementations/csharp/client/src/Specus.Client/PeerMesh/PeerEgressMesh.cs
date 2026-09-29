@@ -246,6 +246,12 @@ internal sealed class PeerEgressMesh(
     private string _upstreamsRefusedLogged = "";
 
     /// <summary>
+    /// The pool the consumer was last configured with, so a reconcile that finds phase two stopped
+    /// knows the consumer still has one to give up. Written under the consumer's lock.
+    /// </summary>
+    private volatile PeerEgressFakeIpPool? _consumerPool;
+
+    /// <summary>
     /// Builds the plane and the threads that carry its frames and its clock, on first use.
     /// </summary>
     /// <remarks>
@@ -732,7 +738,10 @@ internal sealed class PeerEgressMesh(
         var responder = pool is null ? null : DnsResponderFor(rules, meshCidr, pool);
         // Consumer callbacks may reach the mesh. Do not wait for their lock while
         // holding _planLock, which mesh shutdown needs when withdrawing routes.
-        var purge = rules.Count == 0 && pool is null
+        // A consumer still holding the pool is reconfigured even with no rules: phase two stopping
+        // -- the mesh prefix moving onto the pool, say -- has to take the pool and the responder
+        // away from it and purge the flows into the pool, or it would go on steering by names.
+        var purge = rules.Count == 0 && pool is null && _consumerPool is null
             ? new Dictionary<long, IReadOnlyList<string>>()
             : ConfigureConsumer(rules, meshCidr, pool, responder, nowMs);
         lock (_planLock)
@@ -920,6 +929,7 @@ internal sealed class PeerEgressMesh(
         {
             // Queries to the listen address reach the responder only while phase two runs.
             consumerRole.DnsResponder = responder;
+            _consumerPool = fakeIpPool;
             if (string.Equals(key, _consumerKey, StringComparison.Ordinal))
             {
                 return new Dictionary<long, IReadOnlyList<string>>();
