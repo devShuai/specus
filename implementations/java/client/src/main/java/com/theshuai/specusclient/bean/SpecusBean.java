@@ -26,6 +26,8 @@ public class SpecusBean {
      * somebody else's connection.
      */
     private List<PeerEgressRule> peerEgressRules = List.of();
+    /** The consumer's master switch, from the local configuration. */
+    private boolean peerEgressEnabled;
     private String peerMeshDevice = "noop";
     private String peerMeshTunName = "specus0";
     private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;

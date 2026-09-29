@@ -32,6 +32,10 @@ public final class PeerEgressCodes {
     public static final String RULE_MESH_OVERLAP = "EGRESS_RULE_MESH_OVERLAP";
     public static final String RULE_DEFAULT_ROUTE = "EGRESS_RULE_DEFAULT_ROUTE";
     public static final String RULE_PORT_UNSUPPORTED = "EGRESS_RULE_PORT_UNSUPPORTED";
+    /** A rule the user switched off: kept in the list, out of force. */
+    public static final String RULE_DISABLED = "EGRESS_RULE_DISABLED";
+    /** The consumer's master switch is off: rules are kept and nothing is taken over. */
+    public static final String CONSUMER_DISABLED = "EGRESS_CONSUMER_DISABLED";
 
     // SPEG1 frame decoding.
     public static final String FRAME_BAD_MAGIC = "EGRESS_FRAME_BAD_MAGIC";
@@ -42,6 +46,13 @@ public final class PeerEgressCodes {
     public static final String IPV6_UNSUPPORTED = "EGRESS_IPV6_UNSUPPORTED";
     public static final String FRAME_MALFORMED_CONTROL = "EGRESS_FRAME_MALFORMED_CONTROL";
     public static final String CONTROL_UNSUPPORTED = "EGRESS_CONTROL_UNSUPPORTED";
+
+    // Phase two, domain rules (protocol/spec/peer-egress-dns.md).
+    public static final String NAME_UNRESOLVED = "EGRESS_NAME_UNRESOLVED";
+    public static final String NAME_UNSUPPORTED = "EGRESS_NAME_UNSUPPORTED";
+    public static final String RULE_FAKE_IP_OVERLAP = "EGRESS_RULE_FAKE_IP_OVERLAP";
+    public static final String FAKE_IP_POOL_INVALID = "EGRESS_FAKE_IP_POOL_INVALID";
+    public static final String RULE_EGRESS_NO_DOMAIN = "EGRESS_RULE_EGRESS_NO_DOMAIN";
 
     /**
      * Every code this build defines.
@@ -54,9 +65,11 @@ public final class PeerEgressCodes {
             HOP_NOT_ALLOWED, DISABLED, PEER_ACL_DENIED, CONSUMER_DENIED, FORBIDDEN_DESTINATION,
             SCOPE_DENIED, DEST_DENIED, PROTOCOL_DENIED, PORT_DENIED, LIMIT_EXCEEDED,
             RULE_DOMAIN_UNSUPPORTED, RULE_IPV6_UNSUPPORTED, RULE_MALFORMED, RULE_MISSING_TARGET,
-            RULE_MESH_OVERLAP, RULE_DEFAULT_ROUTE, RULE_PORT_UNSUPPORTED,
+            RULE_MESH_OVERLAP, RULE_DEFAULT_ROUTE, RULE_PORT_UNSUPPORTED, RULE_DISABLED,
+            CONSUMER_DISABLED,
             FRAME_BAD_MAGIC, FRAME_UNKNOWN_TYPE, FRAME_RESERVED_SET, FRAME_TRUNCATED,
-            FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED);
+            FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED,
+            NAME_UNRESOLVED, NAME_UNSUPPORTED, RULE_FAKE_IP_OVERLAP, FAKE_IP_POOL_INVALID, RULE_EGRESS_NO_DOMAIN);
 
     /**
      * Reports whether a code is one this build defines.

@@ -20,7 +20,9 @@ internal sealed record PeerEgressApplyOutcome(long AtMillis,
 /// <summary>The consumer's own view, taken under its caller's lock.</summary>
 internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Rules,
     string MeshCidr, IReadOnlyDictionary<long, bool> Online, int Flows,
-    IReadOnlyDictionary<string, long> Blocked);
+    IReadOnlyDictionary<string, long> Blocked,
+    IReadOnlyDictionary<long, int>? FlowsByEgress = null,
+    IReadOnlyDictionary<long, string>? Paths = null);
 
 /// <summary>The egress role's own view, taken under its lock.</summary>
 internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int Flows,
@@ -51,14 +53,68 @@ internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int 
 /// </remarks>
 internal static class PeerEgressStatus
 {
+    // The values of a peer entry's path: what carries frames to that egress now.
+    internal const string PathDirect = "direct";
+    internal const string PathRelay = "relay";
+    internal const string PathNone = "none";
+
     /// <summary>The whole section, assembled for the state file.</summary>
     public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
-        PeerEgressRuntimeStatus? runtime) => new()
+        PeerEgressRuntimeStatus? runtime) => Section(consumer, installed, outcome, runtime, true, []);
+
+    /// <summary>
+    /// The section with the consumer's master switch. Off, no consumer is built, so the rules come
+    /// from the configuration; they are listed all the same, because "kept but not taking anything
+    /// over" is a state to show rather than to hide.
+    /// </summary>
+    public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
+        IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
+        PeerEgressRuntimeStatus? runtime, bool enabled, IReadOnlyList<PeerEgressRule>? configured)
+    {
+        var consumerSection = ConsumerSection(consumer, installed, outcome);
+        consumerSection["enabled"] = enabled;
+        if (!enabled && configured is { Count: > 0 })
         {
-            ["consumer"] = ConsumerSection(consumer, installed, outcome),
+            consumerSection["rules"] = SwitchedOffRules(configured);
+        }
+        return new()
+        {
+            ["consumer"] = consumerSection,
             ["egress"] = EgressSection(runtime),
         };
+    }
+
+    /// <summary>
+    /// Configured rules while the master switch is off. None is in force; a rule the user switched
+    /// off says so itself, the rest name the master switch.
+    /// </summary>
+    internal static List<Dictionary<string, object?>> SwitchedOffRules(IReadOnlyList<PeerEgressRule> configured)
+    {
+        var rules = new List<Dictionary<string, object?>>(configured.Count);
+        for (var index = 0; index < configured.Count; index++)
+        {
+            var rule = configured[index];
+            var entry = new Dictionary<string, object?>
+            {
+                ["index"] = index,
+                ["match"] = rule.Match?.Trim() ?? string.Empty,
+                ["action"] = rule.Action?.Trim() ?? string.Empty,
+                ["inForce"] = false,
+                ["code"] = rule.SwitchedOff ? PeerEgressCodes.RuleDisabled : PeerEgressCodes.ConsumerDisabled,
+            };
+            if (rule.EgressClientId is { } egress and not 0)
+            {
+                entry["egressClientId"] = egress;
+            }
+            if (rule.Port is { } port and not 0)
+            {
+                entry["port"] = port;
+            }
+            rules.Add(entry);
+        }
+        return rules;
+    }
 
     private static Dictionary<string, object?> ConsumerSection(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome)
@@ -125,6 +181,8 @@ internal static class PeerEgressStatus
             {
                 ["clientId"] = peer.Key,
                 ["online"] = peer.Value,
+                ["path"] = consumer.Paths is not null && consumer.Paths.TryGetValue(peer.Key, out var path) ? path : PathNone,
+                ["flows"] = consumer.FlowsByEgress is not null && consumer.FlowsByEgress.TryGetValue(peer.Key, out var count) ? count : 0,
             })
             .ToList();
         section["flows"] = consumer.Flows;

@@ -15,6 +15,14 @@ const cliHelp = `Usage: specus-client [run] [options]
        specus-client status|peers|services|egress --config PATH [--json]
        specus-client doctor --config PATH [--probe] [--json]
        specus-client ui --config PATH [--no-open] [--port PORT]
+       specus-client egress rules --config PATH [--json]
+       specus-client egress rule add --config PATH --match CIDR --action egress|direct|block
+                     [--egress-client-id ID] [--at INDEX] [--disabled] [--json]
+       specus-client egress rule remove|enable|disable --config PATH --index INDEX [--json]
+       specus-client egress rule move --config PATH --index INDEX --to INDEX [--json]
+       specus-client egress enable --config PATH [--yes] [--json]
+       specus-client egress disable --config PATH [--json]
+       specus-client egress test ADDRESS --config PATH [--connect PORT] [--json]
 
 Options:
   -h, --help            Show help without loading configuration or connecting
@@ -31,6 +39,11 @@ Options:
 
 The egress command reports which of this node's egress rules are actually in force, which
 routes were installed, and which were refused because something already owned the prefix.
+
+The egress rules/rule/enable/disable commands edit the configuration file and never a running
+client, which applies the change after a restart. Saving rules and taking over traffic are separate:
+rules take nothing over until egress enable. egress test previews what the rules decide for an IPv4
+address; only --connect PORT makes a connection, and that shows reachability, not the path taken.
 
 Examples:
   specus-client --config "/path with spaces/client.jsonc"
@@ -52,6 +65,39 @@ type cliOptions struct {
 	loginTimeout                        int
 	noOpen                              bool
 	uiPort                              int
+	// The egress editing commands.
+	egressMatch, egressAction, egressAddress   string
+	egressClientID                             int64
+	egressAt, egressIndex, egressTo            int
+	egressDisabled, egressYes                  bool
+	egressConnect                              int
+}
+
+// egressCommand reads the words after "egress" that name an editing command. The plain egress
+// command, which reports a running client's state, is what is left when none of them follows.
+func egressCommand(args []string) (string, []string, string, error) {
+	if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+		return "egress", args[1:], "", nil
+	}
+	switch args[1] {
+	case "rules", "enable", "disable":
+		return "egress " + args[1], args[2:], "", nil
+	case "test":
+		if len(args) < 3 || strings.HasPrefix(args[2], "-") {
+			return "", nil, "", errors.New("expected: egress test ADDRESS --config PATH")
+		}
+		return "egress test", args[3:], args[2], nil
+	case "rule":
+		if len(args) < 3 {
+			return "", nil, "", errors.New("expected: egress rule add|remove|move|enable|disable --config PATH")
+		}
+		switch args[2] {
+		case "add", "remove", "move", "enable", "disable":
+			return "egress rule " + args[2], args[3:], "", nil
+		}
+		return "", nil, "", errors.New("expected: egress rule add|remove|move|enable|disable --config PATH")
+	}
+	return "", nil, "", errors.New("unknown egress command; see --help")
 }
 
 // Parse everything before any config read, update cleanup or network operation.
@@ -65,7 +111,13 @@ func parseCLI(args []string) (cliOptions, error) {
 		}
 		o.command = args[1]
 		args = args[2:]
-	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "egress" || args[0] == "doctor" || args[0] == "ui") {
+	} else if len(args) > 0 && args[0] == "egress" {
+		command, rest, address, err := egressCommand(args)
+		if err != nil {
+			return o, err
+		}
+		o.command, o.egressAddress, args = command, address, rest
+	} else if len(args) > 0 && (args[0] == "status" || args[0] == "peers" || args[0] == "services" || args[0] == "doctor" || args[0] == "ui") {
 		o.command = args[0]
 		args = args[1:]
 	}
@@ -85,6 +137,15 @@ func parseCLI(args []string) (cliOptions, error) {
 	fs.BoolVar(&o.noOpen, "no-open", false, "")
 	fs.IntVar(&o.uiPort, "port", 0, "")
 	fs.IntVar(&o.loginTimeout, "login-timeout", 60, "")
+	fs.StringVar(&o.egressMatch, "match", "", "")
+	fs.StringVar(&o.egressAction, "action", "", "")
+	fs.Int64Var(&o.egressClientID, "egress-client-id", 0, "")
+	fs.IntVar(&o.egressAt, "at", -1, "")
+	fs.IntVar(&o.egressIndex, "index", -1, "")
+	fs.IntVar(&o.egressTo, "to", -1, "")
+	fs.BoolVar(&o.egressDisabled, "disabled", false, "")
+	fs.BoolVar(&o.egressYes, "yes", false, "")
+	fs.IntVar(&o.egressConnect, "connect", 0, "")
 	// Keep the existing verified Windows updater protocol, but hide it in public help.
 	fs.BoolVar(&o.helper, client.UpdateHelperFlagName, false, "")
 	fs.IntVar(&o.parentPID, client.UpdateParentPIDFlagName, 0, "")
@@ -103,11 +164,16 @@ func parseCLI(args []string) (cliOptions, error) {
 		return o, errors.New("unexpected command or argument; see --help")
 	}
 	uiFlag := false
+	given := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
+		given[f.Name] = true
 		if f.Name == "port" || f.Name == "no-open" {
 			uiFlag = true
 		}
 	})
+	if err := checkEgressFlags(o, given); err != nil {
+		return o, err
+	}
 	if (uiFlag && o.command != "ui") || o.uiPort < 0 || o.uiPort > 65535 {
 		return o, errors.New("--no-open and --port (0..65535) are only valid for ui")
 	}
@@ -135,4 +201,59 @@ func parseCLI(args []string) (cliOptions, error) {
 
 func printCLIError(err error) string {
 	return fmt.Sprintf("specus-client: %v\nRun specus-client --help for usage.\n", err)
+}
+
+// checkEgressFlags keeps each editing flag to the command it means something to, and each command to
+// the flags it needs, before anything reads the configuration.
+func checkEgressFlags(o cliOptions, given map[string]bool) error {
+	allowed := map[string][]string{
+		"egress rule add":     {"match", "action", "egress-client-id", "at", "disabled"},
+		"egress rule remove":  {"index"},
+		"egress rule enable":  {"index"},
+		"egress rule disable": {"index"},
+		"egress rule move":    {"index", "to"},
+		"egress enable":       {"yes"},
+		"egress test":         {"connect"},
+	}
+	for _, name := range []string{"match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect"} {
+		if !given[name] {
+			continue
+		}
+		permitted := false
+		for _, candidate := range allowed[o.command] {
+			permitted = permitted || candidate == name
+		}
+		if !permitted {
+			return fmt.Errorf("--%s is not valid for %s; see --help", name, commandOrRun(o.command))
+		}
+	}
+	switch o.command {
+	case "egress rule add":
+		if strings.TrimSpace(o.egressMatch) == "" || strings.TrimSpace(o.egressAction) == "" {
+			return errors.New("egress rule add requires --match and --action")
+		}
+	case "egress rule remove", "egress rule enable", "egress rule disable":
+		if !given["index"] || o.egressIndex < 0 {
+			return fmt.Errorf("%s requires --index INDEX (0 or more)", o.command)
+		}
+	case "egress rule move":
+		if !given["index"] || !given["to"] || o.egressIndex < 0 || o.egressTo < 0 {
+			return errors.New("egress rule move requires --index INDEX and --to INDEX (0 or more)")
+		}
+	case "egress test":
+		if given["connect"] && (o.egressConnect < 1 || o.egressConnect > 65535) {
+			return errors.New("--connect requires a port (1..65535)")
+		}
+	}
+	if given["at"] && o.egressAt < 0 {
+		return errors.New("--at requires an index (0 or more)")
+	}
+	return nil
+}
+
+func commandOrRun(command string) string {
+	if command == "" {
+		return "run"
+	}
+	return command
 }

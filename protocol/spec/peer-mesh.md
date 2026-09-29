@@ -663,12 +663,29 @@ C 仅提供服务端，不参与客户端路径 MTU 探测。
 
 ## direct 与 relay
 
-发送优先级按当前 Java 状态机执行：
+Go、Java、.NET 与 Android 客户端按同一发送优先级执行：
 
 1. session 已绑定 `relayTargetAllocationId` 时优先走 `RELAY`；这表示 relay check/data 已明确选定可用目标。
 2. 未绑定 relay 目标且已有健康 `DIRECT` 路径时直接发送。
 3. direct candidate 连通性检查成功后切到 `DIRECT`；收到有效 direct 数据会清理旧 relay 目标，避免路径状态残留。
 4. direct 尚不可用时继续申请/探测 TURN allocation，relay 目标建立后按第 1 条发送。
+
+经 relay 到达的报文只在下列条件下绑定 relay 目标（第 1 条的"明确选定"）：
+
+| 报文 | 不绑定的条件 | 此时的处理 |
+| --- | --- | --- |
+| relay check | 本端 direct 健康：45 s 内收到过对端经 direct 到达的数据帧、check 或 check-response | 仍经 relay 回 check-response，本端数据继续走 direct |
+| relay check-response | 同上 | 忽略，只更新 relay RTT |
+| relay 数据帧 | 最近 3 s 内收到过对端经 direct 到达的任何报文 | 照常交付，记录 relay 成功时间，发送路径不变 |
+
+direct 可用期间，对端仍会周期性探测 relay，所以一个 relay check 不代表对端改走了 relay。数据帧的
+3 s 静默窗口针对在途帧：两条路径延迟不同，切换瞬间两边都有帧在路上，如果每收到一帧就跟随它的路径，
+两端会在 direct 与 relay 之间来回切换；负载越高在途帧越多，两端就停不下来，吞吐跌到 relay 的水平。
+对端真的改走 relay 时（它的 direct 失效），它不再发 direct 报文，3 s 后到达的下一帧 relay 数据就让本端跟随。
+
+对端 key epoch 变化即对端进程已重启，旧端点背后的 socket 已不存在。此时除重置入站解密状态外，本端还清除该
+会话的端点成功时间、端点 RTT 与 direct 成功时间：否则旧端点仍按粘滞规则保留、direct 仍算健康，最长 45 s 内
+每一帧都发往已退出的进程，新进程无论经 direct 还是 relay 发来的 check 都无法改变路径。
 
 服务端 relay 处理 TURN `Send Indication` 中的加密帧时，会解析帧头并调用
 `PeerMeshService.authorizeRelayFrameForRelay`：

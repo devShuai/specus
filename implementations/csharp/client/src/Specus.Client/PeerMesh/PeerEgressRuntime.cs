@@ -13,6 +13,19 @@ internal interface IPeerEgressSocket : IDisposable
     /// <summary>Returns the byte count, or -1 at end of stream.</summary>
     int Read(byte[] buffer);
 
+    /// <summary>
+    /// Reads at most <paramref name="length"/> bytes into the start of <paramref name="buffer"/>. The
+    /// real sockets read straight into it; this default is for the test doubles.
+    /// </summary>
+    int Read(byte[] buffer, int length)
+    {
+        if (length >= buffer.Length) { return Read(buffer); }
+        var part = new byte[length];
+        var read = Read(part);
+        if (read > 0) { Buffer.BlockCopy(part, 0, buffer, 0, read); }
+        return read;
+    }
+
     void Write(byte[] data);
 
     /// <summary>
@@ -63,7 +76,17 @@ internal sealed class PeerEgressRuntime
     private const int TcpReadBuffer = 32 * 1024;
     private const int UdpReadBuffer = 65535;
 
-    private sealed record TcpFlow(PeerEgressTcpConnection Connection, IPeerEgressSocket Socket);
+    private sealed record TcpFlow(PeerEgressTcpConnection Connection, IPeerEgressSocket Socket)
+    {
+        /// <summary>
+        /// Wakes this flow's reader and no other. Readers used to wait on the plane's lock and every
+        /// state machine output pulsed all of them, so each ACK and each tick roused every reader to
+        /// find the credit was someone else's; with sixty-four flows that herd, not the network, set
+        /// the pace. Set with the lock held after anything that may have given this flow credit or
+        /// ended it; reset by the reader, under the lock, only when it has found none.
+        /// </summary>
+        public ManualResetEventSlim Wake { get; } = new(false);
+    }
 
     private sealed record UdpFlow(IPeerEgressSocket Socket);
 
@@ -74,6 +97,8 @@ internal sealed class PeerEgressRuntime
     // Set before publication. Admission must not block or acquire the mesh lock.
     internal Func<long, byte[], bool>? TrySend { get; set; }
     private int _sendCursor;
+    // Whether any flow has had a transmission refused since the last scan of blocked flows.
+    private bool _sendBlocked;
     private readonly IPeerEgressDialer _dialer;
     private readonly Action<Action> _executor;
     private readonly Func<long> _clock;
@@ -106,6 +131,12 @@ internal sealed class PeerEgressRuntime
     private IReadOnlyList<string> _localInterfaces = [];
 
     private readonly PeerEgressFlowTable _flows = new(0);
+
+    // Phase two: the names consumers bound to their fake addresses, how they are resolved, and which
+    // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
+    private readonly PeerEgressNameTable _names = new();
+    private readonly HashSet<PeerEgressFlowTable.Key> _resolving = [];
+    internal Func<string, IReadOnlyList<uint>> Resolve { get; set; } = ResolveName;
     private long _totalFlows;
     private long _bytesIn;
     private long _bytesOut;
@@ -299,6 +330,16 @@ internal sealed class PeerEgressRuntime
     private void HandleControl(long consumer, PeerEgressFrame.Decoded frame, long nowMs)
     {
         var control = PeerEgressFrame.DecodeControl(frame.Body);
+        if (control is not null && control.Type == PeerEgressFrame.ControlNameBind)
+        {
+            // Validated with the frame; the address parses and the name is well formed.
+            Ipv4Cidr.TryParseAddress(control.Address, out var address);
+            lock (_lock)
+            {
+                _names.Bind(consumer, address, PeerEgressNames.Normalize(control.Name));
+            }
+            return;
+        }
         // flow-reject travels egress to consumer. Receiving one means the peer is confused about
         // which end it is, and acting on it would let a consumer close flows by assertion.
         if (control is null || control.Type != PeerEgressFrame.ControlFlowPurge)
@@ -373,8 +414,20 @@ internal sealed class PeerEgressRuntime
     internal void OpenTcpFlow(
         long consumer, PeerEgressFlowTable.Key key, PeerEgressSegment.Segment syn, long nowMs)
     {
+        var destination = ResolveDestination(consumer, key);
+        if (destination is null)
+        {
+            // A retransmitted SYN while the name is still resolving; the first one is opening the flow.
+            return;
+        }
+        if (destination.Value.Code is not null)
+        {
+            Refuse(consumer, key, destination.Value.Code, nowMs);
+            EmitSegment(consumer, PeerEgressSegment.BuildReset(syn));
+            return;
+        }
         Monitor.Enter(_lock);
-        var (reserved, code, opened) = Reserve(consumer, key, nowMs);
+        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs);
         if (code is not null)
         {
             Monitor.Exit(_lock);
@@ -399,7 +452,7 @@ internal sealed class PeerEgressRuntime
         Exception? failure = null;
         try
         {
-            socket = _dialer.Dial("tcp", Ipv4Cidr.FormatAddress(key.RemoteIp), key.RemotePort, ConnectTimeoutMs);
+            socket = _dialer.Dial("tcp", Ipv4Cidr.FormatAddress(destination.Value.Address), key.RemotePort, ConnectTimeoutMs);
         }
         catch (Exception error)
         {
@@ -432,8 +485,17 @@ internal sealed class PeerEgressRuntime
                 syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output);
             if (TrySend is not null)
             {
-                connection.TryTransmit = packet => TrySend(consumer,
-                    PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
+                connection.TryTransmit = packet =>
+                {
+                    var accepted = TrySend(consumer,
+                        PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
+                    if (!accepted)
+                    {
+                        // Transmission runs inside the state machine, under the lock.
+                        Volatile.Write(ref _sendBlocked, true);
+                    }
+                    return accepted;
+                };
             }
             var handle = new TcpFlow(connection, socket);
             flow.Handle = handle;
@@ -452,23 +514,33 @@ internal sealed class PeerEgressRuntime
     {
         _executor(() =>
         {
+            // One buffer for the life of the flow, read into up to the credit. The credit changes on
+            // nearly every read, and sizing a new buffer to it each time allocated up to this much
+            // per read.
             var buffer = new byte[TcpReadBuffer];
             while (true)
             {
+                int size;
                 lock (_lock)
                 {
-                    while (ReferenceEquals(_flows.Lookup(flow.Key), flow) && handle.Connection.AppReadCredit() == 0)
-                    {
-                        Monitor.Wait(_lock);
-                    }
                     if (!ReferenceEquals(_flows.Lookup(flow.Key), flow)) { return; }
-                    var size = Math.Min(TcpReadBuffer, handle.Connection.AppReadCredit());
-                    if (buffer.Length != size) { buffer = new byte[size]; }
+                    size = Math.Min(TcpReadBuffer, handle.Connection.AppReadCredit());
+                    if (size == 0)
+                    {
+                        // Reset under the lock that every credit change is made under, so a Set that
+                        // follows the change cannot come before this and be lost.
+                        handle.Wake.Reset();
+                    }
+                }
+                if (size == 0)
+                {
+                    handle.Wake.Wait();
+                    continue;
                 }
                 int read;
                 try
                 {
-                    read = handle.Socket.Read(buffer);
+                    read = handle.Socket.Read(buffer, size);
                 }
                 catch (Exception)
                 {
@@ -525,7 +597,7 @@ internal sealed class PeerEgressRuntime
     private void ApplyTcpOutput(
         long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle, PeerEgressTcpConnection.Output output)
     {
-        Monitor.PulseAll(_lock);
+        handle.Wake.Set();
         foreach (var packet in output.Segments)
         {
             EmitSegment(consumer, packet);
@@ -559,6 +631,14 @@ internal sealed class PeerEgressRuntime
         if (output.Done || output.Reset)
         {
             Release(flow);
+            return;
+        }
+        if (handle.Connection.CurrentState == PeerEgressTcpConnection.State.TimeWait && !flow.Lingering)
+        {
+            // Both directions are finished: the socket goes now, and the entry stays only to answer a
+            // retransmitted FIN, outside the limits.
+            handle.Socket.Dispose();
+            _flows.Linger(flow);
         }
     }
 
@@ -576,7 +656,19 @@ internal sealed class PeerEgressRuntime
         var flow = _flows.Lookup(key);
         if (flow is null)
         {
-            var (reserved, code, opened) = Reserve(consumer, key, nowMs);
+            Monitor.Exit(_lock);
+            var destination = ResolveDestination(consumer, key);
+            if (destination is null)
+            {
+                return;
+            }
+            if (destination.Value.Code is not null)
+            {
+                Refuse(consumer, key, destination.Value.Code, nowMs);
+                return;
+            }
+            Monitor.Enter(_lock);
+            var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs);
             if (code is not null)
             {
                 Monitor.Exit(_lock);
@@ -597,7 +689,7 @@ internal sealed class PeerEgressRuntime
             Exception? failure = null;
             try
             {
-                socket = _dialer.Dial("udp", Ipv4Cidr.FormatAddress(key.RemoteIp), key.RemotePort, ConnectTimeoutMs);
+                socket = _dialer.Dial("udp", Ipv4Cidr.FormatAddress(destination.Value.Address), key.RemotePort, ConnectTimeoutMs);
             }
             catch (Exception error)
             {
@@ -730,9 +822,19 @@ internal sealed class PeerEgressRuntime
     /// <summary>Called without the mesh lock when the bounded outbound queue frees a slot.</summary>
     internal void SendReady(long nowMs)
     {
+        // Every frame the send loop takes out of the queue lands here, and on most of them no flow
+        // is waiting for room. Scanning and sorting every flow under the plane's lock for each one
+        // anyway put the send loop in line behind every reader, so the scan only runs once a
+        // transmission has actually been refused. A refusal means the queue was full, so the frames
+        // that follow it are enough to bring the scan round.
+        if (!Volatile.Read(ref _sendBlocked))
+        {
+            return;
+        }
         lock (_lock)
         {
             if (_closed) { return; }
+            _sendBlocked = false;
             var snapshot = FlowSnapshot();
             if (snapshot.Count == 0) { return; }
             var start = _sendCursor % snapshot.Count;
@@ -743,6 +845,10 @@ internal sealed class PeerEgressRuntime
                 if (flow.Handle is TcpFlow handle && handle.Connection.SendBlocked)
                 {
                     ApplyTcpOutput(flow.Consumer, flow, handle, handle.Connection.OnTick(nowMs));
+                    if (handle.Connection.SendBlocked)
+                    {
+                        _sendBlocked = true;
+                    }
                 }
             }
         }
@@ -767,11 +873,31 @@ internal sealed class PeerEgressRuntime
     /// already there, and must not dial again.
     /// </remarks>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) Reserve(
-        long consumer, PeerEgressFlowTable.Key key, long nowMs)
+        long consumer, PeerEgressFlowTable.Key key, long nowMs) =>
+        ReserveTo(consumer, key, key.RemoteIp, nowMs);
+
+    /// <summary>
+    /// Reserve for a flow whose socket goes to destination, which differs from the key's remote
+    /// address only for a flow to a name: the key keeps the consumer's fake address, so replies come
+    /// back from it, and the authorization is of the address actually dialled.
+    /// </summary>
+    private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) ReserveTo(
+        long consumer, PeerEgressFlowTable.Key key, uint destination, long nowMs)
+    {
+        if (AuthorizeTo(consumer, key, destination) is { } code)
+        {
+            return (null, code, false);
+        }
+        var opened = _flows.Open(key, consumer, nowMs);
+        return opened is not null ? (opened, null, true) : (_flows.Lookup(key), null, false);
+    }
+
+    /// <summary>The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held.</summary>
+    private string? AuthorizeTo(long consumer, PeerEgressFlowTable.Key key, uint destination)
     {
         if (_closed || !_enabled)
         {
-            return (null, PeerEgressCodes.Disabled, false);
+            return PeerEgressCodes.Disabled;
         }
         var peerAllowed = _peerAclAllows is null || _peerAclAllows(consumer);
 
@@ -779,7 +905,7 @@ internal sealed class PeerEgressRuntime
             new PeerEgressRequest
             {
                 ConsumerClientId = consumer,
-                DestinationIp = Ipv4Cidr.FormatAddress(key.RemoteIp),
+                DestinationIp = Ipv4Cidr.FormatAddress(destination),
                 DestinationPort = key.RemotePort,
                 Protocol = key.ProtocolName(),
                 ActiveFlowsForConsumer = _flows.CountFor(consumer),
@@ -787,12 +913,97 @@ internal sealed class PeerEgressRuntime
                 LocalInterfaceCidrs = _localInterfaces,
             },
             _policy, peerAllowed, _context);
-        if (!decision.Allowed)
+        return decision.Allowed ? null : decision.Code;
+    }
+
+    /// <summary>Where a new flow goes: the address to dial, or the code that refuses it.</summary>
+    internal readonly record struct Choice(uint Address, string? Code);
+
+    /// <summary>
+    /// Picks the address a named flow is dialled to: the first resolved address the authorization
+    /// allows. With none allowed, the first address's refusal is the answer, so the code the consumer
+    /// sees is about the address it would have gone to. With nothing resolved, the name did not resolve.
+    /// </summary>
+    internal static Choice ChooseAddress(IReadOnlyList<uint> addresses, Func<uint, string?> authorize)
+    {
+        if (addresses.Count == 0)
         {
-            return (null, decision.Code, false);
+            return new Choice(0, PeerEgressCodes.NameUnresolved);
         }
-        var opened = _flows.Open(key, consumer, nowMs);
-        return opened is not null ? (opened, null, true) : (_flows.Lookup(key), null, false);
+        string? first = null;
+        foreach (var address in addresses)
+        {
+            var code = authorize(address);
+            if (code is null)
+            {
+                return new Choice(address, null);
+            }
+            first ??= code;
+        }
+        return new Choice(0, first);
+    }
+
+    /// <summary>
+    /// Decides where a new flow's socket goes. Most flows go where the packet says. A flow to an
+    /// address the consumer bound to a name goes to the first address the name resolves to that the
+    /// policy allows: resolving here and dialling that address, with no second lookup, leaves no
+    /// window between the check and the connect. Called with no lock held; the lookup can take a while.
+    /// </summary>
+    /// <remarks>Null for a second packet of a flow whose name is still resolving: the first one is opening it.</remarks>
+    private Choice? ResolveDestination(long consumer, PeerEgressFlowTable.Key key)
+    {
+        string? name;
+        Func<string, IReadOnlyList<uint>> resolver;
+        lock (_lock)
+        {
+            name = _names.Lookup(consumer, key.RemoteIp);
+            if (name is null)
+            {
+                return new Choice(key.RemoteIp, null);
+            }
+            if (!_resolving.Add(key))
+            {
+                return null;
+            }
+            resolver = Resolve;
+        }
+        IReadOnlyList<uint> addresses;
+        try
+        {
+            addresses = resolver(name);
+        }
+        catch (Exception)
+        {
+            addresses = [];
+        }
+        lock (_lock)
+        {
+            _resolving.Remove(key);
+            return ChooseAddress(addresses, address => AuthorizeTo(consumer, key, address));
+        }
+    }
+
+    /// <summary>
+    /// This device's own resolver: the egress resolves in its own network, which is the point of
+    /// sending the name rather than an address. IPv4 only, in the order the resolver returned them.
+    /// </summary>
+    internal static IReadOnlyList<uint> ResolveName(string name)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var addresses = System.Net.Dns.GetHostAddressesAsync(name, System.Net.Sockets.AddressFamily.InterNetwork, timeout.Token)
+                .GetAwaiter().GetResult();
+            return addresses
+                .Select(address => address.GetAddressBytes())
+                .Where(bytes => bytes.Length == 4)
+                .Select(bytes => (uint)bytes[0] << 24 | (uint)bytes[1] << 16 | (uint)bytes[2] << 8 | bytes[3])
+                .ToList();
+        }
+        catch (Exception error) when (error is System.Net.Sockets.SocketException or OperationCanceledException or ArgumentException)
+        {
+            return [];
+        }
     }
 
     /// <summary>
@@ -810,12 +1021,20 @@ internal sealed class PeerEgressRuntime
         {
             decision = Rejections.Record(consumer, code, nowMs);
         }
+        // Who and why, never where: a line per refused destination would be the consumer's browsing
+        // history kept in this device's log. The consumer is told the destination in the control message.
         if (decision.ShouldLog)
         {
-            _logger?.LogInformation(
-                "[peer-egress] refused consumer={Consumer} protocol={Protocol} destination={Destination}:{Port} code={Code} suppressed={Suppressed}",
-                consumer, subject.ProtocolName(), Ipv4Cidr.FormatAddress(subject.RemoteIp),
-                subject.RemotePort, code, decision.Suppressed);
+            if (decision.Suppressed > 0)
+            {
+                _logger?.LogInformation("[peer-egress] refused consumer={Consumer} protocol={Protocol} code={Code} suppressed={Suppressed}",
+                    consumer, subject.ProtocolName(), code, decision.Suppressed);
+            }
+            else
+            {
+                _logger?.LogInformation("[peer-egress] refused consumer={Consumer} protocol={Protocol} code={Code}",
+                    consumer, subject.ProtocolName(), code);
+            }
         }
         EmitFrame(consumer, PeerEgressFrame.TypeControl,
             PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
@@ -836,16 +1055,40 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private void Unreachable(long consumer, PeerEgressFlowTable.Key key, Exception? cause)
     {
-        _logger?.LogInformation(
-            "[peer-egress] connect failed consumer={Consumer} protocol={Protocol} destination={Destination}:{Port} err={Error}",
-            consumer, key.ProtocolName(), Ipv4Cidr.FormatAddress(key.RemoteIp), key.RemotePort,
-            cause?.Message ?? "no socket");
+        _logger?.LogInformation("[peer-egress] connect failed consumer={Consumer} protocol={Protocol} reason={Reason}",
+            consumer, key.ProtocolName(), ConnectReason(cause));
+    }
+
+    /// <summary>
+    /// Why a dial failed, without the addresses exception messages carry, so the log keeps no record of
+    /// where consumers were going. The same words in every runtime.
+    /// </summary>
+    internal static string ConnectReason(Exception? cause)
+    {
+        for (var error = cause; error is not null; error = error.InnerException)
+        {
+            switch (error)
+            {
+                case PeerEgressNoPhysicalRouteException:
+                    return "no route outside the tunnel";
+                case TimeoutException:
+                    return "timed out";
+                case System.Net.Sockets.SocketException socket:
+                    return socket.SocketErrorCode switch
+                    {
+                        System.Net.Sockets.SocketError.ConnectionRefused => "refused",
+                        System.Net.Sockets.SocketError.TimedOut => "timed out",
+                        System.Net.Sockets.SocketError.NetworkUnreachable or System.Net.Sockets.SocketError.HostUnreachable => "unreachable",
+                        _ => "error",
+                    };
+            }
+        }
+        return cause is null ? "no socket" : "error";
     }
 
     /// <summary>Closes one flow's socket and drops its table entry. Called with the lock held.</summary>
     private void Release(PeerEgressFlowTable.Flow flow)
     {
-        Monitor.PulseAll(_lock);
         if (_flows.Lookup(flow.Key) is null)
         {
             return;
@@ -856,7 +1099,6 @@ internal sealed class PeerEgressRuntime
 
     private void ReleaseKey(PeerEgressFlowTable.Key key)
     {
-        Monitor.PulseAll(_lock);
         if (_flows.Close(key) is { } flow)
         {
             CloseHandle(flow.Handle);
@@ -872,7 +1114,6 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private void ReleaseAll(IReadOnlyList<PeerEgressFlowTable.Revocation> revoked, long nowMs)
     {
-        Monitor.PulseAll(_lock);
         foreach (var entry in revoked)
         {
             var flow = entry.Flow;
@@ -910,6 +1151,8 @@ internal sealed class PeerEgressRuntime
         {
             case TcpFlow tcp:
                 tcp.Socket.Dispose();
+                // Its reader may be waiting for credit that will now never come.
+                tcp.Wake.Set();
                 break;
             case UdpFlow udp:
                 udp.Socket.Dispose();

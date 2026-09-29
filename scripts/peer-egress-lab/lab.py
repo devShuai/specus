@@ -22,11 +22,13 @@ routing. Standard library only.
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import hashlib
 import ipaddress
 import itertools
 import json
+import math
 import os
 import re
 import secrets
@@ -61,6 +63,39 @@ TARGET_URL = f"http://{TARGET_IP}"
 DIRECT_URL = f"http://{TARGET_DIRECT_IP}"
 
 CURL_OK, CURL_CONNECT_FAILED, CURL_PARTIAL, CURL_TIMEOUT, CURL_RECV_FAILED = 0, 7, 18, 28, 56
+
+# Issue #50's performance thresholds for this lab. They were agreed before a baseline was taken and
+# are not to be moved towards whatever a run produces: a gate that follows the numbers gates nothing.
+GATE_REPEATS = 5
+GATE_SINGLE_FLOW_BYTES = 8 * 1048576
+GATE_SINGLE_FLOW_MIBPS = 4.0
+GATE_CONCURRENT_FLOWS = 64
+GATE_CONCURRENT_BYTES = 1048576
+GATE_CONCURRENT_MIBPS = 10.0
+GATE_LOSS_PERCENT = 2.0
+GATE_LOSSY_BYTES = 512 * 1024
+GATE_LOSSY_SECONDS = 10.0
+GATE_FIRST_BYTE_SAMPLES = 20
+GATE_FIRST_BYTE_P95_MS = 50.0
+GATE_MEMORY_GROWTH_MIB = 200.0
+
+
+def p95(samples):
+    """Nearest-rank 95th percentile: a value that was actually observed, never an interpolation."""
+    ordered = sorted(samples)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def rss_kib(pid):
+    """The resident set of a live process in KiB, or None once it is gone."""
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
 
 
 class LabAbort(Exception):
@@ -393,6 +428,8 @@ class Lab:
         }
         if rules is not None:
             config["peerEgressRules"] = rules
+            # Rules are only saved until the master switch is on (#49).
+            config["peerEgressEnabled"] = True
         path = self.work / f"{role}.jsonc"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path
@@ -608,19 +645,44 @@ class Lab:
                     problems.append(f"unexpected host route over the tunnel: {line}")
         self.check("route table holds the exact prefix, the bypass /32 and mesh host routes only; no default",
                    not problems, "; ".join(problems) if problems else "\n".join(self.lab_routes(table)))
-        status = self.client_status("consumer")
-        if status:
+        # Every runtime says which path carries each egress peer's traffic and how many flows it has;
+        # a lab consumer that just reached its egress is on one path or the other. The state file is
+        # refreshed on the process's own period, so it is read until it lists the peer.
+        def egress_peers():
+            status = self.client_status("consumer")
+            if not status:
+                return None
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
+            return [peer for instance in status.get("data", {}).get("instances", [])
+                    for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])] or None
+        peers, _ = self.wait_for("the consumer status to list its egress peer", egress_peers, 30, 1.0)
+        self.check("status names the path to the egress and its flow count",
+                   bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
+                                       for peer in peers),
+                   json.dumps(peers))
 
+        # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
+        # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
+        # A reply from the consumer's own address would still fail the check, and a retry is noted,
+        # so a first datagram that goes missing every time would show up rather than be absorbed.
         script = ("import socket\n"
                   "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
-                  "s.settimeout(5)\n"
-                  f"s.sendto(b'lab', ('{TARGET_IP}', {UDP_PORT}))\n"
-                  "print(s.recv(200).decode().strip())\n")
-        got = self.sh(ns("con", sys.executable, "-c", script), check=False, timeout=15)
+                  "s.settimeout(2)\n"
+                  "for attempt in range(1, 4):\n"
+                  f"    s.sendto(b'lab', ('{TARGET_IP}', {UDP_PORT}))\n"
+                  "    try:\n"
+                  "        print(f'attempt={attempt} ' + s.recv(200).decode().strip())\n"
+                  "        break\n"
+                  "    except socket.timeout:\n"
+                  "        continue\n"
+                  "else:\n"
+                  "    print('no reply to 3 datagrams')\n")
+        got = self.sh(ns("con", sys.executable, "-c", script), check=False, timeout=20)
         reply = got.stdout.strip()
         self.check("UDP under the rule leaves from the egress's address",
                    f"src={EGRESS_IP}:" in reply, reply or got.stderr.strip()[-200:])
+        if reply.startswith("attempt=") and not reply.startswith("attempt=1 "):
+            self.note(f"the UDP probe was answered only on a retry ({reply.split()[0]}); earlier datagrams got no reply")
 
         samples_via, samples_direct = [], []
         for _ in range(5):
@@ -747,21 +809,33 @@ class Lab:
         got["body"].unlink(missing_ok=True)
         payload.unlink(missing_ok=True)
 
-    def lossy(self):
-        percent = self.args.loss_percent
+    @contextlib.contextmanager
+    def lossy_link(self, percent):
+        """Drops `percent`% each way on the egress's link for the length of the block. Yields whether
+        netem went on both sides; when it did not, nothing is left installed."""
         router_side = ["tc", "qdisc", "add", "dev", "r-egr", "root", "netem", "loss", f"{percent}%"]
         egress_side = ns("egr", "tc", "qdisc", "add", "dev", "egr0", "root", "netem", "loss", f"{percent}%")
         if shutil.which("tc") is None or self.sh(router_side, check=False).returncode != 0:
-            self.netem = False
-            self.note("netem is not available here; the lossy-link measurement was skipped")
+            yield False
             return
         if self.sh(egress_side, check=False).returncode != 0:
             self.sh(["tc", "qdisc", "del", "dev", "r-egr", "root"], check=False)
-            self.netem = False
-            self.note("netem is not available inside the egress namespace; the lossy-link measurement was skipped")
+            yield False
             return
-        self.netem = True
         try:
+            yield True
+        finally:
+            self.sh(["tc", "qdisc", "del", "dev", "r-egr", "root"], check=False)
+            self.sh(ns("egr", "tc", "qdisc", "del", "dev", "egr0", "root"), check=False)
+
+    def lossy(self):
+        percent = self.args.loss_percent
+        with self.lossy_link(percent) as available:
+            self.netem = available
+            if not available:
+                self.note("netem is not available on the router or inside the egress namespace; "
+                          "the lossy-link measurement was skipped")
+                return
             # Loss recovery is a correctness gate, not only a throughput measurement (#74).
             size = self.args.lossy_blob_bytes
             label = self.human(size)
@@ -785,9 +859,153 @@ class Lab:
                           f"application got {received} B in {self.args.lossy_timeout}s and then "
                           f"{self.describe(got)}; the loss-recovery correctness gate failed.")
             got["body"].unlink(missing_ok=True)
+
+    # -- performance gate (#50) -------------------------------------------------------------------
+
+    def verified_download(self, size, timeout):
+        got = self.curl(f"{TARGET_URL}/blob/{size}", timeout=timeout)
+        ok = got["code"] == CURL_OK and got["body"].exists() and got["body"].stat().st_size == size
+        if ok:
+            with open(got["body"], "rb") as handle:
+                ok = hashlib.file_digest(handle, "sha256").hexdigest() == blob_sha256(size)
+        got["body"].unlink(missing_ok=True)
+        return ok, got
+
+    def verified_upload(self, size, timeout):
+        payload = self.work / f"upload-{size}.bin"
+        if not payload.exists():
+            with open(payload, "wb") as handle:
+                for chunk in blob_chunks(size):
+                    handle.write(chunk)
+        got = self.curl(f"{TARGET_URL}/upload", "-X", "POST", "-H", "Content-Type: application/octet-stream",
+                        "--data-binary", f"@{payload}", timeout=timeout)
+        ok = False
+        if got["code"] == CURL_OK:
+            try:
+                answer = json.loads(got["body"].read_text())
+                ok = answer.get("sha256") == blob_sha256(size) and answer.get("bytes") == size
+            except (json.JSONDecodeError, OSError):
+                pass
+        got["body"].unlink(missing_ok=True)
+        return ok, got
+
+    def gate_median(self, name, rates, intact, floor):
+        title = f"performance gate: {name} >= {floor:g} MiB/s, median of {GATE_REPEATS}"
+        if not intact or len(rates) < GATE_REPEATS:
+            self.check(title, False, f"{len(rates)}/{GATE_REPEATS} runs arrived intact")
+            return
+        median = statistics.median(rates)
+        self.measure(f"gate: {name}, median of {GATE_REPEATS}", round(median, 2), "MiB/s")
+        self.check(title, median >= floor, "runs " + ", ".join(f"{rate:.2f}" for rate in rates) + " MiB/s")
+
+    def performance_gate(self):
+        """Issue #50's thresholds, agreed before any of these numbers were taken; each is a check."""
+        samples = []
+        for _ in range(GATE_FIRST_BYTE_SAMPLES):
+            got = self.whoami(TARGET_URL)
+            if got["code"] == CURL_OK and got["src"] == EGRESS_IP:
+                samples.append(got["firstByte"] * 1000)
+        title = f"performance gate: first byte of a new flow, p95 <= {GATE_FIRST_BYTE_P95_MS:g} ms"
+        if len(samples) < GATE_FIRST_BYTE_SAMPLES:
+            self.check(title, False, f"only {len(samples)}/{GATE_FIRST_BYTE_SAMPLES} new flows went through the egress")
+        else:
+            value = p95(samples)
+            self.measure(f"gate: first byte of a new flow via egress, p95 of {len(samples)}", round(value, 1), "ms")
+            self.check(title, value <= GATE_FIRST_BYTE_P95_MS, f"p95 {value:.1f} ms over {len(samples)} flows")
+
+        size = GATE_SINGLE_FLOW_BYTES
+        for name, transfer in (("single-flow download of 8 MiB", self.verified_download),
+                               ("single-flow upload of 8 MiB", self.verified_upload)):
+            rates, intact = [], True
+            for _ in range(GATE_REPEATS):
+                ok, got = transfer(size, 120)
+                intact = intact and ok
+                if ok and got.get("total"):
+                    rates.append(size / got["total"] / 1048576)
+            self.gate_median(name, rates, intact, GATE_SINGLE_FLOW_MIBPS)
+
+        self.gate_concurrency()
+
+        with self.lossy_link(GATE_LOSS_PERCENT) as available:
+            title = (f"performance gate: {self.human(GATE_LOSSY_BYTES)} with {GATE_LOSS_PERCENT:g}% loss each way "
+                     f"within {GATE_LOSSY_SECONDS:g} s, median of {GATE_REPEATS}")
+            if not available:
+                self.check(title, False, "netem is not available, so the gate could not be measured")
+                return
+            walls, intact = [], True
+            for _ in range(GATE_REPEATS):
+                ok, got = self.verified_download(GATE_LOSSY_BYTES, timeout=60)
+                intact = intact and ok
+                if ok and got.get("total"):
+                    walls.append(got["total"])
+            if not intact or len(walls) < GATE_REPEATS:
+                self.check(title, False, f"{len(walls)}/{GATE_REPEATS} runs arrived intact")
+                return
+            median = statistics.median(walls)
+            self.measure(f"gate: {self.human(GATE_LOSSY_BYTES)} with {GATE_LOSS_PERCENT:g}% loss each way, "
+                         f"median of {GATE_REPEATS}", round(median, 2), "s")
+            self.check(title, median <= GATE_LOSSY_SECONDS, "runs " + ", ".join(f"{wall:.2f}" for wall in walls) + " s")
+
+    def gate_concurrency(self):
+        """A full set of concurrent flows, gated on integrity, aggregate rate and how much memory the
+        consumer and the egress took on to carry it."""
+        flows, size = GATE_CONCURRENT_FLOWS, GATE_CONCURRENT_BYTES
+        roles = ("consumer", "egress")
+        baseline = {role: rss_kib(self.procs[role].popen.pid) for role in roles}
+        peak = dict(baseline)
+        done = threading.Event()
+
+        def sample():
+            while not done.is_set():
+                for role in roles:
+                    value = rss_kib(self.procs[role].popen.pid)
+                    if value is not None and (peak[role] is None or value > peak[role]):
+                        peak[role] = value
+                done.wait(0.1)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
+        mark = self.target_mark()
+        started = time.monotonic()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=flows) as pool:
+                results = list(pool.map(lambda _: self.verified_download(size, 90), range(flows)))
         finally:
-            self.sh(["tc", "qdisc", "del", "dev", "r-egr", "root"], check=False)
-            self.sh(ns("egr", "tc", "qdisc", "del", "dev", "egr0", "root"), check=False)
+            elapsed = time.monotonic() - started
+            done.set()
+            sampler.join()
+        intact = sum(1 for ok, _ in results if ok)
+        aggregate = flows * size / elapsed / 1048576
+        self.measure(f"gate: {flows} concurrent flows of {self.human(size)}, aggregate", round(aggregate, 2), "MiB/s")
+        self.check(f"performance gate: {flows} concurrent flows of {self.human(size)} all intact, "
+                   f"aggregate >= {GATE_CONCURRENT_MIBPS:g} MiB/s",
+                   intact == flows and aggregate >= GATE_CONCURRENT_MIBPS,
+                   f"{intact}/{flows} intact, {aggregate:.2f} MiB/s in {elapsed:.2f} s")
+        for role in roles:
+            title = f"performance gate: {role} memory growth under {flows} flows <= {GATE_MEMORY_GROWTH_MIB:g} MiB"
+            if baseline[role] is None or peak[role] is None:
+                self.check(title, False, f"could not read the {role}'s resident set")
+                continue
+            growth = (peak[role] - baseline[role]) / 1024
+            self.measure(f"gate: {role} resident set growth under {flows} flows", round(growth, 1), "MiB")
+            self.check(title, growth <= GATE_MEMORY_GROWTH_MIB,
+                       f"resident set {baseline[role] / 1024:.0f} MiB before, peak {peak[role] / 1024:.0f} MiB")
+        self.leak_check("performance gate: no local leak under concurrency", mark)
+
+        # The same set again at once. The flows just finished linger in TIME_WAIT for ten seconds,
+        # and while they counted against maxFlowsPerConsumer (#88) the second set was refused until
+        # they expired: every flow completed, eleven seconds late.
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=flows) as pool:
+            results = list(pool.map(lambda _: self.verified_download(size, 90), range(flows)))
+        elapsed = time.monotonic() - started
+        intact = sum(1 for ok, _ in results if ok)
+        aggregate = flows * size / elapsed / 1048576
+        self.measure(f"gate: {flows} concurrent flows again at once, aggregate", round(aggregate, 2), "MiB/s")
+        self.check(f"performance gate: {flows} concurrent flows again at once, all intact, "
+                   f"aggregate >= {GATE_CONCURRENT_MIBPS:g} MiB/s (finished flows do not hold the limit)",
+                   intact == flows and aggregate >= GATE_CONCURRENT_MIBPS,
+                   f"{intact}/{flows} intact, {aggregate:.2f} MiB/s in {elapsed:.2f} s")
 
     # -- fault injection --------------------------------------------------------------------------
 
@@ -1055,6 +1273,8 @@ class Lab:
             self.concurrent_downloads()
             if not self.args.skip_lossy:
                 self.lossy()
+            if self.args.performance_gate:
+                self.performance_gate()
             if not self.args.skip_faults:
                 self.fault_acl_revoked()
                 for attempt in range(self.args.switch_off_repetitions):
@@ -1104,6 +1324,8 @@ def main():
     parser.add_argument("--skip-faults", action="store_true")
     parser.add_argument("--switch-off-repetitions", type=int, choices=range(1, 21), default=1,
                         help="repeat established-flow revocation (1-20 rounds)")
+    parser.add_argument("--performance-gate", action="store_true",
+                        help="check issue #50's agreed throughput, latency, loss and memory thresholds")
     args = parser.parse_args()
     if not args.client and not (args.consumer_client and args.egress_client):
         parser.error("provide --client or both --consumer-client and --egress-client")

@@ -27,7 +27,7 @@ func configWarnings(data []byte, config Config, warn func(string)) {
 			}
 		}
 	}
-	warnEgressRules(config.PeerEgressRules, warn)
+	warnEgressRules(config, warn)
 }
 
 // warnEgressRules names every egress rule that will not be in force, before anything connects.
@@ -39,8 +39,19 @@ func configWarnings(data []byte, config Config, warn func(string)) {
 //
 // Checked against the default mesh network. The real one arrives from the server at login, so a
 // rule that overlaps only a customised mesh network is caught when the rules are applied, not here.
-func warnEgressRules(rules []egressRule, warn func(string)) {
+//
+// Rules kept with the master switch off are the one state where nothing is in force by design, and
+// that is said once rather than left to be discovered. A rule the user switched off is not warned
+// about: it is out of force because they asked, which is not a problem with the configuration.
+func warnEgressRules(config Config, warn func(string)) {
+	rules := config.PeerEgressRules
+	if len(rules) > 0 && !config.PeerEgressEnabled {
+		warn(fmt.Sprintf("peerEgressRules has %d rule(s) but peerEgressEnabled is false: none is in force", len(rules)))
+	}
 	for _, refused := range validateEgressRuleSet(rules, egressDefaultMeshCIDR) {
+		if refused.Code == egressCodeRuleDisabled {
+			continue
+		}
 		warn(fmt.Sprintf("peerEgressRules[%d] is not in force: %s", refused.Index, refused.Code))
 	}
 }

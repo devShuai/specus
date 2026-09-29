@@ -169,6 +169,13 @@ def serve_udp(address, port, log):
         sock.sendto(f"src={peer[0]}:{peer[1]} dst={address}\n".encode(), peer)
 
 
+class TargetServer(ThreadingHTTPServer):
+    # socketserver listens with a backlog of 5. Sixty-four flows arriving at once through the egress
+    # overflow that, the kernel drops the SYNs it has no room for, and a flow fails for want of a
+    # target that any real service would have. The lab is testing the egress, not this server.
+    request_queue_size = 256
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--http-port", type=int, default=80)
@@ -182,7 +189,7 @@ def main():
     for entry in args.udp:
         address, port = entry.rsplit(":", 1)
         threading.Thread(target=serve_udp, args=(address, int(port), log), daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", args.http_port), Handler)
+    server = TargetServer(("0.0.0.0", args.http_port), Handler)
     server.daemon_threads = True
     print("ready", flush=True)
     try:

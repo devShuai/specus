@@ -43,7 +43,10 @@ type consumerStatusSnapshot struct {
 	MeshCIDR string
 	Online   map[int64]bool
 	Flows    int
-	Blocked  map[string]int64
+	// FlowsByEgress counts the live flows each egress carries, so an operator can see which one the
+	// traffic is on.
+	FlowsByEgress map[int64]int
+	Blocked       map[string]int64
 }
 
 func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
@@ -57,12 +60,17 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	for reason, count := range c.blocked {
 		blocked[reason] = count
 	}
+	byEgress := map[int64]int{}
+	for _, flow := range c.flows {
+		byEgress[flow.Egress]++
+	}
 	return consumerStatusSnapshot{
-		Rules:    append([]egressRule(nil), c.rules...),
-		MeshCIDR: c.meshCIDR,
-		Online:   online,
-		Flows:    len(c.flows),
-		Blocked:  blocked,
+		Rules:         append([]egressRule(nil), c.rules...),
+		MeshCIDR:      c.meshCIDR,
+		Online:        online,
+		Flows:         len(c.flows),
+		FlowsByEgress: byEgress,
+		Blocked:       blocked,
 	}
 }
 
@@ -98,14 +106,70 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	outcome := mesh.egressApplied
 	mesh.mu.Unlock()
 
+	// The path each egress peer's traffic takes now, read the way sendEncryptedPayload chooses it:
+	// a nominated relay first, then the direct endpoint, and "none" when there is neither.
+	paths := map[int64]string{}
+	mesh.mu.Lock()
+	for id, session := range mesh.sessions {
+		switch {
+		case session == nil || time.Now().After(session.ExpiresAt):
+		case session.RelayTargetAllocationID != "":
+			paths[id] = egressPathRelay
+		case session.RemoteEndpoint != nil:
+			paths[id] = egressPathDirect
+		}
+	}
+	mesh.mu.Unlock()
+
 	status := map[string]any{}
-	status["consumer"] = consumerStatusJSON(consumer, installer, outcome)
+	section := consumerStatusJSON(consumer, installer, outcome, paths)
+	section["enabled"] = mesh.config.PeerEgressEnabled
+	if !mesh.config.PeerEgressEnabled && len(mesh.config.PeerEgressRules) > 0 {
+		// The switch off builds no consumer, so the rules come from the configuration. They are
+		// listed all the same: "kept but not taking anything over" is a state to show, not to hide.
+		section["rules"] = switchedOffRulesJSON(mesh.config.PeerEgressRules)
+	}
+	status["consumer"] = section
 	status["egress"] = egressRoleStatusJSON(runtime)
 	return status
 }
 
+// switchedOffRulesJSON lists configured rules while the master switch is off. None is in force; a
+// rule the user switched off says so itself, the rest name the master switch.
+func switchedOffRulesJSON(configured []egressRule) []map[string]any {
+	rules := make([]map[string]any, 0, len(configured))
+	for index, rule := range configured {
+		code := egressCodeConsumerDisabled
+		if rule.switchedOff() {
+			code = egressCodeRuleDisabled
+		}
+		entry := map[string]any{
+			"index":   index,
+			"match":   strings.TrimSpace(rule.Match),
+			"action":  strings.TrimSpace(rule.Action),
+			"inForce": false,
+			"code":    code,
+		}
+		if rule.EgressClientID != 0 {
+			entry["egressClientId"] = rule.EgressClientID
+		}
+		if rule.Port != 0 {
+			entry["port"] = rule.Port
+		}
+		rules = append(rules, entry)
+	}
+	return rules
+}
+
+// The values of a peer entry's path: what carries frames to that egress now.
+const (
+	egressPathDirect = "direct"
+	egressPathRelay  = "relay"
+	egressPathNone   = "none"
+)
+
 func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstaller,
-	outcome egressApplyOutcome) map[string]any {
+	outcome egressApplyOutcome, paths map[int64]string) map[string]any {
 	section := map[string]any{
 		"active": consumer != nil,
 		"rules":  []map[string]any{},
@@ -151,7 +215,7 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 		rules = append(rules, entry)
 	}
 	section["rules"] = rules
-	section["peers"] = egressPeersJSON(peers)
+	section["peers"] = egressPeersJSON(peers, snapshot.FlowsByEgress, paths)
 	section["flows"] = snapshot.Flows
 	section["blocked"] = snapshot.Blocked
 	section["routes"] = routesStatusJSON(installer, outcome)
@@ -204,7 +268,7 @@ func routesStatusJSON(installer *egressRouteInstaller, outcome egressApplyOutcom
 	return routes
 }
 
-func egressPeersJSON(peers map[int64]bool) []map[string]any {
+func egressPeersJSON(peers map[int64]bool, flows map[int64]int, paths map[int64]string) []map[string]any {
 	ids := make([]int64, 0, len(peers))
 	for id := range peers {
 		ids = append(ids, id)
@@ -212,7 +276,11 @@ func egressPeersJSON(peers map[int64]bool) []map[string]any {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	entries := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
-		entries = append(entries, map[string]any{"clientId": id, "online": peers[id]})
+		path := paths[id]
+		if path == "" {
+			path = egressPathNone
+		}
+		entries = append(entries, map[string]any{"clientId": id, "online": peers[id], "path": path, "flows": flows[id]})
 	}
 	return entries
 }

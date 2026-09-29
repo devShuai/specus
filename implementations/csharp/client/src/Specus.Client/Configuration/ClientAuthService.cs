@@ -426,7 +426,7 @@ public sealed class ClientEgressCapabilities
     [JsonPropertyName("egressCapable")]
     public bool EgressCapable { get; set; }
 
-    /// <summary>Phase one carries address targets only.</summary>
+    /// <summary>A domain-capable egress honours name-bind (protocol/spec/peer-egress-dns.md).</summary>
     [JsonPropertyName("domainTargetCapable")]
     public bool DomainTargetCapable { get; set; }
 
@@ -443,6 +443,9 @@ public sealed class ClientEgressCapabilities
         Version = Specus.Protocol.PeerEgress.PeerEgressProtocol.ProtocolVersion,
         ConsumerCapable = Specus.Client.PeerMesh.PeerEgressRouteCommanders.TakeoverSupported(),
         EgressCapable = true,
+        // The egress resolves names consumers bind. IPv6 targets are not announced: the outbound
+        // socket binding that keeps forwarded traffic out of this device's own tunnel is IPv4 only.
+        DomainTargetCapable = true,
     };
 }
 

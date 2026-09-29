@@ -159,6 +159,45 @@ def run(command, name, browser_enabled, output, peers=()):
                 assert not request("/api/status", token=token)["runtime"]["processRunning"]
                 checks += 6
 
+                # The egress editor. Every runtime serves the same routes with the same answers, makes
+                # the changes the egress commands make, and refuses a change against a file that moved
+                # since the page read it.
+                def change(rev, expected=200, **fields):
+                    return request("/api/egress/change", dict(revision=rev, **fields), token, expected=expected)
+                def matches(listing):
+                    return [rule["match"] for rule in listing["rules"]]
+                rules = request("/api/egress", token=token)
+                assert rules["enabled"] is False and rules["rules"] == [] and rules["revision"] == saved["revision"], rules
+                wire("GET", "/api/egress/change", expected=(405,))
+                added = change(rules["revision"], op="add", match="203.0.113.0/24", action="egress", egressClientId=42)
+                assert added["saved"] is True and matches(added) == ["203.0.113.0/24"], added
+                assert added["rules"][0]["code"] == "EGRESS_CONSUMER_DISABLED" and added["rules"][0]["enabled"] is True, added
+                refused = change(added["revision"], 422, op="add", match="example.com", action="direct")
+                assert "EGRESS_RULE_DOMAIN_UNSUPPORTED" in refused["error"], refused
+                change(rules["revision"], 409, op="remove", index=0)
+                first = change(added["revision"], op="add", match="198.51.100.0/24", action="block", at=0, disabled=True)
+                assert matches(first) == ["198.51.100.0/24", "203.0.113.0/24"] and first["rules"][0]["enabled"] is False, first
+                moved = change(first["revision"], op="move", index=0, to=1)
+                assert matches(moved) == ["203.0.113.0/24", "198.51.100.0/24"], moved
+                change(moved["revision"], 422, op="remove", index=5)
+                change(moved["revision"], 422, op="takeover", enabled=True)
+                on = change(moved["revision"], op="takeover", enabled=True, confirmed=True)
+                assert on["enabled"] is True and on["rules"][0]["inForce"] is True and "code" not in on["rules"][0], on
+                assert any("peerMeshDevice is noop" in line for line in on["warnings"]), on
+                assert change(on["revision"], op="takeover", enabled=True, confirmed=True)["saved"] is False
+                preview = request("/api/egress/test", dict(address="203.0.113.9"), token)
+                assert preview["matchedRuleIndex"] == 0 and preview["result"] == "egress" and preview["egressClientId"] == 42, preview
+                request("/api/egress/test", dict(address="example.com"), token, expected=422)
+                off = change(on["revision"], op="takeover", enabled=False)
+                cleared = change(change(off["revision"], op="remove", index=1)["revision"], op="remove", index=0)
+                assert cleared["enabled"] is False and cleared["rules"] == [], cleared
+                text = fixture.config.read_text(encoding="utf-8")
+                assert '"peerEgressEnabled": false' in text and '"peerEgressRules": []' in text, text
+                assert b"/api/egress/change" in wire("GET", "/app.js") and b"rules-list" in wire("GET", "/"), \
+                    "the served page predates the egress editor"
+                saved = request("/api/config", token=token)
+                checks += 14
+
                 # Rejection and a cancelled in-flight HTTP login must leave management alive.
                 auth.status = 403
                 count = auth.logins

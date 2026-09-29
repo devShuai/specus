@@ -33,6 +33,7 @@ func (d *fakePeerVirtualDevice) Error() string                                 {
 func applyEgressRulesForTest(t *testing.T, mesh *peerMeshClient, rules []egressRule, runtime RuntimeConfig) {
 	t.Helper()
 	mesh.config.PeerEgressRules = rules
+	mesh.config.PeerEgressEnabled = true
 	if mesh.egressJournalPath == "" {
 		mesh.egressJournalPath = journalPath(t)
 	}
@@ -64,6 +65,7 @@ func newReconcileHarness(t *testing.T, rules ...egressRule) *reconcileHarness {
 		now:       time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC),
 	}
 	harness.mesh.config.PeerEgressRules = rules
+	harness.mesh.config.PeerEgressEnabled = true
 	harness.mesh.egressCommander = harness.commander
 	harness.mesh.egressBypass = newEgressBypassResolver(func(host string) ([]net.IP, error) {
 		if ips, ok := harness.lookups[host]; ok {

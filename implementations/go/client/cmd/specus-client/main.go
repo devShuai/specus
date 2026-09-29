@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,6 +57,9 @@ func runCLI(args []string) int {
 	if options.command == "status" || options.command == "peers" || options.command == "services" ||
 		options.command == "egress" {
 		return queryState(options, path)
+	}
+	if strings.HasPrefix(options.command, "egress ") {
+		return runEgressCommand(options, path)
 	}
 	if options.command == "ui" {
 		return runLocalUI(options, path)

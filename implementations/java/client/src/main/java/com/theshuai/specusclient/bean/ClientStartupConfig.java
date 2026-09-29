@@ -24,6 +24,11 @@ public class ClientStartupConfig {
      * whose tests all called the mesh with rules directly and so never saw it.
      */
     private List<PeerEgressRule> peerEgressRules = List.of();
+    /**
+     * The consumer's master switch: "take over system traffic". Off by default; the rules are then
+     * kept and none is applied. Saving rules and taking over traffic are separate steps (#49).
+     */
+    private boolean peerEgressEnabled;
     /** Startup + periodic catalogue check. Java phase one only notifies; it never replaces the jar. */
     private boolean updateCheckEnabled = true;
     /** Accepted for the shared cross-client schema; Java phase one deliberately never self-updates. */

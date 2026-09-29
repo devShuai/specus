@@ -103,7 +103,11 @@ internal sealed class LocalUi(ClientCliOptions options, string configPath)
                 }
                 return new { schemaVersion = 1, accepted = true };
             }
-            if (path is "/api/config" or "/api/status" or "/api/config/save" or "/api/config/validate" or "/api/connection") throw new Failure(405, "此接口不支持该方法");
+            if (path == "/api/egress" && method == "GET") return EgressEdit.UiRules(configPath);
+            if (path == "/api/egress/change" && method == "POST") return EgressEdit.UiChange(configPath, body);
+            if (path == "/api/egress/test" && method == "POST") return EgressEdit.UiTest(configPath, body);
+            if (path is "/api/config" or "/api/status" or "/api/config/save" or "/api/config/validate" or "/api/connection"
+                or "/api/egress" or "/api/egress/change" or "/api/egress/test") throw new Failure(405, "此接口不支持该方法");
             throw new Failure(404, "接口不存在");
         }
         finally { _operations.Release(); }

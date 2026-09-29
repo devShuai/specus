@@ -45,6 +45,26 @@ owns and reinstalls them a couple of seconds later; requests under a rule go out
 window. It reproduces on some runs and not others, which is why the probe that catches it also
 captures the consumer's routing table at that instant. Tracked in issue #73.
 
+## Performance gate (#50)
+
+`--performance-gate` checks the thresholds agreed in issue #50 before any baseline was taken. They
+are constants at the top of `lab.py` and are not to be moved towards whatever a run produces.
+
+| Measurement | Threshold |
+| --- | --- |
+| Single-flow 8 MiB download, median of 5 | ≥ 4 MiB/s, every run SHA-256 verified |
+| Single-flow 8 MiB upload, median of 5 | ≥ 4 MiB/s, every run verified by the target |
+| 64 concurrent flows of 1 MiB | all intact, aggregate ≥ 10 MiB/s |
+| 512 KiB with 2% loss each way, median of 5 | ≤ 10 s, every run intact |
+| First byte of a new flow, 20 flows | p95 ≤ 50 ms |
+| Consumer and egress resident set growth under the 64 flows | ≤ 200 MiB each |
+
+The target listens with a backlog of 256. Python's default of 5 made the kernel drop SYNs when 64
+flows arrived at once, and a flow failed for want of a target any real service would have.
+
+CI runs every consumer language against every egress language, Go, Java and .NET, nine jobs in
+all, each with the full acceptance list and the gate. The server is Go in every one.
+
 ## Running it
 
 CI runs it in `.github/workflows/peer-egress-lab.yml`. By hand, with both binaries built:

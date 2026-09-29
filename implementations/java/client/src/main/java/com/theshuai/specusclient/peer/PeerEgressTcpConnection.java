@@ -127,7 +127,7 @@ final class PeerEgressTcpConnection {
     private int sndWnd;
     private int sndWl1;
     private int sndWl2;
-    private byte[] pending = new byte[0];
+    private final SendQueue pending = new SendQueue();
     // Nonblocking transport admission; null keeps the deterministic output-only model.
     java.util.function.Predicate<byte[]> tryTransmit;
     boolean sendBlocked;
@@ -266,7 +266,7 @@ final class PeerEgressTcpConnection {
                 sndNxt, 0, PeerEgressSegment.FLAG_RST, 0, 0, new byte[0])));
         state = State.CLOSED;
         retransmit.clear();
-        pending = new byte[0];
+        pending.clear();
         reassembly.clear();
         output.done = true;
         output.reset = true;
@@ -295,7 +295,7 @@ final class PeerEgressTcpConnection {
                     || segment.seq() == rcvNxt) {
                 state = State.CLOSED;
                 retransmit.clear();
-                pending = new byte[0];
+                pending.clear();
                 reassembly.clear();
                 output.done = true;
                 output.reset = true;
@@ -550,9 +550,7 @@ final class PeerEgressTcpConnection {
         }
         if (data.length > appReadCredit()) { reset(output); return output; }
         lastActivityMs = nowMs;
-        int previous = pending.length;
-        pending = Arrays.copyOf(pending, previous + data.length);
-        System.arraycopy(data, 0, pending, previous, data.length);
+        pending.add(data);
         flushSend(output, nowMs);
         return output;
     }
@@ -560,20 +558,20 @@ final class PeerEgressTcpConnection {
     /** Both unsent and unacknowledged bytes consume credit; socket readers wait for ACKs. */
     int appReadCredit() {
         if (appClosed || (state != State.SYN_RECEIVED && state != State.ESTABLISHED && state != State.CLOSE_WAIT)) { return 0; }
-        return Math.max(0, SEND_BUFFER - pending.length - (sndNxt - sndUna));
+        return Math.max(0, SEND_BUFFER - pending.size() - (sndNxt - sndUna));
     }
 
     private int sendCredit() { return Math.max(0, Math.min(sndWnd, 4 * sndMss) - (sndNxt - sndUna)); }
 
     private void flushSend(Output output, long nowMs) {
         if (state != State.ESTABLISHED && state != State.CLOSE_WAIT) { return; }
-        while (pending.length > 0 && sendCredit() > 0) {
-            int n = Math.min(pending.length, Math.min(sndMss, sendCredit()));
+        while (pending.size() > 0 && sendCredit() > 0) {
+            int n = Math.min(pending.size(), Math.min(sndMss, sendCredit()));
             if (!emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
-                    Arrays.copyOf(pending, n), nowMs, 0)) { return; }
-            pending = Arrays.copyOfRange(pending, n, pending.length);
+                    pending.peek(n), nowMs, 0)) { return; }
+            pending.skip(n);
         }
-        if (appClosed && pending.length == 0 && sendCredit() > 0 && !finSent) {
+        if (appClosed && pending.size() == 0 && sendCredit() > 0 && !finSent) {
             if (!emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
                     new byte[0], nowMs, 0)) { return; }
             state = state == State.CLOSE_WAIT ? State.LAST_ACK : State.FIN_WAIT_1;
@@ -624,14 +622,14 @@ final class PeerEgressTcpConnection {
         }
         flushSend(output, nowMs);
         if (sndWnd == 0 && state != State.SYN_RECEIVED
-                && (pending.length > 0 || !retransmit.isEmpty() || appClosed)) {
+                && (pending.size() > 0 || !retransmit.isEmpty() || appClosed)) {
             if (persistAtMs < 0) { persistAtMs = nowMs; return output; }
             if (nowMs - persistAtMs < rtoMs) { return output; }
             persistAtMs = nowMs;
-            if (retransmit.isEmpty() && pending.length > 0) {
+            if (retransmit.isEmpty() && pending.size() > 0) {
                 if (emit(output, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
-                        Arrays.copyOf(pending, 1), nowMs, 0)) {
-                    pending = Arrays.copyOfRange(pending, 1, pending.length);
+                        pending.peek(1), nowMs, 0)) {
+                    pending.skip(1);
                 }
             } else {
                 int seq = sndNxt - 1;
@@ -647,7 +645,7 @@ final class PeerEgressTcpConnection {
             }
             return output;
         }
-        if (retransmit.isEmpty() && pending.length == 0 && keepalive(nowMs, output)) {
+        if (retransmit.isEmpty() && pending.size() == 0 && keepalive(nowMs, output)) {
             return output;
         }
 
@@ -706,5 +704,68 @@ final class PeerEgressTcpConnection {
                 sndNxt - 1, rcvNxt, PeerEgressSegment.FLAG_ACK,
                 PeerEgressSegment.advertisedWindow(rcvWnd), 0, new byte[0])));
         return false;
+    }
+
+    /**
+     * Bytes read from the real socket and not yet sent, kept as the chunks they arrived in.
+     *
+     * <p>Taking a segment copies only that segment. Holding them in one array that was re-cut after
+     * every segment copied the whole unsent remainder each time, up to {@link #SEND_BUFFER} bytes
+     * per segment of about a thousand: the allocation rate, not live data, is what made a busy
+     * egress's heap grow by hundreds of megabytes.
+     */
+    static final class SendQueue {
+        private final java.util.ArrayDeque<byte[]> chunks = new java.util.ArrayDeque<>();
+        private int headOffset;
+        private int size;
+
+        int size() {
+            return size;
+        }
+
+        /** Keeps {@code data} itself; the caller hands over an array it does not reuse. */
+        void add(byte[] data) {
+            if (data.length > 0) {
+                chunks.addLast(data);
+                size += data.length;
+            }
+        }
+
+        /** Copies the first {@code count} bytes without removing them. */
+        byte[] peek(int count) {
+            byte[] out = new byte[count];
+            int filled = 0;
+            int offset = headOffset;
+            var iterator = chunks.iterator();
+            while (filled < count) {
+                byte[] chunk = iterator.next();
+                int take = Math.min(chunk.length - offset, count - filled);
+                System.arraycopy(chunk, offset, out, filled, take);
+                filled += take;
+                offset = 0;
+            }
+            return out;
+        }
+
+        void skip(int count) {
+            size -= count;
+            while (count > 0) {
+                byte[] head = chunks.peekFirst();
+                int available = head.length - headOffset;
+                if (count < available) {
+                    headOffset += count;
+                    return;
+                }
+                count -= available;
+                chunks.removeFirst();
+                headOffset = 0;
+            }
+        }
+
+        void clear() {
+            chunks.clear();
+            headOffset = 0;
+            size = 0;
+        }
     }
 }

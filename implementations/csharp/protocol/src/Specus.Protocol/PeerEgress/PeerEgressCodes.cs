@@ -32,6 +32,10 @@ public static class PeerEgressCodes
     public const string RuleMeshOverlap = "EGRESS_RULE_MESH_OVERLAP";
     public const string RuleDefaultRoute = "EGRESS_RULE_DEFAULT_ROUTE";
     public const string RulePortUnsupported = "EGRESS_RULE_PORT_UNSUPPORTED";
+    /// <summary>A rule the user switched off: kept in the list, out of force.</summary>
+    public const string RuleDisabled = "EGRESS_RULE_DISABLED";
+    /// <summary>The consumer's master switch is off: rules are kept and nothing is taken over.</summary>
+    public const string ConsumerDisabled = "EGRESS_CONSUMER_DISABLED";
 
     // SPEG1 frame decoding.
     public const string FrameBadMagic = "EGRESS_FRAME_BAD_MAGIC";
@@ -42,6 +46,13 @@ public static class PeerEgressCodes
     public const string Ipv6Unsupported = "EGRESS_IPV6_UNSUPPORTED";
     public const string FrameMalformedControl = "EGRESS_FRAME_MALFORMED_CONTROL";
     public const string ControlUnsupported = "EGRESS_CONTROL_UNSUPPORTED";
+
+    // Phase two, domain rules (protocol/spec/peer-egress-dns.md).
+    public const string NameUnresolved = "EGRESS_NAME_UNRESOLVED";
+    public const string NameUnsupported = "EGRESS_NAME_UNSUPPORTED";
+    public const string RuleFakeIpOverlap = "EGRESS_RULE_FAKE_IP_OVERLAP";
+    public const string FakeIpPoolInvalid = "EGRESS_FAKE_IP_POOL_INVALID";
+    public const string RuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN";
 
     /// <summary>
     /// Every code this build defines.
@@ -56,9 +67,10 @@ public static class PeerEgressCodes
         HopNotAllowed, Disabled, PeerAclDenied, ConsumerDenied, ForbiddenDestination,
         ScopeDenied, DestinationDenied, ProtocolDenied, PortDenied, LimitExceeded,
         RuleDomainUnsupported, RuleIpv6Unsupported, RuleMalformed, RuleMissingTarget,
-        RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported,
+        RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported, RuleDisabled, ConsumerDisabled,
         FrameBadMagic, FrameUnknownType, FrameReservedSet, FrameTruncated,
         FrameTrailingBytes, Ipv6Unsupported, FrameMalformedControl, ControlUnsupported,
+        NameUnresolved, NameUnsupported, RuleFakeIpOverlap, FakeIpPoolInvalid, RuleEgressNoDomain,
     };
 
     /// <summary>

@@ -53,8 +53,22 @@ public final class PeerEgressStatus {
 
     /** The consumer's own view, taken under its lock. */
     public record ConsumerSnapshot(List<PeerEgressRule> rules, String meshCidr,
-            Map<Long, Boolean> online, int flows, Map<String, Long> blocked) {
+            Map<Long, Boolean> online, int flows, Map<String, Long> blocked,
+            Map<Long, Integer> flowsByEgress, Map<Long, String> paths) {
+
+        /**
+         * The same view with the path each egress peer's traffic takes now, which the mesh knows
+         * and the consumer does not.
+         */
+        public ConsumerSnapshot withPaths(Map<Long, String> paths) {
+            return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths);
+        }
     }
+
+    /** The values of a peer entry's path: what carries frames to that egress now. */
+    public static final String PATH_DIRECT = "direct";
+    public static final String PATH_RELAY = "relay";
+    public static final String PATH_NONE = "none";
 
     /** The egress role's own view, taken under its lock. */
     public record RuntimeSnapshot(boolean enabled, long revision, int flows,
@@ -65,10 +79,53 @@ public final class PeerEgressStatus {
     public static Map<String, Object> section(ConsumerSnapshot consumer,
             List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
             RuntimeSnapshot runtime) {
+        return section(consumer, installed, outcome, runtime, true, List.of());
+    }
+
+    /**
+     * The section with the consumer's master switch. Off, no consumer is built, so the rules come
+     * from the configuration; they are listed all the same, because "kept but not taking anything
+     * over" is a state to show rather than to hide.
+     */
+    public static Map<String, Object> section(ConsumerSnapshot consumer,
+            List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
+            RuntimeSnapshot runtime, boolean enabled, List<PeerEgressRule> configured) {
         Map<String, Object> status = new LinkedHashMap<>();
-        status.put("consumer", consumerSection(consumer, installed, outcome));
+        Map<String, Object> consumerSection = consumerSection(consumer, installed, outcome);
+        consumerSection.put("enabled", enabled);
+        if (!enabled && configured != null && !configured.isEmpty()) {
+            consumerSection.put("rules", switchedOffRules(configured));
+        }
+        status.put("consumer", consumerSection);
         status.put("egress", egressSection(runtime));
         return status;
+    }
+
+    /**
+     * Configured rules while the master switch is off. None is in force; a rule the user switched
+     * off says so itself, the rest name the master switch.
+     */
+    static List<Map<String, Object>> switchedOffRules(List<PeerEgressRule> configured) {
+        List<Map<String, Object>> rules = new ArrayList<>();
+        for (int index = 0; index < configured.size(); index++) {
+            PeerEgressRule rule = configured.get(index);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("index", index);
+            entry.put("match", rule.getMatch() == null ? "" : rule.getMatch().trim());
+            entry.put("action", rule.getAction() == null ? "" : rule.getAction().trim());
+            entry.put("inForce", false);
+            entry.put("code", rule.switchedOff()
+                    ? com.theshuai.common.peeregress.PeerEgressCodes.RULE_DISABLED
+                    : com.theshuai.common.peeregress.PeerEgressCodes.CONSUMER_DISABLED);
+            if (rule.getEgressClientId() != null && rule.getEgressClientId() != 0) {
+                entry.put("egressClientId", rule.getEgressClientId());
+            }
+            if (rule.getPort() != null && rule.getPort() != 0) {
+                entry.put("port", rule.getPort());
+            }
+            rules.add(entry);
+        }
+        return rules;
     }
 
     private static Map<String, Object> consumerSection(ConsumerSnapshot consumer,
@@ -125,7 +182,14 @@ public final class PeerEgressStatus {
 
         List<Map<String, Object>> peerEntries = new ArrayList<>();
         for (Map.Entry<Long, Boolean> peer : peers.entrySet()) {
-            peerEntries.add(Map.of("clientId", peer.getKey(), "online", peer.getValue()));
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("clientId", peer.getKey());
+            entry.put("online", peer.getValue());
+            String path = consumer.paths() == null ? null : consumer.paths().get(peer.getKey());
+            entry.put("path", path == null ? PATH_NONE : path);
+            Integer flowCount = consumer.flowsByEgress() == null ? null : consumer.flowsByEgress().get(peer.getKey());
+            entry.put("flows", flowCount == null ? 0 : flowCount);
+            peerEntries.add(entry);
         }
         section.put("peers", peerEntries);
         section.put("flows", consumer.flows());

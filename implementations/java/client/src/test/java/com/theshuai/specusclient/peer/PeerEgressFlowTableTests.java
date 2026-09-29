@@ -263,4 +263,25 @@ class PeerEgressFlowTableTests {
                 "addresses were compared as signed");
         assertEquals(UDP, first.get(2).protocol(), "TCP did not sort before UDP");
     }
+
+    /**
+     * A flow lingering in TIME_WAIT keeps its entry, to answer a retransmitted FIN, and leaves the
+     * limits: a consumer that finished its connections can open new ones at once.
+     */
+    @Test
+    void lingeringFlowsLeaveTheLimits() {
+        PeerEgressFlowTable table = new PeerEgressFlowTable(60_000);
+        Flow first = table.open(key(PeerEgressSegment.IPV4_PROTOCOL_TCP, "100.96.0.1", 40000, "203.0.113.10", 443), 7, 0);
+        table.open(key(PeerEgressSegment.IPV4_PROTOCOL_TCP, "100.96.0.1", 40001, "203.0.113.10", 443), 7, 0);
+
+        table.linger(first);
+        table.linger(first);
+        assertEquals(1, table.countFor(7));
+        assertEquals(1, table.size());
+        assertNotNull(table.lookup(first.key), "a lingering flow lost its entry before its timer");
+
+        table.close(first.key);
+        assertEquals(1, table.countFor(7), "closing the lingering flow changed the live count");
+        assertEquals(1, table.size());
+    }
 }

@@ -33,4 +33,15 @@ public class PeerEgressRule {
      * instead of silently ignoring the field.
      */
     private Integer port;
+
+    /**
+     * {@code null} for a rule as written; only an explicit {@code false} switches the rule off. A
+     * switched-off rule stays in the list, takes no part in matching and installs no route.
+     */
+    private Boolean enabled;
+
+    /** Whether the user has taken this rule out of force. */
+    public boolean switchedOff() {
+        return Boolean.FALSE.equals(enabled);
+    }
 }

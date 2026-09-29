@@ -254,6 +254,38 @@ class PeerEgressStatusTests {
     }
 
     /**
+     * Every problem is followed by what to do about it, and the path to each egress is counted: an
+     * egress on the relay is slower but working, one online with no path is in force with nowhere to
+     * send. The same lines as the Go and .NET views.
+     */
+    @Test
+    void theViewSaysWhatToDoAboutEachProblem() throws Exception {
+        JsonNode section = MAPPER.readTree("""
+                {"consumer": {"active": true, "flows": 2,
+                  "rules": [{"index": 0, "match": "203.0.113.0/24", "action": "egress", "egressClientId": 42, "inForce": true},
+                            {"index": 1, "match": "198.51.100.0/24", "action": "egress", "egressClientId": 43, "inForce": true},
+                            {"index": 2, "match": "192.0.2.0/24", "action": "egress", "egressClientId": 44, "inForce": true}],
+                  "routes": [{"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24", "installed": false,
+                              "conflict": "203.0.113.0/24 via 192.0.2.1 dev eth0"}],
+                  "peers": [{"clientId": 42, "online": true, "path": "relay", "flows": 2},
+                            {"clientId": 43, "online": true, "path": "none", "flows": 0},
+                            {"clientId": 44, "online": false, "path": "none", "flows": 0}],
+                  "routeError": "ip route replace 192.0.2.0/24 dev specus0: Operation not permitted", "rolledBack": true},
+                 "egress": {"active": false}}""");
+        String output = String.join("\n", EgressView.lines(section));
+        for (String want : List.of(
+                "3 egress peers (1 offline, 1 via relay)",
+                "      fix: remove or narrow that route, or change the rule; the client retries every 60 s",
+                "    egress peer 43: online but no path to it yet",
+                "      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP",
+                "      fix: start egress device 44 or restore its connection; until then its destinations are blocked, not sent locally",
+                "      fix: run the client as administrator or root, with peerMeshDevice set to auto")) {
+            assertTrue(output.contains(want), "missing \"" + want + "\" in:\n" + output);
+        }
+        assertFalse(output.contains("egress peer 42"), "an egress on the relay is counted, not listed:\n" + output);
+    }
+
+    /**
      * The state file may have been written by the Go or .NET client, so a missing or wrongly typed
      * field has to produce a line rather than an exception. A status command that failed on a field
      * somebody spelled differently would be worse than one that prints a zero.

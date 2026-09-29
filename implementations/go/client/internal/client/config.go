@@ -29,6 +29,11 @@ type Config struct {
 	// rather than a server push: the egress's own policy is what the server owns, and it is
 	// enforced again at the egress, so a consumer rule can only ask, never grant.
 	PeerEgressRules []egressRule `json:"peerEgressRules,omitempty"`
+	// PeerEgressEnabled is the consumer's master switch: "take over system traffic". Off, the rules
+	// are kept and nothing is steered. Saving rules and taking over traffic are separate steps
+	// (#49), and the off state is reported at load, in validation and in status rather than being
+	// the silent non-effect the feature exists to prevent.
+	PeerEgressEnabled bool `json:"peerEgressEnabled"`
 }
 
 // UpdatesEnabled defaults to true so packaged clients participate without requiring a config

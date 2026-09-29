@@ -75,7 +75,9 @@ Content-Type: application/json
 
 ## 二、消费端：写规则
 
-在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。列表非空即启用，没有单独的开关。
+在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。**规则写好只是保存，还要把 `peerEgressEnabled` 设为 `true` 才会接管流量**：保存规则与启用系统接管是两步，默认关闭。
+
+开关关闭而规则不为空时，`config validate` 和每次启动都会提示 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，`specus-client egress` 显示 `consumer: takeover off`，每条规则的状态是 `EGRESS_CONSUMER_DISABLED`。启用前请确认：客户端需要创建虚拟网卡与安装路由的权限（`peerMeshDevice` 不能是 `noop`）；只有命中规则的目标会被接管，其余流量保持本地直连；命中 `egress` 规则而出口不可用时流量被阻断，不会改走本机。
 
 ```jsonc
 {
@@ -83,13 +85,17 @@ Content-Type: application/json
   "apiKey": "env:SPECUS_API_KEY",
   "secret": "env:SPECUS_SECRET",
   "peerMeshDevice": "auto",
+  // 启用系统接管；不写或写 false 时规则只保存、不生效
+  "peerEgressEnabled": true,
   "peerEgressRules": [
     // 这个网段经 2 号设备访问
     {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
     // 其中这一台仍然本地直连
     {"match": "203.0.113.10", "action": "direct"},
     // 这个网段一律不通
-    {"match": "198.51.100.0/24", "action": "block"}
+    {"match": "198.51.100.0/24", "action": "block"},
+    // 暂时停用的规则：留在列表里，不参与匹配
+    {"match": "192.0.2.0/24", "action": "egress", "egressClientId": 2, "enabled": false}
   ]
 }
 ```
@@ -116,6 +122,32 @@ Content-Type: application/json
 | `EGRESS_RULE_MESH_OVERLAP` | 与 Peer Mesh 虚拟网段重叠 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 规则里写了 `port`。端口限制只在出口策略里配置 |
 | `EGRESS_RULE_MISSING_TARGET` | `action` 是 `egress` 但没有有效的 `egressClientId` |
+
+规则写 `"enabled": false` 即停用：它留在列表里但不参与匹配、不安装路由，状态里显示 `EGRESS_RULE_DISABLED`。停用是用户的选择，`config validate` 不为它告警。
+
+### 用命令编辑规则
+
+不想手改 JSONC 时，三端都提供同一组编辑命令（Java 为 `java -jar specus-client-exec.jar egress ...`）。它们只改配置文件、不碰正在运行的客户端，运行中的客户端**重启后**才应用；每次写入都会提示这一点。
+
+```bash
+specus-client egress rules --config client.jsonc
+specus-client egress rule add --config client.jsonc --match 203.0.113.0/24 --action egress --egress-client-id 2
+specus-client egress rule add --config client.jsonc --match 203.0.113.10 --action direct --at 0
+specus-client egress rule disable --config client.jsonc --index 1
+specus-client egress rule move --config client.jsonc --index 1 --to 0
+specus-client egress enable --config client.jsonc --yes
+specus-client egress test 203.0.113.5 --config client.jsonc
+```
+
+- `egress rules` 列出开关状态与每条规则，形如 `[0] on 203.0.113.0/24 egress 2`；规则本身会被拒绝时在行尾写明错误码与原因。
+- `egress rule add` 会先按上表校验，会被拒绝的规则不写入（`Rule not added: EGRESS_RULE_DOMAIN_UNSUPPORTED (...)`，退出码 2）。`--at` 指定插入位置，`--disabled` 以停用状态加入。
+- `egress rule remove|enable|disable --index N` 与 `egress rule move --index N --to M` 按 `egress rules` 显示的序号操作。
+- `egress enable` 每次都先说明接管意味着什么（需要创建虚拟网卡与安装路由的权限、只接管命中规则的目标、出口不可用时阻断而不改走本机），不加 `--yes` 时不做任何修改、退出码 2。`peerMeshDevice` 为 `noop` 时另有一行提醒。`egress disable` 直接关闭。
+- `egress test ADDRESS` 只根据配置预演该 IPv4 地址会命中哪条规则、结果是经哪个出口、阻断还是本地直连，**不建立任何连接**；开关关闭时同时给出"开启后会怎样"。加 `--connect PORT` 才会做一次 5 秒内的 TCP 连接测试，它只说明地址可达，不说明走的是哪条路径。域名会被明确拒绝，请先解析成地址。
+
+编辑只替换 `peerEgressRules` 或 `peerEgressEnabled` 这一个值，文件里其他内容与注释原样保留，换行风格（LF/CRLF）跟随原文件；写入是原子的，文件在读取后被别处改过则拒绝写入。`peerEgressRules` 列表内部的注释在编辑后不保留，因为整个列表会按每行一条规则重写。所有子命令都支持 `--json`。
+
+本地管理页（`specus-client ui`）的「出口规则」页提供同样的编辑：列表中逐条启用/停用、上移/下移、删除，表单添加规则，开关开启前弹出同样的影响说明，另可预演地址去向。页面与命令走同一段逻辑，写出的文件相同。
 
 ## 三、确认规则生效
 
