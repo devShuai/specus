@@ -172,6 +172,18 @@ class PeerEgressDnsVectorTests {
         assertEquals(PeerEgressCodes.FAKE_IP_POOL_INVALID, phase.code());
     }
 
+    /**
+     * Names compare with every trailing dot gone, as the reference and the other clients compare
+     * them; a Unicode letter that lower-cases to ASCII still makes a rule's match Unicode.
+     */
+    @Test
+    void normalisesNamesAndRefusesUnicodeBeforeLowerCasing() {
+        assertEquals("example.com", PeerEgressNames.normalize(" Example.COM.. "));
+        assertTrue(PeerEgressNames.validMatch("*.Example.com.."));
+        // The Kelvin sign lower-cases to an ASCII k.
+        assertFalse(PeerEgressNames.validMatch("Kexample.com"));
+    }
+
     /** A match that is neither an address nor a name stays malformed, and rules report their kind. */
     @Test
     void kindsAndNonNames() {

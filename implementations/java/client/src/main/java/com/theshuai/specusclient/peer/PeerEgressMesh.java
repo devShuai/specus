@@ -388,8 +388,17 @@ final class PeerEgressMesh implements AutoCloseable {
         if (!plane.acceptRevision(message.revision())) {
             return;
         }
+        List<String> denied = new ArrayList<>(host.deploymentDenyCidrs());
+        // An egress whose own configuration runs phase two refuses to dial its own pool: such a
+        // flow would be routed into this node's tunnel and steered by this node's own names. Judged
+        // from the configuration and the mesh rather than the last reconcile, which may not have
+        // run when the policy arrives.
+        String ownPool = PeerEgressDns.effectivePool(host.fakeIpCidr());
+        if (PeerEgressDns.phaseTwo(host.consumerEnabled(), host.dnsTakeover(), ownPool, meshCidrOrDefault()).active()) {
+            denied.add(ownPool);
+        }
         PeerEgressAuthorization.Context context = new PeerEgressAuthorization.Context(
-                meshCidrOrDefault(), List.copyOf(host.deploymentDenyCidrs()));
+                meshCidrOrDefault(), List.copyOf(denied));
         plane.setLocalInterfaceCidrs(PeerEgressEndpoints.localInterfaceCidrs());
         plane.applyPolicy(message.policy(), context, System.currentTimeMillis());
         log.info("[peer-egress] policy applied enabled={} revision={} rules={}",
@@ -447,23 +456,25 @@ final class PeerEgressMesh implements AutoCloseable {
      * device's interfaces. An unusable pool stops phase two alone and is said once.
      */
     PeerEgressDns.PhaseTwo phaseTwo() {
-        String cidr = host.fakeIpCidr();
+        String cidr = PeerEgressDns.effectivePool(host.fakeIpCidr());
         PeerEgressDns.PhaseTwo phase = PeerEgressDns.phaseTwo(
                 host.consumerEnabled(), host.dnsTakeover(), cidr, meshCidrOrDefault());
         synchronized (phaseLock) {
-            if (phase.active() && overlapsInterface(cidr.trim())) {
+            if (phase.active() && overlapsInterface(cidr)) {
                 phase = new PeerEgressDns.PhaseTwo(false, PeerEgressCodes.FAKE_IP_POOL_INVALID);
             }
             String state = phase.active() + "|" + phase.code() + "|" + cidr;
             if (host.dnsTakeover() && !state.equals(phaseLogged)) {
                 phaseLogged = state;
+                // Without the pool itself: configuration values stay out of the log, as a rule's
+                // match does.
                 if (phase.active()) {
-                    log.info("[peer-egress-consumer] phase two running, fake-IP pool {}", cidr.trim());
+                    log.info("[peer-egress-consumer] phase two running");
                 } else if (phase.code() != null) {
                     // Phase one carries on; domain rules read as though takeover were off.
-                    log.warn("[peer-egress-consumer] phase two not running: {} (peerEgressFakeIpCidr {}"
-                            + " must be IPv4 /8 to /24, clear of the mesh and of this device's networks)",
-                            phase.code(), cidr == null ? "" : cidr.trim());
+                    log.warn("[peer-egress-consumer] phase two not started: {} (peerEgressFakeIpCidr must be"
+                            + " an IPv4 /8 to /24 clear of the Peer Mesh network and of this device's networks)",
+                            phase.code());
                 }
             }
         }
@@ -524,7 +535,7 @@ final class PeerEgressMesh implements AutoCloseable {
         PeerEgressStatus.Dns dns = null;
         if (host.dnsTakeover()) {
             PeerEgressDns.PhaseTwo phase = phaseTwo();
-            dns = new PeerEgressStatus.Dns(host.fakeIpCidr(), phase.active(), phase.code());
+            dns = new PeerEgressStatus.Dns(PeerEgressDns.effectivePool(host.fakeIpCidr()), phase.active(), phase.code());
         }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,
@@ -559,18 +570,19 @@ final class PeerEgressMesh implements AutoCloseable {
 
     void reconcile(List<PeerEgressRule> rules, long nowMs) {
         if (closed.get()) { return; }
-        // Phase two steers by the pool only where there is a consumer to do the steering: with no
-        // rules nothing is built, and a pool route would hand the TUN packets nobody reads.
+        // While phase two runs the pool is routed and the consumer exists whether or not there are
+        // rules: an address in the pool has to reach something that answers it, even if all it can
+        // be told is that the address stands for nothing.
         PeerEgressDns.PhaseTwo phase = phaseTwo();
         PeerEgressFakeIpPool pool = null;
-        if (phase.active() && !rules.isEmpty()) {
-            pool = poolFor(host.fakeIpCidr());
+        if (phase.active()) {
+            pool = poolFor(PeerEgressDns.effectivePool(host.fakeIpCidr()));
         } else {
             fakeIps = null;
         }
         // Consumer sends can reach the mesh. Never wait for its monitor while holding
         // planLock: mesh shutdown acquires planLock to withdraw routes.
-        Map<Long, List<String>> purge = rules.isEmpty() ? Map.of()
+        Map<Long, List<String>> purge = rules.isEmpty() && pool == null ? Map.of()
                 : configureConsumer(rules, meshCidrOrDefault(), pool, nowMs);
         synchronized (planLock) {
             if (closed.get()) {
@@ -599,7 +611,7 @@ final class PeerEgressMesh implements AutoCloseable {
                     PeerEgressRoutePlanner.plan(rules, bypassAddresses(nowMs), meshCidr, fakeIpCidr);
             logRefusals(plan.refused());
             desired = plan.routes();
-        } else if (!rules.isEmpty() && !deviceWaitLogged) {
+        } else if ((!rules.isEmpty() || fakeIpCidr != null) && !deviceWaitLogged) {
             deviceWaitLogged = true;
             log.warn("[peer-egress-consumer] routes not installed: virtual device is {}",
                     host.deviceStatus());

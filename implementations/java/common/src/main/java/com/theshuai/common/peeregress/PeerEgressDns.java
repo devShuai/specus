@@ -27,6 +27,14 @@ public final class PeerEgressDns {
     }
 
     /**
+     * The pool a {@code peerEgressFakeIpCidr} setting means: the default when it is left empty, the
+     * setting itself otherwise, whether or not it is usable.
+     */
+    public static String effectivePool(String cidr) {
+        return cidr == null || cidr.isBlank() ? DEFAULT_FAKE_IP_CIDR : cidr.trim();
+    }
+
+    /**
      * Null when {@code peerEgressFakeIpCidr} is usable: IPv4, host bits zero, {@code /8} to
      * {@code /24}, clear of the mesh. Overlap with this device's interfaces is the caller's check,
      * at startup; it is not something a vector can hold.
@@ -70,16 +78,14 @@ public final class PeerEgressDns {
     }
 
     /**
-     * The pool a configuration would run phase two with, judged as the configuration stands: the
-     * takeover switch on and the pool usable against the default mesh. The consumer's master switch
-     * is not part of it, so a rule is judged on its own before takeover is turned on. Null when
-     * phase two would not run.
+     * The pool a configuration would run phase two with, judged offline: as though the consumer's
+     * master switch were on, against the default mesh, and without this device's networks, which
+     * are only checked when phase two starts. A rule is so judged on its own before takeover is
+     * turned on. Null when phase two would not run.
      */
     public static String configuredPool(boolean takeover, String cidr) {
-        if (!takeover || poolProblem(cidr, PeerEgressRules.DEFAULT_MESH_CIDR) != null) {
-            return null;
-        }
-        return cidr.trim();
+        String pool = effectivePool(cidr);
+        return phaseTwo(true, takeover, pool, PeerEgressRules.DEFAULT_MESH_CIDR).active() ? pool : null;
     }
 
     /**

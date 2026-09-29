@@ -227,6 +227,95 @@ class PeerEgressPhaseTwoTests {
         assertFalse(installedCidrs.contains(POOL), "the pool route outlived the withdrawal");
     }
 
+    /**
+     * While phase two runs the pool is routed and the consumer exists with no rules at all, so an
+     * address in the pool reaches something that answers it rather than nothing.
+     */
+    @Test
+    void thePoolIsRoutedAndAnsweredWithNoRules() {
+        newMesh().applyRules(List.of());
+
+        JsonNode consumer = consumerStatus();
+        assertTrue(consumer.path("active").asBoolean(), "no consumer while phase two runs");
+        assertTrue(consumer.path("dns").path("takeover").asBoolean());
+        assertNotNull(route(consumer, POOL), "no pool route without rules");
+        assertTrue(installedCidrs.contains(POOL));
+
+        assertTrue(mesh.handleOutbound(synTo("198.18.0.9", 40000)), "a packet into the pool was handed back");
+        assertEquals(1L, consumerStatus().path("blocked").path("fake-ip-unmapped").asLong());
+    }
+
+    /** Off, the same empty rule set takes nothing over, as before phase two existed. */
+    @Test
+    void noRulesAndNoPhaseTwoBuildsNothing() {
+        takeover = false;
+        newMesh().applyRules(List.of());
+
+        assertFalse(consumerStatus().path("active").asBoolean());
+        assertTrue(installedCidrs.isEmpty());
+        assertFalse(mesh.handleOutbound(synTo("198.18.0.9", 40000)));
+    }
+
+    /**
+     * A name-bind that did not go takes its packet with it: the egress could only open a flow to the
+     * fake address itself. Counted as send-failed and not answered, like any failed send; the flow
+     * stays, so the retransmitted SYN carries a name-bind again.
+     */
+    @Test
+    void aFailedNameBindDropsThePacketBehindIt() {
+        List<byte[]> sent = new ArrayList<>();
+        List<byte[]> toTun = new ArrayList<>();
+        boolean[] controlFails = {true};
+        PeerEgressConsumer consumer = new PeerEgressConsumer((egress, frame) -> {
+            PeerEgressFrame.Decoded decoded = PeerEgressFrame.parse(frame);
+            if (decoded.type() == PeerEgressFrame.TYPE_CONTROL && controlFails[0]) {
+                return false;
+            }
+            sent.add(frame);
+            return true;
+        }, toTun::add);
+        PeerEgressFakeIpPool pool = new PeerEgressFakeIpPool(Ipv4Cidr.parse(POOL), () -> 0L);
+        consumer.configure(List.of(rule("example.com", PeerEgressRule.ACTION_EGRESS, 2L)),
+                "100.96.0.0/11", VIRTUAL_IP, pool, 0L);
+        consumer.setEgressOnline(2L, true, 0L);
+        consumer.setDomainCapable(java.util.Set.of(2L), 0L);
+        String fake = pool.query("example.com", 0L).addressText();
+
+        assertEquals(PeerEgressConsumer.Outcome.BLOCKED_NO_EGRESS, consumer.handleOutbound(synTo(fake, 40000), 1L));
+        assertTrue(sent.isEmpty(), "the packet went without its name");
+        assertTrue(toTun.isEmpty(), "a failed send was answered");
+        assertEquals(1L, consumer.blockedCounts().get("send-failed"));
+
+        controlFails[0] = false;
+        assertEquals(PeerEgressConsumer.Outcome.FORWARDED, consumer.handleOutbound(synTo(fake, 40000), 2L));
+        assertEquals(2, sent.size(), "the retransmitted SYN did not carry a name-bind");
+        assertNotNull(control(sent.get(0)));
+    }
+
+    /** An egress whose own configuration runs phase two will not dial its own pool. */
+    @Test
+    void anEgressRunningPhaseTwoRefusesItsOwnPool() throws InterruptedException {
+        newMesh().applyEgressConfig("{\"type\":\"egress-config\",\"enabled\":true,\"revision\":1,\"scope\":\"PUBLIC\","
+                + "\"allowedConsumerClientIds\":[7],\"destinationRules\":[{\"cidr\":\"198.18.0.0/15\","
+                + "\"protocols\":[\"tcp\"],\"portRanges\":[[1,65535]]}]}");
+        byte[] syn = PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                Ipv4Cidr.parseAddress("100.96.0.7"), Ipv4Cidr.parseAddress("198.18.0.9"), 40000, 443,
+                1000, 0, PeerEgressSegment.FLAG_SYN, 65535, 1360, new byte[0]));
+        mesh.handleInboundFrame(7, PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, syn));
+
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        PeerEgressFrame.Control reject = null;
+        while (reject == null && System.nanoTime() < deadline) {
+            reject = frames().stream().map(PeerEgressPhaseTwoTests::control)
+                    .filter(message -> message != null && PeerEgressFrame.CONTROL_FLOW_REJECT.equals(message.type()))
+                    .findFirst().orElse(null);
+            // Refusals leave through the plane's send queue, on its own thread.
+            Thread.sleep(1);
+        }
+        assertNotNull(reject, "the flow into this node's own pool was not refused");
+        assertEquals(PeerEgressCodes.FORBIDDEN_DESTINATION, reject.code());
+    }
+
     @Test
     void noPoolRouteWithoutPhaseTwo() {
         takeover = false;

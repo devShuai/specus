@@ -868,10 +868,12 @@ class PeerEgressRuntimeTests {
     }
 
     /**
-     * Which flows a name-bind closes, bound to the {@code nameBindClosesFlows} section of
-     * {@code peer-egress-dns-v1.json}: each flow is a real UDP session opened through the runtime,
-     * the name it remembers is read back, and a flow the case says is closed must be gone with its
-     * socket closed, and without a flow-reject telling the consumer to drop its side.
+     * Which flows a name-bind closes and which of them the application is reset on, bound to the
+     * {@code nameBindClosesFlows} section of {@code peer-egress-dns-v1.json}. Each flow is a real TCP
+     * flow opened through the runtime and answered with a SYN-ACK; the name it remembers is read
+     * back. A flow the case says is closed must be gone with its socket closed; one it says is reset
+     * must have sent the consumer a RST, and no other may have; and no flow-reject goes out, which
+     * would have the consumer drop the flow its next packet reopens.
      */
     @Test
     void nameBindClosesFlowsAsTheSharedVectorSays() throws IOException {
@@ -898,13 +900,14 @@ class PeerEgressRuntimeTests {
                 int port = sourcePort++;
                 String source = "100.96.0." + consumer;
                 int dialsBefore = harness.dialCount();
-                harness.runtime.handleFrame(consumer, frameFor(PeerEgressDatagram.build(new PeerEgressDatagram.Datagram(
-                        address(source), address(destination), port, 53,
-                        "query".getBytes(java.nio.charset.StandardCharsets.US_ASCII)))), EPOCH);
-                PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(PeerEgressDatagram.IPV4_PROTOCOL_UDP,
-                        address(source), port, address(destination), 53);
+                harness.clearFrames();
+                harness.runtime.handleFrame(consumer, frameFor(PeerEgressSegment.build(
+                        syn(source, port, destination, 443))), EPOCH);
+                PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                        address(source), port, address(destination), 443);
                 assertTrue(harness.runtime.hasFlow(key), where + ": the flow did not open");
                 assertEquals(dialsBefore + 1, harness.dialCount(), where);
+                assertTrue(harness.sawFlag(PeerEgressSegment.FLAG_SYN), where + ": the flow was not answered");
                 com.fasterxml.jackson.databind.JsonNode name = expected.path("name");
                 assertEquals(name.isNull() ? null : name.asText(), harness.runtime.flowName(key), where);
                 open.put(event.path("open").asText(), key);
@@ -913,15 +916,27 @@ class PeerEgressRuntimeTests {
                 harness.clearFrames();
                 bindName(harness, consumer, destination, event.path("nameBind").asText());
                 List<String> closed = new ArrayList<>();
+                List<String> reset = new ArrayList<>();
                 for (var entry : open.entrySet()) {
-                    if (!harness.runtime.hasFlow(entry.getValue())) {
+                    PeerEgressFlowTable.Key key = entry.getValue();
+                    if (!harness.runtime.hasFlow(key)) {
                         closed.add(entry.getKey());
+                    }
+                    boolean wasReset = harness.segments().stream().anyMatch(segment ->
+                            segment.has(PeerEgressSegment.FLAG_RST) && segment.destinationIp() == key.consumerIp()
+                                    && segment.destinationPort() == key.consumerPort());
+                    if (wasReset) {
+                        reset.add(entry.getKey());
                     }
                 }
                 java.util.Collections.sort(closed);
-                List<String> want = new ArrayList<>();
-                expected.path("closed").forEach(id -> want.add(id.asText()));
-                assertEquals(want, closed, where);
+                java.util.Collections.sort(reset);
+                List<String> wantClosed = new ArrayList<>();
+                expected.path("closed").forEach(id -> wantClosed.add(id.asText()));
+                List<String> wantReset = new ArrayList<>();
+                expected.path("reset").forEach(id -> wantReset.add(id.asText()));
+                assertEquals(wantClosed, closed, where + ": closed");
+                assertEquals(wantReset, reset, where + ": reset");
                 for (String id : closed) {
                     assertTrue(harness.socket(socketOf.get(id)).isClosed(), where + ": " + id + "'s socket is open");
                     open.remove(id);
@@ -963,5 +978,9 @@ class PeerEgressRuntimeTests {
         assertTrue(harness.segments().stream().anyMatch(segment -> segment.has(PeerEgressSegment.FLAG_SYN)
                 && segment.has(PeerEgressSegment.FLAG_ACK) && segment.sourceIp() == address("198.18.0.5")),
                 "the retransmitted SYN was not answered from the fake address");
+        // Closed silently: a reset here would have the application refuse the connection the
+        // name-bind came to rescue.
+        assertFalse(harness.sawReset(), "the flow opened before its name was reset");
+        assertTrue(harness.rejectCodes().isEmpty());
     }
 }

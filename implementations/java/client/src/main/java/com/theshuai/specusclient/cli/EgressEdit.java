@@ -130,7 +130,7 @@ public final class EgressEdit {
             case PeerEgressCodes.RULE_MALFORMED -> "not an IPv4 address or CIDR range with zero host bits, or an unknown action";
             case PeerEgressCodes.RULE_DEFAULT_ROUTE -> "0.0.0.0/0 would take over the default route, which is not allowed";
             case PeerEgressCodes.RULE_MESH_OVERLAP -> "overlaps the Peer Mesh network";
-            case PeerEgressCodes.RULE_FAKE_IP_OVERLAP -> "overlaps the fake-IP pool (peerEgressFakeIpCidr), where only domain rules decide";
+            case PeerEgressCodes.RULE_FAKE_IP_OVERLAP -> "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out";
             case PeerEgressCodes.RULE_PORT_UNSUPPORTED -> "a rule cannot be limited to a port; port limits belong on the egress policy";
             case PeerEgressCodes.RULE_MISSING_TARGET -> "an egress rule needs a positive egress device id";
             case PeerEgressCodes.RULE_DISABLED -> "switched off";

@@ -11,13 +11,9 @@ public final class PeerEgressNames {
     private PeerEgressNames() {
     }
 
-    /** No trailing dot, lower case. */
+    /** No trailing dots, lower case. */
     public static String normalize(String name) {
-        String text = name == null ? "" : name.trim();
-        if (text.endsWith(".")) {
-            text = text.substring(0, text.length() - 1);
-        }
-        return text.toLowerCase(Locale.ROOT);
+        return stripTrailingDots(name == null ? "" : name.trim()).toLowerCase(Locale.ROOT);
     }
 
     /**
@@ -81,12 +77,14 @@ public final class PeerEgressNames {
         if (!namesDomain(match)) {
             return false;
         }
-        String text = stripTrailingDots(match.trim()).toLowerCase(Locale.ROOT);
-        for (int i = 0; i < text.length(); i++) {
-            if (text.charAt(i) > 127) {
+        // Checked before lower-casing, which can turn a non-ASCII letter into an ASCII one (the
+        // Kelvin sign becomes k) and let a Unicode name through as punycode-clean.
+        for (int i = 0; i < match.length(); i++) {
+            if (match.charAt(i) > 127) {
                 return false;
             }
         }
+        String text = normalize(match);
         if (text.startsWith("*.")) {
             text = text.substring(2);
         }
@@ -103,7 +101,7 @@ public final class PeerEgressNames {
      * suffix never covers its own apex.
      */
     public static int coverage(String match, String normalizedName) {
-        String base = stripTrailingDots(match == null ? "" : match.trim()).toLowerCase(Locale.ROOT);
+        String base = normalize(match);
         if (base.startsWith("*.")) {
             base = base.substring(2);
             if (!normalizedName.endsWith("." + base)) {

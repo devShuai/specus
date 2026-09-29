@@ -526,12 +526,15 @@ final class PeerEgressConsumer {
         if (sender == null) {
             return Outcome.BLOCKED_NO_EGRESS;
         }
-        if (name != null && needsNameBind(protocol, tcpFlags, fresh, flow)) {
-            // Ahead of the packet, so the egress knows the name when the flow reaches it. Best
-            // effort, as every control message is: a lost one is repaired by the next packet that
-            // carries one, and the packet goes regardless.
-            sender.send(egress, PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
-                    PeerEgressFrame.encodeControl(PeerEgressFrame.Control.nameBind(destination, name))));
+        if (name != null && needsNameBind(protocol, tcpFlags, fresh, flow)
+                && !sender.send(egress, PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                        PeerEgressFrame.encodeControl(PeerEgressFrame.Control.nameBind(destination, name))))) {
+            // Ahead of the packet, so the egress knows the name when the flow reaches it. One that
+            // did not go takes the packet with it: sent anyway, the egress could only open a flow to
+            // the fake address itself. Silent, like any failed send; the flow stays registered, so
+            // the retransmitted SYN or the next datagram carries a name-bind again.
+            recordBlocked("send-failed");
+            return Outcome.BLOCKED_NO_EGRESS;
         }
         // hop stays clear: this node is acting as a consumer, not forwarding on behalf of another
         // egress. An egress that receives it set refuses, which is what stops multi-hop chains.

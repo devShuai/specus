@@ -360,12 +360,7 @@ final class PeerEgressRuntime {
             lock.lock();
             try {
                 names.bind(consumer, address, name);
-                // The consumer's flows to this address that were not opened for this name are
-                // closed the way a revocation closes flows, so the packet that follows opens one by
-                // name. No flow-reject goes with them: the consumer keeps its side, and its next
-                // packet is exactly what should reach a fresh flow here.
-                releaseAll(PeerEgressFlowTable.revocationsFor(
-                        flows.closeUnbound(consumer, address, name), null), nowMs);
+                closeUnbound(flows.closeUnbound(consumer, address, name), nowMs);
             } finally {
                 lock.unlock();
             }
@@ -1147,6 +1142,32 @@ final class PeerEgressRuntime {
         }
         if (!revoked.isEmpty()) {
             log.info("[peer-egress] flows released count={} active={}", revoked.size(), flows.size());
+        }
+    }
+
+    /**
+     * Closes the flows a name-bind found were not opened for its name. Called with the lock held.
+     *
+     * <p>A flow opened before any name arrived is closed silently, on this side only: it dialled the
+     * fake address and never worked, and what follows the name-bind is usually the application's own
+     * retransmitted SYN, which a reset sent now would have it refuse. A flow opened for another name
+     * was a real connection to somewhere the address no longer means, and is reset like a revoked
+     * one. Neither gets a flow-reject, which would have the consumer drop the flow its next packet
+     * reopens here, and its replies refused as return-no-flow.
+     */
+    private void closeUnbound(List<PeerEgressFlowTable.Flow> closed, long nowMs) {
+        List<PeerEgressFlowTable.Flow> named = new ArrayList<>();
+        for (PeerEgressFlowTable.Flow flow : closed) {
+            if (flow.name == null) {
+                closeHandle(flow.handle);
+            } else {
+                named.add(flow);
+            }
+        }
+        releaseAll(PeerEgressFlowTable.revocationsFor(named, null), nowMs);
+        if (named.size() < closed.size()) {
+            log.info("[peer-egress] flows opened before their name closed count={} active={}",
+                    closed.size() - named.size(), flows.size());
         }
     }
 

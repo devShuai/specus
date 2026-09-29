@@ -27,9 +27,12 @@ final class ConfigDiagnostics {
     private static void egressRules(ClientStartupConfig effective, Consumer<String> warning) {
         // Phase two asked for over a pool it cannot use stops phase two alone, so it is said here
         // too: otherwise the domain rules below read as unsupported with nothing naming the pool.
+        // Judged as though the master switch were on, against the default mesh; this device's own
+        // networks are only checked when phase two starts. The wording is the same in all clients.
         if (effective.isPeerEgressDnsTakeover()) {
             String problem = com.theshuai.common.peeregress.PeerEgressDns.poolProblem(
-                    effective.getPeerEgressFakeIpCidr(), com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR);
+                    com.theshuai.common.peeregress.PeerEgressDns.effectivePool(effective.getPeerEgressFakeIpCidr()),
+                    com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR);
             if (problem != null)
                 warning.accept("peerEgressFakeIpCidr is not usable: " + problem + "; domain rules are not in force");
         }
