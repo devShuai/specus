@@ -27,7 +27,13 @@ internal enum PeerEgressConsumerOutcome
     /// Sent into the fake-IP pool at an address no rule steers now: one with no mapping, or one
     /// whose name no rule claims any more or <c>direct</c> claims.
     /// </summary>
-    BlockedFakeIp
+    BlockedFakeIp,
+
+    /// <summary>A DNS query to the listen address, taken by the responder.</summary>
+    DnsQuery,
+
+    /// <summary>A DNS query to the listen address from a source that is not this machine.</summary>
+    BlockedDnsNotLocal
 }
 
 /// <summary>
@@ -229,6 +235,12 @@ internal sealed class PeerEgressConsumer(
 
     /// <summary>The fake-IP pool while phase two runs; null otherwise, which is phase one exactly.</summary>
     private PeerEgressFakeIpPool? _pool;
+
+    /// <summary>
+    /// The DNS responder, which queries to port 53 of the pool's listen address go to while phase
+    /// two runs. Set by the caller under the same serialisation as every other call.
+    /// </summary>
+    public PeerEgressDnsResponder? DnsResponder { get; set; }
 
     /// <summary>
     /// The flows this node remembers, bounded by time and by count (protocol/spec/peer-egress.md,
@@ -458,10 +470,20 @@ internal sealed class PeerEgressConsumer(
         {
             if (address == pool.Listen && IsDnsQuery(packet, protocol))
             {
-                // Port 53 of the responder's address belongs to the responder (step four of
-                // protocol/spec/peer-egress-dns.md), which is not this class; anything else sent to
-                // the responder's address is refused below as unmapped.
-                return PeerEgressConsumerOutcome.NotMine;
+                // Port 53 of the listen address belongs to the responder, ahead of any steering;
+                // anything else sent to the listen address is refused below as unmapped.
+                if (DnsResponder is not { } responder)
+                {
+                    return PeerEgressConsumerOutcome.NotMine;
+                }
+                if (responder.Handle(packet, nowMs) == PeerEgressDnsIntake.NotLocal)
+                {
+                    // Dropped unanswered: this machine is routing somebody else's query, and phase
+                    // two does not resolve names on anybody else's behalf.
+                    RecordBlocked("dns-not-local");
+                    return PeerEgressConsumerOutcome.BlockedDnsNotLocal;
+                }
+                return PeerEgressConsumerOutcome.DnsQuery;
             }
             // Using the address keeps its mapping alive, whatever is decided next.
             name = pool.Use(address, nowMs);

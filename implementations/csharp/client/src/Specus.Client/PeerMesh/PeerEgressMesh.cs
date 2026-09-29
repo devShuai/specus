@@ -71,6 +71,19 @@ internal interface IPeerEgressMeshHost
     /// </summary>
     IReadOnlyList<string> LocalInterfaceNetworks() => PeerEgressEndpoints.LocalInterfaceCidrs();
 
+    /// <summary>
+    /// This device's own interface addresses: besides the mesh address, the only sources the DNS
+    /// responder answers.
+    /// </summary>
+    IReadOnlyList<string> LocalInterfaceAddresses() => PeerEgressEndpoints.LocalInterfaceAddresses();
+
+    /// <summary>
+    /// Where the DNS responder forwards what it does not answer itself: addresses, each with an
+    /// optional port. Step five records the system's own resolvers here; until then it is empty,
+    /// and every forwarded query is answered SERVFAIL.
+    /// </summary>
+    IReadOnlyList<string> DnsUpstreams => [];
+
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
 
@@ -120,13 +133,24 @@ internal interface IPeerEgressMeshHost
 /// machine it is running on.
 /// </param>
 /// <param name="lookup">How bypass hostnames are resolved, or null for the system resolver.</param>
+/// <param name="dnsForwarder">
+/// How the DNS responder reaches its upstreams, or null for real sockets. Injected so a test can
+/// answer in place of a resolver.
+/// </param>
 internal sealed class PeerEgressMesh(
     IPeerEgressMeshHost host,
     ILogger? logger = null,
     IPeerEgressDialer? dialer = null,
     IPeerEgressRouteCommander? commander = null,
-    Func<string, IPAddress[]>? lookup = null) : IDisposable
+    Func<string, IPAddress[]>? lookup = null,
+    IPeerEgressDnsForwarder? dnsForwarder = null) : IDisposable
 {
+    /// <summary>
+    /// Drives the DNS responder's TCP retransmission and idle close. Well under the one-second
+    /// retransmission interval, so a retransmission is never late by much of it.
+    /// </summary>
+    private const int DnsTickIntervalMs = 100;
+
     /// <summary>
     /// Bounds frames waiting for encryption. Egress TCP retains rejected payload/FIN until a
     /// writable notification. UDP and untracked control frames remain best effort; no caller blocks.
@@ -212,6 +236,14 @@ internal sealed class PeerEgressMesh(
     private string? _interfacesCheckedFor;
     private bool _clearOfInterfaces;
     private string _phaseTwoLogged = "";
+
+    /// <summary>
+    /// The DNS responder, built the first time phase two runs and kept, like the pool, so its
+    /// counters describe the whole run. Guarded by <see cref="_phaseLock"/>.
+    /// </summary>
+    private PeerEgressDnsResponder? _dnsResponder;
+    private Timer? _dnsTick;
+    private string _upstreamsRefusedLogged = "";
 
     /// <summary>
     /// Builds the plane and the threads that carry its frames and its clock, on first use.
@@ -427,7 +459,7 @@ internal sealed class PeerEgressMesh(
         {
             return false;
         }
-        if (outcome != PeerEgressConsumerOutcome.Forwarded)
+        if (outcome is not (PeerEgressConsumerOutcome.Forwarded or PeerEgressConsumerOutcome.DnsQuery))
         {
             // Logged without the destination: a per-destination record of what a user was blocked
             // from reaching is their own browsing history.
@@ -563,13 +595,28 @@ internal sealed class PeerEgressMesh(
         }
         PeerEgressPhaseTwo phase;
         PeerEgressFakeIpPool? pool;
+        PeerEgressDnsResponder? responder;
         lock (_phaseLock)
         {
             phase = _phaseTwo ?? DecidePhaseTwoLocked(MeshCidrOrDefault()).Phase;
             pool = phase.Active ? _fakeIpPool : null;
+            responder = _dnsResponder;
+        }
+        // The upstreams and the counters are there whenever the switch is on, so a node whose phase
+        // two stopped still says where it would forward and what it did while it ran; the listen
+        // address only while something answers on it.
+        List<string> upstreams;
+        lock (_phaseLock)
+        {
+            upstreams = [.. DnsUpstreams().Select(upstream => upstream.ToString())];
         }
         return new PeerEgressDnsStatus(phase.Active, host.FakeIpCidr?.Trim() ?? string.Empty,
-            pool?.Mappings ?? 0, pool?.Quarantined(nowMs) ?? 0, phase.Code);
+            pool?.Mappings ?? 0, pool?.Quarantined(nowMs) ?? 0, phase.Code)
+        {
+            Listen = pool is not null && responder is not null ? Ipv4Cidr.FormatAddress(pool.Listen) : null,
+            Upstreams = upstreams,
+            Queries = responder?.Counters ?? new PeerEgressDnsCounters(0, 0, 0),
+        };
     }
 
     /// <summary>
@@ -682,11 +729,12 @@ internal sealed class PeerEgressMesh(
         // into the TUN, and whatever arrives there is refused as unmapped rather than dropped
         // unaccounted for by the mesh path.
         var (_, pool) = DecidePhaseTwo(meshCidr);
+        var responder = pool is null ? null : DnsResponderFor(rules, meshCidr, pool);
         // Consumer callbacks may reach the mesh. Do not wait for their lock while
         // holding _planLock, which mesh shutdown needs when withdrawing routes.
         var purge = rules.Count == 0 && pool is null
             ? new Dictionary<long, IReadOnlyList<string>>()
-            : ConfigureConsumer(rules, meshCidr, pool, nowMs);
+            : ConfigureConsumer(rules, meshCidr, pool, responder, nowMs);
         lock (_planLock)
         {
             lock (_gate)
@@ -859,7 +907,8 @@ internal sealed class PeerEgressMesh(
     /// what has to happen.
     /// </remarks>
     private IReadOnlyDictionary<long, IReadOnlyList<string>> ConfigureConsumer(
-        IReadOnlyList<PeerEgressRule> rules, string meshCidr, PeerEgressFakeIpPool? fakeIpPool, long nowMs)
+        IReadOnlyList<PeerEgressRule> rules, string meshCidr, PeerEgressFakeIpPool? fakeIpPool,
+        PeerEgressDnsResponder? responder, long nowMs)
     {
         var virtualIp = host.VirtualIp?.Trim() ?? string.Empty;
         // Phase two starting or stopping changes which rules are in force, so it is part of what
@@ -869,6 +918,8 @@ internal sealed class PeerEgressMesh(
         var consumerRole = EnsureConsumer();
         lock (consumerRole)
         {
+            // Queries to the listen address reach the responder only while phase two runs.
+            consumerRole.DnsResponder = responder;
             if (string.Equals(key, _consumerKey, StringComparison.Ordinal))
             {
                 return new Dictionary<long, IReadOnlyList<string>>();
@@ -880,6 +931,77 @@ internal sealed class PeerEgressMesh(
                 consumerRole.SetEgressCapabilities(_catalog.Capabilities(), nowMs),
                 consumerRole.Configure(rules, meshCidr, virtualIp, nowMs, fakeIpPool));
             return purge;
+        }
+    }
+
+    /// <summary>
+    /// The DNS responder, built the first time phase two runs, and brought up to date with the rules,
+    /// the pool, this node's mesh address and the upstreams on every reconcile.
+    /// </summary>
+    private PeerEgressDnsResponder DnsResponderFor(IReadOnlyList<PeerEgressRule> rules, string meshCidr,
+        PeerEgressFakeIpPool pool)
+    {
+        PeerEgressDnsResponder responder;
+        lock (_phaseLock)
+        {
+            if (_dnsResponder is null)
+            {
+                lock (_gate)
+                {
+                    // Its answers go out on the device loop, like the consumer's.
+                    EnsureLoops();
+                }
+                var built = new PeerEgressDnsResponder(packet => _deviceQueue.TryAdd(packet), dnsForwarder,
+                    localAddresses: host.LocalInterfaceAddresses, logger: logger);
+                _dnsTick = new Timer(_ => built.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                    null, DnsTickIntervalMs, DnsTickIntervalMs);
+                _dnsResponder = built;
+            }
+            responder = _dnsResponder;
+            responder.Configure(rules, meshCidr, pool, host.VirtualIp, DnsUpstreams());
+        }
+        return responder;
+    }
+
+    /// <summary>
+    /// The upstreams the host names, as addresses. One that does not read as an address, with an
+    /// optional port, is left out and said once: forwarding to a guess would be worse than to fewer.
+    /// Called under <see cref="_phaseLock"/>.
+    /// </summary>
+    private List<PeerEgressDnsUpstream> DnsUpstreams()
+    {
+        var upstreams = new List<PeerEgressDnsUpstream>();
+        var refused = 0;
+        foreach (var text in host.DnsUpstreams)
+        {
+            if (PeerEgressDnsUpstream.TryParse(text, out var upstream))
+            {
+                upstreams.Add(upstream);
+            }
+            else
+            {
+                refused++;
+            }
+        }
+        var said = refused.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (refused > 0 && !string.Equals(said, _upstreamsRefusedLogged, StringComparison.Ordinal))
+        {
+            logger?.LogWarning("[peer-egress-dns] {Count} DNS upstream(s) are not an address with an optional port and are not used",
+                refused);
+        }
+        _upstreamsRefusedLogged = refused > 0 ? said : "";
+        return upstreams;
+    }
+
+    /// <summary>The DNS responder while phase two runs, for tests and the status.</summary>
+    internal PeerEgressDnsResponder? DnsResponder
+    {
+        get
+        {
+            lock (_phaseLock)
+            {
+                return _phaseTwo is { Active: true } ? _dnsResponder : null;
+            }
         }
     }
 
@@ -1139,6 +1261,11 @@ internal sealed class PeerEgressMesh(
             _closed = true;
         }
         _runtime?.Shutdown(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        lock (_phaseLock)
+        {
+            _dnsTick?.Dispose();
+            _dnsTick = null;
+        }
         _stopping.Cancel();
         _sendLoop?.Join(TimeSpan.FromSeconds(1));
         _tickLoop?.Join(TimeSpan.FromSeconds(1));

@@ -254,7 +254,8 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
         Assert.Equal(1, dns.GetProperty("mappings").GetInt32());
         Assert.Equal(0, dns.GetProperty("quarantined").GetInt32());
         Assert.False(dns.TryGetProperty("code", out _));
-        Assert.Equal(["takeover", "pool", "mappings", "quarantined"], dns.EnumerateObject().Select(field => field.Name));
+        Assert.Equal(["takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "queries"],
+            dns.EnumerateObject().Select(field => field.Name));
         var route = consumer.GetProperty("routes").EnumerateArray().Single();
         Assert.Equal("198.18.0.0/15", route.GetProperty("cidr").GetString());
         Assert.Equal("tun", route.GetProperty("kind").GetString());
@@ -306,6 +307,10 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
         Assert.False(dns.GetProperty("takeover").GetBoolean());
         Assert.Equal(PeerEgressCodes.FakeIpPoolInvalid, dns.GetProperty("code").GetString());
         Assert.Equal(pool, dns.GetProperty("pool").GetString());
+        // Nothing listens, but where it would forward and what it has done are still said.
+        Assert.False(dns.TryGetProperty("listen", out _));
+        Assert.Equal(0, dns.GetProperty("upstreams").GetArrayLength());
+        Assert.Equal(0, dns.GetProperty("queries").GetProperty("answered").GetInt64());
         var rules = consumer.GetProperty("rules").EnumerateArray().ToList();
         Assert.Equal(PeerEgressCodes.RuleDomainUnsupported, rules[0].GetProperty("code").GetString());
         Assert.True(rules[1].GetProperty("inForce").GetBoolean());
@@ -373,10 +378,11 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
             Assert.True(reset is not null && reset.Has(PeerEgressSegment.FlagRst));
         }
 
-        // The responder's port is left to the responder, which is step four's.
+        // The responder's port is the responder's, not an unmapped address: nothing new is counted.
         var query = PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(Address(VirtualIp), Address("198.18.0.1"),
             53000, 53, "query"u8.ToArray()));
-        Assert.False(mesh.HandleOutbound(query));
+        Assert.True(mesh.HandleOutbound(query));
+        Assert.Equal(1, Consumer(mesh).GetProperty("blocked").GetProperty("fake-ip-unmapped").GetInt64());
     }
 
     /// <summary>
