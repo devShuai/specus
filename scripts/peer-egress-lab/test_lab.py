@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
-from lab import Lab, Proc
+from lab import Lab, Proc, p95
 
 
 class RoleCommandTests(unittest.TestCase):
@@ -72,6 +72,33 @@ class OfflineDiagnosticsTests(unittest.TestCase):
                 instance.start_client = Mock(side_effect=restart)
                 instance.fault_egress_stopped()
                 instance.start_client.assert_called_once()
+
+
+class PerformanceGateTests(unittest.TestCase):
+    def lab(self):
+        instance = Lab.__new__(Lab)
+        instance.results = []
+        instance.measurements = {}
+        instance.say = Mock()
+        return instance
+
+    def test_p95_is_a_value_that_was_observed(self):
+        self.assertEqual(19, p95(range(1, 21)))
+        self.assertEqual(95, p95(range(100, 0, -1)))
+        self.assertEqual(7, p95([7]))
+
+    def test_median_gate_judges_the_median_rather_than_the_best_run(self):
+        instance = self.lab()
+        instance.gate_median("download", [9.0, 3.0, 3.5, 3.9, 12.0], True, 4.0)
+        self.assertFalse(instance.results[-1]["ok"])
+        instance.gate_median("download", [4.1, 3.0, 4.5, 3.9, 12.0], True, 4.0)
+        self.assertTrue(instance.results[-1]["ok"])
+
+    def test_median_gate_fails_when_any_run_did_not_arrive_intact(self):
+        instance = self.lab()
+        instance.gate_median("download", [9.0, 9.0, 9.0, 9.0, 9.0], False, 4.0)
+        self.assertFalse(instance.results[-1]["ok"])
+        self.assertEqual({}, instance.measurements)
 
 
 if __name__ == "__main__":

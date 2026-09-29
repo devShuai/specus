@@ -31,6 +31,17 @@ public sealed record PeerEgressRule
     /// </summary>
     [JsonPropertyName("port")]
     public int? Port { get; init; }
+
+    /// <summary>
+    /// Null for a rule as written; only an explicit false switches the rule off. A switched-off rule
+    /// stays in the list, takes no part in matching and installs no route.
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool? Enabled { get; init; }
+
+    /// <summary>Whether the user has taken this rule out of force.</summary>
+    [JsonIgnore]
+    public bool SwitchedOff => Enabled == false;
 }
 
 /// <summary>
@@ -69,6 +80,12 @@ public static class PeerEgressRules
     /// </remarks>
     public static string? Validate(PeerEgressRule rule, string? meshCidr)
     {
+        // Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
+        // should not have to be fixed before it may sit in the list.
+        if (rule.SwitchedOff)
+        {
+            return PeerEgressCodes.RuleDisabled;
+        }
         var match = rule.Match?.Trim() ?? string.Empty;
         if (match.Length == 0)
         {

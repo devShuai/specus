@@ -63,6 +63,9 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile String controlEndpoint = "";
     /** This node's own consumer rules, from local configuration; empty when it is not a consumer. */
     private volatile List<PeerEgressRule> egressRules = List.of();
+    // The consumer's master switch. True until configured, so a mesh built without a local
+    // configuration behaves as it did before the switch existed.
+    private volatile boolean egressEnabled = true;
     /** The control connection's live remote address, for the bypass that keeps it out of the tunnel. */
     private volatile Supplier<SocketAddress> controlRemote;
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
@@ -139,6 +142,12 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long MAX_SESSION_REFRESH_WINDOW_MILLIS = 120_000;
     private static final long MIN_SESSION_REFRESH_WINDOW_MILLIS = 10_000;
     private static final long DIRECT_STALE_MILLIS = 45_000;
+    /**
+     * How long a session must have heard nothing direct from its peer before a data frame arriving
+     * over the relay moves this side's sending to the relay. Frames already in flight on the two
+     * paths otherwise flip each side back and forth, and under load the two sides never settle.
+     */
+    static final long RELAY_FOLLOW_QUIET_MILLIS = 3_000;
     private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
     /** S4.1 RTT 滞回阈值：避免 direct/relay 频繁切换 */
     private static final long RTT_HYSTERESIS_MS = 100;
@@ -2488,9 +2497,13 @@ public class PeerMeshClient implements AutoCloseable {
             dataDecryptRejected.incrementAndGet();
             return;
         }
+        long nowMillis = System.currentTimeMillis();
         if (StringUtils.hasText(relayFromAllocationId)) {
-            session.remoteEndpoint = relayEndpoint();
-            session.relayTargetAllocationId = relayFromAllocationId;
+            session.lastRelaySuccessMillis = nowMillis;
+            if (!session.heardDirectWithin(nowMillis, RELAY_FOLLOW_QUIET_MILLIS) || shouldAvoidDirectPath()) {
+                session.remoteEndpoint = relayEndpoint();
+                session.relayTargetAllocationId = relayFromAllocationId;
+            }
         } else {
             if (shouldAvoidDirectPath()) {
                 logDirectSuppressed("drop-direct-data-frame");
@@ -2498,6 +2511,9 @@ public class PeerMeshClient implements AutoCloseable {
             }
             session.remoteEndpoint = observedRemote;
             session.relayTargetAllocationId = null;
+            // A direct frame proves the direct path as well as a keepalive answer does, and under
+            // load it is what keeps arriving when a keepalive answer is lost.
+            session.lastDirectSuccessMillis = nowMillis;
             session.addDirectBytes(raw.length);
         }
         log.trace("Peer mesh encrypted frame 收到: session={}, from={}, bytes={}",
@@ -2790,6 +2806,12 @@ public class PeerMeshClient implements AutoCloseable {
         }
         long now = System.currentTimeMillis();
         if (StringUtils.hasText(relayFromAllocationId)) {
+            session.lastRelaySuccessMillis = now;
+            if (session.hasHealthyDirect(now) && !shouldAvoidDirectPath()) {
+                // The peer checks its relay the whole time a direct path works. The reply goes
+                // back over the relay; this side's data stays on the direct path.
+                return;
+            }
             session.remoteEndpoint = relayEndpoint();
             session.relayTargetAllocationId = relayFromAllocationId;
             session.markPath("RELAY", now);
@@ -4165,6 +4187,13 @@ public class PeerMeshClient implements AutoCloseable {
      */
     public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules,
             Supplier<SocketAddress> controlRemote) {
+        configureEgress(controlHost, controlPort, rules, true, controlRemote);
+    }
+
+    /** As above, with the consumer's master switch; off, the rules are kept and none is applied. */
+    public void configureEgress(String controlHost, int controlPort, List<PeerEgressRule> rules,
+            boolean enabled, Supplier<SocketAddress> controlRemote) {
+        egressEnabled = enabled;
         controlEndpoint = StringUtils.hasText(controlHost)
                 ? controlHost.trim() + (controlPort > 0 ? ":" + controlPort : "")
                 : "";
@@ -4261,6 +4290,11 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         @Override
+        public boolean consumerEnabled() {
+            return egressEnabled;
+        }
+
+        @Override
         public Map<Long, Boolean> egressAvailability() {
             Map<Long, Boolean> online = new HashMap<>();
             for (PeerInfo peer : peerIndex.byId().values()) {
@@ -4268,6 +4302,25 @@ public class PeerMeshClient implements AutoCloseable {
                 online.put(peer.clientId(), running && peer.online() && session != null && session.canSend());
             }
             return online;
+        }
+
+        @Override
+        public Map<Long, String> egressPaths() {
+            // Read the way sendEncryptedPayload chooses: a nominated relay first, then the direct
+            // endpoint; a peer with neither has no entry.
+            Map<Long, String> paths = new HashMap<>();
+            long now = System.currentTimeMillis();
+            for (PeerSession session : sessions.values()) {
+                if (session.isExpired(now)) {
+                    continue;
+                }
+                if (StringUtils.hasText(session.relayTargetAllocationId)) {
+                    paths.put(session.peerId(), PeerEgressStatus.PATH_RELAY);
+                } else if (session.remoteEndpoint != null) {
+                    paths.put(session.peerId(), PeerEgressStatus.PATH_DIRECT);
+                }
+            }
+            return paths;
         }
 
         @Override
@@ -4459,6 +4512,14 @@ public class PeerMeshClient implements AutoCloseable {
             inboundTrafficKey = null;
             // 对端从 sequence=1 重新开始，旧窗口会把新帧全部当作重放拒绝
             inboundReplayWindow = new PeerReplayWindow();
+            if (changed) {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                endpointSuccessMillis = 0;
+                endpointRtt = Long.MAX_VALUE;
+                lastDirectSuccessMillis = 0;
+            }
             return changed;
         }
 
@@ -4512,6 +4573,11 @@ public class PeerMeshClient implements AutoCloseable {
                 lastRelaySuccessMillis = nowMillis;
             }
             currentPathType = pathType;
+        }
+
+        /** Whether anything authenticated arrived from the peer over the direct path in the window. */
+        boolean heardDirectWithin(long nowMillis, long windowMillis) {
+            return lastDirectSuccessMillis > 0 && nowMillis - lastDirectSuccessMillis <= windowMillis;
         }
 
         boolean hasHealthyDirect(long nowMillis) {

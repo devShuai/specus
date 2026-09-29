@@ -148,9 +148,13 @@ final class PeerEgressConsumer {
      * this consumer goes on mutating its own.
      */
     PeerEgressStatus.ConsumerSnapshot statusSnapshot() {
+        Map<Long, Integer> byEgress = new java.util.TreeMap<>();
+        for (Flow flow : flows.values()) {
+            byEgress.merge(flow.egress, 1, Integer::sum);
+        }
         return new PeerEgressStatus.ConsumerSnapshot(List.copyOf(rules), meshCidr,
                 new java.util.LinkedHashMap<>(online), flows.size(),
-                new java.util.TreeMap<>(blocked));
+                new java.util.TreeMap<>(blocked), byEgress, Map.of());
     }
 
     /**

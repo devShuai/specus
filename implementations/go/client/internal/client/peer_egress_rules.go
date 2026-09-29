@@ -41,6 +41,14 @@ type egressRule struct {
 	Action         string `json:"action"`
 	EgressClientID int64  `json:"egressClientId,omitempty"`
 	Port           int    `json:"port,omitempty"`
+	// Enabled is nil for a rule as written and false for one the user switched off. Only an
+	// explicit false takes a rule out of force.
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// switchedOff reports whether the user has taken this rule out of force.
+func (rule egressRule) switchedOff() bool {
+	return rule.Enabled != nil && !*rule.Enabled
 }
 
 type egressRuleDecision struct {
@@ -59,6 +67,11 @@ type egressRuleDecision struct {
 // vector to imply. The match is the rule's subject: what it is, whether it is legal, whether it is
 // refused as a prefix, and only then the action and the fields it needs.
 func validateEgressRule(rule egressRule, meshCIDR string) string {
+	// First, ahead of anything about the rule's content: switching a rule off is the user's choice,
+	// and a rule should not have to be fixed before it is allowed to sit in the list switched off.
+	if rule.switchedOff() {
+		return egressCodeRuleDisabled
+	}
 	match := strings.TrimSpace(rule.Match)
 	if match == "" {
 		return egressCodeRuleMalformed

@@ -372,3 +372,28 @@ func TestFlowTableFallsBackToADefaultIdleTimeout(t *testing.T) {
 		t.Error("a session outlived the default timeout")
 	}
 }
+
+// A flow lingering in TIME_WAIT keeps its entry, to answer a retransmitted FIN, and leaves the
+// limits: a consumer that finished its connections can open new ones at once.
+func TestFlowTableLeavesLingeringFlowsOutOfTheLimits(t *testing.T) {
+	table := newEgressFlowTable(time.Minute)
+	first, _ := table.open(flowKey(t, ipv4ProtocolTCP, "100.96.0.1", 40000, "203.0.113.10", 443), 7, flowEpoch)
+	table.open(flowKey(t, ipv4ProtocolTCP, "100.96.0.1", 40001, "203.0.113.10", 443), 7, flowEpoch)
+
+	table.linger(first)
+	table.linger(first)
+	if forConsumer, total := table.counts(7); forConsumer != 1 || total != 1 {
+		t.Errorf("after one flow lingers: %d of %d, want 1 of 1", forConsumer, total)
+	}
+	if table.size() != 1 {
+		t.Errorf("size = %d, want the one live flow", table.size())
+	}
+	if _, ok := table.lookup(first.Key); !ok {
+		t.Error("a lingering flow lost its entry before its timer")
+	}
+
+	table.close(first.Key)
+	if forConsumer, total := table.counts(7); forConsumer != 1 || total != 1 {
+		t.Errorf("closing the lingering flow changed the live counts: %d of %d", forConsumer, total)
+	}
+}

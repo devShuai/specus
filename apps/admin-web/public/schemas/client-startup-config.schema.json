@@ -54,10 +54,15 @@
       "default": true,
       "description": "Java 桌面客户端发现更新时是否尝试打开下载页；无桌面环境时仍记录清晰提示。"
     },
+    "peerEgressEnabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "出口分流总开关，即「启用系统接管」。为 true 时才应用 peerEgressRules、安装路由；为 false 时规则只保存不接管。配置了规则而开关关闭时，config validate 与启动加载都会告警，状态里每条规则显示 EGRESS_CONSUMER_DISABLED。"
+    },
     "peerEgressRules": {
       "type": "array",
       "default": [],
-      "description": "出口分流规则，有序。非空即启用消费端，没有单独的总开关；需要创建虚拟网卡（peerMeshDevice 不能是 noop）。被拒的规则不生效、其余照常生效，config validate 会逐条提示。见 docs/peer-mesh/peer-egress-usage.md。",
+      "description": "出口分流规则，有序。只有 peerEgressEnabled 为 true 时才会应用；需要创建虚拟网卡（peerMeshDevice 不能是 noop）。被拒或停用的规则不生效、其余照常生效，config validate 会逐条提示被拒的规则。见 docs/peer-mesh/peer-egress-usage.md。",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -83,6 +88,11 @@
             "type": "integer",
             "minimum": 1,
             "description": "action=egress 时必填，出口设备的客户端 ID。缺失、0 或负数返回 EGRESS_RULE_MISSING_TARGET。"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "false 时规则保留在列表里但不参与匹配、不安装路由，状态里显示 EGRESS_RULE_DISABLED。停用是用户的选择，不产生配置告警。"
           },
           "port": {
             "type": "integer",

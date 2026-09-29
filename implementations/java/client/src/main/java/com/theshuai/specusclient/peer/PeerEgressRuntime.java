@@ -9,9 +9,16 @@ import com.theshuai.common.peeregress.PeerEgressRequest;
 import java.io.Closeable;
 import java.io.IOException;
 import java.security.SecureRandom;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.function.IntFunction;
 import java.util.function.LongPredicate;
 import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
@@ -54,6 +61,22 @@ final class PeerEgressRuntime {
         /** Returns the byte count, or -1 at end of stream. */
         int read(byte[] buffer) throws IOException;
 
+        /**
+         * Reads at most {@code length} bytes into the start of {@code buffer}. The real sockets read
+         * straight into it; this default is for the test doubles.
+         */
+        default int read(byte[] buffer, int length) throws IOException {
+            if (length >= buffer.length) {
+                return read(buffer);
+            }
+            byte[] part = new byte[length];
+            int read = read(part);
+            if (read > 0) {
+                System.arraycopy(part, 0, buffer, 0, read);
+            }
+            return read;
+        }
+
         void write(byte[] data) throws IOException;
 
         /**
@@ -88,7 +111,14 @@ final class PeerEgressRuntime {
         void run(Runnable reader);
     }
 
-    private record TcpFlow(PeerEgressTcpConnection connection, Socket socket) {
+    /**
+     * One TCP flow. {@code wake} is a condition of the plane's lock that only this flow's reader
+     * waits on. Readers used to share one condition that every state machine output signalled, so
+     * each ACK and each tick woke every reader to find the credit was someone else's; with dozens of
+     * flows that herd set the pace. Signalled with the lock held after anything that may have given
+     * this flow credit or ended it.
+     */
+    private record TcpFlow(PeerEgressTcpConnection connection, Socket socket, Condition wake) {
     }
 
     private record UdpFlow(Socket socket) {
@@ -99,11 +129,12 @@ final class PeerEgressRuntime {
     }
 
     private final ReentrantLock lock = new ReentrantLock();
-    private final java.util.concurrent.locks.Condition readerReady = lock.newCondition();
     private final Sender sender;
     // Installed before the runtime is published; must never block or acquire the mesh lock.
     java.util.function.BiPredicate<Long, byte[]> trySend;
     private int sendCursor;
+    // Whether any flow has had a transmission refused since the last scan of blocked flows.
+    private volatile boolean sendBlocked;
     private final Dialer dialer;
     private final Executor executor;
     private final LongSupplier clock;
@@ -135,6 +166,12 @@ final class PeerEgressRuntime {
     private List<String> localInterfaces = List.of();
 
     private final PeerEgressFlowTable flows = new PeerEgressFlowTable(0);
+
+    // Phase two: the names consumers bound to their fake addresses, how they are resolved, and which
+    // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
+    private final PeerEgressNameTable names = new PeerEgressNameTable();
+    private final Set<PeerEgressFlowTable.Key> resolving = new HashSet<>();
+    Function<String, List<Integer>> resolve = PeerEgressRuntime::resolveName;
     private final PeerEgressRejectionLog rejections = new PeerEgressRejectionLog();
     private long totalFlows;
     private long bytesIn;
@@ -316,6 +353,17 @@ final class PeerEgressRuntime {
         if (control == null) {
             return;
         }
+        if (PeerEgressFrame.CONTROL_NAME_BIND.equals(control.type())) {
+            // Validated with the frame; the address parses and the name is well formed.
+            Integer address = Ipv4Cidr.parseAddress(control.address());
+            lock.lock();
+            try {
+                names.bind(consumer, address, com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name()));
+            } finally {
+                lock.unlock();
+            }
+            return;
+        }
         // flow-reject travels egress to consumer. Receiving one means the peer is confused about
         // which end it is, and acting on it would let a consumer close flows by assertion.
         if (!PeerEgressFrame.CONTROL_FLOW_PURGE.equals(control.type())) {
@@ -383,8 +431,18 @@ final class PeerEgressRuntime {
     // the public entry point, because the lock serialises them there.
     void openTcpFlow(long consumer, PeerEgressFlowTable.Key key,
             PeerEgressSegment.Segment syn, long nowMs) {
+        Choice destination = resolveDestination(consumer, key);
+        if (destination == null) {
+            // A retransmitted SYN while the name is still resolving; the first one is opening the flow.
+            return;
+        }
+        if (destination.code() != null) {
+            refuse(consumer, key, destination.code(), nowMs);
+            emitSegment(consumer, PeerEgressSegment.buildReset(syn));
+            return;
+        }
         lock.lock();
-        Reservation reservation = reserve(consumer, key, nowMs);
+        Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
         if (reservation.code() != null) {
             lock.unlock();
             refuse(consumer, key, reservation.code(), nowMs);
@@ -406,7 +464,7 @@ final class PeerEgressRuntime {
         Socket socket = null;
         IOException failure = null;
         try {
-            socket = dialer.dial("tcp", Ipv4Cidr.format(key.remoteIp()), key.remotePort(), CONNECT_TIMEOUT_MS);
+            socket = dialer.dial("tcp", Ipv4Cidr.format(destination.address()), key.remotePort(), CONNECT_TIMEOUT_MS);
         } catch (IOException error) {
             failure = error;
         }
@@ -435,10 +493,17 @@ final class PeerEgressRuntime {
             PeerEgressTcpConnection connection = PeerEgressTcpConnection.accept(
                     syn, newInitialSendSequence(), mtu, flows.idleTimeoutMs(), nowMs, output);
             if (trySend != null) {
-                connection.tryTransmit = packet -> trySend.test(consumer,
-                        PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet));
+                connection.tryTransmit = packet -> {
+                    boolean accepted = trySend.test(consumer,
+                            PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet));
+                    if (!accepted) {
+                        // Transmission runs inside the state machine, under the lock.
+                        sendBlocked = true;
+                    }
+                    return accepted;
+                };
             }
-            TcpFlow handle = new TcpFlow(connection, socket);
+            TcpFlow handle = new TcpFlow(connection, socket, lock.newCondition());
             flow.handle = handle;
             totalFlows++;
             applyTcpOutput(consumer, flow, handle, output);
@@ -451,22 +516,25 @@ final class PeerEgressRuntime {
     /** Pumps the real socket into the state machine. Called with the lock held. */
     private void startTcpReader(long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle) {
         executor.run(() -> {
+            // One buffer for the life of the flow, read into up to the credit. The credit changes on
+            // nearly every read, and sizing a new buffer to it each time allocated up to this much
+            // per read.
             byte[] buffer = new byte[TCP_READ_BUFFER];
             while (true) {
+                int size;
                 lock.lock();
                 try {
                     while (flows.lookup(flow.key) == flow && handle.connection().appReadCredit() == 0) {
-                        readerReady.awaitUninterruptibly();
+                        handle.wake().awaitUninterruptibly();
                     }
                     if (flows.lookup(flow.key) != flow) { return; }
-                    int size = Math.min(TCP_READ_BUFFER, handle.connection().appReadCredit());
-                    if (buffer.length != size) { buffer = new byte[size]; }
+                    size = Math.min(TCP_READ_BUFFER, handle.connection().appReadCredit());
                 } finally {
                     lock.unlock();
                 }
                 int read;
                 try {
-                    read = handle.socket().read(buffer);
+                    read = handle.socket().read(buffer, size);
                 } catch (IOException error) {
                     finishTcpReader(consumer, flow, handle, false);
                     return;
@@ -522,7 +590,7 @@ final class PeerEgressRuntime {
     /** Performs everything the state machine asked for. Called with the lock held. */
     private void applyTcpOutput(long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle,
             PeerEgressTcpConnection.Output output) {
-        readerReady.signalAll();
+        handle.wake().signalAll();
         for (byte[] packet : output.segments) {
             emitSegment(consumer, packet);
         }
@@ -548,6 +616,13 @@ final class PeerEgressRuntime {
         }
         if (output.done || output.reset) {
             release(flow);
+            return;
+        }
+        if (handle.connection().state() == PeerEgressTcpConnection.State.TIME_WAIT && !flow.lingering) {
+            // Both directions are finished: the socket goes now, and the entry stays only to answer
+            // a retransmitted FIN, outside the limits.
+            handle.socket().close();
+            flows.linger(flow);
         }
     }
 
@@ -564,7 +639,17 @@ final class PeerEgressRuntime {
         lock.lock();
         PeerEgressFlowTable.Flow flow = flows.lookup(key);
         if (flow == null) {
-            Reservation reservation = reserve(consumer, key, nowMs);
+            lock.unlock();
+            Choice destination = resolveDestination(consumer, key);
+            if (destination == null) {
+                return;
+            }
+            if (destination.code() != null) {
+                refuse(consumer, key, destination.code(), nowMs);
+                return;
+            }
+            lock.lock();
+            Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
             if (reservation.code() != null) {
                 lock.unlock();
                 refuse(consumer, key, reservation.code(), nowMs);
@@ -582,7 +667,7 @@ final class PeerEgressRuntime {
             Socket socket = null;
             IOException failure = null;
             try {
-                socket = dialer.dial("udp", Ipv4Cidr.format(key.remoteIp()), key.remotePort(),
+                socket = dialer.dial("udp", Ipv4Cidr.format(destination.address()), key.remotePort(),
                         CONNECT_TIMEOUT_MS);
             } catch (IOException error) {
                 failure = error;
@@ -701,9 +786,18 @@ final class PeerEgressRuntime {
 
     /** Called without the mesh lock when the bounded outbound queue frees a slot. */
     void sendReady(long nowMs) {
+        // Every frame the send loop takes out of the queue lands here, and on most of them no flow
+        // is waiting for room. Scanning and sorting every flow under the plane's lock for each one
+        // anyway put the send loop in line behind every reader, so the scan only runs once a
+        // transmission has actually been refused. A refusal means the queue was full, so the frames
+        // that follow it are enough to bring the scan round.
+        if (!sendBlocked) {
+            return;
+        }
         lock.lock();
         try {
             if (closed) { return; }
+            sendBlocked = false;
             var snapshot = flowSnapshot();
             if (snapshot.isEmpty()) { return; }
             int start = sendCursor % snapshot.size();
@@ -712,6 +806,9 @@ final class PeerEgressRuntime {
                 var flow = snapshot.get((start + i) % snapshot.size());
                 if (flow.handle instanceof TcpFlow handle && handle.connection().sendBlocked) {
                     applyTcpOutput(flow.consumer, flow, handle, handle.connection().onTick(nowMs));
+                    if (handle.connection().sendBlocked) {
+                        sendBlocked = true;
+                    }
                 }
             }
         } finally {
@@ -740,14 +837,35 @@ final class PeerEgressRuntime {
      * reservation already there, and must not dial again.
      */
     private Reservation reserve(long consumer, PeerEgressFlowTable.Key key, long nowMs) {
+        return reserveTo(consumer, key, key.remoteIp(), nowMs);
+    }
+
+    /**
+     * reserve for a flow whose socket goes to destination, which differs from the key's remote
+     * address only for a flow to a name: the key keeps the consumer's fake address, so replies come
+     * back from it, and the authorization is of the address actually dialled.
+     */
+    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, int destination, long nowMs) {
+        String code = authorizeTo(consumer, key, destination);
+        if (code != null) {
+            return new Reservation(null, code, false);
+        }
+        PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
+        return opened != null
+                ? new Reservation(opened, null, true)
+                : new Reservation(flows.lookup(key), null, false);
+    }
+
+    /** The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held. */
+    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, int destination) {
         if (closed || !enabled) {
-            return new Reservation(null, PeerEgressCodes.DISABLED, false);
+            return PeerEgressCodes.DISABLED;
         }
         boolean peerAllowed = peerAclAllows == null || peerAclAllows.test(consumer);
 
         PeerEgressRequest request = new PeerEgressRequest();
         request.setConsumerClientId(consumer);
-        request.setDestinationIp(Ipv4Cidr.format(key.remoteIp()));
+        request.setDestinationIp(Ipv4Cidr.format(destination));
         request.setDestinationPort(key.remotePort());
         request.setProtocol(key.protocolName());
         request.setActiveFlowsForConsumer(flows.countFor(consumer));
@@ -756,13 +874,91 @@ final class PeerEgressRuntime {
 
         PeerEgressAuthorization.Decision decision =
                 PeerEgressAuthorization.evaluate(request, policy, peerAllowed, context);
-        if (!decision.allowed()) {
-            return new Reservation(null, decision.code(), false);
+        return decision.allowed() ? null : decision.code();
+    }
+
+    /** Where a new flow goes: the address to dial, or the code that refuses it. */
+    record Choice(int address, String code) {
+    }
+
+    /**
+     * Picks the address a named flow is dialled to: the first resolved address the authorization
+     * allows. With none allowed, the first address's refusal is the answer, so the code the consumer
+     * sees is about the address it would have gone to. With nothing resolved, the name did not resolve.
+     */
+    static Choice chooseAddress(List<Integer> addresses, IntFunction<String> authorize) {
+        if (addresses == null || addresses.isEmpty()) {
+            return new Choice(0, PeerEgressCodes.NAME_UNRESOLVED);
         }
-        PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
-        return opened != null
-                ? new Reservation(opened, null, true)
-                : new Reservation(flows.lookup(key), null, false);
+        String first = null;
+        for (int address : addresses) {
+            String code = authorize.apply(address);
+            if (code == null) {
+                return new Choice(address, null);
+            }
+            if (first == null) {
+                first = code;
+            }
+        }
+        return new Choice(0, first);
+    }
+
+    /**
+     * Decides where a new flow's socket goes. Most flows go where the packet says. A flow to an
+     * address the consumer bound to a name goes to the first address the name resolves to that the
+     * policy allows: resolving here and dialling that address, with no second lookup, leaves no
+     * window between the check and the connect. Called with no lock held; the lookup can take a while.
+     *
+     * <p>Null for a second packet of a flow whose name is still resolving: the first one is opening it.
+     */
+    private Choice resolveDestination(long consumer, PeerEgressFlowTable.Key key) {
+        String name;
+        Function<String, List<Integer>> resolver;
+        lock.lock();
+        try {
+            name = names.lookup(consumer, key.remoteIp());
+            if (name == null) {
+                return new Choice(key.remoteIp(), null);
+            }
+            if (!resolving.add(key)) {
+                return null;
+            }
+            resolver = resolve;
+        } finally {
+            lock.unlock();
+        }
+        List<Integer> addresses;
+        try {
+            addresses = resolver.apply(name);
+        } catch (RuntimeException failed) {
+            addresses = List.of();
+        }
+        lock.lock();
+        try {
+            resolving.remove(key);
+            return chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * This device's own resolver: the egress resolves in its own network, which is the point of
+     * sending the name rather than an address. IPv4 only, in the order the resolver returned them.
+     */
+    static List<Integer> resolveName(String name) {
+        List<Integer> addresses = new ArrayList<>();
+        try {
+            for (InetAddress address : InetAddress.getAllByName(name)) {
+                if (address instanceof Inet4Address v4) {
+                    byte[] b = v4.getAddress();
+                    addresses.add(((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF));
+                }
+            }
+        } catch (java.net.UnknownHostException unresolved) {
+            return List.of();
+        }
+        return addresses;
     }
 
     /**
@@ -782,15 +978,14 @@ final class PeerEgressRuntime {
         } finally {
             lock.unlock();
         }
+        // Who and why, never where: a line per refused destination would be the consumer's browsing
+        // history kept in this device's log. The consumer is told the destination in the control message.
         if (decision.shouldLog()) {
             if (decision.suppressed() > 0) {
-                log.info("[peer-egress] refused consumer={} protocol={} destination={}:{} code={} suppressed={}",
-                        consumer, subject.protocolName(), Ipv4Cidr.format(subject.remoteIp()),
-                        subject.remotePort(), code, decision.suppressed());
+                log.info("[peer-egress] refused consumer={} protocol={} code={} suppressed={}",
+                        consumer, subject.protocolName(), code, decision.suppressed());
             } else {
-                log.info("[peer-egress] refused consumer={} protocol={} destination={}:{} code={}",
-                        consumer, subject.protocolName(), Ipv4Cidr.format(subject.remoteIp()),
-                        subject.remotePort(), code);
+                log.info("[peer-egress] refused consumer={} protocol={} code={}", consumer, subject.protocolName(), code);
             }
         }
         emitFrame(consumer, PeerEgressFrame.TYPE_CONTROL,
@@ -810,14 +1005,46 @@ final class PeerEgressRuntime {
      * which is what the application waits on anyway.
      */
     private void unreachable(long consumer, PeerEgressFlowTable.Key key, Exception cause) {
-        log.info("[peer-egress] connect failed consumer={} protocol={} destination={}:{} err={}",
-                consumer, key.protocolName(), Ipv4Cidr.format(key.remoteIp()), key.remotePort(),
-                cause == null ? "no socket" : cause.toString());
+        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}",
+                consumer, key.protocolName(), connectReason(cause));
+    }
+
+    /**
+     * Why a dial failed, without the addresses exception messages carry, so the log keeps no record of
+     * where consumers were going. The same words in every runtime.
+     */
+    static String connectReason(Throwable cause) {
+        if (cause == null) {
+            return "no socket";
+        }
+        for (Throwable error = cause; error != null; error = error.getCause()) {
+            if (error instanceof PeerEgressSocketBinder.NoPhysicalRouteException) {
+                return "no route outside the tunnel";
+            }
+            if (error instanceof java.net.SocketTimeoutException) {
+                return "timed out";
+            }
+            if (error instanceof java.net.NoRouteToHostException) {
+                return "unreachable";
+            }
+            if (error instanceof java.net.ConnectException) {
+                String message = String.valueOf(error.getMessage()).toLowerCase(java.util.Locale.ROOT);
+                if (message.contains("refused")) {
+                    return "refused";
+                }
+                if (message.contains("unreachable")) {
+                    return "unreachable";
+                }
+                if (message.contains("timed out")) {
+                    return "timed out";
+                }
+            }
+        }
+        return "error";
     }
 
     /** Closes one flow's socket and drops its table entry. Called with the lock held. */
     private void release(PeerEgressFlowTable.Flow flow) {
-        readerReady.signalAll();
         if (flows.lookup(flow.key) == null) {
             return;
         }
@@ -826,7 +1053,6 @@ final class PeerEgressRuntime {
     }
 
     private void releaseKey(PeerEgressFlowTable.Key key) {
-        readerReady.signalAll();
         PeerEgressFlowTable.Flow flow = flows.close(key);
         if (flow != null) {
             closeHandle(flow.handle);
@@ -841,7 +1067,6 @@ final class PeerEgressRuntime {
      * failure.
      */
     private void releaseAll(List<PeerEgressFlowTable.Revocation> revoked, long nowMs) {
-        readerReady.signalAll();
         for (PeerEgressFlowTable.Revocation entry : revoked) {
             PeerEgressFlowTable.Flow flow = entry.flow();
             if (flow.handle instanceof TcpFlow handle) {
@@ -867,9 +1092,12 @@ final class PeerEgressRuntime {
         }
     }
 
-    private static void closeHandle(Object handle) {
+    /** Closes a flow's socket. Called with the lock held. */
+    private void closeHandle(Object handle) {
         if (handle instanceof TcpFlow tcp) {
             tcp.socket().close();
+            // Its reader may be waiting for credit that will now never come.
+            tcp.wake().signalAll();
         } else if (handle instanceof UdpFlow udp) {
             udp.socket().close();
         }

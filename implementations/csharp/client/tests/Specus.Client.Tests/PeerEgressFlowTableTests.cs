@@ -259,4 +259,26 @@ public class PeerEgressFlowTableTests
         Assert.True(first![0].ConsumerIp == Address("10.0.0.1"), "addresses were compared as signed");
         Assert.True(first[2].Protocol == Udp, "TCP did not sort before UDP");
     }
+
+    /// <summary>
+    /// A flow lingering in TIME_WAIT keeps its entry, to answer a retransmitted FIN, and leaves the
+    /// limits: a consumer that finished its connections can open new ones at once.
+    /// </summary>
+    [Fact]
+    public void LingeringFlowsLeaveTheLimits()
+    {
+        var table = new PeerEgressFlowTable(60_000);
+        var first = table.Open(MakeKey(PeerEgressSegment.Ipv4ProtocolTcp, "100.96.0.1", 40000, "203.0.113.10", 443), 7, 0)!;
+        table.Open(MakeKey(PeerEgressSegment.Ipv4ProtocolTcp, "100.96.0.1", 40001, "203.0.113.10", 443), 7, 0);
+
+        table.Linger(first);
+        table.Linger(first);
+        Assert.Equal(1, table.CountFor(7));
+        Assert.Equal(1, table.Count);
+        Assert.NotNull(table.Lookup(first.Key));
+
+        table.Close(first.Key);
+        Assert.Equal(1, table.CountFor(7));
+        Assert.Equal(1, table.Count);
+    }
 }

@@ -198,6 +198,26 @@ for entry in rules["refusedRules"]:
 for case in authz["cases"] + authz["policyVariantCases"]:
     used.add(case["expect"]["code"])
 
+# The master switch off: every rule is out of force, a rule's own switch still names itself, and
+# nothing matches. Checked against the rule list itself so the section cannot drift from it.
+disabled = rules["consumerDisabled"]
+codes_by_index = {entry["index"]: entry["code"] for entry in disabled["ruleCodes"]}
+check(set(codes_by_index) == {rule["index"] for rule in rules["rules"]},
+      "rules/consumerDisabled: ruleCodes must name every rule exactly once")
+for rule in rules["rules"]:
+    want = "EGRESS_RULE_DISABLED" if rule.get("enabled") is False else "EGRESS_CONSUMER_DISABLED"
+    check(codes_by_index.get(rule["index"]) == want,
+          f"rules/consumerDisabled: rule {rule['index']} should report {want}")
+for case in disabled["cases"]:
+    check(case["expect"] == {"action": "direct", "matchedRuleIndex": None, "reason": "default"},
+          f"rules/consumerDisabled/{case['destination']}: nothing may match with the switch off")
+used.update(codes_by_index.values())
+
+# Phase two's codes are exercised by its own vector (protocol/spec/peer-egress-dns.md).
+_dns_cases = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
+for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgress", "egressChoice"):
+    used.update(case["code"] for case in _dns_cases[section] if case["code"])
+
 undocumented = used - table_codes
 uncovered = table_codes - used
 check(not undocumented, f"codes used in vectors but missing from the spec table: {sorted(undocumented)}")
@@ -910,6 +930,19 @@ print(f"routes plan={len(routes_vector['planCases'])} diff={len(routes_vector['d
       f" reconcile={len(reconcile['cases'])}")
 print(f"failure purge={len(failure['resetOnPurge']['cases'])} packet={len(failure['resetOnPacket']['cases'])}"
       f" datagram={len(failure['unreachableOnDatagram']['cases'])}")
+
+# Phase two (#52). The generator holds the reference implementation and checks every case against it,
+# so the file on disk has to be exactly what the generator produces now.
+import importlib.util
+_dns_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_dns_vectors", Path(__file__).with_name("generate_peer_egress_dns_vectors.py"))
+_dns_module = importlib.util.module_from_spec(_dns_spec)
+_dns_spec.loader.exec_module(_dns_module)
+dns_vector = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
+if dns_vector != _dns_module.build():
+    failures.append("peer-egress-dns-v1.json differs from what its generator produces; regenerate it")
+print(f"dns validation={len(dns_vector['validation'])} selection={len(dns_vector['selection'])}"
+      f" answers={len(dns_vector['answers'])} pool={len(dns_vector['pool'])} egressChoice={len(dns_vector['egressChoice'])}")
 
 if failures:
     print(f"\nFAILED ({len(failures)}):")
