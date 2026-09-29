@@ -321,8 +321,9 @@ func (c *egressConsumer) respondDNSLocked(message []byte, now time.Time) egressD
 }
 
 // reverseDNSAddressLocked reads the address of a reverse name (the part before .in-addr.arpa) and
-// says whether it is in the pool. Four decimal octets of at most three digits, least significant
-// first; anything else is not a name this responder answers for.
+// says whether it is in the pool. Only the spelling resolvers write is read: four decimal octets,
+// least significant first, without leading zeros. Anything else -- `02`, three octets -- is some
+// other name and goes upstream.
 func (c *egressConsumer) reverseDNSAddressLocked(octets string) (uint32, bool) {
 	parts := strings.Split(octets, ".")
 	if len(parts) != 4 {
@@ -331,7 +332,7 @@ func (c *egressConsumer) reverseDNSAddressLocked(octets string) (uint32, bool) {
 	var address uint32
 	for index := 3; index >= 0; index-- {
 		part := parts[index]
-		if part == "" || len(part) > 3 {
+		if part == "" || len(part) > 3 || (len(part) > 1 && part[0] == '0') {
 			return 0, false
 		}
 		value := 0

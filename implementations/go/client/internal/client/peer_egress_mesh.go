@@ -443,10 +443,16 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	// Phase two needs the master switch too, so with it off this is never running either.
 	phase := mesh.egressPhaseTwoFor(meshCIDR)
 
-	// The consumer exists only when it has something to do: rules to apply, or phase two's pool to
+	// The consumer is built only when it has something to do: rules to apply, or phase two's pool to
 	// own. Building it for nothing would start the threads that carry its work and report a
-	// consumer with nothing to do.
-	if len(rules) > 0 || phase.Active {
+	// consumer with nothing to do. One that exists is always given the current setup, even an
+	// empty one: phase two stopping with no rules configured -- the mesh network moved over the
+	// pool, say -- has to take its pool and its responder away, or packets to the old fake
+	// addresses would still be answered for names no longer handed out.
+	mesh.mu.Lock()
+	built := mesh.egressConsumer != nil
+	mesh.mu.Unlock()
+	if len(rules) > 0 || phase.Active || built {
 		mesh.configureEgressConsumer(rules, meshCIDR, runtime.PeerMesh.VirtualIP, phase.pool(), now)
 	}
 
