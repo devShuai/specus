@@ -328,18 +328,10 @@ func egressTest(options cliOptions, path string) int {
 	data, lines := egressPreview(path, config, address)
 	code := 0
 	if options.egressConnect > 0 {
-		target := net.JoinHostPort(address, strconv.Itoa(options.egressConnect))
-		started := time.Now()
-		connection, err := net.DialTimeout("tcp", target, 5*time.Second)
-		elapsed := time.Since(started).Milliseconds()
-		probe := map[string]any{"port": options.egressConnect, "ok": err == nil, "millis": elapsed}
-		if err != nil {
-			probe["error"] = err.Error()
-			lines = append(lines, fmt.Sprintf("Connection test to %s: failed (%v)", target, err))
+		probe, line := egressConnectProbe(address, options.egressConnect)
+		lines = append(lines, line)
+		if probe["ok"] != true {
 			code = 4
-		} else {
-			connection.Close()
-			lines = append(lines, fmt.Sprintf("Connection test to %s: connected in %d ms. This shows the address is reachable, not which path carried it.", target, elapsed))
 		}
 		data["connect"] = probe
 	}
@@ -351,6 +343,23 @@ func egressTest(options cliOptions, path string) int {
 		return resultOutput(false, options.command, code, nil, lines[len(lines)-1])
 	}
 	return resultOutput(options.json, options.command, 0, data, strings.Join(lines, "\n"))
+}
+
+// egressConnectProbe connects to address:port once, within five seconds. It shows the address is
+// reachable from this device, not which path carried the connection; the preview says that. The
+// command and the local page run the same probe and report it the same way.
+func egressConnectProbe(address string, port int) (map[string]any, string) {
+	target := net.JoinHostPort(address, strconv.Itoa(port))
+	started := time.Now()
+	connection, err := net.DialTimeout("tcp", target, 5*time.Second)
+	elapsed := time.Since(started).Milliseconds()
+	probe := map[string]any{"port": port, "ok": err == nil, "millis": elapsed}
+	if err != nil {
+		probe["error"] = err.Error()
+		return probe, fmt.Sprintf("Connection test to %s: failed (%v)", target, err)
+	}
+	connection.Close()
+	return probe, fmt.Sprintf("Connection test to %s: connected in %d ms. This shows the address is reachable, not which path carried it.", target, elapsed)
 }
 
 // egressPreview is what the configured rules decide for one IPv4 address, and what takeover being

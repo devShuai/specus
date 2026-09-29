@@ -14,6 +14,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -53,7 +54,9 @@ def run(command, name, browser_enabled, output, peers=()):
                 threading.Thread(target=server.serve_forever, daemon=True).start()
             process = subprocess.Popen(command + ["ui", "--config", str(fixture.config), "--no-open"], cwd=directory,
                 env=fixture.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", creationflags=flags)
+                # A runtime without a console writes in the system code page (GBK on a Chinese Windows);
+                # the lines the test reads are ASCII, so undecodable text must not end the reader.
+                text=True, encoding="utf-8", errors="replace", creationflags=flags)
             threading.Thread(target=lambda: [lines.put(line) for line in process.stdout], daemon=True).start()
             base = code = ""
             def next_code():
@@ -188,6 +191,15 @@ def run(command, name, browser_enabled, output, peers=()):
                 preview = request("/api/egress/test", dict(address="203.0.113.9"), token)
                 assert preview["matchedRuleIndex"] == 0 and preview["result"] == "egress" and preview["egressClientId"] == 42, preview
                 request("/api/egress/test", dict(address="example.com"), token, expected=422)
+                # The connection test is a real connect from this device, told apart from the preview.
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    listener.listen(1)
+                    port = listener.getsockname()[1]
+                    probed = request("/api/egress/test", dict(address="127.0.0.1", connect=port), token)
+                assert probed["connect"]["ok"] is True and probed["connect"]["port"] == port, probed
+                assert "matchedRuleIndex" in probed, "the connection test dropped the preview"
+                request("/api/egress/test", dict(address="127.0.0.1", connect=0), token, expected=422)
                 off = change(on["revision"], op="takeover", enabled=False)
                 cleared = change(change(off["revision"], op="remove", index=1)["revision"], op="remove", index=0)
                 assert cleared["enabled"] is False and cleared["rules"] == [], cleared
@@ -196,7 +208,7 @@ def run(command, name, browser_enabled, output, peers=()):
                 assert b"/api/egress/change" in wire("GET", "/app.js") and b"rules-list" in wire("GET", "/"), \
                     "the served page predates the egress editor"
                 saved = request("/api/config", token=token)
-                checks += 14
+                checks += 16
 
                 # Rejection and a cancelled in-flight HTTP login must leave management alive.
                 auth.status = 403

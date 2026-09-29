@@ -364,28 +364,8 @@ internal static class EgressEdit
         var port = options.Egress.Connect;
         if (port > 0)
         {
-            var target = $"{address}:{port}";
-            var watch = Stopwatch.StartNew();
-            var probe = new Dictionary<string, object?> { ["port"] = port };
-            try
-            {
-                using var client = new TcpClient();
-                if (!client.ConnectAsync(address, port).Wait(TimeSpan.FromSeconds(5)))
-                    throw new TimeoutException("timed out after 5 s");
-                var elapsed = watch.ElapsedMilliseconds;
-                probe["ok"] = true;
-                probe["millis"] = elapsed;
-                lines.Add($"Connection test to {target}: connected in {elapsed} ms. This shows the address is reachable, not which path carried it.");
-            }
-            catch (Exception error)
-            {
-                var reason = error is AggregateException aggregate && aggregate.InnerException is { } inner ? inner.Message : error.Message;
-                probe["ok"] = false;
-                probe["millis"] = watch.ElapsedMilliseconds;
-                probe["error"] = reason;
-                lines.Add($"Connection test to {target}: failed ({reason})");
-                code = 4;
-            }
+            var probe = ConnectProbe(address, port, lines);
+            if (probe["ok"] is not true) code = 4;
             data["connect"] = probe;
         }
         var last = lines[^1];
@@ -396,6 +376,37 @@ internal static class EgressEdit
             return CliOutput.Result(false, options.Command, code, null, last);
         }
         return CliOutput.Result(options.Json, options.Command, 0, data, string.Join("\n", lines));
+    }
+
+    /// <summary>
+    /// Connects to address:port once, within five seconds, and adds the line that reports it. It shows
+    /// the address is reachable from this device, not which path carried the connection; the preview
+    /// says that. The command and the local page run the same probe and report it the same way.
+    /// </summary>
+    internal static Dictionary<string, object?> ConnectProbe(string address, int port, List<string> lines)
+    {
+        var target = $"{address}:{port}";
+        var watch = Stopwatch.StartNew();
+        var probe = new Dictionary<string, object?> { ["port"] = port };
+        try
+        {
+            using var client = new TcpClient();
+            if (!client.ConnectAsync(address, port).Wait(TimeSpan.FromSeconds(5)))
+                throw new TimeoutException("timed out after 5 s");
+            var elapsed = watch.ElapsedMilliseconds;
+            probe["ok"] = true;
+            probe["millis"] = elapsed;
+            lines.Add($"Connection test to {target}: connected in {elapsed} ms. This shows the address is reachable, not which path carried it.");
+        }
+        catch (Exception error)
+        {
+            var reason = error is AggregateException aggregate && aggregate.InnerException is { } inner ? inner.Message : error.Message;
+            probe["ok"] = false;
+            probe["millis"] = watch.ElapsedMilliseconds;
+            probe["error"] = reason;
+            lines.Add($"Connection test to {target}: failed ({reason})");
+        }
+        return probe;
     }
 
     /// <summary>What the configured rules decide for one IPv4 address, and what takeover being on would change.</summary>
@@ -534,8 +545,13 @@ internal static class EgressEdit
     {
         var address = UiValue(body, "address", "").Trim();
         if (AddressProblem(address) is { } problem) throw new LocalUi.Failure(422, problem);
+        // A port asks for a real connection as well; without one the answer is the preview alone.
+        var asked = body.ContainsKey("connect");
+        var port = UiValue(body, "connect", -1);
+        if (asked && port is < 1 or > 65535) throw new LocalUi.Failure(422, "connect must be a TCP port between 1 and 65535");
         var loaded = UiLoad(path);
         var data = Preview(path, loaded.Config, address, []);
+        if (asked) data["connect"] = ConnectProbe(address, port, []);
         data["schemaVersion"] = 1;
         return data;
     }

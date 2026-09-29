@@ -176,6 +176,16 @@ $("rule-form").addEventListener("submit", event => { event.preventDefault(); egr
   if ($("rule-position").value === "start") body.at = 0;
   await change(body, "规则已添加，"); $("rule-match").value = ""; $("rule-disabled").checked = false;
 }); });
+// A real connection from this device, told apart from the preview: it says whether the address
+// answers, not which path carried it.
+$("preview-connect").addEventListener("click", () => egressAction(async () => {
+  const port = Number($("preview-port").value.trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { $("preview-result").textContent = "请填写 1–65535 之间的端口。"; return; }
+  let data; try { data = await api("/api/egress/test", {address: $("preview-address").value.trim(), connect: port}); }
+  catch (error) { $("preview-result").textContent = /domain name/.test(error.message) ? "这是域名；规则目前只匹配 IPv4 地址，请填写它解析到的地址。" : /IPv4/.test(error.message) ? "请填写一个 IPv4 地址。" : error.message; return; }
+  const probe = data.connect || {}, target = data.address + ":" + port;
+  $("preview-result").textContent = probe.ok === true ? "连通测试：" + target + " 在 " + count(probe.millis) + " ms 内连上。这只说明能连上，不说明走了哪条路径；去向请用预演查看。" : "连通测试：" + target + " 连接失败（" + (probe.error || "未知原因") + "）。";
+}));
 $("preview-form").addEventListener("submit", event => { event.preventDefault(); egressAction(async () => {
   let data; try { data = await api("/api/egress/test", {address: $("preview-address").value.trim()}); }
   catch (error) { $("preview-result").textContent = /domain name/.test(error.message) ? "这是域名；规则目前只匹配 IPv4 地址，请填写它解析到的地址。" : /IPv4/.test(error.message) ? "请填写一个 IPv4 地址。" : error.message; return; }
