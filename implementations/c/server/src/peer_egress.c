@@ -2,6 +2,7 @@
 
 #include "json.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -688,6 +689,249 @@ int st_egress_parse_destination_rules(const char *json,
     }
     st_json_free_string_array(items, items_len);
     return 0;
+}
+
+/*
+ * The whitespace a management-side trim removes: what isspace() accepts in the "C" locale, spelled
+ * out so the result cannot change with the process locale.
+ */
+static int is_trim_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static char *trim_in_place(char *value)
+{
+    while (is_trim_space(*value)) {
+        value++;
+    }
+    size_t len = strlen(value);
+    while (len > 0U && is_trim_space(value[len - 1U])) {
+        len--;
+    }
+    value[len] = '\0';
+    return value;
+}
+
+/* An absent field and an explicit null both read as an empty list. */
+static int is_absent_value(const char *raw)
+{
+    return raw == NULL || strcmp(raw, "null") == 0;
+}
+
+/*
+ * Decodes a raw JSON string. Anything else fails, and so does an escaped NUL: the C string would
+ * end there, and "tcp\u0000x" would be stored as "tcp" -- a value the request never contained.
+ */
+static char *decode_text(const char *raw)
+{
+    size_t len = 0U;
+    char *value = st_json_decode_string(raw, &len);
+    if (value != NULL && strlen(value) != len) {
+        free(value);
+        return NULL;
+    }
+    return value;
+}
+
+/* Splits a raw JSON array into its raw elements. Returns 0 on success; a non-array fails. */
+static int raw_array_items(const char *raw, char ***items, size_t *items_len)
+{
+    *items = NULL;
+    *items_len = 0U;
+    if (raw == NULL || raw[0] != '[') {
+        return 1;
+    }
+    char *wrapped = wrap_array(raw);
+    if (wrapped == NULL) {
+        return 1;
+    }
+    int rc = st_json_get_raw_array(wrapped, "items", items, items_len);
+    free(wrapped);
+    return rc == 0 ? 0 : 1;
+}
+
+/* A port bound must be a JSON integer: 443.0 or 4.43e2 is refused rather than truncated. */
+static int parse_port_bound(const char *raw, long *out)
+{
+    const char *p = raw[0] == '-' ? raw + 1 : raw;
+    if (*p == '\0') {
+        return 1;
+    }
+    for (; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return 1;
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(raw, &end, 10);
+    if (errno == ERANGE || end == NULL || *end != '\0') {
+        return 1;
+    }
+    *out = value;
+    return 0;
+}
+
+static int normalize_port_range(const char *raw, int *low, int *high)
+{
+    char **bounds = NULL;
+    size_t bounds_len = 0U;
+    if (raw_array_items(raw, &bounds, &bounds_len) != 0) {
+        return 1;
+    }
+    long parsed_low = 0;
+    long parsed_high = 0;
+    int ok = bounds_len == 2U
+        && parse_port_bound(bounds[0], &parsed_low) == 0
+        && parse_port_bound(bounds[1], &parsed_high) == 0
+        && parsed_low >= 0 && parsed_high <= 65535 && parsed_low <= parsed_high;
+    st_json_free_string_array(bounds, bounds_len);
+    if (!ok) {
+        return 1;
+    }
+    *low = (int)parsed_low;
+    *high = (int)parsed_high;
+    return 0;
+}
+
+static int normalize_cidr(const char *rule_raw, st_egress_destination_rule *out)
+{
+    char *raw = st_json_get_top_level_raw(rule_raw, "cidr");
+    /* Absent, null and non-string all fail here; an empty string fails the parse below. */
+    char *cidr = decode_text(raw);
+    free(raw);
+    if (cidr == NULL) {
+        return 1;
+    }
+    const char *trimmed = trim_in_place(cidr);
+    st_egress_cidr parsed;
+    int ok = strlen(trimmed) < sizeof(out->cidr) && st_egress_parse_cidr(trimmed, &parsed) == 0;
+    if (ok) {
+        /* Kept as written: a bare address stays bare, so the operator reads back what they typed. */
+        copy_bounded(out->cidr, sizeof(out->cidr), trimmed);
+    }
+    free(cidr);
+    return ok ? 0 : 1;
+}
+
+static int normalize_protocols(const char *rule_raw, st_egress_destination_rule *out)
+{
+    char *raw = st_json_get_top_level_raw(rule_raw, "protocols");
+    if (is_absent_value(raw)) {
+        free(raw);
+        return 0;
+    }
+    char **items = NULL;
+    size_t items_len = 0U;
+    int rc = raw_array_items(raw, &items, &items_len);
+    free(raw);
+    for (size_t i = 0U; rc == 0 && i < items_len; i++) {
+        char *value = decode_text(items[i]);
+        if (value == NULL) {
+            rc = 1;
+            break;
+        }
+        char *protocol = trim_in_place(value);
+        for (char *p = protocol; *p != '\0'; p++) {
+            if (*p >= 'A' && *p <= 'Z') {
+                *p = (char)(*p - 'A' + 'a');
+            }
+        }
+        if (strcmp(protocol, "tcp") != 0 && strcmp(protocol, "udp") != 0) {
+            rc = 1;
+        } else if (!rule_allows_protocol(out, protocol) && out->protocols_len < ST_EGRESS_MAX_PROTOCOLS) {
+            copy_bounded(out->protocols[out->protocols_len], sizeof(out->protocols[0]), protocol);
+            out->protocols_len++;
+        }
+        free(value);
+    }
+    st_json_free_string_array(items, items_len);
+    return rc;
+}
+
+static int normalize_port_ranges(const char *rule_raw, st_egress_destination_rule *out)
+{
+    char *raw = st_json_get_top_level_raw(rule_raw, "portRanges");
+    if (is_absent_value(raw)) {
+        free(raw);
+        return 0;
+    }
+    char **items = NULL;
+    size_t items_len = 0U;
+    int rc = raw_array_items(raw, &items, &items_len);
+    free(raw);
+    if (rc == 0 && items_len > ST_EGRESS_MAX_PORT_RANGES) {
+        rc = 1;
+    }
+    for (size_t i = 0U; rc == 0 && i < items_len; i++) {
+        int low = 0;
+        int high = 0;
+        rc = normalize_port_range(items[i], &low, &high);
+        if (rc == 0) {
+            out->port_ranges[out->port_ranges_len][0] = low;
+            out->port_ranges[out->port_ranges_len][1] = high;
+            out->port_ranges_len++;
+        }
+    }
+    st_json_free_string_array(items, items_len);
+    return rc;
+}
+
+static int normalize_destination_rule(const char *raw, st_egress_destination_rule *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!st_json_is_valid_object(raw)) {
+        return 1;
+    }
+    if (normalize_cidr(raw, out) != 0
+        || normalize_protocols(raw, out) != 0
+        || normalize_port_ranges(raw, out) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+int st_egress_normalize_destination_rules(const char *json, char **out_json)
+{
+    if (out_json == NULL) {
+        return 1;
+    }
+    *out_json = NULL;
+    if (json == NULL || !st_json_is_valid(json)) {
+        return 1;
+    }
+    while (is_trim_space(*json)) {
+        json++;
+    }
+    char **items = NULL;
+    size_t items_len = 0U;
+    if (raw_array_items(json, &items, &items_len) != 0) {
+        return 1;
+    }
+    /* Counted before anything is parsed, so an oversized list is refused, never truncated. */
+    if (items_len > ST_EGRESS_MAX_DESTINATION_RULES) {
+        st_json_free_string_array(items, items_len);
+        return 1;
+    }
+    st_egress_destination_rule *rules =
+        (st_egress_destination_rule *)calloc(items_len == 0U ? 1U : items_len, sizeof(*rules));
+    if (rules == NULL) {
+        st_json_free_string_array(items, items_len);
+        return 1;
+    }
+    int rc = 0;
+    for (size_t i = 0U; rc == 0 && i < items_len; i++) {
+        rc = normalize_destination_rule(items[i], &rules[i]);
+    }
+    st_json_free_string_array(items, items_len);
+    if (rc == 0) {
+        /* The encoder refuses a result over the stored byte limit, which is the last check. */
+        *out_json = st_egress_encode_destination_rules(rules, items_len);
+        rc = *out_json == NULL ? 1 : 0;
+    }
+    free(rules);
+    return rc;
 }
 
 char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules, size_t rules_len)
