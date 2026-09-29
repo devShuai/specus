@@ -63,6 +63,7 @@ public class SpecusClientApplication {
         if (options.help()) { CliOutput.result(options.json(),"help",0,java.util.Map.of("help",ClientCli.HELP),ClientCli.HELP); return; }
         if (options.version()) { CliOutput.result(options.json(),"version",0,java.util.Map.of("version",currentVersion()),currentVersion()); return; }
         if (java.util.Set.of("status","peers","services","egress").contains(options.command())) { System.exit(CliState.query(options)); return; }
+        if (options.command().startsWith("egress ")) { System.exit(com.theshuai.specusclient.cli.EgressEdit.run(options)); return; }
         if ("ui".equals(options.command())) { System.exit(com.theshuai.specusclient.cli.LocalUi.run(options, currentVersion())); return; }
         ClientStartupConfig loaded;
         try {

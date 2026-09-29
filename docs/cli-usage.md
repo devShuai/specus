@@ -58,6 +58,9 @@ Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus
 | 在线设备 | `peers --config PATH` | 已连接控制通道收到的 Peer 名称、虚拟 IP 和在线状态；不扫描网络 |
 | 访问地址 | `services --config PATH` | 已收到的远端 Peer 服务目录、访问地址与可用标记；不枚举尚未发布的后台配置 |
 | 出口分流 | `egress --config PATH` | 本机出口分流状态：哪些规则在生效、哪些路由装上了、哪些被拒及原因、出口设备是否在线、本机是否正作为出口。只读，不连接服务端 |
+| 编辑出口规则 | `egress rules\|rule add\|rule remove\|rule move\|rule enable\|rule disable --config PATH` | 列出、增删、排序、停用或恢复 `peerEgressRules`；只改配置文件，运行中的客户端重启后应用。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#用命令编辑规则) |
+| 出口接管开关 | `egress enable --yes\|disable --config PATH` | 设置 `peerEgressEnabled`；开启前先说明影响，缺 `--yes` 时不修改 |
+| 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 地址的去向，不建连；`--connect` 才做一次 TCP 可达性测试 |
 | 离线排错 | `doctor --config PATH` | 检查配置与密钥引用，不联网 |
 | 主动排错 | `doctor --probe --config PATH` | 最多 5 秒的服务端 DNS/TCP 探测；不发送登录、不校验 TLS、不探测转发目标 |
 | 机器输出 | 上述单次命令加 `--json` | stdout 只有一个版本化 JSON 文档，日志/警告仍写 stderr；帮助/版本也支持 |
