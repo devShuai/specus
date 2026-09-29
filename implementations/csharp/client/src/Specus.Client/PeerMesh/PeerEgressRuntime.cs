@@ -13,6 +13,19 @@ internal interface IPeerEgressSocket : IDisposable
     /// <summary>Returns the byte count, or -1 at end of stream.</summary>
     int Read(byte[] buffer);
 
+    /// <summary>
+    /// Reads at most <paramref name="length"/> bytes into the start of <paramref name="buffer"/>. The
+    /// real sockets read straight into it; this default is for the test doubles.
+    /// </summary>
+    int Read(byte[] buffer, int length)
+    {
+        if (length >= buffer.Length) { return Read(buffer); }
+        var part = new byte[length];
+        var read = Read(part);
+        if (read > 0) { Buffer.BlockCopy(part, 0, buffer, 0, read); }
+        return read;
+    }
+
     void Write(byte[] data);
 
     /// <summary>
@@ -473,6 +486,9 @@ internal sealed class PeerEgressRuntime
     {
         _executor(() =>
         {
+            // One buffer for the life of the flow, read into up to the credit. The credit changes on
+            // nearly every read, and sizing a new buffer to it each time allocated up to this much
+            // per read.
             var buffer = new byte[TcpReadBuffer];
             while (true)
             {
@@ -493,11 +509,10 @@ internal sealed class PeerEgressRuntime
                     handle.Wake.Wait();
                     continue;
                 }
-                if (buffer.Length != size) { buffer = new byte[size]; }
                 int read;
                 try
                 {
-                    read = handle.Socket.Read(buffer);
+                    read = handle.Socket.Read(buffer, size);
                 }
                 catch (Exception)
                 {
