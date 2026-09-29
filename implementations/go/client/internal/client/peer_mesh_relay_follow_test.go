@@ -112,3 +112,44 @@ func TestRelayCheckMovesASessionWithoutAHealthyDirectPath(t *testing.T) {
 		t.Fatalf("path = %s relay=%q, want RELAY via allocation-1", path, relayTarget)
 	}
 }
+
+// A peer that restarted answers from a new socket. What this side learned about the old one, a
+// sticky endpoint and a direct path still counted healthy, must not keep the session on a socket
+// whose process is gone.
+func TestAPeerRestartLetsItsNewEndpointTakeOver(t *testing.T) {
+	mesh, session, _, _ := relayTestMesh(t)
+	old := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 42000}
+	fresh := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 43000}
+	mesh.mu.Lock()
+	session.RemoteEndpoint = old
+	session.EndpointSuccess = time.Now()
+	session.EndpointRTT = 1
+	session.LastDirectSuccess = time.Now()
+	restarted := session.applyRemoteKeyEpoch("epoch-restarted")
+	mesh.mu.Unlock()
+	if !restarted {
+		t.Fatal("precondition: a second epoch is a restart")
+	}
+
+	mesh.markPathFromInboundCheck(session, fresh, "")
+	if _, _, endpoint := pathOf(mesh, session); endpoint == nil || endpoint.String() != fresh.String() {
+		t.Fatalf("endpoint = %v, want the restarted peer's %v", endpoint, fresh)
+	}
+}
+
+// The same restart seen first over the relay: the old direct path no longer counts as healthy, so
+// the relay check gives the session a way to send.
+func TestAPeerRestartLetsItsRelayCheckTakeOver(t *testing.T) {
+	mesh, session, _, _ := relayTestMesh(t)
+	mesh.mu.Lock()
+	session.RemoteEndpoint = &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 42000}
+	session.EndpointSuccess = time.Now()
+	session.LastDirectSuccess = time.Now()
+	session.applyRemoteKeyEpoch("epoch-restarted")
+	mesh.mu.Unlock()
+
+	mesh.markPathFromInboundCheck(session, nil, "allocation-9")
+	if path, relayTarget, _ := pathOf(mesh, session); path != "RELAY" || relayTarget != "allocation-9" {
+		t.Fatalf("path = %s relay=%q, want RELAY via allocation-9", path, relayTarget)
+	}
+}
