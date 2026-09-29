@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongPredicate;
 import java.util.function.LongSupplier;
@@ -88,7 +89,14 @@ final class PeerEgressRuntime {
         void run(Runnable reader);
     }
 
-    private record TcpFlow(PeerEgressTcpConnection connection, Socket socket) {
+    /**
+     * One TCP flow. {@code wake} is a condition of the plane's lock that only this flow's reader
+     * waits on. Readers used to share one condition that every state machine output signalled, so
+     * each ACK and each tick woke every reader to find the credit was someone else's; with dozens of
+     * flows that herd set the pace. Signalled with the lock held after anything that may have given
+     * this flow credit or ended it.
+     */
+    private record TcpFlow(PeerEgressTcpConnection connection, Socket socket, Condition wake) {
     }
 
     private record UdpFlow(Socket socket) {
@@ -99,11 +107,12 @@ final class PeerEgressRuntime {
     }
 
     private final ReentrantLock lock = new ReentrantLock();
-    private final java.util.concurrent.locks.Condition readerReady = lock.newCondition();
     private final Sender sender;
     // Installed before the runtime is published; must never block or acquire the mesh lock.
     java.util.function.BiPredicate<Long, byte[]> trySend;
     private int sendCursor;
+    // Whether any flow has had a transmission refused since the last scan of blocked flows.
+    private volatile boolean sendBlocked;
     private final Dialer dialer;
     private final Executor executor;
     private final LongSupplier clock;
@@ -435,10 +444,17 @@ final class PeerEgressRuntime {
             PeerEgressTcpConnection connection = PeerEgressTcpConnection.accept(
                     syn, newInitialSendSequence(), mtu, flows.idleTimeoutMs(), nowMs, output);
             if (trySend != null) {
-                connection.tryTransmit = packet -> trySend.test(consumer,
-                        PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet));
+                connection.tryTransmit = packet -> {
+                    boolean accepted = trySend.test(consumer,
+                            PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet));
+                    if (!accepted) {
+                        // Transmission runs inside the state machine, under the lock.
+                        sendBlocked = true;
+                    }
+                    return accepted;
+                };
             }
-            TcpFlow handle = new TcpFlow(connection, socket);
+            TcpFlow handle = new TcpFlow(connection, socket, lock.newCondition());
             flow.handle = handle;
             totalFlows++;
             applyTcpOutput(consumer, flow, handle, output);
@@ -456,7 +472,7 @@ final class PeerEgressRuntime {
                 lock.lock();
                 try {
                     while (flows.lookup(flow.key) == flow && handle.connection().appReadCredit() == 0) {
-                        readerReady.awaitUninterruptibly();
+                        handle.wake().awaitUninterruptibly();
                     }
                     if (flows.lookup(flow.key) != flow) { return; }
                     int size = Math.min(TCP_READ_BUFFER, handle.connection().appReadCredit());
@@ -522,7 +538,7 @@ final class PeerEgressRuntime {
     /** Performs everything the state machine asked for. Called with the lock held. */
     private void applyTcpOutput(long consumer, PeerEgressFlowTable.Flow flow, TcpFlow handle,
             PeerEgressTcpConnection.Output output) {
-        readerReady.signalAll();
+        handle.wake().signalAll();
         for (byte[] packet : output.segments) {
             emitSegment(consumer, packet);
         }
@@ -701,9 +717,18 @@ final class PeerEgressRuntime {
 
     /** Called without the mesh lock when the bounded outbound queue frees a slot. */
     void sendReady(long nowMs) {
+        // Every frame the send loop takes out of the queue lands here, and on most of them no flow
+        // is waiting for room. Scanning and sorting every flow under the plane's lock for each one
+        // anyway put the send loop in line behind every reader, so the scan only runs once a
+        // transmission has actually been refused. A refusal means the queue was full, so the frames
+        // that follow it are enough to bring the scan round.
+        if (!sendBlocked) {
+            return;
+        }
         lock.lock();
         try {
             if (closed) { return; }
+            sendBlocked = false;
             var snapshot = flowSnapshot();
             if (snapshot.isEmpty()) { return; }
             int start = sendCursor % snapshot.size();
@@ -712,6 +737,9 @@ final class PeerEgressRuntime {
                 var flow = snapshot.get((start + i) % snapshot.size());
                 if (flow.handle instanceof TcpFlow handle && handle.connection().sendBlocked) {
                     applyTcpOutput(flow.consumer, flow, handle, handle.connection().onTick(nowMs));
+                    if (handle.connection().sendBlocked) {
+                        sendBlocked = true;
+                    }
                 }
             }
         } finally {
@@ -817,7 +845,6 @@ final class PeerEgressRuntime {
 
     /** Closes one flow's socket and drops its table entry. Called with the lock held. */
     private void release(PeerEgressFlowTable.Flow flow) {
-        readerReady.signalAll();
         if (flows.lookup(flow.key) == null) {
             return;
         }
@@ -826,7 +853,6 @@ final class PeerEgressRuntime {
     }
 
     private void releaseKey(PeerEgressFlowTable.Key key) {
-        readerReady.signalAll();
         PeerEgressFlowTable.Flow flow = flows.close(key);
         if (flow != null) {
             closeHandle(flow.handle);
@@ -841,7 +867,6 @@ final class PeerEgressRuntime {
      * failure.
      */
     private void releaseAll(List<PeerEgressFlowTable.Revocation> revoked, long nowMs) {
-        readerReady.signalAll();
         for (PeerEgressFlowTable.Revocation entry : revoked) {
             PeerEgressFlowTable.Flow flow = entry.flow();
             if (flow.handle instanceof TcpFlow handle) {
@@ -867,9 +892,12 @@ final class PeerEgressRuntime {
         }
     }
 
-    private static void closeHandle(Object handle) {
+    /** Closes a flow's socket. Called with the lock held. */
+    private void closeHandle(Object handle) {
         if (handle instanceof TcpFlow tcp) {
             tcp.socket().close();
+            // Its reader may be waiting for credit that will now never come.
+            tcp.wake().signalAll();
         } else if (handle instanceof UdpFlow udp) {
             udp.socket().close();
         }
