@@ -239,47 +239,101 @@ macOS 网络服务的 DNS 设置都经路由到达。发往监听地址其他端
 
 ## 六、系统 DNS 接管
 
-### 共同要求
+共享向量 `peer-egress-dns-takeover-v1.json` 给出这一节里所有不碰系统的部分：从各平台工具的输出里读出 DNS 设置、
+判定能否接管与转发给哪些上游、接管与回滚的确切命令、回滚时遇到别人改过的设置怎么办。执行命令、事务日志与时机各端自测。
 
-- **开启前检查，任一不满足即拒绝启动二期并说明原因**（一期照常运行）：
-  - fake-IP 池段已被本功能以外的路由占用，或与 mesh 网段、本机任一接口地址重叠；
-  - 系统 DNS 当前指向回环地址或某个 TUN/虚拟接口的地址（强烈暗示已有别的接管者在场）。
-    这一条同时防住**回滚陷阱**：把这样的值记成「原值」，将来回滚会把用户指向一个已经不存在的接管者，直接断网。
-- **事务日志**先落盘再改系统：记录改了哪里、原值是什么；改动成功后标记为已提交。
-- 进程启动时若发现事务日志，**先按日志回滚**，再按当前配置决定是否重新接管。
-- 正常退出回滚；被强杀后的回滚在下次启动时完成，或由显式命令完成。
-- 网络切换（默认路由或接口地址变化）后重新做开启前检查；新网络落进池段时停止接管、回滚并告警，不静默继续。
+### 开启前检查
+
+二期运行（第二节）之后才谈接管。下面任一条不满足即**拒绝接管**：状态的 `dns` 写 `takeover: false`、
+`"code": "EGRESS_DNS_TAKEOVER_REFUSED"` 和 `reason`，数据面与应答者照常运行（有人手动把 DNS 指向监听地址时仍然可用），
+一期不受影响。
+
+| `reason` | 何时 |
+| --- | --- |
+| `pool-route-not-installed` | 池段路由没装上（被别人占用，或没有 TUN）：发往 fake-IP 的流量到不了本功能 |
+| `system-dns-loopback` | 系统 DNS 有一个是回环地址（向量 `upstreams`） |
+| `system-dns-virtual` | 系统 DNS 有一个落在池段、mesh 网段，或是本机某个隧道类接口的地址（向量 `upstreams`） |
+| `no-upstream` | 去掉 IPv6 与 `0.0.0.0` 之后一个上游也不剩（向量 `upstreams`） |
+| `resolv-conf-managed` | Linux 没有经 stub 使用 systemd-resolved，而 `/etc/resolv.conf` 是符号链接（向量 `linuxMode`） |
+| `nrpt-root-occupied` | Windows 已有别人的、命名空间为 `.` 的 NRPT 规则（向量 `parseWindowsNrpt`） |
+| `unsupported-platform` | 不是 Linux、macOS、Windows |
+
+`system-dns-loopback` 与 `system-dns-virtual` 同时是**回滚陷阱**的防线：系统 DNS 指向回环或虚拟地址，强烈暗示已有别的接管者在场；
+把这样的值记成「原值」，将来回滚会把用户指向一个已经不存在的接管者，直接断网。
+
+**本机隧道类接口**：Linux 带 `IFF_POINTOPOINT` 标志的接口；macOS 名字以 `utun`、`ipsec`、`ppp` 开头的接口；
+Windows 接口类型为 53（虚拟）或 131（隧道）的接口。本客户端自己的 TUN 除外（它的地址在 mesh 网段里，另有一条管着）。
+
+上游只取 IPv4，按读到的顺序去重。IPv6 上游本版本不转发，读到了也不算拒绝的理由（回环的 `::1` 除外）。
+
+### 事务日志
+
+- 位置：`~/.specus/egress-dns-journal.json`，与路由安装记录同一目录、同一套私有文件写法（先写临时文件再改名）。
+- 内容：
+
+  ```json
+  {"version": 1, "state": "committed", "platform": "linux-resolved", "pid": 4242,
+   "listen": "198.18.0.1", "tunnel": "specus0", "upstreams": ["192.168.1.1"],
+   "startedAtUnixMs": 1757000000000}
+  ```
+
+  `platform` 取 `linux-resolved`、`linux-resolvconf`、`macos`、`windows`。`linux-resolvconf` 另存 `resolvConf`（原文件全文），
+  `macos` 另存 `services`（`[{"name": "Wi-Fi", "servers": ["Empty"]}]`，每个被改的服务与它原来的 DNS）。
+- **先落盘再改系统**：检查通过后以 `state: "pending"` 写日志，再按向量 `plan` 的 `apply` 顺序执行，全部成功后改写为 `committed`。
+  任一步失败：完整执行一遍 `revert`（它对执行到哪一步都安全），删日志，状态写 `EGRESS_DNS_TAKEOVER_FAILED`，
+  `error` 是失败命令输出的第一行。
+- **回滚**按日志执行 `revert`，成功后删日志；某一步失败则保留日志，留给下次启动或 `egress dns restore` 再试，并记日志。
+- 进程启动时若发现事务日志，不论 `pending` 还是 `committed`，**先按日志回滚**，再按当前配置决定是否重新接管。
+- 正常退出回滚；被强杀后的回滚在下次启动时完成，或由 `egress dns restore` 完成。
+- 应答者转发用的上游就是日志里的 `upstreams`。
+
+### 网络切换
+
+每 10 秒比较一次网络指纹：默认路由所在接口，加上本机全部 IPv4 地址（排序后）。变化时**先回滚，再重新检查并接管**，
+这样新网络经 DHCP 下发的 DNS 会被重新读成上游，而不是继续转发给上一个网络的路由器。
+新网络的接口地址落进池段时，二期整体停止（`EGRESS_FAKE_IP_POOL_INVALID`），回滚并告警，不静默继续。
 
 ### 各平台做法
 
-| 平台 | 接管 | 记录的原值 | 回滚 |
+| 平台 | 读原值与上游 | 接管 | 回滚 |
 | --- | --- | --- | --- |
-| Linux，systemd-resolved 在运行 | 对 TUN 链路 `resolvectl dns <tun> 198.18.0.1`、`resolvectl domain <tun> '~.'`，使其成为所有名字的默认路由 | `resolvectl status` 中全局与各链路的 DNS 服务器（仅用于转发，不需要写回） | `resolvectl revert <tun>` |
-| Linux，无 systemd-resolved | 备份 `/etc/resolv.conf` 后改写为 `nameserver 198.18.0.1` | 原 `resolv.conf` 的 `nameserver` 行 | 恢复备份；若文件在接管期间被别人改过，保留别人的版本并告警 |
-| macOS | 对每个启用的网络服务 `networksetup -setdnsservers <service> 198.18.0.1` | 各服务原来的 DNS（`Empty` 表示用 DHCP 下发的） | 逐个服务写回原值（`Empty` 原样写回） |
-| Windows | 添加 NRPT 规则 `Add-DnsClientNrptRule -Namespace "." -NameServers 198.18.0.1`，带本功能的注释标记 | 各启用接口的 DNS 服务器 | 删除带本功能标记的 NRPT 规则 |
+| Linux，经 stub 使用 systemd-resolved | 上游：`resolvectl dns` 的全局与各链路服务器，跳过本机 TUN（向量 `parseResolvectl`） | 对 TUN 链路 `resolvectl dns`、`resolvectl domain <tun> '~.'`，再清缓存 | `resolvectl revert <tun>`，再清缓存 |
+| Linux，其他 | 原文件全文；上游：它的 `nameserver` 行（向量 `parseResolvConf`） | 改写 `/etc/resolv.conf` 为固定内容（向量 `resolvConfWritten`） | 文件仍是我们写的内容时写回原文；否则保留别人的版本并告警（向量 `revertResolvConf`） |
+| macOS | 启用的服务（`networksetup -listallnetworkservices`）各自的 DNS（`-getdnsservers`，没有时记 `Empty`）；上游：`scutil --dns` 默认解析器的服务器（向量 `parseScutil`） | 每个启用的服务 `networksetup -setdnsservers <service> 198.18.0.1`，再清缓存 | 只把仍然只指向监听地址的服务写回原值，`Empty` 原样写回；别人改过的保留并告警（向量 `revertMacService`） |
+| Windows | 上游：已连接的 IPv4 接口的 DNS 服务器，跳过本机 TUN（向量 `windowsReadServers`、`parseWindowsServers`） | 添加命名空间 `.`、注释为 `specus-peer-egress` 的 NRPT 规则，再清缓存 | 删除注释为 `specus-peer-egress` 的 NRPT 规则，再清缓存 |
+
+Linux 选哪一种做法见向量 `linuxMode`：`resolvectl dns` 能执行、且 `/etc/resolv.conf` 的 `nameserver` 全是 stub
+（`127.0.0.53`、`127.0.0.54`）时用 systemd-resolved；否则改写文件，但文件是符号链接时拒绝——那说明它归别的程序管理，
+我们写进去的内容会被随时覆盖，回滚时也说不清该写回哪里。systemd-resolved 在运行、而 `resolv.conf` 没经它的 stub
+（应用直接问上游），这时对 resolved 设置什么都不会被应用看到，所以同样走改写文件。
 
 Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取最先到的应答，改一张网卡挡不住别的网卡抢答；NRPT 规则优先于所有网卡。
 
-转发用的原上游取自上表「记录的原值」；取不到（例如全部指向回环）时按开启前检查拒绝启动。
+各平台的确切命令见向量 `plan`：`apply` 与 `revert` 是命令行参数数组（不经 shell）；`write`、`restore`、`restore-service`
+是文件或按 `revertResolvConf`、`revertMacService` 判定后的动作。
 
 ### 命令
 
-- `egress dns status --config PATH`：是否接管、原上游、事务日志状态、映射数与池使用率。
-- `egress dns restore`：按事务日志回滚，不需要客户端在运行；日志不存在时说明没有需要恢复的内容并以 0 退出。
+- `egress dns status --config PATH`：是否接管、原因、上游、事务日志状态、映射数与池使用率。读状态文件与日志，不需要客户端在运行。
+- `egress dns restore`：按事务日志回滚，不需要客户端在运行。日志不存在时说明没有需要恢复的内容并以 0 退出。
+  日志里记的 `pid` 仍在运行时拒绝并以 1 退出，提示先停止客户端或关闭 `peerEgressDnsTakeover`；`--force` 跳过这一检查
+  （进程号可能被别的进程重用）。回滚成功以 0 退出，某一步失败以 1 退出并说明是哪一步。
 
 ## 七、状态查询增量
 
 `consumer.dns`：
 
 ```json
-{"takeover": true, "listen": "198.18.0.1", "pool": "198.18.0.0/15", "mappings": 42,
+{"active": true, "takeover": true, "listen": "198.18.0.1", "pool": "198.18.0.0/15", "mappings": 42,
  "quarantined": 0, "upstreams": ["192.0.2.53"], "journal": "committed",
  "queries": {"answered": 120, "forwarded": 300, "failed": 2}}
 ```
 
-- 开了 `peerEgressDnsTakeover` 这一节才出现。`takeover` 是二期此刻是否在运行；池不可用时为 `false`，
-  并带 `"code": "EGRESS_FAKE_IP_POOL_INVALID"`。
+- 开了 `peerEgressDnsTakeover` 这一节才出现。`active` 是二期此刻是否在运行（池、路由、应答者）；池不可用时为 `false`，
+  并带 `"code": "EGRESS_FAKE_IP_POOL_INVALID"`。`takeover` 是系统 DNS 此刻是否指向应答者（日志已提交）；
+  拒绝或失败时为 `false`，带 `code`（`EGRESS_DNS_TAKEOVER_REFUSED` 带 `reason`，`EGRESS_DNS_TAKEOVER_FAILED` 带 `error`）。
+  第三、四步交付时还没有接管，那时 `takeover` 与 `active` 同值；第五步起按这里的含义。
+- `journal` 取 `none`、`pending`、`committed`。
 - `mappings` 是存活的映射数，`quarantined` 是还在隔离期的地址数，都在取快照时按当时的时间现算。
 - `listen`、`upstreams`、`queries` 由第四步填，`journal` 由第五步填；还没交付的字段不输出。
   `listen` 只在二期运行时输出；`upstreams`（没有时为 `[]`）与 `queries` 只要开了 `peerEgressDnsTakeover` 就输出。
@@ -303,5 +357,7 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
    这一步之后映射只能由第四步的应答者创建，所以单开这一步的开关，域名规则显示生效，却还没有流量会落进池里；
    用户文档在第五步交付之前不介绍这个开关。
 4. 消费端 DNS 应答者：读包路径上的 UDP 与 TCP、报文（向量 `wire`）、反向查询、转发（上游由调用方传入）、状态。三端。
-5. 系统 DNS 接管、事务日志、回滚与 `egress dns restore`，三平台。
+5. 系统 DNS 接管：开启前检查、读原值与上游、事务日志、各平台接管与回滚（向量 `peer-egress-dns-takeover-v1.json`）、
+   网络切换、`egress dns status` 与 `egress dns restore`、状态的 `active`/`takeover`，三端三平台。
+   用户文档从这一步起介绍 `peerEgressDnsTakeover`，并写明「可识别边界」那句话。
 6. 实验室：Linux 命名空间里完整跑通（resolv.conf 方式），并增加「池内无映射」与「接管后强杀再启动」用例。
