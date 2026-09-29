@@ -868,12 +868,20 @@ internal sealed class PeerEgressRuntime
         {
             decision = Rejections.Record(consumer, code, nowMs);
         }
+        // Who and why, never where: a line per refused destination would be the consumer's browsing
+        // history kept in this device's log. The consumer is told the destination in the control message.
         if (decision.ShouldLog)
         {
-            _logger?.LogInformation(
-                "[peer-egress] refused consumer={Consumer} protocol={Protocol} destination={Destination}:{Port} code={Code} suppressed={Suppressed}",
-                consumer, subject.ProtocolName(), Ipv4Cidr.FormatAddress(subject.RemoteIp),
-                subject.RemotePort, code, decision.Suppressed);
+            if (decision.Suppressed > 0)
+            {
+                _logger?.LogInformation("[peer-egress] refused consumer={Consumer} protocol={Protocol} code={Code} suppressed={Suppressed}",
+                    consumer, subject.ProtocolName(), code, decision.Suppressed);
+            }
+            else
+            {
+                _logger?.LogInformation("[peer-egress] refused consumer={Consumer} protocol={Protocol} code={Code}",
+                    consumer, subject.ProtocolName(), code);
+            }
         }
         EmitFrame(consumer, PeerEgressFrame.TypeControl,
             PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
@@ -894,10 +902,35 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private void Unreachable(long consumer, PeerEgressFlowTable.Key key, Exception? cause)
     {
-        _logger?.LogInformation(
-            "[peer-egress] connect failed consumer={Consumer} protocol={Protocol} destination={Destination}:{Port} err={Error}",
-            consumer, key.ProtocolName(), Ipv4Cidr.FormatAddress(key.RemoteIp), key.RemotePort,
-            cause?.Message ?? "no socket");
+        _logger?.LogInformation("[peer-egress] connect failed consumer={Consumer} protocol={Protocol} reason={Reason}",
+            consumer, key.ProtocolName(), ConnectReason(cause));
+    }
+
+    /// <summary>
+    /// Why a dial failed, without the addresses exception messages carry, so the log keeps no record of
+    /// where consumers were going. The same words in every runtime.
+    /// </summary>
+    internal static string ConnectReason(Exception? cause)
+    {
+        for (var error = cause; error is not null; error = error.InnerException)
+        {
+            switch (error)
+            {
+                case PeerEgressNoPhysicalRouteException:
+                    return "no route outside the tunnel";
+                case TimeoutException:
+                    return "timed out";
+                case System.Net.Sockets.SocketException socket:
+                    return socket.SocketErrorCode switch
+                    {
+                        System.Net.Sockets.SocketError.ConnectionRefused => "refused",
+                        System.Net.Sockets.SocketError.TimedOut => "timed out",
+                        System.Net.Sockets.SocketError.NetworkUnreachable or System.Net.Sockets.SocketError.HostUnreachable => "unreachable",
+                        _ => "error",
+                    };
+            }
+        }
+        return cause is null ? "no socket" : "error";
     }
 
     /// <summary>Closes one flow's socket and drops its table entry. Called with the lock held.</summary>

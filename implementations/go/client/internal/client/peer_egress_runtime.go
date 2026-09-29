@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -627,13 +629,14 @@ func (r *egressRuntime) refuse(consumer int64, key egressFlowKey, code string, n
 	logger := r.logger
 	r.mu.Unlock()
 
+	// Who and why, never where: a line per refused destination would be the consumer's browsing
+	// history kept in this device's log. The consumer is told the destination in the control message.
 	if write && logger != nil {
 		if suppressed > 0 {
-			logger.Printf("[peer-egress] refused consumer=%d protocol=%s destination=%s:%d code=%s suppressed=%d",
-				consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, code, suppressed)
+			logger.Printf("[peer-egress] refused consumer=%d protocol=%s code=%s suppressed=%d",
+				consumer, key.protocolName(), code, suppressed)
 		} else {
-			logger.Printf("[peer-egress] refused consumer=%d protocol=%s destination=%s:%d code=%s",
-				consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, code)
+			logger.Printf("[peer-egress] refused consumer=%d protocol=%s code=%s", consumer, key.protocolName(), code)
 		}
 	}
 	body, err := encodePeerEgressControl(peerEgressControl{
@@ -663,9 +666,39 @@ func (r *egressRuntime) unreachable(consumer int64, key egressFlowKey, cause err
 	logger := r.logger
 	r.mu.Unlock()
 	if logger != nil {
-		logger.Printf("[peer-egress] connect failed consumer=%d protocol=%s destination=%s:%d err=%v",
-			consumer, key.protocolName(), formatEgressAddress(key.remoteIP), key.remotePort, cause)
+		logger.Printf("[peer-egress] connect failed consumer=%d protocol=%s reason=%s",
+			consumer, key.protocolName(), egressConnectReason(cause))
 	}
+}
+
+// egressConnectReason names why a dial failed without the addresses the error text carries, so the
+// log keeps no record of where consumers were going. The same words in every runtime.
+func egressConnectReason(err error) string {
+	var timeout interface{ Timeout() bool }
+	switch {
+	case err == nil:
+		return "no socket"
+	case errors.Is(err, errEgressNoPhysicalRoute):
+		return "no route outside the tunnel"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "unreachable"
+	case errors.As(err, &timeout) && timeout.Timeout():
+		return "timed out"
+	}
+	// Windows reports these under its own error numbers. The innermost error's text names the
+	// cause and, unlike the dial error around it, no address.
+	var dial *net.OpError
+	if errors.As(err, &dial) && dial.Err != nil {
+		switch text := strings.ToLower(dial.Err.Error()); {
+		case strings.Contains(text, "refused"):
+			return "refused"
+		case strings.Contains(text, "unreachable"):
+			return "unreachable"
+		}
+	}
+	return "error"
 }
 
 // release closes one flow's socket and drops its table entry. Called with the lock held.

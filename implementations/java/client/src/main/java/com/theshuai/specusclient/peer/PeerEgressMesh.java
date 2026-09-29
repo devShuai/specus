@@ -578,8 +578,9 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         refusalsLogged = joined;
         for (PeerEgressRoutePlanner.Refusal refusal : refused) {
-            log.warn("[peer-egress-consumer] rule {} ({}) refused: {}",
-                    refusal.index(), refusal.match(), refusal.code());
+            // The index and the code, not the match: configuration values stay out of the log.
+            log.warn("[peer-egress-consumer] rule {} refused: {}",
+                    refusal.index(), refusal.code());
         }
     }
 

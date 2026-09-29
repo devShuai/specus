@@ -829,15 +829,14 @@ final class PeerEgressRuntime {
         } finally {
             lock.unlock();
         }
+        // Who and why, never where: a line per refused destination would be the consumer's browsing
+        // history kept in this device's log. The consumer is told the destination in the control message.
         if (decision.shouldLog()) {
             if (decision.suppressed() > 0) {
-                log.info("[peer-egress] refused consumer={} protocol={} destination={}:{} code={} suppressed={}",
-                        consumer, subject.protocolName(), Ipv4Cidr.format(subject.remoteIp()),
-                        subject.remotePort(), code, decision.suppressed());
+                log.info("[peer-egress] refused consumer={} protocol={} code={} suppressed={}",
+                        consumer, subject.protocolName(), code, decision.suppressed());
             } else {
-                log.info("[peer-egress] refused consumer={} protocol={} destination={}:{} code={}",
-                        consumer, subject.protocolName(), Ipv4Cidr.format(subject.remoteIp()),
-                        subject.remotePort(), code);
+                log.info("[peer-egress] refused consumer={} protocol={} code={}", consumer, subject.protocolName(), code);
             }
         }
         emitFrame(consumer, PeerEgressFrame.TYPE_CONTROL,
@@ -857,9 +856,42 @@ final class PeerEgressRuntime {
      * which is what the application waits on anyway.
      */
     private void unreachable(long consumer, PeerEgressFlowTable.Key key, Exception cause) {
-        log.info("[peer-egress] connect failed consumer={} protocol={} destination={}:{} err={}",
-                consumer, key.protocolName(), Ipv4Cidr.format(key.remoteIp()), key.remotePort(),
-                cause == null ? "no socket" : cause.toString());
+        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}",
+                consumer, key.protocolName(), connectReason(cause));
+    }
+
+    /**
+     * Why a dial failed, without the addresses exception messages carry, so the log keeps no record of
+     * where consumers were going. The same words in every runtime.
+     */
+    static String connectReason(Throwable cause) {
+        if (cause == null) {
+            return "no socket";
+        }
+        for (Throwable error = cause; error != null; error = error.getCause()) {
+            if (error instanceof PeerEgressSocketBinder.NoPhysicalRouteException) {
+                return "no route outside the tunnel";
+            }
+            if (error instanceof java.net.SocketTimeoutException) {
+                return "timed out";
+            }
+            if (error instanceof java.net.NoRouteToHostException) {
+                return "unreachable";
+            }
+            if (error instanceof java.net.ConnectException) {
+                String message = String.valueOf(error.getMessage()).toLowerCase(java.util.Locale.ROOT);
+                if (message.contains("refused")) {
+                    return "refused";
+                }
+                if (message.contains("unreachable")) {
+                    return "unreachable";
+                }
+                if (message.contains("timed out")) {
+                    return "timed out";
+                }
+            }
+        }
+        return "error";
     }
 
     /** Closes one flow's socket and drops its table entry. Called with the lock held. */

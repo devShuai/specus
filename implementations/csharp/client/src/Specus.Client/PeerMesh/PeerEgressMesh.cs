@@ -681,8 +681,9 @@ internal sealed class PeerEgressMesh(
         _refusalsLogged = joined;
         foreach (var refusal in refused)
         {
-            logger?.LogWarning("[peer-egress-consumer] rule {Index} ({Match}) refused: {Code}",
-                refusal.Index, refusal.Match, refusal.Code);
+            // The index and the code, not the match: configuration values stay out of the log.
+            logger?.LogWarning("[peer-egress-consumer] rule {Index} refused: {Code}",
+                refusal.Index, refusal.Code);
         }
     }
 
