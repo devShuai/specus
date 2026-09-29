@@ -41,6 +41,12 @@ func runEgressCommand(options cliOptions, path string) int {
 		return egressTest(options, path)
 	case "egress enable", "egress disable":
 		return egressSwitch(options, path)
+	case "egress dns enable", "egress dns disable":
+		return egressDNSSwitch(options, path)
+	case "egress dns status":
+		return egressDNSStatus(options, path)
+	case "egress dns restore":
+		return egressDNSRestore(options)
 	default:
 		return egressRuleEdit(options, path)
 	}
@@ -465,14 +471,14 @@ func jsonString(value string) string {
 var errEgressEditUnsupported = errors.New("请求包含不支持编辑的字段")
 
 // uiPatchRawConfig replaces or adds top-level values the egress commands own, with the encoded JSON
-// given. Only these two fields; everything else goes through uiPatchConfig's checks.
+// given. Only the egress switches and rules; everything else goes through uiPatchConfig's checks.
 func uiPatchRawConfig(data []byte, values map[string][]byte) ([]byte, error) {
 	spans, err := uiConfigSpans(data)
 	if err != nil {
 		return nil, err
 	}
 	for key := range values {
-		if key != "peerEgressRules" && key != "peerEgressEnabled" {
+		if key != "peerEgressRules" && key != "peerEgressEnabled" && key != "peerEgressDnsTakeover" {
 			return nil, errEgressEditUnsupported
 		}
 		// A differently cased duplicate would leave two readings of the same switch.
@@ -495,7 +501,7 @@ func uiPatchRawConfig(data []byte, values map[string][]byte) ([]byte, error) {
 	}
 	var edits []edit
 	var additions []string
-	for _, key := range []string{"peerEgressEnabled", "peerEgressRules"} {
+	for _, key := range []string{"peerEgressEnabled", "peerEgressDnsTakeover", "peerEgressRules"} {
 		value, wanted := values[key]
 		if !wanted {
 			continue

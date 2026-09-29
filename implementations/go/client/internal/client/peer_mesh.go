@@ -183,6 +183,18 @@ type peerMeshClient struct {
 	// egressDNSUpstreams are the resolvers the DNS responder forwards to, kept here so a consumer
 	// built later starts with them. Guarded by mu.
 	egressDNSUpstreams []string
+	// egressDNS points the system's DNS at the responder (step five). Built on the first
+	// reconcile, which is also when a journal left by an earlier run is given back; driven under
+	// egressPlanMu, the pointer read under mu.
+	egressDNS *egressDNSTakeover
+	// The machine, platform, journal location, tunnel-interface listing and network check the
+	// takeover uses. Empty means the real ones; tests set them so nothing touches the DNS of the
+	// machine they run on.
+	egressDNSHost            EgressDNSHost
+	egressDNSPlatform        string
+	egressDNSJournalPath     string
+	egressDNSTunnelAddresses func(tunnel string) []string
+	egressDNSFingerprint     func() (string, error)
 
 	// The consumer's route plan, kept true on the mesh's own tick. Guarded by egressPlanMu, which
 	// is never taken under mu: a reconcile resolves hostnames and runs route commands.

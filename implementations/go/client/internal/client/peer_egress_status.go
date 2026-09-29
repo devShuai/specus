@@ -173,16 +173,27 @@ func (mesh *peerMeshClient) egressDNSStatusJSON(consumer *egressConsumer) map[st
 	phase := mesh.currentEgressPhaseTwo()
 	mesh.mu.Lock()
 	upstreams := append([]string{}, mesh.egressDNSUpstreams...)
+	takeover := mesh.egressDNSTakeoverStatusLocked()
 	mesh.mu.Unlock()
 	var queries egressDNSQueries
+	// active is phase two running -- pool, route, responder -- and takeover the system's DNS
+	// pointing at it, with the journal committed. A pool that is not usable stops both and is the
+	// code given; otherwise a refused or failed takeover says why.
 	dns := map[string]any{
-		"takeover":    phase.Active,
+		"active":      phase.Active,
+		"takeover":    phase.Active && takeover.Takeover,
 		"pool":        phase.CIDR,
 		"mappings":    0,
 		"quarantined": 0,
+		"journal":     takeover.Journal,
 	}
-	if phase.Code != "" {
+	switch {
+	case phase.Code != "":
 		dns["code"] = phase.Code
+	case phase.Active && takeover.Code == egressCodeDNSTakeoverRefused:
+		dns["code"], dns["reason"] = takeover.Code, takeover.Reason
+	case takeover.Code == egressCodeDNSTakeoverFailed:
+		dns["code"], dns["error"] = takeover.Code, takeover.Error
 	}
 	if consumer != nil {
 		snapshot := consumer.statusSnapshot()
