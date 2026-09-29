@@ -51,6 +51,9 @@ class PeerServiceDiscoverySchemaMigratorTests {
         Map<String, Object> session = jdbc.queryForMap(
                 "select peer_service_discovery_version, peer_service_applications from specus_client_session where id=1");
         assertThat(((Number) session.get("peer_service_discovery_version")).intValue()).isZero();
+        Map<String, Object> egress = jdbc.queryForMap(
+                "select client_egress_version from specus_client_session where id=1");
+        assertThat(((Number) egress.get("client_egress_version")).intValue()).isZero();
         assertThat(sharing).isNotEmpty();
     }
 }
