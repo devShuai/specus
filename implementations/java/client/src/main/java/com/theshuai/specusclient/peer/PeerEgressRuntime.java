@@ -356,9 +356,16 @@ final class PeerEgressRuntime {
         if (PeerEgressFrame.CONTROL_NAME_BIND.equals(control.type())) {
             // Validated with the frame; the address parses and the name is well formed.
             Integer address = Ipv4Cidr.parseAddress(control.address());
+            String name = com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name());
             lock.lock();
             try {
-                names.bind(consumer, address, com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name()));
+                names.bind(consumer, address, name);
+                // The consumer's flows to this address that were not opened for this name are
+                // closed the way a revocation closes flows, so the packet that follows opens one by
+                // name. No flow-reject goes with them: the consumer keeps its side, and its next
+                // packet is exactly what should reach a fresh flow here.
+                releaseAll(PeerEgressFlowTable.revocationsFor(
+                        flows.closeUnbound(consumer, address, name), null), nowMs);
             } finally {
                 lock.unlock();
             }
@@ -442,6 +449,12 @@ final class PeerEgressRuntime {
             return;
         }
         lock.lock();
+        if (bindingMoved(consumer, key, destination)) {
+            // The address was bound (again) while this was resolving; the retransmitted SYN opens
+            // the flow by the name that stands now.
+            lock.unlock();
+            return;
+        }
         Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
         if (reservation.code() != null) {
             lock.unlock();
@@ -458,6 +471,7 @@ final class PeerEgressRuntime {
             return;
         }
         PeerEgressFlowTable.Flow flow = reservation.flow();
+        flow.name = destination.name();
         int mtu = pathMtu;
         lock.unlock();
 
@@ -649,6 +663,12 @@ final class PeerEgressRuntime {
                 return;
             }
             lock.lock();
+            if (bindingMoved(consumer, key, destination)) {
+                // Rebound while this was resolving; the consumer's next datagram carries the name
+                // that stands now, and opens the session by it.
+                lock.unlock();
+                return;
+            }
             Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
             if (reservation.code() != null) {
                 lock.unlock();
@@ -662,6 +682,7 @@ final class PeerEgressRuntime {
                 return;
             }
             PeerEgressFlowTable.Flow reserved = reservation.flow();
+            reserved.name = destination.name();
             lock.unlock();
 
             Socket socket = null;
@@ -877,8 +898,44 @@ final class PeerEgressRuntime {
         return decision.allowed() ? null : decision.code();
     }
 
-    /** Where a new flow goes: the address to dial, or the code that refuses it. */
-    record Choice(int address, String code) {
+    /**
+     * Where a new flow goes: the address to dial, or the code that refuses it, and the name it was
+     * resolved from (null for a flow to the address itself).
+     */
+    record Choice(int address, String code, String name) {
+        Choice(int address, String code) {
+            this(address, code, null);
+        }
+    }
+
+    /**
+     * Whether the name bound to a new flow's address changed between its resolution and its
+     * reservation. A name-bind closes the flows that do not match it, but one reserved after that
+     * would be missed, so it is not reserved at all. Called with the lock held.
+     */
+    private boolean bindingMoved(long consumer, PeerEgressFlowTable.Key key, Choice destination) {
+        return !java.util.Objects.equals(names.lookup(consumer, key.remoteIp()), destination.name());
+    }
+
+    /** The name a flow was opened for, or null; for tests. */
+    String flowName(PeerEgressFlowTable.Key key) {
+        lock.lock();
+        try {
+            PeerEgressFlowTable.Flow flow = flows.lookup(key);
+            return flow == null ? null : flow.name;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Whether a flow is open for a four-tuple; for tests. */
+    boolean hasFlow(PeerEgressFlowTable.Key key) {
+        lock.lock();
+        try {
+            return flows.lookup(key) != null;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -936,7 +993,8 @@ final class PeerEgressRuntime {
         lock.lock();
         try {
             resolving.remove(key);
-            return chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+            Choice chosen = chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+            return new Choice(chosen.address(), chosen.code(), name);
         } finally {
             lock.unlock();
         }
