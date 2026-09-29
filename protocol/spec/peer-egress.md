@@ -658,6 +658,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `fake-ip-unmapped` | 二期：发往 fake-IP 池内、却没有映射的地址 |
 | `fake-ip-stale` | 二期：fake-IP 映射的名字已没有规则认领，或改由 `direct` 认领 |
 | `egress-no-domain` | 二期：域名规则指向的出口在线，却没有声明 `domainTargetCapable` |
+| `dns-not-local` | 二期：发往 DNS 应答者的查询不是本机发出的 |
 
 **`blocked` 与 `refused` 按原因/错误码分别计数，不汇总。** 「没有出口在线」与「被出口拒绝」数字一样大，却是完全不同的两个问题。计数为零的不输出：一排零会把真正发生过的那一条埋掉。
 

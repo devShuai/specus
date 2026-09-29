@@ -4,7 +4,9 @@ Covers what the three clients must decide identically: which domain rules are va
 name selects, how the DNS responder answers, how the fake-IP pool allocates, refreshes, evicts and
 quarantines, how name-bind is encoded, and which resolved address an egress connects to. Step three
 adds the consumer's side: when phase two runs at all, what it reads from egress-catalog, which
-rules the status reports in force, and what happens to each packet sent into the pool.
+rules the status reports in force, and what happens to each packet sent into the pool. Step four
+adds the responder's wire format: the bytes of every answer it builds itself, and which queries it
+forwards untouched or drops.
 
 Every expectation is produced by the reference implementation here and asserted against the case
 before writing, so the file cannot ship internally inconsistent cases. See
@@ -13,6 +15,7 @@ protocol/spec/peer-egress-dns.md.
 import ipaddress
 import json
 import re
+import struct
 from pathlib import Path
 
 VECTORS = Path("protocol/test-vectors")
@@ -155,7 +158,8 @@ def dns_answer(rules, qname, qtype):
         return {"answer": "forward", "ruleIndex": index}
     if qtype == "A":
         return {"answer": "fake", "ruleIndex": index}
-    if qtype in ("AAAA", "HTTPS", "SVCB"):
+    if qtype in ("AAAA", "HTTPS", "SVCB", "ANY"):
+        # ANY would carry the real addresses past the fake one as surely as AAAA would.
         return {"answer": "nodata", "ruleIndex": index}
     return {"answer": "forward", "ruleIndex": index}
 
@@ -474,6 +478,163 @@ def run_steering(case):
 
 
 # --------------------------------------------------------------------------------------------------
+# Step four: the responder's wire format
+# --------------------------------------------------------------------------------------------------
+
+QTYPES = {"A": 1, "NS": 2, "CNAME": 5, "PTR": 12, "MX": 15, "TXT": 16, "AAAA": 28, "SVCB": 64, "HTTPS": 65,
+          "ANY": 255}
+QTYPE_NAMES = {number: name for name, number in QTYPES.items()}
+TYPE_OPT = 41
+EDNS_PAYLOAD = 1232
+ANSWER_TTL = 1
+IN_ADDR_ARPA = ".in-addr.arpa"
+
+
+def encode_name(name):
+    out = b""
+    for label in name.rstrip(".").split("."):
+        raw = label.encode("ascii")
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def build_query(ident, name, qtype, rd=True, edns=None, qdcount=1, opcode=0, qclass=1, response=False,
+                trailing=b""):
+    flags = (0x8000 if response else 0) | (opcode << 11) | (0x0100 if rd else 0)
+    question = encode_name(name) + struct.pack("!HH", QTYPES.get(qtype, qtype) if isinstance(qtype, str)
+                                                else qtype, qclass)
+    additional = b""
+    if edns is not None:
+        # OPT: the root name, type 41, the class is the payload size, the TTL carries the DO bit.
+        additional = b"\x00" + struct.pack("!HHIH", TYPE_OPT, edns["payload"], 0x8000 if edns.get("do") else 0, 0)
+    header = struct.pack("!HHHHHH", ident, flags, qdcount, 0, 0, 1 if edns is not None else 0)
+    return header + question * qdcount + additional + trailing
+
+
+def read_name(message, pos, allow_pointers):
+    """Labels from pos, and the position after the name; None when it cannot be read."""
+    labels = []
+    end = None
+    hops = 0
+    while True:
+        if pos >= len(message):
+            return None
+        length = message[pos]
+        if length == 0:
+            return labels, (pos + 1 if end is None else end)
+        if length & 0xC0 == 0xC0:
+            if not allow_pointers or pos + 1 >= len(message) or hops > 16:
+                return None
+            if end is None:
+                end = pos + 2
+            pos = ((length & 0x3F) << 8) | message[pos + 1]
+            hops += 1
+            continue
+        if length & 0xC0 or pos + 1 + length > len(message):
+            return None
+        labels.append(message[pos + 1:pos + 1 + length])
+        pos += 1 + length
+
+
+def find_opt(message, pos, count):
+    """Whether one of the records from pos is an OPT. A record that cannot be read ends the search:
+    the query is then answered as one without EDNS."""
+    for _ in range(count):
+        read = read_name(message, pos, True)
+        if read is None or read[1] + 10 > len(message):
+            return False
+        pos = read[1]
+        rtype, _, _, rdlength = struct.unpack("!HHIH", message[pos:pos + 10])
+        if rtype == TYPE_OPT:
+            return True
+        pos += 10 + rdlength
+    return False
+
+
+def usable_name(labels):
+    """The name as rules see it, or None when it is not one they could match: empty, or a label with
+    a dot or a byte outside printable ASCII. Such a query is forwarded, never answered."""
+    if not labels:
+        return None
+    text = []
+    for label in labels:
+        if any(b < 0x21 or b > 0x7E or b == 0x2E for b in label):
+            return None
+        text.append(label.decode("ascii").lower())
+    return ".".join(text)
+
+
+def reply(message, rcode, question, answer=b"", ancount=0, edns=False):
+    """A response built from the query: ID, opcode, RD and CD copied, QR and RA set, AA and TC clear."""
+    ident, flags = struct.unpack("!HH", message[:4])
+    out_flags = 0x8000 | (flags & 0x7800) | (flags & 0x0100) | 0x0080 | (flags & 0x0010) | rcode
+    opt = b"\x00" + struct.pack("!HHIH", TYPE_OPT, EDNS_PAYLOAD, 0, 0) if edns else b""
+    header = struct.pack("!HHHHHH", ident, out_flags, 1 if question else 0, ancount, 0, 1 if edns else 0)
+    return header + question + answer + opt
+
+
+def respond(rules, pool, network, message, now):
+    """What the responder does with one query message: drop it, forward it unchanged, or answer it."""
+    if len(message) < 12:
+        return {"result": "drop"}
+    ident, flags, qdcount, ancount, nscount, arcount = struct.unpack("!HHHHHH", message[:12])
+    if flags & 0x8000:
+        return {"result": "drop"}
+    if (flags >> 11) & 0x0F != 0 or qdcount != 1:
+        return {"result": "forward"}
+    read = read_name(message, 12, False)
+    if read is None or read[1] + 4 > len(message):
+        return {"result": "answer", "response": reply(message, 1, b"")}
+    labels, pos = read
+    qtype, qclass = struct.unpack("!HH", message[pos:pos + 4])
+    question = message[12:pos + 4]
+    edns = find_opt(message, pos + 4, ancount + nscount + arcount)
+    name = usable_name(labels)
+    if qclass != 1 or name is None:
+        return {"result": "forward"}
+
+    if name.endswith(IN_ADDR_ARPA):
+        octets = name[:-len(IN_ADDR_ARPA)].split(".")
+        if len(octets) != 4 or not all(o.isdigit() and len(o) <= 3 and int(o) <= 255 for o in octets):
+            return {"result": "forward"}
+        address = ipaddress.IPv4Address(".".join(reversed(octets)))
+        if address not in network:
+            return {"result": "forward"}
+        mapped = pool.by_address.get(int(address))
+        if mapped is None:
+            return {"result": "answer", "response": reply(message, 3, question, edns=edns)}
+        if qtype != QTYPES["PTR"]:
+            return {"result": "answer", "response": reply(message, 0, question, edns=edns)}
+        rdata = encode_name(mapped)
+        record = b"\xc0\x0c" + struct.pack("!HHIH", QTYPES["PTR"], 1, ANSWER_TTL, len(rdata)) + rdata
+        return {"result": "answer", "response": reply(message, 0, question, record, 1, edns)}
+
+    decision = dns_answer(rules, name, QTYPE_NAMES.get(qtype, str(qtype)))
+    if decision["answer"] == "forward":
+        return {"result": "forward"}
+    if decision["answer"] == "nodata":
+        return {"result": "answer", "response": reply(message, 0, question, edns=edns)}
+    allocated = pool.query(name, now)
+    if "address" not in allocated:
+        return {"result": "answer", "response": reply(message, 2, question, edns=edns), "exhausted": True}
+    record = b"\xc0\x0c" + struct.pack("!HHIH", QTYPES["A"], 1, ANSWER_TTL, 4) + \
+        ipaddress.IPv4Address(allocated["address"]).packed
+    return {"result": "answer", "response": reply(message, 0, question, record, 1, edns)}
+
+
+def run_wire(case, rules):
+    pool = Pool(case["cidr"])
+    network = ipaddress.IPv4Network(case["cidr"])
+    results = []
+    for event in case["events"]:
+        outcome = respond(rules, pool, network, bytes.fromhex(event["query"]), event["at"])
+        if "response" in outcome:
+            outcome = dict(outcome, response=outcome["response"].hex())
+        results.append(outcome)
+    return results
+
+
+# --------------------------------------------------------------------------------------------------
 # name-bind and the egress's choice of address
 # --------------------------------------------------------------------------------------------------
 
@@ -573,6 +734,7 @@ ANSWERS = [
     ("egress-aaaa-nodata", "www.example.com", "AAAA"),
     ("egress-https-nodata", "www.example.com", "HTTPS"),
     ("egress-svcb-nodata", "www.example.com", "SVCB"),
+    ("egress-any-nodata", "www.example.com", "ANY"),
     ("egress-mx-forwarded", "www.example.com", "MX"),
     ("block-a", "img.cdn.example.com", "A"),
     ("direct-forwarded", "direct.example.com", "A"),
@@ -750,6 +912,42 @@ EGRESS_BIND_EVENTS = [
     {"nameBind": "www.example.com", "consumer": 1, "address": "198.18.0.5"},
 ]
 
+def wire(name, query, at=0):
+    return {"name": name, "at": at, "query": query.hex()}
+
+
+WIRE_EVENTS = [
+    wire("egress-a", build_query(0x1234, "www.example.com", "A")),
+    wire("same-name-any-case-same-address", build_query(0x1235, "WWW.Example.COM", "A")),
+    wire("block-a-is-faked-too", build_query(0x1236, "img.cdn.example.com", "A", rd=False)),
+    wire("edns-answered-with-edns", build_query(0x1237, "api.example.com", "A", edns={"payload": 4096, "do": True})),
+    wire("aaaa-nodata", build_query(0x1238, "www.example.com", "AAAA")),
+    wire("https-nodata-with-edns", build_query(0x1239, "www.example.com", "HTTPS", edns={"payload": 1232})),
+    wire("any-nodata", build_query(0x123A, "www.example.com", "ANY")),
+    wire("mx-forwarded", build_query(0x123B, "www.example.com", "MX")),
+    wire("direct-forwarded", build_query(0x123C, "direct.example.com", "A")),
+    wire("unmatched-forwarded", build_query(0x123D, "example.org", "A")),
+    wire("ptr-of-a-mapping", build_query(0x123E, "2.0.18.198.in-addr.arpa", "PTR")),
+    wire("ptr-unmapped-nxdomain", build_query(0x123F, "6.0.18.198.in-addr.arpa", "PTR")),
+    wire("other-type-on-a-mapped-reverse-name", build_query(0x1240, "3.0.18.198.in-addr.arpa", "TXT")),
+    wire("ptr-outside-the-pool-forwarded", build_query(0x1241, "1.0.0.10.in-addr.arpa", "PTR")),
+    wire("two-questions-forwarded", build_query(0x1242, "www.example.com", "A", qdcount=2)),
+    wire("not-a-query-opcode-forwarded", build_query(0x1243, "www.example.com", "A", opcode=2)),
+    wire("chaos-class-forwarded", build_query(0x1244, "www.example.com", "A", qclass=3)),
+    wire("label-with-a-dot-forwarded", bytes.fromhex("124501000001000000000000") + b"\x07www.exa\x07example\x03com\x00"
+         + struct.pack("!HH", 1, 1)),
+    wire("response-dropped", build_query(0x1246, "www.example.com", "A", response=True)),
+    wire("short-dropped", bytes.fromhex("1247010000")),
+    wire("cut-question-formerr", build_query(0x1248, "www.example.com", "A")[:20]),
+    wire("pointer-in-question-formerr", bytes.fromhex("124901000001000000000000c00c00010001")),
+]
+
+WIRE_EXHAUSTION = [
+    wire("first-name-takes-the-only-address", build_query(0x2001, "a.example.com", "A")),
+    wire("next-name-finds-none-servfail", build_query(0x2002, "b.example.com", "A"), at=1),
+    wire("known-name-still-answered", build_query(0x2003, "a.example.com", "A"), at=2),
+]
+
 EGRESS_CHOICES = [
     ("first-allowed-a", ["203.0.113.10", "203.0.113.11"], [], False,
      {"203.0.113.10": "EGRESS_ALLOWED", "203.0.113.11": "EGRESS_ALLOWED"}),
@@ -794,7 +992,8 @@ def build():
         answers.append({"name": name, "query": qname, "type": qtype, **produced})
     # Hand-checked expectations for the answers, so the reference itself is pinned.
     expected_answers = {"egress-a": "fake", "egress-aaaa-nodata": "nodata", "egress-https-nodata": "nodata",
-                        "egress-svcb-nodata": "nodata", "egress-mx-forwarded": "forward", "block-a": "fake",
+                        "egress-svcb-nodata": "nodata", "egress-any-nodata": "nodata",
+                        "egress-mx-forwarded": "forward", "block-a": "fake",
                         "direct-forwarded": "forward", "unmatched-forwarded": "forward"}
     for case in answers:
         assert case["answer"] == expected_answers[case["name"]], case
@@ -898,6 +1097,39 @@ def build():
         {"purge": {}},
         {"outcome": "blocked", "reason": "fake-ip-stale", "answered": True},
     ], outcomes
+    wire_cases = []
+    for name, cidr, events in (("responder", "198.18.0.0/29", WIRE_EVENTS),
+                               ("pool-exhausted", "198.18.0.0/30", WIRE_EXHAUSTION)):
+        case = {"name": name, "cidr": cidr, "events": events}
+        case["results"] = run_wire(case, rules)
+        wire_cases.append(case)
+    # Hand-checked, so the reference itself is pinned.
+    by_name = {event["name"]: result for event, result in zip(WIRE_EVENTS, wire_cases[0]["results"])}
+    assert [r["result"] for r in wire_cases[0]["results"]] == [
+        "answer", "answer", "answer", "answer", "answer", "answer", "answer", "forward", "forward", "forward",
+        "answer", "answer", "answer", "forward", "forward", "forward", "forward", "forward", "drop", "drop",
+        "answer", "answer"], wire_cases[0]["results"]
+    first = bytes.fromhex(by_name["egress-a"]["response"])
+    assert first == bytes.fromhex("1234" "8180" "0001" "0001" "0000" "0000"
+                                  "03777777076578616d706c6503636f6d00" "0001" "0001"
+                                  "c00c" "0001" "0001" "00000001" "0004" "c6120002"), first.hex()
+    second = bytes.fromhex(by_name["same-name-any-case-same-address"]["response"])
+    assert second.endswith(bytes.fromhex("c6120002")) and b"\x03WWW\x07Example\x03COM" in second, second.hex()
+    block = bytes.fromhex(by_name["block-a-is-faked-too"]["response"])
+    assert block[2:4] == bytes.fromhex("8080") and block.endswith(bytes.fromhex("c6120003")), block.hex()
+    edns = bytes.fromhex(by_name["edns-answered-with-edns"]["response"])
+    assert edns[10:12] == b"\x00\x01" and edns.endswith(bytes.fromhex("00" "0029" "04d0" "00000000" "0000")), edns.hex()
+    nodata = bytes.fromhex(by_name["aaaa-nodata"]["response"])
+    assert nodata[2:12] == bytes.fromhex("81800001000000000000"), nodata.hex()
+    ptr = bytes.fromhex(by_name["ptr-of-a-mapping"]["response"])
+    assert ptr.endswith(bytes.fromhex("c00c" "000c" "0001" "00000001" "0011") + encode_name("www.example.com")), ptr.hex()
+    assert bytes.fromhex(by_name["ptr-unmapped-nxdomain"]["response"])[2:4] == bytes.fromhex("8183")
+    assert bytes.fromhex(by_name["other-type-on-a-mapped-reverse-name"]["response"])[2:8] == bytes.fromhex("818000010000")
+    assert bytes.fromhex(by_name["cut-question-formerr"]["response"]) == bytes.fromhex("124881810000000000000000")
+    assert bytes.fromhex(by_name["pointer-in-question-formerr"]["response"]) == bytes.fromhex("124981810000000000000000")
+    exhausted = wire_cases[1]["results"]
+    assert bytes.fromhex(exhausted[1]["response"])[2:4] == bytes.fromhex("8182") and exhausted[1]["exhausted"], exhausted
+    assert bytes.fromhex(exhausted[2]["response"]).endswith(bytes.fromhex("c6120002")), exhausted
     bind_events = [dict(event) for event in EGRESS_BIND_EVENTS]
     bind_results = run_egress_binds(bind_events)
     assert bind_results == [
@@ -929,6 +1161,9 @@ def build():
         "catalog": catalog,
         "steering": [steering_case],
         "nameBindClosesFlows": {"events": bind_events, "results": bind_results},
+        "responderAnswerTtlSeconds": ANSWER_TTL,
+        "responderEdnsPayload": EDNS_PAYLOAD,
+        "wire": wire_cases,
     }
 
 
@@ -939,7 +1174,8 @@ def main():
     print(f"wrote {path}: validation={len(document['validation'])} selection={len(document['selection'])} "
           f"answers={len(document['answers'])} pool={len(document['pool'])} egressChoice={len(document['egressChoice'])} "
           f"phaseTwo={len(document['phaseTwo'])} ruleStatus={len(document['ruleStatus'])} "
-          f"catalog={len(document['catalog'])} steering={len(document['steering'][0]['events'])}")
+          f"catalog={len(document['catalog'])} steering={len(document['steering'][0]['events'])} "
+          f"wire={sum(len(case['events']) for case in document['wire'])}")
 
 
 if __name__ == "__main__":
