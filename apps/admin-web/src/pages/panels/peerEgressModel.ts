@@ -6,9 +6,10 @@ import type {
   PeerMeshDevice,
 } from "../../api/types";
 
-// The rules an egress applies, as protocol/spec/peer-egress.md states them. No server validates a
-// destination rule's content when a policy is saved: an invalid CIDR is stored and then simply never
-// matches. This page is where a mistake has to be caught.
+// The rules an egress applies, as protocol/spec/peer-egress.md states them. The servers refuse a policy
+// whose destination rules the egress could not read (peer-egress-management-v1.json), one problem at a
+// time; the page checks first so every problem is listed at once, in words, with the hints a server
+// does not give. Policies stored before the servers checked can still hold such rules.
 
 export const MAX_DESTINATION_RULES = 64;
 export const MAX_CONSUMERS = 32;

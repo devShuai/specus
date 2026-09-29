@@ -879,8 +879,10 @@ public static class AdminApiEndpoints
         app.MapPut("/api/admin/peer-mesh/egress/switch",
             (HttpContext context, PeerEgressSwitchMutation request, IOptions<AuthOptions> authOptions,
                 PeerMeshService service, CancellationToken cancellationToken) =>
+                // Passed through as given: a body without enabled is refused by the service, after
+                // the admin check, rather than read as a request to switch egress off.
                 service.SetEgressSwitchAsync(ManagementContext.From(context, authOptions.Value),
-                    request.Enabled ?? false, cancellationToken));
+                    request.Enabled, cancellationToken));
 
         app.MapGet("/api/admin/peer-mesh/egress/activity",
             (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,

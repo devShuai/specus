@@ -191,13 +191,80 @@ func (s *Service) ListEgressPolicies(ctx context.Context, access AccessContext) 
 	return views, nil
 }
 
+// EgressRequestError is a management request the egress rules refuse. The API answers it with 400
+// and its message; anything else that goes wrong while serving the request is the server's fault.
+type EgressRequestError struct{ Msg string }
+
+func (e EgressRequestError) Error() string { return e.Msg }
+
+func egressInvalid(format string, args ...any) error {
+	return EgressRequestError{Msg: fmt.Sprintf(format, args...)}
+}
+
+const egressAdminOnly = "只有租户 ADMIN 可以管理出口授权"
+
+// MaxEgressPortRangesPerRule bounds one rule's port list, as every server stores it.
+const MaxEgressPortRangesPerRule = 32
+
+// NormalizeEgressDestinationRules checks a management request's destination rules the way an egress
+// reads them and returns what to store (protocol/spec/peer-egress.md,
+// protocol/test-vectors/peer-egress-management-v1.json).
+//
+// An egress never matches a CIDR it cannot parse, a protocol other than tcp or udp, or a malformed
+// port range. Storing such a rule used to succeed, so a typo became a rule that silently did
+// nothing; now the whole request is refused. Only spelling is normalised: a CIDR is trimmed and
+// kept as written, protocols are trimmed, lowercased and de-duplicated, absent lists become empty.
+func NormalizeEgressDestinationRules(rules []peeregress.DestinationRule) ([]peeregress.DestinationRule, error) {
+	if len(rules) > MaxEgressDestinationRules {
+		return nil, egressInvalid("too many destination rules: %d, at most %d", len(rules), MaxEgressDestinationRules)
+	}
+	stored := make([]peeregress.DestinationRule, 0, len(rules))
+	for index, rule := range rules {
+		cidr := strings.TrimSpace(rule.CIDR)
+		if _, ok := peeregress.ParseCIDR(cidr); !ok {
+			return nil, egressInvalid("destinationRules[%d].cidr %q is not an IPv4 address or CIDR with zero host bits", index, rule.CIDR)
+		}
+		protocols := []string{}
+		for _, protocol := range rule.Protocols {
+			value := strings.ToLower(strings.TrimSpace(protocol))
+			if value != "tcp" && value != "udp" {
+				return nil, egressInvalid("destinationRules[%d].protocols: %q is not tcp or udp", index, protocol)
+			}
+			if !containsString(protocols, value) {
+				protocols = append(protocols, value)
+			}
+		}
+		if len(rule.PortRanges) > MaxEgressPortRangesPerRule {
+			return nil, egressInvalid("destinationRules[%d].portRanges: at most %d ranges", index, MaxEgressPortRangesPerRule)
+		}
+		ranges := make([][]int, 0, len(rule.PortRanges))
+		for _, pair := range rule.PortRanges {
+			if len(pair) != 2 || pair[0] < 0 || pair[1] > 65535 || pair[0] > pair[1] {
+				return nil, egressInvalid("destinationRules[%d].portRanges: %v is not [low, high] within 0-65535", index, pair)
+			}
+			ranges = append(ranges, []int{pair[0], pair[1]})
+		}
+		stored = append(stored, peeregress.DestinationRule{CIDR: cidr, Protocols: protocols, PortRanges: ranges})
+	}
+	return stored, nil
+}
+
+func containsString(values []string, value string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
 // UpsertEgressPolicy creates or updates the policy for one egress device.
 func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, mutation EgressPolicyMutation) (EgressPolicyView, error) {
 	if !access.Admin {
-		return EgressPolicyView{}, errors.New("只有租户 ADMIN 可以管理出口授权")
+		return EgressPolicyView{}, errForbidden(egressAdminOnly)
 	}
 	if mutation.EgressClientID == nil || *mutation.EgressClientID <= 0 {
-		return EgressPolicyView{}, errors.New("egressClientId is required")
+		return EgressPolicyView{}, egressInvalid("egressClientId is required")
 	}
 	egress, err := s.findTenantClient(ctx, access.TenantID, *mutation.EgressClientID)
 	if err != nil {
@@ -227,39 +294,43 @@ func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, 
 	if mutation.Scope != nil {
 		scope := strings.ToUpper(strings.TrimSpace(*mutation.Scope))
 		if scope != peeregress.ScopePublic && scope != peeregress.ScopeLAN {
-			return EgressPolicyView{}, fmt.Errorf("invalid scope: %s", *mutation.Scope)
+			return EgressPolicyView{}, egressInvalid("invalid scope: %s", *mutation.Scope)
 		}
 		policy.Scope = scope
 	}
 	if mutation.AllowedConsumerClientIDs != nil {
 		encoded, err := encodeClientIDs(mutation.AllowedConsumerClientIDs)
 		if err != nil {
-			return EgressPolicyView{}, err
+			return EgressPolicyView{}, egressInvalid("%s", err.Error())
 		}
 		policy.AllowedConsumerClientIDs = encoded
 	}
 	if mutation.DestinationRules != nil {
-		encoded, err := EncodeEgressDestinationRules(mutation.DestinationRules)
+		rules, err := NormalizeEgressDestinationRules(mutation.DestinationRules)
 		if err != nil {
 			return EgressPolicyView{}, err
+		}
+		encoded, err := EncodeEgressDestinationRules(rules)
+		if err != nil {
+			return EgressPolicyView{}, egressInvalid("%s", err.Error())
 		}
 		policy.DestinationRules = encoded
 	}
 	if mutation.MaxConcurrentFlows != nil {
 		if *mutation.MaxConcurrentFlows <= 0 {
-			return EgressPolicyView{}, errors.New("maxConcurrentFlows must be positive")
+			return EgressPolicyView{}, egressInvalid("maxConcurrentFlows must be positive")
 		}
 		policy.MaxConcurrentFlows = *mutation.MaxConcurrentFlows
 	}
 	if mutation.MaxFlowsPerConsumer != nil {
 		if *mutation.MaxFlowsPerConsumer <= 0 {
-			return EgressPolicyView{}, errors.New("maxFlowsPerConsumer must be positive")
+			return EgressPolicyView{}, egressInvalid("maxFlowsPerConsumer must be positive")
 		}
 		policy.MaxFlowsPerConsumer = *mutation.MaxFlowsPerConsumer
 	}
 	if mutation.IdleTimeoutSeconds != nil {
 		if *mutation.IdleTimeoutSeconds <= 0 {
-			return EgressPolicyView{}, errors.New("idleTimeoutSeconds must be positive")
+			return EgressPolicyView{}, egressInvalid("idleTimeoutSeconds must be positive")
 		}
 		policy.IdleTimeoutSeconds = *mutation.IdleTimeoutSeconds
 	}
@@ -280,14 +351,14 @@ func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, 
 // DeleteEgressPolicy removes a policy.
 func (s *Service) DeleteEgressPolicy(ctx context.Context, access AccessContext, id int64) error {
 	if !access.Admin {
-		return errors.New("只有租户 ADMIN 可以管理出口授权")
+		return errForbidden(egressAdminOnly)
 	}
 	policy, err := s.db.GetPeerMeshEgressPolicy(ctx, access.TenantID, id)
 	if err != nil {
 		return err
 	}
 	if policy == nil {
-		return fmt.Errorf("egress policy not found: %d", id)
+		return fmt.Errorf("egress policy %d: %w", id, store.ErrNotFound)
 	}
 	if err := s.db.DeletePeerMeshEgressPolicy(ctx, access.TenantID, id); err != nil {
 		return err
@@ -794,13 +865,13 @@ func (s *Service) EgressSwitchStatus(ctx context.Context, access AccessContext) 
 // configured rather than making the operator rebuild it.
 func (s *Service) SetEgressSwitch(ctx context.Context, access AccessContext, mutation EgressSwitchMutation) (EgressSwitchView, error) {
 	if !access.Admin {
-		return EgressSwitchView{}, errors.New("只有租户 ADMIN 可以管理出口授权")
+		return EgressSwitchView{}, errForbidden(egressAdminOnly)
 	}
 	if mutation.Enabled == nil {
-		return EgressSwitchView{}, errors.New("enabled is required")
+		return EgressSwitchView{}, egressInvalid("enabled is required")
 	}
 	if *mutation.Enabled && !s.Enabled() {
-		return EgressSwitchView{}, errors.New("部署端未启用 Peer Mesh，不能开启出口分流")
+		return EgressSwitchView{}, egressInvalid("部署端未启用 Peer Mesh，不能开启出口分流")
 	}
 	if err := s.db.UpsertPeerMeshEgressSwitch(ctx, store.PeerMeshEgressSwitch{
 		TenantID: access.TenantID, Enabled: *mutation.Enabled,

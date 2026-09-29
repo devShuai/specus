@@ -2228,7 +2228,7 @@ func (a *API) handlePeerEgressPolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := a.peerMesh.ListEgressPolicies(r.Context(), a.peerAccess(principal))
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
@@ -2245,7 +2245,7 @@ func (a *API) handlePeerEgressSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := a.peerMesh.EgressSwitchStatus(r.Context(), a.peerAccess(principal))
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, view)
@@ -2264,7 +2264,7 @@ func (a *API) handlePeerEgressSetSwitch(w http.ResponseWriter, r *http.Request) 
 	}
 	view, err := a.peerMesh.SetEgressSwitch(r.Context(), a.peerAccess(principal), req)
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, view)
@@ -2280,7 +2280,7 @@ func (a *API) handlePeerEgressActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := a.peerMesh.ListEgressActivity(r.Context(), a.peerAccess(principal))
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
@@ -2300,7 +2300,7 @@ func (a *API) handlePeerEgressUpsertPolicy(w http.ResponseWriter, r *http.Reques
 	}
 	item, err := a.peerMesh.UpsertEgressPolicy(r.Context(), a.peerAccess(principal), req)
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -2314,11 +2314,11 @@ func (a *API) handlePeerEgressDeletePolicy(w http.ResponseWriter, r *http.Reques
 	}
 	id, err := pathInt(r, "id")
 	if err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	if err := a.peerMesh.DeleteEgressPolicy(r.Context(), a.peerAccess(principal), id); err != nil {
-		a.fail(w, err)
+		a.failPeerEgress(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -2504,6 +2504,22 @@ func (a *API) handlePeerMeshDeleteService(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// failPeerEgress answers the egress management routes: a request the egress rules refuse is 400 with
+// its reason, a non-admin change 403; anything else goes through the general mapping, where a missing
+// client or policy is 404 and the rest is the server's own failure.
+func (a *API) failPeerEgress(w http.ResponseWriter, err error) {
+	var forbidden peermesh.ForbiddenError
+	var invalid peermesh.EgressRequestError
+	switch {
+	case errors.As(err, &forbidden):
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.As(err, &invalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		a.fail(w, err)
+	}
 }
 
 func (a *API) failPeerService(w http.ResponseWriter, err error) {
