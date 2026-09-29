@@ -1,5 +1,6 @@
 package com.theshuai.specusclient.bean;
 
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.specusclient.peer.PeerVirtualDeviceOptions;
 import java.util.List;
@@ -29,6 +30,14 @@ public class ClientStartupConfig {
      * kept and none is applied. Saving rules and taking over traffic are separate steps (#49).
      */
     private boolean peerEgressEnabled;
+    /**
+     * Phase two of peer egress, domain rules through fake IPs (protocol/spec/peer-egress-dns.md).
+     * Off by default, and only ever on top of {@link #peerEgressEnabled}; off, domain rules are
+     * refused exactly as in phase one.
+     */
+    private boolean peerEgressDnsTakeover;
+    /** The pool fake IPs are handed out of: IPv4, /8 to /24, clear of the mesh and local networks. */
+    private String peerEgressFakeIpCidr = PeerEgressDns.DEFAULT_FAKE_IP_CIDR;
     /** Startup + periodic catalogue check. Java phase one only notifies; it never replaces the jar. */
     private boolean updateCheckEnabled = true;
     /** Accepted for the shared cross-client schema; Java phase one deliberately never self-updates. */

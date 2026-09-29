@@ -34,6 +34,15 @@ type Config struct {
 	// (#49), and the off state is reported at load, in validation and in status rather than being
 	// the silent non-effect the feature exists to prevent.
 	PeerEgressEnabled bool `json:"peerEgressEnabled"`
+	// PeerEgressDNSTakeover is phase two's switch (protocol/spec/peer-egress-dns.md): domain rules,
+	// steered through addresses handed out of the fake-IP pool. It runs only on top of
+	// PeerEgressEnabled and with a usable pool; otherwise domain rules are refused exactly as in
+	// phase one. Off by default.
+	PeerEgressDNSTakeover bool `json:"peerEgressDnsTakeover"`
+	// PeerEgressFakeIPCIDR is the fake-IP pool: an IPv4 /8 to /24 clear of the Peer Mesh network
+	// and of this device's own networks. Empty means DefaultPeerEgressFakeIPCIDR. An unusable pool
+	// stops phase two only, reported as EGRESS_FAKE_IP_POOL_INVALID.
+	PeerEgressFakeIPCIDR string `json:"peerEgressFakeIpCidr"`
 }
 
 // UpdatesEnabled defaults to true so packaged clients participate without requiring a config
@@ -73,6 +82,7 @@ const (
 	DefaultUpdateCheckIntervalHours = 24
 	MinUpdateCheckIntervalHours     = 1
 	MaxUpdateCheckIntervalHours     = 168
+	DefaultPeerEgressFakeIPCIDR     = egressDefaultFakeIPCIDR
 )
 
 type SpecusConfig struct {
@@ -207,6 +217,9 @@ func (config *Config) Validate() error {
 	if config.PeerMeshTunName == "" {
 		config.PeerMeshTunName = DefaultPeerMeshTunName
 	}
+	// Filled in rather than left empty, so what the configuration shows is the pool in use. Not
+	// checked here: an unusable pool stops phase two, not the client.
+	config.PeerEgressFakeIPCIDR = effectiveEgressFakeIPCIDR(config.PeerEgressFakeIPCIDR)
 	if config.PeerMeshMTU <= 0 {
 		config.PeerMeshMTU = DefaultPeerMeshMTU
 	} else if config.PeerMeshMTU < MinPeerMeshMTU {

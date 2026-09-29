@@ -12,19 +12,29 @@ type EgressRule = egressRule
 // DefaultEgressMeshCIDR is the Peer Mesh network offline checks assume; the real one arrives at login.
 const DefaultEgressMeshCIDR = egressDefaultMeshCIDR
 
-// EgressRuleCode reports why a rule is not in force as configured, or "" when it would be. The
-// master switch is not part of it; see EgressRuleStatusCode.
-func EgressRuleCode(rule EgressRule) string {
-	return validateEgressRule(rule, egressDefaultMeshCIDR)
+// EgressRuleCode reports why a rule is not in force under a configuration, or "" when it would be.
+// The master switch is not part of it; see EgressRuleStatusCode. The configuration decides whether
+// a domain rule is judged as a name (peerEgressDnsTakeover on with a usable pool) or refused.
+func EgressRuleCode(config Config, rule EgressRule) string {
+	return validateEgressRuleIn(rule, egressDefaultMeshCIDR, offlineEgressFakeIPPool(config))
 }
 
 // EgressRuleStatusCode is the code a rule reports in status: the master switch off names itself
 // unless the rule was switched off on its own, which is the more specific statement.
-func EgressRuleStatusCode(enabled bool, rule EgressRule) string {
-	if !enabled && !rule.switchedOff() {
+func EgressRuleStatusCode(config Config, rule EgressRule) string {
+	if !config.PeerEgressEnabled && !rule.switchedOff() {
 		return egressCodeConsumerDisabled
 	}
-	return EgressRuleCode(rule)
+	return EgressRuleCode(config, rule)
+}
+
+// offlineEgressFakeIPPool is the pool phase two would run with under a configuration if the master
+// switch were on, judged without a connection: against the default mesh network, and without the
+// device's own networks, which are checked when it starts. "" when it would not run.
+func offlineEgressFakeIPPool(config Config) string {
+	phase := egressPhaseTwo{CIDR: effectiveEgressFakeIPCIDR(config.PeerEgressFakeIPCIDR)}
+	phase.Active, phase.Code = evaluateEgressPhaseTwo(true, config.PeerEgressDNSTakeover, phase.CIDR, egressDefaultMeshCIDR)
+	return phase.pool()
 }
 
 // EgressRuleSwitchedOff reports whether the user has taken a rule out of force.
@@ -68,6 +78,8 @@ func EgressCodeExplanation(code string) string {
 		return "a rule cannot be limited to a port; port limits belong on the egress policy"
 	case egressCodeRuleMissingTarget:
 		return "an egress rule needs a positive egress device id"
+	case egressCodeRuleFakeIPOverlap:
+		return "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out"
 	case egressCodeRuleDisabled:
 		return "switched off"
 	case egressCodeConsumerDisabled:
