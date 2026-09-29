@@ -75,7 +75,10 @@ function renderState(data) {
 // Why a rule is not in force, in the words an operator configuring it needs. The code itself is
 // always shown next to this, because it is what the CLI and the logs print and what someone
 // searching for the problem will have in hand.
-const egressRuleReasons = {EGRESS_RULE_DEFAULT_ROUTE: "一期不接管默认路由", EGRESS_RULE_MESH_OVERLAP: "与组网虚拟网段重叠", EGRESS_RULE_MALFORMED: "规则格式不正确（含主机位非零）", EGRESS_RULE_MISSING_TARGET: "没有指定出口设备", EGRESS_RULE_DOMAIN_UNSUPPORTED: "一期不支持域名规则", EGRESS_RULE_IPV6_UNSUPPORTED: "一期不支持 IPv6 规则", EGRESS_RULE_PORT_UNSUPPORTED: "消费端规则不支持端口字段", EGRESS_RULE_DISABLED: "规则已停用", EGRESS_CONSUMER_DISABLED: "系统接管未开启"};
+const egressRuleReasons = {EGRESS_RULE_DEFAULT_ROUTE: "一期不接管默认路由", EGRESS_RULE_MESH_OVERLAP: "与组网虚拟网段重叠", EGRESS_RULE_MALFORMED: "规则格式不正确（含主机位非零）", EGRESS_RULE_MISSING_TARGET: "没有指定出口设备", EGRESS_RULE_DOMAIN_UNSUPPORTED: "域名规则需要开启系统 DNS 接管（peerEgressDnsTakeover）", EGRESS_RULE_FAKE_IP_OVERLAP: "与 fake-IP 池（peerEgressFakeIpCidr）重叠，池内地址只能由域名规则分配", EGRESS_RULE_EGRESS_NO_DOMAIN: "指向的出口设备在线，但不支持域名目标", EGRESS_RULE_IPV6_UNSUPPORTED: "一期不支持 IPv6 规则", EGRESS_RULE_PORT_UNSUPPORTED: "消费端规则不支持端口字段", EGRESS_RULE_DISABLED: "规则已停用", EGRESS_CONSUMER_DISABLED: "系统接管未开启"};
+// Why phase two is not running or has not taken the system DNS over, in the words of the spec's
+// refusal table (protocol/spec/peer-egress-dns.md, 开启前检查).
+const dnsReasons = {"pool-route-not-installed": "fake-IP 池段的路由没有装上（被别的路由占用，或没有虚拟网卡）", "system-dns-loopback": "系统 DNS 指向回环地址，像是已有别的 DNS 接管者；为免日后回滚时断网，拒绝接管", "system-dns-virtual": "系统 DNS 指向 fake-IP 池、组网网段或别的隧道接口，像是已有别的接管者，拒绝接管", "no-upstream": "读不到可以转发的 IPv4 上游 DNS", "resolv-conf-managed": "/etc/resolv.conf 由别的程序管理（符号链接），不改写它", "nrpt-root-occupied": "已有别人的根命名空间 NRPT 规则", "unsupported-platform": "本平台不支持系统 DNS 接管"};
 // Field readers that tolerate state written by another runtime: a wrong type reads as absent, so a
 // page never throws on a field somebody spelled differently.
 const list = value => Array.isArray(value) ? value.filter(item => item && typeof item === "object") : [];
@@ -112,7 +115,21 @@ function renderEgress(state) {
     for (const peer of relayed) issue(issues, "出口设备 " + count(peer.clientId) + " 经中继连接", "可用，但比直连慢；" + count(peer.flows) + " 个流。直连需要两台设备之间的 UDP 可达。", "", true);
     problems = refused.length + missing.length + offline.length + pathless.length + (consumer.routeError ? 1 : 0);
     if (!problems) issue(issues, "规则均已生效", "路由均已安装，指向的出口设备均在线。", "", true);
-    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝。", blocked, !problems);
+    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝；域名分流另有 fake-ip-unmapped（发往 fake-IP 却没有映射）、fake-ip-stale（映射的名字已不归任何域名规则）、egress-no-domain（出口不支持域名目标）、dns-not-local（不是本机发来的 DNS 查询）。", blocked, !problems);
+  }
+  // Phase two, present only while peerEgressDnsTakeover is on. Not running, and running without the
+  // system DNS pointed at it, both leave every domain rule matching nothing, so each is a problem.
+  const dns = consumer.dns && typeof consumer.dns === "object" ? consumer.dns : null;
+  if (dns) {
+    const upstreams = Array.isArray(dns.upstreams) ? dns.upstreams.filter(item => typeof item === "string") : [];
+    if (dns.active !== true) {
+      issue(issues, "域名分流未运行", dns.code === "EGRESS_FAKE_IP_POOL_INVALID" ? "fake-IP 池（peerEgressFakeIpCidr）不可用：不是 /8–/24 的 IPv4 网段，或与组网网段、本机网段重叠。域名规则不生效。" : "二期没有运行，域名规则不生效。", dns.code); problems++;
+    } else if (dns.takeover !== true) {
+      const why = dns.reason ? dnsReasons[dns.reason] || dns.reason : typeof dns.error === "string" ? dns.error : "";
+      issue(issues, "系统 DNS 未接管", (why ? why + "。" : "") + "应用的查询没有送到本机应答者，域名规则现在不会命中。处理：按原因修正后重新连接；被强制结束的客户端留下的改动可用 egress dns restore 交还。", dns.code); problems++;
+    } else {
+      issue(issues, "系统 DNS 已接管", "查询由 " + (dns.listen || "—") + " 应答，" + (upstreams.length ? "其余转发到 " + upstreams.join("、") : "没有上游，需要转发的查询回 SERVFAIL") + "；fake-IP 映射 " + count(dns.mappings) + " 个，隔离中 " + count(dns.quarantined) + " 个。退出客户端时交还系统 DNS。", "", true);
+    }
   }
   badge.textContent = problems ? problems + " 个问题" : "正常"; if (problems) badge.dataset.problems = String(problems);
   const refusedByEgress = counters(egress.refused);

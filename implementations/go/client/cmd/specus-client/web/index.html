@@ -28,6 +28,7 @@
         <p id="egress-summary" class="muted">连接后显示本机分流规则是否生效。</p>
         <ul id="egress-issues" class="catalog issues" aria-label="分流问题"></ul>
         <p id="egress-role" class="egress-role"></p>
+        <p class="scope-note">域名规则靠系统 DNS 接管生效（peerEgressDnsTakeover）。应用自带 DoH/DoT、使用系统缓存、或直接硬编码 IP 时，域名规则不会命中，这类流量只能靠 IP/CIDR 规则覆盖。</p>
         <p class="scope-note">只列出没有生效的部分，其余只计数。规则是否生效每次按本机校验重算；路由是否已安装来自上次下发时的系统路由表。</p>
       </section>
     </section>
@@ -49,7 +50,7 @@
         <p class="muted">前缀更长的规则优先，同样长时靠前的优先；未命中任何规则的流量本地直连。</p>
         <ul id="rules-list" class="catalog rules" aria-label="分流规则"></ul>
         <form id="rule-form" autocomplete="off"><h3>添加规则</h3>
-          <div class="form-grid"><div><label for="rule-match">目标地址或网段</label><input id="rule-match" placeholder="203.0.113.0/24" required spellcheck="false"></div>
+          <div class="form-grid"><div><label for="rule-match">目标地址、网段或域名</label><input id="rule-match" placeholder="203.0.113.0/24" required spellcheck="false"></div>
             <div><label for="rule-action">动作</label><select id="rule-action"><option value="egress">经出口设备访问</option><option value="direct">本地直连</option><option value="block">阻断</option></select></div></div>
           <div class="form-grid"><div id="rule-target-field"><label for="rule-target">出口设备 ID</label><input id="rule-target" inputmode="numeric" placeholder="例如 2" spellcheck="false"></div>
             <div><label for="rule-position">位置</label><select id="rule-position"><option value="end">加到末尾</option><option value="start">加到最前</option></select></div></div>
