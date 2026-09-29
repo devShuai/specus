@@ -149,6 +149,8 @@ public class NettyClient {
                     Channel channel = controlChannel.get();
                     return channel == null ? null : channel.remoteAddress();
                 });
+        this.peerMeshClient.configureEgressDns(specusBean.isPeerEgressDnsTakeover(),
+                specusBean.getPeerEgressFakeIpCidr());
     }
 
     public void start() {
@@ -392,6 +394,9 @@ public class NettyClient {
         if (prior > 0) {
             log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
         }
+        // Before anything this session pushes is read: a catalogue revision counts within one
+        // control session, and the server behind this one may number from 1 again.
+        peerMeshClient.onControlSession();
         var cachedPeerMesh = specusBean.getPeerMesh();
         if (cachedPeerMesh != null && cachedPeerMesh.isEnabled()) {
             peerMeshClient.startOrUpdate(cachedPeerMesh);

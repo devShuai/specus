@@ -29,13 +29,31 @@ public final class PeerEgressRules {
         }
     }
 
+    /** The {@code kind} a rule reports in the status: what its match is. */
+    public static final String KIND_CIDR = "cidr";
+    public static final String KIND_DOMAIN = "domain";
+
     /**
-     * Returns the failing code, or {@code null} when the rule is acceptable.
+     * Returns the failing code, or {@code null} when the rule is acceptable, with phase two not
+     * running: a domain rule is refused as unsupported, word for word as in phase one.
      *
      * <p>The checks run in a fixed order so that every implementation reports the same code for a
      * rule that violates more than one constraint.
      */
     public static String validate(PeerEgressRule rule, String meshCidr) {
+        return validate(rule, meshCidr, null);
+    }
+
+    /**
+     * As above, with the fake-IP pool while phase two runs ({@code protocol/spec/peer-egress-dns.md}),
+     * or null while it does not. Running, a well-formed domain rule is accepted and an address rule
+     * reaching into the pool is refused: an address in the pool means whatever name it was handed out
+     * for, so only a domain rule may decide where it goes.
+     *
+     * <p>The order is phase one's with phase two's checks in the places the shared vector pins:
+     * a domain match is checked where phase one refused it, the pool after the mesh.
+     */
+    public static String validate(PeerEgressRule rule, String meshCidr, String fakeIpCidr) {
         if (rule == null) {
             return PeerEgressCodes.RULE_MALFORMED;
         }
@@ -51,21 +69,34 @@ public final class PeerEgressRules {
         if (match.indexOf(':') >= 0) {
             return PeerEgressCodes.RULE_IPV6_UNSUPPORTED;
         }
+        Ipv4Cidr pool = fakeIpCidr == null ? null : Ipv4Cidr.parse(fakeIpCidr);
+        boolean phaseTwo = fakeIpCidr != null;
         if (looksLikeDomain(match)) {
-            return PeerEgressCodes.RULE_DOMAIN_UNSUPPORTED;
-        }
-        Ipv4Cidr cidr = Ipv4Cidr.parse(match);
-        if (cidr == null) {
-            return PeerEgressCodes.RULE_MALFORMED;
-        }
-        if (cidr.prefixLength() == 0) {
-            // This version never takes over the default route: doing so would override the user's
-            // existing configuration and contradict "unmatched traffic stays local".
-            return PeerEgressCodes.RULE_DEFAULT_ROUTE;
-        }
-        Ipv4Cidr mesh = Ipv4Cidr.parse(meshCidr == null || meshCidr.isBlank() ? DEFAULT_MESH_CIDR : meshCidr);
-        if (mesh != null && cidr.overlaps(mesh)) {
-            return PeerEgressCodes.RULE_MESH_OVERLAP;
+            if (!phaseTwo) {
+                return PeerEgressCodes.RULE_DOMAIN_UNSUPPORTED;
+            }
+            // Neither an address nor a name (1.2.3.4-5 names nothing) is malformed, as an address
+            // that failed to parse would be.
+            if (!PeerEgressNames.validMatch(match)) {
+                return PeerEgressCodes.RULE_MALFORMED;
+            }
+        } else {
+            Ipv4Cidr cidr = Ipv4Cidr.parse(match);
+            if (cidr == null) {
+                return PeerEgressCodes.RULE_MALFORMED;
+            }
+            if (cidr.prefixLength() == 0) {
+                // This version never takes over the default route: doing so would override the
+                // user's existing configuration and contradict "unmatched traffic stays local".
+                return PeerEgressCodes.RULE_DEFAULT_ROUTE;
+            }
+            Ipv4Cidr mesh = Ipv4Cidr.parse(meshCidr == null || meshCidr.isBlank() ? DEFAULT_MESH_CIDR : meshCidr);
+            if (mesh != null && cidr.overlaps(mesh)) {
+                return PeerEgressCodes.RULE_MESH_OVERLAP;
+            }
+            if (pool != null && cidr.overlaps(pool)) {
+                return PeerEgressCodes.RULE_FAKE_IP_OVERLAP;
+            }
         }
         if (rule.getPort() != null) {
             return PeerEgressCodes.RULE_PORT_UNSUPPORTED;
@@ -101,6 +132,14 @@ public final class PeerEgressRules {
      * refused would not match where the traffic actually goes.
      */
     public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr) {
+        return match(rules, destination, meshCidr, null);
+    }
+
+    /**
+     * As above while phase two runs with the given pool (null when it does not). Domain rules never
+     * match an address, and an address rule the pool refuses takes no part, like any refused rule.
+     */
+    public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr, String fakeIpCidr) {
         Integer address = Ipv4Cidr.parseAddress(destination);
         if (address == null || rules == null || rules.isEmpty()) {
             return Match.unmatched();
@@ -110,7 +149,7 @@ public final class PeerEgressRules {
         int bestPrefix = -1;
         for (int index = 0; index < rules.size(); index++) {
             PeerEgressRule rule = rules.get(index);
-            if (validate(rule, meshCidr) != null) {
+            if (validate(rule, meshCidr, fakeIpCidr) != null || isDomain(rule)) {
                 continue;
             }
             Ipv4Cidr cidr = Ipv4Cidr.parse(rule.getMatch());
@@ -128,6 +167,20 @@ public final class PeerEgressRules {
         }
         Long target = PeerEgressRule.ACTION_EGRESS.equals(best.getAction()) ? best.getEgressClientId() : null;
         return new Match(best.getAction(), bestIndex, target);
+    }
+
+    /**
+     * Whether a rule's match is a domain rather than an address, which is the {@code kind} the
+     * status reports. Anything with a colon is an (IPv6) address, whatever letters it carries.
+     */
+    public static boolean isDomain(PeerEgressRule rule) {
+        String match = rule == null || rule.getMatch() == null ? "" : rule.getMatch().trim();
+        return !match.isEmpty() && match.indexOf(':') < 0 && looksLikeDomain(match);
+    }
+
+    /** {@link #KIND_DOMAIN} or {@link #KIND_CIDR}. */
+    public static String kind(PeerEgressRule rule) {
+        return isDomain(rule) ? KIND_DOMAIN : KIND_CIDR;
     }
 
     private static boolean looksLikeDomain(String match) {
