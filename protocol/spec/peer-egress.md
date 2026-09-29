@@ -8,7 +8,8 @@
 
 ## 一期边界
 
-本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级：
+本规范当前定义的是一期范围。以下能力**明确不在本版本内**，实现必须拒绝而不是静默降级。其中域名规则、DNS 接管与 IPv6 目标由二期规范
+[peer-egress-dns.md](peer-egress-dns.md) 定义，默认关闭；未开启 `peerEgressDnsTakeover` 时下表照旧成立：
 
 | 不支持 | 行为 |
 | --- | --- |
@@ -46,9 +47,18 @@
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| `peerEgressRules` | 空 | 有序规则列表，语义见下节。**没有单独的总开关**：列表非空即启用消费端，空或缺省即不启用 |
+| `peerEgressEnabled` | `false` | 消费端总开关，即「启用系统接管」。只有为 `true` 时才应用规则、安装路由；为 `false` 时规则只保存、不接管任何流量 |
+| `peerEgressRules` | 空 | 有序规则列表，语义见下节。每条规则可带 `enabled`（缺省 `true`），`false` 的规则留在列表里但不参与匹配 |
 
-设计阶段写过 `egressEnabled` 与 `egressRules` 两个字段，实现时没有采用：多一个开关就多一种「规则写了但没打开」的状态，而那恰好是本功能要防的静默不生效。
+一期最初没有总开关，列表非空即启用：多一个开关就多一种「规则写了但没打开」的状态，而那恰好是本功能要防的静默不生效。P6（#49）要求把「保存配置」与「启用系统接管」分开，并在首次启用时说明需要的权限、会接管的流量和失败时的行为，所以加入了 `peerEgressEnabled`，默认关闭。
+
+关闭状态因此必须是响亮的，而不是静默的：
+
+- `config validate` 与每次启动加载配置时，对「配置了规则但总开关关闭」写一条告警 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，三端逐字一致；
+- 状态查询里 `consumer.enabled` 为 `false`，每条规则 `inForce: false`、错误码 `EGRESS_CONSUMER_DISABLED`；
+- CLI、本地管理页与桌面端都把「已保存、未启用」作为一种状态显示出来。
+
+单条规则的 `enabled: false` 是用户的明确选择，不是配置错误：它不产生告警，只在状态里以 `inForce: false`、`EGRESS_RULE_DISABLED` 列出。
 
 出口端不在客户端本地配置授权。出口由服务端两级开关控制——租户级总开关与每台设备的出口策略，**两者都开**这台设备才会作为出口——持久化后通过 `egress-config` 下发，避免出口设备本地被改写后绕过租户策略。管理接口见 [出口分流使用说明](../../docs/peer-mesh/peer-egress-usage.md)。客户端本地只保留一个只读的当前生效视图。
 
@@ -73,6 +83,7 @@
 
 配置校验顺序固定，实现必须按此顺序返回第一个命中的错误码。一条规则可能同时违反多项，顺序不固定则各语言会对同一条规则报出不同的码，而共享向量目前没有同时违反两项的用例，无法靠它兜住：
 
+0. `EGRESS_RULE_DISABLED` —— `enabled` 显式为 `false`。排在所有内容检查之前：停用是用户的选择，一条停用的规则不必先修好才能留在列表里
 1. `EGRESS_RULE_MALFORMED` —— `match` 为空
 2. `EGRESS_RULE_IPV6_UNSUPPORTED` —— `match` 含冒号
 3. `EGRESS_RULE_DOMAIN_UNSUPPORTED` —— `match` 是域名或域名后缀
@@ -364,12 +375,12 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | --- | --- |
 | `version` | 当前为 `1`。`0` 或缺省表示不支持出口 |
 | `consumerCapable` / `egressCapable` | 该客户端能否作为消费端 / 出口端 |
-| `domainTargetCapable` | 是否支持域名目标。一期固定为 `false` |
+| `domainTargetCapable` | 是否支持域名目标，即接受 `name-bind` 并在出口侧解析（[二期](peer-egress-dns.md)） |
 | `ipv6TargetCapable` | 是否支持 IPv6 目标。一期固定为 `false` |
 
 服务端**不得**向 `version` 为 `0` 或缺省的客户端下发 `egress-config` 或 `egress-catalog`。四个服务端都按这条门控。
 
-设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 与 `ipv6TargetCapable` 为 `false`。
+设计稿里这个字段叫 `egressVersion`，四个服务端实现与 Java 共享模型读的都是 `version`，以实现为准。三个客户端上报 `version: 1`、`egressCapable: true`（出口只需要普通 socket）、`consumerCapable` 按本平台能否接管路由（Linux、Windows、macOS 为 `true`），`domainTargetCapable` 为 `true`（出口侧二期已交付），`ipv6TargetCapable` 为 `false`。
 
 > 在 P8 审计之前，三个客户端**都没有上报**这个对象（Java 上报了但 `version` 为默认的 `0`），于是没有任何服务端向任何客户端下发过 `egress-config`：真实部署里没有设备能被启用为出口，出口数据面只在直接喂策略的测试里跑过。修复见 `fix(peer-egress): make the feature reachable outside its own tests`。
 
@@ -533,7 +544,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口关闭匹配这些目标的全部已建流。
 
-`name-bind` 为二期域名分流保留。一期收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。
+`name-bind` 属于二期域名分流，定义见 [peer-egress-dns.md](peer-egress-dns.md)。声明 `domainTargetCapable` 的出口接受它；不支持二期的出口收到必须拒绝，返回 `EGRESS_CONTROL_UNSUPPORTED`，不得当作已实现。其他未定义的控制类型一律返回 `EGRESS_CONTROL_UNSUPPORTED`。
 
 固定向量：`protocol/test-vectors/peer-egress-frame-v1.json`。
 
@@ -559,6 +570,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_RULE_MESH_OVERLAP` | 配置校验：规则覆盖 Peer Mesh 虚拟网段 |
 | `EGRESS_RULE_DEFAULT_ROUTE` | 配置校验：一期不接管默认路由 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 配置校验：消费端规则不支持端口维度 |
+| `EGRESS_RULE_DISABLED` | 配置校验：规则被用户停用（`enabled: false`），不参与匹配 |
+| `EGRESS_CONSUMER_DISABLED` | 状态：消费端总开关 `peerEgressEnabled` 关闭，规则只保存、不接管 |
 | `EGRESS_FRAME_BAD_MAGIC` | 帧 magic 不是 `SPEG1` |
 | `EGRESS_FRAME_UNKNOWN_TYPE` | 未定义的 `type` |
 | `EGRESS_FRAME_RESERVED_SET` | `reserved` 字节或保留 flag 位非零 |
@@ -567,6 +580,11 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_IPV6_UNSUPPORTED` | 数据面收到 IPv6 packet |
 | `EGRESS_FRAME_MALFORMED_CONTROL` | `type=2` 的 body 不是 UTF-8 JSON object |
 | `EGRESS_CONTROL_UNSUPPORTED` | 控制消息类型未在本版本实现 |
+| `EGRESS_NAME_UNRESOLVED` | 二期：出口解析名字失败或没有可用地址 |
+| `EGRESS_NAME_UNSUPPORTED` | 二期：出口不支持域名目标（未声明 `domainTargetCapable`）却收到 `name-bind` |
+| `EGRESS_RULE_FAKE_IP_OVERLAP` | 二期配置校验：IP/CIDR 规则与 fake-IP 池重叠 |
+| `EGRESS_FAKE_IP_POOL_INVALID` | 二期配置校验：`peerEgressFakeIpCidr` 不合法，或与 Peer Mesh 网段、本机接口地址重叠 |
+| `EGRESS_RULE_EGRESS_NO_DOMAIN` | 二期配置校验：域名规则指向的出口未声明 `domainTargetCapable` |
 
 ## 状态查询
 
@@ -579,6 +597,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 ```json
 {
   "consumer": {
+    "enabled": true,
     "active": true,
     "appliedAtUnixMs": 1757000000000,
     "rules": [
@@ -591,7 +610,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
       {"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24",
        "installed": false, "conflict": "203.0.113.0/24 via 192.0.2.1 dev eth0"}
     ],
-    "peers": [{"clientId": 42, "online": true}],
+    "peers": [{"clientId": 42, "online": true, "path": "direct", "flows": 3}],
     "flows": 3,
     "blocked": {"egress-unavailable": 7},
     "routeError": "",
@@ -607,9 +626,15 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 **`inForce` 是这一节存在的理由。** 一条配置了但被拒的规则读出来是 `false` 并带着它的错误码。这是「这条规则在保护我」和「这条规则是文件里的一段文字」之间的区别。被拒的规则**必须列出来**，不能省掉：只列生效规则的状态，会让写下那条规则的人无从发现它没生效。
 
+**总开关关闭时这一节照样出现。** 只要配置了规则，`consumer` 就在，`enabled: false`、`active: false`，每条规则 `inForce: false` 并带 `EGRESS_CONSUMER_DISABLED`（本身停用的规则仍报 `EGRESS_RULE_DISABLED`），不列路由也不列出口对端。没有配置规则时这一节缺省，与之前相同。
+
 **没装上的路由必须列出来**，带 `installed: false` 和占用者的描述。省掉它会让状态看起来干干净净，而它本该捕获的流量正从物理网卡出去。
 
 **两个字段是现算的，两个是记下来的。** 规则是否生效每次取快照时用与 `matchEgressRules` 相同的校验重算，这样状态不会与真正的导流决定漂移；路由是否装上算不出来——那个答案来自下发那一刻的系统路由表——所以记下来。记下来的只有冲突：已装的在安装记录里，而安装记录才是重启后被接管的东西。
+
+**每个出口对端说明当前走哪条路径、承载多少流。** `path` 取 `direct`（发往对端的直连端点）、`relay`（经服务端中继）或 `none`（两者都还没有），按发送时的选择读取：已指定中继目标即为 `relay`，否则有直连端点即为 `direct`。`flows` 是本机发往该出口的活动流数。出口慢时人们先问的就是走的直连还是中继；在线却 `none` 的出口，规则已生效却无处可发，与离线同属问题。
+
+**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
 
 **被拒的规则不贡献 `peers` 条目。** 否则状态会报告一个本节点永远不会发往的出口，看起来像一条生效规则有个健康的目的地。
 
@@ -641,12 +666,19 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 出口不得成为开放代理。上限四端取一致口径，并在成功、失败、超时和取消路径全部释放：
 
-- 全进程活动流上限、每出口策略上限、每消费设备上限
+- 全进程活动流上限、每出口策略上限、每消费设备上限。**处于 TIME_WAIT 的 TCP 流不计入**：出口先关的流
+  进入 TIME_WAIT 时，两个方向都已结束，出口立即关闭其上游 socket，条目只为回应重传的 FIN 保留到 10 s
+  计时结束。计入的话，一个刚完成 64 条短连接的消费端在之后 10 s 内新建的连接会被 `EGRESS_LIMIT_EXCEEDED`
+  拒绝（#88）。状态里的 `flows` 同样只计活动流
 - TCP connect timeout、双向 idle timeout
 - UDP 来源映射 idle TTL
 - 速率限制——**尚未实现**，见当前限制
 
-拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。
+拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。具体到三端的出口日志：
+
+- 出口拒绝一条流：`[peer-egress] refused consumer=<id> protocol=<tcp|udp> code=<码>`（限频时附 `suppressed=<n>`），不写目标地址与端口；目标随拒绝控制消息告诉消费端本身。
+- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。
+- 消费端运行时跳过被拒的规则：`[peer-egress-consumer] rule <序号> refused: <码>`，不写 `match`，与离线校验的告警同一约定。
 
 ## 对系统的改动
 
@@ -666,7 +698,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 - **下行已有有界发送窗口、出口发送队列准入和 socket 背压，但不是完整拥塞控制。** Go、Java、.NET 的发送信用为 `min(消费端通告窗口, 4 × MSS) - 在途字节`；待发送与未确认数据共享每流 65536 字节预算，耗尽后暂停目标 socket 读取，ACK 释放容量后恢复。握手前的数据也有界保留；FIN 等待缓冲发完且窗口允许。窗口更新忽略旧序号，部分 ACK 裁掉已确认前缀；零窗口按 RTO 节奏探测一个字节，不消耗普通重传次数，但仍受空闲超时限制。普通超时每次只重传最老的未确认段，并限制在当前接收窗口内。RTT/RTO 仍为初始 1 s、下限 200 ms、上限 60 s、最多重传 6 次；本端通告的接收窗口仍是 65535，无窗口缩放。固定四段在途限制不提供 Reno/CUBIC 的自适应拥塞控制。
 - **512 深度的出口发送队列已对 TCP 数据/FIN 提供非阻塞准入与可写通知。** 入队失败不推进发送序号、不移除待发数据、不计重传次数；出队后轮转唤醒等待流，100 ms tick 作通知遗漏的后备。回调只入队，不获取 mesh 锁、不等待网络，保持原有锁顺序。初始 SYN-ACK、未跟踪控制帧和 UDP 仍为尽力发送；入队成功后的网络丢包仍靠重传处理。日志中的 `data plane saturated ... depth=2048` 指的是另一层接收工作队列，该队列必须保持非阻塞以免拖住 STUN/TURN/保活，仍允许过载丢帧；这不等于端到端无丢帧保证。
-- **#74 的大响应修复已通过 Linux Go 实测，跨平台混合语言矩阵尚待验证。** 2026-09-26 的 WSL 2 真 TUN、Go↔Go、1280 MTU 实验通过 52 项检查：8 MiB 下行 SHA-256 正确，单次 8.70 MiB/s；8 MiB 上行 7.06 MiB/s；512 KiB、1 MiB、8 MiB 大响应均完整；双向 2% 丢包时 512 KiB 下载校验正确，0.13 MiB/s。此前 512 KiB/1 MiB 下载耗尽重传后复位的问题没有在此次探测重现。这里的 8 MiB 是测试覆盖量，不是新大小上限，吞吐是单机实验观测而非性能承诺。详见[真机实验室](../../scripts/peer-egress-lab/README.md)。
+- **#74 的大响应修复已在 Linux 上覆盖三种语言的全部 9 种组合，Windows 与 macOS 真 TUN 尚待验证（#50）。** 9 种组合在每次 PR 上跑真机实验室与性能门槛。 2026-09-26 的 WSL 2 真 TUN、Go↔Go、1280 MTU 实验通过 52 项检查：8 MiB 下行 SHA-256 正确，单次 8.70 MiB/s；8 MiB 上行 7.06 MiB/s；512 KiB、1 MiB、8 MiB 大响应均完整；双向 2% 丢包时 512 KiB 下载校验正确，0.13 MiB/s。此前 512 KiB/1 MiB 下载耗尽重传后复位的问题没有在此次探测重现。这里的 8 MiB 是测试覆盖量，不是新大小上限，吞吐是单机实验观测而非性能承诺。详见[真机实验室](../../scripts/peer-egress-lab/README.md)。
 - 分片 IPv4 packet 不在出口重组；超过有效路径 MTU 的包沿用 Peer Mesh 既有处理，向本地虚拟网卡回注 ICMP Destination Unreachable code 4。
 - 出口使用普通 socket 连接目标，因此不保留原始源地址；目标看到的是出口所在网络的出口地址。
 - 出口与消费端角色可以同时启用，但不构成出口链：hop 标记保证一跳即止。

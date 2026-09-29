@@ -49,6 +49,13 @@ public sealed class SpecusClientConfig
     [JsonPropertyName("peerEgressRules")]
     public IReadOnlyList<Specus.Protocol.PeerEgress.PeerEgressRule> PeerEgressRules { get; set; } = [];
 
+    /// <summary>
+    /// The consumer's master switch: "take over system traffic". Off by default; the rules are then
+    /// kept and none is applied. Saving rules and taking over traffic are separate steps (#49).
+    /// </summary>
+    [JsonPropertyName("peerEgressEnabled")]
+    public bool PeerEgressEnabled { get; set; }
+
     [JsonPropertyName("updateCheckEnabled")]
     public bool UpdateEnabled { get; set; } = true;
 

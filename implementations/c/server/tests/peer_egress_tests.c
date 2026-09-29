@@ -381,6 +381,10 @@ static void load_rule(const char *raw, st_egress_rule *rule)
         rule->port = port;
         rule->has_port = 1;
     }
+    int enabled = 1;
+    if (st_json_get_bool(raw, "enabled", &enabled) == 0 && !enabled) {
+        rule->switched_off = 1;
+    }
 }
 
 static int load_rules(const char *vector, st_egress_rule *rules, size_t capacity, size_t *out_len)

@@ -92,7 +92,11 @@ public final class LocalUi {
                 }
                 return Map.of("schemaVersion",1,"accepted",true);
             }
-            if(Set.of("/api/config","/api/status","/api/config/save","/api/config/validate","/api/connection").contains(path)) throw new Failure(405,"此接口不支持该方法");
+            if(path.equals("/api/egress")&&method.equals("GET")) return EgressEdit.uiRules(options.config());
+            if(path.equals("/api/egress/change")&&method.equals("POST")) return EgressEdit.uiChange(options.config(),body);
+            if(path.equals("/api/egress/test")&&method.equals("POST")) return EgressEdit.uiTest(options.config(),body);
+            if(Set.of("/api/config","/api/status","/api/config/save","/api/config/validate","/api/connection",
+                    "/api/egress","/api/egress/change","/api/egress/test").contains(path)) throw new Failure(405,"此接口不支持该方法");
             throw new Failure(404,"接口不存在");
         }
     }

@@ -151,9 +151,10 @@ class PeerServiceRuntimeTests {
                 runtime.applyConfig(config(true, replacement));
                 firstCaller.setSoTimeout(1_000);
                 assertThat(readClosed(firstCaller)).isTrue();
-                assertThat(org.assertj.core.api.Assertions.catchThrowable(
-                        () -> new Socket("127.0.0.1", firstPublishedPort)))
-                        .isInstanceOf(IOException.class);
+                // The runtime probes a target before bridging it; drop those queued connections
+                // so the next accept can only see a flow made after the revocation.
+                drainQueued(firstTarget);
+                assertLateConnectNeverReachesTarget("127.0.0.1", firstPublishedPort, firstTarget);
 
                 try (Socket secondCaller = new Socket("127.0.0.1", secondPublishedPort);
                      Socket secondForwarded = secondTarget.accept()) {
@@ -163,9 +164,8 @@ class PeerServiceRuntimeTests {
                     secondCaller.setSoTimeout(1_000);
                     assertThat(readClosed(secondCaller)).isTrue();
                 }
-                assertThat(org.assertj.core.api.Assertions.catchThrowable(
-                        () -> new Socket("127.0.0.1", secondPublishedPort)))
-                        .isInstanceOf(IOException.class);
+                drainQueued(secondTarget);
+                assertLateConnectNeverReachesTarget("127.0.0.1", secondPublishedPort, secondTarget);
             }
         }
     }
@@ -255,10 +255,14 @@ class PeerServiceRuntimeTests {
 
     @Test
     void probeTcpDetectsOpenAndClosedPorts() throws Exception {
-        int port = freePort();
-        assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", port, 200)).isFalse();
-        try (ServerSocket ignored = listen(port)) {
-            assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", port, 400)).isTrue();
+        // A freed port can be taken by any listener before the probe runs; a socket that is
+        // bound but never listens keeps it closed for the whole check.
+        try (Socket closed = new Socket()) {
+            closed.bind(new InetSocketAddress("127.0.0.1", 0));
+            assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", closed.getLocalPort(), 200)).isFalse();
+        }
+        try (ServerSocket open = new ServerSocket(0)) {
+            assertThat(PeerServiceDiscovery.probeTcp("127.0.0.1", open.getLocalPort(), 400)).isTrue();
         }
     }
 
@@ -374,9 +378,7 @@ class PeerServiceRuntimeTests {
                     assertThat(result).isEqualTo(-1);
                 }
             }
-            assertThat(org.assertj.core.api.Assertions.catchThrowable(
-                    () -> connectFrom("127.0.0.2", publishedPort)))
-                    .isInstanceOf(IOException.class);
+            assertLateConnectNeverReachesTarget("127.0.0.2", publishedPort, target);
         }
     }
 
@@ -428,6 +430,41 @@ class PeerServiceRuntimeTests {
             socket.close();
             throw failure;
         }
+    }
+
+    /**
+     * Revocation promises that no new flow reaches the target, not that the published port
+     * refuses at once. A ServerSocket closed while its accept loop is blocked stays listening in
+     * the kernel until that thread wakes, and may hand it one more connection; once released, any
+     * other listener can take the port. So the late connect may succeed or fail, but the target
+     * must never see it.
+     */
+    private static void assertLateConnectNeverReachesTarget(String sourceIp, int publishedPort,
+                                                            ServerSocket target) throws IOException {
+        target.setSoTimeout(250);
+        Socket late = null;
+        try {
+            late = connectFrom(sourceIp, publishedPort);
+        } catch (IOException refused) {
+            // Nothing listens on the published port any more.
+        }
+        try (Socket ignored = late) {
+            assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> target.accept().close()))
+                    .as("a connection made after revocation reached the target")
+                    .isInstanceOf(SocketTimeoutException.class);
+        }
+    }
+
+    private static void drainQueued(ServerSocket target) throws IOException {
+        target.setSoTimeout(250);
+        for (int i = 0; i < 16; i++) {
+            try {
+                target.accept().close();
+            } catch (SocketTimeoutException drained) {
+                return;
+            }
+        }
+        throw new AssertionError("target keeps accepting connections");
     }
 
     private static int freeUdpPort() throws IOException {

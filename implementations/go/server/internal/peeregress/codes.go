@@ -28,6 +28,10 @@ const (
 	CodeRuleMeshOverlap       = "EGRESS_RULE_MESH_OVERLAP"
 	CodeRuleDefaultRoute      = "EGRESS_RULE_DEFAULT_ROUTE"
 	CodeRulePortUnsupported   = "EGRESS_RULE_PORT_UNSUPPORTED"
+	// CodeRuleDisabled is a rule the user switched off: kept in the list, out of force.
+	CodeRuleDisabled = "EGRESS_RULE_DISABLED"
+	// CodeConsumerDisabled is the consumer's master switch being off: rules kept, nothing taken over.
+	CodeConsumerDisabled = "EGRESS_CONSUMER_DISABLED"
 
 	// SPEG1 frame decoding.
 	CodeFrameBadMagic      = "EGRESS_FRAME_BAD_MAGIC"
@@ -38,6 +42,13 @@ const (
 	CodeIPv6Unsupported    = "EGRESS_IPV6_UNSUPPORTED"
 	CodeFrameMalformedCtrl = "EGRESS_FRAME_MALFORMED_CONTROL"
 	CodeControlUnsupported = "EGRESS_CONTROL_UNSUPPORTED"
+
+	// Phase two, domain rules (protocol/spec/peer-egress-dns.md).
+	CodeNameUnresolved     = "EGRESS_NAME_UNRESOLVED"
+	CodeNameUnsupported    = "EGRESS_NAME_UNSUPPORTED"
+	CodeRuleFakeIPOverlap  = "EGRESS_RULE_FAKE_IP_OVERLAP"
+	CodeFakeIPPoolInvalid  = "EGRESS_FAKE_IP_POOL_INVALID"
+	CodeRuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN"
 )
 
 // knownCodes is every code this build defines, built from the constants above rather than repeated
@@ -51,11 +62,14 @@ var knownCodes = map[string]struct{}{
 
 	CodeRuleDomainUnsupported: {}, CodeRuleIPv6Unsupported: {}, CodeRuleMalformed: {},
 	CodeRuleMissingTarget: {}, CodeRuleMeshOverlap: {}, CodeRuleDefaultRoute: {},
-	CodeRulePortUnsupported: {},
+	CodeRulePortUnsupported: {}, CodeRuleDisabled: {}, CodeConsumerDisabled: {},
 
 	CodeFrameBadMagic: {}, CodeFrameUnknownType: {}, CodeFrameReservedSet: {},
 	CodeFrameTruncated: {}, CodeFrameTrailingBytes: {}, CodeIPv6Unsupported: {},
 	CodeFrameMalformedCtrl: {}, CodeControlUnsupported: {},
+
+	CodeNameUnresolved: {}, CodeNameUnsupported: {}, CodeRuleFakeIPOverlap: {},
+	CodeFakeIPPoolInvalid: {}, CodeRuleEgressNoDomain: {},
 }
 
 // IsKnownCode reports whether a code is one this build defines.

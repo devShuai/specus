@@ -290,8 +290,12 @@ static int test_peer_egress_known_codes(void)
         fprintf(stderr, "an undefined result code was accepted\n");
         failures++;
     }
-    if (ST_EGRESS_ALL_CODES_LEN != 26U) {
-        fprintf(stderr, "expected 26 result codes, got %zu\n", ST_EGRESS_ALL_CODES_LEN);
+    if (!st_egress_is_known_code(ST_EGRESS_CODE_NAME_UNRESOLVED)) {
+        fprintf(stderr, "a phase-two refusal code was not recognised\n");
+        failures++;
+    }
+    if (ST_EGRESS_ALL_CODES_LEN != 33U) {
+        fprintf(stderr, "expected 33 result codes, got %zu\n", ST_EGRESS_ALL_CODES_LEN);
         failures++;
     }
     return failures;

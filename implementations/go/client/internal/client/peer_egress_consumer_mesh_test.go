@@ -134,3 +134,37 @@ func TestMeshWithdrawEgressRoutesIsSafeWhenNothingWasInstalled(t *testing.T) {
 	mesh.withdrawEgressRoutes()
 	mesh.withdrawEgressRoutes()
 }
+
+// Rules saved with the master switch off take nothing over: the reconcile withdraws the tunnel
+// routes, and the status still lists every rule, out of force and saying why.
+func TestMeshWithTheSwitchOffKeepsRulesAndTakesNothingOver(t *testing.T) {
+	mesh := newConsumerMeshHarness(t)
+	defer mesh.withdrawEgressRoutes()
+
+	off := false
+	applyEgressRulesForTest(t, mesh, []egressRule{
+		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 2},
+		{Match: "198.51.100.0/24", Action: egressActionBlock, Enabled: &off},
+	}, consumerRuntimeConfig())
+	mesh.config.PeerEgressEnabled = false
+	mesh.reconcileEgressRoutes()
+
+	status := mesh.egressStatusJSON()["consumer"].(map[string]any)
+	if status["enabled"] != false {
+		t.Fatalf("status enabled = %v, want false", status["enabled"])
+	}
+	rules := status["rules"].([]map[string]any)
+	if len(rules) != 2 || rules[0]["code"] != egressCodeConsumerDisabled || rules[1]["code"] != egressCodeRuleDisabled {
+		t.Fatalf("switched-off rules = %v", rules)
+	}
+	for _, rule := range rules {
+		if rule["inForce"] != false {
+			t.Fatalf("a rule reads in force with the switch off: %v", rule)
+		}
+	}
+	for _, route := range status["routes"].([]map[string]any) {
+		if route["installed"] == true && route["kind"] == "tun" {
+			t.Fatalf("a tunnel route is still installed with the switch off: %v", route)
+		}
+	}
+}

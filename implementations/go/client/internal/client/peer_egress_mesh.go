@@ -301,7 +301,12 @@ func (mesh *peerMeshClient) reconcileEgressRoutesAt(now time.Time) {
 	mesh.egressPlanMu.Lock()
 	defer mesh.egressPlanMu.Unlock()
 
-	rules := mesh.config.PeerEgressRules
+	// With the master switch off nothing is taken over. The plan is then empty, which withdraws
+	// whatever a previous run left installed, and the consumer is not built.
+	var rules []egressRule
+	if mesh.config.PeerEgressEnabled {
+		rules = mesh.config.PeerEgressRules
+	}
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	device := mesh.device
@@ -493,7 +498,8 @@ func (mesh *peerMeshClient) logEgressRefusals(refused []egressRuleSetError) {
 	if joined := strings.Join(keys, ","); joined != mesh.egressRefusalsLogged {
 		mesh.egressRefusalsLogged = joined
 		for _, entry := range refused {
-			mesh.logger.Printf("[peer-egress-consumer] rule %d (%s) refused: %s", entry.Index, entry.Match, entry.Code)
+			// The index and the code, not the match: configuration values stay out of the log.
+			mesh.logger.Printf("[peer-egress-consumer] rule %d refused: %s", entry.Index, entry.Code)
 		}
 	}
 }

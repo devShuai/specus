@@ -26,6 +26,8 @@ type Rule struct {
 	// Port exists only so a configuration carrying it can be rejected with a specific code rather
 	// than having the field silently ignored.
 	Port *int `json:"port,omitempty"`
+	// Enabled is nil for a rule as written; only an explicit false switches a rule off.
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // Match is the outcome of evaluating a destination against an ordered rule list.
@@ -48,6 +50,11 @@ func Unmatched() Match {
 // The checks run in a fixed order so every implementation reports the same code for a rule that
 // violates more than one constraint.
 func ValidateRule(rule Rule, meshCIDR string) string {
+	// Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
+	// should not have to be fixed before it may sit in the list.
+	if rule.Enabled != nil && !*rule.Enabled {
+		return CodeRuleDisabled
+	}
 	match := strings.TrimSpace(rule.Match)
 	if match == "" {
 		return CodeRuleMalformed

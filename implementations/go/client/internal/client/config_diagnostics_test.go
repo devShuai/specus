@@ -75,3 +75,32 @@ func TestConfigWarningsKnowEgressRulesAndNameTheOnesNotInForce(t *testing.T) {
 		t.Errorf("a usable rule was named or a match was printed: %q", joined)
 	}
 }
+
+// Rules kept with the master switch off are warned about once, by count; a rule the user switched
+// off is not warned about at all, since it is out of force because they asked. The switch is a known
+// field, and the warning is the same text the Java and .NET clients print.
+func TestConfigWarningsSayRulesAreNotTakingOverWithTheSwitchOff(t *testing.T) {
+	data := []byte(`{"peerEgressEnabled":false,"peerEgressRules":[
+		{"match":"203.0.113.0/24","action":"egress","egressClientId":42},
+		{"match":"198.51.100.0/24","action":"block","enabled":false}]}`)
+	var config Config
+	if err := unmarshalJSONC(data, &config); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var warnings []string
+	configWarnings(data, config, func(w string) { warnings = append(warnings, w) })
+	want := []string{"peerEgressRules has 2 rule(s) but peerEgressEnabled is false: none is in force"}
+	if strings.Join(warnings, "|") != strings.Join(want, "|") {
+		t.Fatalf("warnings = %q, want %q", warnings, want)
+	}
+
+	config.PeerEgressEnabled = true
+	warnings = nil
+	configWarnings([]byte(`{"peerEgressEnabled":true,"peerEgressRules":[{"match":"198.51.100.0/24","action":"block","enabled":false}]}`),
+		config, func(w string) { warnings = append(warnings, w) })
+	for _, warning := range warnings {
+		if strings.Contains(warning, "peerEgressRules[1]") || strings.Contains(warning, egressCodeRuleDisabled) {
+			t.Fatalf("a rule the user switched off was warned about: %q", warnings)
+		}
+	}
+}
