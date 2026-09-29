@@ -192,6 +192,17 @@ jobs:
         working-directory: apps/admin-web
         run: npm run build
 
+      # The build regenerates public/schemas from protocol/schemas, deleting the directory first.
+      # Both are committed, so a schema edited only in the generated copy is reverted by the next
+      # build anywhere -- which is how the egress definitions went missing from protocol/schemas.
+      # After the build the generated copy must be exactly what is committed.
+      - name: Generated schemas match their source
+        run: |
+          if ! git diff --exit-code -- apps/admin-web/public/schemas; then
+            echo "apps/admin-web/public/schemas is generated from protocol/schemas; edit the source and run npm run sync:schemas"
+            exit 1
+          fi
+
   android:
     name: Android protocol client
     runs-on: ubuntu-latest
