@@ -30,6 +30,10 @@ import type {
   NatControlResult,
   OidcConfig,
   Overview,
+  PeerEgressActivity,
+  PeerEgressPolicy,
+  PeerEgressPolicyMutation,
+  PeerEgressSwitch,
   PeerMeshAcl,
   PeerMeshAclMutation,
   PeerMeshDevice,
@@ -493,6 +497,15 @@ export const adminApi = {
       body: JSON.stringify({ clientId, source }),
     }),
   listPeerMeshServiceAudit: () => request<PeerMeshServiceAuditEvent[]>("/peer-mesh/service-audit"),
+  peerEgressSwitch: () => request<PeerEgressSwitch>("/peer-mesh/egress/switch"),
+  // enabled is always sent: some servers read a missing field as false and switch off.
+  updatePeerEgressSwitch: (enabled: boolean) =>
+    request<PeerEgressSwitch>("/peer-mesh/egress/switch", { method: "PUT", body: JSON.stringify({ enabled }) }),
+  listPeerEgressPolicies: () => request<PeerEgressPolicy[]>("/peer-mesh/egress/policies"),
+  savePeerEgressPolicy: (body: PeerEgressPolicyMutation) =>
+    request<PeerEgressPolicy>("/peer-mesh/egress/policies", { method: "POST", body: JSON.stringify(body) }),
+  deletePeerEgressPolicy: (id: number) => request<null>(`/peer-mesh/egress/policies/${id}`, { method: "DELETE" }),
+  listPeerEgressActivity: () => request<PeerEgressActivity[]>("/peer-mesh/egress/activity"),
 
   listClientDownloads: () => request<ClientDownloadLink[]>(`/client-downloads`),
   createClientDownload: (body: ClientDownloadLinkMutation) =>
