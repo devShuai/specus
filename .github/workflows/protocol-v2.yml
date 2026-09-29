@@ -106,6 +106,32 @@ jobs:
           --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests|FullyQualifiedName~PublicTransferClusterFaultToleranceTests"
           --verbosity minimal
 
+  go-server:
+    name: Go server
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/server/go.mod
+          cache-dependency-path: implementations/go/server/go.sum
+
+      # The management SPA the server embeds is built from apps/admin-web and is not committed. No
+      # test here opens it, and a placeholder satisfies the embed directive without the npm build.
+      - name: Create placeholder web assets for go:embed
+        run: |
+          mkdir -p implementations/go/server/web/static
+          printf '<!doctype html><title>ci-placeholder</title>\n' > implementations/go/server/web/static/index.html
+
+      # The whole suite. Only the cluster tests above ran before, which is how the server's rule
+      # engine drifted from the shared rules vector without a single failing check to say so.
+      - name: Test
+        working-directory: implementations/go/server
+        run: go test ./... -count=1
+
   c-linux:
     name: C server (Linux)
     runs-on: ubuntu-latest
