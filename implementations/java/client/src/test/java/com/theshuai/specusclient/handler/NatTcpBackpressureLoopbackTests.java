@@ -6,6 +6,9 @@ import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.bean.SpecusConfig;
 import com.theshuai.specusclient.client.TcpConnection;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
@@ -19,6 +22,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 
@@ -32,46 +37,38 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The data connection carries every stream, so pausing it because one local socket stopped
  * draining also stalls the others, including the stream the stalled upstream may be waiting on. A
- * single-threaded upstream with a second connection queued behind the first deadlocks that way, and
- * so did the C server NAT smoke test now and then.
+ * single-threaded upstream with a second connection queued behind the first deadlocks that way.
  */
 class NatTcpBackpressureLoopbackTests {
     private static final int STALLED_PORT = 19_001;
     private static final int ECHO_PORT = 19_002;
     private static final int FRAME = 64 * 1024;
+    private static final long WINDOW = StreamFlowController.INITIAL_WINDOW_BYTES;
 
     @Test
     void aStreamWhoseUpstreamStopsReadingLeavesTheDataConnectionReading() throws Exception {
         try (StalledUpstream stalled = new StalledUpstream(); EchoUpstream echo = new EchoUpstream()) {
             NatClientHandler handler = new NatClientHandler(
                     bean(stalled.port(), echo.port()), new TcpConnection());
-            EmbeddedChannel control = new EmbeddedChannel(handler);
+            SentFrames sent = new SentFrames();
+            EmbeddedChannel control = new EmbeddedChannel(sent, handler);
             try {
-                drainOutbound(control); // REGISTER frames
-
                 int stuck = 51;
                 int flowing = 52;
                 control.writeInbound(open(stuck, STALLED_PORT));
                 control.writeInbound(open(flowing, ECHO_PORT));
                 await(() -> handler.hasLocalTcpStream(stuck) && handler.hasLocalTcpStream(flowing), control);
 
-                // A full window towards an upstream that never reads leaves most of it queued in front
-                // of the local socket, far past the point where that socket stops being writable.
-                byte[] chunk = new byte[FRAME];
-                for (int sent = 0; sent < StreamFlowController.INITIAL_WINDOW_BYTES; sent += FRAME) {
-                    control.writeInbound(data(stuck, chunk));
-                }
-                long credited = settledCredit(control, stuck);
-                assertTrue(credited <= StreamFlowController.INITIAL_WINDOW_BYTES - 2L * FRAME,
-                        "the upstream must be holding back most of the window for this test to mean anything, "
-                                + "credited=" + credited);
+                long queued = fillUntilTheUpstreamStops(control, sent, stuck);
+                assertTrue(queued > 2L * FRAME,
+                        "the stalled upstream must leave bytes queued in front of its socket, queued=" + queued);
 
                 assertTrue(control.config().isAutoRead(),
                         "one stalled upstream must not stop the data connection from reading");
 
                 byte[] ping = "still-flowing".getBytes(StandardCharsets.UTF_8);
                 control.writeInbound(data(flowing, ping));
-                assertArrayEquals(ping, awaitData(control, flowing, ping.length),
+                assertArrayEquals(ping, awaitData(control, sent, flowing, ping.length),
                         "another stream must keep moving while the first one is stalled");
                 assertTrue(control.config().isAutoRead());
             } finally {
@@ -85,21 +82,21 @@ class NatTcpBackpressureLoopbackTests {
         try (StalledUpstream stalled = new StalledUpstream(); EchoUpstream echo = new EchoUpstream()) {
             NatClientHandler handler = new NatClientHandler(
                     bean(stalled.port(), echo.port()), new TcpConnection());
-            EmbeddedChannel control = new EmbeddedChannel(handler);
+            SentFrames sent = new SentFrames();
+            EmbeddedChannel control = new EmbeddedChannel(sent, handler);
             try {
-                drainOutbound(control);
-
                 int streamId = 53;
                 control.writeInbound(open(streamId, STALLED_PORT));
                 await(() -> handler.hasLocalTcpStream(streamId), control);
 
-                // A server that honours the window can never get this far ahead of the credit returned.
+                // Far more than any socket buffer takes from a peer that is not reading, sent without
+                // waiting for credit, which a server honouring the window never does.
                 byte[] chunk = new byte[FRAME];
-                for (int sent = 0; sent < 8 * StreamFlowController.INITIAL_WINDOW_BYTES; sent += FRAME) {
+                for (long offered = 0; offered < 32 * WINDOW; offered += FRAME) {
                     control.writeInbound(data(streamId, chunk));
                 }
 
-                NatMessagePacket reset = awaitReset(control, streamId);
+                NatMessagePacket reset = awaitReset(control, sent, streamId);
                 assertNotNull(reset, "the stream must be reset once the server overruns the window");
                 assertEquals(8, reset.getValue());
                 assertEquals("pending local TCP data exceeds receive window", reset.getMetaData().get("reason"));
@@ -110,38 +107,47 @@ class NatTcpBackpressureLoopbackTests {
         }
     }
 
-    /** Credit returned for one stream once it has stopped changing. */
-    private static long settledCredit(EmbeddedChannel control, int streamId) throws Exception {
+    /**
+     * Plays a server that honours the window: keeps the stream's window full as credit comes back,
+     * until the upstream stops taking bytes and credit stops coming. How much the kernel buffers for
+     * a peer that is not reading differs by platform, so a fixed amount would not reliably get there.
+     * Returns what is left queued in front of the local socket.
+     */
+    private static long fillUntilTheUpstreamStops(EmbeddedChannel control, SentFrames sent, int streamId)
+            throws Exception {
+        byte[] chunk = new byte[FRAME];
+        long offered = 0;
         long credited = 0;
-        long lastChange = System.nanoTime();
-        long deadline = lastChange + Duration.ofSeconds(10).toNanos();
-        while (System.nanoTime() < deadline
-                && System.nanoTime() - lastChange < Duration.ofMillis(500).toNanos()) {
+        long lastCredit = System.nanoTime();
+        long deadline = lastCredit + Duration.ofSeconds(20).toNanos();
+        while (System.nanoTime() - lastCredit < Duration.ofMillis(500).toNanos()
+                && System.nanoTime() < deadline) {
+            while (offered - credited + FRAME <= WINDOW) {
+                control.writeInbound(data(streamId, chunk));
+                offered += FRAME;
+            }
             control.runPendingTasks();
-            Object outbound;
-            while ((outbound = control.readOutbound()) != null) {
-                if (outbound instanceof NatMessagePacket packet
-                        && packet.getStreamId() == streamId
-                        && packet.getNatMessageType() == NatMessageType.WINDOW_UPDATE) {
+            NatMessagePacket packet;
+            while ((packet = sent.frames.poll()) != null) {
+                if (packet.getStreamId() == streamId && packet.getNatMessageType() == NatMessageType.WINDOW_UPDATE) {
                     credited += packet.getValue();
-                    lastChange = System.nanoTime();
+                    lastCredit = System.nanoTime();
                 }
             }
             Thread.sleep(10);
         }
-        return credited;
+        return offered - credited;
     }
 
-    private static byte[] awaitData(EmbeddedChannel control, int streamId, int length) throws Exception {
+    private static byte[] awaitData(EmbeddedChannel control, SentFrames sent, int streamId, int length)
+            throws Exception {
         ByteArrayOutputStream received = new ByteArrayOutputStream();
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
         while (System.nanoTime() < deadline && received.size() < length) {
             control.runPendingTasks();
-            Object outbound;
-            while ((outbound = control.readOutbound()) != null) {
-                if (outbound instanceof NatMessagePacket packet
-                        && packet.getStreamId() == streamId
-                        && packet.getNatMessageType() == NatMessageType.DATA) {
+            NatMessagePacket packet;
+            while ((packet = sent.frames.poll()) != null) {
+                if (packet.getStreamId() == streamId && packet.getNatMessageType() == NatMessageType.DATA) {
                     received.write(packet.getData());
                 }
             }
@@ -150,15 +156,14 @@ class NatTcpBackpressureLoopbackTests {
         return received.toByteArray();
     }
 
-    private static NatMessagePacket awaitReset(EmbeddedChannel control, int streamId) throws Exception {
+    private static NatMessagePacket awaitReset(EmbeddedChannel control, SentFrames sent, int streamId)
+            throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
         while (System.nanoTime() < deadline) {
             control.runPendingTasks();
-            Object outbound;
-            while ((outbound = control.readOutbound()) != null) {
-                if (outbound instanceof NatMessagePacket packet
-                        && packet.getStreamId() == streamId
-                        && packet.getNatMessageType() == NatMessageType.RST) {
+            NatMessagePacket packet;
+            while ((packet = sent.frames.poll()) != null) {
+                if (packet.getStreamId() == streamId && packet.getNatMessageType() == NatMessageType.RST) {
                     return packet;
                 }
             }
@@ -179,9 +184,20 @@ class NatTcpBackpressureLoopbackTests {
         assertTrue(condition.getAsBoolean(), "condition was not met before timeout");
     }
 
-    private static void drainOutbound(EmbeddedChannel channel) {
-        while (channel.readOutbound() != null) {
-            // Drain setup frames.
+    /**
+     * Collects what the client sends on the data connection. Credit and resets are written from the
+     * local channels' threads, and EmbeddedChannel's own outbound queue is not safe to share with the
+     * test thread, so frames are taken here and never reach it.
+     */
+    private static final class SentFrames extends ChannelOutboundHandlerAdapter {
+        private final Queue<NatMessagePacket> frames = new ConcurrentLinkedQueue<>();
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            if (msg instanceof NatMessagePacket packet) {
+                frames.add(packet);
+            }
+            promise.trySuccess();
         }
     }
 
