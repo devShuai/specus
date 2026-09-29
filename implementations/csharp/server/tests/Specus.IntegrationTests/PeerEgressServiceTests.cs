@@ -185,6 +185,72 @@ public sealed class PeerEgressServiceTests
         Assert.Empty(catalog.Egresses!);
     }
 
+    /// <summary>
+    /// A consumer can only reject a domain rule aimed at an egress that cannot resolve names if the
+    /// catalogue says which ones can. The answer comes from what each egress's online session
+    /// announced; an egress with no online session is never advertised as capable, whatever it
+    /// announced the last time it was connected.
+    /// </summary>
+    [Fact]
+    public async Task TheCatalogueCarriesEachEgressAnnouncedDomainTargets()
+    {
+        const long PlainEgressId = 4004;
+        const long OfflineEgressId = 5005;
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var resolving = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        var plain = fixture.AddClient(PlainEgressId, "egress-owner", "plain-gateway");
+        var offline = fixture.AddClient(OfflineEgressId, "egress-owner", "offline-gateway");
+        foreach (var egress in new[] { resolving, plain, offline })
+        {
+            fixture.AllowPeering(consumer, egress);
+        }
+        fixture.AddOnlineSession(resolving, 4401, egressVersion: 1, domainTargets: true);
+        fixture.AddOnlineSession(plain, 4402, egressVersion: 1, domainTargets: false);
+        fixture.AddSession(offline, 4403, egressVersion: 1, domainTargets: true, status: "DISCONNECTED");
+        await fixture.SaveChangesAsync();
+        foreach (var egressId in new[] { EgressId, PlainEgressId, OfflineEgressId })
+        {
+            await fixture.UpsertAsync(egressId, enabled: true, consumers: [ConsumerId]);
+        }
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+
+        Assert.NotNull(catalog);
+        var entries = catalog.Egresses!.ToDictionary(entry => entry.ClientId);
+        Assert.Equal(3, entries.Count);
+        Assert.True(entries[EgressId].DomainTargetCapable);
+        Assert.False(entries[PlainEgressId].DomainTargetCapable);
+        Assert.False(entries[OfflineEgressId].DomainTargetCapable);
+        // IPv6 targets are not announced by any client yet.
+        Assert.All(entries.Values, entry => Assert.False(entry.Ipv6TargetCapable));
+    }
+
+    /// <summary>
+    /// Only the newest online session speaks for the egress: one that reconnected with a build that
+    /// cannot resolve names stops being advertised as able to, even while an older session row has
+    /// not yet been marked disconnected.
+    /// </summary>
+    [Fact]
+    public async Task TheNewestOnlineSessionDecidesDomainTargets()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        var connected = DateTimeOffset.UtcNow;
+        fixture.AddOnlineSession(egress, 4501, egressVersion: 1, domainTargets: true,
+            connectedAt: connected.AddMinutes(-5));
+        fixture.AddOnlineSession(egress, 4502, egressVersion: 1, domainTargets: false, connectedAt: connected);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+
+        var entry = Assert.Single(catalog!.Egresses!);
+        Assert.False(entry.DomainTargetCapable);
+    }
+
     [Fact]
     public void DestinationRulesRoundTripAndRejectOversizedInput()
     {
@@ -648,10 +714,18 @@ public sealed class PeerEgressServiceTests
             return account;
         }
 
-        /// <summary>An online control session, which is where the reporter identity is bound from.</summary>
-        public void AddOnlineSession(ClientAccount account, long sessionId, int egressVersion)
+        /// <summary>
+        /// An online control session, which is where the reporter identity and the announced
+        /// capabilities are bound from.
+        /// </summary>
+        public void AddOnlineSession(ClientAccount account, long sessionId, int egressVersion,
+            bool domainTargets = false, DateTimeOffset? connectedAt = null) =>
+            AddSession(account, sessionId, egressVersion, domainTargets, "NETTY_ONLINE", connectedAt);
+
+        public void AddSession(ClientAccount account, long sessionId, int egressVersion, bool domainTargets,
+            string status, DateTimeOffset? connectedAt = null)
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = connectedAt ?? DateTimeOffset.UtcNow;
             Db.ClientSessions.Add(new ClientSession
             {
                 Id = sessionId,
@@ -659,10 +733,11 @@ public sealed class PeerEgressServiceTests
                 ClientId = account.Id,
                 ClientName = account.ClientName,
                 TokenHash = $"egress-report-{sessionId}",
-                Status = "NETTY_ONLINE",
+                Status = status,
                 MachineFingerprint = "machine",
                 OsUser = "user",
                 ClientEgressVersion = egressVersion,
+                ClientEgressDomainTargets = domainTargets,
                 HttpLoginAt = now,
                 NettyConnectedAt = now,
                 ExpiresAt = now.AddHours(1),

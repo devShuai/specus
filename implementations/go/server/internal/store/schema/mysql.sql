@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   peer_service_discovery_version INT NOT NULL DEFAULT 0,
   peer_service_applications VARCHAR(160),
   client_egress_version INT NOT NULL DEFAULT 0,
+  client_egress_domain_targets TINYINT(1) NOT NULL DEFAULT 0,
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),

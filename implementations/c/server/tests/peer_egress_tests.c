@@ -784,6 +784,38 @@ static int run_cross_language_sweep(const char *vector)
 }
 
 /*
+ * domainTargetCapable as read from a login's clientEgressCapabilities. It is advertised to every
+ * consumer in the catalogue, so anything short of an explicit true next to a usable version must
+ * read as false.
+ */
+static int run_domain_target_declaration(void)
+{
+    static const struct {
+        const char *label;
+        const char *capabilities;
+        int version;
+        int expected;
+    } cases[] = {
+        { "declared true", "{\"version\":1,\"domainTargetCapable\":true}", 1, 1 },
+        { "declared false", "{\"version\":1,\"domainTargetCapable\":false}", 1, 0 },
+        { "field absent", "{\"version\":1,\"egressCapable\":true}", 1, 0 },
+        { "version 0", "{\"version\":0,\"domainTargetCapable\":true}", 0, 0 },
+        { "object absent", NULL, 1, 0 },
+        { "not a boolean", "{\"version\":1,\"domainTargetCapable\":7}", 1, 0 },
+    };
+    int failures = 0;
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int actual = st_egress_declares_domain_targets(cases[i].capabilities, cases[i].version);
+        if (actual != cases[i].expected) {
+            fprintf(stderr, "domain target declaration %s: got %d, want %d\n", cases[i].label,
+                    actual, cases[i].expected);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/*
  * Drops the whitespace between tokens of a JSON text, leaving strings intact. The vector is
  * pretty-printed, and the stored form is compared byte for byte because its size is itself a limit.
  */
@@ -969,6 +1001,7 @@ int main(void)
     failures += run_rule_validation(rules);
     failures += run_parser_boundaries();
     failures += run_storage_round_trip();
+    failures += run_domain_target_declaration();
     failures += run_management_vector(management);
     failures += run_management_edges();
     free(authz);
