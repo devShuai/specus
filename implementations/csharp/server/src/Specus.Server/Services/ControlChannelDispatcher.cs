@@ -100,8 +100,10 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 await using (var scope = _services.CreateAsyncScope())
                 {
                     var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
-                    await peerMesh.HandleSignalAsync(message, context.ClientName!, context.Lifetime,
-                            context.ClientSessionId)
+                    await RoutePeerSignalAsync(
+                            () => peerMesh.HandleSignalAsync(message, context.ClientName!, context.Lifetime,
+                                context.ClientSessionId),
+                            _logger, context.ChannelId, message.ToClientName)
                         .ConfigureAwait(false);
                 }
                 return;
@@ -112,6 +114,36 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 _logger.LogDebug("[{ChannelId}] dropped unhandled packet: {Cmd}",
                     context.ChannelId, packet.Command);
                 return;
+        }
+    }
+
+    /// <summary>
+    /// Runs a client's peer signal through the mesh.
+    /// </summary>
+    /// <remarks>
+    /// The read loop closes a connection on any exception the dispatcher lets through, which is right
+    /// for a message that breaks the protocol and wrong for one that merely could not be delivered.
+    /// A peer that has just gone offline is not the sender's doing, and every client still signalling
+    /// it was being disconnected for it. So an undeliverable signal is dropped here, and everything
+    /// else still closes, now with the reason in the log.
+    /// </remarks>
+    internal static async Task RoutePeerSignalAsync(Func<Task> handle, ILogger logger, string channelId,
+        string? target)
+    {
+        try
+        {
+            await handle().ConfigureAwait(false);
+        }
+        catch (PeerSignalUndeliverableException ex)
+        {
+            logger.LogDebug("[{ChannelId}] dropped undeliverable peer signal to {Target}: {Reason}",
+                channelId, target, ex.Message);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning("[{ChannelId}] peer signal rejected; closing the sender's connection: {Reason}",
+                channelId, ex.Message);
+            throw;
         }
     }
 
@@ -246,11 +278,16 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             await using var scope = _services.CreateAsyncScope();
             var clientService = scope.ServiceProvider.GetRequiredService<ClientAccountService>();
             clientService.MarkNettyDisconnected(context.ClientSessionId);
+            var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
             if (context.ClientSessionId is { } disconnectedSessionId)
             {
-                var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
                 await peerMesh.OnClientDisconnectedAsync(disconnectedSessionId, CancellationToken.None)
                     .ConfigureAwait(false);
+            }
+            if (context.ClientName is { } departedName)
+            {
+                // After the unbind above, so the roster its peers are sent counts it as offline.
+                await peerMesh.PushOnLogoutAsync(departedName, CancellationToken.None).ConfigureAwait(false);
             }
             if (context.ConnectionRecordId is not { } recordId)
             {
