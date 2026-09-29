@@ -9,10 +9,16 @@ import com.theshuai.common.peeregress.PeerEgressRequest;
 import java.io.Closeable;
 import java.io.IOException;
 import java.security.SecureRandom;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.function.IntFunction;
 import java.util.function.LongPredicate;
 import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
@@ -160,6 +166,12 @@ final class PeerEgressRuntime {
     private List<String> localInterfaces = List.of();
 
     private final PeerEgressFlowTable flows = new PeerEgressFlowTable(0);
+
+    // Phase two: the names consumers bound to their fake addresses, how they are resolved, and which
+    // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
+    private final PeerEgressNameTable names = new PeerEgressNameTable();
+    private final Set<PeerEgressFlowTable.Key> resolving = new HashSet<>();
+    Function<String, List<Integer>> resolve = PeerEgressRuntime::resolveName;
     private final PeerEgressRejectionLog rejections = new PeerEgressRejectionLog();
     private long totalFlows;
     private long bytesIn;
@@ -341,6 +353,17 @@ final class PeerEgressRuntime {
         if (control == null) {
             return;
         }
+        if (PeerEgressFrame.CONTROL_NAME_BIND.equals(control.type())) {
+            // Validated with the frame; the address parses and the name is well formed.
+            Integer address = Ipv4Cidr.parseAddress(control.address());
+            lock.lock();
+            try {
+                names.bind(consumer, address, com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name()));
+            } finally {
+                lock.unlock();
+            }
+            return;
+        }
         // flow-reject travels egress to consumer. Receiving one means the peer is confused about
         // which end it is, and acting on it would let a consumer close flows by assertion.
         if (!PeerEgressFrame.CONTROL_FLOW_PURGE.equals(control.type())) {
@@ -408,8 +431,18 @@ final class PeerEgressRuntime {
     // the public entry point, because the lock serialises them there.
     void openTcpFlow(long consumer, PeerEgressFlowTable.Key key,
             PeerEgressSegment.Segment syn, long nowMs) {
+        Choice destination = resolveDestination(consumer, key);
+        if (destination == null) {
+            // A retransmitted SYN while the name is still resolving; the first one is opening the flow.
+            return;
+        }
+        if (destination.code() != null) {
+            refuse(consumer, key, destination.code(), nowMs);
+            emitSegment(consumer, PeerEgressSegment.buildReset(syn));
+            return;
+        }
         lock.lock();
-        Reservation reservation = reserve(consumer, key, nowMs);
+        Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
         if (reservation.code() != null) {
             lock.unlock();
             refuse(consumer, key, reservation.code(), nowMs);
@@ -431,7 +464,7 @@ final class PeerEgressRuntime {
         Socket socket = null;
         IOException failure = null;
         try {
-            socket = dialer.dial("tcp", Ipv4Cidr.format(key.remoteIp()), key.remotePort(), CONNECT_TIMEOUT_MS);
+            socket = dialer.dial("tcp", Ipv4Cidr.format(destination.address()), key.remotePort(), CONNECT_TIMEOUT_MS);
         } catch (IOException error) {
             failure = error;
         }
@@ -606,7 +639,17 @@ final class PeerEgressRuntime {
         lock.lock();
         PeerEgressFlowTable.Flow flow = flows.lookup(key);
         if (flow == null) {
-            Reservation reservation = reserve(consumer, key, nowMs);
+            lock.unlock();
+            Choice destination = resolveDestination(consumer, key);
+            if (destination == null) {
+                return;
+            }
+            if (destination.code() != null) {
+                refuse(consumer, key, destination.code(), nowMs);
+                return;
+            }
+            lock.lock();
+            Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
             if (reservation.code() != null) {
                 lock.unlock();
                 refuse(consumer, key, reservation.code(), nowMs);
@@ -624,7 +667,7 @@ final class PeerEgressRuntime {
             Socket socket = null;
             IOException failure = null;
             try {
-                socket = dialer.dial("udp", Ipv4Cidr.format(key.remoteIp()), key.remotePort(),
+                socket = dialer.dial("udp", Ipv4Cidr.format(destination.address()), key.remotePort(),
                         CONNECT_TIMEOUT_MS);
             } catch (IOException error) {
                 failure = error;
@@ -794,14 +837,35 @@ final class PeerEgressRuntime {
      * reservation already there, and must not dial again.
      */
     private Reservation reserve(long consumer, PeerEgressFlowTable.Key key, long nowMs) {
+        return reserveTo(consumer, key, key.remoteIp(), nowMs);
+    }
+
+    /**
+     * reserve for a flow whose socket goes to destination, which differs from the key's remote
+     * address only for a flow to a name: the key keeps the consumer's fake address, so replies come
+     * back from it, and the authorization is of the address actually dialled.
+     */
+    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, int destination, long nowMs) {
+        String code = authorizeTo(consumer, key, destination);
+        if (code != null) {
+            return new Reservation(null, code, false);
+        }
+        PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
+        return opened != null
+                ? new Reservation(opened, null, true)
+                : new Reservation(flows.lookup(key), null, false);
+    }
+
+    /** The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held. */
+    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, int destination) {
         if (closed || !enabled) {
-            return new Reservation(null, PeerEgressCodes.DISABLED, false);
+            return PeerEgressCodes.DISABLED;
         }
         boolean peerAllowed = peerAclAllows == null || peerAclAllows.test(consumer);
 
         PeerEgressRequest request = new PeerEgressRequest();
         request.setConsumerClientId(consumer);
-        request.setDestinationIp(Ipv4Cidr.format(key.remoteIp()));
+        request.setDestinationIp(Ipv4Cidr.format(destination));
         request.setDestinationPort(key.remotePort());
         request.setProtocol(key.protocolName());
         request.setActiveFlowsForConsumer(flows.countFor(consumer));
@@ -810,13 +874,91 @@ final class PeerEgressRuntime {
 
         PeerEgressAuthorization.Decision decision =
                 PeerEgressAuthorization.evaluate(request, policy, peerAllowed, context);
-        if (!decision.allowed()) {
-            return new Reservation(null, decision.code(), false);
+        return decision.allowed() ? null : decision.code();
+    }
+
+    /** Where a new flow goes: the address to dial, or the code that refuses it. */
+    record Choice(int address, String code) {
+    }
+
+    /**
+     * Picks the address a named flow is dialled to: the first resolved address the authorization
+     * allows. With none allowed, the first address's refusal is the answer, so the code the consumer
+     * sees is about the address it would have gone to. With nothing resolved, the name did not resolve.
+     */
+    static Choice chooseAddress(List<Integer> addresses, IntFunction<String> authorize) {
+        if (addresses == null || addresses.isEmpty()) {
+            return new Choice(0, PeerEgressCodes.NAME_UNRESOLVED);
         }
-        PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
-        return opened != null
-                ? new Reservation(opened, null, true)
-                : new Reservation(flows.lookup(key), null, false);
+        String first = null;
+        for (int address : addresses) {
+            String code = authorize.apply(address);
+            if (code == null) {
+                return new Choice(address, null);
+            }
+            if (first == null) {
+                first = code;
+            }
+        }
+        return new Choice(0, first);
+    }
+
+    /**
+     * Decides where a new flow's socket goes. Most flows go where the packet says. A flow to an
+     * address the consumer bound to a name goes to the first address the name resolves to that the
+     * policy allows: resolving here and dialling that address, with no second lookup, leaves no
+     * window between the check and the connect. Called with no lock held; the lookup can take a while.
+     *
+     * <p>Null for a second packet of a flow whose name is still resolving: the first one is opening it.
+     */
+    private Choice resolveDestination(long consumer, PeerEgressFlowTable.Key key) {
+        String name;
+        Function<String, List<Integer>> resolver;
+        lock.lock();
+        try {
+            name = names.lookup(consumer, key.remoteIp());
+            if (name == null) {
+                return new Choice(key.remoteIp(), null);
+            }
+            if (!resolving.add(key)) {
+                return null;
+            }
+            resolver = resolve;
+        } finally {
+            lock.unlock();
+        }
+        List<Integer> addresses;
+        try {
+            addresses = resolver.apply(name);
+        } catch (RuntimeException failed) {
+            addresses = List.of();
+        }
+        lock.lock();
+        try {
+            resolving.remove(key);
+            return chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * This device's own resolver: the egress resolves in its own network, which is the point of
+     * sending the name rather than an address. IPv4 only, in the order the resolver returned them.
+     */
+    static List<Integer> resolveName(String name) {
+        List<Integer> addresses = new ArrayList<>();
+        try {
+            for (InetAddress address : InetAddress.getAllByName(name)) {
+                if (address instanceof Inet4Address v4) {
+                    byte[] b = v4.getAddress();
+                    addresses.add(((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF));
+                }
+            }
+        } catch (java.net.UnknownHostException unresolved) {
+            return List.of();
+        }
+        return addresses;
     }
 
     /**

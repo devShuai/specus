@@ -30,6 +30,12 @@ public static class PeerEgressFrame
     public const string ControlFlowReject = "flow-reject";
     public const string ControlFlowPurge = "flow-purge";
 
+    /// <summary>
+    /// Phase two: a consumer binds one of its fake addresses to the name a flow to it should reach
+    /// (protocol/spec/peer-egress-dns.md).
+    /// </summary>
+    public const string ControlNameBind = "name-bind";
+
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("SPEG1");
     private const int Ipv4MinHeaderBytes = 20;
     private const int ProtocolTcp = 6;
@@ -182,8 +188,15 @@ public static class PeerEgressFrame
             {
                 return null;
             }
-            // Includes name-bind, which phase two defines. Refusing keeps a phase-one egress from
-            // looking like it honours domain rules it does not implement.
+            if (type == ControlNameBind)
+            {
+                // Both fields, both well formed: a binding the egress cannot resolve or dial is
+                // refused here rather than stored.
+                var root = document.RootElement;
+                return Ipv4Cidr.TryParseAddress(Text(root, "address"), out _) && PeerEgressNames.Valid(Text(root, "name"))
+                    ? null
+                    : PeerEgressCodes.FrameMalformedControl;
+            }
             return PeerEgressCodes.ControlUnsupported;
         }
     }
@@ -204,7 +217,9 @@ public static class PeerEgressFrame
         string DestinationIp,
         int DestinationPort,
         IReadOnlyList<string> Destinations,
-        string Code)
+        string Code,
+        string Address = "",
+        string Name = "")
     {
         /// <summary>A flow-reject: the reason one flow was refused, for the consumer to display.</summary>
         public static Control FlowReject(
@@ -216,6 +231,11 @@ public static class PeerEgressFrame
         public static Control FlowPurge(IReadOnlyList<string>? destinations, string code) =>
             new(ControlFlowPurge, string.Empty, string.Empty, 0, string.Empty, 0,
                 destinations ?? [], code);
+
+        /// <summary>A name-bind: the name a fake address stands for, normalised.</summary>
+        public static Control NameBind(string address, string name) =>
+            new(ControlNameBind, string.Empty, string.Empty, 0, string.Empty, 0, [], string.Empty,
+                address, PeerEgressNames.Normalize(name));
     }
 
     /// <summary>
@@ -250,6 +270,8 @@ public static class PeerEgressFrame
             text.Append(']');
         }
         AppendString(text, "code", control.Code, first: false);
+        AppendString(text, "address", control.Address, first: false);
+        AppendString(text, "name", control.Name, first: false);
         return Encoding.UTF8.GetBytes(text.Append('}').ToString());
     }
 
@@ -301,7 +323,8 @@ public static class PeerEgressFrame
             return new Control(
                 Text(root, "type"), Text(root, "protocol"), Text(root, "sourceIp"),
                 Number(root, "sourcePort"), Text(root, "destinationIp"),
-                Number(root, "destinationPort"), destinations, Text(root, "code"));
+                Number(root, "destinationPort"), destinations, Text(root, "code"),
+                Text(root, "address"), Text(root, "name"));
         }
         catch (JsonException)
         {

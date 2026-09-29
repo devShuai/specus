@@ -47,6 +47,13 @@ public static class PeerEgressCodes
     public const string FrameMalformedControl = "EGRESS_FRAME_MALFORMED_CONTROL";
     public const string ControlUnsupported = "EGRESS_CONTROL_UNSUPPORTED";
 
+    // Phase two, domain rules (protocol/spec/peer-egress-dns.md).
+    public const string NameUnresolved = "EGRESS_NAME_UNRESOLVED";
+    public const string NameUnsupported = "EGRESS_NAME_UNSUPPORTED";
+    public const string RuleFakeIpOverlap = "EGRESS_RULE_FAKE_IP_OVERLAP";
+    public const string FakeIpPoolInvalid = "EGRESS_FAKE_IP_POOL_INVALID";
+    public const string RuleEgressNoDomain = "EGRESS_RULE_EGRESS_NO_DOMAIN";
+
     /// <summary>
     /// Every code this build defines.
     /// </summary>
@@ -63,6 +70,7 @@ public static class PeerEgressCodes
         RuleMeshOverlap, RuleDefaultRoute, RulePortUnsupported, RuleDisabled, ConsumerDisabled,
         FrameBadMagic, FrameUnknownType, FrameReservedSet, FrameTruncated,
         FrameTrailingBytes, Ipv6Unsupported, FrameMalformedControl, ControlUnsupported,
+        NameUnresolved, NameUnsupported, RuleFakeIpOverlap, FakeIpPoolInvalid, RuleEgressNoDomain,
     };
 
     /// <summary>

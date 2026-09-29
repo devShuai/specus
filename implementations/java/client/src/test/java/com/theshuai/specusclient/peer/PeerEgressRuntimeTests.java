@@ -169,6 +169,11 @@ class PeerEgressRuntimeTests {
             return dialed.size();
         }
 
+        /** Every host:port dialled, in order. */
+        synchronized List<String> dialed() {
+            return List.copyOf(dialed);
+        }
+
         synchronized FakeSocket socket(int index) {
             if (index >= sockets.size()) {
                 fail("no socket at index " + index + ", only " + sockets.size() + " opened");
@@ -759,5 +764,105 @@ class PeerEgressRuntimeTests {
 
         harness.gate.countDown();
         first.join(2000);
+    }
+
+    private static void bindName(Harness harness, long consumer, String address, String name) {
+        harness.runtime.handleFrame(consumer, PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                PeerEgressFrame.encodeControl(PeerEgressFrame.Control.nameBind(address, name))), EPOCH);
+    }
+
+    private static java.util.function.Function<String, List<Integer>> resolvingTo(String... addresses) {
+        return name -> {
+            List<Integer> resolved = new ArrayList<>();
+            for (String text : addresses) {
+                resolved.add(address(text));
+            }
+            return resolved;
+        };
+    }
+
+    /**
+     * A flow to a bound address is dialled to what the name resolves to, and the flow keeps the
+     * fake address, so the replies come back from the address the consumer's application connected to.
+     */
+    @Test
+    void dialsTheResolvedAddressOfABoundName() {
+        Harness harness = new Harness();
+        harness.runtime.resolve = resolvingTo("127.0.0.1", "203.0.113.10");
+        bindName(harness, 7, "198.18.0.5", "example.com");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(List.of("203.0.113.10:443"), harness.dialed());
+        List<PeerEgressSegment.Segment> segments = harness.segments();
+        assertTrue(!segments.isEmpty() && segments.get(0).sourceIp() == address("198.18.0.5"),
+                "the SYN-ACK did not come from the fake address");
+    }
+
+    /**
+     * A name that resolves only to what the policy forbids is refused, which is where DNS rebinding
+     * is stopped: nothing is dialled.
+     */
+    @Test
+    void refusesANameThatResolvesToAForbiddenAddress() {
+        Harness harness = new Harness();
+        harness.runtime.resolve = resolvingTo("127.0.0.1");
+        bindName(harness, 7, "198.18.0.5", "rebind.example");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(0, harness.dialCount(), "a name resolving to loopback was dialled");
+        assertTrue(harness.sawReset(), "the refused flow was not reset");
+        assertEquals(List.of(PeerEgressCodes.FORBIDDEN_DESTINATION), harness.rejectCodes());
+    }
+
+    @Test
+    void refusesANameThatDoesNotResolve() {
+        Harness harness = new Harness();
+        harness.runtime.resolve = name -> {
+            throw new IllegalStateException("no such host");
+        };
+        bindName(harness, 7, "198.18.0.5", "nowhere.example");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(0, harness.dialCount(), "an unresolved name was dialled");
+        assertEquals(List.of(PeerEgressCodes.NAME_UNRESOLVED), harness.rejectCodes());
+    }
+
+    /**
+     * Bindings are per consumer: one consumer's name for an address says nothing about another's
+     * flows to the same address.
+     */
+    @Test
+    void keepsBindingsPerConsumer() {
+        Harness harness = new Harness();
+        harness.runtime.resolve = resolvingTo("203.0.113.10");
+        bindName(harness, 9, "198.18.0.5", "example.com");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(0, harness.dialCount(), "consumer 7's flow used consumer 9's binding");
+        assertTrue(harness.sawReset(), "the unbound fake address was not refused");
+    }
+
+    /** A UDP session to a bound address goes to the resolved address too. */
+    @Test
+    void carriesAUdpSessionToABoundName() {
+        Harness harness = new Harness();
+        harness.runtime.resolve = resolvingTo("203.0.113.53");
+        bindName(harness, 7, "198.18.0.9", "dns.example");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressDatagram.build(new PeerEgressDatagram.Datagram(
+                address("100.96.0.1"), address("198.18.0.9"), 50000, 53,
+                "query".getBytes(java.nio.charset.StandardCharsets.US_ASCII)))), EPOCH);
+
+        waitFor("the datagram to reach the socket",
+                () -> harness.dialCount() == 1 && !harness.socket(0).written().isEmpty());
+        assertEquals(List.of("203.0.113.53:53"), harness.dialed());
     }
 }

@@ -207,6 +207,115 @@
       "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
     }
   ],
+  "poolConfig": [
+    {
+      "name": "default",
+      "cidr": "198.18.0.0/15",
+      "code": null
+    },
+    {
+      "name": "narrowest",
+      "cidr": "198.18.5.0/24",
+      "code": null
+    },
+    {
+      "name": "widest",
+      "cidr": "10.0.0.0/8",
+      "code": null
+    },
+    {
+      "name": "too-narrow",
+      "cidr": "198.18.0.0/25",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "too-wide",
+      "cidr": "198.0.0.0/7",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "host-bits-set",
+      "cidr": "198.18.0.1/15",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "ipv6",
+      "cidr": "fd00::/64",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "overlaps-mesh",
+      "cidr": "100.96.0.0/16",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    },
+    {
+      "name": "not-a-cidr",
+      "cidr": "fake-ip",
+      "code": "EGRESS_FAKE_IP_POOL_INVALID"
+    }
+  ],
+  "egressCapability": [
+    {
+      "name": "domain-to-capable-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": true,
+      "code": null
+    },
+    {
+      "name": "domain-to-incapable-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "suffix-to-incapable-egress",
+      "rule": {
+        "match": "*.example.com",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    },
+    {
+      "name": "domain-block-needs-no-egress",
+      "rule": {
+        "match": "example.com",
+        "action": "block"
+      },
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "address-rule-to-incapable-egress",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "egressDomainTargetCapable": false,
+      "code": null
+    },
+    {
+      "name": "disabled-still-first",
+      "rule": {
+        "match": "example.com",
+        "action": "egress",
+        "egressClientId": 2,
+        "enabled": false
+      },
+      "egressDomainTargetCapable": false,
+      "code": "EGRESS_RULE_DISABLED"
+    }
+  ],
   "selection": [
     {
       "name": "exact-beats-suffix",
@@ -565,6 +674,20 @@
       "address": "198.18.0.6",
       "domain": "WWW.Example.com.",
       "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.6\",\"name\":\"www.example.com\"}"
+    }
+  ],
+  "nameBindAtEgress": [
+    {
+      "name": "capable-egress-binds",
+      "domainTargetCapable": true,
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.5\",\"name\":\"example.com\"}",
+      "code": null
+    },
+    {
+      "name": "incapable-egress-refuses",
+      "domainTargetCapable": false,
+      "json": "{\"type\":\"name-bind\",\"address\":\"198.18.0.5\",\"name\":\"example.com\"}",
+      "code": "EGRESS_NAME_UNSUPPORTED"
     }
   ],
   "egressChoice": [

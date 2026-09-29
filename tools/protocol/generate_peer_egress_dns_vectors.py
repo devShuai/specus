@@ -88,6 +88,36 @@ def validate_rule(rule, takeover, pool=DEFAULT_POOL, mesh=MESH_CIDR):
     return None
 
 
+def pool_problem(cidr, mesh=MESH_CIDR):
+    """None when `peerEgressFakeIpCidr` is usable: IPv4, host bits zero, /8 to /24, clear of the mesh.
+    Overlap with this device's own interface addresses is checked at startup and is not in a vector."""
+    try:
+        network = ipaddress.IPv4Network((cidr or "").strip())
+    except ValueError:
+        return "EGRESS_FAKE_IP_POOL_INVALID"
+    if not 8 <= network.prefixlen <= 24 or network.overlaps(ipaddress.IPv4Network(mesh)):
+        return "EGRESS_FAKE_IP_POOL_INVALID"
+    return None
+
+
+def rule_in_force(rule, takeover, egress_domain_capable):
+    """validate_rule, then the capability check: a domain rule sent to an egress that does not
+    announce domainTargetCapable is out of force rather than resolved locally."""
+    code = validate_rule(rule, takeover)
+    if code is not None:
+        return code
+    match = (rule.get("match") or "").strip()
+    if looks_like_domain(match) and rule["action"] == "egress" and not egress_domain_capable:
+        return "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    return None
+
+
+def name_bind_at_egress(domain_target_capable):
+    """What an egress that knows phase two answers a well-formed name-bind with. A phase-one build
+    does not know the type at all and answers EGRESS_CONTROL_UNSUPPORTED (peer-egress.md)."""
+    return None if domain_target_capable else "EGRESS_NAME_UNSUPPORTED"
+
+
 def domain_rank(match, qname):
     """None when the rule does not cover the name; otherwise a sort key, smaller wins:
     exact before suffix, and among suffixes the one with more labels."""
@@ -259,6 +289,31 @@ VALIDATION = [
     ("ipv6-still-refused", {"match": "2001:db8::/32", "action": "direct"}, True, "EGRESS_RULE_IPV6_UNSUPPORTED"),
 ]
 
+POOL_CONFIG = [
+    ("default", "198.18.0.0/15", None),
+    ("narrowest", "198.18.5.0/24", None),
+    ("widest", "10.0.0.0/8", None),
+    ("too-narrow", "198.18.0.0/25", "EGRESS_FAKE_IP_POOL_INVALID"),
+    ("too-wide", "198.0.0.0/7", "EGRESS_FAKE_IP_POOL_INVALID"),
+    ("host-bits-set", "198.18.0.1/15", "EGRESS_FAKE_IP_POOL_INVALID"),
+    ("ipv6", "fd00::/64", "EGRESS_FAKE_IP_POOL_INVALID"),
+    ("overlaps-mesh", "100.96.0.0/16", "EGRESS_FAKE_IP_POOL_INVALID"),
+    ("not-a-cidr", "fake-ip", "EGRESS_FAKE_IP_POOL_INVALID"),
+]
+
+EGRESS_CAPABILITY = [
+    ("domain-to-capable-egress", {"match": "example.com", "action": "egress", "egressClientId": 2}, True, None),
+    ("domain-to-incapable-egress", {"match": "example.com", "action": "egress", "egressClientId": 2}, False,
+     "EGRESS_RULE_EGRESS_NO_DOMAIN"),
+    ("suffix-to-incapable-egress", {"match": "*.example.com", "action": "egress", "egressClientId": 2}, False,
+     "EGRESS_RULE_EGRESS_NO_DOMAIN"),
+    ("domain-block-needs-no-egress", {"match": "example.com", "action": "block"}, False, None),
+    ("address-rule-to-incapable-egress", {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+     False, None),
+    ("disabled-still-first", {"match": "example.com", "action": "egress", "egressClientId": 2, "enabled": False},
+     False, "EGRESS_RULE_DISABLED"),
+]
+
 SELECTION = [
     ("exact-beats-suffix", "example.com", 0),
     ("suffix-covers-subdomain", "www.example.com", 1),
@@ -358,6 +413,16 @@ def build():
         produced = validate_rule(rule, takeover)
         assert produced == code, (name, produced, code)
         validation.append({"name": name, "rule": rule, "takeover": takeover, "code": code})
+    pool_config = []
+    for name, cidr, code in POOL_CONFIG:
+        produced = pool_problem(cidr)
+        assert produced == code, (name, produced, code)
+        pool_config.append({"name": name, "cidr": cidr, "code": code})
+    capability = []
+    for name, rule, capable, code in EGRESS_CAPABILITY:
+        produced = rule_in_force(rule, True, capable)
+        assert produced == code, (name, produced, code)
+        capability.append({"name": name, "rule": rule, "egressDomainTargetCapable": capable, "code": code})
     selection = []
     for name, qname, index in SELECTION:
         produced = select_domain_rule(rules, qname)
@@ -401,6 +466,12 @@ def build():
          "json": encode_name_bind("198.18.0.6", "WWW.Example.com.")},
     ]
     assert name_bind[1]["json"] == '{"type":"name-bind","address":"198.18.0.6","name":"www.example.com"}'
+    bind_at_egress = [
+        {"name": "capable-egress-binds", "domainTargetCapable": True,
+         "json": encode_name_bind("198.18.0.5", "example.com"), "code": name_bind_at_egress(True)},
+        {"name": "incapable-egress-refuses", "domainTargetCapable": False,
+         "json": encode_name_bind("198.18.0.5", "example.com"), "code": name_bind_at_egress(False)},
+    ]
     choices = []
     for name, a_records, aaaa_records, capable, decisions in EGRESS_CHOICES:
         choices.append({"name": name, "a": a_records, "aaaa": aaaa_records, "ipv6TargetCapable": capable,
@@ -414,10 +485,13 @@ def build():
         "quarantineSeconds": QUARANTINE,
         "rules": rules,
         "validation": validation,
+        "poolConfig": pool_config,
+        "egressCapability": capability,
         "selection": selection,
         "answers": answers,
         "pool": pool,
         "nameBind": name_bind,
+        "nameBindAtEgress": bind_at_egress,
         "egressChoice": choices,
     }
 
