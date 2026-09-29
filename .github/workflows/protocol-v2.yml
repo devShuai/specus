@@ -119,12 +119,14 @@ jobs:
           go-version-file: implementations/go/server/go.mod
           cache-dependency-path: implementations/go/server/go.sum
 
-      # The management SPA the server embeds is built from apps/admin-web and is not committed. No
-      # test here opens it, and a placeholder satisfies the embed directive without the npm build.
+      # The management SPA the server embeds is built from apps/admin-web and is not committed. A
+      # placeholder satisfies the embed directive without the npm build. The favicon is the one real
+      # file in it, because the static cache-header test fetches it from the embedded tree.
       - name: Create placeholder web assets for go:embed
         run: |
           mkdir -p implementations/go/server/web/static
           printf '<!doctype html><title>ci-placeholder</title>\n' > implementations/go/server/web/static/index.html
+          cp apps/admin-web/public/favicon.svg implementations/go/server/web/static/favicon.svg
 
       # The whole suite. Only the cluster tests above ran before, which is how the server's rule
       # engine drifted from the shared rules vector without a single failing check to say so.
