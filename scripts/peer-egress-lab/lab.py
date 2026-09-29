@@ -428,6 +428,8 @@ class Lab:
         }
         if rules is not None:
             config["peerEgressRules"] = rules
+            # Rules are only saved until the master switch is on (#49).
+            config["peerEgressEnabled"] = True
         path = self.work / f"{role}.jsonc"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path
@@ -643,9 +645,21 @@ class Lab:
                     problems.append(f"unexpected host route over the tunnel: {line}")
         self.check("route table holds the exact prefix, the bypass /32 and mesh host routes only; no default",
                    not problems, "; ".join(problems) if problems else "\n".join(self.lab_routes(table)))
-        status = self.client_status("consumer")
-        if status:
+        # Every runtime says which path carries each egress peer's traffic and how many flows it has;
+        # a lab consumer that just reached its egress is on one path or the other. The state file is
+        # refreshed on the process's own period, so it is read until it lists the peer.
+        def egress_peers():
+            status = self.client_status("consumer")
+            if not status:
+                return None
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
+            return [peer for instance in status.get("data", {}).get("instances", [])
+                    for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])] or None
+        peers, _ = self.wait_for("the consumer status to list its egress peer", egress_peers, 30, 1.0)
+        self.check("status names the path to the egress and its flow count",
+                   bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
+                                       for peer in peers),
+                   json.dumps(peers))
 
         # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
         # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
@@ -977,6 +991,21 @@ class Lab:
             self.check(title, growth <= GATE_MEMORY_GROWTH_MIB,
                        f"resident set {baseline[role] / 1024:.0f} MiB before, peak {peak[role] / 1024:.0f} MiB")
         self.leak_check("performance gate: no local leak under concurrency", mark)
+
+        # The same set again at once. The flows just finished linger in TIME_WAIT for ten seconds,
+        # and while they counted against maxFlowsPerConsumer (#88) the second set was refused until
+        # they expired: every flow completed, eleven seconds late.
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=flows) as pool:
+            results = list(pool.map(lambda _: self.verified_download(size, 90), range(flows)))
+        elapsed = time.monotonic() - started
+        intact = sum(1 for ok, _ in results if ok)
+        aggregate = flows * size / elapsed / 1048576
+        self.measure(f"gate: {flows} concurrent flows again at once, aggregate", round(aggregate, 2), "MiB/s")
+        self.check(f"performance gate: {flows} concurrent flows again at once, all intact, "
+                   f"aggregate >= {GATE_CONCURRENT_MIBPS:g} MiB/s (finished flows do not hold the limit)",
+                   intact == flows and aggregate >= GATE_CONCURRENT_MIBPS,
+                   f"{intact}/{flows} intact, {aggregate:.2f} MiB/s in {elapsed:.2f} s")
 
     # -- fault injection --------------------------------------------------------------------------
 

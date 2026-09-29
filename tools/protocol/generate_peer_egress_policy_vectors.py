@@ -30,6 +30,10 @@ RULES = [
     {"index": 6, "match": "192.0.2.128/25", "action": "block", "port": 443},
     {"index": 7, "match": "172.16.0.0/16", "action": "egress", "egressClientId": 3},
     {"index": 8, "match": "172.16.5.0/24", "action": "egress", "egressClientId": 0},
+    # Switched off by the user rather than refused. Kept in the list, and with a prefix that beats
+    # rule 2 for half its range, so a matcher that ignored `enabled` would send those addresses to
+    # the block instead of the egress.
+    {"index": 9, "match": "198.51.100.0/25", "action": "block", "enabled": False},
 ]
 
 MESH_NETWORK = ipaddress.IPv4Network("100.96.0.0/11")
@@ -42,6 +46,8 @@ REFUSED_RULES = [
      "reason": "携带端口维度；消费端按路由分流，路由选不了端口"},
     {"index": 8, "code": "EGRESS_RULE_MISSING_TARGET",
      "reason": "egressClientId 为 0，不是有效标识"},
+    {"index": 9, "code": "EGRESS_RULE_DISABLED",
+     "reason": "用户停用；停用的规则留在列表里，不参与匹配、不安装路由"},
 ]
 
 
@@ -51,6 +57,9 @@ def validate_rule(rule):
     Here so the codes in CONFIG_REJECT are checked against a reference rather than only
     against each other, and so match_rule can skip what it refuses.
     """
+    # Only an explicit false switches a rule off; an absent field is the rule as written.
+    if rule.get("enabled") is False:
+        return "EGRESS_RULE_DISABLED"
     match = (rule.get("match") or "").strip()
     if not match:
         return "EGRESS_RULE_MALFORMED"
@@ -123,6 +132,8 @@ RULE_CASES = [
      "覆盖它的 /25 因携带端口被拒，落回 /24；被拒的规则若仍参与匹配，运维看到「已拒绝」的规则依然在改变流量走向"),
     ("refused-target-does-not-steer-traffic", "172.16.5.10",
      "更长的 /24 因 egressClientId 为 0 被拒，落回 /16"),
+    ("disabled-rule-does-not-steer-traffic", "198.51.100.20",
+     "覆盖它的 /25 已被用户停用，落回 /24 的 egress；停用与被拒一样不参与匹配"),
 ]
 
 rule_cases = []
@@ -192,6 +203,12 @@ CONFIG_REJECT = [
     {"name": "zero-egress-client-id", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 0},
      "code": "EGRESS_RULE_MISSING_TARGET",
      "reason": "0 是本项目里「没有消费端」的哨兵值。接受它等于让规则过校验、路由照常安装，然后每个包都找不到出口对端——配置期能报出的错被推迟成运行期的黑洞"},
+    {"name": "disabled-rule", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2, "enabled": False},
+     "code": "EGRESS_RULE_DISABLED",
+     "reason": "用户停用的规则。留在配置里，不参与匹配、不安装路由；状态里以 inForce=false 列出"},
+    {"name": "disabled-outranks-everything", "rule": {"match": "example.com", "action": "forward", "enabled": False},
+     "code": "EGRESS_RULE_DISABLED",
+     "reason": "停用是用户的明确选择，排在所有内容检查之前：一条停用的规则不必先修好才能留在列表里"},
     {"name": "negative-egress-client-id", "rule": {"match": "203.0.113.0/24", "action": "egress", "egressClientId": -1},
      "code": "EGRESS_RULE_MISSING_TARGET",
      "reason": "同上：标识必须是正整数，字段在场不等于字段有效"},
@@ -207,6 +224,23 @@ expected_refusals = {entry["index"]: entry["code"] for entry in REFUSED_RULES}
 for rule in RULES:
     assert validate_rule(rule) == expected_refusals.get(rule["index"]), f"rule {rule['index']}"
 
+# The consumer's master switch. Off, nothing is in force and nothing matches, whatever the rules
+# say; each rule still reports why it is not in force, with a rule's own switch taking precedence
+# because that is the more specific statement. Clients read this section; servers have no switch.
+CONSUMER_DISABLED = {
+    "description": "peerEgressEnabled=false：规则只保存不接管。每条规则 inForce=false，错误码 EGRESS_CONSUMER_DISABLED；本身停用的规则仍报 EGRESS_RULE_DISABLED。任何目的地址都不命中规则，按未匹配处理——没有安装路由的目标本来就不进 TUN。",
+    "ruleCodes": [
+        {"index": rule["index"],
+         "code": "EGRESS_RULE_DISABLED" if rule.get("enabled") is False else "EGRESS_CONSUMER_DISABLED"}
+        for rule in RULES
+    ],
+    "cases": [
+        {"destination": destination,
+         "expect": {"action": "direct", "matchedRuleIndex": None, "reason": "default"}}
+        for _, destination, _ in RULE_CASES
+    ],
+}
+
 rules_vector = {
     "name": "peer-egress-rules-v1",
     "version": 1,
@@ -218,12 +252,14 @@ rules_vector = {
         "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。",
         "校验失败的规则不参与匹配，实现必须在匹配前跳过它们。否则一条被拒的长前缀规则仍会压过合法的短前缀规则，运维读到的「已拒绝」与流量实际走向不符。",
         "egressClientId 必须是正整数：缺失、0 与负数都返回 EGRESS_RULE_MISSING_TARGET。字段在场不等于字段有效。",
+        "enabled 缺省为 true；显式 false 的规则返回 EGRESS_RULE_DISABLED，排在所有校验之前。它与被拒的规则一样不参与匹配、不安装路由，但它是用户的选择而不是配置错误，config validate 不为它告警。",
     ],
     "meshCidr": "100.96.0.0/11",
     "rules": RULES,
     "refusedRules": REFUSED_RULES,
     "cases": rule_cases,
     "configValidation": CONFIG_REJECT,
+    "consumerDisabled": CONSUMER_DISABLED,
 }
 
 # --------------------------------------------------------------------------

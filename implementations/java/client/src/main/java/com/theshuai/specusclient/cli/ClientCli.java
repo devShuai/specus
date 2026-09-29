@@ -24,6 +24,14 @@ public final class ClientCli {
                    java -jar specus-client-exec.jar status|peers|services|egress --config PATH [--json]
                    java -jar specus-client-exec.jar doctor --config PATH [--probe] [--json]
                    java -jar specus-client-exec.jar ui --config PATH [--no-open] [--port PORT]
+                   java -jar specus-client-exec.jar egress rules --config PATH [--json]
+                   java -jar specus-client-exec.jar egress rule add --config PATH --match CIDR --action egress|direct|block
+                                 [--egress-client-id ID] [--at INDEX] [--disabled] [--json]
+                   java -jar specus-client-exec.jar egress rule remove|enable|disable --config PATH --index INDEX [--json]
+                   java -jar specus-client-exec.jar egress rule move --config PATH --index INDEX --to INDEX [--json]
+                   java -jar specus-client-exec.jar egress enable --config PATH [--yes] [--json]
+                   java -jar specus-client-exec.jar egress disable --config PATH [--json]
+                   java -jar specus-client-exec.jar egress test ADDRESS --config PATH [--connect PORT] [--json]
 
             Options:
               -h, --help            Show help without loading configuration or connecting
@@ -41,6 +49,12 @@ public final class ClientCli {
             which routes were installed, and which were refused because something already owned
             the prefix.
 
+            The egress rules/rule/enable/disable commands edit the configuration file and never a
+            running client, which applies the change after a restart. Saving rules and taking over
+            traffic are separate: rules take nothing over until egress enable. egress test previews
+            what the rules decide for an IPv4 address; only --connect PORT makes a connection, and
+            that shows reachability, not the path taken.
+
             Example:
               java -jar specus-client-exec.jar --config "/path with spaces/client.jsonc"
 
@@ -51,7 +65,23 @@ public final class ClientCli {
 
     public record Options(Path config, String command, boolean help, boolean version,
                           boolean noUpdate, boolean debug, int loginTimeoutSeconds, boolean json, boolean probe,
-                          boolean noOpen, int uiPort) { }
+                          boolean noOpen, int uiPort, EgressOptions egress) { }
+
+    /** The egress editing commands' flags; -1 marks an index that was not given. */
+    public record EgressOptions(String address, String match, String action, long egressClientId,
+                                int at, int index, int to, boolean disabled, boolean yes, int connect) { }
+
+    /** Each editing flag belongs to the commands it means something to. */
+    private static final java.util.Map<String, java.util.Set<String>> EGRESS_FLAGS = java.util.Map.of(
+            "egress rule add", java.util.Set.of("match", "action", "egress-client-id", "at", "disabled"),
+            "egress rule remove", java.util.Set.of("index"),
+            "egress rule enable", java.util.Set.of("index"),
+            "egress rule disable", java.util.Set.of("index"),
+            "egress rule move", java.util.Set.of("index", "to"),
+            "egress enable", java.util.Set.of("yes"),
+            "egress test", java.util.Set.of("connect"));
+    private static final java.util.List<String> EGRESS_FLAG_ORDER = java.util.List.of(
+            "match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect");
 
     public static Options parse(String[] args) {
         Path config = Path.of("client.jsonc");
@@ -61,8 +91,31 @@ public final class ClientCli {
         boolean json = false, probe = false;
         boolean noOpen = false, portSet = false;
         int uiPort = 0;
+        String egressAddress = "", egressMatch = "", egressAction = "";
+        long egressClientId = 0;
+        int egressAt = -1, egressIndex = -1, egressTo = -1, egressConnect = 0;
+        boolean egressDisabled = false, egressYes = false;
+        var given = new java.util.HashSet<String>();
         int i = 0;
         if (args.length > 0 && "run".equals(args[0])) i++;
+        else if (args.length > 1 && "egress".equals(args[0]) && !args[1].startsWith("-")) {
+            // The words after "egress" that name an editing command. The plain egress command,
+            // which reports a running client's state, is what is left when none of them follows.
+            switch (args[1]) {
+                case "rules", "enable", "disable" -> { command = "egress " + args[1]; i = 2; }
+                case "test" -> {
+                    if (args.length < 3 || args[2].startsWith("-"))
+                        throw new IllegalArgumentException("expected: egress test ADDRESS --config PATH");
+                    command = "egress test"; egressAddress = args[2]; i = 3;
+                }
+                case "rule" -> {
+                    if (args.length < 3 || !java.util.Set.of("add", "remove", "move", "enable", "disable").contains(args[2]))
+                        throw new IllegalArgumentException("expected: egress rule add|remove|move|enable|disable --config PATH");
+                    command = "egress rule " + args[2]; i = 3;
+                }
+                default -> throw new IllegalArgumentException("unknown egress command; see --help");
+            }
+        }
         else if (args.length > 0 && "config".equals(args[0])) {
             if (args.length < 2 || !("validate".equals(args[1]) || "show".equals(args[1])))
                 throw new IllegalArgumentException("Expected: config validate|show --config PATH");
@@ -82,6 +135,22 @@ public final class ClientCli {
                 case "--port" -> {
                     if (++i >= args.length) throw new IllegalArgumentException("--port requires 0..65535");
                     uiPort = port(args[i]); portSet = true;
+                }
+                case "--disabled" -> { egressDisabled = true; given.add("disabled"); }
+                case "--yes" -> { egressYes = true; given.add("yes"); }
+                case "--match", "--action", "--egress-client-id", "--at", "--index", "--to", "--connect" -> {
+                    String name = arg.substring(2);
+                    if (++i >= args.length) throw new IllegalArgumentException(arg + " requires a value");
+                    given.add(name);
+                    switch (name) {
+                        case "match" -> egressMatch = args[i];
+                        case "action" -> egressAction = args[i];
+                        case "egress-client-id" -> egressClientId = integer(arg, args[i]);
+                        case "at" -> egressAt = (int) integer(arg, args[i]);
+                        case "index" -> egressIndex = (int) integer(arg, args[i]);
+                        case "to" -> egressTo = (int) integer(arg, args[i]);
+                        default -> egressConnect = (int) integer(arg, args[i]);
+                    }
                 }
                 case "--no-update", "--no-update-check" -> noUpdate = true;
                 case "--login-timeout" -> {
@@ -104,7 +173,46 @@ public final class ClientCli {
         if ((noOpen || portSet) && !command.equals("ui")) throw new IllegalArgumentException("--no-open/--port are only valid for ui");
         if (command.equals("ui") && (json || debug || noUpdate) && !help && !version) throw new IllegalArgumentException("ui does not accept --json/--debug/update options");
         if (json && command.equals("run") && !help && !version) throw new IllegalArgumentException("--json is for help/version/config/status/doctor/peers/services/egress; use status --json to observe a running client");
-        return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe, noOpen, uiPort);
+        var egress = new EgressOptions(egressAddress, egressMatch, egressAction, egressClientId,
+                egressAt, egressIndex, egressTo, egressDisabled, egressYes, egressConnect);
+        checkEgressFlags(command, egress, given);
+        return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe, noOpen, uiPort, egress);
+    }
+
+    /**
+     * Keeps each editing flag to the command it means something to, and each command to the flags
+     * it needs, before anything reads the configuration.
+     */
+    private static void checkEgressFlags(String command, EgressOptions egress, java.util.Set<String> given) {
+        for (String name : EGRESS_FLAG_ORDER) {
+            if (given.contains(name) && !EGRESS_FLAGS.getOrDefault(command, java.util.Set.of()).contains(name))
+                throw new IllegalArgumentException("--" + name + " is not valid for " + command + "; see --help");
+        }
+        switch (command) {
+            case "egress rule add" -> {
+                if (egress.match().isBlank() || egress.action().isBlank())
+                    throw new IllegalArgumentException("egress rule add requires --match and --action");
+            }
+            case "egress rule remove", "egress rule enable", "egress rule disable" -> {
+                if (!given.contains("index") || egress.index() < 0)
+                    throw new IllegalArgumentException(command + " requires --index INDEX (0 or more)");
+            }
+            case "egress rule move" -> {
+                if (!given.contains("index") || !given.contains("to") || egress.index() < 0 || egress.to() < 0)
+                    throw new IllegalArgumentException("egress rule move requires --index INDEX and --to INDEX (0 or more)");
+            }
+            case "egress test" -> {
+                if (given.contains("connect") && (egress.connect() < 1 || egress.connect() > 65535))
+                    throw new IllegalArgumentException("--connect requires a port (1..65535)");
+            }
+            default -> { }
+        }
+        if (given.contains("at") && egress.at() < 0) throw new IllegalArgumentException("--at requires an index (0 or more)");
+    }
+
+    private static long integer(String flag, String value) {
+        try { return Long.parseLong(value.trim()); }
+        catch (NumberFormatException error) { throw new IllegalArgumentException(flag + " requires an integer"); }
     }
 
     private static int port(String value) {

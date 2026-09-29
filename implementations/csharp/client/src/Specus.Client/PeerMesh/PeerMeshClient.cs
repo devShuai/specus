@@ -294,6 +294,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
 
+        public bool ConsumerEnabled => owner._config.PeerEgressEnabled;
+
         public IReadOnlyDictionary<long, bool> EgressAvailability
         {
             get
@@ -302,6 +304,27 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 {
                     return owner.EgressAvailabilityLocked(DateTimeOffset.UtcNow);
                 }
+            }
+        }
+
+        // Read the way SendEncryptedPayloadAsync chooses: a nominated relay first, then the direct
+        // endpoint; a peer with neither has no entry.
+        public IReadOnlyDictionary<long, string> EgressPaths
+        {
+            get
+            {
+                var paths = new Dictionary<long, string>();
+                var now = DateTimeOffset.UtcNow;
+                lock (owner._sync)
+                {
+                    foreach (var (peerId, session) in owner._sessions)
+                    {
+                        if (now > session.ExpiresAt) continue;
+                        if (!string.IsNullOrWhiteSpace(session.RelayTargetAllocationId)) paths[peerId] = PeerEgressStatus.PathRelay;
+                        else if (session.RemoteEndpoint is not null) paths[peerId] = PeerEgressStatus.PathDirect;
+                    }
+                }
+                return paths;
             }
         }
 

@@ -25,11 +25,12 @@ const (
 
 var peerEgressMagic = [5]byte{'S', 'P', 'E', 'G', '1'}
 
-// Control message types this version understands. name-bind is reserved for phase two domain
-// routing and must be refused now rather than silently treated as implemented.
+// Control message types this version understands. name-bind is phase two's: a consumer binds a
+// fake address to the name a flow to it should reach (protocol/spec/peer-egress-dns.md).
 const (
 	peerEgressControlFlowReject = "flow-reject"
 	peerEgressControlFlowPurge  = "flow-purge"
+	peerEgressControlNameBind   = "name-bind"
 )
 
 type peerEgressFrame struct {
@@ -57,6 +58,9 @@ type peerEgressControl struct {
 	DestinationPort int      `json:"destinationPort,omitempty"`
 	Destinations    []string `json:"destinations,omitempty"`
 	Code            string   `json:"code,omitempty"`
+	// name-bind: the fake address and the name it stands for, in this order on the wire.
+	Address string `json:"address,omitempty"`
+	Name    string `json:"name,omitempty"`
 }
 
 // looksLikePeerEgressFrame reports whether a decrypted payload carries the SPEG1 magic.
@@ -148,9 +152,14 @@ func validatePeerEgressControlBody(body []byte) string {
 	switch control.Type {
 	case peerEgressControlFlowReject, peerEgressControlFlowPurge:
 		return ""
+	case peerEgressControlNameBind:
+		// Both fields, both well formed: a binding the egress cannot resolve or dial is refused here
+		// rather than stored.
+		if _, ok := parseEgressAddress(control.Address); !ok || !validEgressName(control.Name) {
+			return egressCodeFrameMalformedControl
+		}
+		return ""
 	default:
-		// Includes name-bind, which phase two defines. Refusing keeps a phase-one egress from
-		// looking like it honours domain rules it does not implement.
 		return egressCodeControlUnsupported
 	}
 }
