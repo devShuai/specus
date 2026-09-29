@@ -910,7 +910,8 @@ class Lab:
                     rates.append(size / got["total"] / 1048576)
             self.gate_median(name, rates, intact, GATE_SINGLE_FLOW_MIBPS)
 
-        self.gate_concurrency()
+        for _ in range(4):
+            self.gate_concurrency()
 
         with self.lossy_link(GATE_LOSS_PERCENT) as available:
             title = (f"performance gate: {self.human(GATE_LOSSY_BYTES)} with {GATE_LOSS_PERCENT:g}% loss each way "

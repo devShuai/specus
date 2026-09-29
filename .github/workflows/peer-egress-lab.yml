@@ -47,8 +47,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        consumer: [Go, Java, .NET]
-        egress: [Go, Java, .NET]
+        consumer: [Go, Java]
+        egress: [Java]
     env:
       USES_JAVA: ${{ matrix.consumer == 'Java' || matrix.egress == 'Java' }}
       USES_DOTNET: ${{ matrix.consumer == '.NET' || matrix.egress == '.NET' }}
@@ -100,7 +100,7 @@ jobs:
           ln -s "$RUNNER_TEMP/specus-client" "$RUNNER_TEMP/clients/Go"
           if [ "$USES_JAVA" = true ]; then
             jar="$GITHUB_WORKSPACE/implementations/java/client/target/specus-client-exec.jar"
-            printf '#!/bin/sh\nexec %s -jar %s "$@"\n' "$(command -v java)" "$jar" > "$RUNNER_TEMP/clients/Java"
+            printf '#!/bin/sh\nexec %s -Xlog:gc:file=/tmp/gc-%%p.log:time,uptime -jar %s "$@"\n' "$(command -v java)" "$jar" > "$RUNNER_TEMP/clients/Java"
             chmod +x "$RUNNER_TEMP/clients/Java"
           fi
           if [ "$USES_DOTNET" = true ]; then
@@ -126,6 +126,11 @@ jobs:
             --switch-off-repetitions 3 \
             --performance-gate
 
+      - name: GC logs
+        if: always()
+        run: |
+          sudo sh -c 'cp /tmp/gc-*.log "$RUNNER_TEMP/lab/" 2>/dev/null; chmod a+r "$RUNNER_TEMP"/lab/gc-*.log 2>/dev/null' || true
+          ls -la "$RUNNER_TEMP/lab" | grep gc || true
       - name: Report
         if: always()
         run: |
