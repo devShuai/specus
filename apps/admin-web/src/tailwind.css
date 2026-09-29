@@ -202,10 +202,11 @@
     opacity: revert;
   }
 
-  /* Table cells kept the browser's 1px padding; Tailwind 4 zeroes padding on every element. */
+  /* Table cells and options kept the browser's padding; Tailwind 4 zeroes padding on every element. */
   td,
-  th {
-    padding: 1px;
+  th,
+  option {
+    padding: revert;
   }
 
   /* Date and time fields kept the browser's own inner layout, which Tailwind 4 now normalizes. */

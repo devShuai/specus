@@ -2054,6 +2054,21 @@ body {
   box-shadow: none !important;
 }
 
+/* HeroUI 2.8 styles keyboard focus with outline-solid, another class Tailwind 3 never generated, so
+ * its fields, tabs and list items showed the browser's own focus ring. Keep that ring; the width,
+ * color and offset still come from HeroUI's focus classes and the rules here, as before. Inline
+ * `outline: none` (react-aria puts it on focusable overlays) still wins, as it did then. */
+.outline-solid:focus-visible,
+.focus-visible\:outline-solid:focus-visible {
+  outline-style: auto;
+}
+
+/* The input slot's !outline-solid is important. :where() leaves the dark-theme input rules near
+ * the top of this file, which remove the outline altogether, in charge. */
+:where(.\!outline-solid):focus-visible {
+  outline-style: auto !important;
+}
+
 /* HeroUI 2.8 gives fields, selects, tab lists and pagination shadow-xs, a class Tailwind 3 never
  * generated, so those slots have always rendered flat here, including in portaled modals. */
 :where([data-slot]).shadow-xs,
@@ -2202,6 +2217,9 @@ body {
 .app-apple-dashboard :where(button, a).transform-gpu[class~="bg-primary"][class~="text-primary-foreground"]:hover,
 .app-apple-dashboard :where(button, a).transform-gpu[class~="bg-primary"][class~="text-primary-foreground"][data-hover="true"] {
   transform: translateY(-1px);
+  /* As in the pressed rule below: this transform replaced HeroUI's scales before they became a
+   * separate property. */
+  scale: none;
   filter: brightness(0.96);
 }
 
