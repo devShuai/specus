@@ -95,3 +95,8 @@ jobs:
           python scripts/test-cli-ui.py --name dotnet -- dotnet $dll
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test-cli-matrix.py --name dotnet -- dotnet $dll
+      - name: Test the Windows desktop window
+        if: matrix.runtime == 'dotnet' && runner.os == 'Windows'
+        # Lays the real window out in both themes and two sizes, including the egress page with rules
+        # it has to tell apart, and a running client's status with each kind of problem in it.
+        run: dotnet test implementations/csharp/client/tests/Specus.Client.Desktop.Tests/Specus.Client.Desktop.Tests.csproj -c Release -v minimal

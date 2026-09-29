@@ -1,4 +1,5 @@
 using Specus.Client.Configuration;
+using Specus.Protocol.PeerEgress;
 
 namespace Specus.Client.Desktop;
 
@@ -16,8 +17,15 @@ internal sealed class DesktopClientSettings
         SpecusClientConfig.DefaultUpdateCheckIntervalHours;
     public bool AutoUpdate { get; set; }
 
+    /// <summary>The consumer's takeover switch; rules are only saved while it is off.</summary>
+    public bool PeerEgressEnabled { get; set; }
+
+    /// <summary>The split-routing rules, in the order they are matched.</summary>
+    public List<PeerEgressRule> PeerEgressRules { get; set; } = [];
+
     public DesktopClientSettings Normalize()
     {
+        PeerEgressRules ??= [];
         UpdateCheckIntervalHours = UpdateCheckIntervalHours <= 0
             ? SpecusClientConfig.DefaultUpdateCheckIntervalHours
             : Math.Clamp(UpdateCheckIntervalHours, SpecusClientConfig.MinUpdateCheckIntervalHours,

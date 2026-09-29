@@ -586,6 +586,231 @@
                         </Border>
                     </Grid>
                 </TabItem>
+                <TabItem x:Name="EgressTab" Header="出口分流">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel>
+                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="系统接管" Style="{StaticResource SectionLabelTextStyle}" />
+                                            <TextBlock x:Name="EgressTakeoverStateText"
+                                                       Text="已关闭"
+                                                       Margin="8,0,0,0"
+                                                       FontWeight="Bold" />
+                                        </StackPanel>
+                                        <TextBlock x:Name="EgressTakeoverDetailText"
+                                                   Margin="0,4,0,0"
+                                                   TextWrapping="Wrap"
+                                                   Style="{StaticResource CaptionTextStyle}" />
+                                    </StackPanel>
+                                    <Button x:Name="EgressTakeoverButton"
+                                            Grid.Column="1"
+                                            Content="开启接管"
+                                            Margin="12,0,0,0"
+                                            Padding="14,4"
+                                            VerticalAlignment="Center"
+                                            Style="{StaticResource SecondaryButtonStyle}"
+                                            Click="EgressTakeoverButton_Click" />
+                                </Grid>
+                            </Border>
+
+                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                                <StackPanel>
+                                    <TextBlock Text="添加规则" Style="{StaticResource SectionLabelTextStyle}" />
+                                    <Grid Margin="0,6,0,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="116" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="EgressMatchBox"
+                                                 Grid.ColumnSpan="3"
+                                                 Margin="0,0,0,6"
+                                                 ToolTip="IPv4 地址或网段，例如 203.0.113.0/24"
+                                                 AutomationProperties.Name="规则目标" />
+                                        <ComboBox x:Name="EgressActionBox"
+                                                  Grid.Row="1"
+                                                  Margin="0,0,8,0"
+                                                  SelectedIndex="0"
+                                                  AutomationProperties.Name="规则动作"
+                                                  SelectionChanged="EgressActionBox_SelectionChanged">
+                                            <ComboBoxItem Content="经出口设备" Tag="egress" />
+                                            <ComboBoxItem Content="本地直连" Tag="direct" />
+                                            <ComboBoxItem Content="阻断" Tag="block" />
+                                        </ComboBox>
+                                        <ComboBox x:Name="EgressTargetBox"
+                                                  Grid.Row="1"
+                                                  Grid.Column="1"
+                                                  Margin="0,0,8,0"
+                                                  IsEditable="True"
+                                                  ItemsSource="{Binding PeerRoutes}"
+                                                  DisplayMemberPath="ClientName"
+                                                  ToolTip="出口设备：从在线设备中选择，或填写设备 ID"
+                                                  AutomationProperties.Name="出口设备" />
+                                        <Button x:Name="EgressAddButton"
+                                                Grid.Row="1"
+                                                Grid.Column="2"
+                                                Content="添加"
+                                                Padding="16,4"
+                                                Style="{StaticResource PrimaryButtonStyle}"
+                                                Click="EgressAddButton_Click" />
+                                    </Grid>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <CheckBox x:Name="EgressAddFirstBox" Content="放在最前（优先匹配）" Margin="0,0,16,0" />
+                                        <CheckBox x:Name="EgressAddDisabledBox" Content="先停用" />
+                                    </StackPanel>
+                                    <TextBlock Margin="0,6,0,0"
+                                               TextWrapping="Wrap"
+                                               Style="{StaticResource CaptionTextStyle}"
+                                               Text="规则只匹配 IPv4 地址和网段，按列表顺序取第一条命中的；域名规则需二期的 DNS 接管，目前不会生效。应用自带 DoH/DoT、使用系统缓存或直接写死 IP 时，域名规则不会命中。" />
+                                    <TextBlock x:Name="EgressNoticeText"
+                                               Margin="0,6,0,0"
+                                               TextWrapping="Wrap"
+                                               Visibility="Collapsed" />
+                                </StackPanel>
+                            </Border>
+
+                            <Border Style="{StaticResource TableShellStyle}" Margin="0,0,0,8" MaxHeight="260">
+                                <DataGrid x:Name="EgressRuleGrid"
+                                          AlternationCount="2"
+                                          MinHeight="84"
+                                          ItemsSource="{Binding EgressRules}">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="44" />
+                                        <DataGridTemplateColumn Header="目标" SortMemberPath="Match" Width="2*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding Match, Mode=OneWay}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTextColumn Header="去向" Binding="{Binding Target}" Width="2*" />
+                                        <DataGridTemplateColumn Header="状态" Width="3*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding State}"
+                                                               ToolTip="{Binding StateTip}"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               VerticalAlignment="Center" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="操作" Width="228">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Button Content="{Binding ToggleLabel}" Padding="8,2" Margin="0,0,4,0"
+                                                                Tag="{Binding}" Click="EgressToggleRule_Click" />
+                                                        <Button Content="上移" Padding="8,2" Margin="0,0,4,0"
+                                                                IsEnabled="{Binding CanMoveUp}"
+                                                                Tag="{Binding}" Click="EgressMoveUp_Click" />
+                                                        <Button Content="下移" Padding="8,2" Margin="0,0,4,0"
+                                                                IsEnabled="{Binding CanMoveDown}"
+                                                                Tag="{Binding}" Click="EgressMoveDown_Click" />
+                                                        <Button Content="删除" Padding="8,2"
+                                                                Tag="{Binding}" Click="EgressRemoveRule_Click" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Border>
+
+                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10" Margin="0,0,0,8">
+                                <StackPanel>
+                                    <TextBlock Text="规则测试" Style="{StaticResource SectionLabelTextStyle}" />
+                                    <Grid Margin="0,6,0,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="EgressTestAddressBox"
+                                                 Margin="0,0,8,6"
+                                                 ToolTip="要测试的 IPv4 地址"
+                                                 AutomationProperties.Name="测试地址" />
+                                        <Button x:Name="EgressPreviewButton"
+                                                Grid.Column="1"
+                                                Content="按配置预演"
+                                                Padding="12,4"
+                                                Margin="0,0,0,6"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                Click="EgressPreviewButton_Click" />
+                                        <StackPanel Grid.Row="1" Orientation="Horizontal">
+                                            <TextBlock Text="端口"
+                                                       VerticalAlignment="Center"
+                                                       Margin="0,0,8,0"
+                                                       Style="{StaticResource FieldLabelTextStyle}" />
+                                            <TextBox x:Name="EgressTestPortBox"
+                                                     Width="72"
+                                                     Text="443"
+                                                     ToolTip="连通测试的 TCP 端口"
+                                                     AutomationProperties.Name="测试端口" />
+                                        </StackPanel>
+                                        <Button x:Name="EgressConnectButton"
+                                                Grid.Row="1"
+                                                Grid.Column="1"
+                                                Content="连通测试"
+                                                Padding="12,4"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                Click="EgressConnectButton_Click" />
+                                    </Grid>
+                                    <TextBlock x:Name="EgressTestResultText"
+                                               Margin="0,6,0,0"
+                                               TextWrapping="Wrap"
+                                               Text="预演只按已保存的规则判断去向，不建立连接；连通测试真实连接一次，只说明能否连上，不说明走了哪条路径。" />
+                                </StackPanel>
+                            </Border>
+
+                            <Border Style="{StaticResource SurfacePanelStyle}" Padding="12,10">
+                                <StackPanel>
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="运行状态" Style="{StaticResource SectionLabelTextStyle}" />
+                                        <TextBlock x:Name="EgressProblemsText" Margin="8,0,0,0" FontWeight="Bold" Text="—" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="EgressSummaryText"
+                                               Margin="0,4,0,0"
+                                               TextWrapping="Wrap"
+                                               Text="连接后显示本机分流规则是否生效；未连接时不读取路由表。" />
+                                    <ItemsControl x:Name="EgressIssueList" ItemsSource="{Binding EgressIssues}" Margin="0,4,0,0">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Style="{StaticResource InfoStripStyle}" Margin="0,4,0,0">
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                        <TextBlock Text="{Binding Detail}" TextWrapping="Wrap" Style="{StaticResource CaptionTextStyle}" />
+                                                        <TextBox Text="{Binding Code, Mode=OneWay}"
+                                                                 Visibility="{Binding CodeVisibility}"
+                                                                 Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                                 FontFamily="Consolas" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <TextBlock x:Name="EgressRoleText"
+                                               Margin="0,6,0,0"
+                                               TextWrapping="Wrap"
+                                               Style="{StaticResource CaptionTextStyle}" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
                 <TabItem Header="互传">
                     <Grid>
                         <Grid.RowDefinitions>

@@ -25,6 +25,8 @@ public partial class MainWindow : Window
     private static readonly JsonSerializerOptions SettingsJsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true,
+        // Egress rules carry optional fields; an absent one stays absent rather than a null.
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
 
     private const string ThemeModeSystem = "system";
@@ -95,6 +97,7 @@ public partial class MainWindow : Window
         _networkSignature = NetworkSignature();
         ApplyConfiguredTheme();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
+        InitializeEgressPage();
         if (backgroundIntegration) InitializeTray();
     }
 
@@ -102,6 +105,7 @@ public partial class MainWindow : Window
     {
         _trayIcon?.Dispose();
         _trayIcon = null;
+        StopEgressPage();
         _updateCts.Cancel();
         _updateCts.Dispose();
         _updateService.Dispose();
@@ -794,6 +798,8 @@ public partial class MainWindow : Window
             UpdateEnabled = UpdateCheckEnabledCheckBox.IsChecked == true,
             UpdateCheckIntervalHours = ParseUpdateIntervalHours(),
             AutoUpdate = AutoUpdateCheckBox.IsChecked == true,
+            PeerEgressEnabled = _egressEnabled,
+            PeerEgressRules = _egressRules.ToList(),
         };
         config.Normalize();
         return config;
@@ -815,6 +821,8 @@ public partial class MainWindow : Window
         UpdateThemeModeButton();
         TunNameBox.Text = settings.PeerMeshTunName;
         MtuBox.Text = settings.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _egressEnabled = settings.PeerEgressEnabled;
+        _egressRules = settings.PeerEgressRules.ToList();
         _loadingSettings = false;
     }
 
@@ -854,6 +862,9 @@ public partial class MainWindow : Window
             UpdateCheckEnabled = UpdateCheckEnabledCheckBox.IsChecked == true,
             UpdateCheckIntervalHours = ParseUpdateIntervalHours(),
             AutoUpdate = AutoUpdateCheckBox.IsChecked == true,
+            PeerEgressEnabled = _egressEnabled,
+            // Positions are written as they stand, so the file reads in the order the rules match.
+            PeerEgressRules = _egressRules.Select((rule, index) => rule with { Index = index }).ToList(),
         };
         var path = SettingsPath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
