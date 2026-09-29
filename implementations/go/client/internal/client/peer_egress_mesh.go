@@ -198,9 +198,24 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	if mesh.egressCatalog != nil {
 		consumer.capable = mesh.egressCatalog.domainCapable()
 	}
+	consumer.dnsUpstreams = append([]string(nil), mesh.egressDNSUpstreams...)
 	mesh.egressConsumer = consumer
 	mesh.mu.Unlock()
 	return consumer
+}
+
+// setEgressDNSUpstreams gives the DNS responder the resolvers it forwards to, in order. Step five
+// supplies them from the system's DNS settings as they were before the takeover; until a caller
+// does, the list is empty and every query the responder forwards is answered SERVFAIL. Called with
+// no mesh lock held.
+func (mesh *peerMeshClient) setEgressDNSUpstreams(upstreams []string) {
+	mesh.mu.Lock()
+	mesh.egressDNSUpstreams = append([]string(nil), upstreams...)
+	consumer := mesh.egressConsumer
+	mesh.mu.Unlock()
+	if consumer != nil {
+		consumer.setDNSUpstreams(upstreams)
+	}
 }
 
 // applyEgressCatalog reads a pushed egress-catalog and gives the consumer the capabilities it lists.
@@ -337,7 +352,9 @@ func (mesh *peerMeshClient) handleEgressOutbound(packet []byte) bool {
 	if outcome == egressOutcomeNotMine {
 		return false
 	}
-	if outcome != egressOutcomeForwarded && mesh.logger != nil {
+	// A DNS query is the responder's business, answered or not, and one line per lookup would be
+	// a record of every name this device asked for.
+	if outcome != egressOutcomeForwarded && outcome != egressOutcomeDNS && mesh.logger != nil {
 		// Logged without the destination: a per-destination record of what a user was blocked
 		// from reaching is their own browsing history.
 		mesh.logger.Printf("[peer-egress-consumer] packet not forwarded: %s", outcome)
