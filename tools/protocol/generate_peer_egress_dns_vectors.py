@@ -422,8 +422,13 @@ class Steering:
 
 class EgressBindings:
     """An egress's name bindings and the flows it opened, for one question: which flows a name-bind
-    closes. A flow opened before its name arrived went to the fake address itself and will never
-    work; once the name is known it is closed, so the consumer's next packet opens it properly."""
+    closes, and which of them the application is told about.
+
+    A flow opened before its name arrived went to the fake address itself and will never work; once
+    the name is known it is closed, so the consumer's next packet opens it properly. It is closed
+    silently: that next packet is usually the application's own retransmitted SYN, and a reset sent
+    now would refuse the connection the name-bind came to rescue. A flow opened for another name was
+    a real connection to somewhere the address no longer means, and is reset like a revoked one."""
 
     def __init__(self):
         self.names = {}
@@ -439,9 +444,10 @@ class EgressBindings:
         self.names[(consumer, address)] = name
         closed = sorted(flow_id for flow_id, flow in self.flows.items()
                         if flow["consumer"] == consumer and flow["address"] == address and flow["name"] != name)
+        reset = [flow_id for flow_id in closed if self.flows[flow_id]["name"] is not None]
         for flow_id in closed:
             del self.flows[flow_id]
-        return {"closed": closed}
+        return {"closed": closed, "reset": reset}
 
 
 def run_egress_binds(events):
@@ -1133,8 +1139,8 @@ def build():
     bind_events = [dict(event) for event in EGRESS_BIND_EVENTS]
     bind_results = run_egress_binds(bind_events)
     assert bind_results == [
-        {"name": None}, {"name": None}, {"closed": ["early"]}, {"name": "example.com"},
-        {"closed": []}, {"closed": ["bound"]}], bind_results
+        {"name": None}, {"name": None}, {"closed": ["early"], "reset": []}, {"name": "example.com"},
+        {"closed": [], "reset": []}, {"closed": ["bound"], "reset": ["bound"]}], bind_results
     choices = []
     for name, a_records, aaaa_records, capable, decisions in EGRESS_CHOICES:
         choices.append({"name": name, "a": a_records, "aaaa": aaaa_records, "ipv6TargetCapable": capable,
