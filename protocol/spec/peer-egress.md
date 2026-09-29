@@ -444,6 +444,8 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 }
 ```
 
+`domainTargetCapable` 取该出口**当前在线会话**登录时在 `clientEgressCapabilities` 里声明的值：服务端把它与 `version` 一起保存在会话上（会话表列 `client_egress_domain_targets`，布尔，默认 `false`，已有数据库在启动时补上）。出口不在线、或登录时没有声明，为 `false`。出口重新登录、声明变化时，随出口上线这一变化照常重新下发目录。此前四个服务端都固定写 `false`，消费端无从得知哪台出口能解析域名，二期的域名规则因此无法判断 `EGRESS_RULE_EGRESS_NO_DOMAIN`。`ipv6TargetCapable` 仍固定为 `false`：还没有客户端声明它。
+
 目录**不包含**出口的目标白名单细节：消费端不需要它，泄露出去等于把出口的内网拓扑告诉每个对端。消费端配了不被允许的目标时，由出口在建流阶段拒绝并通过 `flow-reject` 说明。
 
 出口下线、设备停用、ACL 撤销或总开关关闭时立即下发 `egresses: []`。`egress-catalog` 只能由服务端发出；客户端上报该类型必须拒绝。
