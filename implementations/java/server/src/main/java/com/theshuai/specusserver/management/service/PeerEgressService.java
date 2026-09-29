@@ -20,6 +20,7 @@ import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
 import com.theshuai.specusserver.management.model.PeerMeshEgressSwitchView;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicyView;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressSwitchRepository;
@@ -66,6 +67,7 @@ public class PeerEgressService {
     private final ConcurrentHashMap<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
     private final PeerMeshDeviceRepository deviceRepository;
     private final ClientAccountRepository clientAccountRepository;
+    private final ClientSessionRepository clientSessionRepository;
     private final PeerMeshService peerMeshService;
 
     public PeerEgressService(PeerMeshEgressPolicyRepository policyRepository,
@@ -73,12 +75,14 @@ public class PeerEgressService {
                              PeerMeshEgressSwitchRepository switchRepository,
                              PeerMeshDeviceRepository deviceRepository,
                              ClientAccountRepository clientAccountRepository,
+                             ClientSessionRepository clientSessionRepository,
                              PeerMeshService peerMeshService) {
         this.policyRepository = policyRepository;
         this.activityRepository = activityRepository;
         this.switchRepository = switchRepository;
         this.deviceRepository = deviceRepository;
         this.clientAccountRepository = clientAccountRepository;
+        this.clientSessionRepository = clientSessionRepository;
         this.peerMeshService = peerMeshService;
     }
 
@@ -502,12 +506,30 @@ public class PeerEgressService {
             entry.setOnline(isDeviceEnabled(egress.get()));
             entry.setScope(policy.getScope());
             entry.setProtocols(protocolsOf(decodeDestinationRules(policy.getDestinationRules())));
-            entry.setDomainTargetCapable(false);
+            entry.setDomainTargetCapable(entry.isOnline() && announcesDomainTargets(egress.get()));
+            // No client announces IPv6 targets yet.
             entry.setIpv6TargetCapable(false);
             entries.add(entry);
         }
         message.setEgresses(entries);
         return message;
+    }
+
+    /**
+     * Whether the egress's current online session announced domain targets at login.
+     *
+     * <p>Read from the online session, like the egress version the signal path pushes with, rather
+     * than from anything remembered about the device: an egress that went offline, or came back on
+     * a client without domain support, must not keep advertising it. Consumers rely on this to tell
+     * which egress can take a domain rule.
+     */
+    private boolean announcesDomainTargets(ClientAccount egress) {
+        return clientSessionRepository
+                .findByTenantIdAndClientIdInAndStatus(egress.getTenantId(), List.of(egress.getId()),
+                        ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .anyMatch(session -> session.getClientEgressVersion() >= 1
+                        && session.isClientEgressDomainTargets());
     }
 
     /**
