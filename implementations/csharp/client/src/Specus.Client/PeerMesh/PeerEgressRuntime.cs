@@ -603,6 +603,14 @@ internal sealed class PeerEgressRuntime
         if (output.Done || output.Reset)
         {
             Release(flow);
+            return;
+        }
+        if (handle.Connection.CurrentState == PeerEgressTcpConnection.State.TimeWait && !flow.Lingering)
+        {
+            // Both directions are finished: the socket goes now, and the entry stays only to answer a
+            // retransmitted FIN, outside the limits.
+            handle.Socket.Dispose();
+            _flows.Linger(flow);
         }
     }
 

@@ -43,6 +43,10 @@ type egressFlow struct {
 	BytesToRemote   int64
 	BytesFromRemote int64
 
+	// Lingering marks a TCP flow in TIME_WAIT: its socket is closed and it no longer counts against
+	// the limits, but the entry stays until the timer so a retransmitted FIN is still answered.
+	Lingering bool
+
 	// Handle is whatever the caller attached: a tcpConn, a UDP socket, a cancel function. The
 	// table stores it so that everything needed to tear a flow down travels with the entry that
 	// authorises it, and never reads it.
@@ -57,7 +61,9 @@ type egressFlow struct {
 type egressFlowTable struct {
 	idleTimeout time.Duration
 	flows       map[egressFlowKey]*egressFlow
+	// perConsumer and lingering together account for every entry: a flow counts in exactly one.
 	perConsumer map[int64]int
+	lingering   int
 }
 
 func newEgressFlowTable(idleTimeout time.Duration) *egressFlowTable {
@@ -76,12 +82,27 @@ func newEgressFlowTable(idleTimeout time.Duration) *egressFlowTable {
 // vanished stops holding a socket and a quota slot.
 const egressDefaultIdleTimeout = 5 * time.Minute
 
-func (t *egressFlowTable) size() int { return len(t.flows) }
+// size is the number of live flows; a flow lingering in TIME_WAIT is not one.
+func (t *egressFlowTable) size() int { return len(t.flows) - t.lingering }
 
 // counts feeds the two limit checks in authorizeEgressFlow. It is read before the flow opens, so it
-// deliberately excludes the flow being considered.
+// deliberately excludes the flow being considered. Lingering flows are left out: a consumer that
+// finished 64 short connections could otherwise open no more for the ten seconds they linger.
 func (t *egressFlowTable) counts(consumer int64) (forConsumer int, total int) {
-	return t.perConsumer[consumer], len(t.flows)
+	return t.perConsumer[consumer], len(t.flows) - t.lingering
+}
+
+// linger moves a flow out of the limits for the rest of its TIME_WAIT. Idempotent.
+func (t *egressFlowTable) linger(flow *egressFlow) {
+	if flow.Lingering {
+		return
+	}
+	if _, ok := t.flows[flow.Key]; !ok {
+		return
+	}
+	flow.Lingering = true
+	t.lingering++
+	t.dropConsumerCount(flow.Consumer)
 }
 
 func (t *egressFlowTable) lookup(key egressFlowKey) (*egressFlow, bool) {
@@ -124,12 +145,20 @@ func (t *egressFlowTable) close(key egressFlowKey) (*egressFlow, bool) {
 
 func (t *egressFlowTable) remove(flow *egressFlow) {
 	delete(t.flows, flow.Key)
-	if remaining := t.perConsumer[flow.Consumer] - 1; remaining > 0 {
-		t.perConsumer[flow.Consumer] = remaining
+	if flow.Lingering {
+		t.lingering--
+		return
+	}
+	t.dropConsumerCount(flow.Consumer)
+}
+
+func (t *egressFlowTable) dropConsumerCount(consumer int64) {
+	if remaining := t.perConsumer[consumer] - 1; remaining > 0 {
+		t.perConsumer[consumer] = remaining
 	} else {
 		// Dropping the entry rather than leaving a zero keeps the map bounded by live
 		// consumers instead of by every consumer that ever connected.
-		delete(t.perConsumer, flow.Consumer)
+		delete(t.perConsumer, consumer)
 	}
 }
 

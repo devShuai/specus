@@ -426,6 +426,15 @@ func (r *egressRuntime) applyTCPOutput(consumer int64, flow *egressFlow, handle 
 	}
 	if output.Done || output.Reset {
 		r.release(flow)
+		return
+	}
+	if handle.conn.state == tcpStateTimeWait && !flow.Lingering {
+		// Both directions are finished: the socket goes now, and the entry stays only to answer a
+		// retransmitted FIN, outside the limits.
+		if handle.socket != nil {
+			_ = handle.socket.Close()
+		}
+		r.flows.linger(flow)
 	}
 }
 

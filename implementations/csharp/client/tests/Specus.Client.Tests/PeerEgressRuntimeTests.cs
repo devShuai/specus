@@ -464,6 +464,39 @@ public class PeerEgressRuntimeTests
     }
 
     /// <summary>
+    /// The egress closed first and the consumer answered with its own FIN: the flow is in TIME_WAIT.
+    /// Its socket is closed and its quota is free at once; the entry stays to answer a retransmitted
+    /// FIN.
+    /// </summary>
+    [Fact]
+    public void FreesTheQuotaOfAFlowInTimeWait()
+    {
+        var harness = new Harness();
+        var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+        WaitFor("the flow to open", () => harness.Runtime.FlowCount == 1);
+        harness.CompleteHandshake(7, opening);
+        harness.ClearFrames();
+
+        harness.Socket(0).EndOfStreamNow();
+        WaitFor("a FIN for the consumer", harness.SawFin);
+        var fin = harness.Segments().FindLast(segment => segment.Has(PeerEgressSegment.FlagFin))!;
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(new Segment(
+            opening.SourceIp, opening.DestinationIp, opening.SourcePort, opening.DestinationPort,
+            opening.Seq + 1, fin.Seq + 1, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin,
+            65535, 0, []))), Epoch);
+
+        Assert.Equal(0, harness.Runtime.FlowCount);
+        var table = (PeerEgressFlowTable)typeof(PeerEgressRuntime)
+            .GetField("_flows", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(harness.Runtime)!;
+        Assert.Equal(0, table.CountFor(7));
+        Assert.NotNull(table.Lookup(new PeerEgressFlowTable.Key(PeerEgressSegment.Ipv4ProtocolTcp,
+            opening.SourceIp, opening.SourcePort, opening.DestinationIp, opening.DestinationPort)));
+        Assert.True(harness.Socket(0).IsClosed, "the socket of a finished flow was kept open through TIME_WAIT");
+    }
+
+    /// <summary>
     /// A socket that ends while the handshake is still in flight owes the consumer a FIN as soon as
     /// the handshake completes. Sending it earlier would run ahead of a sequence space the consumer
     /// has not acknowledged; never sending it leaves the flow open until the idle timer collects it,

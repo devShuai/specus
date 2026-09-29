@@ -583,6 +583,13 @@ final class PeerEgressRuntime {
         }
         if (output.done || output.reset) {
             release(flow);
+            return;
+        }
+        if (handle.connection().state() == PeerEgressTcpConnection.State.TIME_WAIT && !flow.lingering) {
+            // Both directions are finished: the socket goes now, and the entry stays only to answer
+            // a retransmitted FIN, outside the limits.
+            handle.socket().close();
+            flows.linger(flow);
         }
     }
 

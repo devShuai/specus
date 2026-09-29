@@ -63,6 +63,12 @@ final class PeerEgressFlowTable {
         long bytesFromRemote;
 
         /**
+         * A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
+         * but the entry stays until the timer so a retransmitted FIN is still answered.
+         */
+        boolean lingering;
+
+        /**
          * Whatever the caller attached: a connection, a socket, a cancellation handle. Stored so
          * that everything needed to tear a flow down travels with the entry that authorises it, and
          * never read here.
@@ -90,7 +96,9 @@ final class PeerEgressFlowTable {
 
     private long idleTimeoutMs;
     private final Map<Key, Flow> flows = new LinkedHashMap<>();
+    /** perConsumer and lingering together account for every entry: a flow counts in exactly one. */
     private final Map<Long, Integer> perConsumer = new LinkedHashMap<>();
+    private int lingering;
 
     PeerEgressFlowTable(long idleTimeoutMs) {
         setIdleTimeoutMs(idleTimeoutMs);
@@ -105,8 +113,22 @@ final class PeerEgressFlowTable {
         this.idleTimeoutMs = value > 0 ? value : DEFAULT_IDLE_TIMEOUT_MS;
     }
 
+    /** The live flows; a flow lingering in TIME_WAIT is not one. */
     int size() {
-        return flows.size();
+        return flows.size() - lingering;
+    }
+
+    /**
+     * Moves a flow out of the limits for the rest of its TIME_WAIT. A consumer that finished 64 short
+     * connections could otherwise open no more for the ten seconds they linger. Idempotent.
+     */
+    void linger(Flow flow) {
+        if (flow.lingering || flows.get(flow.key) != flow) {
+            return;
+        }
+        flow.lingering = true;
+        lingering++;
+        release(flow.consumer);
     }
 
     /** The timeout in force, which a pushed policy can change. */
@@ -164,9 +186,18 @@ final class PeerEgressFlowTable {
     Flow close(Key key) {
         Flow flow = flows.remove(key);
         if (flow != null) {
-            release(flow.consumer);
+            forget(flow);
         }
         return flow;
+    }
+
+    /** Takes a removed flow out of whichever count holds it. */
+    private void forget(Flow flow) {
+        if (flow.lingering) {
+            lingering--;
+        } else {
+            release(flow.consumer);
+        }
     }
 
     private void release(long consumer) {
@@ -318,7 +349,7 @@ final class PeerEgressFlowTable {
         sort(reaped);
         for (Flow flow : reaped) {
             flows.remove(flow.key);
-            release(flow.consumer);
+            forget(flow);
         }
         return reaped;
     }

@@ -60,6 +60,12 @@ internal sealed class PeerEgressFlowTable
         public long BytesFromRemote { get; set; }
 
         /// <summary>
+        /// A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
+        /// but the entry stays until the timer so a retransmitted FIN is still answered.
+        /// </summary>
+        public bool Lingering { get; set; }
+
+        /// <summary>
         /// Whatever the caller attached: a connection, a socket, a cancellation handle. Stored so
         /// that everything needed to tear a flow down travels with the entry that authorises it,
         /// and never read here.
@@ -80,7 +86,9 @@ internal sealed class PeerEgressFlowTable
 
     private long _idleTimeoutMs;
     private readonly Dictionary<Key, Flow> _flows = [];
+    // _perConsumer and _lingering together account for every entry: a flow counts in exactly one.
     private readonly Dictionary<long, int> _perConsumer = [];
+    private int _lingering;
 
     public PeerEgressFlowTable(long idleTimeoutMs) => IdleTimeoutMs = idleTimeoutMs;
 
@@ -95,7 +103,36 @@ internal sealed class PeerEgressFlowTable
         set => _idleTimeoutMs = value > 0 ? value : DefaultIdleTimeoutMs;
     }
 
-    public int Count => _flows.Count;
+    /// <summary>The live flows; a flow lingering in TIME_WAIT is not one.</summary>
+    public int Count => _flows.Count - _lingering;
+
+    /// <summary>
+    /// Moves a flow out of the limits for the rest of its TIME_WAIT. A consumer that finished 64 short
+    /// connections could otherwise open no more for the ten seconds they linger. Idempotent.
+    /// </summary>
+    public void Linger(Flow flow)
+    {
+        if (flow.Lingering || !_flows.TryGetValue(flow.Key, out var current) || !ReferenceEquals(current, flow))
+        {
+            return;
+        }
+        flow.Lingering = true;
+        _lingering++;
+        Release(flow.Consumer);
+    }
+
+    /// <summary>Takes a removed flow out of whichever count holds it.</summary>
+    private void Forget(Flow flow)
+    {
+        if (flow.Lingering)
+        {
+            _lingering--;
+        }
+        else
+        {
+            Release(flow.Consumer);
+        }
+    }
 
     /// <summary>Feeds the two limit checks in the judgment layer, so it excludes the flow being considered.</summary>
     public int CountFor(long consumer) => _perConsumer.GetValueOrDefault(consumer, 0);
@@ -151,7 +188,7 @@ internal sealed class PeerEgressFlowTable
         {
             return null;
         }
-        Release(flow.Consumer);
+        Forget(flow);
         return flow;
     }
 
@@ -326,7 +363,7 @@ internal sealed class PeerEgressFlowTable
         foreach (var flow in reaped)
         {
             _flows.Remove(flow.Key);
-            Release(flow.Consumer);
+            Forget(flow);
         }
         return reaped;
     }

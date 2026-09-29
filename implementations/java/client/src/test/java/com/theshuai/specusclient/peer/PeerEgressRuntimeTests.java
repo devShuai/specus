@@ -2,6 +2,7 @@ package com.theshuai.specusclient.peer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -455,6 +456,40 @@ class PeerEgressRuntimeTests {
 
         waitFor("a FIN for the consumer", harness::sawFin);
         assertFalse(harness.sawReset(), "a clean end of stream was reported as a reset");
+    }
+
+    /**
+     * The egress closed first and the consumer answered with its own FIN: the flow is in TIME_WAIT.
+     * Its socket is closed and its quota is free at once; the entry stays to answer a retransmitted
+     * FIN.
+     */
+    @Test
+    void freesTheQuotaOfAFlowInTimeWait() throws Exception {
+        Harness harness = new Harness();
+        PeerEgressSegment.Segment opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+        waitFor("the flow to open", () -> harness.runtime.flowCount() == 1);
+        harness.completeHandshake(7, opening);
+        harness.clearFrames();
+
+        harness.socket(0).endOfStream();
+        waitFor("a FIN for the consumer", harness::sawFin);
+        PeerEgressSegment.Segment fin = harness.segments().stream()
+                .filter(segment -> segment.has(PeerEgressSegment.FLAG_FIN)).reduce((a, b) -> b).orElseThrow();
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                opening.seq() + 1, fin.seq() + 1, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
+                65535, 0, new byte[0]))), EPOCH);
+
+        assertEquals(0, harness.runtime.flowCount(), "a flow in TIME_WAIT still counts");
+        java.lang.reflect.Field field = PeerEgressRuntime.class.getDeclaredField("flows");
+        field.setAccessible(true);
+        PeerEgressFlowTable table = (PeerEgressFlowTable) field.get(harness.runtime);
+        assertEquals(0, table.countFor(7));
+        assertNotNull(table.lookup(new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                        opening.sourceIp(), opening.sourcePort(), opening.destinationIp(), opening.destinationPort())),
+                "the TIME_WAIT entry went before its timer, so a retransmitted FIN would go unanswered");
+        assertTrue(harness.socket(0).isClosed(), "the socket of a finished flow was kept open through TIME_WAIT");
     }
 
     /**
