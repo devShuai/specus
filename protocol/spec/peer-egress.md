@@ -630,7 +630,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 **`inForce` 是这一节存在的理由。** 一条配置了但被拒的规则读出来是 `false` 并带着它的错误码。这是「这条规则在保护我」和「这条规则是文件里的一段文字」之间的区别。被拒的规则**必须列出来**，不能省掉：只列生效规则的状态，会让写下那条规则的人无从发现它没生效。
 
-**总开关关闭时这一节照样出现。** 只要配置了规则，`consumer` 就在，`enabled: false`、`active: false`，每条规则 `inForce: false` 并带 `EGRESS_CONSUMER_DISABLED`（本身停用的规则仍报 `EGRESS_RULE_DISABLED`），不列路由也不列出口对端。没有配置规则时这一节缺省，与之前相同。
+**总开关关闭时这一节照样出现。** 只要配置了规则（或开了二期的 `peerEgressDnsTakeover`，见 [peer-egress-dns.md](peer-egress-dns.md)），`consumer` 就在，`enabled: false`、`active: false`，每条规则 `inForce: false` 并带 `EGRESS_CONSUMER_DISABLED`（本身停用的规则仍报 `EGRESS_RULE_DISABLED`），不列路由也不列出口对端。没有配置规则时这一节缺省，与之前相同。
 
 **没装上的路由必须列出来**，带 `installed: false` 和占用者的描述。省掉它会让状态看起来干干净净，而它本该捕获的流量正从物理网卡出去。
 
