@@ -1,0 +1,172 @@
+import { describe, expect, it } from "vitest";
+import type { PeerEgressPolicy, PeerEgressSwitch } from "../../api/types";
+import {
+  checkPolicyDraft,
+  consumerNote,
+  destinationNotes,
+  draftFromPolicy,
+  emptyPolicyDraft,
+  formatPorts,
+  parseCidr,
+  parsePorts,
+  policyState,
+  storedRuleProblem,
+  switchSummary,
+} from "./peerEgressModel";
+
+const mesh = "100.96.0.0/11";
+
+describe("parseCidr", () => {
+  it("reads a CIDR the way the egress does", () => {
+    expect(parseCidr("203.0.113.0/24")).toMatchObject({ text: "203.0.113.0/24", prefix: 24 });
+    expect(parseCidr(" 203.0.113.7 ")).toMatchObject({ text: "203.0.113.7/32" });
+    expect(parseCidr("0.0.0.0/0")).toMatchObject({ text: "0.0.0.0/0" });
+  });
+
+  it("refuses what the egress would store and never match", () => {
+    expect(parseCidr("203.0.113.1/24")).toEqual({ error: "203.0.113.1/24：主机位不为零，应写作 203.0.113.0/24" });
+    expect(parseCidr("203.0.113.01")).toHaveProperty("error");
+    expect(parseCidr("256.0.0.0/8")).toHaveProperty("error");
+    expect(parseCidr("10.0.0.0/33")).toHaveProperty("error");
+    expect(parseCidr("2001:db8::/32")).toEqual({ error: "2001:db8::/32：目前只支持 IPv4" });
+    expect(parseCidr("example.com")).toHaveProperty("error");
+    expect(parseCidr("")).toEqual({ error: "请填写目标网段" });
+  });
+});
+
+describe("ports", () => {
+  it("parses single ports, ranges and all", () => {
+    expect(parsePorts("443, 8000-8100")).toEqual([[443, 443], [8000, 8100]]);
+    expect(parsePorts("80，443")).toEqual([[80, 80], [443, 443]]);
+    expect(parsePorts("全部")).toEqual([[1, 65535]]);
+  });
+
+  it("refuses an empty list, which would deny every port", () => {
+    expect(parsePorts("")).toHaveProperty("error");
+    expect(parsePorts("0")).toHaveProperty("error");
+    expect(parsePorts("9000-8000")).toHaveProperty("error");
+    expect(parsePorts("65536")).toHaveProperty("error");
+  });
+
+  it("formats what the server stored", () => {
+    expect(formatPorts([[1, 65535]])).toBe("全部端口");
+    expect(formatPorts([[443, 443], [8000, 8100]])).toBe("443, 8000-8100");
+    expect(formatPorts([])).toBe("无（拒绝所有端口）");
+    expect(formatPorts(null)).toBe("无（拒绝所有端口）");
+  });
+});
+
+describe("destinationNotes", () => {
+  it("names the forced-deny ranges a rule covers, the mesh included", () => {
+    expect(destinationNotes("127.0.0.1", "PUBLIC", mesh)[0]).toContain("回环地址");
+    expect(destinationNotes("0.0.0.0/0", "PUBLIC", mesh)[0]).toContain("组网网段 100.96.0.0/11");
+    expect(destinationNotes("203.0.113.0/24", "PUBLIC", mesh)).toEqual([]);
+  });
+
+  it("warns when the scope can never let a rule through", () => {
+    expect(destinationNotes("192.168.1.0/24", "PUBLIC", mesh)[0]).toContain("局域网地址");
+    expect(destinationNotes("203.0.113.0/24", "LAN", mesh)[0]).toContain("不在局域网范围内");
+    expect(destinationNotes("192.168.1.0/24", "LAN", mesh)).toEqual([]);
+  });
+});
+
+describe("checkPolicyDraft", () => {
+  it("builds the request with flat limits and normalised rules", () => {
+    const draft = { ...emptyPolicyDraft(), egressClientId: "2", consumers: ["3", "3", "4"],
+      rules: [{ cidr: "203.0.113.9", tcp: true, udp: true, ports: "443" }] };
+    const check = checkPolicyDraft(draft, mesh);
+    expect(check.errors).toEqual([]);
+    expect(check.mutation).toEqual({
+      egressClientId: 2, enabled: false, scope: "PUBLIC", allowedConsumerClientIds: [3, 4],
+      destinationRules: [{ cidr: "203.0.113.9/32", protocols: ["tcp", "udp"], portRanges: [[443, 443]] }],
+      maxConcurrentFlows: 256, maxFlowsPerConsumer: 64, idleTimeoutSeconds: 60,
+    });
+  });
+
+  it("refuses a draft the egress would misread", () => {
+    const draft = { ...emptyPolicyDraft(), consumers: [], maxConcurrentFlows: "0",
+      rules: [{ cidr: "203.0.113.1/24", tcp: false, udp: false, ports: "" }] };
+    const check = checkPolicyDraft(draft, mesh);
+    expect(check.mutation).toBeNull();
+    expect(check.errors).toEqual([
+      "请选择出口设备",
+      "目的规则 1：203.0.113.1/24：主机位不为零，应写作 203.0.113.0/24",
+      "目的规则 1：至少选择一个协议",
+      "目的规则 1：请填写端口；所有端口填「全部」",
+      "最大并发流应为正整数",
+    ]);
+    expect(check.warnings).toContain("未授权任何消费设备：出口不会为任何设备转发");
+  });
+
+  it("does not let a device be its own consumer", () => {
+    const draft = { ...emptyPolicyDraft(), egressClientId: "2", consumers: ["2"],
+      rules: [{ cidr: "203.0.113.0/24", tcp: true, udp: false, ports: "443" }] };
+    expect(checkPolicyDraft(draft, mesh).errors).toEqual(["出口设备不能授权给自己"]);
+  });
+});
+
+function policy(overrides: Partial<PeerEgressPolicy> = {}): PeerEgressPolicy {
+  return {
+    id: 1, egressClientId: 2, egressClientName: "home", enabled: true, scope: "PUBLIC",
+    allowedConsumerClientIds: [3, 4], effectiveConsumerClientIds: [3, 4],
+    destinationRules: [{ cidr: "203.0.113.0/24", protocols: ["tcp"], portRanges: [[443, 443]] }],
+    maxConcurrentFlows: 256, maxFlowsPerConsumer: 64, idleTimeoutSeconds: 60,
+    createdAt: "2026-09-29T00:00:00Z", updatedAt: "2026-09-29T00:00:00Z", ...overrides,
+  };
+}
+
+const switchOn: PeerEgressSwitch = {
+  deploymentEnabled: true, configuredEnabled: true, effectiveEnabled: true, protocolVersion: 1,
+  enabledPolicyCount: 1, updatedAt: null, updatedBy: null,
+};
+
+describe("policyState", () => {
+  it("names the one thing stopping a policy", () => {
+    expect(policyState(policy(), switchOn)).toMatchObject({ label: "生效中", color: "success" });
+    expect(policyState(policy({ effectiveConsumerClientIds: [3] }), switchOn).detail).toBe("1/2 台消费设备经 ACL 放行");
+    expect(policyState(policy({ enabled: false }), switchOn).label).toBe("未启用");
+    expect(policyState(policy(), { ...switchOn, configuredEnabled: false }).label).toBe("总开关关闭");
+    expect(policyState(policy(), { ...switchOn, deploymentEnabled: false }).label).toBe("部署未启用组网");
+    expect(policyState(policy({ allowedConsumerClientIds: [], effectiveConsumerClientIds: [] }), switchOn).label).toBe("未授权设备");
+    expect(policyState(policy({ effectiveConsumerClientIds: null }), switchOn).label).toBe("无设备可用");
+    expect(policyState(policy({ destinationRules: null }), switchOn).label).toBe("无目的规则");
+  });
+
+  it("tells a disabled device apart from a missing ACL", () => {
+    const enabled = new Map([[2, { enabled: true }], [3, { enabled: true }], [4, { enabled: true }]]);
+    const idle = policy({ effectiveConsumerClientIds: [] });
+    expect(policyState(idle, switchOn, new Map([...enabled, [2, { enabled: false }]])).label).toBe("出口设备未启用组网");
+    expect(policyState(idle, switchOn, new Map([...enabled, [3, { enabled: false }], [4, { enabled: false }]])).label).toBe("消费设备未启用组网");
+    expect(policyState(idle, switchOn, enabled).label).toBe("无设备可用");
+    expect(consumerNote(3, policy({ effectiveConsumerClientIds: [4] }), enabled)).toBe("Peer ACL 未放行");
+    expect(consumerNote(3, policy({ effectiveConsumerClientIds: [4] }), new Map([...enabled, [3, { enabled: false }]]))).toBe("未启用组网");
+    expect(consumerNote(9, policy({ allowedConsumerClientIds: [9], effectiveConsumerClientIds: [] }), enabled)).toBe("不在组网设备中");
+    expect(consumerNote(4, policy(), enabled)).toBe("");
+    expect(consumerNote(3, policy({ enabled: false, effectiveConsumerClientIds: [] }), enabled)).toBe("");
+  });
+
+  it("describes the switch", () => {
+    expect(switchSummary(null, true)).toBe("正在读取出口分流状态…");
+    expect(switchSummary({ ...switchOn, configuredEnabled: false }, false)).toBe("已关闭：所有出口停止转发（1 条已启用策略开启后恢复）");
+    expect(switchSummary(switchOn, false)).toBe("已开启：1 条策略启用中");
+  });
+});
+
+it("flags a stored rule the egress would never match", () => {
+  expect(storedRuleProblem({ cidr: "203.0.113.0/24", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("");
+  expect(storedRuleProblem({ cidr: "203.0.113.1/24", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("网段无效，不会匹配");
+  expect(storedRuleProblem({ cidr: "203.0.113.0/24", protocols: ["TCP"], portRanges: [[443, 443]] })).toContain("只认小写");
+  expect(storedRuleProblem({ cidr: "203.0.113.0/24", protocols: ["udp"], portRanges: null })).toBe("没有端口，所有端口都被拒绝");
+});
+
+it("round-trips a stored policy into an editable draft", () => {
+  const draft = draftFromPolicy(policy({ destinationRules: [
+    { cidr: "203.0.113.0/24", protocols: ["tcp", "udp"], portRanges: [[1, 65535]] },
+    { cidr: "198.51.100.0/24", protocols: null, portRanges: null },
+  ] }));
+  expect(draft.rules).toEqual([
+    { cidr: "203.0.113.0/24", tcp: true, udp: true, ports: "全部" },
+    { cidr: "198.51.100.0/24", tcp: false, udp: false, ports: "" },
+  ]);
+  expect(draft.consumers).toEqual(["3", "4"]);
+});
