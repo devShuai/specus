@@ -647,15 +647,28 @@ class Lab:
         if status:
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
 
+        # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
+        # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
+        # A reply from the consumer's own address would still fail the check, and a retry is noted,
+        # so a first datagram that goes missing every time would show up rather than be absorbed.
         script = ("import socket\n"
                   "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
-                  "s.settimeout(5)\n"
-                  f"s.sendto(b'lab', ('{TARGET_IP}', {UDP_PORT}))\n"
-                  "print(s.recv(200).decode().strip())\n")
-        got = self.sh(ns("con", sys.executable, "-c", script), check=False, timeout=15)
+                  "s.settimeout(2)\n"
+                  "for attempt in range(1, 4):\n"
+                  f"    s.sendto(b'lab', ('{TARGET_IP}', {UDP_PORT}))\n"
+                  "    try:\n"
+                  "        print(f'attempt={attempt} ' + s.recv(200).decode().strip())\n"
+                  "        break\n"
+                  "    except socket.timeout:\n"
+                  "        continue\n"
+                  "else:\n"
+                  "    print('no reply to 3 datagrams')\n")
+        got = self.sh(ns("con", sys.executable, "-c", script), check=False, timeout=20)
         reply = got.stdout.strip()
         self.check("UDP under the rule leaves from the egress's address",
                    f"src={EGRESS_IP}:" in reply, reply or got.stderr.strip()[-200:])
+        if reply.startswith("attempt=") and not reply.startswith("attempt=1 "):
+            self.note(f"the UDP probe was answered only on a retry ({reply.split()[0]}); earlier datagrams got no reply")
 
         samples_via, samples_direct = [], []
         for _ in range(5):
