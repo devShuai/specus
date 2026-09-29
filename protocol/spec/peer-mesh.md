@@ -683,6 +683,10 @@ direct 可用期间，对端仍会周期性探测 relay，所以一个 relay che
 两端会在 direct 与 relay 之间来回切换；负载越高在途帧越多，两端就停不下来，吞吐跌到 relay 的水平。
 对端真的改走 relay 时（它的 direct 失效），它不再发 direct 报文，3 s 后到达的下一帧 relay 数据就让本端跟随。
 
+对端 key epoch 变化即对端进程已重启，旧端点背后的 socket 已不存在。此时除重置入站解密状态外，本端还清除该
+会话的端点成功时间、端点 RTT 与 direct 成功时间：否则旧端点仍按粘滞规则保留、direct 仍算健康，最长 45 s 内
+每一帧都发往已退出的进程，新进程无论经 direct 还是 relay 发来的 check 都无法改变路径。
+
 服务端 relay 处理 TURN `Send Indication` 中的加密帧时，会解析帧头并调用
 `PeerMeshService.authorizeRelayFrameForRelay`：
 
