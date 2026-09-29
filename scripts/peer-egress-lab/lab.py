@@ -645,17 +645,21 @@ class Lab:
                     problems.append(f"unexpected host route over the tunnel: {line}")
         self.check("route table holds the exact prefix, the bypass /32 and mesh host routes only; no default",
                    not problems, "; ".join(problems) if problems else "\n".join(self.lab_routes(table)))
-        status = self.client_status("consumer")
-        if status:
+        # Every runtime says which path carries each egress peer's traffic and how many flows it has;
+        # a lab consumer that just reached its egress is on one path or the other. The state file is
+        # refreshed on the process's own period, so it is read until it lists the peer.
+        def egress_peers():
+            status = self.client_status("consumer")
+            if not status:
+                return None
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
-            # Every runtime says which path carries each egress peer's traffic and how many flows it
-            # has; a lab consumer that just reached its egress is on one path or the other.
-            peers = [peer for instance in status.get("data", {}).get("instances", [])
-                     for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])]
-            self.check("status names the path to the egress and its flow count",
-                       bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
-                                           for peer in peers),
-                       json.dumps(peers))
+            return [peer for instance in status.get("data", {}).get("instances", [])
+                    for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])] or None
+        peers, _ = self.wait_for("the consumer status to list its egress peer", egress_peers, 30, 1.0)
+        self.check("status names the path to the egress and its flow count",
+                   bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
+                                       for peer in peers),
+                   json.dumps(peers))
 
         # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
         # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
