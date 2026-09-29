@@ -4305,6 +4305,25 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         @Override
+        public Map<Long, String> egressPaths() {
+            // Read the way sendEncryptedPayload chooses: a nominated relay first, then the direct
+            // endpoint; a peer with neither has no entry.
+            Map<Long, String> paths = new HashMap<>();
+            long now = System.currentTimeMillis();
+            for (PeerSession session : sessions.values()) {
+                if (session.isExpired(now)) {
+                    continue;
+                }
+                if (StringUtils.hasText(session.relayTargetAllocationId)) {
+                    paths.put(session.peerId(), PeerEgressStatus.PATH_RELAY);
+                } else if (session.remoteEndpoint != null) {
+                    paths.put(session.peerId(), PeerEgressStatus.PATH_DIRECT);
+                }
+            }
+            return paths;
+        }
+
+        @Override
         public boolean deviceReady() {
             PeerVirtualDevice device = virtualDevice;
             return running && device != null && !(device instanceof NoopPeerVirtualDevice);

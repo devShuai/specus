@@ -498,7 +498,8 @@ func (mesh *peerMeshClient) logEgressRefusals(refused []egressRuleSetError) {
 	if joined := strings.Join(keys, ","); joined != mesh.egressRefusalsLogged {
 		mesh.egressRefusalsLogged = joined
 		for _, entry := range refused {
-			mesh.logger.Printf("[peer-egress-consumer] rule %d (%s) refused: %s", entry.Index, entry.Match, entry.Code)
+			// The index and the code, not the match: configuration values stay out of the log.
+			mesh.logger.Printf("[peer-egress-consumer] rule %d refused: %s", entry.Index, entry.Code)
 		}
 	}
 }

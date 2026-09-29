@@ -181,6 +181,102 @@ class Matrix:
             assert match not in err, ("a configuration value was printed in a warning", match)
         self.checks += 1
 
+    def run_text(self, args, code=0):
+        """A person's view of a command: stdout and stderr, line endings normalised."""
+        result = subprocess.run(self.command + args, cwd=self.directory, env=self.env, capture_output=True, timeout=20)
+        out = result.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+        err = result.stderr.decode("utf-8", "replace").replace("\r\n", "\n")
+        assert result.returncode == code, (args, result.returncode, out, err)
+        assert SECRET not in out + err and TOKEN not in out + err, ("sensitive output", args)
+        self.checks += 1
+        return out, err
+
+    def egress_editing(self, url):
+        # The editing commands write the configuration file and print the same lines in every
+        # runtime. The first line of a write names the absolute path, which runtimes may spell
+        # differently on Windows, so only its fixed part is compared; the listing after it is exact.
+        path = self.directory / "egress edit.jsonc"
+        path.write_text('{\n  // kept across edits\n  "serverBaseUrl": "' + url + '",\n'
+                        '  "apiKey": "CLI_TEST_KEY_MUST_NOT_LEAK",\n  "secret": "env:CLI_TEST_SECRET"\n}\n',
+                        encoding="utf-8")
+        cfg = ["--config", str(path)]
+        off_saved = "takeover: off (peerEgressEnabled is false); rules are saved, none is in force"
+        restart = ". A running client applies the change after a restart."
+
+        def written(args, listing, code=0):
+            out, err = self.run_text(args + cfg, code)
+            lines = out.rstrip("\n").split("\n")
+            saved = [index for index, line in enumerate(lines) if line.startswith("Saved ")]
+            assert len(saved) == 1 and lines[saved[0]].endswith(restart), ("no save line", args, out, err)
+            assert lines[saved[0] + 1:] == listing, ("listing", args, lines[saved[0] + 1:], listing)
+            return lines[:saved[0]]
+
+        out, _ = self.run_text(["egress", "rules"] + cfg)
+        assert out == "takeover: off (peerEgressEnabled is false)\n  No egress rules configured.\n", out
+        written(["egress", "rule", "add", "--match", "203.0.113.0/24", "--action", "egress", "--egress-client-id", "42"],
+                [off_saved, "  [0] on 203.0.113.0/24 egress 42"])
+        _, err = self.run_text(["egress", "rule", "add", "--match", "example.com", "--action", "egress",
+                                "--egress-client-id", "42"] + cfg, 2)
+        assert "Rule not added: EGRESS_RULE_DOMAIN_UNSUPPORTED (domain rules are not supported yet; use an IPv4 address or CIDR range)" in err, err
+        written(["egress", "rule", "add", "--match", "198.51.100.0/24", "--action", "block", "--at", "0", "--disabled"],
+                [off_saved, "  [0] off 198.51.100.0/24 block", "  [1] on 203.0.113.0/24 egress 42"])
+        written(["egress", "rule", "move", "--index", "0", "--to", "1"],
+                [off_saved, "  [0] on 203.0.113.0/24 egress 42", "  [1] off 198.51.100.0/24 block"])
+        out, _ = self.run_text(["egress", "test", "203.0.113.9"] + cfg)
+        assert out == ("Preview for 203.0.113.9 from the configuration (no connection is made; --connect PORT tests one)\n"
+                       "  takeover: off\n  rule: [0] 203.0.113.0/24 egress 42\n"
+                       "  result: takeover is off, so it stays local (direct); with takeover on: through egress 42\n"), out
+
+        notice = ["Turning on egress takeover:",
+                  "  - needs permission to create a virtual interface and install routes (administrator or root; peerMeshDevice must not be noop)",
+                  "  - takes over only the destinations a rule covers; everything else stays local",
+                  "  - blocks a destination covered by an egress rule while its egress is unavailable, instead of sending it locally"]
+        before = path.read_text(encoding="utf-8")
+        _, err = self.run_text(["egress", "enable"] + cfg, 2)
+        assert err.rstrip("\n").split("\n") == notice + ["Not changed. Re-run with --yes to confirm."], err
+        assert path.read_text(encoding="utf-8") == before, "enable without --yes changed the file"
+        preface = written(["egress", "enable", "--yes"],
+                          ["takeover: on", "  [0] on 203.0.113.0/24 egress 42", "  [1] off 198.51.100.0/24 block"])
+        assert preface == notice + ["Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto."], preface
+        out, _ = self.run_text(["egress", "test", "203.0.113.9"] + cfg)
+        assert out.endswith("  takeover: on\n  rule: [0] 203.0.113.0/24 egress 42\n  result: through egress 42\n"), out
+        out, _ = self.run_text(["egress", "test", "8.8.8.8"] + cfg)
+        assert out.endswith("  rule: none\n  result: not covered by any rule; stays local (direct)\n"), out
+        _, err = self.run_text(["egress", "test", "example.com"] + cfg, 2)
+        assert "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to." in err, err
+
+        written(["egress", "rule", "disable", "--index", "0"],
+                ["takeover: on", "  [0] off 203.0.113.0/24 egress 42", "  [1] off 198.51.100.0/24 block"])
+        written(["egress", "rule", "enable", "--index", "1"],
+                ["takeover: on", "  [0] off 203.0.113.0/24 egress 42", "  [1] on 198.51.100.0/24 block"])
+        written(["egress", "rule", "remove", "--index", "1"],
+                ["takeover: on", "  [0] off 203.0.113.0/24 egress 42"])
+        written(["egress", "disable"], [off_saved, "  [0] off 203.0.113.0/24 egress 42"])
+        _, err = self.run_text(["egress", "rule", "remove", "--index", "5"] + cfg, 2)
+        assert "No rule at index 5; there are 1 rule(s). List them with egress rules." in err, err
+        self.run_text(["egress", "rules", "--at", "1"] + cfg, 2)
+
+        text = path.read_text(encoding="utf-8")
+        assert "// kept across edits" in text, "an edit dropped a comment outside the rule list"
+        assert '{"match": "203.0.113.0/24", "action": "egress", "egressClientId": 42, "enabled": false}' in text, text
+        assert '"peerEgressEnabled": false' in text, text
+        listing = self.run(["egress", "rules"] + cfg)["data"]
+        assert listing["enabled"] is False and len(listing["rules"]) == 1, listing
+        rule = listing["rules"][0]
+        assert rule["enabled"] is False and rule["inForce"] is False and rule["code"] == "EGRESS_RULE_DISABLED", rule
+        self.run(["config", "validate"] + cfg)
+
+        # A file with CRLF line breaks keeps them: what an edit adds follows the file.
+        crlf = self.directory / "egress crlf.jsonc"
+        crlf.write_bytes(('{\r\n  "serverBaseUrl": "' + url + '",\r\n  "apiKey": "CLI_TEST_KEY_MUST_NOT_LEAK",\r\n'
+                          '  "secret": "env:CLI_TEST_SECRET"\r\n}\r\n').encode("utf-8"))
+        self.run_text(["egress", "rule", "add", "--match", "203.0.113.0/24", "--action", "block", "--config", str(crlf)])
+        self.run_text(["egress", "rule", "add", "--match", "198.51.100.0/24", "--action", "direct", "--config", str(crlf)])
+        self.run_text(["egress", "disable", "--config", str(crlf)])
+        self.run_text(["egress", "enable", "--yes", "--config", str(crlf)])
+        edited = crlf.read_bytes()
+        assert edited.count(b"\n") == edited.count(b"\r\n") and b'"peerEgressEnabled": true' in edited, edited
+
     def run(self, args, code=0, machine=True):
         command = self.command + args + (["--json"] if machine else [])
         result = subprocess.run(command, cwd=self.directory, env=self.env, capture_output=True, timeout=20)
@@ -299,6 +395,7 @@ class Matrix:
                 cfg = ["--config", str(self.config)]
                 self.run(["config", "validate"] + cfg)
                 self.egress_rule_warnings("http://127.0.0.1:" + str(http.server_port))
+                self.egress_editing("http://127.0.0.1:" + str(http.server_port))
                 shown = self.run(["config", "show"] + cfg)["data"]["config"]
                 assert shown["apiKey"] == shown["secret"] == "<redacted>"
                 assert shown["peerMeshMtu"] == 1280 and shown["updateCheckIntervalHours"] == 168
@@ -317,7 +414,9 @@ class Matrix:
                     assert isinstance(capabilities, dict),                         f"login announced no clientEgressCapabilities (POST paths seen: {getattr(http, 'post_paths', [])}, "                         f"environment keys: {sorted(((getattr(http, 'last_login', None) or {}).get('environment') or {}).keys())})"
                     assert isinstance(capabilities.get("version"), int) and capabilities["version"] >= 1,                         f"login announced egress version {capabilities.get('version')!r}; servers skip egress-config below 1"
                     assert capabilities.get("egressCapable") is True, "login did not announce egressCapable"
-                    assert capabilities.get("domainTargetCapable") is False and capabilities.get("ipv6TargetCapable") is False,                         "phase one must not announce domain or IPv6 targets"
+                    # The egress side of phase two resolves names (peer-egress-dns.md); IPv6 targets are not carried.
+                    assert capabilities.get("domainTargetCapable") is True, "login did not announce domain targets"
+                    assert capabilities.get("ipv6TargetCapable") is False, "IPv6 targets must not be announced"
                     self.checks += 1
                     self.checks += 1
                     control.data_delay = 0

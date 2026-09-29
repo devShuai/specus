@@ -176,7 +176,9 @@ class PeerEgressFrameVectorTests {
                     json.path("destinationIp").asText(""),
                     json.path("destinationPort").asInt(0),
                     destinations,
-                    json.path("code").asText(""));
+                    json.path("code").asText(""),
+                    json.path("address").asText(""),
+                    json.path("name").asText(""));
 
             byte[] body = PeerEgressFrame.encodeControl(control);
             assertEquals(canonical, HEX.formatHex(body), name + ": canonical body");

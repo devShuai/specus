@@ -25,10 +25,15 @@ Java HTTP 适配器复用现有 Netty HTTP 编解码、聚合及超时处理；.
 | POST `/api/config/validate` | `{revision,changes}` → `{saved:false,offline:true,warnings}` | 复用核心离线验证，可能读取显式密钥/TLS 引用；不写、不登录 |
 | POST `/api/config/save` | `{revision,changes}` → `{saved:true,offline:true,warnings}` | 校验后无损修改所选文件；不重连 |
 | POST `/api/connection` | `{action,revision}`，action 为 start/stop/restart | 只控制本管理进程拥有的运行时；restart 先校验再断开 |
+| GET `/api/egress` | `{revision,configPath,enabled,rules}` | 只读；`rules[]` 与 `egress rules --json` 同形（`index,match,action,enabled,inForce,egressClientId?,code?,refusal?`） |
+| POST `/api/egress/change` | `{revision,op,...}` → 同上加 `{saved,warnings}` | 只改 `peerEgressRules` 或 `peerEgressEnabled` 一个顶层值；不重连 |
+| POST `/api/egress/test` | `{address}` → `{address,takeover,matchedRuleIndex,ruleAction?,egressClientId?,result,resultWithTakeover?}` | 只读预演，不建连 |
 
 `revision` 是原始文件字节 SHA-256；不存在用 `missing`。`changes` 只接受 serverBaseUrl/apiKey/secret/peerMeshDevice，值为字符串；省略表示保留，凭据空字符串也表示保留。请求不接受文件路径、环境变量写入或任意配置属性。新增凭据字段可写入 env:/file: 引用，验证只检查可解析性，不把实际值替换到配置。
 
 应用返回类别：400 格式/超限/未知操作、401 未授权或过期、403 来源/Host 不符、404 路径不存在、405 方法不符、409 配置冲突/实例或运行时控制冲突、415 非 JSON 写请求、422 配置或文件校验失败、429 页面会话上限。传输层可在进入 JSON API 前以 413 拒绝过大请求（Java），或关闭超时/超额连接；前端也必须处理非 JSON/连接失败。错误不包含 HTTP 登录响应体、原始 JSON 解析片段或凭据值。
+
+出口规则编辑器与 `egress rule`/`egress enable|disable` 命令共用同一段计算：`op` 为 `add`（`match,action,egressClientId?,at?,disabled?`）、`remove`/`enable`/`disable`（`index`）、`move`（`index,to`）或 `takeover`（`enabled`，开启时必须带 `confirmed:true`，否则 422 且不修改）。会被拒绝的规则不写入（422，消息含错误码）；`revision` 与磁盘不一致时 409。开启接管的影响说明由页面在确认框里给出，响应的 `warnings` 只带页面没说的内容（如虚拟网卡模式为 noop）。写入与设置页相同：只替换一个顶层值、保留注释与其余内容、换行风格跟随原文件、原子写入。三端响应同形，`scripts/test-cli-ui.py` 逐一检查。
 
 `runtime.egress` 是出口分流状态，与 CLI `egress` 命令同一形状（见 [peer-egress.md 状态查询](../../protocol/spec/peer-egress.md#状态查询)）；未连接时缺省，页面据此显示「连接后显示」，而不是读取路由表。三端 UI 路由都必须带上它，`scripts/test-cli-ui.py` 对三端逐一检查两半都在。
 
