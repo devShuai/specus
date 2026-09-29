@@ -175,6 +175,7 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
   "sourceClientName": "client-a",
   "sourceVirtualIp": "100.96.0.1",
   "sourcePublicKey": "base64-public-key",
+  "sourceKeyEpoch": "f3a1c8d9e2b04756",
   "targetClientId": 2,
   "targetClientName": "client-b",
   "targetVirtualIp": "100.96.0.2",
@@ -223,6 +224,14 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 客户端会枚举 STUN 域名的全部 A/AAAA 结果并逐一探测；候选按 `priority` 降序检查，默认全局 IPv6
 host、IPv4 host、IPv6 srflx、IPv4 srflx 的 priority 分别为 `1200`、`1000`、`900`、`800`。
 Peer 数据面固定使用 SPM2，不提供旧帧协商或降级。
+
+**`sourceKeyEpoch` 必须携带，服务端必须原样转发。** 它是发送方本次运行实例的随机值，是对端派生
+SPM2 入向 traffic key 的唯一来源，见[数据面加密帧](#数据面加密帧)。它不是身份字段：服务端用已认证
+的控制连接覆盖 `sourceClient*`、`sourceVirtualIp`、`sourcePublicKey`，但既不生成也不改写这一个。
+把信令反序列化成本端 DTO 再重新序列化转发的服务端，**DTO 必须声明这个字段**，否则它在转发时被静默
+丢弃，两端都拿不到对端 epoch，session 建得起来却永远派生不出 traffic key，数据面完全不通。对端
+epoch 只能从对端自己的信令学到：`roster` 不携带它，服务端发给发起方的 `session-grant` 里的
+`sourceKeyEpoch` 是发起方自己的，对它没有意义。
 
 ### `session-grant`
 
@@ -561,8 +570,27 @@ prk = HMAC_SHA256(salt, sharedSecret)
 aesKey = HKDF-Expand(prk, "specus-peer-mesh/aes-gcm/v1", 32)
 ```
 
-每个授权 session 都产生新的 `sessionId + token`，它们构成数据面的 key epoch。服务端不得复用已关闭或
-过期的 session；客户端重启后必须申请新 session，不能在旧 key 下把 sequence 重置为 1。
+每个授权 session 都产生新的 `sessionId + token`。服务端不得复用已关闭或过期的 session；客户端重启后
+必须申请新 session，不能在旧 key 下把 sequence 重置为 1。
+
+基础 session key 双向共用。真正加解密用的是在它之上再派生一层的**单向 traffic key**，每个方向一把：
+
+```text
+salt   = big-endian uint64(sessionId)
+prk    = HMAC_SHA256(salt, aesKey)
+info   = "specus-peer-mesh/spm2/aes-gcm\n" + sessionId + "\n" + fromClientId + "\n" + toClientId
+         + "\n" + senderKeyEpoch
+material   = HKDF-Expand(prk, info, 36)
+trafficKey = material[0:32]；noncePrefix = big-endian uint32(material[32:36])
+```
+
+`senderKeyEpoch` 取自该方向**发送方**的 `sourceKeyEpoch`：出向用自己的，入向用对端在 `candidates`
+里带来的那个。**它是强制的，缺任何一侧都不得建立编解码器**，必须失败而不是退化成无 epoch 的派生：
+`sessionId + token` 在服务端 session TTL 内会被复用，X25519 密钥又持久化在磁盘上，少了这个每次运行
+都变的随机值，客户端重启后会在同一把 AES-GCM key 下重放同一段 nonce 空间。
+
+对端 epoch 变化说明对端重启了：它的 sequence 从 1 重新开始，因此收到新 epoch 时必须丢弃入向编解码器
+与重放窗口后重建，否则旧窗口会拒掉对端的每一帧。
 
 ### SPM2 帧
 

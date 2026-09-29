@@ -1905,6 +1905,38 @@ int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
     return 0;
 }
 
+/* Tells a departed client's peers that it is gone.
+ *
+ * Rosters were pushed when a client arrived and never when it left, so the peers of a device that
+ * disconnected kept it as online until something else in the tenant logged in. A consumer whose
+ * egress had stopped went on sending flows into a session nobody answered.
+ *
+ * Called after the session has been removed from the active list, so the rosters built here count
+ * the client as offline. A client already back on a newer session was announced by that login and
+ * is left alone. */
+int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
+                                const char *client_name)
+{
+    if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL
+        || runtime->online == NULL || !pm_has_text(client_name)
+        || !pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
+    st_storage_client departed;
+    if (st_storage_get_client_by_name(runtime->database_path, client_name, &departed) != 0) return -1;
+    if (runtime->online(runtime->ctx, departed.id, departed.client_name)) return 0;
+    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    size_t client_count = 0U;
+    if (st_storage_list_clients(runtime->database_path, clients,
+                                ST_PEER_MESH_MAX_CLIENTS, &client_count) != 0) return -1;
+    for (size_t i = 0; i < client_count; ++i) {
+        if (clients[i].id == departed.id
+            || strcmp(clients[i].tenant_id, departed.tenant_id) != 0
+            || !runtime->online(runtime->ctx, clients[i].id, clients[i].client_name)) continue;
+        (void)pm_push_roster(runtime, &clients[i], clients, client_count);
+        (void)pm_push_egress_catalog(runtime, &clients[i], clients, client_count);
+    }
+    return 0;
+}
+
 int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
                                 const char *tenant_id)
 {

@@ -13,10 +13,24 @@ public class LocalSpecusHandler extends NatCommonHandler {
     private final NatClientHandler specusHandler;
     private final int streamId;
     private final TcpHalfCloseState closeState = new TcpHalfCloseState();
+    private final StreamReceiveWindow receiveWindow = new StreamReceiveWindow();
 
     public LocalSpecusHandler(NatClientHandler specusHandler, int streamId) {
         this.specusHandler = specusHandler;
         this.streamId = streamId;
+    }
+
+    /**
+     * NatClientHandler publishes this handler from the channel initializer, and its connect returns
+     * as soon as the connect promise succeeds, which Netty completes before it fires channelActive on
+     * this channel's own loop. DATA or FIN that follows OPEN straight away can therefore arrive first.
+     * Holding the context from here lets that work queue behind channelActive on this loop instead of
+     * finding no context, resetting the stream and leaving its upstream connection open with no owner.
+     */
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        this.ctx = ctx;
+        super.handlerAdded(ctx);
     }
 
     @Override
@@ -79,6 +93,10 @@ public class LocalSpecusHandler extends NatCommonHandler {
             specusHandler.resetTcpStream(streamId, 7, "local TCP stream is not active");
             return;
         }
+        if (!receiveWindow.reserve(data.length)) {
+            execute(localCtx, () -> resetAndClose(localCtx, 8, "pending local TCP data exceeds receive window"));
+            return;
+        }
         execute(localCtx, () -> {
             if (!closeState.canReceiveRemoteData()) {
                 protocolViolation(localCtx, "remote TCP DATA after FIN");
@@ -89,14 +107,12 @@ public class LocalSpecusHandler extends NatCommonHandler {
                     resetAndClose(localCtx, 9, "write to local TCP channel failed");
                     return;
                 }
-                specusHandler.sendTcpWindowUpdate(streamId, data.length);
+                receiveWindow.release(data.length);
+                specusHandler.sendStreamWindowUpdate(streamId, data.length);
                 if (endStream) {
                     receiveRemoteFinOnEventLoop(localCtx);
                 }
             });
-            if (!localCtx.channel().isWritable()) {
-                specusHandler.pauseTcpControlReads();
-            }
         });
     }
 
@@ -199,11 +215,5 @@ public class LocalSpecusHandler extends NatCommonHandler {
         } else {
             ctx.executor().execute(task);
         }
-    }
-
-    @Override
-    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
-        specusHandler.updateControlAutoReadForLocalWritability();
-        super.channelWritabilityChanged(ctx);
     }
 }

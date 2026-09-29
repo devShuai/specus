@@ -80,7 +80,8 @@ func ValidateRule(rule Rule, meshCIDR string) string {
 	if action != ActionEgress && action != ActionDirect && action != ActionBlock {
 		return CodeRuleMalformed
 	}
-	if action == ActionEgress && rule.EgressClientID == nil {
+	// Zero and negative are no more a device than an absent id is.
+	if action == ActionEgress && (rule.EgressClientID == nil || *rule.EgressClientID <= 0) {
 		return CodeRuleMissingTarget
 	}
 	return ""
@@ -91,7 +92,10 @@ func ValidateRule(rule Rule, meshCIDR string) string {
 // Longest prefix wins; when two rules share a prefix length the earlier one wins. An unmatched
 // destination resolves to direct. That is the routing table's own behaviour rather than a fallback
 // branch: a destination with no installed route never reaches the tunnel device in the first place.
-func MatchRules(rules []Rule, destination string) Match {
+//
+// A rule that fails validation takes no part. It is refused, so it installs no route and can steer
+// nothing; letting it win the prefix contest here would describe traffic going somewhere it cannot.
+func MatchRules(rules []Rule, destination string, meshCIDR string) Match {
 	address, ok := ParseAddress(destination)
 	if !ok || len(rules) == 0 {
 		return Unmatched()
@@ -99,6 +103,9 @@ func MatchRules(rules []Rule, destination string) Match {
 	best := Unmatched()
 	bestPrefix := -1
 	for index, rule := range rules {
+		if ValidateRule(rule, meshCIDR) != "" {
+			continue
+		}
 		cidr, ok := ParseCIDR(rule.Match)
 		if !ok || !cidr.Contains(address) {
 			continue

@@ -421,13 +421,13 @@ public sealed partial class PeerMeshService
         var target = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.ClientName == request.ToClientName,
                 cancellationToken)
             .ConfigureAwait(false)
-            ?? throw new ArgumentException($"target client not found: {request.ToClientName}");
+            ?? throw new PeerSignalUndeliverableException($"target client not found: {request.ToClientName}");
         if (!await CanPeerAsync(source, target, cancellationToken).ConfigureAwait(false))
         {
-            throw new UnauthorizedAccessException("peer access denied");
+            throw new PeerSignalUndeliverableException("peer access denied");
         }
         var targetSession = _sessions.Find(target.ClientName)
-            ?? throw new InvalidOperationException($"target peer is offline: {target.ClientName}");
+            ?? throw new PeerSignalUndeliverableException($"target peer is offline: {target.ClientName}");
         await EnrichTargetAsync(signal, target, cancellationToken).ConfigureAwait(false);
         if (signal.SessionId is null && (signal.Type == TypeCandidates || signal.Type == "offer"))
         {
@@ -437,8 +437,16 @@ public sealed partial class PeerMeshService
             signal.ExpiresAt = grant.Session.ExpiresAt;
             await SendSessionGrantAsync(source, target, grant, cancellationToken).ConfigureAwait(false);
         }
-        await SendSignalAsync(targetSession, source.ClientName, target.ClientName, signal, cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            await SendSignalAsync(targetSession, source.ClientName, target.ClientName, signal, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+        {
+            // The target's connection went away between the lookup and the write.
+            throw new PeerSignalUndeliverableException($"target peer connection closed: {target.ClientName}", ex);
+        }
     }
 
     public async Task PushConfigAsync(ClientAccount account, CancellationToken cancellationToken)
@@ -498,6 +506,37 @@ public sealed partial class PeerMeshService
         }
         // A device coming online changes which egresses its peers see as reachable, so the
         // whole tenant is refreshed rather than only the device that just logged in.
+        await PushTenantEgressAsync(account.TenantId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Tells a departed client's peers that it is gone.
+    /// </summary>
+    /// <remarks>
+    /// Rosters were pushed when a client arrived and never when it left, so the peers of a device
+    /// that disconnected kept it as online until something else in the tenant logged in. A consumer
+    /// whose egress had stopped went on sending flows into a session nobody answered. Called once the
+    /// client's control session is unbound, so the roster built here counts it as offline; a client
+    /// already back on a newer connection was announced by that login and is left alone.
+    /// </remarks>
+    public async Task PushOnLogoutAsync(string clientName, CancellationToken cancellationToken)
+    {
+        if (!Enabled || string.IsNullOrWhiteSpace(clientName) || _sessions.Find(clientName) is not null)
+        {
+            return;
+        }
+        var account = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.ClientName == clientName,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (account is null)
+        {
+            return;
+        }
+        var targets = await RosterRefreshTargetsAsync(account, cancellationToken).ConfigureAwait(false);
+        foreach (var target in targets)
+        {
+            await PushRosterAsync(target, cancellationToken).ConfigureAwait(false);
+        }
         await PushTenantEgressAsync(account.TenantId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -2146,6 +2185,13 @@ public sealed class PeerControlMessage
 
     [JsonPropertyName("sourcePublicKey")]
     public string? SourcePublicKey { get; set; }
+
+    // The sender's random epoch for this run of its process, relayed verbatim. The peers derive
+    // their SPM2 traffic keys from it, so a signal that arrives without it leaves the receiver
+    // unable to build a codec and the data plane never comes up. The server neither reads nor
+    // rewrites it: FillSource owns the identity fields, this one belongs to the sender.
+    [JsonPropertyName("sourceKeyEpoch")]
+    public string? SourceKeyEpoch { get; set; }
 
     [JsonPropertyName("targetClientId")]
     public long TargetClientId { get; set; }

@@ -1,6 +1,5 @@
 package com.theshuai.specusclient.handler;
 
-import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.RecentStreamTombstones;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.handler.NatCommonHandler;
@@ -287,10 +286,6 @@ public class NatClientHandler extends NatCommonHandler {
                 return;
             }
             handler.writeFrame(wsCtx, data);
-            sendWindowUpdate(streamId, data.length);
-            if (!wsCtx.channel().isWritable()) {
-                pauseControlReads();
-            }
             return;
         }
         LocalSpecusHandler handler = channelHandlerMap.get(streamId);
@@ -408,7 +403,6 @@ public class NatClientHandler extends NatCommonHandler {
                         return;
                     }
                     channelGroup.add(channel);
-                    syncLocalReadWithControl(channel);
                     channel.closeFuture().addListener(future -> {
                         removeLocalHandler(streamId, localSpecusHandler);
                     });
@@ -508,10 +502,7 @@ public class NatClientHandler extends NatCommonHandler {
                         if (wsLocalChannels.containsKey(streamId)) {
                             markStreamClosed(streamId);
                         }
-                        ChannelHandlerContext removed = wsLocalChannels.remove(streamId);
-                        if (removed != null) {
-                            updateControlAutoReadForLocalWritability();
-                        }
+                        wsLocalChannels.remove(streamId);
                     });
                 });
     }
@@ -542,9 +533,7 @@ public class NatClientHandler extends NatCommonHandler {
         ChannelHandlerContext ctx = wsLocalChannels.get(streamId);
         if (ctx != null && ctx.pipeline().get(WsLocalSpecusHandler.class) == handler) {
             markStreamClosed(streamId);
-            if (wsLocalChannels.remove(streamId, ctx)) {
-                updateControlAutoReadForLocalWritability();
-            }
+            wsLocalChannels.remove(streamId, ctx);
         }
     }
 
@@ -729,27 +718,23 @@ public class NatClientHandler extends NatCommonHandler {
         StreamFlowController.get(ctx.channel()).onWindowUpdate(packet.getStreamId(), packet.getValue());
     }
 
+    /**
+     * Reads on this connection and on the local channels are not coupled here. Each local channel's
+     * reads belong to {@link StreamFlowController}, which pauses a stream that has no credit or cannot
+     * reach this connection. Writes towards a local channel are bounded per stream by
+     * {@link StreamReceiveWindow}, so this connection keeps reading however slow one upstream is.
+     */
     @Override
     public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
         StreamFlowController.get(ctx.channel()).onControlWritabilityChanged();
-        updateLocalAutoReadForControlWritability();
-        updateControlAutoReadForLocalWritability();
         super.channelWritabilityChanged(ctx);
-    }
-
-    void updateControlAutoReadForLocalWritability() {
-        if (ctx != null) {
-            ChannelBackpressure.setAutoRead(ctx.channel(), ctx.channel().isWritable() && localChannelsWritable());
-        }
     }
 
     void removeLocalHandler(int streamId, LocalSpecusHandler handler) {
         if (channelHandlerMap.get(streamId) == handler) {
             markStreamClosed(streamId);
         }
-        if (channelHandlerMap.remove(streamId, handler)) {
-            updateControlAutoReadForLocalWritability();
-        }
+        channelHandlerMap.remove(streamId, handler);
     }
 
     private void markStreamOpened(int streamId) {
@@ -779,7 +764,7 @@ public class NatClientHandler extends NatCommonHandler {
         }
     }
 
-    void sendTcpWindowUpdate(int streamId, int credit) {
+    void sendStreamWindowUpdate(int streamId, int credit) {
         sendWindowUpdate(streamId, credit);
     }
 
@@ -794,46 +779,8 @@ public class NatClientHandler extends NatCommonHandler {
         }
     }
 
-    void pauseTcpControlReads() {
-        pauseControlReads();
-    }
-
     boolean hasLocalTcpStream(int streamId) {
         return channelHandlerMap.containsKey(streamId);
-    }
-
-    private void pauseControlReads() {
-        if (ctx != null) {
-            ChannelBackpressure.setAutoRead(ctx.channel(), false);
-        }
-    }
-
-    private void updateLocalAutoReadForControlWritability() {
-        if (ctx == null) {
-            return;
-        }
-        boolean controlWritable = ctx.channel().isWritable();
-        channelGroup.forEach(channel -> ChannelBackpressure.setAutoRead(channel, controlWritable));
-        // WS 本地 Channel 不在 channelGroup 里（握手前还不算"已建立"），单独处理
-        wsLocalChannels.values().forEach(localCtx -> ChannelBackpressure.setAutoRead(localCtx.channel(), controlWritable));
-    }
-
-    void syncLocalReadWithControl(Channel channel) {
-        if (ctx != null) {
-            ChannelBackpressure.setAutoRead(channel, ctx.channel().isWritable());
-        }
-    }
-
-    private boolean localChannelsWritable() {
-        if (!ChannelBackpressure.allWritable(channelGroup)) {
-            return false;
-        }
-        for (ChannelHandlerContext wsCtx : wsLocalChannels.values()) {
-            if (!wsCtx.channel().isWritable()) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private synchronized void processRegisterResult(NatMessagePacket natMessagePacket) {

@@ -28,6 +28,7 @@ type fakeEgressConn struct {
 	wroteClose bool
 	reads      chan []byte
 	readErr    chan error
+	readCalls  int
 }
 
 func newFakeEgressConn() *fakeEgressConn {
@@ -35,6 +36,9 @@ func newFakeEgressConn() *fakeEgressConn {
 }
 
 func (c *fakeEgressConn) Read(buffer []byte) (int, error) {
+	c.mu.Lock()
+	c.readCalls++
+	c.mu.Unlock()
 	select {
 	case chunk := <-c.reads:
 		return copy(buffer, chunk), nil
@@ -77,6 +81,12 @@ func (c *fakeEgressConn) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.closed
+}
+
+func (c *fakeEgressConn) readCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readCalls
 }
 
 func (c *fakeEgressConn) written() [][]byte {
@@ -291,6 +301,98 @@ func TestEgressRuntimeOpensAndForwardsATCPFlow(t *testing.T) {
 	})
 	if got := string(harness.socket(0).written()[0]); got != string(data.Payload) {
 		t.Errorf("socket received %q", got)
+	}
+}
+
+func TestEgressRuntimeBackpressuresReaderAndResumesOnAck(t *testing.T) {
+	h := newEgressHarness(t)
+	t.Cleanup(func() { h.runtime.shutdown(flowEpoch) })
+	syn := egressSyn(t, "100.96.0.1", 40000, "203.0.113.10", 443)
+	h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+	ack := syn
+	ack.Seq++
+	ack.Ack = h.segments()[0].Seq + 1
+	ack.Flags, ack.Window = tcpFlagACK, 0
+	h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(ack)), flowEpoch)
+	key := egressFlowKey{protocol: ipv4ProtocolTCP, consumerIP: syn.SourceIP,
+		consumerPort: syn.SourcePort, remoteIP: syn.DestinationIP, remotePort: syn.DestinationPort}
+	socket := h.socket(0)
+	socket.reads <- make([]byte, 32768)
+	socket.reads <- make([]byte, 32768)
+	h.waitFor("bounded pending buffer", func() bool {
+		h.runtime.mu.Lock()
+		defer h.runtime.mu.Unlock()
+		flow, ok := h.runtime.flows.lookup(key)
+		return ok && len(flow.Handle.(*egressTCPFlow).conn.pending) == tcpSendBuffer
+	})
+	// No third read may start until an ACK releases budget. A reopened window alone
+	// moves bytes from pending to unacknowledged but does not release the memory budget.
+	ack.Window = 1
+	h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(ack)), flowEpoch)
+	if socket.readCount() != 2 {
+		t.Fatal("socket read continued while the send budget was full")
+	}
+	ack.Ack++
+	h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(ack)), flowEpoch)
+	h.waitFor("reader resumed after ACK", func() bool { return socket.readCount() == 3 })
+	h.runtime.shutdown(flowEpoch)
+	h.waitFor("socket closed after shutdown", socket.isClosed)
+}
+
+func TestEgressRuntimeQueueWritableRotatesWaitingFlows(t *testing.T) {
+	h := newEgressHarness(t)
+	t.Cleanup(func() { h.runtime.shutdown(flowEpoch) })
+	for i := 0; i < 2; i++ {
+		syn := egressSyn(t, "100.96.0.1", 40000+i, "203.0.113.10", 443)
+		h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+		segments := h.segments()
+		ack := syn
+		ack.Seq++
+		ack.Ack, ack.Flags = segments[len(segments)-1].Seq+1, tcpFlagACK
+		h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(ack)), flowEpoch)
+	}
+	queue := make(chan []byte, 1)
+	queue <- []byte("occupied")
+	h.runtime.mu.Lock()
+	h.runtime.send = func(_ int64, frame []byte) error {
+		select {
+		case queue <- frame:
+			return nil
+		default:
+			return errEgressQueueFull
+		}
+	}
+	for _, flow := range h.runtime.flowSnapshot() {
+		handle := flow.Handle.(*egressTCPFlow)
+		h.runtime.applyTCPOutput(7, flow, handle, handle.conn.onAppData(make([]byte, 3000), flowEpoch), flowEpoch)
+		if !handle.conn.sendBlocked {
+			t.Error("full queue was not reported")
+		}
+	}
+	h.runtime.mu.Unlock()
+	<-queue
+	for i := 0; i < 2; i++ {
+		h.runtime.sendReady(flowEpoch)
+		select {
+		case raw := <-queue:
+			frame, _ := parsePeerEgressFrame(raw)
+			segment, ok := parseTCPSegment(frame.Body)
+			if !ok || segment.DestinationPort != uint16(40000+i) || len(segment.Payload) == 0 {
+				t.Fatalf("waiting flow did not get its turn: %+v", segment)
+			}
+		default:
+			t.Fatal("queue drained but pending data was not resumed")
+		}
+	}
+}
+
+func TestEgressRuntimeCloseWakesBackpressuredReader(t *testing.T) {
+	handle := &egressTCPFlow{wake: make(chan struct{}, 1), socket: newFakeEgressConn()}
+	closeEgressHandle(handle)
+	select {
+	case <-handle.wake:
+	default:
+		t.Fatal("closing a flow left its reader waiting for send credit")
 	}
 }
 
