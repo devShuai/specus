@@ -58,8 +58,8 @@
         </form>
       </section>
       <section class="panel rules-panel" aria-labelledby="preview-title"><div class="section-heading"><h2 id="preview-title">预演</h2></div>
-        <p class="muted">按配置判断一个 IPv4 地址会命中哪条规则、去向如何。不建立任何连接，也不代表出口设备在线。</p>
-        <form id="preview-form" class="inline-form" autocomplete="off"><input id="preview-address" placeholder="203.0.113.5" aria-label="要预演的 IPv4 地址" required spellcheck="false"><button type="submit">预演</button></form>
+        <p class="muted">「预演」按配置判断一个 IPv4 地址会命中哪条规则、去向如何，不建立任何连接，也不代表出口设备在线。「连通测试」从本机真实连接一次指定端口，只说明能否连上，不说明走了哪条路径。</p>
+        <form id="preview-form" class="inline-form" autocomplete="off"><input id="preview-address" placeholder="203.0.113.5" aria-label="要预演的 IPv4 地址" required spellcheck="false"><button type="submit">预演</button><input id="preview-port" class="port" value="443" inputmode="numeric" aria-label="连通测试的 TCP 端口"><button type="button" id="preview-connect">连通测试</button></form>
         <p id="preview-result" role="status"></p>
       </section>
     </section>

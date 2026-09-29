@@ -347,25 +347,8 @@ public final class EgressEdit {
         int code = 0;
         int port = options.egress().connect();
         if (port > 0) {
-            String target = address + ":" + port;
-            long started = System.nanoTime();
-            var probe = new LinkedHashMap<String, Object>();
-            probe.put("port", port);
-            try (var socket = new Socket()) {
-                socket.connect(new InetSocketAddress(address, port), 5_000);
-                long elapsed = (System.nanoTime() - started) / 1_000_000;
-                probe.put("ok", true);
-                probe.put("millis", elapsed);
-                lines.add("Connection test to " + target + ": connected in " + elapsed
-                        + " ms. This shows the address is reachable, not which path carried it.");
-            } catch (Exception error) {
-                long elapsed = (System.nanoTime() - started) / 1_000_000;
-                probe.put("ok", false);
-                probe.put("millis", elapsed);
-                probe.put("error", String.valueOf(error.getMessage()));
-                lines.add("Connection test to " + target + ": failed (" + error.getMessage() + ")");
-                code = 4;
-            }
+            var probe = connectProbe(address, port, lines);
+            if (!Boolean.TRUE.equals(probe.get("ok"))) code = 4;
             data.put("connect", probe);
         }
         String last = lines.get(lines.size() - 1);
@@ -375,6 +358,33 @@ public final class EgressEdit {
             return CliOutput.result(false, options.command(), code, null, last);
         }
         return CliOutput.result(options.json(), options.command(), 0, data, String.join("\n", lines));
+    }
+
+    /**
+     * Connects to address:port once, within five seconds, and adds the line that reports it. It shows
+     * the address is reachable from this device, not which path carried the connection; the preview
+     * says that. The command and the local page run the same probe and report it the same way.
+     */
+    static LinkedHashMap<String, Object> connectProbe(String address, int port, List<String> lines) {
+        String target = address + ":" + port;
+        long started = System.nanoTime();
+        var probe = new LinkedHashMap<String, Object>();
+        probe.put("port", port);
+        try (var socket = new Socket()) {
+            socket.connect(new InetSocketAddress(address, port), 5_000);
+            long elapsed = (System.nanoTime() - started) / 1_000_000;
+            probe.put("ok", true);
+            probe.put("millis", elapsed);
+            lines.add("Connection test to " + target + ": connected in " + elapsed
+                    + " ms. This shows the address is reachable, not which path carried it.");
+        } catch (Exception error) {
+            long elapsed = (System.nanoTime() - started) / 1_000_000;
+            probe.put("ok", false);
+            probe.put("millis", elapsed);
+            probe.put("error", String.valueOf(error.getMessage()));
+            lines.add("Connection test to " + target + ": failed (" + error.getMessage() + ")");
+        }
+        return probe;
     }
 
     /** What the configured rules decide for one IPv4 address, and what takeover being on would change. */
@@ -489,8 +499,15 @@ public final class EgressEdit {
         String address = trim(body.path("address").asText(""));
         String problem = addressProblem(address);
         if (problem != null) throw new LocalUi.Failure(422, problem);
+        // A port asks for a real connection as well; without one the answer is the preview alone.
+        var connect = body.get("connect");
+        int port = connect != null && connect.isInt() ? connect.asInt() : -1;
+        if (connect != null && (port < 1 || port > 65535)) {
+            throw new LocalUi.Failure(422, "connect must be a TCP port between 1 and 65535");
+        }
         Loaded loaded = uiLoad(path);
         var data = preview(path, loaded.config(), address, new ArrayList<>());
+        if (connect != null) data.put("connect", connectProbe(address, port, new ArrayList<>()));
         data.put("schemaVersion", 1);
         return data;
     }

@@ -132,6 +132,8 @@ func (u *localUI) egressChange(w http.ResponseWriter, r *http.Request) {
 func (u *localUI) egressTest(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Address string `json:"address"`
+		// A port asks for a real connection as well; without one the answer is the preview alone.
+		Connect *int `json:"connect"`
 	}
 	if !uiDecode(w, r, &body) {
 		return
@@ -141,11 +143,18 @@ func (u *localUI) egressTest(w http.ResponseWriter, r *http.Request) {
 		uiError(w, 422, problem)
 		return
 	}
+	if body.Connect != nil && (*body.Connect < 1 || *body.Connect > 65535) {
+		uiError(w, 422, "connect must be a TCP port between 1 and 65535")
+		return
+	}
 	_, _, config, ok := u.egressLoad(w)
 	if !ok {
 		return
 	}
 	data, _ := egressPreview(u.path, config, address)
+	if body.Connect != nil {
+		data["connect"], _ = egressConnectProbe(address, *body.Connect)
+	}
 	data["schemaVersion"] = 1
 	uiJSON(w, 200, data)
 }
