@@ -67,6 +67,11 @@ final class PeerEgressSocketDialer implements PeerEgressRuntime.Dialer {
         }
 
         @Override
+        public int read(byte[] buffer, int length) throws IOException {
+            return channel.read(ByteBuffer.wrap(buffer, 0, Math.min(length, buffer.length)));
+        }
+
+        @Override
         public void write(byte[] data) throws IOException {
             ByteBuffer remaining = ByteBuffer.wrap(data);
             while (remaining.hasRemaining()) {
@@ -121,6 +126,11 @@ final class PeerEgressSocketDialer implements PeerEgressRuntime.Dialer {
         @Override
         public int read(byte[] buffer) throws IOException {
             return channel.read(ByteBuffer.wrap(buffer));
+        }
+
+        @Override
+        public int read(byte[] buffer, int length) throws IOException {
+            return channel.read(ByteBuffer.wrap(buffer, 0, Math.min(length, buffer.length)));
         }
 
         @Override

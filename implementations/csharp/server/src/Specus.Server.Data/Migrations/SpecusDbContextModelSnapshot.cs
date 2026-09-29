@@ -367,6 +367,10 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("channel_id");
 
+                    b.Property<bool>("ClientEgressDomainTargets")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_egress_domain_targets");
+
                     b.Property<int>("ClientEgressVersion")
                         .HasColumnType("INTEGER")
                         .HasColumnName("client_egress_version");

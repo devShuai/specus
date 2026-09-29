@@ -50,8 +50,8 @@ public class PeerEgressResource {
     public PeerMeshEgressSwitchView setSwitch(@AuthenticationPrincipal Jwt jwt,
                                               @RequestBody SwitchMutation request) {
         ManagementContext context = contextResolver.resolve(jwt);
-        PeerMeshEgressSwitchView view = peerEgressService.setSwitch(context,
-                request.enabled() != null && request.enabled());
+        // Passed through as given: a body without "enabled" is refused with 400, not taken as off.
+        PeerMeshEgressSwitchView view = peerEgressService.setSwitch(context, request.enabled());
         // Turning the tenant off has to reach the peers now, like any other authorization change.
         peerSignalService.pushTenantEgress(context.tenant().tenantId());
         return view;
@@ -66,7 +66,12 @@ public class PeerEgressResource {
         return peerEgressService.listPolicyViews(contextResolver.resolve(jwt));
     }
 
-    /** Upsert by {@code egressClientId}; omitted fields keep their stored value. */
+    /**
+     * Upsert by {@code egressClientId}; omitted fields keep their stored value.
+     *
+     * <p>{@code destinationRules} is stored normalised or refused whole with 400, never saved in
+     * part; the response carries the rules as stored.
+     */
     @PostMapping("/policies")
     public PeerMeshEgressPolicyView upsert(@AuthenticationPrincipal Jwt jwt,
                                            @RequestBody PeerEgressService.PolicyMutation request) {

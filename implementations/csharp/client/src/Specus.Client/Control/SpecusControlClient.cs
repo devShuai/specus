@@ -78,6 +78,9 @@ public sealed class SpecusControlClient : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<SpecusControlClient>();
     }
 
+    /// <summary>The egress section the status file carries, read live for a page in this process.</summary>
+    internal Dictionary<string, object?> EgressStatus() => _peerMesh.EgressStatus();
+
     public void SetLocalPeerServicePublished(string serviceId, bool published)
     {
         _peerMesh.SetLocalServicePublished(serviceId, published);

@@ -8,7 +8,8 @@
     "规则变更对已建流：已建流不受影响，除非规则从 allow 变为 deny 或不再匹配，此时立即断开并向出口发送 flow-purge 控制消息。",
     "meshCidr 取默认 100.96.0.0/11；部署使用其它网段时按实际值判定重叠。",
     "校验失败的规则不参与匹配，实现必须在匹配前跳过它们。否则一条被拒的长前缀规则仍会压过合法的短前缀规则，运维读到的「已拒绝」与流量实际走向不符。",
-    "egressClientId 必须是正整数：缺失、0 与负数都返回 EGRESS_RULE_MISSING_TARGET。字段在场不等于字段有效。"
+    "egressClientId 必须是正整数：缺失、0 与负数都返回 EGRESS_RULE_MISSING_TARGET。字段在场不等于字段有效。",
+    "enabled 缺省为 true；显式 false 的规则返回 EGRESS_RULE_DISABLED，排在所有校验之前。它与被拒的规则一样不参与匹配、不安装路由，但它是用户的选择而不是配置错误，config validate 不为它告警。"
   ],
   "meshCidr": "100.96.0.0/11",
   "rules": [
@@ -62,6 +63,12 @@
       "match": "172.16.5.0/24",
       "action": "egress",
       "egressClientId": 0
+    },
+    {
+      "index": 9,
+      "match": "198.51.100.0/25",
+      "action": "block",
+      "enabled": false
     }
   ],
   "refusedRules": [
@@ -74,6 +81,11 @@
       "index": 8,
       "code": "EGRESS_RULE_MISSING_TARGET",
       "reason": "egressClientId 为 0，不是有效标识"
+    },
+    {
+      "index": 9,
+      "code": "EGRESS_RULE_DISABLED",
+      "reason": "用户停用；停用的规则留在列表里，不参与匹配、不安装路由"
     }
   ],
   "cases": [
@@ -180,6 +192,17 @@
       "expect": {
         "action": "egress",
         "matchedRuleIndex": 7,
+        "reason": "matched",
+        "egressClientId": 3
+      }
+    },
+    {
+      "name": "disabled-rule-does-not-steer-traffic",
+      "destination": "198.51.100.20",
+      "description": "覆盖它的 /25 已被用户停用，落回 /24 的 egress；停用与被拒一样不参与匹配",
+      "expect": {
+        "action": "egress",
+        "matchedRuleIndex": 2,
         "reason": "matched",
         "egressClientId": 3
       }
@@ -365,6 +388,27 @@
       "reason": "0 是本项目里「没有消费端」的哨兵值。接受它等于让规则过校验、路由照常安装，然后每个包都找不到出口对端——配置期能报出的错被推迟成运行期的黑洞"
     },
     {
+      "name": "disabled-rule",
+      "rule": {
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2,
+        "enabled": false
+      },
+      "code": "EGRESS_RULE_DISABLED",
+      "reason": "用户停用的规则。留在配置里，不参与匹配、不安装路由；状态里以 inForce=false 列出"
+    },
+    {
+      "name": "disabled-outranks-everything",
+      "rule": {
+        "match": "example.com",
+        "action": "forward",
+        "enabled": false
+      },
+      "code": "EGRESS_RULE_DISABLED",
+      "reason": "停用是用户的明确选择，排在所有内容检查之前：一条停用的规则不必先修好才能留在列表里"
+    },
+    {
       "name": "negative-egress-client-id",
       "rule": {
         "match": "203.0.113.0/24",
@@ -374,5 +418,140 @@
       "code": "EGRESS_RULE_MISSING_TARGET",
       "reason": "同上：标识必须是正整数，字段在场不等于字段有效"
     }
-  ]
+  ],
+  "consumerDisabled": {
+    "description": "peerEgressEnabled=false：规则只保存不接管。每条规则 inForce=false，错误码 EGRESS_CONSUMER_DISABLED；本身停用的规则仍报 EGRESS_RULE_DISABLED。任何目的地址都不命中规则，按未匹配处理——没有安装路由的目标本来就不进 TUN。",
+    "ruleCodes": [
+      {
+        "index": 0,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 1,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 2,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 3,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 4,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 5,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 6,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 7,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 8,
+        "code": "EGRESS_CONSUMER_DISABLED"
+      },
+      {
+        "index": 9,
+        "code": "EGRESS_RULE_DISABLED"
+      }
+    ],
+    "cases": [
+      {
+        "destination": "203.0.113.200",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "203.0.113.10",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "198.51.100.50",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "198.51.100.51",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "192.0.2.5",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "8.8.8.8",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "203.0.113.128",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "203.0.113.255",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "192.0.2.200",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "172.16.5.10",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "destination": "198.51.100.20",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      }
+    ]
+  }
 }

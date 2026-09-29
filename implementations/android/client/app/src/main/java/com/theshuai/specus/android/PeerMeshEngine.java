@@ -77,6 +77,12 @@ final class PeerMeshEngine implements Closeable {
     private static final long REPORT_INTERVAL_MS = 60_000L;
     private static final long MAINTENANCE_INTERVAL_MS = 30_000L;
     private static final long DIRECT_STALE_MS = 45_000L;
+    /**
+     * How long a session must have heard nothing direct from its peer before a data frame arriving
+     * over the relay moves this side's sending to the relay. Frames already in flight on the two
+     * paths otherwise flip each side back and forth, and under load the two sides never settle.
+     */
+    private static final long RELAY_FOLLOW_QUIET_MS = 3_000L;
     private static final long PENDING_PROBE_TTL_MS = 15_000L;
     private static final long PROBE_CLOCK_SKEW_MS = 15_000L;
     private static final long RTT_HYSTERESIS_MS = 100L;
@@ -1262,7 +1268,14 @@ final class PeerMeshEngine implements Closeable {
         if (frame == null || !session.accept(frame)) {
             return;
         }
-        markSessionPath(session, remote, relayFromAllocationId, -1L);
+        long now = System.currentTimeMillis();
+        if (!isBlank(relayFromAllocationId)
+                && session.lastDirectSuccessMillis > 0L
+                && now - session.lastDirectSuccessMillis <= RELAY_FOLLOW_QUIET_MS) {
+            session.lastRelaySuccessMillis = now;
+        } else {
+            markSessionPath(session, remote, relayFromAllocationId, -1L);
+        }
         session.pathReady = true;
         if (handlePathMtuMessage(frame.plaintext, session)) {
             return;
@@ -1381,7 +1394,13 @@ final class PeerMeshEngine implements Closeable {
                         probeReplayExpiry(sentAtMillis), now)) {
             return;
         }
-        markSessionPath(session, remote, relayFromAllocationId, -1L);
+        if (!isBlank(relayFromAllocationId) && session.hasHealthyDirect(now)) {
+            // The peer checks its relay the whole time a direct path works. The reply goes back
+            // over the relay; this side's data stays on the direct path.
+            session.lastRelaySuccessMillis = now;
+        } else {
+            markSessionPath(session, remote, relayFromAllocationId, -1L);
+        }
         session.pathReady = true;
         flushPending(peerId);
 
@@ -3660,6 +3679,14 @@ final class PeerMeshEngine implements Closeable {
             remoteKeyEpoch = epoch;
             inboundCodec = null;
             replay = new ReplayWindow();
+            if (changed) {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                endpointSuccessMillis = 0L;
+                endpointRtt = Long.MAX_VALUE;
+                lastDirectSuccessMillis = 0L;
+            }
             return changed;
         }
 

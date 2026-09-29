@@ -1,6 +1,7 @@
 package client
 
 import (
+	"net"
 	"testing"
 	"time"
 )
@@ -229,4 +230,40 @@ func mapSection(t *testing.T, status map[string]any, key string) map[string]any 
 		t.Fatalf("status carries no %q section: %#v", key, status)
 	}
 	return section
+}
+
+// Each egress peer says what carries its traffic now and how many flows it has: the path a person
+// asks about first when an egress is slow is whether the frames go direct or through the relay.
+func TestEgressStatusNamesThePathToEachEgressPeer(t *testing.T) {
+	mesh := newEgressMeshHarness(t)
+	defer mesh.shutdownEgress()
+	mesh.egressRoutes = newEgressRouteInstaller(newFakeRouteCommander(), journalPath(t))
+	applyEgressRulesForTest(t, mesh, []egressRule{
+		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42},
+		{Match: "198.51.100.0/24", Action: egressActionEgress, EgressClientID: 43},
+		{Match: "192.0.2.0/24", Action: egressActionEgress, EgressClientID: 44},
+	}, statusRuntimeConfig())
+
+	mesh.mu.Lock()
+	if mesh.sessions == nil {
+		mesh.sessions = map[int64]*peerMeshSession{}
+	}
+	expires := time.Now().Add(time.Hour)
+	mesh.sessions[42] = &peerMeshSession{ID: 1, PeerID: 42, ExpiresAt: expires,
+		RemoteEndpoint: &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 41000}}
+	mesh.sessions[43] = &peerMeshSession{ID: 2, PeerID: 43, ExpiresAt: expires, RelayTargetAllocationID: "allocation-7"}
+	mesh.mu.Unlock()
+
+	consumer := mapSection(t, mesh.egressStatusJSON(), "consumer")
+	peers, _ := consumer["peers"].([]map[string]any)
+	want := map[int64]string{42: "direct", 43: "relay", 44: "none"}
+	if len(peers) != len(want) {
+		t.Fatalf("peers = %#v, want one entry for each of %v", peers, want)
+	}
+	for _, peer := range peers {
+		id, _ := peer["clientId"].(int64)
+		if peer["path"] != want[id] || peer["flows"] != 0 {
+			t.Errorf("peer %d = %#v, want path %q and flows 0", id, peer, want[id])
+		}
+	}
 }

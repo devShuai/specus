@@ -27,10 +27,17 @@ final class ConfigDiagnostics {
     private static void egressRules(ClientStartupConfig effective, Consumer<String> warning) {
         var rules = effective.getPeerEgressRules();
         if (rules == null) return;
+        // Kept with the master switch off is the one state where nothing is in force by design,
+        // said once rather than left to be discovered. A rule the user switched off is not warned
+        // about: it is out of force because they asked.
+        if (!rules.isEmpty() && !effective.isPeerEgressEnabled())
+            warning.accept("peerEgressRules has " + rules.size()
+                    + " rule(s) but peerEgressEnabled is false: none is in force");
         for (int index = 0; index < rules.size(); index++) {
             String code = com.theshuai.common.peeregress.PeerEgressRules.validate(rules.get(index),
                     com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR);
-            if (code != null) warning.accept("peerEgressRules[" + index + "] is not in force: " + code);
+            if (code != null && !com.theshuai.common.peeregress.PeerEgressCodes.RULE_DISABLED.equals(code))
+                warning.accept("peerEgressRules[" + index + "] is not in force: " + code);
         }
     }
 

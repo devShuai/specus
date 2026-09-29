@@ -33,7 +33,9 @@
 
 出口由两级开关控制，**两者都打开**这台设备才会作为出口：租户级总开关，与这台设备自己的出口策略。策略变更会立即推送给在线设备，不必等它重新登录。
 
-管理后台目前**没有**出口分流页面，请通过管理接口操作。所有请求都需要管理员登录后的 Bearer 令牌。
+管理后台「私有组网 → 出口分流」页提供这些操作：总开关（开关前说明影响）、为设备新增或编辑出口策略（目标范围、授权的消费设备、目的规则、限额、启用）、启停与删除。页面保存前按出口的解析规则校验目的规则——网段必须主机位为零、协议只认小写 `tcp`/`udp`、端口不能为空（全部端口写「全部」）——并提示强制拒绝的地址、与目标范围不符的网段；列表逐条说明策略为什么没有生效（总开关关闭、设备未启用组网、Peer ACL 未放行、没有目的规则），并标出已存下但出口永远不会匹配的规则。
+
+也可以直接调用管理接口，下文给出请求形状。所有请求都需要管理员登录后的 Bearer 令牌。服务端保存策略时按出口的读法校验目的规则，出口读不懂的规则整个请求以 400 拒绝（规则见[规范](../../protocol/spec/peer-egress.md#出口授权模型)）；非 ADMIN 修改为 403，设备或策略不存在为 404。在此之前保存的策略里可能仍有无效规则，管理后台会在列表里标出。
 
 打开租户开关：
 
@@ -75,7 +77,9 @@ Content-Type: application/json
 
 ## 二、消费端：写规则
 
-在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。列表非空即启用，没有单独的开关。
+在消费端的 `client.jsonc` 里加 `peerEgressRules`，三端共用这个字段。**规则写好只是保存，还要把 `peerEgressEnabled` 设为 `true` 才会接管流量**：保存规则与启用系统接管是两步，默认关闭。
+
+开关关闭而规则不为空时，`config validate` 和每次启动都会提示 `peerEgressRules has <N> rule(s) but peerEgressEnabled is false: none is in force`，`specus-client egress` 显示 `consumer: takeover off`，每条规则的状态是 `EGRESS_CONSUMER_DISABLED`。启用前请确认：客户端需要创建虚拟网卡与安装路由的权限（`peerMeshDevice` 不能是 `noop`）；只有命中规则的目标会被接管，其余流量保持本地直连；命中 `egress` 规则而出口不可用时流量被阻断，不会改走本机。
 
 ```jsonc
 {
@@ -83,13 +87,17 @@ Content-Type: application/json
   "apiKey": "env:SPECUS_API_KEY",
   "secret": "env:SPECUS_SECRET",
   "peerMeshDevice": "auto",
+  // 启用系统接管；不写或写 false 时规则只保存、不生效
+  "peerEgressEnabled": true,
   "peerEgressRules": [
     // 这个网段经 2 号设备访问
     {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
     // 其中这一台仍然本地直连
     {"match": "203.0.113.10", "action": "direct"},
     // 这个网段一律不通
-    {"match": "198.51.100.0/24", "action": "block"}
+    {"match": "198.51.100.0/24", "action": "block"},
+    // 暂时停用的规则：留在列表里，不参与匹配
+    {"match": "192.0.2.0/24", "action": "egress", "egressClientId": 2, "enabled": false}
   ]
 }
 ```
@@ -116,6 +124,40 @@ Content-Type: application/json
 | `EGRESS_RULE_MESH_OVERLAP` | 与 Peer Mesh 虚拟网段重叠 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 规则里写了 `port`。端口限制只在出口策略里配置 |
 | `EGRESS_RULE_MISSING_TARGET` | `action` 是 `egress` 但没有有效的 `egressClientId` |
+
+规则写 `"enabled": false` 即停用：它留在列表里但不参与匹配、不安装路由，状态里显示 `EGRESS_RULE_DISABLED`。停用是用户的选择，`config validate` 不为它告警。
+
+### 用命令编辑规则
+
+不想手改 JSONC 时，三端都提供同一组编辑命令（Java 为 `java -jar specus-client-exec.jar egress ...`）。它们只改配置文件、不碰正在运行的客户端，运行中的客户端**重启后**才应用；每次写入都会提示这一点。
+
+```bash
+specus-client egress rules --config client.jsonc
+specus-client egress rule add --config client.jsonc --match 203.0.113.0/24 --action egress --egress-client-id 2
+specus-client egress rule add --config client.jsonc --match 203.0.113.10 --action direct --at 0
+specus-client egress rule disable --config client.jsonc --index 1
+specus-client egress rule move --config client.jsonc --index 1 --to 0
+specus-client egress enable --config client.jsonc --yes
+specus-client egress test 203.0.113.5 --config client.jsonc
+```
+
+- `egress rules` 列出开关状态与每条规则，形如 `[0] on 203.0.113.0/24 egress 2`；规则本身会被拒绝时在行尾写明错误码与原因。
+- `egress rule add` 会先按上表校验，会被拒绝的规则不写入（`Rule not added: EGRESS_RULE_DOMAIN_UNSUPPORTED (...)`，退出码 2）。`--at` 指定插入位置，`--disabled` 以停用状态加入。
+- `egress rule remove|enable|disable --index N` 与 `egress rule move --index N --to M` 按 `egress rules` 显示的序号操作。
+- `egress enable` 每次都先说明接管意味着什么（需要创建虚拟网卡与安装路由的权限、只接管命中规则的目标、出口不可用时阻断而不改走本机），不加 `--yes` 时不做任何修改、退出码 2。`peerMeshDevice` 为 `noop` 时另有一行提醒。`egress disable` 直接关闭。
+- `egress test ADDRESS` 只根据配置预演该 IPv4 地址会命中哪条规则、结果是经哪个出口、阻断还是本地直连，**不建立任何连接**；开关关闭时同时给出"开启后会怎样"。加 `--connect PORT` 才会做一次 5 秒内的 TCP 连接测试，它只说明地址可达，不说明走的是哪条路径。域名会被明确拒绝，请先解析成地址。
+
+编辑只替换 `peerEgressRules` 或 `peerEgressEnabled` 这一个值，文件里其他内容与注释原样保留，换行风格（LF/CRLF）跟随原文件；写入是原子的，文件在读取后被别处改过则拒绝写入。`peerEgressRules` 列表内部的注释在编辑后不保留，因为整个列表会按每行一条规则重写。所有子命令都支持 `--json`。
+
+本地管理页（`specus-client ui`）的「出口规则」页提供同样的编辑：列表中逐条启用/停用、上移/下移、删除，表单添加规则，开关开启前弹出同样的影响说明，另可预演地址去向。页面与命令走同一段逻辑，写出的文件相同。
+
+### 用 Windows 桌面端编辑规则
+
+桌面端（`specus-desktop`）的「出口分流」页提供同一组操作：添加规则（目标、动作、出口设备可从在线设备中选或填 ID，可放在最前、可先停用）、逐条启用/停用、上移/下移、删除，以及系统接管开关——开启前每次弹出与 `egress enable` 相同的影响说明。规则的校验与上面的命令、本地管理页是同一段逻辑，被拒绝的规则同样不写入，并给出原因与错误码。
+
+- 桌面端的规则与开关保存在桌面端自己的设置里（与连接设置同一个文件），不读写 `client.jsonc`；**断开后重新连接**才会应用到正在运行的连接。
+- 「规则测试」分成两个按钮：「按配置预演」只按已保存的规则判断去向，不建立连接；「连通测试」真实连接一次指定端口，只说明能否连上，不说明走了哪条路径。
+- 「运行状态」与本地管理页的状态卡片一致：只列出不起作用的规则、没装上的路由、离线或尚无路径的出口设备、路由下发失败，其余只计数；并显示本机作为出口时的流数与拒绝计数。
 
 ## 三、确认规则生效
 
@@ -199,11 +241,10 @@ ip rule add fwmark 0x5350 table 100
 
 完整列表见规范的[当前限制](../../protocol/spec/peer-egress.md#当前限制)。影响使用的几条：
 
-- **经出口下载大响应会失败，不是变慢。** 出口从目标读到多少就立刻发给消费端，不看消费端的接收窗口，也没有拥塞窗口。超出接收端能容纳的量之后，多余的段被丢弃，重传仍按原速发进同一个满窗口，重传次数耗尽（约 113 秒）后连接被复位，应用看到 `Connection reset by peer`。真机实测：256 KiB 以内毫秒级完成，512 KiB 只到 8.6%、1 MiB 只到 46% 就复位；同方向上传 8 MiB 正常。**界限在几百 KiB 量级，随接收端 socket 缓冲浮动**，一张稍大的图片就可能超过。有丢包的链路更早失败。修复跟踪在 #74。
+- **下行只有有界发送窗口，没有自适应拥塞控制。** 此前经出口下载大响应会被复位的问题已修复（#74）：出口按消费端通告的窗口发送，并对目标 socket 施加背压。Linux 上三种语言两两组合的 9 种组合在每次 PR 上用真 TUN 验证 8 MiB 上下行、64 条并发流与 2% 丢包下的完整性（见[真机实验室](../../scripts/peer-egress-lab/README.md)）；Windows 与 macOS 的真 TUN 验收仍在 #50 中进行。
 - **客户端不处理服务端下发的出口目录，也不上报出口计数。** 出口是否可用取自组网在线状态；管理接口的活动页现在总是空的。
 - **遇到版本过旧的对端时没有专门提示**，只会表现为出口离线。
 - **出口侧没有字节速率限制**，只有并发数与空闲超时上限。
 - **切网或休眠恢复后，路由最多在 5 秒内补回；这 5 秒内命中规则的目标会从本机直连出去，而不是被阻断。** 日志里的 `route … put back` 说明发生过一次补回；如果它频繁出现，说明有别的东西在反复改路由表。Linux 上只对照主表，另一个 VPN 用策略路由把流量导走时发现不了。
 - **控制连接断开重连时路由保持不变**，不再有窗口。断开期间客户端只挂起：路由与虚拟网卡都留着，命中规则的流量仍然被接管，由出口承载或被拒绝；已建立的对端流量走 UDP，不受影响。只有真正退出时才撤回路由。
 - **Windows 的路由安装与撤销尚未在真机上执行过**；macOS 的安装路径在 CI 真机上验证过，但指向的是回环接口而不是 utun。
-- **桌面图形界面没有出口分流页面。**

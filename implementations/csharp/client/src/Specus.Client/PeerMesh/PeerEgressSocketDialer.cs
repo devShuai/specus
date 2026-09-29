@@ -94,9 +94,11 @@ internal sealed class PeerEgressSocketDialer(PeerEgressSocketBinder binder) : IP
             }
         }
 
-        public int Read(byte[] buffer)
+        public int Read(byte[] buffer) => Read(buffer, buffer.Length);
+
+        public int Read(byte[] buffer, int length)
         {
-            var read = _socket.Receive(buffer);
+            var read = _socket.Receive(buffer, 0, Math.Min(length, buffer.Length), SocketFlags.None);
             // A zero-length receive on a stream socket is the peer's end of stream, which the plane
             // turns into a FIN. Reporting it as zero bytes would spin the reader loop instead.
             return read == 0 ? -1 : read;

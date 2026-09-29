@@ -39,6 +39,11 @@ public final class PeerEgressRules {
         if (rule == null) {
             return PeerEgressCodes.RULE_MALFORMED;
         }
+        // Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
+        // should not have to be fixed before it may sit in the list.
+        if (rule.switchedOff()) {
+            return PeerEgressCodes.RULE_DISABLED;
+        }
         String match = rule.getMatch() == null ? "" : rule.getMatch().trim();
         if (match.isEmpty()) {
             return PeerEgressCodes.RULE_MALFORMED;

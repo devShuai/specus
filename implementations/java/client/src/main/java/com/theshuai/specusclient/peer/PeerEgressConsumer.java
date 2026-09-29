@@ -67,13 +67,54 @@ final class PeerEgressConsumer {
 
     private static final int IPV4_MIN_HEADER_BYTES = 20;
 
+    /*
+     * When a flow is forgotten. Without these an entry left only on a revocation or a flow-reject,
+     * so every flow ever made stayed in memory and the status's flow count only ever grew. The
+     * same for all three clients: protocol/spec/peer-egress.md (resource limits) and
+     * protocol/test-vectors/peer-egress-consumer-flows-v1.json.
+     */
+
+    /** A datagram flow is forgotten this long after its last packet in either direction. */
+    static final long UDP_IDLE_MS = 180_000L;
+    /**
+     * A TCP flow that has not closed is forgotten this long after its last packet. Long, because
+     * forgetting a live connection refuses its replies; the egress's own idle timer has normally
+     * ended the flow well before this.
+     */
+    static final long TCP_IDLE_MS = 7_200_000L;
+    /**
+     * A TCP flow is forgotten this long after a reset in either direction, or after a FIN has been
+     * seen both ways. Kept that long so the last ACK and any retransmitted FIN still get through.
+     */
+    static final long TCP_CLOSED_LINGER_MS = 120_000L;
+    /** The most flows remembered at once. */
+    static final int DEFAULT_FLOW_CAPACITY = 65_536;
+    /**
+     * The least time between two walks of the whole table. Lookups already treat a lapsed entry as
+     * gone, so the walk only releases memory, and a table whose entries lapse one after another
+     * must not be walked once per packet.
+     */
+    static final long SWEEP_INTERVAL_MS = 1_000L;
+
     /**
      * One flow this node opened through an egress, tracked so a reply can be matched to something
      * we actually asked for, and so a rule change can close exactly the flows it invalidates.
      */
     private static final class Flow {
+        final int protocol;
         final long egress;
+        /** When it was registered, as a counter: the tie-break when two flows are equally stale. */
+        final long registration;
         long lastSeenMs;
+        /** A FIN seen from the application, and one seen from the egress. */
+        boolean finOut;
+        boolean finIn;
+        /**
+         * Set by a reset in either direction or a FIN both ways, and never cleared: packets after
+         * that do not keep the flow alive, and a new SYN on the four-tuple starts a new flow.
+         */
+        boolean closed;
+        long closedAtMs;
         /**
          * What the application last said on a TCP flow, kept so the flow can be reset without
          * waiting for it to speak again. Its acknowledgement number is its receive-next, the one
@@ -84,9 +125,44 @@ final class PeerEgressConsumer {
         int appAck;
         int appSeqNext;
 
-        Flow(long egress, long lastSeenMs) {
+        Flow(int protocol, long egress, long registration, long nowMs) {
+            this.protocol = protocol;
             this.egress = egress;
-            this.lastSeenMs = lastSeenMs;
+            this.registration = registration;
+            this.lastSeenMs = nowMs;
+        }
+
+        /** Records one packet on the flow, in either direction. */
+        void note(int tcpFlags, boolean outbound, long nowMs) {
+            lastSeenMs = nowMs;
+            if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+                return;
+            }
+            if ((tcpFlags & PeerEgressSegment.FLAG_RST) != 0 && !closed) {
+                closed = true;
+                closedAtMs = nowMs;
+            }
+            if ((tcpFlags & PeerEgressSegment.FLAG_FIN) != 0) {
+                if (outbound) {
+                    finOut = true;
+                } else {
+                    finIn = true;
+                }
+            }
+            // One FIN is a half close, after which the other side may go on sending for as long as
+            // it likes; only both together end the connection.
+            if (finOut && finIn && !closed) {
+                closed = true;
+                closedAtMs = nowMs;
+            }
+        }
+
+        /** The first moment at which the flow is forgotten. */
+        long deadlineMs() {
+            if (protocol != PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+                return lastSeenMs + UDP_IDLE_MS;
+            }
+            return closed ? closedAtMs + TCP_CLOSED_LINGER_MS : lastSeenMs + TCP_IDLE_MS;
         }
 
         /**
@@ -132,12 +208,33 @@ final class PeerEgressConsumer {
     /** Which egress peers can currently take a flow. Absent means no. */
     private final Map<Long, Boolean> online = new LinkedHashMap<>();
 
-    private final Map<PeerEgressFlowTable.Key, Flow> flows = new LinkedHashMap<>();
+    /**
+     * Kept in the order packets were last seen, oldest first: every packet moves its flow to the
+     * end. That puts the flow to evict when the table is full at the head, rather than at the end of
+     * a walk over up to {@link #DEFAULT_FLOW_CAPACITY} entries for every new flow.
+     */
+    private final LinkedHashMap<PeerEgressFlowTable.Key, Flow> flows = new LinkedHashMap<>();
+    private final int flowCapacity;
+    private long registrations;
+    /**
+     * No entry lapses before this. A lower bound rather than the exact moment, so that a packet
+     * which moves a deadline later costs nothing; a deadline that moves earlier (a new flow, or a
+     * TCP close) lowers it. While it lies ahead, a full table holds only live flows and no walk is
+     * needed to know it.
+     */
+    private long nextExpiryMs = Long.MAX_VALUE;
+    private long lastSweepMs;
     private final Map<String, Long> blocked = new TreeMap<>();
 
     PeerEgressConsumer(Sender sender, TunWriter tunWriter) {
+        this(sender, tunWriter, DEFAULT_FLOW_CAPACITY);
+    }
+
+    /** With a smaller table, so a test can fill it. */
+    PeerEgressConsumer(Sender sender, TunWriter tunWriter, int flowCapacity) {
         this.sender = sender;
         this.tunWriter = tunWriter;
+        this.flowCapacity = Math.max(1, flowCapacity);
     }
 
     /**
@@ -145,12 +242,18 @@ final class PeerEgressConsumer {
      *
      * <p>No lock here, for the same reason nothing else in this class has one: the caller
      * serialises access. Copies of the collections, because the caller is a diagnostic reader and
-     * this consumer goes on mutating its own.
+     * this consumer goes on mutating its own. Lapsed flows are swept first, so the count is of the
+     * flows still remembered.
      */
-    PeerEgressStatus.ConsumerSnapshot statusSnapshot() {
+    PeerEgressStatus.ConsumerSnapshot statusSnapshot(long nowMs) {
+        sweep(nowMs);
+        Map<Long, Integer> byEgress = new java.util.TreeMap<>();
+        for (Flow flow : flows.values()) {
+            byEgress.merge(flow.egress, 1, Integer::sum);
+        }
         return new PeerEgressStatus.ConsumerSnapshot(List.copyOf(rules), meshCidr,
                 new java.util.LinkedHashMap<>(online), flows.size(),
-                new java.util.TreeMap<>(blocked));
+                new java.util.TreeMap<>(blocked), byEgress, Map.of());
     }
 
     /**
@@ -191,6 +294,9 @@ final class PeerEgressConsumer {
      * two flow-purge messages could not tell a real difference from iteration order.
      */
     private Map<Long, List<String>> purgeInvalidated(long nowMs) {
+        // A flow already forgotten is not reset or purged: whether it was would otherwise depend on
+        // whether a sweep had happened to run since it lapsed.
+        sweep(nowMs);
         Map<Long, TreeSet<String>> purge = new TreeMap<>();
         List<PeerEgressFlowTable.Key> dropped = new ArrayList<>();
         List<byte[]> resets = new ArrayList<>();
@@ -287,12 +393,23 @@ final class PeerEgressConsumer {
 
         PeerEgressFlowTable.Key key = flowKeyFor(packet, protocol);
         if (key != null) {
-            Flow flow = flows.get(key);
-            if (flow == null) {
-                flow = new Flow(egress, nowMs);
-                flows.put(key, flow);
+            sweepIfDue(nowMs);
+            int tcpFlags = tcpFlags(packet);
+            Flow flow = liveFlow(key, nowMs);
+            if (flow != null && flow.closed
+                    && (tcpFlags & (PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK))
+                            == PeerEgressSegment.FLAG_SYN) {
+                // A SYN on a four-tuple whose connection has closed is a new connection reusing
+                // the port. Folding it into the old entry would leave it forgotten when the old
+                // one's linger ends, and its replies refused.
+                flows.remove(key);
+                flow = null;
             }
-            flow.lastSeenMs = nowMs;
+            if (flow == null) {
+                makeRoom(nowMs);
+                flow = new Flow(protocol, egress, ++registrations, nowMs);
+            }
+            touch(key, flow, tcpFlags, true, nowMs);
             if (protocol == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
                 flow.noteApplicationProgress(packet);
             }
@@ -369,6 +486,98 @@ final class PeerEgressConsumer {
         return ((data[offset] & 0xff) << 8) | (data[offset + 1] & 0xff);
     }
 
+    /** The flags of an IPv4 TCP segment, or none for anything else or a header cut short. */
+    private static int tcpFlags(byte[] packet) {
+        if (packet.length < IPV4_MIN_HEADER_BYTES
+                || (packet[9] & 0xff) != PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            return 0;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        if (ihl < IPV4_MIN_HEADER_BYTES || packet.length < ihl + 14) {
+            return 0;
+        }
+        return packet[ihl + 13] & 0xff;
+    }
+
+    /**
+     * The flow for a four-tuple if it is still remembered. One that has lapsed is removed on the
+     * way, so a lookup never depends on whether a sweep has run since.
+     */
+    private Flow liveFlow(PeerEgressFlowTable.Key key, long nowMs) {
+        Flow flow = flows.get(key);
+        if (flow != null && nowMs >= flow.deadlineMs()) {
+            flows.remove(key);
+            return null;
+        }
+        return flow;
+    }
+
+    /** Records a packet on a flow, registering the flow if it is new. */
+    private void touch(PeerEgressFlowTable.Key key, Flow flow, int tcpFlags, boolean outbound, long nowMs) {
+        flow.note(tcpFlags, outbound, nowMs);
+        flows.putLast(key, flow);
+        nextExpiryMs = Math.min(nextExpiryMs, flow.deadlineMs());
+    }
+
+    /**
+     * Frees one entry for a new flow when the table is full, by forgetting the flow that has gone
+     * longest without a packet.
+     *
+     * <p>Only live flows fill the table, so lapsed ones are swept first when any may have lapsed.
+     * The map's order is the order of last packets, so the candidates are the run at its head that
+     * share the oldest time; of those, the one registered first goes. With a clock that stepped
+     * back the head is no longer strictly the oldest, but it is still the least recently seen.
+     */
+    private void makeRoom(long nowMs) {
+        if (flows.size() < flowCapacity) {
+            return;
+        }
+        if (nowMs >= nextExpiryMs) {
+            sweep(nowMs);
+        }
+        while (flows.size() >= flowCapacity) {
+            Map.Entry<PeerEgressFlowTable.Key, Flow> victim = null;
+            for (Map.Entry<PeerEgressFlowTable.Key, Flow> entry : flows.entrySet()) {
+                if (victim == null) {
+                    victim = entry;
+                } else if (entry.getValue().lastSeenMs != victim.getValue().lastSeenMs) {
+                    break;
+                } else if (entry.getValue().registration < victim.getValue().registration) {
+                    victim = entry;
+                }
+            }
+            flows.remove(victim.getKey());
+        }
+    }
+
+    /** Walks the table only when an entry may have lapsed, and not more than once a second. */
+    private void sweepIfDue(long nowMs) {
+        if (nowMs >= nextExpiryMs && (nowMs - lastSweepMs >= SWEEP_INTERVAL_MS || nowMs < lastSweepMs)) {
+            sweep(nowMs);
+        }
+    }
+
+    /** Removes every lapsed flow, which releases its memory, and learns the next deadline exactly. */
+    private void sweep(long nowMs) {
+        long next = Long.MAX_VALUE;
+        for (var iterator = flows.values().iterator(); iterator.hasNext(); ) {
+            long deadline = iterator.next().deadlineMs();
+            if (nowMs >= deadline) {
+                iterator.remove();
+            } else {
+                next = Math.min(next, deadline);
+            }
+        }
+        nextExpiryMs = next;
+        lastSweepMs = nowMs;
+    }
+
+    /** Whether the flow for a four-tuple is still remembered. Changes nothing. */
+    boolean remembers(PeerEgressFlowTable.Key key, long nowMs) {
+        Flow flow = flows.get(key);
+        return flow != null && nowMs < flow.deadlineMs();
+    }
+
     /**
      * Takes one SPEG1 frame addressed to this node as a consumer and writes the packet to the TUN.
      * Reports whether the frame was this node's to handle.
@@ -395,7 +604,7 @@ final class PeerEgressConsumer {
             if (control == null || !PeerEgressFrame.CONTROL_FLOW_REJECT.equals(control.type())) {
                 return false;
             }
-            handleFlowReject(control, fromEgress);
+            handleFlowReject(control, fromEgress, nowMs);
             return true;
         }
         if (parsed.type() != PeerEgressFrame.TYPE_IP_PACKET) {
@@ -414,7 +623,7 @@ final class PeerEgressConsumer {
             recordBlocked("return-mesh-source");
             return true;
         }
-        if (!hasReturnFlow(parsed.inner(), fromEgress, nowMs)) {
+        if (!hasReturnFlow(parsed.inner(), parsed.body(), fromEgress, nowMs)) {
             recordBlocked("return-no-flow");
             return true;
         }
@@ -425,21 +634,24 @@ final class PeerEgressConsumer {
     }
 
     /**
-     * Reports whether a reply belongs to a flow this node opened through this egress. The tuple is
-     * mirrored, since the reply travels the other way.
+     * Reports whether a reply belongs to a flow this node opened through this egress and still
+     * remembers, and records it on that flow. The tuple is mirrored, since the reply travels the
+     * other way.
      */
-    private boolean hasReturnFlow(PeerEgressFrame.Inner inner, long fromEgress, long nowMs) {
+    private boolean hasReturnFlow(PeerEgressFrame.Inner inner, byte[] packet, long fromEgress, long nowMs) {
         Integer remote = Ipv4Cidr.parseAddress(inner.sourceIp());
         Integer local = Ipv4Cidr.parseAddress(inner.destinationIp());
         if (remote == null || local == null) {
             return false;
         }
-        Flow flow = flows.get(new PeerEgressFlowTable.Key(
-                inner.protocol(), local, inner.destinationPort(), remote, inner.sourcePort()));
+        sweepIfDue(nowMs);
+        var key = new PeerEgressFlowTable.Key(
+                inner.protocol(), local, inner.destinationPort(), remote, inner.sourcePort());
+        Flow flow = liveFlow(key, nowMs);
         if (flow == null || flow.egress != fromEgress) {
             return false;
         }
-        flow.lastSeenMs = nowMs;
+        touch(key, flow, tcpFlags(packet), false, nowMs);
         return true;
     }
 
@@ -447,7 +659,7 @@ final class PeerEgressConsumer {
      * A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
      * the flow, and only accept its actual egress as the sender.
      */
-    private void handleFlowReject(PeerEgressFrame.Control control, long fromEgress) {
+    private void handleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs) {
         Integer remote = Ipv4Cidr.parseAddress(control.destinationIp());
         Integer local = Ipv4Cidr.parseAddress(control.sourceIp());
         if (remote == null || local == null) {
@@ -455,7 +667,8 @@ final class PeerEgressConsumer {
         }
         var key = new PeerEgressFlowTable.Key(protocolNumberFor(control.protocol()),
                 local, control.sourcePort(), remote, control.destinationPort());
-        Flow flow = flows.get(key);
+        // A flow already forgotten has nothing left to reset.
+        Flow flow = liveFlow(key, nowMs);
         if (flow == null || flow.egress != fromEgress) {
             return;
         }
@@ -490,6 +703,10 @@ final class PeerEgressConsumer {
         return Map.copyOf(blocked);
     }
 
+    /**
+     * The entries held in memory, including any that have lapsed and not yet been swept. The count
+     * an operator reads is {@link #statusSnapshot}'s, which sweeps first.
+     */
     int flowCount() {
         return flows.size();
     }

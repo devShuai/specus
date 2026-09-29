@@ -26,6 +26,8 @@ class PeerServiceDiscoverySchemaMigratorTests {
                     status text not null
                 )
                 """);
+        // A session that was already there when the server was upgraded.
+        jdbc.execute("insert into specus_client_session(id, tenant_id, status) values (2, 'default', 'DISCONNECTED')");
 
         PeerServiceDiscoverySchemaMigrator migrator = new PeerServiceDiscoverySchemaMigrator(
                 jdbc, "org.hibernate.community.dialect.SQLiteDialect");
@@ -51,6 +53,14 @@ class PeerServiceDiscoverySchemaMigratorTests {
         Map<String, Object> session = jdbc.queryForMap(
                 "select peer_service_discovery_version, peer_service_applications from specus_client_session where id=1");
         assertThat(((Number) session.get("peer_service_discovery_version")).intValue()).isZero();
+        // Sessions from before the egress columns, and new rows that do not set them, announce no
+        // egress and no domain targets.
+        for (int id : new int[] {1, 2}) {
+            Map<String, Object> egress = jdbc.queryForMap(
+                    "select client_egress_version, client_egress_domain_targets from specus_client_session where id=?", id);
+            assertThat(((Number) egress.get("client_egress_version")).intValue()).isZero();
+            assertThat(((Number) egress.get("client_egress_domain_targets")).intValue()).isZero();
+        }
         assertThat(sharing).isNotEmpty();
     }
 }

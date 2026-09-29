@@ -209,6 +209,10 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
 		{"specus_client_session", "peer_service_discovery_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"specus_client_session", "peer_service_applications", "VARCHAR(160)"},
+		// Added with peer egress after v1.2.6. Without it a database from an earlier release keeps
+		// its session table as it was, and every login fails writing a column that is not there.
+		{"specus_client_session", "client_egress_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"specus_client_session", "client_egress_domain_targets", clientCapabilityBoolType},
 		{"peer_mesh_service_sharing", "mdns_import_enabled", boolType},
 		{"peer_mesh_shared_service", "allowed_client_ids", "VARCHAR(512) NOT NULL DEFAULT ''"},
 		{"client_download_link", "version", "VARCHAR(32)"},

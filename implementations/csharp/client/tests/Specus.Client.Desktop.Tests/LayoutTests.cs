@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -40,7 +41,12 @@ public class LayoutTests
                 foreach (var size in new[] { new Size(800, 520), new Size(1200, 760) })
                 {
                     var settings = Path.Combine(output, $"fixture-{theme}.json");
-                    File.WriteAllText(settings, "{\"themeMode\":\"" + theme + "\",\"updateCheckEnabled\":false}");
+                    // Three rules the egress page has to tell apart: one waiting for takeover, one it
+                    // refuses (a domain), one switched off.
+                    File.WriteAllText(settings, "{\"themeMode\":\"" + theme + "\",\"updateCheckEnabled\":false,"
+                        + "\"peerEgressRules\":[{\"match\":\"203.0.113.0/24\",\"action\":\"egress\",\"egressClientId\":42},"
+                        + "{\"match\":\"example.com\",\"action\":\"direct\"},"
+                        + "{\"match\":\"198.51.100.0/24\",\"action\":\"block\",\"enabled\":false}]}");
                     var window = new MainWindow(settings, false);
                     if (screenshots)
                     {
@@ -63,24 +69,73 @@ public class LayoutTests
                     Assert.True(((Expander)window.FindName("ConnectionSettingsExpander")).IsExpanded);
                     Assert.True(root.ActualWidth <= size.Width);
                     Assert.True(root.ActualHeight <= size.Height);
+                    if (screenshots) Capture(root, size, Path.Combine(output, $"windows-{theme}-{size.Width}"));
+
+                    ((TabItem)window.FindName("EgressTab")).IsSelected = true;
+                    root.Measure(size);
+                    root.Arrange(new Rect(size));
+                    root.UpdateLayout();
+                    // The grid sizes its star columns on a later pass, once it knows its width.
+                    root.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+                    root.UpdateLayout();
+                    Assert.Equal(3, window.EgressRules.Count);
+                    Assert.Equal("已启用，开启系统接管后生效", window.EgressRules[0].State);
+                    Assert.StartsWith("不会生效", window.EgressRules[1].State);
+                    Assert.Equal("EGRESS_RULE_DOMAIN_UNSUPPORTED", window.EgressRules[1].Code);
+                    Assert.Equal("已停用", window.EgressRules[2].State);
+                    Assert.Equal("启用", window.EgressRules[2].ToggleLabel);
+                    Assert.False(window.EgressRules[0].CanMoveUp);
+                    Assert.False(window.EgressRules[2].CanMoveDown);
+                    var takeover = (Button)window.FindName("EgressTakeoverButton");
+                    Assert.Equal("开启接管", takeover.Content);
+                    Assert.True(takeover.ActualHeight > 0, "the egress page did not lay out");
+                    var takeoverPosition = takeover.TransformToAncestor(root).Transform(new Point());
+                    Assert.InRange(takeoverPosition.X + takeover.ActualWidth, 0, size.Width);
+                    // The add and test buttons stay inside the window at the narrowest size.
+                    foreach (var name in new[] { "EgressAddButton", "EgressConnectButton", "EgressPreviewButton" })
+                    {
+                        var control = (Button)window.FindName(name);
+                        var position = control.TransformToAncestor(root).Transform(new Point());
+                        Assert.True(position.X + control.ActualWidth <= size.Width - 16, name + " runs past the window edge");
+                    }
+                    var grid = (DataGrid)window.FindName("EgressRuleGrid");
+                    Assert.True(grid.Columns[1].ActualWidth >= 80, "the target column is squeezed: " + grid.Columns[1].ActualWidth);
                     if (screenshots)
                     {
-                        root.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Render);
-                        foreach (double scale in new[] { 1.0, 1.5, 2.0 })
-                        {
-                            var bitmap = new RenderTargetBitmap((int)(size.Width * scale), (int)(size.Height * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
-                            var drawing = new DrawingVisual();
-                            using (var context = drawing.RenderOpen()) context.DrawRectangle(new VisualBrush(root), null, new Rect(size));
-                            bitmap.Render(drawing);
-                            byte[] pixels = new byte[bitmap.PixelWidth * bitmap.PixelHeight * 4];
-                            bitmap.CopyPixels(pixels, bitmap.PixelWidth * 4, 0);
-                            Assert.True(pixels.Any(value => value != 0), "Blank screenshot is not a successful visual check");
-                            var encoder = new PngBitmapEncoder();
-                            encoder.Frames.Add(BitmapFrame.Create(bitmap));
-                            using var file = File.Create(Path.Combine(output, $"windows-{theme}-{size.Width}-{scale:F1}.png"));
-                            encoder.Save(file);
-                        }
+                        Capture(root, size, Path.Combine(output, $"windows-egress-{theme}-{size.Width}"));
+                        var scroller = (ScrollViewer)((TabItem)window.FindName("EgressTab")).Content;
+                        scroller.ScrollToEnd();
+                        root.UpdateLayout();
+                        Capture(root, size, Path.Combine(output, $"windows-egress-end-{theme}-{size.Width}"));
                     }
+
+                    // What a running client reports, rendered the way the local page renders it: each
+                    // problem listed, a relayed egress noted without counting as one.
+                    window.RenderEgressStatus((JsonObject)JsonNode.Parse("""
+                        {"consumer":{"enabled":true,"active":true,"flows":3,
+                          "rules":[{"index":0,"match":"203.0.113.0/24","action":"egress","inForce":true,"egressClientId":42},
+                                   {"index":1,"match":"10.0.0.0/33","action":"direct","inForce":false,"code":"EGRESS_RULE_MALFORMED"}],
+                          "routes":[{"cidr":"203.0.113.0/24","kind":"tun","origin":"rule:203.0.113.0/24","installed":false,"conflict":"203.0.113.0/24 via 192.168.1.1"}],
+                          "peers":[{"clientId":42,"online":false,"path":"none","flows":0},{"clientId":43,"online":true,"path":"relay","flows":3}],
+                          "blocked":{"egress-unavailable":5,"rule":0}},
+                         "egress":{"active":true,"flows":2,"totalFlows":9,"refused":{"EGRESS_DEST_DENIED":1}}}
+                        """)!);
+                    Assert.Equal("3 个问题", ((TextBlock)window.FindName("EgressProblemsText")).Text);
+                    Assert.Equal(["规则 #1「10.0.0.0/33」未生效", "路由 203.0.113.0/24 未安装", "出口设备 42 离线", "出口设备 43 经中继连接", "拦截计数"],
+                        window.EgressIssues.Select(issue => issue.Title).ToArray());
+                    Assert.Equal("egress-unavailable=5", window.EgressIssues[^1].Code);
+                    Assert.StartsWith("本机正在作为出口 · 2 个流 · 累计 9 个 · 拒绝：EGRESS_DEST_DENIED=1", ((TextBlock)window.FindName("EgressRoleText")).Text);
+                    root.UpdateLayout();
+                    if (screenshots) Capture(root, size, Path.Combine(output, $"windows-egress-status-{theme}-{size.Width}"));
+
+                    // An edit goes through the plan the commands use: a domain is refused with its
+                    // reason, an address range is added and saved.
+                    Assert.False(window.AddEgressRule("example.org", "direct", 0, first: false, disabled: false));
+                    Assert.Equal(3, window.EgressRules.Count);
+                    Assert.Contains("EGRESS_RULE_DOMAIN_UNSUPPORTED", ((TextBlock)window.FindName("EgressNoticeText")).Text);
+                    Assert.True(window.AddEgressRule("10.0.0.0/8", "direct", 0, first: true, disabled: false));
+                    Assert.Equal("10.0.0.0/8", window.EgressRules[0].Match);
+                    Assert.Contains("\"match\": \"10.0.0.0/8\"", File.ReadAllText(settings));
                     window.Close();
                 }
                 app.Shutdown();
@@ -92,5 +147,24 @@ public class LayoutTests
         thread.Start();
         Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "WPF layout timed out");
         Assert.Null(failure);
+    }
+
+    private static void Capture(FrameworkElement root, Size size, string prefix)
+    {
+        root.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+        foreach (double scale in new[] { 1.0, 1.5, 2.0 })
+        {
+            var bitmap = new RenderTargetBitmap((int)(size.Width * scale), (int)(size.Height * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+            var drawing = new DrawingVisual();
+            using (var context = drawing.RenderOpen()) context.DrawRectangle(new VisualBrush(root), null, new Rect(size));
+            bitmap.Render(drawing);
+            byte[] pixels = new byte[bitmap.PixelWidth * bitmap.PixelHeight * 4];
+            bitmap.CopyPixels(pixels, bitmap.PixelWidth * 4, 0);
+            Assert.True(pixels.Any(value => value != 0), "Blank screenshot is not a successful visual check");
+            var encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(bitmap));
+            using var file = File.Create($"{prefix}-{scale:F1}.png");
+            encoder.Save(file);
+        }
     }
 }

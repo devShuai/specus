@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Rendering the egress section of a live instance's state for a person.
@@ -26,6 +27,15 @@ func egressLines(section map[string]any) []string {
 }
 
 func consumerLines(consumer map[string]any) []string {
+	// Rules saved with the master switch off are a state of their own, and the one where nothing is
+	// in force by design; said as such rather than folded into "not configured". A state file from
+	// a build without the switch has no such field and reads as before.
+	if enabled, present := consumer["enabled"].(bool); present && !enabled {
+		if rules := listAt(consumer, "rules"); len(rules) > 0 {
+			return []string{fmt.Sprintf(
+				"  consumer: takeover off | %d rules saved, none in force (peerEgressEnabled is false)", len(rules))}
+		}
+	}
 	if consumer == nil || !boolAt(consumer, "active") {
 		return []string{"  consumer: not configured (no rules have been applied)"}
 	}
@@ -33,7 +43,7 @@ func consumerLines(consumer map[string]any) []string {
 	routes := listAt(consumer, "routes")
 	peers := listAt(consumer, "peers")
 
-	refused, notInstalled, offline := 0, 0, 0
+	refused, notInstalled, offline, relayed := 0, 0, 0, 0
 	for _, rule := range rules {
 		if !boolAt(rule, "inForce") {
 			refused++
@@ -48,11 +58,14 @@ func consumerLines(consumer map[string]any) []string {
 		if !boolAt(peer, "online") {
 			offline++
 		}
+		if stringAt(peer, "path") == "relay" {
+			relayed++
+		}
 	}
 
 	lines := []string{fmt.Sprintf(
-		"  consumer: %d rules (%d not in force) | %d routes (%d not installed) | %d flows | %d egress peers (%d offline)",
-		len(rules), refused, len(routes), notInstalled, intAt(consumer, "flows"), len(peers), offline)}
+		"  consumer: %d rules (%d not in force) | %d routes (%d not installed) | %d flows | %d egress peers (%d offline, %d via relay)",
+		len(rules), refused, len(routes), notInstalled, intAt(consumer, "flows"), len(peers), offline, relayed)}
 
 	// Then the problems, one line each, in the order an operator would act on them: a rule that
 	// is not in force steers nothing at all, a route that is not installed means the traffic
@@ -69,23 +82,43 @@ func consumerLines(consumer map[string]any) []string {
 			continue
 		}
 		lines = append(lines, fmt.Sprintf("    route %s (%s): NOT INSTALLED, already present: %s",
-			stringAt(route, "cidr"), stringAt(route, "origin"), stringAt(route, "conflict")))
+			stringAt(route, "cidr"), stringAt(route, "origin"), stringAt(route, "conflict")),
+			"      fix: remove or narrow that route, or change the rule; the client retries every 60 s")
 	}
+	// Each problem is followed by what to do about it, in the same words in every runtime and on
+	// the local page. A peer that is online with no path yet is a problem too: its rules are in
+	// force and have nowhere to send.
 	for _, peer := range peers {
-		if boolAt(peer, "online") {
-			continue
+		id := intAt(peer, "clientId")
+		switch {
+		case !boolAt(peer, "online"):
+			lines = append(lines, fmt.Sprintf("    egress peer %d: offline, so its rules have nowhere to send", id),
+				fmt.Sprintf("      fix: start egress device %d or restore its connection; until then its destinations are blocked, not sent locally", id))
+		case stringAt(peer, "path") == "none":
+			lines = append(lines, fmt.Sprintf("    egress peer %d: online but no path to it yet", id),
+				"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP")
 		}
-		lines = append(lines, fmt.Sprintf("    egress peer %d: offline, so its rules have nowhere to send",
-			intAt(peer, "clientId")))
 	}
 	if message := stringAt(consumer, "routeError"); message != "" {
 		lines = append(lines, fmt.Sprintf("    route install failed: %s (rolledBack=%v)",
-			message, boolAt(consumer, "rolledBack")))
+			message, boolAt(consumer, "rolledBack")), "      fix: "+routeErrorFix(message))
 	}
 	if blocked := countsAt(consumer, "blocked"); len(blocked) > 0 {
 		lines = append(lines, "    blocked: "+joinCounts(blocked))
 	}
 	return lines
+}
+
+// routeErrorFix names what to do about a failed route install. A refused permission is the common
+// case and has one answer; anything else is in the log line of the command that failed.
+func routeErrorFix(message string) string {
+	lower := strings.ToLower(message)
+	for _, hint := range []string{"permission", "denied", "not permitted", "elevat", "access"} {
+		if strings.Contains(lower, hint) {
+			return "run the client as administrator or root, with peerMeshDevice set to auto"
+		}
+	}
+	return "the client log names the route command that failed; fix what it reports and restart the client"
 }
 
 func egressRoleLines(egress map[string]any) []string {

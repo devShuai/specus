@@ -1,8 +1,10 @@
 package com.theshuai.specusserver.management.service;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.peeregress.Ipv4Cidr;
 import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
@@ -20,21 +22,25 @@ import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
 import com.theshuai.specusserver.management.model.PeerMeshEgressSwitchView;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicyView;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressSwitchRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -66,6 +72,7 @@ public class PeerEgressService {
     private final ConcurrentHashMap<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
     private final PeerMeshDeviceRepository deviceRepository;
     private final ClientAccountRepository clientAccountRepository;
+    private final ClientSessionRepository clientSessionRepository;
     private final PeerMeshService peerMeshService;
 
     public PeerEgressService(PeerMeshEgressPolicyRepository policyRepository,
@@ -73,12 +80,14 @@ public class PeerEgressService {
                              PeerMeshEgressSwitchRepository switchRepository,
                              PeerMeshDeviceRepository deviceRepository,
                              ClientAccountRepository clientAccountRepository,
+                             ClientSessionRepository clientSessionRepository,
                              PeerMeshService peerMeshService) {
         this.policyRepository = policyRepository;
         this.activityRepository = activityRepository;
         this.switchRepository = switchRepository;
         this.deviceRepository = deviceRepository;
         this.clientAccountRepository = clientAccountRepository;
+        this.clientSessionRepository = clientSessionRepository;
         this.peerMeshService = peerMeshService;
     }
 
@@ -87,10 +96,22 @@ public class PeerEgressService {
                                  Boolean enabled,
                                  String scope,
                                  List<Long> allowedConsumerClientIds,
-                                 List<PeerEgressPolicy.PeerEgressDestinationRule> destinationRules,
+                                 List<DestinationRuleMutation> destinationRules,
                                  Integer maxConcurrentFlows,
                                  Integer maxFlowsPerConsumer,
                                  Integer idleTimeoutSeconds) {
+    }
+
+    /**
+     * One destination rule as the client sent it; {@link #normalizeDestinationRules} turns it into
+     * what is stored.
+     *
+     * <p>Port bounds are bound untyped on purpose. Bound as integers, the JSON reader would coerce
+     * {@code 443.5}, {@code 443.0} or {@code "443"} to 443 and store a rule the operator never wrote;
+     * kept as sent, anything but a JSON integer can be refused.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record DestinationRuleMutation(String cidr, List<String> protocols, List<List<Object>> portRanges) {
     }
 
     /** Whether the tenant switch is on. Off by default: egress is opt-in for the tenant too. */
@@ -121,11 +142,16 @@ public class PeerEgressService {
      *
      * <p>Switching off leaves every per-device policy intact, so turning it back on restores what
      * was configured rather than making the operator rebuild it.
+     *
+     * @param enabled required; {@code null} is refused rather than read as off
      */
     @Transactional
-    public PeerMeshEgressSwitchView setSwitch(ManagementContext context, boolean enabled) {
-        if (!context.isAdmin()) {
-            throw new IllegalArgumentException("只有租户 ADMIN 可以管理出口授权");
+    public PeerMeshEgressSwitchView setSwitch(ManagementContext context, Boolean enabled) {
+        requireAdmin(context);
+        if (enabled == null) {
+            // A body without the field is malformed, not a request to switch off. Reading it as
+            // false would let a truncated or misspelt request stop egress for the whole tenant.
+            throw new IllegalArgumentException("enabled is required");
         }
         if (enabled && !peerMeshService.isEnabled()) {
             throw new IllegalArgumentException("部署端未启用 Peer Mesh，不能开启出口分流");
@@ -151,16 +177,15 @@ public class PeerEgressService {
 
     @Transactional
     public PeerMeshEgressPolicy upsertPolicy(ManagementContext context, PolicyMutation mutation) {
-        if (!context.isAdmin()) {
-            throw new IllegalArgumentException("只有租户 ADMIN 可以管理出口授权");
-        }
+        requireAdmin(context);
         Long egressClientId = mutation.egressClientId();
         if (egressClientId == null) {
             throw new IllegalArgumentException("egressClientId is required");
         }
         ClientAccount egress = clientAccountRepository
                 .findByIdAndTenantId(egressClientId, context.tenant().tenantId())
-                .orElseThrow(() -> new IllegalArgumentException("client not found: " + egressClientId));
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "client not found: " + egressClientId));
 
         PeerMeshEgressPolicy policy = policyRepository
                 .findByTenantIdAndEgressClientId(context.tenant().tenantId(), egressClientId)
@@ -189,7 +214,8 @@ public class PeerEgressService {
                     PeerServiceDiscovery.encodeClientIds(mutation.allowedConsumerClientIds()));
         }
         if (mutation.destinationRules() != null) {
-            policy.setDestinationRules(encodeDestinationRules(mutation.destinationRules()));
+            policy.setDestinationRules(encodeDestinationRules(
+                    normalizeDestinationRules(mutation.destinationRules())));
         }
         if (mutation.maxConcurrentFlows() != null) {
             policy.setMaxConcurrentFlows(requirePositive(mutation.maxConcurrentFlows(), "maxConcurrentFlows"));
@@ -238,13 +264,22 @@ public class PeerEgressService {
 
     @Transactional
     public void deletePolicy(ManagementContext context, long id) {
-        if (!context.isAdmin()) {
-            throw new IllegalArgumentException("只有租户 ADMIN 可以管理出口授权");
-        }
+        requireAdmin(context);
         PeerMeshEgressPolicy policy = policyRepository
                 .findByIdAndTenantId(id, context.tenant().tenantId())
-                .orElseThrow(() -> new IllegalArgumentException("egress policy not found: " + id));
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "egress policy not found: " + id));
         policyRepository.delete(policy);
+    }
+
+    /**
+     * Every mutation here is tenant-ADMIN only. Refused with 403 rather than 400 so the caller can
+     * tell "you may not" from "what you sent is wrong".
+     */
+    private static void requireAdmin(ManagementContext context) {
+        if (context == null || !context.isAdmin()) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "只有租户 ADMIN 可以管理出口授权");
+        }
     }
 
     /**
@@ -502,12 +537,30 @@ public class PeerEgressService {
             entry.setOnline(isDeviceEnabled(egress.get()));
             entry.setScope(policy.getScope());
             entry.setProtocols(protocolsOf(decodeDestinationRules(policy.getDestinationRules())));
-            entry.setDomainTargetCapable(false);
+            entry.setDomainTargetCapable(entry.isOnline() && announcesDomainTargets(egress.get()));
+            // No client announces IPv6 targets yet.
             entry.setIpv6TargetCapable(false);
             entries.add(entry);
         }
         message.setEgresses(entries);
         return message;
+    }
+
+    /**
+     * Whether the egress's current online session announced domain targets at login.
+     *
+     * <p>Read from the online session, like the egress version the signal path pushes with, rather
+     * than from anything remembered about the device: an egress that went offline, or came back on
+     * a client without domain support, must not keep advertising it. Consumers rely on this to tell
+     * which egress can take a domain rule.
+     */
+    private boolean announcesDomainTargets(ClientAccount egress) {
+        return clientSessionRepository
+                .findByTenantIdAndClientIdInAndStatus(egress.getTenantId(), List.of(egress.getId()),
+                        ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .anyMatch(session -> session.getClientEgressVersion() >= 1
+                        && session.isClientEgressDomainTargets());
     }
 
     /**
@@ -570,21 +623,119 @@ public class PeerEgressService {
         return List.copyOf(protocols);
     }
 
+    /**
+     * Serialises rules for storage, enforcing the stored limits.
+     *
+     * <p>Takes rules already through {@link #normalizeDestinationRules}, so the size is measured on
+     * what is stored rather than on what was sent: surrounding whitespace and repeated protocols
+     * are gone by then and cannot push an otherwise valid list over the limit.
+     */
     static String encodeDestinationRules(List<PeerEgressPolicy.PeerEgressDestinationRule> rules) {
         if (rules == null || rules.isEmpty()) {
             return "[]";
         }
         if (rules.size() > PeerMeshEgressPolicy.MAX_DESTINATION_RULES) {
-            throw new IllegalArgumentException("too many destination rules: " + rules.size());
+            throw new IllegalArgumentException("too many destination rules: " + rules.size()
+                    + " (at most " + PeerMeshEgressPolicy.MAX_DESTINATION_RULES + ")");
         }
         String json = JsonUtil.objectToString(rules);
         if (json == null) {
             throw new IllegalArgumentException("destination rules cannot be serialised");
         }
         if (json.getBytes(StandardCharsets.UTF_8).length > PeerMeshEgressPolicy.MAX_DESTINATION_RULES_BYTES) {
-            throw new IllegalArgumentException("destination rules exceed the storage limit");
+            throw new IllegalArgumentException("destination rules exceed "
+                    + PeerMeshEgressPolicy.MAX_DESTINATION_RULES_BYTES + " bytes once stored");
         }
         return json;
+    }
+
+    /**
+     * The destination rules as they will be stored, or {@link IllegalArgumentException} for the
+     * whole list.
+     *
+     * <p>The egress reads a stored rule strictly: a CIDR it cannot parse, a protocol other than
+     * {@code tcp}/{@code udp} or a malformed port range simply never matches. Storing such input as
+     * given would turn a typo into a rule that silently does nothing, so what is only spelling is
+     * normalised (surrounding whitespace, protocol case, repeated protocols, absent lists) and
+     * everything else is refused. The CIDR is checked with the egress's own parser and kept as
+     * written after trimming, so a bare address stays a bare address.
+     *
+     * <p>Shared vector: {@code protocol/test-vectors/peer-egress-management-v1.json}.
+     */
+    static List<PeerEgressPolicy.PeerEgressDestinationRule> normalizeDestinationRules(
+            List<DestinationRuleMutation> rules) {
+        if (rules == null || rules.isEmpty()) {
+            return List.of();
+        }
+        if (rules.size() > PeerMeshEgressPolicy.MAX_DESTINATION_RULES) {
+            throw new IllegalArgumentException("too many destination rules: " + rules.size()
+                    + " (at most " + PeerMeshEgressPolicy.MAX_DESTINATION_RULES + ")");
+        }
+        List<PeerEgressPolicy.PeerEgressDestinationRule> stored = new ArrayList<>(rules.size());
+        for (int index = 0; index < rules.size(); index++) {
+            DestinationRuleMutation rule = rules.get(index);
+            String field = "destinationRules[" + index + "]";
+            if (rule == null) {
+                throw new IllegalArgumentException(field + " must be an object");
+            }
+            PeerEgressPolicy.PeerEgressDestinationRule normalized = new PeerEgressPolicy.PeerEgressDestinationRule();
+            normalized.setCidr(normalizeCidr(rule.cidr(), field));
+            normalized.setProtocols(normalizeProtocols(rule.protocols(), field));
+            normalized.setPortRanges(normalizePortRanges(rule.portRanges(), field));
+            stored.add(normalized);
+        }
+        return List.copyOf(stored);
+    }
+
+    private static String normalizeCidr(String raw, String field) {
+        String cidr = raw == null ? "" : raw.strip();
+        // Whitespace is what is forgiven, not every control character. parse() trims on its own,
+        // so without the equality check a leading control character that strip() keeps would pass
+        // the parser and then be stored.
+        if (!cidr.equals(cidr.trim()) || Ipv4Cidr.parse(cidr) == null) {
+            throw new IllegalArgumentException(field + ".cidr is not an IPv4 address or CIDR: " + raw);
+        }
+        return cidr;
+    }
+
+    private static List<String> normalizeProtocols(List<String> raw, String field) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        Set<String> protocols = new LinkedHashSet<>();
+        for (String protocol : raw) {
+            String value = protocol == null ? "" : protocol.strip().toLowerCase(Locale.ROOT);
+            if (!"tcp".equals(value) && !"udp".equals(value)) {
+                throw new IllegalArgumentException(field + ".protocols may contain only tcp and udp: " + protocol);
+            }
+            protocols.add(value);
+        }
+        return List.copyOf(protocols);
+    }
+
+    private static List<List<Integer>> normalizePortRanges(List<List<Object>> raw, String field) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        if (raw.size() > PeerMeshEgressPolicy.MAX_PORT_RANGES_PER_RULE) {
+            throw new IllegalArgumentException(field + ".portRanges has " + raw.size()
+                    + " ranges (at most " + PeerMeshEgressPolicy.MAX_PORT_RANGES_PER_RULE + ")");
+        }
+        List<List<Integer>> ranges = new ArrayList<>(raw.size());
+        for (List<Object> pair : raw) {
+            // Bound untyped, a JSON integer within int range arrives as Integer. A larger one arrives
+            // as Long or BigInteger, out of port range anyway; a fraction, string or boolean as
+            // something else entirely.
+            if (pair == null || pair.size() != 2
+                    || !(pair.get(0) instanceof Integer low) || !(pair.get(1) instanceof Integer high)
+                    || low < 0 || high > 65535 || low > high) {
+                throw new IllegalArgumentException(field
+                        + ".portRanges entries must be [low, high] integers with 0 <= low <= high <= 65535: "
+                        + pair);
+            }
+            ranges.add(List.of(low, high));
+        }
+        return List.copyOf(ranges);
     }
 
     static List<PeerEgressPolicy.PeerEgressDestinationRule> decodeDestinationRules(String raw) {

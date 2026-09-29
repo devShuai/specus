@@ -62,6 +62,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan KeepaliveTickInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan DirectStaleInterval = TimeSpan.FromSeconds(45);
+    // How long a session must have heard nothing direct from its peer before a data frame arriving
+    // over the relay moves this side's sending to the relay. Frames already in flight on the two
+    // paths otherwise flip each side back and forth, and under load the two sides never settle.
+    internal static readonly TimeSpan RelayFollowQuiet = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
     // H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
     // HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 15s
@@ -290,17 +294,37 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public IReadOnlyList<PeerEgressRule> ConsumerRules => owner._config.PeerEgressRules;
 
+        public bool ConsumerEnabled => owner._config.PeerEgressEnabled;
+
         public IReadOnlyDictionary<long, bool> EgressAvailability
         {
             get
             {
                 lock (owner._sync)
                 {
-                    var now = DateTimeOffset.UtcNow;
-                    return owner._peers.ToDictionary(item => item.Key, item => item.Value.Online
-                        && owner._sessions.TryGetValue(item.Key, out var session)
-                        && session.CanCarryEgress(now));
+                    return owner.EgressAvailabilityLocked(DateTimeOffset.UtcNow);
                 }
+            }
+        }
+
+        // Read the way SendEncryptedPayloadAsync chooses: a nominated relay first, then the direct
+        // endpoint; a peer with neither has no entry.
+        public IReadOnlyDictionary<long, string> EgressPaths
+        {
+            get
+            {
+                var paths = new Dictionary<long, string>();
+                var now = DateTimeOffset.UtcNow;
+                lock (owner._sync)
+                {
+                    foreach (var (peerId, session) in owner._sessions)
+                    {
+                        if (now > session.ExpiresAt) continue;
+                        if (!string.IsNullOrWhiteSpace(session.RelayTargetAllocationId)) paths[peerId] = PeerEgressStatus.PathRelay;
+                        else if (session.RemoteEndpoint is not null) paths[peerId] = PeerEgressStatus.PathDirect;
+                    }
+                }
+                return paths;
             }
         }
 
@@ -1555,10 +1579,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             if (!string.IsNullOrWhiteSpace(relayFrom))
             {
+                current.LastRelaySuccess = DateTimeOffset.UtcNow;
+                if (current.HasHealthyDirect(DateTimeOffset.UtcNow) && !ShouldAvoidDirectPathLocked())
+                {
+                    // The peer checks its relay the whole time a direct path works. The reply goes
+                    // back over the relay; this side's data stays on the direct path.
+                    return;
+                }
                 current.PathType = "RELAY";
                 current.RelayTargetAllocationId = relayFrom;
                 current.RemoteEndpoint = null;
-                current.LastRelaySuccess = DateTimeOffset.UtcNow;
                 ready = current;
             }
             else if (ShouldAvoidDirectPathLocked() || InCidr(remote.Address, _runtime?.PeerMesh.Cidr))
@@ -1815,8 +1845,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 return true;
             }
         }
-        var useRelay = !string.IsNullOrWhiteSpace(session.RelayTargetAllocationId);
-        if (!useRelay && (session.RemoteEndpoint is null || avoidDirect || IsMeshEndpoint(session.RemoteEndpoint)))
+        // Each read once. Path maintenance clears and replaces the endpoint and the relay target on
+        // other threads, so a null check followed by a second read of the field could send to a
+        // null endpoint; with dozens of flows sending, that window was hit and the egress's send
+        // loop died with the process.
+        var relayTarget = session.RelayTargetAllocationId;
+        var remote = session.RemoteEndpoint;
+        var useRelay = !string.IsNullOrWhiteSpace(relayTarget);
+        if (!useRelay && (remote is null || avoidDirect || IsMeshEndpoint(remote)))
         {
             return false;
         }
@@ -1838,9 +1874,18 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         var frame = outboundCodec.Encode(session.Id, sequence, payload);
         if (useRelay)
         {
-            return await SendRelayPayloadAsync(session.RelayTargetAllocationId, frame).ConfigureAwait(false);
+            return await SendRelayPayloadAsync(relayTarget, frame).ConfigureAwait(false);
         }
-        await SendPeerUdpAsync(udp, frame, session.RemoteEndpoint!).ConfigureAwait(false);
+        try
+        {
+            await SendPeerUdpAsync(udp, frame, remote!).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // A mesh restart closed the socket after it was read above; the frame is lost the way
+            // any datagram can be, and the caller's own retransmission covers it.
+            return false;
+        }
         lock (_sync)
         {
             if (_sessions.TryGetValue(peerId, out var current))
@@ -2219,10 +2264,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             var frameBytes = payload.LongLength;
             if (!string.IsNullOrWhiteSpace(relayFrom))
             {
-                current.PathType = "RELAY";
-                current.RelayTargetAllocationId = relayFrom;
-                current.RemoteEndpoint = null;
                 current.LastRelaySuccess = DateTimeOffset.UtcNow;
+                if (!current.HeardDirectWithin(DateTimeOffset.UtcNow, RelayFollowQuiet) || ShouldAvoidDirectPathLocked())
+                {
+                    current.PathType = "RELAY";
+                    current.RelayTargetAllocationId = relayFrom;
+                    current.RemoteEndpoint = null;
+                }
             }
             else
             {
@@ -2456,12 +2504,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    /// <summary>Which peers can carry an egress flow right now. Called with <c>_sync</c> held.</summary>
+    private Dictionary<long, bool> EgressAvailabilityLocked(DateTimeOffset now) =>
+        _peers.ToDictionary(item => item.Key, item => item.Value.Online
+            && _sessions.TryGetValue(item.Key, out var session)
+            && session.CanCarryEgress(now));
+
     private void MergeRoster(IReadOnlyList<PeerMeshPeer>? peers)
     {
         if (peers is null)
         {
             return;
         }
+        Dictionary<long, bool> availability;
         lock (_sync)
         {
             // Roster updates carry identity and online state; rebuild so removed peers disappear immediately
@@ -2489,8 +2544,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 item => item.Key,
                 item => new PeerServiceRuntime.RosterHint(item.Value.VirtualIp ?? "", item.Value.Online)));
             _serviceRuntime.SetHasAuthorizedOnlinePeer(onlinePeer);
+            availability = EgressAvailabilityLocked(DateTimeOffset.UtcNow);
         }
         PublishPeerMeshSnapshot();
+        // An egress that has just gone offline has its flows refused now. Otherwise the roster only
+        // reached the consumer at the next maintenance reconcile, and until then every flow under a
+        // rule waited on a peer that was gone instead of failing at once; on a slow machine that
+        // wait outlasted a 90-second probe. The Go client syncs from its roster merge the same way.
+        // Outside _sync: the sync can deliver purges through the mesh.
+        _egress.SyncEgressAvailability(availability);
     }
 
     private void MergePeerFromSignal(PeerControlMessage message)
@@ -4980,7 +5042,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     }
 
     private static Task<int> SendPeerUdpAsync(UdpClient udp, byte[] payload, IPEndPoint endpoint)
-        => udp.SendAsync(payload, payload.Length, EndpointForSocket(udp, endpoint));
+    {
+        // Disposing a UdpClient leaves Client null rather than making it throw, so a socket closed
+        // under a sender is named here instead of surfacing as a null reference further down.
+        if (udp.Client is null)
+        {
+            throw new ObjectDisposedException(nameof(UdpClient));
+        }
+        return udp.SendAsync(payload, payload.Length, EndpointForSocket(udp, endpoint));
+    }
 
     private static IPEndPoint EndpointForSocket(UdpClient udp, IPEndPoint endpoint)
     {
@@ -5178,6 +5248,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             InboundCodec?.Dispose();
             InboundCodec = null;
             Replay = new PeerReplayWindow();
+            if (changed)
+            {
+                // A new epoch means the process behind the old endpoint is gone. Kept, the endpoint
+                // would stay sticky and the direct path healthy for up to 45 s after the last answer
+                // from a dead socket, and the new process's checks could not move the session.
+                EndpointSuccess = default;
+                EndpointRttMillis = long.MaxValue;
+                LastDirectSuccess = default;
+            }
             return changed;
         }
 
@@ -5227,6 +5306,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             OutboundCodec = null;
             InboundCodec = null;
         }
+
+        // Whether anything authenticated arrived from the peer over the direct path in the window:
+        // a data frame, a check or a check response.
+        public bool HeardDirectWithin(DateTimeOffset now, TimeSpan window) =>
+            LastDirectSuccess != default && now - LastDirectSuccess <= window;
 
         public bool HasHealthyDirect(DateTimeOffset now) =>
             string.Equals(PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)

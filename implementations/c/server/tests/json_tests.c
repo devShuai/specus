@@ -37,6 +37,25 @@ int main(void)
     }
     free(top_level);
     free(emoji);
+    size_t decoded_len = 0;
+    char *decoded = st_json_decode_string(" \"a\\u0000b\" ", &decoded_len);
+    char *not_string = st_json_decode_string("42", &decoded_len);
+    char *trailing = st_json_decode_string("\"a\" \"b\"", &decoded_len);
+    if (decoded == NULL || strcmp(decoded, "a") != 0 || not_string != NULL || trailing != NULL) {
+        fprintf(stderr, "json string decode mismatch\n");
+        free(decoded);
+        free(not_string);
+        free(trailing);
+        return 1;
+    }
+    free(decoded);
+    decoded = st_json_decode_string("\"a\\u0000b\"", &decoded_len);
+    if (decoded == NULL || decoded_len != 3U || memcmp(decoded, "a\0b", 3U) != 0) {
+        fprintf(stderr, "json string decode must report the length past an escaped NUL\n");
+        free(decoded);
+        return 1;
+    }
+    free(decoded);
     char *raw = st_json_get_top_level_raw(
         "{\"payload\":{\"nested\":[1,true,null]},\"other\":{\"payload\":\"wrong\"}}",
         "payload");

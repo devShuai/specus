@@ -35,6 +35,10 @@
 #define ST_EGRESS_CODE_RULE_MESH_OVERLAP "EGRESS_RULE_MESH_OVERLAP"
 #define ST_EGRESS_CODE_RULE_DEFAULT_ROUTE "EGRESS_RULE_DEFAULT_ROUTE"
 #define ST_EGRESS_CODE_RULE_PORT_UNSUPPORTED "EGRESS_RULE_PORT_UNSUPPORTED"
+/* A rule the user switched off: kept in the list, out of force. */
+#define ST_EGRESS_CODE_RULE_DISABLED "EGRESS_RULE_DISABLED"
+/* The consumer's master switch is off: rules are kept and nothing is taken over. */
+#define ST_EGRESS_CODE_CONSUMER_DISABLED "EGRESS_CONSUMER_DISABLED"
 
 /* SPEG1 frame decoding. */
 #define ST_EGRESS_CODE_FRAME_BAD_MAGIC "EGRESS_FRAME_BAD_MAGIC"
@@ -45,6 +49,13 @@
 #define ST_EGRESS_CODE_IPV6_UNSUPPORTED "EGRESS_IPV6_UNSUPPORTED"
 #define ST_EGRESS_CODE_FRAME_MALFORMED_CONTROL "EGRESS_FRAME_MALFORMED_CONTROL"
 #define ST_EGRESS_CODE_CONTROL_UNSUPPORTED "EGRESS_CONTROL_UNSUPPORTED"
+
+/* Phase two, domain rules (protocol/spec/peer-egress-dns.md). */
+#define ST_EGRESS_CODE_NAME_UNRESOLVED "EGRESS_NAME_UNRESOLVED"
+#define ST_EGRESS_CODE_NAME_UNSUPPORTED "EGRESS_NAME_UNSUPPORTED"
+#define ST_EGRESS_CODE_RULE_FAKE_IP_OVERLAP "EGRESS_RULE_FAKE_IP_OVERLAP"
+#define ST_EGRESS_CODE_FAKE_IP_POOL_INVALID "EGRESS_FAKE_IP_POOL_INVALID"
+#define ST_EGRESS_CODE_RULE_EGRESS_NO_DOMAIN "EGRESS_RULE_EGRESS_NO_DOMAIN"
 
 /* Rule actions. */
 #define ST_EGRESS_ACTION_EGRESS "egress"
@@ -107,6 +118,14 @@ int st_egress_cidr_overlaps(const st_egress_cidr *left, const st_egress_cidr *ri
 int st_egress_normalize_version(int version);
 
 /*
+ * Whether a login's clientEgressCapabilities object declared domainTargetCapable. Only an explicit
+ * true counts, and only next to a version this build takes part with (pass the normalized one): an
+ * absent object, an absent field or version 0 all read as 0, so the catalogue never tells consumers
+ * that a device resolves names when it did not say so.
+ */
+int st_egress_declares_domain_targets(const char *capabilities_json, int version);
+
+/*
  * One consumer-side split-routing rule.
  *
  * Rules match on destination address only. The consumer steers traffic by installing routes and a
@@ -122,6 +141,9 @@ typedef struct {
     /* Present only so a configuration carrying it can be rejected with a specific code. */
     int port;
     int has_port;
+    /* Set only by an explicit "enabled": false. A switched-off rule stays in the list, takes no
+     * part in matching and installs no route. */
+    int switched_off;
 } st_egress_rule;
 
 /* The outcome of evaluating a destination against an ordered rule list. */
@@ -261,11 +283,32 @@ extern const size_t ST_EGRESS_LAN_CIDRS_LEN;
 /*
  * Reads a stored allowlist. A row that cannot be parsed yields zero rules, which denies everything
  * rather than falling back to something permissive. Returns 0 when the input parsed cleanly.
+ *
+ * Lenient on purpose: an entry it cannot use is dropped rather than failing the row, because a
+ * reader that failed open would be worse. New rows never need that leniency, since the management
+ * API refuses such input before it is stored (st_egress_normalize_destination_rules).
  */
 int st_egress_parse_destination_rules(const char *json,
                                       st_egress_destination_rule *out,
                                       size_t capacity,
                                       size_t *out_len);
+
+/*
+ * Validates the destination rules of a policy saved through the management API and returns the
+ * form to store, as fixed by protocol/test-vectors/peer-egress-management-v1.json.
+ *
+ * What is only spelling is normalised: the CIDR is trimmed and otherwise kept as written, protocols
+ * are trimmed, lowercased and de-duplicated in order, and an absent or null list is stored as an
+ * empty one. Anything the egress would not read -- a CIDR it cannot parse, a protocol other than
+ * tcp or udp, a port range other than [low, high] within 0-65535, or more rules, ranges or bytes
+ * than may be stored -- refuses the whole list instead of dropping the offending part, so what is
+ * saved is exactly what was asked for. A top-level null is refused too; whether it means "leave
+ * the rules as they are" is the caller's decision.
+ *
+ * Returns 0 and sets *out_json to a malloc'd compact JSON array the caller frees, or nonzero with
+ * *out_json NULL when the request must be refused.
+ */
+int st_egress_normalize_destination_rules(const char *json, char **out_json);
 
 /*
  * Serialises an allowlist for storage. Returns a malloc'd string the caller frees, or NULL when the

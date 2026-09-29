@@ -388,7 +388,8 @@ static int hex_value(char ch)
     return -1;
 }
 
-static char *parse_json_string_value(const char **cursor)
+/* out_len, when given, receives the decoded length, which strlen misses past an escaped NUL. */
+static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
 {
     const char *p = *cursor;
     if (*p != '"') {
@@ -491,10 +492,36 @@ static char *parse_json_string_value(const char **cursor)
         return NULL;
     }
     *cursor = p + 1;
+    if (out_len != NULL) {
+        *out_len = len;
+    }
     if (out == NULL) {
         return st_strdup_len("", 0);
     }
     return out;
+}
+
+static char *parse_json_string_value(const char **cursor)
+{
+    return parse_json_string_value_len(cursor, NULL);
+}
+
+char *st_json_decode_string(const char *raw, size_t *out_len)
+{
+    if (raw == NULL) {
+        return NULL;
+    }
+    const char *p = skip_ws(raw);
+    const char *end = validate_json_string(p);
+    if (end == NULL || *skip_ws(end) != '\0') {
+        return NULL;
+    }
+    size_t len = 0;
+    char *value = parse_json_string_value_len(&p, &len);
+    if (value != NULL && out_len != NULL) {
+        *out_len = len;
+    }
+    return value;
 }
 
 char *st_json_get_string(const char *json, const char *key)

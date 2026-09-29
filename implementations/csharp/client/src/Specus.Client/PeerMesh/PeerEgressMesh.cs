@@ -50,8 +50,20 @@ internal interface IPeerEgressMeshHost
     /// <summary>This node's own consumer rules, fixed for the life of the process.</summary>
     IReadOnlyList<PeerEgressRule> ConsumerRules => [];
 
+    /// <summary>
+    /// The consumer's master switch, <c>peerEgressEnabled</c>. Off, the rules are kept and none is
+    /// applied. True by default so a host built only to drive the plane applies what it is given.
+    /// </summary>
+    bool ConsumerEnabled => true;
+
     /// <summary>Complete snapshot; omitted peers are offline.</summary>
     IReadOnlyDictionary<long, bool> EgressAvailability => new Dictionary<long, bool>();
+
+    /// <summary>
+    /// What carries frames to each peer now: <c>direct</c>, <c>relay</c>, or absent when there is
+    /// neither. Read for status only.
+    /// </summary>
+    IReadOnlyDictionary<long, string> EgressPaths => new Dictionary<long, string>();
 
     /// <summary>Whether there is an interface to route into: a real device that started.</summary>
     bool DeviceReady => true;
@@ -222,12 +234,22 @@ internal sealed class PeerEgressMesh(
         {
             foreach (var outbound in _queue.GetConsumingEnumerable(_stopping.Token))
             {
-                _runtime?.SendReady(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                // Blocking on the task is what this thread is for. It is not a pool thread, so
-                // waiting here costs nothing anyone else needs.
-                if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())
+                // One frame that fails to go out is a lost datagram. Letting its exception leave
+                // this loop ended the thread and, unobserved on a thread of its own, the process:
+                // every flow of every consumer went with it.
+                try
                 {
-                    logger?.LogDebug("Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
+                    _runtime?.SendReady(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    // Blocking on the task is what this thread is for. It is not a pool thread, so
+                    // waiting here costs nothing anyone else needs.
+                    if (!host.SendToPeerAsync(outbound.Consumer, outbound.Frame).GetAwaiter().GetResult())
+                    {
+                        logger?.LogDebug("Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
+                    }
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or StackOverflowException))
+                {
+                    logger?.LogDebug(ex, "Peer Mesh egress send failed: peer={Peer}", outbound.Consumer);
                 }
             }
         });
@@ -235,7 +257,15 @@ internal sealed class PeerEgressMesh(
         {
             foreach (var packet in _deviceQueue.GetConsumingEnumerable(_stopping.Token))
             {
-                host.WriteToDeviceAsync(packet).GetAwaiter().GetResult();
+                // As above: one packet the device would not take must not end the loop.
+                try
+                {
+                    host.WriteToDeviceAsync(packet).GetAwaiter().GetResult();
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or StackOverflowException))
+                {
+                    logger?.LogDebug(ex, "Peer Mesh egress device write failed");
+                }
             }
         });
     }
@@ -414,11 +444,12 @@ internal sealed class PeerEgressMesh(
         {
             lock (consumerRole)
             {
-                consumerStatus = consumerRole.StatusSnapshot();
+                consumerStatus = consumerRole.StatusSnapshot(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             }
         }
+        if (consumerStatus is not null) consumerStatus = consumerStatus with { Paths = host.EgressPaths };
         return PeerEgressStatus.Section(consumerStatus,
-            installer?.Installed ?? [], _applied, plane?.StatusSnapshot());
+            installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules);
     }
 
     /// <summary>
@@ -442,7 +473,9 @@ internal sealed class PeerEgressMesh(
     /// drop, the relay is reassigned, the control connection is re-established.
     /// </remarks>
     public void ReconcileRoutes() =>
-        Reconcile(host.ConsumerRules, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // With the master switch off nothing is taken over. The plan is then empty, which withdraws
+        // whatever a previous run left installed, and the consumer is not built.
+        Reconcile(host.ConsumerEnabled ? host.ConsumerRules : [], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
     public void Reconcile(IReadOnlyList<PeerEgressRule> rules, long nowMs)
     {
@@ -655,8 +688,9 @@ internal sealed class PeerEgressMesh(
         _refusalsLogged = joined;
         foreach (var refusal in refused)
         {
-            logger?.LogWarning("[peer-egress-consumer] rule {Index} ({Match}) refused: {Code}",
-                refusal.Index, refusal.Match, refusal.Code);
+            // The index and the code, not the match: configuration values stay out of the log.
+            logger?.LogWarning("[peer-egress-consumer] rule {Index} refused: {Code}",
+                refusal.Index, refusal.Code);
         }
     }
 
@@ -748,7 +782,7 @@ internal sealed class PeerEgressMesh(
         var purge = new Dictionary<long, IReadOnlyList<string>>();
         lock (consumerRole)
         {
-            var peers = consumerRole.StatusSnapshot().Online.Keys.Concat(online.Keys).Distinct().ToArray();
+            var peers = consumerRole.StatusSnapshot(nowMs).Online.Keys.Concat(online.Keys).Distinct().ToArray();
             foreach (var peer in peers)
             {
                 foreach (var (egress, destinations) in consumerRole.SetEgressOnline(peer,

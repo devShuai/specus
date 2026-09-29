@@ -2400,6 +2400,106 @@ static int test_sws2_validation(void)
     return 0;
 }
 
+/*
+ * The egress policy endpoint end to end. The rule-by-rule semantics are replayed from the shared
+ * vector in peer_egress_tests; what is checked here is that a refused list refuses the whole
+ * request, so neither the rules nor any other field of it is saved.
+ */
+static int test_peer_mesh_egress_policy_validation(int egress_client_id)
+{
+    static const char *const path = "/api/admin/peer-mesh/egress/policies";
+    static const char *const stored =
+        "\"destinationRules\":[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\",\"udp\"],"
+        "\"portRanges\":[[80,80],[8000,8100]]},"
+        "{\"cidr\":\"198.51.100.0/24\",\"protocols\":[],\"portRanges\":[]}]";
+    char response[16384];
+    char body[1024];
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"maxConcurrentFlows\":10,\"destinationRules\":["
+             "{\"cidr\":\" 10.0.0.0/8 \",\"protocols\":[\" TCP \",\"udp\",\"tcp\"],"
+             "\"portRanges\":[[80,80],[8000,8100]]},{\"cidr\":\"198.51.100.0/24\"}]}",
+             egress_client_id);
+    int len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    int policy_id = 0;
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
+        || !contains(response, "\"maxConcurrentFlows\":10")
+        || st_json_get_int(response, "id", &policy_id) != 0 || policy_id <= 0) {
+        fprintf(stderr, "egress policy save did not store the normalised rules: %s\n", response);
+        return 1;
+    }
+
+    static const char *const refused_rules[] = {
+        "[{\"cidr\":\"203.0.113.07\"}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"icmp\"]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443,80]]}]",
+        "[{\"protocols\":[\"tcp\"]}]",
+    };
+    for (size_t i = 0; i < sizeof(refused_rules) / sizeof(refused_rules[0]); ++i) {
+        snprintf(body, sizeof(body),
+                 "{\"egressClientId\":%d,\"maxConcurrentFlows\":20,\"destinationRules\":%s}",
+                 egress_client_id, refused_rules[i]);
+        len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "invalid destinationRules")) {
+            fprintf(stderr, "egress policy accepted %s: %s\n", refused_rules[i], response);
+            return 1;
+        }
+    }
+    len = st_admin_build_response("GET", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
+        || !contains(response, "\"maxConcurrentFlows\":10")) {
+        fprintf(stderr, "a refused egress policy request changed what was stored: %s\n", response);
+        return 1;
+    }
+
+    /* null reads as absent: the other fields apply and the rules stay as stored. */
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"maxConcurrentFlows\":30,\"destinationRules\":null}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
+        || !contains(response, "\"maxConcurrentFlows\":30")) {
+        fprintf(stderr, "null destinationRules did not keep the stored rules: %s\n", response);
+        return 1;
+    }
+
+    /* Truncated: the field readers could still pick egressClientId out of it. */
+    snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"maxConcurrentFlows\":40,\"destinationRules\":[",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+        fprintf(stderr, "egress policy accepted an unparsable body: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response_with_body("POST", path,
+                                            "{\"egressClientId\":987654321,\"destinationRules\":[]}",
+                                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")) {
+        fprintf(stderr, "egress policy for an unknown client was not 404: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/egress/switch",
+                                            "{\"enabled\":false", response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+        fprintf(stderr, "egress switch accepted an unparsable body: %s\n", response);
+        return 1;
+    }
+
+    char delete_path[128];
+    snprintf(delete_path, sizeof(delete_path), "%s/%d", path, policy_id);
+    len = st_admin_build_response("DELETE", delete_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "egress policy delete failed: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", delete_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")) {
+        fprintf(stderr, "deleting a missing egress policy was not 404: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
@@ -2823,6 +2923,8 @@ int main(void)
              "\"clientMessageCapabilities\":{\"sendMessages\":true,\"receiveMessages\":true,"
              "\"attachments\":true,\"mediaPreview\":true,"
              "\"maxAttachmentBytes\":16777216},"
+             "\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,"
+             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":false},"
              "\"clientPeerServiceCapabilities\":{\"version\":2,"
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
@@ -2868,6 +2970,12 @@ int main(void)
         || negotiated_session.peer_service_discovery_version != 2
         || strcmp(negotiated_session.peer_service_applications, "http,tcp") != 0) {
         fprintf(stderr, "client peer service capability negotiation mismatch\n");
+        return 1;
+    }
+    /* The egress-catalog reads domainTargetCapable from this session, so it must be stored here. */
+    if (negotiated_session.client_egress_version != 1
+        || !negotiated_session.client_egress_domain_targets) {
+        fprintf(stderr, "client egress capability negotiation mismatch\n");
         return 1;
     }
     if (st_storage_mark_client_session_online(auth_db_path,
@@ -3726,6 +3834,9 @@ int main(void)
         || !contains(response, "\"targetClientName\":\"C peer target\"")
         || !contains(response, "\"direction\":\"BOTH\"")) {
         fprintf(stderr, "peer mesh acl list response mismatch\n");
+        return 1;
+    }
+    if (test_peer_mesh_egress_policy_validation(target_client_id) != 0) {
         return 1;
     }
     snprintf(acl_body,

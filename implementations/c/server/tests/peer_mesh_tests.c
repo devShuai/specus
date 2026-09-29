@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "peer_egress.h"
 #include "peer_mesh.h"
 #include "storage.h"
 
@@ -48,6 +49,231 @@ static int is_online(void *raw, long long client_id, const char *client_name)
 static int contains(const char *value, const char *needle)
 {
     return value != NULL && strstr(value, needle) != NULL;
+}
+
+/* The catalogue fixture: the consumer and the plain egress stay up, the DNS egress comes and goes. */
+typedef struct {
+    peer_test_context capture;
+    int dns_egress_online;
+} egress_test_context;
+
+static int capture_egress_signal(void *raw,
+                                 const char *target,
+                                 const char *source,
+                                 const char *message)
+{
+    return capture_signal(&((egress_test_context *)raw)->capture, target, source, message);
+}
+
+static int egress_is_online(void *raw, long long client_id, const char *client_name)
+{
+    (void)client_id;
+    egress_test_context *ctx = (egress_test_context *)raw;
+    return strcmp(client_name, "egress-consumer") == 0
+        || strcmp(client_name, "egress-plain") == 0
+        || (ctx->dns_egress_online && strcmp(client_name, "egress-dns") == 0);
+}
+
+/* Logs a client in the way the HTTP login and the control connection leave its session row. */
+static int open_egress_session(const char *path,
+                               const st_storage_client *client,
+                               int domain_targets,
+                               long long *session_id)
+{
+    static int logins;
+    st_storage_client_session session;
+    memset(&session, 0, sizeof(session));
+    snprintf(session.tenant_id, sizeof(session.tenant_id), "%s", client->tenant_id);
+    session.credential_id = 1;
+    session.identity_id = client->id;
+    session.client_id = client->id;
+    snprintf(session.client_name, sizeof(session.client_name), "%s", client->client_name);
+    snprintf(session.token_hash, sizeof(session.token_hash), "token-%d", ++logins);
+    snprintf(session.status, sizeof(session.status), "%s", "HTTP_AUTHENTICATED");
+    snprintf(session.machine_fingerprint, sizeof(session.machine_fingerprint), "machine-%lld", client->id);
+    snprintf(session.os_user, sizeof(session.os_user), "%s", "tester");
+    snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", "2026-06-25T00:00:00Z");
+    snprintf(session.expires_at, sizeof(session.expires_at), "%s", "2099-06-25T08:00:00Z");
+    session.client_egress_version = 1;
+    session.client_egress_domain_targets = domain_targets;
+    if (st_storage_create_client_session(path, &session, &session) != 0
+        || st_storage_mark_client_session_online(path, session.id, "channel", "127.0.0.1:7000",
+                                                 "2026-06-25T00:01:00Z") != 0) return -1;
+    *session_id = session.id;
+    return 0;
+}
+
+static int add_egress_policy(const char *path, const st_storage_client *egress, long long consumer_id)
+{
+    st_storage_peer_mesh_egress_policy policy;
+    memset(&policy, 0, sizeof(policy));
+    snprintf(policy.tenant_id, sizeof(policy.tenant_id), "%s", egress->tenant_id);
+    snprintf(policy.owner_username, sizeof(policy.owner_username), "%s", egress->owner_username);
+    policy.egress_client_id = egress->id;
+    snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "%s", egress->client_name);
+    policy.enabled = 1;
+    snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
+    snprintf(policy.allowed_consumer_client_ids, sizeof(policy.allowed_consumer_client_ids), "%lld",
+             consumer_id);
+    snprintf(policy.destination_rules, sizeof(policy.destination_rules),
+             "[{\"cidr\":\"203.0.113.0/24\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+    policy.max_concurrent_flows = 16;
+    policy.max_flows_per_consumer = 8;
+    policy.idle_timeout_seconds = 60;
+    return st_storage_upsert_peer_mesh_egress_policy(path, &policy, NULL);
+}
+
+/* The most recent egress-catalog pushed to the named device, or NULL. */
+static const char *last_egress_catalog(const peer_test_context *ctx, const char *target)
+{
+    const char *found = NULL;
+    for (size_t i = 0; i < ctx->count; ++i) {
+        if (strcmp(ctx->signals[i].target, target) == 0
+            && contains(ctx->signals[i].message, "\"type\":\"egress-catalog\"")) {
+            found = ctx->signals[i].message;
+        }
+    }
+    return found;
+}
+
+/* A boolean field of one catalogue entry: 1, 0, or -1 when the entry or field is missing. */
+static int catalog_entry_flag(const char *message, const char *client_name, const char *field)
+{
+    char needle[160];
+    char key[64];
+    snprintf(needle, sizeof(needle), "\"clientName\":\"%s\"", client_name);
+    snprintf(key, sizeof(key), "\"%s\":", field);
+    const char *entry = message == NULL ? NULL : strstr(message, needle);
+    /* Entries hold no nested objects, so the first closing brace ends this one. */
+    const char *end = entry == NULL ? NULL : strchr(entry, '}');
+    const char *value = entry == NULL ? NULL : strstr(entry, key);
+    if (end == NULL || value == NULL || value > end) return -1;
+    value += strlen(key);
+    if (strncmp(value, "true", 4) == 0) return 1;
+    if (strncmp(value, "false", 5) == 0) return 0;
+    return -1;
+}
+
+/*
+ * domainTargetCapable in the egress-catalog follows what each egress declared on its current
+ * online session. It used to be written as false for every entry, which left consumers unable to
+ * tell which egress could take a domain rule.
+ */
+static int test_egress_catalog_domain_targets(void)
+{
+    char path[] = "/tmp/specus_c_peer_egress_catalog_tests.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) return 1;
+
+    st_storage_client consumer;
+    st_storage_client dns_egress;
+    st_storage_client plain_egress;
+    st_storage_peer_mesh_device device;
+    long long consumer_session = 0;
+    long long dns_session = 0;
+    long long plain_session = 0;
+    st_storage_peer_mesh_egress_switch egress_switch;
+    memset(&egress_switch, 0, sizeof(egress_switch));
+    snprintf(egress_switch.tenant_id, sizeof(egress_switch.tenant_id), "%s", "tenant-egress");
+    egress_switch.enabled = 1;
+    snprintf(egress_switch.updated_by, sizeof(egress_switch.updated_by), "%s", "admin");
+    if (st_storage_upsert_client(path, 0, "tenant-egress", "egress-consumer", "owner", 1, 60, &consumer) != 0
+        || st_storage_upsert_client(path, 0, "tenant-egress", "egress-dns", "owner", 1, 60, &dns_egress) != 0
+        || st_storage_upsert_client(path, 0, "tenant-egress", "egress-plain", "owner", 1, 60, &plain_egress) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &consumer, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &dns_egress, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &plain_egress, 1, &device) != 0
+        || st_storage_upsert_peer_mesh_egress_switch(path, &egress_switch) != 0
+        || add_egress_policy(path, &dns_egress, consumer.id) != 0
+        || add_egress_policy(path, &plain_egress, consumer.id) != 0
+        || open_egress_session(path, &consumer, 0, &consumer_session) != 0
+        || open_egress_session(path, &dns_egress, 1, &dns_session) != 0
+        || open_egress_session(path, &plain_egress, 0, &plain_session) != 0) {
+        fprintf(stderr, "egress catalog fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+
+    egress_test_context context;
+    memset(&context, 0, sizeof(context));
+    context.dns_egress_online = 1;
+    st_peer_mesh_runtime runtime = {path, capture_egress_signal, egress_is_online, &context, 0, 2};
+    if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0) {
+        fprintf(stderr, "egress catalog refresh failed\n");
+        unlink(path);
+        return 1;
+    }
+    const char *catalog = last_egress_catalog(&context.capture, "egress-consumer");
+    if (catalog_entry_flag(catalog, "egress-dns", "domainTargetCapable") != 1
+        || catalog_entry_flag(catalog, "egress-plain", "domainTargetCapable") != 0
+        || catalog_entry_flag(catalog, "egress-dns", "ipv6TargetCapable") != 0
+        || catalog_entry_flag(catalog, "egress-plain", "ipv6TargetCapable") != 0) {
+        fprintf(stderr, "egress catalog did not carry the announced domainTargetCapable: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+
+    /*
+     * The departure push runs before the session row is marked disconnected, so the row still says
+     * it declared domain targets. The catalogue must follow the live connection, not that row.
+     */
+    context.capture.count = 0;
+    context.dns_egress_online = 0;
+    if (st_peer_mesh_push_on_logout(&runtime, "egress-dns") != 0) {
+        fprintf(stderr, "egress catalog departure push failed\n");
+        unlink(path);
+        return 1;
+    }
+    catalog = last_egress_catalog(&context.capture, "egress-consumer");
+    if (catalog_entry_flag(catalog, "egress-dns", "domainTargetCapable") != 0) {
+        fprintf(stderr, "egress catalog kept domainTargetCapable for a departed egress: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+
+    /* Back on a session that did not declare it: the new session wins over the old declaration. */
+    context.capture.count = 0;
+    context.dns_egress_online = 1;
+    if (st_storage_mark_client_session_disconnected(path, dns_session, "2026-06-25T00:02:00Z") != 0
+        || open_egress_session(path, &dns_egress, 0, &dns_session) != 0
+        || st_peer_mesh_push_on_login(&runtime, "egress-dns") != 0) {
+        fprintf(stderr, "egress catalog relogin fixture failed\n");
+        unlink(path);
+        return 1;
+    }
+    catalog = last_egress_catalog(&context.capture, "egress-consumer");
+    if (catalog_entry_flag(catalog, "egress-dns", "domainTargetCapable") != 0) {
+        fprintf(stderr, "egress catalog did not follow the current session's declaration: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+
+    /* No online session at all reads as not declared, whatever an earlier one said. */
+    context.capture.count = 0;
+    if (st_storage_mark_client_session_disconnected(path, dns_session, "2026-06-25T00:03:00Z") != 0
+        || open_egress_session(path, &dns_egress, 1, &dns_session) != 0
+        || st_storage_mark_client_session_disconnected(path, dns_session, "2026-06-25T00:04:00Z") != 0
+        || st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0) {
+        fprintf(stderr, "egress catalog offline fixture failed\n");
+        unlink(path);
+        return 1;
+    }
+    catalog = last_egress_catalog(&context.capture, "egress-consumer");
+    if (catalog_entry_flag(catalog, "egress-dns", "domainTargetCapable") != 0
+        || catalog_entry_flag(catalog, "egress-plain", "domainTargetCapable") != 0) {
+        fprintf(stderr, "egress catalog advertised domain targets without an online session: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
 }
 
 int main(void)
@@ -343,6 +569,7 @@ int main(void)
     }
 
     unlink(path);
+    if (test_egress_catalog_domain_targets() != 0) return 1;
     printf("peer mesh tests passed\n");
     return 0;
 }

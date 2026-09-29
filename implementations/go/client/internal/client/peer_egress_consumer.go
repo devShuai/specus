@@ -55,6 +55,13 @@ type egressConsumerFlow struct {
 	Key      egressFlowKey
 	Egress   int64
 	LastSeen time.Time
+	// registered orders flows that were last seen at the same moment, so eviction is
+	// deterministic: of two equally idle flows, the one registered first goes.
+	registered uint64
+	// A TCP flow closes on an RST either way or once both directions have sent FIN; from then it
+	// is kept only long enough to take the stragglers (egressConsumerClosedLinger).
+	finOut, finIn bool
+	closedAt      time.Time
 	// What the application last said on a TCP flow, kept so the flow can be reset without waiting
 	// for it to speak again. Its acknowledgement number is its receive-next, the one sequence
 	// number a stack accepts a reset at (RFC 5961); its next sequence number is what the reset
@@ -75,6 +82,12 @@ type egressConsumer struct {
 	// online is which egress peers can currently take a flow. Absent means no.
 	online map[int64]bool
 	flows  map[egressFlowKey]*egressConsumerFlow
+	// flowCapacity bounds flows; flowOrder numbers them as they register. latest is the newest
+	// time any caller passed in, which the status uses to count only the flows still remembered.
+	flowCapacity int
+	flowOrder    uint64
+	latest       time.Time
+	lastSweep    time.Time
 
 	// send delivers an SPEG1 frame to an egress peer; toTun writes a packet to the local stack.
 	send  func(egress int64, frame []byte) error
@@ -92,9 +105,11 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 		meshCIDR: egressDefaultMeshCIDR,
 		online:   map[int64]bool{},
 		flows:    map[egressFlowKey]*egressConsumerFlow{},
-		send:     send,
-		toTun:    toTun,
-		blocked:  map[string]int64{},
+
+		flowCapacity: egressConsumerFlowCapacity,
+		send:         send,
+		toTun:        toTun,
+		blocked:      map[string]int64{},
 	}
 }
 
@@ -142,6 +157,8 @@ func (c *egressConsumer) setEgressOnline(egress int64, online bool, now time.Tim
 //
 // The resets are returned rather than written here, so the device is written to with no lock held.
 func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]string, [][]byte) {
+	// A flow already forgotten is not reset: its application stopped waiting long ago.
+	c.sweepLocked(now)
 	purge := map[int64][]string{}
 	var resets [][]byte
 	for key, flow := range c.flows {
@@ -246,14 +263,19 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 
 	key, ok := consumerFlowKeyFor(packet, protocol)
 	if ok {
-		flow, known := c.flows[key]
-		if !known {
-			flow = &egressConsumerFlow{Key: key, Egress: decision.EgressClientID}
-			c.flows[key] = flow
+		flow := c.liveFlowLocked(key, now)
+		if flow != nil && protocol == ipv4ProtocolTCP && !flow.closedAt.IsZero() && tcpPacketIsOpening(packet) {
+			// A new connection reusing the four-tuple of one that closed.
+			delete(c.flows, key)
+			flow = nil
+		}
+		if flow == nil {
+			flow = c.registerFlowLocked(key, decision.EgressClientID, now)
 		}
 		flow.LastSeen = now
 		if protocol == ipv4ProtocolTCP {
 			flow.noteApplicationProgress(packet)
+			flow.noteTCPFlags(tcpPacketFlags(packet), true, now)
 		}
 	}
 	egress, send := decision.EgressClientID, c.send
@@ -334,7 +356,7 @@ func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.
 		c.mu.Unlock()
 		return true
 	}
-	if !c.hasReturnFlowLocked(parsed.Inner, fromEgress, now) {
+	if !c.hasReturnFlowLocked(parsed.Inner, parsed.Body, fromEgress, now) {
 		c.recordBlockedLocked("return-no-flow")
 		c.mu.Unlock()
 		return true
@@ -350,7 +372,7 @@ func (c *egressConsumer) handleInbound(frame []byte, fromEgress int64, now time.
 
 // hasReturnFlowLocked reports whether a reply belongs to a flow this node opened through this
 // egress. The tuple is mirrored, since the reply travels the other way.
-func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, fromEgress int64, now time.Time) bool {
+func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, packet []byte, fromEgress int64, now time.Time) bool {
 	remote, remoteOK := parseEgressAddress(inner.SourceIP)
 	local, localOK := parseEgressAddress(inner.DestinationIP)
 	if !remoteOK || !localOK {
@@ -363,12 +385,33 @@ func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, fromEgress i
 		remoteIP:     remote,
 		remotePort:   uint16(inner.SourcePort),
 	}
-	flow, known := c.flows[key]
-	if !known || flow.Egress != fromEgress {
+	flow := c.liveFlowLocked(key, now)
+	if flow == nil || flow.Egress != fromEgress {
 		return false
 	}
 	flow.LastSeen = now
+	if inner.Protocol == ipv4ProtocolTCP {
+		flow.noteTCPFlags(tcpPacketFlags(packet), false, now)
+	}
 	return true
+}
+
+// tcpPacketFlags reads the flags of an IPv4 TCP packet, or 0 for anything else.
+func tcpPacketFlags(packet []byte) byte {
+	if len(packet) < ipv4MinHeaderLen || packet[0]>>4 != 4 || int(packet[9]) != ipv4ProtocolTCP {
+		return 0
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+14 {
+		return 0
+	}
+	return packet[ihl+13]
+}
+
+// tcpPacketIsOpening reports a SYN without ACK: the first packet of a connection.
+func tcpPacketIsOpening(packet []byte) bool {
+	flags := tcpPacketFlags(packet)
+	return flags&tcpFlagSYN != 0 && flags&tcpFlagACK == 0
 }
 
 // A flow-reject can overtake (or survive loss of) the remote RST on the UDP peer path.
@@ -433,5 +476,105 @@ func (c *egressConsumer) blockedCounts() map[string]int64 {
 func (c *egressConsumer) flowCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sweepLocked(c.latest)
 	return len(c.flows)
+}
+
+// How long a consumer remembers a flow it sent through an egress (protocol/spec/peer-egress.md,
+// protocol/test-vectors/peer-egress-consumer-flows-v1.json). Until these, nothing but a revocation
+// or a flow-reject removed an entry, so every flow ever made stayed in memory and the status's
+// active flows only grew.
+const (
+	egressConsumerUDPIdle      = 180 * time.Second
+	egressConsumerTCPIdle      = 7200 * time.Second
+	egressConsumerClosedLinger = 120 * time.Second
+	egressConsumerFlowCapacity = 65536
+	// A full sweep walks every flow, so it runs at most this often; a flow looked up in between
+	// is checked on its own.
+	egressConsumerSweepInterval = 10 * time.Second
+)
+
+// forgetAt is when a flow stops being remembered.
+func (flow *egressConsumerFlow) forgetAt() time.Time {
+	switch {
+	case flow.Key.protocol != ipv4ProtocolTCP:
+		return flow.LastSeen.Add(egressConsumerUDPIdle)
+	case !flow.closedAt.IsZero():
+		return flow.closedAt.Add(egressConsumerClosedLinger)
+	default:
+		return flow.LastSeen.Add(egressConsumerTCPIdle)
+	}
+}
+
+// noteTCPFlags records the close of a TCP flow: an RST either way, or FIN from both sides.
+func (flow *egressConsumerFlow) noteTCPFlags(flags byte, outbound bool, now time.Time) {
+	if flags&tcpFlagRST != 0 && flow.closedAt.IsZero() {
+		flow.closedAt = now
+	}
+	if flags&tcpFlagFIN != 0 {
+		if outbound {
+			flow.finOut = true
+		} else {
+			flow.finIn = true
+		}
+	}
+	if flow.finOut && flow.finIn && flow.closedAt.IsZero() {
+		flow.closedAt = now
+	}
+}
+
+// liveFlowLocked is the flow for key if it is still remembered at now, forgetting it otherwise.
+func (c *egressConsumer) liveFlowLocked(key egressFlowKey, now time.Time) *egressConsumerFlow {
+	c.noteTimeLocked(now)
+	flow, known := c.flows[key]
+	if !known {
+		return nil
+	}
+	if !now.Before(flow.forgetAt()) {
+		delete(c.flows, key)
+		return nil
+	}
+	return flow
+}
+
+// registerFlowLocked adds a flow, making room first when the table is full: whatever has expired,
+// then the flow that has been idle longest.
+func (c *egressConsumer) registerFlowLocked(key egressFlowKey, egress int64, now time.Time) *egressConsumerFlow {
+	if len(c.flows) >= c.flowCapacity {
+		c.sweepLocked(now)
+	}
+	if len(c.flows) >= c.flowCapacity {
+		var oldest *egressConsumerFlow
+		for _, flow := range c.flows {
+			if oldest == nil || flow.LastSeen.Before(oldest.LastSeen) ||
+				(flow.LastSeen.Equal(oldest.LastSeen) && flow.registered < oldest.registered) {
+				oldest = flow
+			}
+		}
+		delete(c.flows, oldest.Key)
+	}
+	c.flowOrder++
+	flow := &egressConsumerFlow{Key: key, Egress: egress, LastSeen: now, registered: c.flowOrder}
+	c.flows[key] = flow
+	return flow
+}
+
+// noteTimeLocked keeps the newest time seen and sweeps now and then, so a table nobody looks up
+// still gives its memory back.
+func (c *egressConsumer) noteTimeLocked(now time.Time) {
+	if now.After(c.latest) {
+		c.latest = now
+	}
+	if now.Sub(c.lastSweep) >= egressConsumerSweepInterval {
+		c.sweepLocked(now)
+	}
+}
+
+func (c *egressConsumer) sweepLocked(now time.Time) {
+	c.lastSweep = now
+	for key, flow := range c.flows {
+		if !now.Before(flow.forgetAt()) {
+			delete(c.flows, key)
+		}
+	}
 }

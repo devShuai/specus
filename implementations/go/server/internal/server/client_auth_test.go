@@ -54,6 +54,36 @@ func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {
 	}
 }
 
+// The catalogue tells consumers which egress resolves names, from what that egress declared at
+// login; the declaration only counts from a client that takes part in egress at all.
+func TestClientAuthLoginStoresTheEgressDomainTargetDeclaration(t *testing.T) {
+	app, ts := newAPIServer(t)
+	const (
+		apiKey = "ck_egress_domains"
+		secret = "tenant-secret"
+	)
+	insertCredentialForTest(t, app, "tenant-a", "alice", apiKey, secret, 8)
+	cases := []struct {
+		name         string
+		capabilities map[string]any
+		want         bool
+	}{
+		{"declared", map[string]any{"version": 1, "egressCapable": true, "domainTargetCapable": true}, true},
+		{"not declared", map[string]any{"version": 1, "egressCapable": true}, false},
+		{"declared false", map[string]any{"version": 1, "egressCapable": true, "domainTargetCapable": false}, false},
+		{"no egress version", map[string]any{"version": 0, "domainTargetCapable": true}, false},
+	}
+	for i, tc := range cases {
+		machine := "machine-egress-domains-" + strconv.Itoa(i)
+		decoded := clientAuthLoginWithEnvironmentForTest(t, ts.URL, apiKey, secret, machine, "alice",
+			map[string]any{"clientEgressCapabilities": tc.capabilities})
+		session := getClientSessionForTest(t, app, decoded.ClientSessionID)
+		if session.ClientEgressDomainTargets != tc.want {
+			t.Errorf("%s: stored domainTargetCapable = %v, want %v", tc.name, session.ClientEgressDomainTargets, tc.want)
+		}
+	}
+}
+
 func TestClientAuthAdvertisesTLSWhenTerminatedUpstream(t *testing.T) {
 	cfg := config.Default()
 	cfg.TLS.Mode = "disabled"
@@ -223,6 +253,12 @@ func getClientSessionForTest(t *testing.T, app *App, id int64) *store.ClientSess
 
 func clientAuthLoginForTest(t *testing.T, baseURL, apiKey, secret, machineFingerprint, osUser string) clientAuthLoginForTestResponse {
 	t.Helper()
+	return clientAuthLoginWithEnvironmentForTest(t, baseURL, apiKey, secret, machineFingerprint, osUser, nil)
+}
+
+// clientAuthLoginWithEnvironmentForTest logs in with extra environment fields on top of the defaults.
+func clientAuthLoginWithEnvironmentForTest(t *testing.T, baseURL, apiKey, secret, machineFingerprint, osUser string, extra map[string]any) clientAuthLoginForTestResponse {
+	t.Helper()
 	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	nonce := "nonce-" + machineFingerprint + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	environment := map[string]any{
@@ -236,6 +272,9 @@ func clientAuthLoginForTest(t *testing.T, baseURL, apiKey, secret, machineFinger
 			"sendMessages": true, "receiveMessages": true, "attachments": true,
 			"mediaPreview": true, "maxAttachmentBytes": 123456,
 		},
+	}
+	for key, value := range extra {
+		environment[key] = value
 	}
 	request := map[string]any{
 		"apiKey":      apiKey,

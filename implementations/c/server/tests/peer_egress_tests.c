@@ -381,6 +381,10 @@ static void load_rule(const char *raw, st_egress_rule *rule)
         rule->port = port;
         rule->has_port = 1;
     }
+    int enabled = 1;
+    if (st_json_get_bool(raw, "enabled", &enabled) == 0 && !enabled) {
+        rule->switched_off = 1;
+    }
 }
 
 static int load_rules(const char *vector, st_egress_rule *rules, size_t capacity, size_t *out_len)
@@ -779,13 +783,213 @@ static int run_cross_language_sweep(const char *vector)
     return failures;
 }
 
+/*
+ * domainTargetCapable as read from a login's clientEgressCapabilities. It is advertised to every
+ * consumer in the catalogue, so anything short of an explicit true next to a usable version must
+ * read as false.
+ */
+static int run_domain_target_declaration(void)
+{
+    static const struct {
+        const char *label;
+        const char *capabilities;
+        int version;
+        int expected;
+    } cases[] = {
+        { "declared true", "{\"version\":1,\"domainTargetCapable\":true}", 1, 1 },
+        { "declared false", "{\"version\":1,\"domainTargetCapable\":false}", 1, 0 },
+        { "field absent", "{\"version\":1,\"egressCapable\":true}", 1, 0 },
+        { "version 0", "{\"version\":0,\"domainTargetCapable\":true}", 0, 0 },
+        { "object absent", NULL, 1, 0 },
+        { "not a boolean", "{\"version\":1,\"domainTargetCapable\":7}", 1, 0 },
+    };
+    int failures = 0;
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int actual = st_egress_declares_domain_targets(cases[i].capabilities, cases[i].version);
+        if (actual != cases[i].expected) {
+            fprintf(stderr, "domain target declaration %s: got %d, want %d\n", cases[i].label,
+                    actual, cases[i].expected);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/*
+ * Drops the whitespace between tokens of a JSON text, leaving strings intact. The vector is
+ * pretty-printed, and the stored form is compared byte for byte because its size is itself a limit.
+ */
+static char *compact_json(const char *raw)
+{
+    char *out = (char *)malloc(strlen(raw) + 1U);
+    if (out == NULL) {
+        return NULL;
+    }
+    size_t used = 0U;
+    int in_string = 0;
+    for (const char *p = raw; *p != '\0'; p++) {
+        if (in_string) {
+            out[used++] = *p;
+            if (*p == '\\' && p[1] != '\0') {
+                out[used++] = *++p;
+            } else if (*p == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            continue;
+        }
+        if (*p == '"') {
+            in_string = 1;
+        }
+        out[used++] = *p;
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int expect_limit(const char *limits, const char *key, long long want)
+{
+    long long got = 0;
+    if (limits == NULL || st_json_get_i64(limits, key, &got) != 0 || got != want) {
+        fprintf(stderr, "management vector limit %s = %lld, this build enforces %lld\n", key, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Replays peer-egress-management-v1.json: every accepted list must normalise to exactly the stored
+ * form, and every refused one must be refused as a whole with nothing to store.
+ */
+static int run_management_vector(const char *vector)
+{
+    int failures = 0;
+    char *limits = st_json_get_top_level_raw(vector, "limits");
+    failures += expect_limit(limits, "rules", ST_EGRESS_MAX_DESTINATION_RULES);
+    failures += expect_limit(limits, "portRangesPerRule", ST_EGRESS_MAX_PORT_RANGES);
+    failures += expect_limit(limits, "storedJsonBytes", ST_EGRESS_MAX_DESTINATION_RULES_BYTES);
+    free(limits);
+
+    char **accept = NULL;
+    size_t accept_len = 0U;
+    char **reject = NULL;
+    size_t reject_len = 0U;
+    if (st_json_get_raw_array(vector, "accept", &accept, &accept_len) != 0 || accept_len == 0U
+        || st_json_get_raw_array(vector, "reject", &reject, &reject_len) != 0 || reject_len == 0U) {
+        fprintf(stderr, "management vector carried no cases\n");
+        st_json_free_string_array(accept, accept_len);
+        st_json_free_string_array(reject, reject_len);
+        return failures + 1;
+    }
+    for (size_t i = 0U; i < accept_len; i++) {
+        char *name = st_json_get_top_level_string(accept[i], "name");
+        char *rules_raw = st_json_get_top_level_raw(accept[i], "destinationRules");
+        char *stored_raw = st_json_get_top_level_raw(accept[i], "stored");
+        char *want = stored_raw == NULL ? NULL : compact_json(stored_raw);
+        char *got = NULL;
+        if (name == NULL || rules_raw == NULL || want == NULL) {
+            fprintf(stderr, "management accept case %zu is incomplete\n", i);
+            failures++;
+        } else if (st_egress_normalize_destination_rules(rules_raw, &got) != 0 || got == NULL) {
+            fprintf(stderr, "%s: refused, want stored %s\n", name, want);
+            failures++;
+        } else if (strcmp(got, want) != 0) {
+            fprintf(stderr, "%s: stored %s, want %s\n", name, got, want);
+            failures++;
+        }
+        free(got);
+        free(want);
+        free(stored_raw);
+        free(rules_raw);
+        free(name);
+    }
+    for (size_t i = 0U; i < reject_len; i++) {
+        char *name = st_json_get_top_level_string(reject[i], "name");
+        char *rules_raw = st_json_get_top_level_raw(reject[i], "destinationRules");
+        char *got = NULL;
+        if (name == NULL || rules_raw == NULL) {
+            fprintf(stderr, "management reject case %zu is incomplete\n", i);
+            failures++;
+        } else if (st_egress_normalize_destination_rules(rules_raw, &got) == 0 || got != NULL) {
+            fprintf(stderr, "%s: accepted as %s, want refused\n", name, got == NULL ? "(null)" : got);
+            failures++;
+        }
+        free(got);
+        free(rules_raw);
+        free(name);
+    }
+    st_json_free_string_array(accept, accept_len);
+    st_json_free_string_array(reject, reject_len);
+    return failures;
+}
+
+/*
+ * Inputs the vector does not spell out but this parser could get wrong: a C string ends at an
+ * escaped NUL, and a reader that coerces types would turn 443.0 or "443" into a port.
+ */
+static int run_management_edges(void)
+{
+    static const char *const refused[] = {
+        "{\"cidr\":\"10.0.0.0/8\"}",
+        "null",
+        "[{\"cidr\":\"10.0.0.0/8\\u0000junk\"}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"tcp\\u0000x\"]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[6]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":\"tcp\"}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443.0,443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[\"443\",443]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[1,2,3]]}]",
+        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[1,99999999999999999999]]}]",
+        "[{\"cidr\":10}]",
+        "[{\"cidr\":null}]",
+        "[\"10.0.0.0/8\"]",
+        "[{\"cidr\":\"10.0.0.0 /8\"}]",
+        "[{\"cidr\":\"10.0.0.0/8\"}",
+    };
+    int failures = 0;
+    for (size_t i = 0U; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char *got = NULL;
+        if (st_egress_normalize_destination_rules(refused[i], &got) == 0 || got != NULL) {
+            fprintf(stderr, "edge %s: accepted as %s, want refused\n", refused[i],
+                    got == NULL ? "(null)" : got);
+            failures++;
+        }
+        free(got);
+    }
+
+    static const char *const accepted[][2] = {
+        /* Explicit nulls read like absent lists; a later duplicate key wins, as in the reference. */
+        {"[{\"cidr\":\"10.0.0.0/8\",\"protocols\":null,\"portRanges\":null}]",
+         "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[],\"portRanges\":[]}]"},
+        {"[{\"cidr\":\"192.0.2.0/24\",\"cidr\":\"\\t10.0.0.0/8\\n\",\"note\":{\"cidr\":\"x\"}}]",
+         "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[],\"portRanges\":[]}]"},
+        {"  [ { \"cidr\" : \"10.0.0.0/8\" , \"protocols\" : [ \"UDP\" ] , \"portRanges\" : [ [ -0 , 53 ] ] } ]  ",
+         "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"udp\"],\"portRanges\":[[0,53]]}]"},
+    };
+    for (size_t i = 0U; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        char *got = NULL;
+        if (st_egress_normalize_destination_rules(accepted[i][0], &got) != 0 || got == NULL
+            || strcmp(got, accepted[i][1]) != 0) {
+            fprintf(stderr, "edge %s: stored %s, want %s\n", accepted[i][0],
+                    got == NULL ? "(refused)" : got, accepted[i][1]);
+            failures++;
+        }
+        free(got);
+    }
+    return failures;
+}
+
 int main(void)
 {
     char *authz = read_vector("peer-egress-authz-v1.json");
     char *rules = read_vector("peer-egress-rules-v1.json");
-    if (authz == NULL || rules == NULL) {
+    char *management = read_vector("peer-egress-management-v1.json");
+    if (authz == NULL || rules == NULL || management == NULL) {
         free(authz);
         free(rules);
+        free(management);
         return 1;
     }
     int failures = 0;
@@ -797,8 +1001,12 @@ int main(void)
     failures += run_rule_validation(rules);
     failures += run_parser_boundaries();
     failures += run_storage_round_trip();
+    failures += run_domain_target_declaration();
+    failures += run_management_vector(management);
+    failures += run_management_edges();
     free(authz);
     free(rules);
+    free(management);
     if (failures != 0) {
         fprintf(stderr, "peer egress: %d assertion(s) failed\n", failures);
         return 1;

@@ -1,13 +1,16 @@
 name: Peer egress Linux lab
 
-# The consumer-to-egress path end to end, on Linux, with real processes: the Go server, a Go
-# consumer with a TUN device and routes of its own, a Go egress, and a target that records who
-# reached it, in network namespaces behind one router namespace. scripts/peer-egress-lab/lab.py
-# builds the namespaces and drives the acceptance list of issue #56; its report goes to the job
-# summary and the artifact.
+# The consumer-to-egress path end to end, on Linux, with real processes: the Go server, a consumer
+# with a TUN device and routes of its own, an egress, and a target that records who reached it, in
+# network namespaces behind one router namespace. scripts/peer-egress-lab/lab.py builds the
+# namespaces and drives the acceptance list of issue #56 and the performance thresholds of #50; its
+# report goes to the job summary and the artifact.
 #
-# Its own workflow because it needs both binaries built and runs for minutes rather than seconds,
-# and because it needs root and a kernel with TUN, which the CLI matrix does not.
+# Every consumer language against every egress language, nine combinations, because a flow crosses
+# two implementations and a defect in either shows only in the pairs that include it (#50).
+#
+# Its own workflow because it needs the binaries built and runs for minutes rather than seconds, and
+# because it needs root and a kernel with TUN, which the CLI matrix does not.
 
 on:
   pull_request:
@@ -16,6 +19,10 @@ on:
       - 'scripts/peer-egress-lab/**'
       - 'implementations/go/client/**'
       - 'implementations/go/server/**'
+      - 'implementations/java/client/**'
+      - 'implementations/java/common/**'
+      - 'implementations/csharp/client/src/**'
+      - 'pom.xml'
   push:
     branches: [main]
     paths:
@@ -23,6 +30,10 @@ on:
       - 'scripts/peer-egress-lab/**'
       - 'implementations/go/client/**'
       - 'implementations/go/server/**'
+      - 'implementations/java/client/**'
+      - 'implementations/java/common/**'
+      - 'implementations/csharp/client/src/**'
+      - 'pom.xml'
   workflow_dispatch:
 
 permissions:
@@ -30,9 +41,17 @@ permissions:
 
 jobs:
   lab:
-    name: Consumer to egress through real namespaces
+    name: Consumer to egress through real namespaces (${{ matrix.consumer }} consumer, ${{ matrix.egress }} egress)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer: [Go, Java, .NET]
+        egress: [Go, Java, .NET]
+    env:
+      USES_JAVA: ${{ matrix.consumer == 'Java' || matrix.egress == 'Java' }}
+      USES_DOTNET: ${{ matrix.consumer == '.NET' || matrix.egress == '.NET' }}
     steps:
       - uses: actions/checkout@v4
       - name: Test lab role selection and evidence parsing
@@ -43,11 +62,21 @@ jobs:
           cache-dependency-path: |
             implementations/go/client/go.sum
             implementations/go/server/go.sum
+      - uses: actions/setup-java@v4
+        if: env.USES_JAVA == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-dotnet@v4
+        if: env.USES_DOTNET == 'true'
+        with:
+          dotnet-version: 10.0.x
 
       # The management SPA the server embeds is built from apps/admin-web and is not committed.
       # The lab never opens it, and a placeholder satisfies the embed directive without the npm
       # build.
-      - name: Build the server and the client
+      - name: Build the server and the Go client
         run: |
           mkdir -p implementations/go/server/web/static
           if [ ! -e implementations/go/server/web/static/index.html ]; then
@@ -55,6 +84,32 @@ jobs:
           fi
           (cd implementations/go/server && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-server" ./cmd/specus-server)
           (cd implementations/go/client && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-client" ./cmd/specus-client)
+      - name: Build the Java client
+        if: env.USES_JAVA == 'true'
+        run: mvn -B -q -pl :specus-client -am package -DskipTests
+      - name: Build the .NET client
+        if: env.USES_DOTNET == 'true'
+        run: dotnet build implementations/csharp/client/src/Specus.Client/Specus.Client.csproj -c Release -v quiet
+
+      # The lab starts each role as a literal executable, as root, with an environment of its own,
+      # so the launchers carry absolute paths: sudo drops PATH and JAVA_HOME. Each one execs in
+      # place, which keeps the lab's pid the client itself and its resident set the client's.
+      - name: Write the client launchers
+        run: |
+          mkdir -p "$RUNNER_TEMP/clients"
+          ln -s "$RUNNER_TEMP/specus-client" "$RUNNER_TEMP/clients/Go"
+          if [ "$USES_JAVA" = true ]; then
+            jar="$GITHUB_WORKSPACE/implementations/java/client/target/specus-client-exec.jar"
+            printf '#!/bin/sh\nexec %s -jar %s "$@"\n' "$(command -v java)" "$jar" > "$RUNNER_TEMP/clients/Java"
+            chmod +x "$RUNNER_TEMP/clients/Java"
+          fi
+          if [ "$USES_DOTNET" = true ]; then
+            dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
+            printf '#!/bin/sh\nexport DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1\nexec %s %s "$@"\n' \
+              "$(readlink -f "$(command -v dotnet)")" "$dll" > "$RUNNER_TEMP/clients/.NET"
+            chmod +x "$RUNNER_TEMP/clients/.NET"
+          fi
+          for launcher in "$RUNNER_TEMP"/clients/*; do echo "== $launcher"; cat "$launcher" 2>/dev/null | head -n 3; done
 
       # Root, in a network namespace of its own so that nothing it installs can touch the
       # runner's table, and in a mount namespace so that the netns handles go with it.
@@ -63,9 +118,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lab"
           sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
             --server "$RUNNER_TEMP/specus-server" \
-            --client "$RUNNER_TEMP/specus-client" \
+            --consumer-client "$RUNNER_TEMP/clients/${{ matrix.consumer }}" \
+            --consumer-implementation "${{ matrix.consumer }}" \
+            --egress-client "$RUNNER_TEMP/clients/${{ matrix.egress }}" \
+            --egress-implementation "${{ matrix.egress }}" \
             --report-dir "$RUNNER_TEMP/lab" \
-            --switch-off-repetitions 3
+            --switch-off-repetitions 3 \
+            --performance-gate
 
       - name: Report
         if: always()
@@ -77,7 +136,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: peer-egress-lab
+          name: peer-egress-lab-${{ matrix.consumer }}-to-${{ matrix.egress }}
           path: ${{ runner.temp }}/lab
           if-no-files-found: warn
 

@@ -13,6 +13,7 @@ type egressRulesVector struct {
 		Action         string `json:"action"`
 		EgressClientID int64  `json:"egressClientId"`
 		Port           int    `json:"port"`
+		Enabled        *bool  `json:"enabled"`
 	} `json:"rules"`
 	// RefusedRules names the rules in the list above that must not pass validation. The list
 	// carries a few on purpose so the match cases can prove a refused rule steers nothing.
@@ -37,9 +38,24 @@ type egressRulesVector struct {
 			Action         string `json:"action"`
 			EgressClientID int64  `json:"egressClientId"`
 			Port           int    `json:"port"`
+			Enabled        *bool  `json:"enabled"`
 		} `json:"rule"`
 		Code string `json:"code"`
 	} `json:"configValidation"`
+	// ConsumerDisabled is what the master switch off does to the same rule list.
+	ConsumerDisabled struct {
+		RuleCodes []struct {
+			Index int    `json:"index"`
+			Code  string `json:"code"`
+		} `json:"ruleCodes"`
+		Cases []struct {
+			Destination string `json:"destination"`
+			Expect      struct {
+				Action           string `json:"action"`
+				MatchedRuleIndex *int   `json:"matchedRuleIndex"`
+			} `json:"expect"`
+		} `json:"cases"`
+	} `json:"consumerDisabled"`
 }
 
 func loadEgressRulesVector(t *testing.T) (egressRulesVector, []egressRule) {
@@ -61,6 +77,7 @@ func loadEgressRulesVector(t *testing.T) (egressRulesVector, []egressRule) {
 			Action:         entry.Action,
 			EgressClientID: entry.EgressClientID,
 			Port:           entry.Port,
+			Enabled:        entry.Enabled,
 		})
 	}
 	return vector, rules
@@ -105,6 +122,7 @@ func TestEgressRuleValidationMatchesSharedVector(t *testing.T) {
 			Action:         testCase.Rule.Action,
 			EgressClientID: testCase.Rule.EgressClientID,
 			Port:           testCase.Rule.Port,
+			Enabled:        testCase.Rule.Enabled,
 		}, vector.MeshCIDR)
 		if code != testCase.Code {
 			t.Errorf("%s (%q): code = %q, want %q", testCase.Name, testCase.Rule.Match, code, testCase.Code)
@@ -266,5 +284,29 @@ func TestEgressRulesDistinguishDefaultFromAnExplicitDirect(t *testing.T) {
 	}
 	if fallthrough_.Action != egressActionDirect {
 		t.Errorf("an unmatched destination reported action %s", fallthrough_.Action)
+	}
+}
+
+// The master switch off: the status names every rule out of force, a rule's own switch still names
+// itself, and the plan the reconcile builds from the rules it is handed is empty, so nothing matches.
+func TestEgressConsumerSwitchedOffMatchesSharedVector(t *testing.T) {
+	vector, rules := loadEgressRulesVector(t)
+	if len(vector.ConsumerDisabled.RuleCodes) != len(rules) || len(vector.ConsumerDisabled.Cases) == 0 {
+		t.Fatal("rules vector carried no consumerDisabled section for every rule")
+	}
+	listed := switchedOffRulesJSON(rules)
+	for _, want := range vector.ConsumerDisabled.RuleCodes {
+		entry := listed[want.Index]
+		if entry["inForce"] != false || entry["code"] != want.Code {
+			t.Errorf("rule %d: inForce=%v code=%v, want false/%s", want.Index, entry["inForce"], entry["code"], want.Code)
+		}
+	}
+	// Off, the reconcile hands the engine no rules at all; nothing it is asked about matches.
+	for _, testCase := range vector.ConsumerDisabled.Cases {
+		decision := matchEgressRules(nil, testCase.Destination, vector.MeshCIDR)
+		if decision.Action != testCase.Expect.Action || decision.MatchedRuleIndex != -1 || testCase.Expect.MatchedRuleIndex != nil {
+			t.Errorf("%s: got %s/rule=%d, want %s/unmatched", testCase.Destination, decision.Action,
+				decision.MatchedRuleIndex, testCase.Expect.Action)
+		}
 	}
 }

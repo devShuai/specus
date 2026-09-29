@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -23,6 +24,8 @@ public sealed class PeerEgressServiceTests
     private const long ConsumerId = 1001;
     private const long EgressId = 2002;
     private const long OutsiderId = 3003;
+
+    private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
 
     /// <summary>
     /// The point of keeping egress policy separate from the mesh ACL: naming a device in the egress
@@ -182,6 +185,72 @@ public sealed class PeerEgressServiceTests
         Assert.Empty(catalog.Egresses!);
     }
 
+    /// <summary>
+    /// A consumer can only reject a domain rule aimed at an egress that cannot resolve names if the
+    /// catalogue says which ones can. The answer comes from what each egress's online session
+    /// announced; an egress with no online session is never advertised as capable, whatever it
+    /// announced the last time it was connected.
+    /// </summary>
+    [Fact]
+    public async Task TheCatalogueCarriesEachEgressAnnouncedDomainTargets()
+    {
+        const long PlainEgressId = 4004;
+        const long OfflineEgressId = 5005;
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var resolving = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        var plain = fixture.AddClient(PlainEgressId, "egress-owner", "plain-gateway");
+        var offline = fixture.AddClient(OfflineEgressId, "egress-owner", "offline-gateway");
+        foreach (var egress in new[] { resolving, plain, offline })
+        {
+            fixture.AllowPeering(consumer, egress);
+        }
+        fixture.AddOnlineSession(resolving, 4401, egressVersion: 1, domainTargets: true);
+        fixture.AddOnlineSession(plain, 4402, egressVersion: 1, domainTargets: false);
+        fixture.AddSession(offline, 4403, egressVersion: 1, domainTargets: true, status: "DISCONNECTED");
+        await fixture.SaveChangesAsync();
+        foreach (var egressId in new[] { EgressId, PlainEgressId, OfflineEgressId })
+        {
+            await fixture.UpsertAsync(egressId, enabled: true, consumers: [ConsumerId]);
+        }
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+
+        Assert.NotNull(catalog);
+        var entries = catalog.Egresses!.ToDictionary(entry => entry.ClientId);
+        Assert.Equal(3, entries.Count);
+        Assert.True(entries[EgressId].DomainTargetCapable);
+        Assert.False(entries[PlainEgressId].DomainTargetCapable);
+        Assert.False(entries[OfflineEgressId].DomainTargetCapable);
+        // IPv6 targets are not announced by any client yet.
+        Assert.All(entries.Values, entry => Assert.False(entry.Ipv6TargetCapable));
+    }
+
+    /// <summary>
+    /// Only the newest online session speaks for the egress: one that reconnected with a build that
+    /// cannot resolve names stops being advertised as able to, even while an older session row has
+    /// not yet been marked disconnected.
+    /// </summary>
+    [Fact]
+    public async Task TheNewestOnlineSessionDecidesDomainTargets()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        var connected = DateTimeOffset.UtcNow;
+        fixture.AddOnlineSession(egress, 4501, egressVersion: 1, domainTargets: true,
+            connectedAt: connected.AddMinutes(-5));
+        fixture.AddOnlineSession(egress, 4502, egressVersion: 1, domainTargets: false, connectedAt: connected);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+
+        var entry = Assert.Single(catalog!.Egresses!);
+        Assert.False(entry.DomainTargetCapable);
+    }
+
     [Fact]
     public void DestinationRulesRoundTripAndRejectOversizedInput()
     {
@@ -203,6 +272,116 @@ public sealed class PeerEgressServiceTests
             })
             .ToArray();
         Assert.Throws<ArgumentException>(() => PeerMeshService.EncodeEgressDestinationRules(oversized));
+    }
+
+    public static TheoryData<string> AcceptedRuleCases => PeerEgressManagementVector.Names("accept");
+
+    public static TheoryData<string> RefusedRuleCases => PeerEgressManagementVector.Names("reject");
+
+    /// <summary>
+    /// The shared vector: what a policy saved through the management API stores. The stored column
+    /// is compared byte for byte with the reference, which is also the form the 4096-byte limit is
+    /// measured on.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AcceptedRuleCases))]
+    public async Task SavedDestinationRulesAreStoredAsTheSharedVectorSays(string name)
+    {
+        var vectorCase = PeerEgressManagementVector.Case("accept", name);
+        await using var fixture = await EgressFixture.CreateAsync();
+        fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        await fixture.SaveChangesAsync();
+
+        var view = await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            DestinationRules: VectorRules(vectorCase)), default);
+
+        var expected = PeerEgressManagementVector.Compact(vectorCase.GetProperty("stored"));
+        Assert.Equal(expected, JsonSerializer.Serialize(view.DestinationRules, WebJson));
+        fixture.Db.ChangeTracker.Clear();
+        var row = await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync();
+        Assert.Equal(expected, row.DestinationRules);
+    }
+
+    /// <summary>
+    /// A refused case refuses the whole request: neither the update of an existing policy nor the
+    /// creation of a new one saves anything, including the other fields that were valid, and
+    /// nothing is left pending in the context for a later save to pick up.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RefusedRuleCases))]
+    public async Task RefusedDestinationRulesSaveNothing(string name)
+    {
+        var vectorCase = PeerEgressManagementVector.Case("reject", name);
+        await using var fixture = await EgressFixture.CreateAsync();
+        fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AddClient(OutsiderId, "outsider-owner", "phone");
+        await fixture.SaveChangesAsync();
+        await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            Enabled: false,
+            Scope: PeerEgressAuthorization.ScopeLan,
+            DestinationRules: [Rule("192.168.1.0/24", "tcp", 22)]), default);
+        fixture.Db.ChangeTracker.Clear();
+        var before = await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync();
+
+        foreach (var egressClientId in new[] { EgressId, OutsiderId })
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.UpsertEgressPolicyAsync(
+                fixture.Admin,
+                new PeerEgressPolicyMutation(
+                    EgressClientId: egressClientId,
+                    Enabled: true,
+                    Scope: PeerEgressAuthorization.ScopePublic,
+                    AllowedConsumerClientIds: [ConsumerId],
+                    DestinationRules: VectorRules(vectorCase),
+                    MaxConcurrentFlows: 7),
+                default));
+        }
+
+        Assert.False(fixture.Db.ChangeTracker.HasChanges());
+        var after = Assert.Single(await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().ToListAsync());
+        Assert.Equal(before.Id, after.Id);
+        Assert.False(after.Enabled);
+        Assert.Equal(before.Scope, after.Scope);
+        Assert.Equal(before.AllowedConsumerClientIds, after.AllowedConsumerClientIds);
+        Assert.Equal(before.DestinationRules, after.DestinationRules);
+        Assert.Equal(before.MaxConcurrentFlows, after.MaxConcurrentFlows);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    /// <summary>
+    /// A switch request without <c>enabled</c> used to be read as "off", turning a malformed body
+    /// into the most disruptive change available. It is refused instead.
+    /// </summary>
+    [Fact]
+    public async Task ASwitchRequestWithoutEnabledIsRefusedRatherThanReadAsOff()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        await fixture.Service.SetEgressSwitchAsync(fixture.Admin, true, default);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            fixture.Service.SetEgressSwitchAsync(fixture.Admin, null, default));
+        Assert.True((await fixture.Service.EgressSwitchStatusAsync(fixture.Admin, default)).ConfiguredEnabled);
+
+        // Authorisation is still decided first, so a non-admin gets the same answer for any body.
+        var user = new ManagementContext("default", "someone", ManagementRole.User, false);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Service.SetEgressSwitchAsync(user, null, default));
+    }
+
+    /// <summary>Mapped to 404 by the management API, not to the 400 of an invalid field.</summary>
+    [Fact]
+    public async Task AnUnknownEgressDeviceOrPolicyIsNotFound()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+
+        await Assert.ThrowsAsync<ResourceNotFoundException>(() =>
+            fixture.Service.UpsertEgressPolicyAsync(fixture.Admin,
+                new PeerEgressPolicyMutation(EgressClientId: EgressId, Enabled: true), default));
+        await Assert.ThrowsAsync<ResourceNotFoundException>(() =>
+            fixture.Service.DeleteEgressPolicyAsync(fixture.Admin, 424242, default));
+        Assert.Empty(await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().ToListAsync());
     }
 
     /// <summary>An unreadable row must deny everything rather than fall back to something permissive.</summary>
@@ -459,6 +638,10 @@ public sealed class PeerEgressServiceTests
         PortRanges = [[port, port]],
     };
 
+    /// <summary>The vector's request rules, read the way the management endpoint binds its body.</summary>
+    private static List<PeerEgressDestinationRule> VectorRules(JsonElement vectorCase) =>
+        vectorCase.GetProperty("destinationRules").Deserialize<List<PeerEgressDestinationRule>>(WebJson)!;
+
     private sealed class EgressFixture : IAsyncDisposable
     {
         private readonly SqliteConnection _connection;
@@ -531,10 +714,18 @@ public sealed class PeerEgressServiceTests
             return account;
         }
 
-        /// <summary>An online control session, which is where the reporter identity is bound from.</summary>
-        public void AddOnlineSession(ClientAccount account, long sessionId, int egressVersion)
+        /// <summary>
+        /// An online control session, which is where the reporter identity and the announced
+        /// capabilities are bound from.
+        /// </summary>
+        public void AddOnlineSession(ClientAccount account, long sessionId, int egressVersion,
+            bool domainTargets = false, DateTimeOffset? connectedAt = null) =>
+            AddSession(account, sessionId, egressVersion, domainTargets, "NETTY_ONLINE", connectedAt);
+
+        public void AddSession(ClientAccount account, long sessionId, int egressVersion, bool domainTargets,
+            string status, DateTimeOffset? connectedAt = null)
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = connectedAt ?? DateTimeOffset.UtcNow;
             Db.ClientSessions.Add(new ClientSession
             {
                 Id = sessionId,
@@ -542,10 +733,11 @@ public sealed class PeerEgressServiceTests
                 ClientId = account.Id,
                 ClientName = account.ClientName,
                 TokenHash = $"egress-report-{sessionId}",
-                Status = "NETTY_ONLINE",
+                Status = status,
                 MachineFingerprint = "machine",
                 OsUser = "user",
                 ClientEgressVersion = egressVersion,
+                ClientEgressDomainTargets = domainTargets,
                 HttpLoginAt = now,
                 NettyConnectedAt = now,
                 ExpiresAt = now.AddHours(1),

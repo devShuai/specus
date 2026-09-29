@@ -25,8 +25,13 @@ public sealed partial class PeerMeshService
     /// <summary>Caps a stored allowlist; enforced before persisting.</summary>
     internal const int MaxEgressDestinationRules = 64;
 
+    /// <summary>Caps the port ranges of one destination rule; enforced before persisting.</summary>
+    internal const int MaxEgressPortRangesPerRule = 32;
+
     /// <summary>Matches the column width in every schema dialect.</summary>
     internal const int MaxEgressDestinationRulesBytes = 4096;
+
+    private const int MaxEgressPort = 65535;
 
     private static readonly JsonSerializerOptions EgressRuleJsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -124,6 +129,26 @@ public sealed partial class PeerMeshService
             .ConfigureAwait(false);
         return version ?? 0;
     }
+
+    /// <summary>
+    /// Whether the egress's current online session announced <c>domainTargetCapable</c> at login.
+    /// </summary>
+    /// <remarks>
+    /// Read from the newest online session rather than any session the device ever had: a device
+    /// that reconnects with a build that cannot resolve names must stop being advertised as one
+    /// that can, or consumers would send it name-bind requests it can only refuse. No online
+    /// session means false, so an egress that has gone away is never advertised as capable.
+    /// </remarks>
+    private async Task<bool> EgressDomainTargetsAsync(ClientAccount egress, CancellationToken cancellationToken) =>
+        await _db.ClientSessions.AsNoTracking()
+            .Where(row => row.TenantId == egress.TenantId
+                && row.ClientId == egress.Id
+                && row.Status == "NETTY_ONLINE")
+            .OrderByDescending(row => row.NettyConnectedAt ?? row.HttpLoginAt)
+            .ThenByDescending(row => row.Id)
+            .Select(row => row.ClientEgressDomainTargets)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
     /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
     internal const int MaxEgressReportBytes = 8 * 1024;
@@ -397,12 +422,20 @@ public sealed partial class PeerMeshService
     /// <remarks>
     /// Switching off leaves every per-device policy intact, so turning it back on restores what was
     /// configured rather than making the operator rebuild it.
+    /// <para>
+    /// <paramref name="enabled"/> is nullable because a request without it is refused, not read as
+    /// "off": reading it as off turned a malformed body into the most disruptive change available.
+    /// </para>
     /// </remarks>
     public async Task<PeerMeshEgressSwitchView> SetEgressSwitchAsync(ManagementContext context,
-        bool enabled, CancellationToken cancellationToken)
+        bool? enabled, CancellationToken cancellationToken)
     {
         RequireEgressAdmin(context);
-        if (enabled && !Enabled)
+        if (enabled is null)
+        {
+            throw new ArgumentException("enabled is required");
+        }
+        if (enabled.Value && !Enabled)
         {
             throw new ArgumentException("部署端未启用 Peer Mesh，不能开启出口分流");
         }
@@ -414,7 +447,7 @@ public sealed partial class PeerMeshService
             row = new PeerMeshEgressSwitch { TenantId = context.TenantId };
             _db.PeerMeshEgressSwitches.Add(row);
         }
-        row.Enabled = enabled;
+        row.Enabled = enabled.Value;
         row.UpdatedBy = context.Username;
         row.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -441,6 +474,11 @@ public sealed partial class PeerMeshService
     }
 
     /// <summary>Creates or updates the policy for one egress device.</summary>
+    /// <remarks>
+    /// Every field is validated before the tracked row is created or touched, so a refused request
+    /// saves nothing, not even the fields that happened to be valid, and leaves nothing behind in
+    /// the context for a later SaveChanges to persist.
+    /// </remarks>
     public async Task<PeerMeshEgressPolicyView> UpsertEgressPolicyAsync(ManagementContext context,
         PeerEgressPolicyMutation mutation, CancellationToken cancellationToken)
     {
@@ -449,7 +487,32 @@ public sealed partial class PeerMeshService
             ?? throw new ArgumentException("egressClientId is required");
         var egress = await FindEgressClientOrNullAsync(context.TenantId, egressClientId, cancellationToken)
                 .ConfigureAwait(false)
-            ?? throw new ArgumentException($"client not found: {egressClientId}");
+            ?? throw new ResourceNotFoundException($"client not found: {egressClientId}");
+
+        string? scope = null;
+        if (mutation.Scope is not null)
+        {
+            scope = mutation.Scope.Trim().ToUpperInvariant();
+            if (scope is not (PeerEgressAuthorization.ScopePublic or PeerEgressAuthorization.ScopeLan))
+            {
+                throw new ArgumentException($"invalid scope: {mutation.Scope}");
+            }
+        }
+        var allowedConsumers = mutation.AllowedConsumerClientIds is null
+            ? null
+            : EncodeClientIds(mutation.AllowedConsumerClientIds);
+        var destinationRules = mutation.DestinationRules is null
+            ? null
+            : EncodeEgressDestinationRules(mutation.DestinationRules);
+        var maxConcurrentFlows = mutation.MaxConcurrentFlows is null
+            ? (int?)null
+            : RequirePositive(mutation.MaxConcurrentFlows.Value, "maxConcurrentFlows");
+        var maxFlowsPerConsumer = mutation.MaxFlowsPerConsumer is null
+            ? (int?)null
+            : RequirePositive(mutation.MaxFlowsPerConsumer.Value, "maxFlowsPerConsumer");
+        var idleTimeoutSeconds = mutation.IdleTimeoutSeconds is null
+            ? (int?)null
+            : RequirePositive(mutation.IdleTimeoutSeconds.Value, "idleTimeoutSeconds");
 
         var policy = await _db.PeerMeshEgressPolicies
             .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.EgressClientId == egress.Id,
@@ -475,34 +538,29 @@ public sealed partial class PeerMeshService
         {
             policy.Enabled = mutation.Enabled.Value;
         }
-        if (mutation.Scope is not null)
+        if (scope is not null)
         {
-            var scope = mutation.Scope.Trim().ToUpperInvariant();
-            if (scope is not (PeerEgressAuthorization.ScopePublic or PeerEgressAuthorization.ScopeLan))
-            {
-                throw new ArgumentException($"invalid scope: {mutation.Scope}");
-            }
             policy.Scope = scope;
         }
-        if (mutation.AllowedConsumerClientIds is not null)
+        if (allowedConsumers is not null)
         {
-            policy.AllowedConsumerClientIds = EncodeClientIds(mutation.AllowedConsumerClientIds);
+            policy.AllowedConsumerClientIds = allowedConsumers;
         }
-        if (mutation.DestinationRules is not null)
+        if (destinationRules is not null)
         {
-            policy.DestinationRules = EncodeEgressDestinationRules(mutation.DestinationRules);
+            policy.DestinationRules = destinationRules;
         }
-        if (mutation.MaxConcurrentFlows is not null)
+        if (maxConcurrentFlows is not null)
         {
-            policy.MaxConcurrentFlows = RequirePositive(mutation.MaxConcurrentFlows.Value, "maxConcurrentFlows");
+            policy.MaxConcurrentFlows = maxConcurrentFlows.Value;
         }
-        if (mutation.MaxFlowsPerConsumer is not null)
+        if (maxFlowsPerConsumer is not null)
         {
-            policy.MaxFlowsPerConsumer = RequirePositive(mutation.MaxFlowsPerConsumer.Value, "maxFlowsPerConsumer");
+            policy.MaxFlowsPerConsumer = maxFlowsPerConsumer.Value;
         }
-        if (mutation.IdleTimeoutSeconds is not null)
+        if (idleTimeoutSeconds is not null)
         {
-            policy.IdleTimeoutSeconds = RequirePositive(mutation.IdleTimeoutSeconds.Value, "idleTimeoutSeconds");
+            policy.IdleTimeoutSeconds = idleTimeoutSeconds.Value;
         }
         policy.UpdatedAt = now;
 
@@ -524,7 +582,7 @@ public sealed partial class PeerMeshService
         var policy = await _db.PeerMeshEgressPolicies
                 .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == id, cancellationToken)
                 .ConfigureAwait(false)
-            ?? throw new ArgumentException($"egress policy not found: {id}");
+            ?? throw new ResourceNotFoundException($"egress policy not found: {id}");
         _db.PeerMeshEgressPolicies.Remove(policy);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         Audit("egress-policy", context.TenantId, policy.EgressClientId, null, null, "deleted");
@@ -626,8 +684,11 @@ public sealed partial class PeerMeshService
                 Online = online,
                 Scope = policy.Scope,
                 Protocols = EgressProtocols(DecodeEgressDestinationRules(policy.DestinationRules)),
-                // Both stay false until domain rules and an IPv6 data plane ship.
-                DomainTargetCapable = false,
+                // Never capable while the entry itself reads offline, so a consumer is not told an
+                // absent egress can resolve names.
+                DomainTargetCapable = online
+                    && await EgressDomainTargetsAsync(egress, cancellationToken).ConfigureAwait(false),
+                // No client announces IPv6 targets yet, so there is nothing to carry.
                 Ipv6TargetCapable = false,
             });
         }
@@ -709,23 +770,96 @@ public sealed partial class PeerMeshService
         _db.ClientAccounts.AsNoTracking()
             .FirstOrDefaultAsync(row => row.TenantId == tenantId && row.Id == clientId, cancellationToken);
 
-    /// <summary>Serialises an allowlist for storage.</summary>
+    /// <summary>Validates, normalises and serialises an allowlist for storage.</summary>
+    /// <remarks>
+    /// The size limit applies to what is stored, after normalisation, so spelling the server
+    /// would drop anyway does not count against it.
+    /// </remarks>
     internal static string EncodeEgressDestinationRules(IReadOnlyList<PeerEgressDestinationRule> rules)
     {
-        if (rules.Count == 0)
-        {
-            return "[]";
-        }
-        if (rules.Count > MaxEgressDestinationRules)
-        {
-            throw new ArgumentException($"too many destination rules: {rules.Count}");
-        }
-        var encoded = JsonSerializer.Serialize(rules, EgressRuleJsonOptions);
-        if (encoded.Length > MaxEgressDestinationRulesBytes)
+        var normalized = NormalizeEgressDestinationRules(rules);
+        var encoded = JsonSerializer.Serialize(normalized, EgressRuleJsonOptions);
+        if (Encoding.UTF8.GetByteCount(encoded) > MaxEgressDestinationRulesBytes)
         {
             throw new ArgumentException("destination rules exceed the storage limit");
         }
         return encoded;
+    }
+
+    /// <summary>
+    /// The rules as they are stored, or <see cref="ArgumentException"/> for the whole list.
+    /// </summary>
+    /// <remarks>
+    /// The egress reads a stored rule strictly (protocol/spec/peer-egress.md): a CIDR it cannot
+    /// parse, a protocol other than tcp or udp, or a malformed port range never matches. Storing
+    /// such a rule as given would turn a typo into a rule that silently does nothing, so what is
+    /// only spelling is normalised here and what is wrong is refused. The CIDR is checked with the
+    /// parser the egress itself uses and kept as written after trimming; protocols are trimmed,
+    /// lowercased and de-duplicated in order; an absent list is stored as an empty one, which
+    /// still means deny-all.
+    /// </remarks>
+    internal static IReadOnlyList<PeerEgressDestinationRule> NormalizeEgressDestinationRules(
+        IReadOnlyList<PeerEgressDestinationRule> rules)
+    {
+        if (rules.Count > MaxEgressDestinationRules)
+        {
+            throw new ArgumentException($"too many destination rules: {rules.Count}");
+        }
+        var normalized = new List<PeerEgressDestinationRule>(rules.Count);
+        for (var index = 0; index < rules.Count; index++)
+        {
+            // Nullable annotations are not enforced by the deserializer, so a JSON null element or
+            // an explicit null field arrives here as null despite the declared types.
+            var rule = rules[index]
+                ?? throw new ArgumentException($"destinationRules[{index}] must be an object");
+            var cidr = rule.Cidr?.Trim() ?? string.Empty;
+            if (!Ipv4Cidr.TryParse(cidr, out _))
+            {
+                throw new ArgumentException(
+                    $"destinationRules[{index}].cidr must be an IPv4 address or CIDR");
+            }
+            var protocols = new List<string>(2);
+            foreach (var protocol in rule.Protocols ?? [])
+            {
+                var value = protocol?.Trim().ToLowerInvariant();
+                if (value is not ("tcp" or "udp"))
+                {
+                    throw new ArgumentException($"destinationRules[{index}].protocols accepts only tcp and udp");
+                }
+                if (!protocols.Contains(value, StringComparer.Ordinal))
+                {
+                    protocols.Add(value);
+                }
+            }
+            var portRanges = rule.PortRanges ?? [];
+            if (portRanges.Count > MaxEgressPortRangesPerRule)
+            {
+                throw new ArgumentException(
+                    $"destinationRules[{index}] has more than {MaxEgressPortRangesPerRule} port ranges");
+            }
+            var ranges = new List<int[]>(portRanges.Count);
+            foreach (var pair in portRanges)
+            {
+                if (pair is not { Length: 2 })
+                {
+                    throw new ArgumentException(
+                        $"destinationRules[{index}].portRanges entries must be [low, high]");
+                }
+                if (pair[0] < 0 || pair[1] > MaxEgressPort || pair[0] > pair[1])
+                {
+                    throw new ArgumentException(
+                        $"destinationRules[{index}].portRanges entries need 0 <= low <= high <= {MaxEgressPort}");
+                }
+                ranges.Add([pair[0], pair[1]]);
+            }
+            normalized.Add(new PeerEgressDestinationRule
+            {
+                Cidr = cidr,
+                Protocols = protocols,
+                PortRanges = ranges,
+            });
+        }
+        return normalized;
     }
 
     /// <summary>
