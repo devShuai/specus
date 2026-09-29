@@ -71,6 +71,16 @@ def ns(name, *args):
     return ["ip", "netns", "exec", name, *args]
 
 
+def in_child_user_namespace():
+    """True inside any user namespace but the initial one, whose uid map is the identity."""
+    try:
+        with open("/proc/self/uid_map", encoding="ascii") as handle:
+            mapping = handle.read().split()
+    except OSError:
+        return False
+    return mapping[:3] != ["0", "0", "4294967295"]
+
+
 class Proc:
     def __init__(self, lab, label, args, log_path):
         self.lab = lab
@@ -237,7 +247,15 @@ class Lab:
         # Mount namespaces isolate mounts, not files: root can otherwise create persistent empty
         # /run/netns handles in the host filesystem. Always use private storage, not just when
         # fake root lacks write access. Refuse an invocation missing the mount namespace first.
-        if os.readlink("/proc/self/ns/mnt") == os.readlink("/proc/1/ns/mnt"):
+        try:
+            shared = os.readlink("/proc/self/ns/mnt") == os.readlink("/proc/1/ns/mnt")
+        except PermissionError:
+            # The fake root of `unshare -rnm` may not read PID 1's handle. It does not need to: a
+            # user namespace other than the initial one can only mount inside a mount namespace it
+            # owns, so the host's cannot be the one about to be changed, and make-rprivate below
+            # would fail on it rather than proceed.
+            shared = not in_child_user_namespace()
+        if shared:
             raise LabAbort("a private mount namespace is required; use unshare -n -m")
         self.sh(["mount", "--make-rprivate", "/"])
         self.sh(["mount", "-t", "tmpfs", "tmpfs", "/run"])
