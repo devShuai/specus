@@ -243,6 +243,39 @@ class PeerEgressServiceTests {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    /**
+     * Edges the shared vector does not reach; the vector itself is replayed over HTTP in
+     * {@code PeerEgressResourceTests}. A control character is not whitespace: the CIDR parser would
+     * trim it away, so without a check of its own the service would store it.
+     */
+    @Test
+    void destinationRuleEdgesOutsideTheSharedVectorAreRefused() {
+        List<List<Object>> https = List.of(List.of(443, 443));
+        List<PeerEgressService.DestinationRuleMutation> refused = java.util.Arrays.asList(
+                null,
+                new PeerEgressService.DestinationRuleMutation((char) 0 + "10.0.0.0/8", List.of("tcp"), https),
+                new PeerEgressService.DestinationRuleMutation("10.0.0.0/8" + (char) 7, List.of("tcp"), https),
+                new PeerEgressService.DestinationRuleMutation("10.0.0.0/8", java.util.Arrays.asList("tcp", null), https),
+                new PeerEgressService.DestinationRuleMutation("10.0.0.0/8", List.of("tcp"),
+                        java.util.Collections.singletonList(null)),
+                new PeerEgressService.DestinationRuleMutation("10.0.0.0/8", List.of("tcp"),
+                        List.of(java.util.Arrays.<Object>asList(443, null))));
+        for (PeerEgressService.DestinationRuleMutation rule : refused) {
+            assertThatThrownBy(() -> PeerEgressService.normalizeDestinationRules(
+                    java.util.Collections.singletonList(rule)))
+                    .as(String.valueOf(rule))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        // Whitespace other than an ASCII space is still only spelling.
+        List<PeerEgressPolicy.PeerEgressDestinationRule> stored = PeerEgressService.normalizeDestinationRules(List.of(
+                new PeerEgressService.DestinationRuleMutation("\t10.0.0.0/8\n", List.of(" UDP"), null)));
+        assertThat(stored).hasSize(1);
+        assertThat(stored.get(0).getCidr()).isEqualTo("10.0.0.0/8");
+        assertThat(stored.get(0).getProtocols()).containsExactly("udp");
+        assertThat(stored.get(0).getPortRanges()).isEmpty();
+    }
+
     /** An unreadable row must deny everything rather than fall back to something permissive. */
     @Test
     void unreadableStoredRulesDenyEverything() {

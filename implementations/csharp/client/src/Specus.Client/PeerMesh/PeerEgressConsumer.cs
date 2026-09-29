@@ -38,18 +38,110 @@ internal enum PeerEgressConsumerOutcome
 /// access the same way the Go consumer's mutex does.</para>
 /// </remarks>
 internal sealed class PeerEgressConsumer(
-    Func<long, byte[], bool>? send, Action<byte[]>? toTun, ILogger? logger = null)
+    Func<long, byte[], bool>? send, Action<byte[]>? toTun, ILogger? logger = null,
+    int flowCapacity = PeerEgressConsumer.DefaultFlowCapacity)
 {
     private const int Ipv4MinHeaderBytes = 20;
+
+    /// <summary>A datagram flow is forgotten after this long without a packet either way.</summary>
+    internal const long UdpIdleMs = 180_000;
+
+    /// <summary>
+    /// A TCP flow that has not closed is forgotten after this long without a packet either way. The
+    /// egress's own idle timeout (60 seconds by default) has usually ended the flow long before;
+    /// this only bounds what a consumer holds when that end never reaches it.
+    /// </summary>
+    internal const long TcpIdleMs = 7_200_000;
+
+    /// <summary>
+    /// A TCP flow is forgotten this long after it closed: an RST either way, or a FIN both ways.
+    /// Long enough for the last ACK and any retransmitted FIN to still find the flow.
+    /// </summary>
+    internal const long TcpClosedLingerMs = 120_000;
+
+    /// <summary>How many flows the consumer remembers at most; protocol/spec/peer-egress.md.</summary>
+    internal const int DefaultFlowCapacity = 65536;
+
+    private readonly int _flowCapacity = flowCapacity > 0
+        ? flowCapacity
+        : throw new ArgumentOutOfRangeException(nameof(flowCapacity), "the flow table must hold at least one flow");
 
     /// <summary>
     /// One flow this node opened through an egress, tracked so a reply can be matched to something
     /// we actually asked for, and so a rule change can close exactly the flows it invalidates.
     /// </summary>
-    private sealed class Flow(long egress, long lastSeenMs)
+    private sealed class Flow
     {
-        public long Egress { get; } = egress;
-        public long LastSeenMs { get; set; } = lastSeenMs;
+        public Flow(PeerEgressFlowTable.Key key, long egress, long registered, long nowMs)
+        {
+            Key = key;
+            Egress = egress;
+            Registered = registered;
+            LastSeenMs = nowMs;
+            // Allocated once with the flow and moved between lists from then on, so a packet
+            // touching a flow allocates nothing.
+            RecencyNode = new LinkedListNode<Flow>(this);
+            DeadlineNode = new LinkedListNode<Flow>(this);
+        }
+
+        public PeerEgressFlowTable.Key Key { get; }
+
+        public long Egress { get; }
+
+        /// <summary>
+        /// When the flow was registered relative to the others. A full table evicts the flow with
+        /// the oldest last packet, and among flows last seen at the same moment the one registered
+        /// first, as the shared vector does.
+        /// </summary>
+        public long Registered { get; }
+
+        public long LastSeenMs { get; set; }
+
+        public bool IsTcp => Key.Protocol == PeerEgressSegment.Ipv4ProtocolTcp;
+
+        private bool _finOut;
+        private bool _finIn;
+
+        /// <summary>When a TCP flow closed, an RST either way or a FIN both ways; null while open.</summary>
+        public long? ClosedAtMs { get; private set; }
+
+        /// <summary>This flow's place in the consumer's recency list.</summary>
+        public LinkedListNode<Flow> RecencyNode { get; }
+
+        /// <summary>This flow's place in the deadline list for its protocol and state.</summary>
+        public LinkedListNode<Flow> DeadlineNode { get; }
+
+        /// <summary>The moment the flow is forgotten. At that moment, not after it.</summary>
+        public long DeadlineMs => !IsTcp
+            ? LastSeenMs + UdpIdleMs
+            : ClosedAtMs is { } closedAt ? closedAt + TcpClosedLingerMs : LastSeenMs + TcpIdleMs;
+
+        /// <summary>
+        /// Records the flags of a TCP segment on this flow. The close time is set once: the last ACK
+        /// or a retransmitted FIN after it must not keep a finished flow around.
+        /// </summary>
+        public void NoteTcpFlags(int flags, bool outbound, long nowMs)
+        {
+            if ((flags & PeerEgressSegment.FlagRst) != 0)
+            {
+                ClosedAtMs ??= nowMs;
+            }
+            if ((flags & PeerEgressSegment.FlagFin) != 0)
+            {
+                if (outbound)
+                {
+                    _finOut = true;
+                }
+                else
+                {
+                    _finIn = true;
+                }
+            }
+            if (_finOut && _finIn)
+            {
+                ClosedAtMs ??= nowMs;
+            }
+        }
 
         /// <summary>
         /// What the application last said on a TCP flow, kept so the flow can be reset without
@@ -110,8 +202,44 @@ internal sealed class PeerEgressConsumer(
     /// <summary>Which egress peers can currently take a flow. Absent means no.</summary>
     private readonly Dictionary<long, bool> _online = [];
 
+    /// <summary>
+    /// The flows this node remembers, bounded by time and by count (protocol/spec/peer-egress.md,
+    /// shared vector <c>peer-egress-consumer-flows-v1.json</c>). Unbounded, every flow ever made
+    /// stayed here, and the status's active flows only ever grew.
+    /// </summary>
     private readonly Dictionary<PeerEgressFlowTable.Key, Flow> _flows = [];
+
+    /// <summary>Every remembered flow, least recently seen first: the order a full table evicts in.</summary>
+    private readonly LinkedList<Flow> _byRecency = new();
+
+    // One list per expiry rule. Within a rule a flow's deadline moves only forward, and the list is
+    // appended to as it does -- on each packet for UDP and open TCP, once at close for closed TCP --
+    // so each list stays in deadline order and finding what has expired means looking at three
+    // heads. That lets every packet sweep, as the reference does, at a constant cost. A single list
+    // would not do: a closed TCP flow expires two minutes after its close however recently it was
+    // seen, and an open one two hours after its last packet.
+    private readonly LinkedList<Flow> _udpByDeadline = new();
+    private readonly LinkedList<Flow> _tcpOpenByDeadline = new();
+    private readonly LinkedList<Flow> _tcpClosedByDeadline = new();
+    private long _registrations;
+
     private readonly SortedDictionary<string, long> _blocked = [];
+
+    /// <summary>What an operator can read, for the status surface.</summary>
+    /// <remarks>
+    /// No lock here, for the same reason nothing else in this class has one: the caller serialises
+    /// access. Copies of the collections, because the caller is a diagnostic reader and this
+    /// consumer goes on mutating its own. Expired flows are forgotten first, so an idle consumer
+    /// does not report the flows it had when traffic stopped.
+    /// </remarks>
+    public PeerEgressConsumerStatus StatusSnapshot(long nowMs)
+    {
+        ExpireFlows(nowMs);
+        return new(
+            _rules.ToList(), _meshCidr, new Dictionary<long, bool>(_online), _flows.Count,
+            new Dictionary<string, long>(_blocked),
+            _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()));
+    }
 
     /// <summary>
     /// Installs a rule set and closes the flows it invalidates.
@@ -122,17 +250,6 @@ internal sealed class PeerEgressConsumer(
     /// them the egress would hold the socket until its own idle timer, and the user would see a
     /// connection that is dead at one end and open at the other.
     /// </remarks>
-    /// <summary>What an operator can read, for the status surface.</summary>
-    /// <remarks>
-    /// No lock here, for the same reason nothing else in this class has one: the caller serialises
-    /// access. Copies of the collections, because the caller is a diagnostic reader and this
-    /// consumer goes on mutating its own.
-    /// </remarks>
-    public PeerEgressConsumerStatus StatusSnapshot() => new(
-        _rules.ToList(), _meshCidr, new Dictionary<long, bool>(_online), _flows.Count,
-        new Dictionary<string, long>(_blocked),
-        _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()));
-
     public IReadOnlyDictionary<long, IReadOnlyList<string>> Configure(
         IReadOnlyList<PeerEgressRule>? rules, string? meshCidr, string? virtualIp, long nowMs)
     {
@@ -172,8 +289,11 @@ internal sealed class PeerEgressConsumer(
     /// </remarks>
     private IReadOnlyDictionary<long, IReadOnlyList<string>> PurgeInvalidated(long nowMs)
     {
+        // A flow already forgotten is not reset or purged: its application finished with it, or
+        // stopped using it, long enough ago that a reset now would only be noise.
+        ExpireFlows(nowMs);
         var purge = new SortedDictionary<long, SortedSet<string>>();
-        var dropped = new List<PeerEgressFlowTable.Key>();
+        var dropped = new List<Flow>();
         var resets = new List<byte[]>();
         foreach (var (key, flow) in _flows)
         {
@@ -185,7 +305,7 @@ internal sealed class PeerEgressConsumer(
             {
                 continue;
             }
-            dropped.Add(key);
+            dropped.Add(flow);
             if (!purge.TryGetValue(flow.Egress, out var destinations))
             {
                 destinations = new SortedSet<string>(StringComparer.Ordinal);
@@ -197,9 +317,9 @@ internal sealed class PeerEgressConsumer(
                 resets.Add(reset);
             }
         }
-        foreach (var key in dropped)
+        foreach (var flow in dropped)
         {
-            _flows.Remove(key);
+            Forget(flow);
         }
         // The application is told each flow is over, so it fails now rather than at its own
         // timeout; the egress is told through the purge messages returned.
@@ -277,12 +397,17 @@ internal sealed class PeerEgressConsumer(
 
         if (FlowKeyFor(packet, protocol) is { } key)
         {
-            if (!_flows.TryGetValue(key, out var flow))
+            var flow = Remembered(key, nowMs);
+            // A SYN on a four-tuple whose flow has closed is a new connection reusing the port.
+            // Kept on the old entry, it would inherit the old close time and be forgotten two
+            // minutes in, with its replies refused from then on.
+            if (flow is { ClosedAtMs: not null } && IsBareSyn(packet))
             {
-                flow = new Flow(egress, nowMs);
-                _flows[key] = flow;
+                Forget(flow);
+                flow = null;
             }
-            flow.LastSeenMs = nowMs;
+            flow ??= Register(key, egress, nowMs);
+            Touch(flow, packet, outbound: true, nowMs);
             if (protocol == PeerEgressSegment.Ipv4ProtocolTcp)
             {
                 flow.NoteApplicationProgress(packet);
@@ -354,6 +479,149 @@ internal sealed class PeerEgressConsumer(
             ReadUInt16(packet, ihl + 2));
     }
 
+    /// <summary>
+    /// The TCP flags of an IPv4 packet, or zero when it is too short to carry them. Read from the
+    /// header directly, like <see cref="Flow.NoteApplicationProgress"/>, because it runs on every
+    /// packet either way.
+    /// </summary>
+    private static int TcpFlags(byte[] packet)
+    {
+        var ihl = (packet[0] & 0x0f) * 4;
+        return packet.Length > ihl + 13 ? packet[ihl + 13] : 0;
+    }
+
+    private static bool IsBareSyn(byte[] packet) =>
+        (TcpFlags(packet) & (PeerEgressSegment.FlagSyn | PeerEgressSegment.FlagAck)) == PeerEgressSegment.FlagSyn;
+
+    /// <summary>
+    /// The flow remembered for a four-tuple, or null. Everything already expired is forgotten
+    /// first, which is what releases the memory of flows nobody asks about again.
+    /// </summary>
+    /// <remarks>
+    /// The deadline is checked here as well. The deadline lists are in order only while the clock
+    /// runs forward; after the wall clock steps back an expired flow can sit behind one that has
+    /// not, and it must not answer for its four-tuple in the meantime.
+    /// </remarks>
+    private Flow? Remembered(PeerEgressFlowTable.Key key, long nowMs)
+    {
+        ExpireFlows(nowMs);
+        if (!_flows.TryGetValue(key, out var flow))
+        {
+            return null;
+        }
+        if (nowMs >= flow.DeadlineMs)
+        {
+            Forget(flow);
+            return null;
+        }
+        return flow;
+    }
+
+    /// <summary>
+    /// Whether a flow is remembered at a given moment: what the shared vector's <c>known</c>
+    /// events ask.
+    /// </summary>
+    public bool Remembers(PeerEgressFlowTable.Key key, long nowMs) => Remembered(key, nowMs) is not null;
+
+    /// <summary>Forgets every flow whose deadline has passed.</summary>
+    private void ExpireFlows(long nowMs)
+    {
+        ExpireFrom(_udpByDeadline, nowMs);
+        ExpireFrom(_tcpOpenByDeadline, nowMs);
+        ExpireFrom(_tcpClosedByDeadline, nowMs);
+    }
+
+    private void ExpireFrom(LinkedList<Flow> byDeadline, long nowMs)
+    {
+        while (byDeadline.First is { } head && nowMs >= head.Value.DeadlineMs)
+        {
+            Forget(head.Value);
+        }
+    }
+
+    /// <summary>
+    /// Starts remembering a flow, evicting the least recently seen one when the table is full.
+    /// Callers have just expired what was due, so a full table here is full of live flows.
+    /// </summary>
+    private Flow Register(PeerEgressFlowTable.Key key, long egress, long nowMs)
+    {
+        if (_flows.Count >= _flowCapacity)
+        {
+            Forget(LeastRecentlySeen());
+        }
+        var flow = new Flow(key, egress, ++_registrations, nowMs);
+        _flows[key] = flow;
+        _byRecency.AddLast(flow.RecencyNode);
+        (flow.IsTcp ? _tcpOpenByDeadline : _udpByDeadline).AddLast(flow.DeadlineNode);
+        return flow;
+    }
+
+    /// <summary>
+    /// The flow a full table gives up: the oldest last packet, and among flows last seen at the
+    /// same moment the one registered first.
+    /// </summary>
+    /// <remarks>
+    /// Flows last seen at the same moment sit together at the front of the recency list, but in
+    /// the order they were last touched rather than registered, so that run is scanned. It is as
+    /// long as the number of flows that saw a packet in one millisecond.
+    /// </remarks>
+    private Flow LeastRecentlySeen()
+    {
+        var first = _byRecency.First!;
+        var victim = first.Value;
+        for (var node = first.Next; node is not null && node.Value.LastSeenMs == first.Value.LastSeenMs; node = node.Next)
+        {
+            if (node.Value.Registered < victim.Registered)
+            {
+                victim = node.Value;
+            }
+        }
+        return victim;
+    }
+
+    /// <summary>Records a packet on a remembered flow, in either direction.</summary>
+    private void Touch(Flow flow, byte[] packet, bool outbound, long nowMs)
+    {
+        flow.LastSeenMs = nowMs;
+        MoveToBack(_byRecency, flow.RecencyNode);
+        if (!flow.IsTcp)
+        {
+            MoveToBack(_udpByDeadline, flow.DeadlineNode);
+            return;
+        }
+        if (flow.ClosedAtMs is not null)
+        {
+            // Its deadline was fixed when it closed; nothing on the flow moves it now.
+            return;
+        }
+        flow.NoteTcpFlags(TcpFlags(packet), outbound, nowMs);
+        if (flow.ClosedAtMs is null)
+        {
+            MoveToBack(_tcpOpenByDeadline, flow.DeadlineNode);
+        }
+        else
+        {
+            _tcpOpenByDeadline.Remove(flow.DeadlineNode);
+            _tcpClosedByDeadline.AddLast(flow.DeadlineNode);
+        }
+    }
+
+    private static void MoveToBack(LinkedList<Flow> list, LinkedListNode<Flow> node)
+    {
+        if (list.Last != node)
+        {
+            list.Remove(node);
+            list.AddLast(node);
+        }
+    }
+
+    private void Forget(Flow flow)
+    {
+        _flows.Remove(flow.Key);
+        _byRecency.Remove(flow.RecencyNode);
+        flow.DeadlineNode.List!.Remove(flow.DeadlineNode);
+    }
+
     private static uint ReadUInt32(byte[] data, int offset) =>
         ((uint)data[offset] << 24) | ((uint)data[offset + 1] << 16)
         | ((uint)data[offset + 2] << 8) | data[offset + 3];
@@ -393,7 +661,7 @@ internal sealed class PeerEgressConsumer(
             {
                 return false;
             }
-            HandleFlowReject(control, fromEgress);
+            HandleFlowReject(control, fromEgress, nowMs);
             return true;
         }
         if (parsed.Type != PeerEgressFrame.TypeIpPacket)
@@ -414,7 +682,7 @@ internal sealed class PeerEgressConsumer(
             RecordBlocked("return-mesh-source");
             return true;
         }
-        if (!HasReturnFlow(parsed.Inner, fromEgress, nowMs))
+        if (!HasReturnFlow(parsed.Inner, parsed.Body, fromEgress, nowMs))
         {
             RecordBlocked("return-no-flow");
             return true;
@@ -425,9 +693,10 @@ internal sealed class PeerEgressConsumer(
 
     /// <summary>
     /// Reports whether a reply belongs to a flow this node opened through this egress. The tuple is
-    /// mirrored, since the reply travels the other way.
+    /// mirrored, since the reply travels the other way. A reply that arrives after its flow was
+    /// forgotten has nothing to belong to, and is refused like any other.
     /// </summary>
-    private bool HasReturnFlow(PeerEgressFrame.Inner inner, long fromEgress, long nowMs)
+    private bool HasReturnFlow(PeerEgressFrame.Inner inner, byte[] packet, long fromEgress, long nowMs)
     {
         if (!Ipv4Cidr.TryParseAddress(inner.SourceIp, out var remote)
             || !Ipv4Cidr.TryParseAddress(inner.DestinationIp, out var local))
@@ -436,11 +705,13 @@ internal sealed class PeerEgressConsumer(
         }
         var key = new PeerEgressFlowTable.Key(
             inner.Protocol, local, (ushort)inner.DestinationPort, remote, (ushort)inner.SourcePort);
-        if (!_flows.TryGetValue(key, out var flow) || flow.Egress != fromEgress)
+        if (Remembered(key, nowMs) is not { } flow || flow.Egress != fromEgress)
         {
             return false;
         }
-        flow.LastSeenMs = nowMs;
+        // Replies count as activity and carry the remote's FIN or RST, both of which decide when
+        // the flow is forgotten.
+        Touch(flow, packet, outbound: false, nowMs);
         return true;
     }
 
@@ -448,7 +719,7 @@ internal sealed class PeerEgressConsumer(
     /// A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
     /// the flow, and only accept its actual egress as the sender.
     /// </summary>
-    private void HandleFlowReject(PeerEgressFrame.Control control, long fromEgress)
+    private void HandleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs)
     {
         if (!Ipv4Cidr.TryParseAddress(control.DestinationIp, out var remote)
             || !Ipv4Cidr.TryParseAddress(control.SourceIp, out var local))
@@ -457,12 +728,12 @@ internal sealed class PeerEgressConsumer(
         }
         var key = new PeerEgressFlowTable.Key(ProtocolNumberFor(control.Protocol),
             local, (ushort)control.SourcePort, remote, (ushort)control.DestinationPort);
-        if (!_flows.TryGetValue(key, out var flow) || flow.Egress != fromEgress)
+        if (Remembered(key, nowMs) is not { } flow || flow.Egress != fromEgress)
         {
             return;
         }
         var reset = FlowResetPacket(key, flow);
-        _flows.Remove(key);
+        Forget(flow);
         RecordBlocked("rejected-" + control.Code.ToLowerInvariant());
         logger?.LogInformation("[peer-egress-consumer] egress={Egress} refused flow code={Code}",
             fromEgress, control.Code);
@@ -489,5 +760,9 @@ internal sealed class PeerEgressConsumer(
 
     public IReadOnlyDictionary<string, long> BlockedCounts() => new Dictionary<string, long>(_blocked);
 
+    /// <summary>
+    /// The flows held right now, including any that expired since the last packet or status read;
+    /// <see cref="StatusSnapshot"/> forgets those before it counts.
+    /// </summary>
     public int FlowCount => _flows.Count;
 }

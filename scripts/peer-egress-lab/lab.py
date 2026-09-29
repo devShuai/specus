@@ -227,11 +227,12 @@ class Lab:
             self.trace.write(f"{stamp} {text}\n")
             self.trace.flush()
 
-    def sh(self, args, check=True, timeout=60):
+    def sh(self, args, check=True, timeout=60, quiet=False):
+        """Runs a command and traces it; quiet leaves its output out of the trace."""
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         with self.trace_lock:
             self.trace.write(f"$ {' '.join(args)} -> {completed.returncode}\n")
-            if completed.stdout.strip():
+            if completed.stdout.strip() and not quiet:
                 self.trace.write(completed.stdout.rstrip() + "\n")
             if completed.stderr.strip():
                 self.trace.write("stderr: " + completed.stderr.rstrip() + "\n")
@@ -871,6 +872,34 @@ class Lab:
         got["body"].unlink(missing_ok=True)
         return ok, got
 
+    STALL_SECONDS = 15
+
+    def watched_download(self, size, timeout, label):
+        """verified_download, and if it is still running after STALL_SECONDS, a record of where it
+        waits taken while it waits: both ends' TCP state and what the consumer says about its egress.
+
+        A lossy download once stopped 688 bytes short of the end and waited out curl's timeout, and
+        nothing afterwards could say which side still held those bytes."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.verified_download, size, timeout)
+            try:
+                return pending.result(timeout=self.STALL_SECONDS)
+            except concurrent.futures.TimeoutError:
+                pass
+            lines = [f"{label} still running after {self.STALL_SECONDS} s:"]
+            for name in ("con", "egr", "tgt"):
+                sockets = self.sh(ns(name, "ss", "-tin"), check=False, quiet=True).stdout.strip()
+                lines.append(f"[{name}] ss -tin\n{sockets or '(nothing)'}")
+            status = self.client_status("consumer")
+            consumer = [((instance.get("egress") or {}).get("consumer") or {})
+                        for instance in (status or {}).get("data", {}).get("instances", [])]
+            lines.append("consumer egress status: " + json.dumps(
+                [{key: section.get(key) for key in ("flows", "blocked", "peers")} for section in consumer]))
+            self.snapshots[f"{label}, stalled"] = "\n".join(lines)
+            self.note(f"{label} was still running after {self.STALL_SECONDS} s; the snapshot '{label}, stalled' "
+                      "records both ends while it waited")
+            return pending.result()
+
     def verified_upload(self, size, timeout):
         payload = self.work / f"upload-{size}.bin"
         if not payload.exists():
@@ -898,13 +927,39 @@ class Lab:
         self.measure(f"gate: {name}, median of {GATE_REPEATS}", round(median, 2), "MiB/s")
         self.check(title, median >= floor, "runs " + ", ".join(f"{rate:.2f}" for rate in rates) + " MiB/s")
 
+    TCP_COUNTERS = ("TcpExtTCPSynRetrans", "TcpRetransSegs", "TcpExtListenDrops", "TcpExtListenOverflows",
+                    "TcpAttemptFails", "TcpOutRsts", "TcpExtPAWSActive", "TcpExtTCPChallengeACK")
+
+    def tcp_counters(self):
+        """The counters that tell where a new flow waited, in the consumer, egress and target namespaces.
+        None when nstat is missing, so the gate still runs without the diagnosis."""
+        if shutil.which("nstat") is None:
+            return None
+        values = {}
+        for name in ("con", "egr", "tgt"):
+            for line in self.sh(ns(name, "nstat", "-az"), check=False, quiet=True).stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] in self.TCP_COUNTERS:
+                    values[f"{name}.{parts[0]}"] = int(parts[1])
+        return values
+
     def performance_gate(self):
         """Issue #50's thresholds, agreed before any of these numbers were taken; each is a check."""
-        samples = []
+        samples, slow = [], []
         for _ in range(GATE_FIRST_BYTE_SAMPLES):
+            # A new flow that takes a second waited out one SYN retransmission somewhere. Which kernel
+            # retransmitted says where: the consumer's (its SYN or the SYN-ACK was lost in the tunnel or
+            # the egress answered late), the egress's (its connect to the target waited) or the target's
+            # listen queue. Taken around every sample because a slow one is only known afterwards.
+            before = self.tcp_counters()
             got = self.whoami(TARGET_URL)
             if got["code"] == CURL_OK and got["src"] == EGRESS_IP:
                 samples.append(got["firstByte"] * 1000)
+            if got.get("firstByte", 0) * 1000 > GATE_FIRST_BYTE_P95_MS and before is not None:
+                after = self.tcp_counters() or {}
+                moved = {key: after[key] - before.get(key, 0) for key in after if after[key] != before.get(key, 0)}
+                slow.append(f"{got['firstByte'] * 1000:.0f} ms (connect {got.get('connect', 0) * 1000:.0f} ms) "
+                            + (", ".join(f"{key}+{delta}" for key, delta in sorted(moved.items())) or "no counter moved"))
         title = f"performance gate: first byte of a new flow, p95 <= {GATE_FIRST_BYTE_P95_MS:g} ms"
         if len(samples) < GATE_FIRST_BYTE_SAMPLES:
             self.check(title, False, f"only {len(samples)}/{GATE_FIRST_BYTE_SAMPLES} new flows went through the egress")
@@ -912,6 +967,8 @@ class Lab:
             value = p95(samples)
             self.measure(f"gate: first byte of a new flow via egress, p95 of {len(samples)}", round(value, 1), "ms")
             self.check(title, value <= GATE_FIRST_BYTE_P95_MS, f"p95 {value:.1f} ms over {len(samples)} flows")
+        if slow:
+            self.note("slow new flows in the first-byte gate: " + "; ".join(slow))
 
         size = GATE_SINGLE_FLOW_BYTES
         for name, transfer in (("single-flow download of 8 MiB", self.verified_download),
@@ -933,8 +990,8 @@ class Lab:
                 self.check(title, False, "netem is not available, so the gate could not be measured")
                 return
             walls, intact = [], True
-            for _ in range(GATE_REPEATS):
-                ok, got = self.verified_download(GATE_LOSSY_BYTES, timeout=60)
+            for attempt in range(GATE_REPEATS):
+                ok, got = self.watched_download(GATE_LOSSY_BYTES, 60, f"lossy gate run {attempt + 1}")
                 intact = intact and ok
                 if ok and got.get("total"):
                     walls.append(got["total"])

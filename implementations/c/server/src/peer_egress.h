@@ -283,11 +283,32 @@ extern const size_t ST_EGRESS_LAN_CIDRS_LEN;
 /*
  * Reads a stored allowlist. A row that cannot be parsed yields zero rules, which denies everything
  * rather than falling back to something permissive. Returns 0 when the input parsed cleanly.
+ *
+ * Lenient on purpose: an entry it cannot use is dropped rather than failing the row, because a
+ * reader that failed open would be worse. New rows never need that leniency, since the management
+ * API refuses such input before it is stored (st_egress_normalize_destination_rules).
  */
 int st_egress_parse_destination_rules(const char *json,
                                       st_egress_destination_rule *out,
                                       size_t capacity,
                                       size_t *out_len);
+
+/*
+ * Validates the destination rules of a policy saved through the management API and returns the
+ * form to store, as fixed by protocol/test-vectors/peer-egress-management-v1.json.
+ *
+ * What is only spelling is normalised: the CIDR is trimmed and otherwise kept as written, protocols
+ * are trimmed, lowercased and de-duplicated in order, and an absent or null list is stored as an
+ * empty one. Anything the egress would not read -- a CIDR it cannot parse, a protocol other than
+ * tcp or udp, a port range other than [low, high] within 0-65535, or more rules, ranges or bytes
+ * than may be stored -- refuses the whole list instead of dropping the offending part, so what is
+ * saved is exactly what was asked for. A top-level null is refused too; whether it means "leave
+ * the rules as they are" is the caller's decision.
+ *
+ * Returns 0 and sets *out_json to a malloc'd compact JSON array the caller frees, or nonzero with
+ * *out_json NULL when the request must be refused.
+ */
+int st_egress_normalize_destination_rules(const char *json, char **out_json);
 
 /*
  * Serialises an allowlist for storage. Returns a malloc'd string the caller frees, or NULL when the

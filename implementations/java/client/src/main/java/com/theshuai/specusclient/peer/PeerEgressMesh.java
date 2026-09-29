@@ -369,7 +369,7 @@ final class PeerEgressMesh implements AutoCloseable {
         PeerEgressStatus.ConsumerSnapshot consumerSnapshot = null;
         if (consumerRole != null) {
             synchronized (consumerRole) {
-                consumerSnapshot = consumerRole.statusSnapshot();
+                consumerSnapshot = consumerRole.statusSnapshot(System.currentTimeMillis());
             }
         }
         if (consumerSnapshot != null) {
@@ -670,7 +670,7 @@ final class PeerEgressMesh implements AutoCloseable {
         long nowMs = System.currentTimeMillis();
         Map<Long, List<String>> purge = new java.util.LinkedHashMap<>();
         synchronized (consumerRole) {
-            var peers = new java.util.HashSet<>(consumerRole.statusSnapshot().online().keySet());
+            var peers = new java.util.HashSet<>(consumerRole.statusSnapshot(nowMs).online().keySet());
             peers.addAll(online.keySet());
             for (long peer : peers) {
                 purge.putAll(consumerRole.setEgressOnline(peer,

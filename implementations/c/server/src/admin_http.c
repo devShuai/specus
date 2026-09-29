@@ -4375,6 +4375,10 @@ static int handle_peer_mesh_egress_switch_update(const st_admin_context *context
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"database-backed egress policies are unavailable\"}");
     }
+    /* A body that is not JSON is refused even when "enabled": true can be picked out of it. */
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid request body\"}");
+    }
     int enabled = 0;
     if (st_json_get_bool(body, "enabled", &enabled) != 0) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled is required\"}");
@@ -4427,23 +4431,18 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
     return len;
 }
 
-/* Serialises the destination allowlist for storage, rejecting anything the column cannot hold. */
+/*
+ * Validates the destination allowlist and writes the form to store. Anything the egress would not
+ * read refuses the request as a whole (protocol/spec/peer-egress.md): dropping only the bad part,
+ * as this used to, saved a policy other than the one the operator asked for and said nothing.
+ */
 static int admin_encode_egress_destination_rules(const char *raw, char *out, size_t out_len)
 {
-    st_egress_destination_rule rules[ST_EGRESS_MAX_DESTINATION_RULES];
-    size_t rules_len = 0U;
-    if (raw == NULL || *raw == '\0') {
-        snprintf(out, out_len, "[]");
-        return 0;
-    }
-    if (st_egress_parse_destination_rules(raw, rules, ST_EGRESS_MAX_DESTINATION_RULES, &rules_len) != 0) {
-        return 1;
-    }
-    char *encoded = st_egress_encode_destination_rules(rules, rules_len);
-    if (encoded == NULL) return 1;
-    int rc = strlen(encoded) < out_len ? 0 : 1;
-    if (rc == 0) snprintf(out, out_len, "%s", encoded);
-    free(encoded);
+    char *normalized = NULL;
+    if (st_egress_normalize_destination_rules(raw, &normalized) != 0) return 1;
+    int rc = strlen(normalized) < out_len ? 0 : 1;
+    if (rc == 0) snprintf(out, out_len, "%s", normalized);
+    free(normalized);
     return rc;
 }
 
@@ -4460,6 +4459,14 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     if (database_path == NULL) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"database-backed egress policies are unavailable\"}");
+    }
+    /*
+     * The field readers below also match text in a body that is not JSON at all, and the structural
+     * ones treat it as carrying no fields: a truncated body would save the other fields while
+     * silently keeping the old rules.
+     */
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid request body\"}");
     }
     long long egress_client_id = 0;
     if (st_json_get_i64(body, "egressClientId", &egress_client_id) != 0 || egress_client_id <= 0) {
@@ -4532,14 +4539,19 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     }
 
     char *rules_raw = st_json_get_top_level_raw(body, "destinationRules");
-    if (rules_raw != NULL) {
+    /* null leaves the stored rules as they are, like an absent field, as the other servers read it. */
+    if (rules_raw != NULL && strcmp(rules_raw, "null") != 0) {
         int rc = admin_encode_egress_destination_rules(rules_raw, policy.destination_rules,
                                                        sizeof(policy.destination_rules));
         free(rules_raw);
         if (rc != 0) {
             return write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"destinationRules exceed the storage limit\"}");
+                "{\"error\":\"invalid destinationRules: each rule needs an IPv4 cidr, tcp or udp protocols "
+                "and [low, high] port ranges within 0-65535; at most 64 rules, 32 ranges per rule "
+                "and 4096 bytes stored\"}");
         }
+    } else {
+        free(rules_raw);
     }
 
     int value = 0;
