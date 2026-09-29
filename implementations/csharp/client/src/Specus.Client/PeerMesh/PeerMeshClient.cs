@@ -296,10 +296,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 lock (owner._sync)
                 {
-                    var now = DateTimeOffset.UtcNow;
-                    return owner._peers.ToDictionary(item => item.Key, item => item.Value.Online
-                        && owner._sessions.TryGetValue(item.Key, out var session)
-                        && session.CanCarryEgress(now));
+                    return owner.EgressAvailabilityLocked(DateTimeOffset.UtcNow);
                 }
             }
         }
@@ -2456,12 +2453,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    /// <summary>Which peers can carry an egress flow right now. Called with <c>_sync</c> held.</summary>
+    private Dictionary<long, bool> EgressAvailabilityLocked(DateTimeOffset now) =>
+        _peers.ToDictionary(item => item.Key, item => item.Value.Online
+            && _sessions.TryGetValue(item.Key, out var session)
+            && session.CanCarryEgress(now));
+
     private void MergeRoster(IReadOnlyList<PeerMeshPeer>? peers)
     {
         if (peers is null)
         {
             return;
         }
+        Dictionary<long, bool> availability;
         lock (_sync)
         {
             // Roster updates carry identity and online state; rebuild so removed peers disappear immediately
@@ -2489,8 +2493,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 item => item.Key,
                 item => new PeerServiceRuntime.RosterHint(item.Value.VirtualIp ?? "", item.Value.Online)));
             _serviceRuntime.SetHasAuthorizedOnlinePeer(onlinePeer);
+            availability = EgressAvailabilityLocked(DateTimeOffset.UtcNow);
         }
         PublishPeerMeshSnapshot();
+        // An egress that has just gone offline has its flows refused now. Otherwise the roster only
+        // reached the consumer at the next maintenance reconcile, and until then every flow under a
+        // rule waited on a peer that was gone instead of failing at once; on a slow machine that
+        // wait outlasted a 90-second probe. The Go client syncs from its roster merge the same way.
+        // Outside _sync: the sync can deliver purges through the mesh.
+        _egress.SyncEgressAvailability(availability);
     }
 
     private void MergePeerFromSignal(PeerControlMessage message)
