@@ -93,6 +93,38 @@ func TestMeshInstallsThePoolRouteAndTakesItBack(t *testing.T) {
 	}
 }
 
+// Phase two stopping with no rules configured still reaches the consumer: it drops its pool and
+// its responder, and the pool's route comes out of the table.
+func TestMeshStopsPhaseTwoWithoutRules(t *testing.T) {
+	harness := newPhaseTwoHarness(t, nil)
+	harness.tick(0)
+	consumer := harness.consumer()
+	if consumer == nil || consumer.fakeIPCIDR == "" || !contains(harness.commander.installLog, "198.18.0.0/15") {
+		t.Fatal("phase two did not start without rules")
+	}
+
+	// The mesh network moves over the pool, which stops phase two.
+	harness.mesh.mu.Lock()
+	harness.mesh.runtime.PeerMesh.CIDR = "198.18.0.0/16"
+	harness.mesh.mu.Unlock()
+	harness.tick(time.Second)
+
+	consumer.mu.Lock()
+	pool, responder := consumer.fakeIPCIDR, consumer.fakeIP
+	consumer.mu.Unlock()
+	if pool != "" || responder != nil {
+		t.Errorf("the consumer kept pool %q after phase two stopped", pool)
+	}
+	if !contains(harness.commander.removeLog, "198.18.0.0/15") {
+		t.Errorf("the pool's route was not taken out: removed %v", harness.commander.removeLog)
+	}
+	query := buildUDPDatagram(udpDatagram{SourceIP: testAddr(t, "100.96.0.1"), DestinationIP: testAddr(t, "198.18.0.1"),
+		SourcePort: 53000, DestinationPort: 53, Payload: []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}})
+	if outcome := consumer.handleOutbound(query, flowEpoch); outcome != egressOutcomeNotMine {
+		t.Errorf("a query to the old listen address: %s, want not-mine", outcome)
+	}
+}
+
 // A pool somebody else already routes is refused the way a rule's prefix is, and the status lists it
 // as not installed; a failed install is rolled back with the rest of that apply.
 func TestMeshTreatsThePoolRouteLikeARuleRoute(t *testing.T) {

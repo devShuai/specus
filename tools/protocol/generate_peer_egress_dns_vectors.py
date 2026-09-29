@@ -601,7 +601,9 @@ def respond(rules, pool, network, message, now):
 
     if name.endswith(IN_ADDR_ARPA):
         octets = name[:-len(IN_ADDR_ARPA)].split(".")
-        if len(octets) != 4 or not all(o.isdigit() and len(o) <= 3 and int(o) <= 255 for o in octets):
+        # Only the canonical spelling is ours: four decimal octets without leading zeros, which is
+        # the only form a resolver writes. Anything else is some other name and goes upstream.
+        if len(octets) != 4 or not all(o.isdigit() and o == str(int(o)) and int(o) <= 255 for o in octets):
             return {"result": "forward"}
         address = ipaddress.IPv4Address(".".join(reversed(octets)))
         if address not in network:
@@ -937,6 +939,8 @@ WIRE_EVENTS = [
     wire("ptr-unmapped-nxdomain", build_query(0x123F, "6.0.18.198.in-addr.arpa", "PTR")),
     wire("other-type-on-a-mapped-reverse-name", build_query(0x1240, "3.0.18.198.in-addr.arpa", "TXT")),
     wire("ptr-outside-the-pool-forwarded", build_query(0x1241, "1.0.0.10.in-addr.arpa", "PTR")),
+    wire("ptr-leading-zero-forwarded", build_query(0x124A, "02.0.18.198.in-addr.arpa", "PTR")),
+    wire("ptr-three-octets-forwarded", build_query(0x124B, "0.18.198.in-addr.arpa", "PTR")),
     wire("two-questions-forwarded", build_query(0x1242, "www.example.com", "A", qdcount=2)),
     wire("not-a-query-opcode-forwarded", build_query(0x1243, "www.example.com", "A", opcode=2)),
     wire("chaos-class-forwarded", build_query(0x1244, "www.example.com", "A", qclass=3)),
@@ -1113,8 +1117,8 @@ def build():
     by_name = {event["name"]: result for event, result in zip(WIRE_EVENTS, wire_cases[0]["results"])}
     assert [r["result"] for r in wire_cases[0]["results"]] == [
         "answer", "answer", "answer", "answer", "answer", "answer", "answer", "forward", "forward", "forward",
-        "answer", "answer", "answer", "forward", "forward", "forward", "forward", "forward", "drop", "drop",
-        "answer", "answer"], wire_cases[0]["results"]
+        "answer", "answer", "answer", "forward", "forward", "forward", "forward", "forward", "forward", "forward",
+        "drop", "drop", "answer", "answer"], wire_cases[0]["results"]
     first = bytes.fromhex(by_name["egress-a"]["response"])
     assert first == bytes.fromhex("1234" "8180" "0001" "0001" "0000" "0000"
                                   "03777777076578616d706c6503636f6d00" "0001" "0001"
