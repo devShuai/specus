@@ -57,13 +57,14 @@ internal static class EgressView
         var refused = rules.Count(rule => !Flag(rule, "inForce"));
         var notInstalled = routes.Count(route => !Flag(route, "installed"));
         var offline = peers.Count(peer => !Flag(peer, "online"));
+        var relayed = peers.Count(peer => Text(peer, "path") == "relay");
 
         var lines = new List<string>
         {
             $"  consumer: {rules.Count} rules ({refused} not in force)"
                 + $" | {routes.Count} routes ({notInstalled} not installed)"
                 + $" | {Number(present, "flows")} flows"
-                + $" | {peers.Count} egress peers ({offline} offline)",
+                + $" | {peers.Count} egress peers ({offline} offline, {relayed} via relay)",
         };
 
         // Then the problems, one line each, in the order an operator would act on them: a rule
@@ -73,17 +74,35 @@ internal static class EgressView
         lines.AddRange(rules.Where(rule => !Flag(rule, "inForce")).Select(rule =>
             $"    rule {Number(rule, "index")} \"{Text(rule, "match")}\""
                 + $": NOT IN FORCE ({Text(rule, "code")})"));
-        lines.AddRange(routes.Where(route => !Flag(route, "installed")).Select(route =>
-            $"    route {Text(route, "cidr")} ({Text(route, "origin")})"
-                + $": NOT INSTALLED, already present: {Text(route, "conflict")}"));
-        lines.AddRange(peers.Where(peer => !Flag(peer, "online")).Select(peer =>
-            $"    egress peer {Number(peer, "clientId")}"
-                + ": offline, so its rules have nowhere to send"));
+        foreach (var route in routes.Where(route => !Flag(route, "installed")))
+        {
+            lines.Add($"    route {Text(route, "cidr")} ({Text(route, "origin")})"
+                + $": NOT INSTALLED, already present: {Text(route, "conflict")}");
+            lines.Add("      fix: remove or narrow that route, or change the rule; the client retries every 60 s");
+        }
+        // Each problem is followed by what to do about it, in the same words in every runtime and on
+        // the local page. A peer that is online with no path yet is a problem too: its rules are in
+        // force and have nowhere to send.
+        foreach (var peer in peers)
+        {
+            var id = Number(peer, "clientId");
+            if (!Flag(peer, "online"))
+            {
+                lines.Add($"    egress peer {id}: offline, so its rules have nowhere to send");
+                lines.Add($"      fix: start egress device {id} or restore its connection; until then its destinations are blocked, not sent locally");
+            }
+            else if (Text(peer, "path") == "none")
+            {
+                lines.Add($"    egress peer {id}: online but no path to it yet");
+                lines.Add("      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP");
+            }
+        }
 
         var error = Text(present, "routeError");
         if (error.Length != 0)
         {
             lines.Add($"    route install failed: {error} (rolledBack={Flag(present, "rolledBack")})");
+            lines.Add("      fix: " + RouteErrorFix(error));
         }
         var blocked = Counts(present, "blocked");
         if (blocked.Count != 0)
@@ -91,6 +110,18 @@ internal static class EgressView
             lines.Add("    blocked: " + Join(blocked));
         }
         return lines;
+    }
+
+    /// <summary>
+    /// What to do about a failed route install. A refused permission is the common case and has one
+    /// answer; anything else is in the log line of the command that failed.
+    /// </summary>
+    internal static string RouteErrorFix(string message)
+    {
+        var lower = message.ToLowerInvariant();
+        return new[] { "permission", "denied", "not permitted", "elevat", "access" }.Any(lower.Contains)
+            ? "run the client as administrator or root, with peerMeshDevice set to auto"
+            : "the client log names the route command that failed; fix what it reports and restart the client";
     }
 
     private static List<string> EgressLines(JsonElement? egress)

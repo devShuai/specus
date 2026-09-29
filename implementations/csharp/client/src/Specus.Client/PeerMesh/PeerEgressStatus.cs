@@ -20,7 +20,9 @@ internal sealed record PeerEgressApplyOutcome(long AtMillis,
 /// <summary>The consumer's own view, taken under its caller's lock.</summary>
 internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Rules,
     string MeshCidr, IReadOnlyDictionary<long, bool> Online, int Flows,
-    IReadOnlyDictionary<string, long> Blocked);
+    IReadOnlyDictionary<string, long> Blocked,
+    IReadOnlyDictionary<long, int>? FlowsByEgress = null,
+    IReadOnlyDictionary<long, string>? Paths = null);
 
 /// <summary>The egress role's own view, taken under its lock.</summary>
 internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int Flows,
@@ -51,6 +53,11 @@ internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int 
 /// </remarks>
 internal static class PeerEgressStatus
 {
+    // The values of a peer entry's path: what carries frames to that egress now.
+    internal const string PathDirect = "direct";
+    internal const string PathRelay = "relay";
+    internal const string PathNone = "none";
+
     /// <summary>The whole section, assembled for the state file.</summary>
     public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
@@ -174,6 +181,8 @@ internal static class PeerEgressStatus
             {
                 ["clientId"] = peer.Key,
                 ["online"] = peer.Value,
+                ["path"] = consumer.Paths is not null && consumer.Paths.TryGetValue(peer.Key, out var path) ? path : PathNone,
+                ["flows"] = consumer.FlowsByEgress is not null && consumer.FlowsByEgress.TryGetValue(peer.Key, out var count) ? count : 0,
             })
             .ToList();
         section["flows"] = consumer.Flows;

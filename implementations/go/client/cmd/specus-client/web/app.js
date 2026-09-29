@@ -101,12 +101,16 @@ function renderEgress(state) {
   } else {
     const rules = list(consumer.rules), routes = list(consumer.routes), peers = list(consumer.peers);
     const refused = rules.filter(rule => rule.inForce !== true), missing = routes.filter(route => route.installed !== true), offline = peers.filter(peer => peer.online !== true);
-    $("egress-summary").textContent = rules.length + " 条规则，" + refused.length + " 条未生效 · " + routes.length + " 条路由，" + missing.length + " 条未安装 · " + count(consumer.flows) + " 个流 · " + peers.length + " 个出口设备，" + offline.length + " 个离线";
+    const relayed = peers.filter(peer => peer.path === "relay"), pathless = peers.filter(peer => peer.online === true && peer.path === "none");
+    $("egress-summary").textContent = rules.length + " 条规则，" + refused.length + " 条未生效 · " + routes.length + " 条路由，" + missing.length + " 条未安装 · " + count(consumer.flows) + " 个流 · " + peers.length + " 个出口设备，" + offline.length + " 个离线，" + relayed.length + " 个经中继";
     for (const rule of refused) issue(issues, "规则 #" + count(rule.index) + "「" + (rule.match || "—") + "」未生效", (egressRuleReasons[rule.code] || "规则被拒绝") + "；这条规则现在不引导任何流量。", rule.code);
-    for (const route of missing) issue(issues, "路由 " + (route.cidr || "—") + " 未安装", "该前缀已被本功能之外的路由占用，本该进隧道的流量正从物理网卡出去：" + (route.conflict || "—"), route.origin);
-    for (const peer of offline) issue(issues, "出口设备 " + count(peer.clientId) + " 离线", "指向它的规则已经生效，但流量没有出口可发，会被丢弃而不是改走本机。");
-    if (typeof consumer.routeError === "string" && consumer.routeError) issue(issues, "路由下发失败", consumer.routeError + (consumer.rolledBack === true ? "（本次下发已整体回滚）" : ""));
-    problems = refused.length + missing.length + offline.length + (consumer.routeError ? 1 : 0);
+    // Each problem says what to do about it, in the words the egress command uses.
+    for (const route of missing) issue(issues, "路由 " + (route.cidr || "—") + " 未安装", "该前缀已被本功能之外的路由占用，本该进隧道的流量正从物理网卡出去：" + (route.conflict || "—") + "。处理：删除或缩小那条路由，或修改规则；客户端每 60 秒重试一次。", route.origin);
+    for (const peer of offline) issue(issues, "出口设备 " + count(peer.clientId) + " 离线", "指向它的规则已经生效，但流量没有出口可发，会被阻断而不是改走本机。处理：启动该设备或恢复它的网络连接。");
+    for (const peer of pathless) issue(issues, "出口设备 " + count(peer.clientId) + " 在线但尚无路径", "直连与中继路径都还没建立，指向它的流量暂时发不出去。处理：稍候；持续如此时检查两台设备到服务端的 UDP 是否可达。");
+    if (typeof consumer.routeError === "string" && consumer.routeError) issue(issues, "路由下发失败", consumer.routeError + (consumer.rolledBack === true ? "（本次下发已整体回滚）" : "") + "。处理：" + (/permission|denied|not permitted|elevat|access/i.test(consumer.routeError) ? "以管理员或 root 身份运行客户端，并把虚拟网卡模式设为私有组网（auto）。" : "客户端日志里记录了失败的路由命令，按其提示修正后重启客户端。"));
+    for (const peer of relayed) issue(issues, "出口设备 " + count(peer.clientId) + " 经中继连接", "可用，但比直连慢；" + count(peer.flows) + " 个流。直连需要两台设备之间的 UDP 可达。", "", true);
+    problems = refused.length + missing.length + offline.length + pathless.length + (consumer.routeError ? 1 : 0);
     if (!problems) issue(issues, "规则均已生效", "路由均已安装，指向的出口设备均在线。", "", true);
     const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝。", blocked, !problems);
   }
