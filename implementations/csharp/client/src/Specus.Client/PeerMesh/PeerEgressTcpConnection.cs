@@ -135,7 +135,7 @@ internal sealed class PeerEgressTcpConnection
     private int _sndWnd;
     private uint _sndWl1;
     private uint _sndWl2;
-    private byte[] _pending = [];
+    private readonly SendQueue _pending = new();
     // Nonblocking admission; null preserves the deterministic output-only model.
     internal Func<byte[], bool>? TryTransmit { get; set; }
     internal bool SendBlocked { get; private set; }
@@ -278,7 +278,7 @@ internal sealed class PeerEgressTcpConnection
             _sndNxt, 0, PeerEgressSegment.FlagRst, 0, 0, [])));
         _state = State.Closed;
         _retransmit.Clear();
-        _pending = [];
+        _pending.Clear();
         _reassembly.Clear();
         output.Done = true;
         output.Reset = true;
@@ -311,7 +311,7 @@ internal sealed class PeerEgressTcpConnection
             {
                 _state = State.Closed;
                 _retransmit.Clear();
-                _pending = [];
+                _pending.Clear();
                 _reassembly.Clear();
                 output.Done = true;
                 output.Reset = true;
@@ -613,9 +613,7 @@ internal sealed class PeerEgressTcpConnection
         }
         if (data.Length > AppReadCredit()) { ResetFlow(output); return output; }
         _lastActivityMs = nowMs;
-        var previous = _pending.Length;
-        Array.Resize(ref _pending, previous + data.Length);
-        data.CopyTo(_pending, previous);
+        _pending.Add(data);
         FlushSend(output, nowMs);
         return output;
     }
@@ -623,7 +621,7 @@ internal sealed class PeerEgressTcpConnection
     internal int AppReadCredit()
     {
         if (_appClosed || (_state != State.SynReceived && _state != State.Established && _state != State.CloseWait)) { return 0; }
-        return Math.Max(0, SendBuffer - _pending.Length - (int)(_sndNxt - _sndUna));
+        return Math.Max(0, SendBuffer - _pending.Count - (int)(_sndNxt - _sndUna));
     }
 
     private int SendCredit() => Math.Max(0, Math.Min(_sndWnd, 4 * _sndMss) - (int)(_sndNxt - _sndUna));
@@ -631,13 +629,13 @@ internal sealed class PeerEgressTcpConnection
     private void FlushSend(Output output, long nowMs)
     {
         if (_state != State.Established && _state != State.CloseWait) { return; }
-        while (_pending.Length > 0 && SendCredit() > 0)
+        while (_pending.Count > 0 && SendCredit() > 0)
         {
-            var n = Math.Min(_pending.Length, Math.Min(_sndMss, SendCredit()));
-            if (!Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending[..n], nowMs, 0)) { return; }
-            _pending = _pending[n..];
+            var n = Math.Min(_pending.Count, Math.Min(_sndMss, SendCredit()));
+            if (!Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending.Peek(n), nowMs, 0)) { return; }
+            _pending.Skip(n);
         }
-        if (_appClosed && _pending.Length == 0 && SendCredit() > 0 && !_finSent)
+        if (_appClosed && _pending.Count == 0 && SendCredit() > 0 && !_finSent)
         {
             if (!Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, [], nowMs, 0)) { return; }
             _state = _state == State.CloseWait ? State.LastAck : State.FinWait1;
@@ -697,16 +695,16 @@ internal sealed class PeerEgressTcpConnection
         }
         FlushSend(output, nowMs);
         if (_sndWnd == 0 && _state != State.SynReceived
-            && (_pending.Length > 0 || _retransmit.Count > 0 || _appClosed))
+            && (_pending.Count > 0 || _retransmit.Count > 0 || _appClosed))
         {
             if (_persistAtMs < 0) { _persistAtMs = nowMs; return output; }
             if (nowMs - _persistAtMs < _rtoMs) { return output; }
             _persistAtMs = nowMs;
-            if (_retransmit.Count == 0 && _pending.Length > 0)
+            if (_retransmit.Count == 0 && _pending.Count > 0)
             {
-                if (Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending[..1], nowMs, 0))
+                if (Emit(output, PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, _pending.Peek(1), nowMs, 0))
                 {
-                    _pending = _pending[1..];
+                    _pending.Skip(1);
                 }
             }
             else
@@ -725,7 +723,7 @@ internal sealed class PeerEgressTcpConnection
             }
             return output;
         }
-        if (_retransmit.Count == 0 && _pending.Length == 0 && Keepalive(nowMs, output))
+        if (_retransmit.Count == 0 && _pending.Count == 0 && Keepalive(nowMs, output))
         {
             return output;
         }
@@ -794,5 +792,70 @@ internal sealed class PeerEgressTcpConnection
             _sndNxt - 1, _rcvNxt, PeerEgressSegment.FlagAck,
             PeerEgressSegment.AdvertisedWindow(_rcvWnd), 0, [])));
         return false;
+    }
+}
+
+/// <summary>
+/// Bytes read from the real socket and not yet sent, kept as the chunks they arrived in.
+/// </summary>
+/// <remarks>
+/// Taking a segment copies only that segment. Holding them in one array that was re-cut after every
+/// segment copied the whole unsent remainder each time, up to the send buffer per segment of about a
+/// thousand bytes.
+/// </remarks>
+internal sealed class SendQueue
+{
+    private readonly Queue<byte[]> _chunks = new();
+    private int _headOffset;
+
+    public int Count { get; private set; }
+
+    /// <summary>Keeps <paramref name="data"/> itself; the caller hands over an array it does not reuse.</summary>
+    public void Add(byte[] data)
+    {
+        if (data.Length == 0) { return; }
+        _chunks.Enqueue(data);
+        Count += data.Length;
+    }
+
+    /// <summary>Copies the first <paramref name="count"/> bytes without removing them.</summary>
+    public byte[] Peek(int count)
+    {
+        var output = new byte[count];
+        var filled = 0;
+        var offset = _headOffset;
+        foreach (var chunk in _chunks)
+        {
+            if (filled == count) { break; }
+            var take = Math.Min(chunk.Length - offset, count - filled);
+            Buffer.BlockCopy(chunk, offset, output, filled, take);
+            filled += take;
+            offset = 0;
+        }
+        return output;
+    }
+
+    public void Skip(int count)
+    {
+        Count -= count;
+        while (count > 0)
+        {
+            var available = _chunks.Peek().Length - _headOffset;
+            if (count < available)
+            {
+                _headOffset += count;
+                return;
+            }
+            count -= available;
+            _chunks.Dequeue();
+            _headOffset = 0;
+        }
+    }
+
+    public void Clear()
+    {
+        _chunks.Clear();
+        _headOffset = 0;
+        Count = 0;
     }
 }

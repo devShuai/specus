@@ -59,6 +59,11 @@ const (
 	peerMaxAdaptivePortDelta      = 512
 	peerDirectKeepaliveInterval   = 25 * time.Second
 	peerDirectStaleInterval       = 45 * time.Second
+	// peerRelayFollowQuiet is how long a session must have heard nothing direct from its peer
+	// before a data frame arriving over the relay moves this side's sending to the relay. Frames
+	// already in flight on the two paths otherwise flip each side back and forth, and under load
+	// the two sides never settle on one path.
+	peerRelayFollowQuiet = 3 * time.Second
 	// H-1：候选回礼节流间隔，避免两端互相触发形成信令循环，对齐 Java
 	// CANDIDATE_RECIPROCATE_INTERVAL_MILLIS=2000。
 	peerCandidateReciprocateInterval = 2 * time.Second
@@ -281,6 +286,12 @@ type peerMeshSession struct {
 	DirectBytes             int64
 	DirectBytesPending      int64
 	PathMTU                 *peerPathMTUDiscovery
+}
+
+// heardDirectWithin reports whether anything authenticated arrived from the peer over the direct
+// path in the last window: a data frame, a check or a check response.
+func (session *peerMeshSession) heardDirectWithin(now time.Time, window time.Duration) bool {
+	return session != nil && !session.LastDirectSuccess.IsZero() && now.Sub(session.LastDirectSuccess) <= window
 }
 
 func (session *peerMeshSession) hasHealthyDirect(now time.Time) bool {
@@ -1431,10 +1442,12 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 		return
 	}
 	if relayFrom != "" {
-		current.PathType = "RELAY"
-		current.RelayTargetAllocationID = relayFrom
-		current.RemoteEndpoint = nil
 		current.LastRelaySuccess = time.Now()
+		if !current.heardDirectWithin(time.Now(), peerRelayFollowQuiet) || mesh.shouldAvoidDirectPathLocked() {
+			current.PathType = "RELAY"
+			current.RelayTargetAllocationID = relayFrom
+			current.RemoteEndpoint = nil
+		}
 	} else {
 		current.PathType = "DIRECT"
 		current.RemoteEndpoint = remote
@@ -1540,10 +1553,16 @@ func (mesh *peerMeshClient) markPathFromInboundCheck(session *peerMeshSession, r
 		return
 	}
 	if relayFrom != "" {
+		current.LastRelaySuccess = time.Now()
+		if current.hasHealthyDirect(time.Now()) && !mesh.shouldAvoidDirectPathLocked() {
+			// The peer checks its relay the whole time a direct path works. The reply goes back
+			// over the relay; this side's data stays on the direct path.
+			mesh.mu.Unlock()
+			return
+		}
 		current.PathType = "RELAY"
 		current.RelayTargetAllocationID = relayFrom
 		current.RemoteEndpoint = nil
-		current.LastRelaySuccess = time.Now()
 		mesh.mu.Unlock()
 		mesh.flushPendingPackets(current)
 		return

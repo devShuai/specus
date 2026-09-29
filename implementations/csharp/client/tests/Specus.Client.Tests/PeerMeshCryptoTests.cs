@@ -483,6 +483,61 @@ public sealed class PeerMeshCryptoTests
         Assert.Equal("", Property<string>(session, "RelayTargetAllocationId"));
     }
 
+    // A session follows its peer onto the relay only when the peer has gone quiet on the direct
+    // path. Following every relayed frame let frames already in flight on the two paths flip both
+    // sides back and forth, and under load the two sides never settled on one path.
+    [Theory]
+    [InlineData(0, "DIRECT", "")]
+    [InlineData(5, "RELAY", "alloc-peer")]
+    public async Task RelayFrameMovesASessionOnlyAfterItsDirectPathWentQuiet(
+        int secondsSinceDirect, string expectedPath, string expectedRelayTarget)
+    {
+        var client = new PeerMeshClient(new SpecusClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_runtime", new SpecusRuntimeState
+        {
+            PeerMesh = new PeerMeshConfig { ClientId = 1, Cidr = "100.96.0.0/11" },
+        });
+        SetPrivateField(client, "_device", new NoopPeerVirtualDevice("test"));
+        var session = NewPeerMeshSession(1001, 2, "token",
+            new IPEndPoint(IPAddress.Parse("192.0.2.10"), 51000), "", "DIRECT",
+            DateTimeOffset.UtcNow.AddSeconds(-secondsSinceDirect));
+        PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
+        PrivateField<IDictionary>(client, "_sessionsById").Add(1001L, session);
+        using var peerCodec = PeerDataFrameCodec.CreateTrafficCodec(
+            "0123456789abcdef0123456789abcdef"u8.ToArray(), 1001, 2, 1, "epoch-remote");
+        var frame = peerCodec.Encode(1001, 1, new byte[] { 1, 2, 3, 4 });
+
+        await InvokePrivateAsync(client, "HandlePeerDataFrameAsync", frame,
+            new IPEndPoint(IPAddress.Parse("198.51.100.20"), 3478), "alloc-peer");
+
+        Assert.Equal(expectedPath, Property<string>(session, "PathType"));
+        Assert.Equal(expectedRelayTarget, Property<string>(session, "RelayTargetAllocationId"));
+        Assert.NotEqual(default, Property<DateTimeOffset>(session, "LastRelaySuccess"));
+    }
+
+    // A peer checks its relay the whole time a direct path works: the check is answered over the
+    // relay and this side keeps sending direct. Without a healthy direct path the check is what
+    // first gives the session a way to send.
+    [Theory]
+    [InlineData(10, "DIRECT", "")]
+    [InlineData(60, "RELAY", "alloc-peer")]
+    public async Task RelayCheckMovesOnlyASessionWithoutAHealthyDirectPath(
+        int secondsSinceDirect, string expectedPath, string expectedRelayTarget)
+    {
+        var client = new PeerMeshClient(new SpecusClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_runtime", new SpecusRuntimeState { PeerMesh = new PeerMeshConfig { Cidr = "100.96.0.0/11" } });
+        var session = NewPeerMeshSession(1001, 2, "token",
+            new IPEndPoint(IPAddress.Parse("192.0.2.10"), 51000), "", "DIRECT",
+            DateTimeOffset.UtcNow.AddSeconds(-secondsSinceDirect));
+        PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
+
+        await InvokePrivateAsync(client, "MarkPathFromInboundCheckAsync", session,
+            new IPEndPoint(IPAddress.Parse("198.51.100.20"), 3478), "alloc-peer");
+
+        Assert.Equal(expectedPath, Property<string>(session, "PathType"));
+        Assert.Equal(expectedRelayTarget, Property<string>(session, "RelayTargetAllocationId"));
+    }
+
     [Fact]
     public async Task DirectKeepaliveUsesNominatedEndpointLikeJava()
     {

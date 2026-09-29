@@ -62,6 +62,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan KeepaliveTickInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan DirectStaleInterval = TimeSpan.FromSeconds(45);
+    // How long a session must have heard nothing direct from its peer before a data frame arriving
+    // over the relay moves this side's sending to the relay. Frames already in flight on the two
+    // paths otherwise flip each side back and forth, and under load the two sides never settle.
+    internal static readonly TimeSpan RelayFollowQuiet = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
     // H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
     // HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 15s
@@ -1554,10 +1558,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             if (!string.IsNullOrWhiteSpace(relayFrom))
             {
+                current.LastRelaySuccess = DateTimeOffset.UtcNow;
+                if (current.HasHealthyDirect(DateTimeOffset.UtcNow) && !ShouldAvoidDirectPathLocked())
+                {
+                    // The peer checks its relay the whole time a direct path works. The reply goes
+                    // back over the relay; this side's data stays on the direct path.
+                    return;
+                }
                 current.PathType = "RELAY";
                 current.RelayTargetAllocationId = relayFrom;
                 current.RemoteEndpoint = null;
-                current.LastRelaySuccess = DateTimeOffset.UtcNow;
                 ready = current;
             }
             else if (ShouldAvoidDirectPathLocked() || InCidr(remote.Address, _runtime?.PeerMesh.Cidr))
@@ -2233,10 +2243,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             var frameBytes = payload.LongLength;
             if (!string.IsNullOrWhiteSpace(relayFrom))
             {
-                current.PathType = "RELAY";
-                current.RelayTargetAllocationId = relayFrom;
-                current.RemoteEndpoint = null;
                 current.LastRelaySuccess = DateTimeOffset.UtcNow;
+                if (!current.HeardDirectWithin(DateTimeOffset.UtcNow, RelayFollowQuiet) || ShouldAvoidDirectPathLocked())
+                {
+                    current.PathType = "RELAY";
+                    current.RelayTargetAllocationId = relayFrom;
+                    current.RemoteEndpoint = null;
+                }
             }
             else
             {
@@ -5263,6 +5276,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             OutboundCodec = null;
             InboundCodec = null;
         }
+
+        // Whether anything authenticated arrived from the peer over the direct path in the window:
+        // a data frame, a check or a check response.
+        public bool HeardDirectWithin(DateTimeOffset now, TimeSpan window) =>
+            LastDirectSuccess != default && now - LastDirectSuccess <= window;
 
         public bool HasHealthyDirect(DateTimeOffset now) =>
             string.Equals(PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
