@@ -262,6 +262,16 @@ int st_egress_normalize_version(int version)
     return version > ST_EGRESS_PROTOCOL_VERSION ? ST_EGRESS_PROTOCOL_VERSION : version;
 }
 
+int st_egress_declares_domain_targets(const char *capabilities_json, int version)
+{
+    int declared = 0;
+    if (capabilities_json == NULL || version < 1
+        || st_json_get_bool(capabilities_json, "domainTargetCapable", &declared) != 0) {
+        return 0;
+    }
+    return declared ? 1 : 0;
+}
+
 static int contained_in(uint32_t address, const char *const *cidrs, size_t cidrs_len)
 {
     for (size_t i = 0U; i < cidrs_len; i++) {

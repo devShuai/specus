@@ -2823,6 +2823,8 @@ int main(void)
              "\"clientMessageCapabilities\":{\"sendMessages\":true,\"receiveMessages\":true,"
              "\"attachments\":true,\"mediaPreview\":true,"
              "\"maxAttachmentBytes\":16777216},"
+             "\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,"
+             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":false},"
              "\"clientPeerServiceCapabilities\":{\"version\":2,"
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
@@ -2868,6 +2870,12 @@ int main(void)
         || negotiated_session.peer_service_discovery_version != 2
         || strcmp(negotiated_session.peer_service_applications, "http,tcp") != 0) {
         fprintf(stderr, "client peer service capability negotiation mismatch\n");
+        return 1;
+    }
+    /* The egress-catalog reads domainTargetCapable from this session, so it must be stored here. */
+    if (negotiated_session.client_egress_version != 1
+        || !negotiated_session.client_egress_domain_targets) {
+        fprintf(stderr, "client egress capability negotiation mismatch\n");
         return 1;
     }
     if (st_storage_mark_client_session_online(auth_db_path,
