@@ -926,6 +926,19 @@ print(f"routes plan={len(routes_vector['planCases'])} diff={len(routes_vector['d
 print(f"failure purge={len(failure['resetOnPurge']['cases'])} packet={len(failure['resetOnPacket']['cases'])}"
       f" datagram={len(failure['unreachableOnDatagram']['cases'])}")
 
+# Phase two (#52). The generator holds the reference implementation and checks every case against it,
+# so the file on disk has to be exactly what the generator produces now.
+import importlib.util
+_dns_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_dns_vectors", Path(__file__).with_name("generate_peer_egress_dns_vectors.py"))
+_dns_module = importlib.util.module_from_spec(_dns_spec)
+_dns_spec.loader.exec_module(_dns_module)
+dns_vector = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
+if dns_vector != _dns_module.build():
+    failures.append("peer-egress-dns-v1.json differs from what its generator produces; regenerate it")
+print(f"dns validation={len(dns_vector['validation'])} selection={len(dns_vector['selection'])}"
+      f" answers={len(dns_vector['answers'])} pool={len(dns_vector['pool'])} egressChoice={len(dns_vector['egressChoice'])}")
+
 if failures:
     print(f"\nFAILED ({len(failures)}):")
     for f in failures:
