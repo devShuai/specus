@@ -36,7 +36,12 @@
 **二期何时运行**（向量 `phaseTwo`）：`peerEgressEnabled` 与 `peerEgressDnsTakeover` 都为 `true`，且池可用。
 池不可用只停二期：一期照常运行，规则按接管关闭来校验（域名规则报 `EGRESS_RULE_DOMAIN_UNSUPPORTED`），
 状态的 `dns` 一节写明 `EGRESS_FAKE_IP_POOL_INVALID`。二期运行时，池段作为一条 TUN 路由安装，
-`origin` 为 `fake-ip-pool`，与规则路由一样记录冲突、一样由安装器回滚。
+`origin` 为 `fake-ip-pool`，与规则路由一样记录冲突、一样由安装器回滚；这条路由不看有没有规则，
+一条规则都没有时也装，状态里的 `consumer` 一节也因此出现。
+
+离线校验（`config validate` 与每次启动加载配置）按「总开关为开」、默认 mesh 网段判断池：`peerEgressDnsTakeover`
+为 `true` 而池不可用时，写一条告警 `peerEgressFakeIpCidr is not usable: EGRESS_FAKE_IP_POOL_INVALID; domain rules are not in force`，
+三端逐字一致，与一期的规则告警同一处输出。本机接口网段的重叠要到启动二期时才查得到，不在离线校验里。
 
 ### 域名规则的写法与校验
 
@@ -133,7 +138,8 @@
 - 消费端在向出口发出发往 fake-IP 的包之前，满足下面任一条时先发送该地址的 `name-bind`（向量 `steering`）：
   这个包在流表里登记了一条新流；它是 TCP 的 SYN（不带 ACK），**包括重传的 SYN**；它属于一条还没收到过出口回包的 UDP 流。
   其他包不再发送。控制消息不可靠，所以不只发一次：TCP 靠应用自己重传的 SYN 补发，UDP 没有重传，
-  就在出口回话之前每个数据报都带一条。
+  就在出口回话之前每个数据报都带一条。`name-bind` 本身发送失败时，随后的 IP 包也不发，计 `send-failed`：
+  一个明知出口无从知道名字的包，发出去只会建一条连向 fake-IP 的流。
 - 出口按 `(消费端, address)` 登记，登记本身按最近使用保留、上限与流表同级，不另设 TTL。
 - 出口收到发往某地址的新流、但该 `(消费端, address)` 没有登记时，按一期的地址流处理（通常因目标不可达而失败）；
   不得猜测名字。
