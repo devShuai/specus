@@ -14,6 +14,7 @@ import signal
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -312,7 +313,9 @@ class Matrix:
                 assert SECRET.encode() not in output and TOKEN.encode() not in output, "sensitive runtime log"
 
     def wait_ready(self, process):
-        deadline = time.monotonic() + 18
+        # Generous because it is spent only when readiness is late: a cold JVM on a Windows runner,
+        # where every status query is itself a JVM start, has taken more than 18 s.
+        deadline = time.monotonic() + 45
         last = ""
         while time.monotonic() < deadline:
             assert process.poll() is None, ("runtime exited before readiness", process.returncode)
@@ -512,6 +515,10 @@ class Matrix:
 
 
 if __name__ == "__main__":
+    # A Windows runner's console is cp1252; a runtime log with any other character must still print
+    # rather than replace the failure being reported with an encoding error.
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True, choices=["go", "dotnet", "java"])
     parser.add_argument("command", nargs=argparse.REMAINDER)
