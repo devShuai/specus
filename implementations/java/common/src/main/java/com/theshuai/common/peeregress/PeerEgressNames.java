@@ -51,4 +51,75 @@ public final class PeerEgressNames {
         }
         return !numeric;
     }
+
+    /**
+     * Whether a rule's match names a domain rather than failing to be an address: it starts with
+     * {@code *}, or carries a letter or a non-ASCII character. A match that is neither an address
+     * nor this -- {@code 1.2.3.4-5} -- is a malformed address, not a name made of digits.
+     */
+    public static boolean namesDomain(String match) {
+        String text = match == null ? "" : match.trim();
+        if (text.startsWith("*")) {
+            return true;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isLetter(c) || c > 127) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a domain rule's match is well formed: {@code name} or {@code *.name}, trailing dots
+     * and case ignored, with the name's labels as {@link #valid} requires them. A Unicode name is
+     * refused rather than converted: IDN is written as punycode. {@code *} is only ever the whole
+     * leftmost label.
+     */
+    public static boolean validMatch(String match) {
+        if (!namesDomain(match)) {
+            return false;
+        }
+        String text = stripTrailingDots(match.trim()).toLowerCase(Locale.ROOT);
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) > 127) {
+                return false;
+            }
+        }
+        if (text.startsWith("*.")) {
+            text = text.substring(2);
+        }
+        if (text.isEmpty() || text.indexOf('*') >= 0) {
+            return false;
+        }
+        return valid(text);
+    }
+
+    /**
+     * How a domain rule's match ranks for a normalised query name, smaller winning, or -1 when it
+     * does not cover the name at all. An exact match is 0 and beats every suffix; among suffixes the
+     * one with more labels ranks first, so {@code *.cdn.example.com} beats {@code *.example.com}. A
+     * suffix never covers its own apex.
+     */
+    public static int coverage(String match, String normalizedName) {
+        String base = stripTrailingDots(match == null ? "" : match.trim()).toLowerCase(Locale.ROOT);
+        if (base.startsWith("*.")) {
+            base = base.substring(2);
+            if (!normalizedName.endsWith("." + base)) {
+                return -1;
+            }
+            // Ranked below every exact match; among suffixes, more labels rank higher.
+            return Integer.MAX_VALUE - base.split("\\.", -1).length;
+        }
+        return normalizedName.equals(base) ? 0 : -1;
+    }
+
+    private static String stripTrailingDots(String text) {
+        int end = text.length();
+        while (end > 0 && text.charAt(end - 1) == '.') {
+            end--;
+        }
+        return text.substring(0, end);
+    }
 }

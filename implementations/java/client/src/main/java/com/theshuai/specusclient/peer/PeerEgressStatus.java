@@ -1,5 +1,6 @@
 package com.theshuai.specusclient.peer;
 
+import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import java.util.ArrayList;
@@ -7,6 +8,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 /**
@@ -51,18 +53,38 @@ public final class PeerEgressStatus {
         }
     }
 
-    /** The consumer's own view, taken under its lock. */
+    /**
+     * The consumer's own view, taken under its lock.
+     *
+     * @param fakeIpCidr    the pool phase two runs with, or null while it does not
+     * @param domainCapable the egresses the catalogue says resolve names
+     * @param mappings      the fake-IP mappings held when the snapshot was taken
+     * @param quarantined   the pool addresses still in quarantine then
+     */
     public record ConsumerSnapshot(List<PeerEgressRule> rules, String meshCidr,
             Map<Long, Boolean> online, int flows, Map<String, Long> blocked,
-            Map<Long, Integer> flowsByEgress, Map<Long, String> paths) {
+            Map<Long, Integer> flowsByEgress, Map<Long, String> paths,
+            String fakeIpCidr, Set<Long> domainCapable, int mappings, int quarantined) {
 
         /**
          * The same view with the path each egress peer's traffic takes now, which the mesh knows
          * and the consumer does not.
          */
         public ConsumerSnapshot withPaths(Map<Long, String> paths) {
-            return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths);
+            return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths,
+                    fakeIpCidr, domainCapable, mappings, quarantined);
         }
+    }
+
+    /**
+     * Phase two as configured and as it stands, for {@code consumer.dns}; the section is there only
+     * when {@code peerEgressDnsTakeover} is on (protocol/spec/peer-egress-dns.md, status).
+     *
+     * @param pool    {@code peerEgressFakeIpCidr} as configured
+     * @param running whether phase two runs now
+     * @param code    why it does not although it was asked for, or null
+     */
+    public record Dns(String pool, boolean running, String code) {
     }
 
     /** The values of a peer entry's path: what carries frames to that egress now. */
@@ -90,15 +112,43 @@ public final class PeerEgressStatus {
     public static Map<String, Object> section(ConsumerSnapshot consumer,
             List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
             RuntimeSnapshot runtime, boolean enabled, List<PeerEgressRule> configured) {
+        return section(consumer, installed, outcome, runtime, enabled, configured, null);
+    }
+
+    /** As above, with phase two, or null when {@code peerEgressDnsTakeover} is off. */
+    public static Map<String, Object> section(ConsumerSnapshot consumer,
+            List<PeerEgressRoutePlanner.Route> installed, ApplyOutcome outcome,
+            RuntimeSnapshot runtime, boolean enabled, List<PeerEgressRule> configured, Dns dns) {
         Map<String, Object> status = new LinkedHashMap<>();
         Map<String, Object> consumerSection = consumerSection(consumer, installed, outcome);
         consumerSection.put("enabled", enabled);
         if (!enabled && configured != null && !configured.isEmpty()) {
             consumerSection.put("rules", switchedOffRules(configured));
         }
+        if (dns != null) {
+            consumerSection.put("dns", dnsSection(dns, consumer));
+        }
         status.put("consumer", consumerSection);
         status.put("egress", egressSection(runtime));
         return status;
+    }
+
+    /**
+     * {@code consumer.dns}: whether phase two runs, over which pool, and how full the pool is. The
+     * counts are taken when the snapshot is. {@code listen} and {@code upstreams} belong to the DNS
+     * responder and {@code journal} to the system takeover, and are left out until those exist.
+     */
+    static Map<String, Object> dnsSection(Dns dns, ConsumerSnapshot consumer) {
+        Map<String, Object> section = new LinkedHashMap<>();
+        section.put("takeover", dns.running());
+        section.put("pool", dns.pool() == null ? "" : dns.pool().trim());
+        boolean counted = dns.running() && consumer != null && consumer.fakeIpCidr() != null;
+        section.put("mappings", counted ? consumer.mappings() : 0);
+        section.put("quarantined", counted ? consumer.quarantined() : 0);
+        if (dns.code() != null && !dns.code().isEmpty()) {
+            section.put("code", dns.code());
+        }
+        return section;
     }
 
     /**
@@ -112,6 +162,7 @@ public final class PeerEgressStatus {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("index", index);
             entry.put("match", rule.getMatch() == null ? "" : rule.getMatch().trim());
+            entry.put("kind", PeerEgressRules.kind(rule));
             entry.put("action", rule.getAction() == null ? "" : rule.getAction().trim());
             entry.put("inForce", false);
             entry.put("code", rule.switchedOff()
@@ -151,11 +202,18 @@ public final class PeerEgressStatus {
             // empty string. Normalised at the boundary rather than compared against null twice
             // below: "in force" is one condition, and writing it two ways is how the two halves of
             // this section end up disagreeing about the same rule.
-            String refusal = PeerEgressRules.validate(rule, consumer.meshCidr());
+            //
+            // In phase two a domain rule's egress also has to resolve names, but only an online
+            // egress is judged: offline, the catalogue says false for every egress, and the rule is
+            // right and waiting like any rule to an offline egress.
+            Set<Long> capable = consumer.domainCapable() == null ? Set.of() : consumer.domainCapable();
+            String refusal = PeerEgressDns.ruleStatus(rule, consumer.meshCidr(), consumer.fakeIpCidr(),
+                    egress -> Boolean.TRUE.equals(consumer.online().get(egress)), capable::contains);
             String code = refusal == null ? "" : refusal;
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("index", index);
             entry.put("match", rule.getMatch() == null ? "" : rule.getMatch().trim());
+            entry.put("kind", PeerEgressRules.kind(rule));
             entry.put("action", rule.getAction() == null ? "" : rule.getAction().trim());
             // inForce is the field worth having. A rule that is configured but refused reads
             // false and carries its code, which is the difference between "this rule is

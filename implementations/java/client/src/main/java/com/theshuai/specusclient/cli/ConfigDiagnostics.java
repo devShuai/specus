@@ -25,6 +25,14 @@ final class ConfigDiagnostics {
      * network, because the real one arrives from the server at login.
      */
     private static void egressRules(ClientStartupConfig effective, Consumer<String> warning) {
+        // Phase two asked for over a pool it cannot use stops phase two alone, so it is said here
+        // too: otherwise the domain rules below read as unsupported with nothing naming the pool.
+        if (effective.isPeerEgressDnsTakeover()) {
+            String problem = com.theshuai.common.peeregress.PeerEgressDns.poolProblem(
+                    effective.getPeerEgressFakeIpCidr(), com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR);
+            if (problem != null)
+                warning.accept("peerEgressFakeIpCidr is not usable: " + problem + "; domain rules are not in force");
+        }
         var rules = effective.getPeerEgressRules();
         if (rules == null) return;
         // Kept with the master switch off is the one state where nothing is in force by design,
@@ -33,9 +41,13 @@ final class ConfigDiagnostics {
         if (!rules.isEmpty() && !effective.isPeerEgressEnabled())
             warning.accept("peerEgressRules has " + rules.size()
                     + " rule(s) but peerEgressEnabled is false: none is in force");
+        // Judged against the pool phase two would run with, so a domain rule is not reported as
+        // unsupported while takeover is asked for, and an address rule in the pool is.
+        String pool = com.theshuai.common.peeregress.PeerEgressDns.configuredPool(
+                effective.isPeerEgressDnsTakeover(), effective.getPeerEgressFakeIpCidr());
         for (int index = 0; index < rules.size(); index++) {
             String code = com.theshuai.common.peeregress.PeerEgressRules.validate(rules.get(index),
-                    com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR);
+                    com.theshuai.common.peeregress.PeerEgressRules.DEFAULT_MESH_CIDR, pool);
             if (code != null && !com.theshuai.common.peeregress.PeerEgressCodes.RULE_DISABLED.equals(code))
                 warning.accept("peerEgressRules[" + index + "] is not in force: " + code);
         }
