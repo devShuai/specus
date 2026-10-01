@@ -237,7 +237,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "expires_at TEXT NOT NULL,"
         "channel_id TEXT,"
         "remote_address TEXT,"
-        "client_egress_version INTEGER NOT NULL DEFAULT 0"
+        "client_egress_version INTEGER NOT NULL DEFAULT 0,"
+        "client_egress_domain_targets INTEGER NOT NULL DEFAULT 0"
         ");");
     }
     if (rc == 0) {
@@ -692,6 +693,11 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "specus_client_session", "client_egress_version", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
+        /* Sessions stored before the catalog carried it never declared domain targets. */
+        rc = add_column_if_missing(db, "specus_client_session", "client_egress_domain_targets",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
     if (rc == 0) {
@@ -881,6 +887,7 @@ static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
     client->upload_bytes = sqlite3_column_int64(stmt, 16);
     client->download_bytes = sqlite3_column_int64(stmt, 17);
     client->client_egress_version = sqlite3_column_int(stmt, 18);
+    client->client_egress_domain_targets = sqlite3_column_int(stmt, 19) != 0;
     return 0;
 }
 
@@ -993,6 +1000,7 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
     session->message_max_attachment_bytes = sqlite3_column_int64(stmt, 21);
     session->peer_service_discovery_version = sqlite3_column_int(stmt, 22);
     session->client_egress_version = sqlite3_column_int(stmt, 30);
+    session->client_egress_domain_targets = sqlite3_column_int(stmt, 31) != 0;
     return 0;
 }
 
@@ -1359,7 +1367,8 @@ int st_storage_list_clients(const char *path,
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account ORDER BY client_name",
         -1,
         &stmt,
@@ -1401,7 +1410,8 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE rowid = ?",
         -1,
         &stmt,
@@ -1438,7 +1448,8 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
         "COALESCE((SELECT client_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), ''), "
         "COALESCE((SELECT SUM(upload_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
         "COALESCE((SELECT SUM(download_bytes) FROM traffic_usage t WHERE t.client_id = client_account.rowid), 0), "
-        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT client_egress_version FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT client_egress_domain_targets FROM specus_client_session s WHERE s.client_id = client_account.rowid AND s.status = 'NETTY_ONLINE' ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE client_name = ?",
         -1,
         &stmt,
@@ -2734,7 +2745,8 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
-        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version "
+        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
+        "client_egress_domain_targets "
         "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -2765,7 +2777,8 @@ int st_storage_create_client_session(const char *path,
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, peer_service_discovery_version, peer_service_applications, "
-        "http_login_at, expires_at, client_egress_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -2796,6 +2809,7 @@ int st_storage_create_client_session(const char *path,
         sqlite3_bind_text(stmt, 24, session->http_login_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 25, session->expires_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 26, session->client_egress_version);
+        sqlite3_bind_int(stmt, 27, session->client_egress_domain_targets ? 1 : 0);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -2825,7 +2839,8 @@ int st_storage_get_client_session_for_login(const char *path,
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
-        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version "
+        "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
+        "client_egress_domain_targets "
         "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,

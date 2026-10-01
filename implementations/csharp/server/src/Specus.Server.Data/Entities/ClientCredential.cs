@@ -67,6 +67,17 @@ public sealed class ClientSession
     /// </summary>
     public int ClientEgressVersion { get; set; }
 
+    /// <summary>
+    /// Whether the client announced <c>domainTargetCapable</c> at login, i.e. it accepts
+    /// <c>name-bind</c> and resolves names on the egress side.
+    /// </summary>
+    /// <remarks>
+    /// Kept per session rather than per account because the egress-catalog has to reflect the
+    /// build that is online right now: a device that reconnects with an older client stops being
+    /// advertised as able to resolve names.
+    /// </remarks>
+    public bool ClientEgressDomainTargets { get; set; }
+
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

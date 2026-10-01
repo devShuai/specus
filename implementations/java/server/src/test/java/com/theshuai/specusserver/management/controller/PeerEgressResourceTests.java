@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
 import com.theshuai.specusserver.management.model.PeerMeshEgressSwitch;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
@@ -72,7 +73,8 @@ class PeerEgressResourceTests {
     void setUp() {
         PeerEgressService service = new PeerEgressService(
                 policyRepository, mock(PeerMeshEgressActivityRepository.class), switchRepository,
-                mock(PeerMeshDeviceRepository.class), clientAccountRepository, peerMeshService);
+                mock(PeerMeshDeviceRepository.class), clientAccountRepository,
+                mock(ClientSessionRepository.class), peerMeshService);
         mvc = standaloneSetup(new PeerEgressResource(service, peerSignalService, contextResolver))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .setCustomArgumentResolvers(new AuthenticationPrincipalArgumentResolver())

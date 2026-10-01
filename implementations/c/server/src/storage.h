@@ -22,6 +22,11 @@ typedef struct {
     char peer_service_applications[128];
     /* Peer egress split routing; 0 or absent means the client cannot take part. */
     int client_egress_version;
+    /*
+     * Whether the current online session announced domainTargetCapable. Read from that session
+     * like the version above, so an offline device reads as 0 rather than as its last login.
+     */
+    int client_egress_domain_targets;
     char client_version[81];
     long long upload_bytes;
     long long download_bytes;
@@ -146,6 +151,8 @@ typedef struct {
     char remote_address[256];
     /* Peer egress split routing; 0 or absent means the client cannot take part. */
     int client_egress_version;
+    /* domainTargetCapable as declared at login; 0 when absent or when the version is 0. */
+    int client_egress_domain_targets;
 } st_storage_client_session;
 
 typedef struct {

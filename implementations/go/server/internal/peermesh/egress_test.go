@@ -208,10 +208,53 @@ func TestCatalogueCarriesNoDestinationAllowlist(t *testing.T) {
 		t.Errorf("protocols = %+v", catalog.Egresses[0].Protocols)
 	}
 	if catalog.Egresses[0].DomainTargetCapable || catalog.Egresses[0].IPv6TargetCapable {
-		t.Error("neither domain nor IPv6 targets ship in this version")
+		t.Error("an egress with no online session takes no domain targets, and no client declares IPv6 ones")
 	}
 	if catalog.DestinationRules != nil {
 		t.Errorf("catalogue leaked the destination allowlist: %+v", catalog.DestinationRules)
+	}
+}
+
+// A consumer needs to know which egress resolves names before it sends one a domain target. The
+// catalogue answers from what each egress declared on its current online session, and only that.
+func TestCatalogueCarriesWhatEachOnlineEgressDeclaredAboutDomainTargets(t *testing.T) {
+	ctx := context.Background()
+	service, db := newEgressTestService(t)
+	consumer := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	resolver := insertPeerClient(t, db, 1002, "tenant-a", "alice", "resolving-gateway")
+	plain := insertPeerClient(t, db, 1003, "tenant-a", "alice", "plain-gateway")
+	gone := insertPeerClient(t, db, 1004, "tenant-a", "alice", "gone-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.10", "consumer-key")
+	insertPeerDevice(t, db, resolver, "100.96.0.11", "resolver-key")
+	insertPeerDevice(t, db, plain, "100.96.0.12", "plain-key")
+	insertPeerDevice(t, db, gone, "100.96.0.13", "gone-key")
+	for _, egress := range []store.ClientAccount{resolver, plain, gone} {
+		upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
+	}
+	insertEgressSession(t, db, resolver, 91, "NETTY_ONLINE", true)
+	insertEgressSession(t, db, plain, 92, "NETTY_ONLINE", false)
+	// It declared the capability, but that session has ended: nothing online can resolve a name.
+	insertEgressSession(t, db, gone, 93, "DISCONNECTED", true)
+
+	catalog, err := service.BuildEgressCatalog(ctx, consumer, capableClient())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]bool{}
+	for _, entry := range catalog.Egresses {
+		got[entry.ClientID] = entry.DomainTargetCapable
+		if entry.IPv6TargetCapable {
+			t.Errorf("egress %d: ipv6TargetCapable must stay false", entry.ClientID)
+		}
+	}
+	want := map[int64]bool{resolver.ID: true, plain.ID: false, gone.ID: false}
+	if len(got) != len(want) {
+		t.Fatalf("catalogue = %+v", catalog.Egresses)
+	}
+	for id, capable := range want {
+		if got[id] != capable {
+			t.Errorf("egress %d: domainTargetCapable = %v, want %v", id, got[id], capable)
+		}
 	}
 }
 
@@ -293,6 +336,20 @@ func insertEgressCapableSession(t *testing.T, db *store.DB, account store.Client
 		Status: "NETTY_ONLINE", MachineFingerprint: "machine", OSUser: "user",
 		ClientEgressVersion: EgressProtocolVersion,
 		HTTPLoginAt:         now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertEgressSession(t *testing.T, db *store.DB, account store.ClientAccount, sessionID int64, status string, domainTargets bool) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := db.InsertClientSession(context.Background(), store.ClientSession{
+		ID: sessionID, TenantID: account.TenantID, ClientID: account.ID,
+		ClientName: account.ClientName, TokenHash: fmt.Sprintf("egress-domain-test-%d", sessionID),
+		Status: status, MachineFingerprint: "machine", OSUser: "user",
+		ClientEgressVersion: EgressProtocolVersion, ClientEgressDomainTargets: domainTargets,
+		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
 	}); err != nil {
 		t.Fatal(err)
 	}

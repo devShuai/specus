@@ -479,6 +479,11 @@ public sealed class ClientAccountService
                 environment.ClientPeerServiceCapabilities.Applications),
             ClientEgressVersion = PeerEgressProtocol.NormalizeVersion(
                 environment.ClientEgressCapabilities.Version),
+            // A client that cannot take part in egress at all is never advertised as resolving
+            // names, whatever else it sent alongside version 0.
+            ClientEgressDomainTargets = PeerEgressProtocol.NormalizeVersion(
+                    environment.ClientEgressCapabilities.Version) >= 1
+                && environment.ClientEgressCapabilities.DomainTargetCapable,
             HttpLoginAt = DateTimeOffset.UtcNow,
             ExpiresAt = session.ExpiresAt,
         };
