@@ -258,7 +258,7 @@ func TestTCPVectorMatchesTheStack(t *testing.T) {
 			"步骤类型：segment（消费端发来的段）、appData（真实 socket 收到的数据）、appClose（socket EOF）、abort、tick。",
 			"advanceMs 是相对上一步的增量，各语言不必知道自己平台上的「现在」是什么。",
 			"期望值录自 Go 实现，因此本向量证明的是三端一致，不是各自独立正确；正确性由 Go 侧逐条对照 RFC 的用例论证。",
-			"Karn 算法这类只影响内部 RTO 估计、不体现在输出上的行为无法脚本化，留在 Go 的白盒用例里。",
+			"RTO 估计本身不出现在输出里，只能从重传落在哪一次 tick 间接断言；Karn 规则因此用重传时刻脚本化（same-tick-clean-ack-collapses-backoff、ack-filling-a-hole-takes-no-rtt-sample），其余估计细节留在各语言的白盒用例里。",
 		},
 		Params: params,
 		Cases:  make([]tcpVectorCase, 0, len(scenarios)),

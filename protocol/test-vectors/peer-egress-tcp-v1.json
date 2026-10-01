@@ -6,7 +6,7 @@
     "步骤类型：segment（消费端发来的段）、appData（真实 socket 收到的数据）、appClose（socket EOF）、abort、tick。",
     "advanceMs 是相对上一步的增量，各语言不必知道自己平台上的「现在」是什么。",
     "期望值录自 Go 实现，因此本向量证明的是三端一致，不是各自独立正确；正确性由 Go 侧逐条对照 RFC 的用例论证。",
-    "Karn 算法这类只影响内部 RTO 估计、不体现在输出上的行为无法脚本化，留在 Go 的白盒用例里。"
+    "RTO 估计本身不出现在输出里，只能从重传落在哪一次 tick 间接断言；Karn 规则因此用重传时刻脚本化（same-tick-clean-ack-collapses-backoff、ack-filling-a-hole-takes-no-rtt-sample），其余估计细节留在各语言的白盒用例里。"
   ],
   "params": {
     "consumerIp": "100.96.0.1",
@@ -185,6 +185,311 @@
                 "ack": 1001,
                 "window": 65535,
                 "payloadHex": "63"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ack-filling-a-hole-takes-no-rtt-sample",
+      "description": "补洞的累计 ACK 覆盖了重传过的段，整个 ACK 不取 RTT 样本、保留退避；之后的干净 ACK 才把 RTO 收回下限",
+      "steps": [
+        {
+          "do": "segment",
+          "seq": 1000,
+          "flags": [
+            "SYN"
+          ],
+          "window": 65535,
+          "mss": 1200,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "SYN",
+                  "ACK"
+                ],
+                "seq": 5000,
+                "ack": 1001,
+                "window": 65535,
+                "mss": 1240
+              }
+            ],
+            "state": "SYN_RECEIVED"
+          }
+        },
+        {
+          "do": "segment",
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "61",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "61"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "62",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5002,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "62"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "63",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5003,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "63"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "64",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5004,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "64"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "advanceMs": 1,
+          "seq": 1001,
+          "ack": 5001,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 199,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5001,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "61"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "advanceMs": 1,
+          "seq": 1001,
+          "ack": 5005,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "65",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5005,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "65"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 399,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 1,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5005,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "65"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "advanceMs": 1,
+          "seq": 1001,
+          "ack": 5006,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "66",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5006,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "66"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "segment",
+          "advanceMs": 1,
+          "seq": 1001,
+          "ack": 5007,
+          "flags": [
+            "ACK"
+          ],
+          "window": 65535,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "appData",
+          "dataHex": "67",
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5007,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "67"
+              }
+            ],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 199,
+          "expect": {
+            "segments": [],
+            "state": "ESTABLISHED"
+          }
+        },
+        {
+          "do": "tick",
+          "advanceMs": 1,
+          "expect": {
+            "segments": [
+              {
+                "flags": [
+                  "PSH",
+                  "ACK"
+                ],
+                "seq": 5007,
+                "ack": 1001,
+                "window": 65535,
+                "payloadHex": "67"
               }
             ],
             "state": "ESTABLISHED"
