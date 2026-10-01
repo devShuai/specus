@@ -69,8 +69,8 @@ type App struct {
 	webSocketTickets        *security.WebSocketTicketService
 	addressResolver         *security.ClientAddressResolver
 
-	// backgroundWritersMu guards backgroundWriters, which is set when Run launches the goroutines
-	// that write to the database on their own schedule and closed once they have all returned.
+	// backgroundWritersMu guards backgroundWriters, which is set when Run launches its goroutines
+	// (every one of which can write to the database) and closed once they have all returned.
 	backgroundWritersMu sync.Mutex
 	backgroundWriters   chan struct{}
 	runCtx              context.Context
@@ -446,9 +446,10 @@ func (a *App) flushPendingWrites() error {
 	return nil
 }
 
-// awaitBackgroundWriters waits for the workers that flush on context cancellation to finish their
-// final write. Run returning only means the listeners stopped; these goroutines outlive it briefly,
-// and closing the database underneath them silently drops whatever they were writing.
+// awaitBackgroundWriters waits for every goroutine Run launched to return: the workers that flush on
+// context cancellation, and the control connections whose disconnect handlers record the session
+// going offline. Run returning does not mean they have; they outlive it briefly, and closing the
+// database underneath them drops whatever they were writing.
 func (a *App) awaitBackgroundWriters(ctx context.Context) {
 	a.backgroundWritersMu.Lock()
 	finished := a.backgroundWriters
@@ -469,26 +470,70 @@ func (a *App) awaitBackgroundWriters(ctx context.Context) {
 	}
 }
 
-// Run starts the background workers, binds and serves the control channel, and serves the
+// Run binds and serves the control channel, starts the background workers, and serves the
 // management HTTP surface until ctx is cancelled.
 func (a *App) Run(ctx context.Context) error {
+	controlAddr := net.JoinHostPort(strings.TrimSpace(a.cfg.Netty.BindAddress),
+		fmt.Sprint(a.cfg.Netty.Port))
+	if err := a.listener.Start(controlAddr); err != nil {
+		return err
+	}
+	a.logger.Info("control channel listening", "port", a.listener.BoundPort())
 	a.executor.Start(ctx)
 
-	// These two goroutines each perform a final write when the context is cancelled. Close has to
-	// wait for both before closing the database, or the last flush races the close and its bytes are
-	// re-credited to a counter map nobody will ever drain again.
+	// Every goroutine started here can write to the database: on its own schedule, as a final flush
+	// once the context is cancelled, or from a connection's disconnect handler. Close has to wait
+	// for all of them before closing the database. Otherwise a write still in flight races the
+	// close: a final flush's bytes are re-credited to a counter map nobody will ever drain again,
+	// and on SQLite the write can recreate its journal file after the database file was removed.
 	var writers sync.WaitGroup
-	writers.Add(2)
-	go func() {
-		defer writers.Done()
-		a.traffic.Run(ctx)
-	}()
-	go func() {
-		defer writers.Done()
+	launch := func(run func(context.Context)) {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			run(ctx)
+		}()
+	}
+	launch(a.traffic.Run)
+	launch(func(ctx context.Context) {
 		a.db.RunTrafficDetailFlush(ctx,
 			time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
 			func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
-	}()
+	})
+	launch(a.peerMesh.Run)
+	launch(a.peerMesh.RunStunTurn)
+	launch(a.attachments.RunExpiration)
+	launch(a.mediaCapture.Run)
+	launch(a.api.RunRegistrationCleanup)
+	launch(func(ctx context.Context) { runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord) })
+
+	errc := make(chan error, 2)
+	launch(func(ctx context.Context) {
+		if err := a.listener.Serve(ctx); err != nil {
+			errc <- err
+			return
+		}
+		// Serve returns after the last connection handler, so nothing can queue a login any more,
+		// but a login a worker already took may still be writing the session it admitted.
+		a.executor.Wait()
+	})
+
+	httpServer := &http.Server{
+		Addr:     a.cfg.ManagementAddr,
+		Handler:  a.managementHandler(),
+		ErrorLog: slog.NewLogLogger(a.logger.Handler(), slog.LevelError),
+	}
+	if a.tlsConfig != nil {
+		httpServer.TLSConfig = a.tlsConfig
+	}
+	// Shutdown returns once in-flight management requests have finished, and those write too.
+	launch(func(ctx context.Context) {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	})
+
 	finished := make(chan struct{})
 	go func() {
 		writers.Wait()
@@ -499,37 +544,6 @@ func (a *App) Run(ctx context.Context) error {
 	a.runCtx = ctx
 	a.backgroundWritersMu.Unlock()
 
-	go a.peerMesh.Run(ctx)
-	go a.peerMesh.RunStunTurn(ctx)
-	go a.attachments.RunExpiration(ctx)
-	go a.mediaCapture.Run(ctx)
-	go a.api.RunRegistrationCleanup(ctx)
-	go runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord)
-
-	controlAddr := net.JoinHostPort(strings.TrimSpace(a.cfg.Netty.BindAddress),
-		fmt.Sprint(a.cfg.Netty.Port))
-	if err := a.listener.Start(controlAddr); err != nil {
-		return err
-	}
-	a.logger.Info("control channel listening", "port", a.listener.BoundPort())
-
-	errc := make(chan error, 2)
-	go func() { errc <- a.listener.Serve(ctx) }()
-
-	httpServer := &http.Server{
-		Addr:     a.cfg.ManagementAddr,
-		Handler:  a.managementHandler(),
-		ErrorLog: slog.NewLogLogger(a.logger.Handler(), slog.LevelError),
-	}
-	if a.tlsConfig != nil {
-		httpServer.TLSConfig = a.tlsConfig
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(shutdownCtx)
-	}()
 	go func() {
 		a.logger.Info("management HTTP listening", "addr", a.cfg.ManagementAddr, "tls", a.tlsConfig != nil)
 		var err error

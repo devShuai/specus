@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"syscall"
+
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type ListenerOptions struct {
@@ -40,6 +42,12 @@ type Listener struct {
 	mu        sync.Mutex
 	listener  net.Listener
 	boundPort int
+
+	// connsMu guards conns, the connections whose handler is still running. handlers counts the
+	// same goroutines so Serve can wait for every OnDisconnect to return before it does.
+	connsMu  sync.Mutex
+	conns    map[*Conn]struct{}
+	handlers sync.WaitGroup
 }
 
 // NewListener builds a control-channel listener that dispatches to handler.
@@ -100,7 +108,9 @@ func (l *Listener) BoundPort() int {
 	return l.boundPort
 }
 
-// Serve accepts connections until ctx is cancelled or the listener is closed.
+// Serve accepts connections until ctx is cancelled. It then closes every connection still open and
+// returns only once each connection's handler, OnDisconnect included, has returned: those handlers
+// write to the database, and the caller closes the database after Serve.
 func (l *Listener) Serve(ctx context.Context) error {
 	l.mu.Lock()
 	listener := l.listener
@@ -123,6 +133,15 @@ func (l *Listener) Serve(ctx context.Context) error {
 		}()
 	}
 	workers.Wait()
+
+	// No accept loop is left to add a connection, so the set below is final. Closing a TLS
+	// connection can block on its close_notify write, hence one goroutine per connection.
+	l.connsMu.Lock()
+	for conn := range l.conns {
+		go conn.Close(store.ReasonServerShutdown)
+	}
+	l.connsMu.Unlock()
+	l.handlers.Wait()
 	return nil
 }
 
@@ -146,7 +165,22 @@ func (l *Listener) acceptLoop(ctx context.Context, listener net.Listener) {
 		}
 		conn := newConn(netConn, l.maxFrameSize, l.preAuthMaxFrameSize,
 			l.writeLowWaterMark, l.writeHighWaterMark, ctx)
-		go conn.run(l.handler)
+		l.connsMu.Lock()
+		if l.conns == nil {
+			l.conns = make(map[*Conn]struct{})
+		}
+		l.conns[conn] = struct{}{}
+		l.connsMu.Unlock()
+		l.handlers.Add(1)
+		go func() {
+			defer l.handlers.Done()
+			defer func() {
+				l.connsMu.Lock()
+				delete(l.conns, conn)
+				l.connsMu.Unlock()
+			}()
+			conn.run(l.handler)
+		}()
 	}
 }
 

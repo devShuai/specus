@@ -1,14 +1,19 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
@@ -144,5 +149,74 @@ func TestShutdownIsIdempotentAndSafeWithNothingBuffered(t *testing.T) {
 	case <-closed:
 	case <-time.After(15 * time.Second):
 		t.Fatal("a second Close hung")
+	}
+}
+
+// A client still connected at SIGTERM is disconnected by the server, and its disconnect handler
+// finishes recording that before Close closes the database. Left to the process exit instead, the
+// handler of a connection that drops during shutdown writes into a database that is closing under it.
+func TestSignalShapedShutdownRecordsLiveControlConnectionsBeforeClosingTheDatabase(t *testing.T) {
+	app, cancel, done, databasePath := newSignalShutdownApp(t)
+	_, ts := newHTTPTestServer(t, app)
+	insertCredentialForTest(t, app, "tenant-a", "alice", "ck_shutdown_live", "tenant-secret", 2)
+	runtime := clientAuthLoginForTest(t, ts.URL, "ck_shutdown_live", "tenant-secret", "machine-live", "alice")
+
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(app.ControlPort())))
+	if err != nil {
+		t.Fatalf("dial control: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := protocol.WritePacket(conn, protocol.LoginRequest{
+		ClientName:      runtime.ClientName,
+		ClientSessionID: runtime.ClientSessionID,
+		AccessToken:     runtime.AccessToken,
+		ConnectionRole:  protocol.ConnectionRoleControl,
+	}); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	if login, ok := readPacket(t, reader).(protocol.LoginResponse); !ok || !login.Success {
+		t.Fatalf("control login failed: %+v", login)
+	}
+	// The server reads the heartbeat only once the login and its follow-up pushes are done, so the
+	// answer means the connection sits idle in its read loop, as a long-lived client's does at SIGTERM.
+	if err := protocol.WritePacket(conn, protocol.HeartbeatRequest{}); err != nil {
+		t.Fatalf("write heartbeat: %v", err)
+	}
+	for {
+		if _, ok := readPacket(t, reader).(protocol.HeartbeatResponse); ok {
+			break
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The server ended the connection itself; whatever it pushed after the login is drained first.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("the server did not close the control connection at shutdown: %v", err)
+	}
+
+	reopened := reopenStoreAfterShutdown(t, databasePath)
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer verifyCancel()
+	session, err := reopened.GetClientSession(verifyCtx, runtime.ClientSessionID)
+	if err != nil {
+		t.Fatalf("get client session: %v", err)
+	}
+	if session.Status != auth.StatusDisconnected {
+		t.Fatalf("session status after shutdown = %q, want %q", session.Status, auth.StatusDisconnected)
 	}
 }
