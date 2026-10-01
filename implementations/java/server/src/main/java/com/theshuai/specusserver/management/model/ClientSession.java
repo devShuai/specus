@@ -7,6 +7,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.annotations.ColumnDefault;
 
 @Entity
 @Table(name = "specus_client_session", indexes = {
@@ -95,6 +96,19 @@ public class ClientSession {
      */
     @Column(name = "client_egress_version", nullable = false)
     private int clientEgressVersion;
+
+    /**
+     * Whether the client, as an egress, announced at login that it resolves domain targets
+     * ({@code domainTargetCapable} in {@code clientEgressCapabilities}). Only meaningful with
+     * {@link #clientEgressVersion} of 1 or more; it is stored false otherwise.
+     *
+     * <p>The column default matters: an existing session table gets this column from Hibernate's
+     * schema update, and a NOT NULL column added without a default is refused by SQLite and by a
+     * non-empty PostgreSQL table. The startup migrator adds it the same way when Hibernate did not.
+     */
+    @ColumnDefault("false")
+    @Column(name = "client_egress_domain_targets", nullable = false)
+    private boolean clientEgressDomainTargets;
 
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;

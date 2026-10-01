@@ -2060,6 +2060,9 @@ static int build_database_client_auth_login_response(const char *database_path,
         (void)st_json_get_int(egress_caps_raw, "version", &client_egress_version);
     }
     client_egress_version = st_egress_normalize_version(client_egress_version);
+    /* Stored with the session so the egress-catalog can tell consumers which egress resolves names. */
+    int client_egress_domain_targets = st_egress_declares_domain_targets(egress_caps_raw,
+                                                                         client_egress_version);
     (void)st_json_get_int(peer_caps, "version", &peer_service_discovery_version);
     if (peer_service_discovery_version < 1) peer_service_discovery_version = 0;
     else if (peer_service_discovery_version > 2) peer_service_discovery_version = 2;
@@ -2264,6 +2267,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.message_max_attachment_bytes = message_max_attachment_bytes;
     session.peer_service_discovery_version = peer_service_discovery_version;
     session.client_egress_version = client_egress_version;
+    session.client_egress_domain_targets = client_egress_domain_targets;
     snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
              "%s", peer_service_applications);
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", now_text);

@@ -42,6 +42,9 @@ public class PeerServiceDiscoverySchemaMigrator {
         // default, which SQLite and a non-empty PostgreSQL table refuse, and then every login fails
         // writing a column that is not there.
         ensureColumn("specus_client_session", "client_egress_version", dialect.intDefaultZero());
+        // Whether the egress announced domain targets; read back into the egress-catalog. Default
+        // false so sessions from before the column existed never claim a capability.
+        ensureColumn("specus_client_session", "client_egress_domain_targets", dialect.boolNotNullFalse());
         ensureColumn("peer_mesh_shared_service", "allowed_client_ids", dialect.varchar(512));
         ensureColumn("peer_mesh_service_sharing", "mdns_import_enabled", dialect.boolNotNullFalse());
         int sharingForcedOff = 0;

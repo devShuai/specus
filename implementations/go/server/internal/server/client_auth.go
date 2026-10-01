@@ -198,6 +198,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		PeerServiceDiscoveryVersion: peermesh.NormalizePeerServiceVersion(request.Environment.ClientPeerServiceCapabilities.Version),
 		PeerServiceApplications:     peermesh.EncodePeerServiceApplications(request.Environment.ClientPeerServiceCapabilities.Applications),
 		ClientEgressVersion:         peermesh.NormalizeEgressVersion(request.Environment.ClientEgressCapabilities.Version),
+		ClientEgressDomainTargets:   peermesh.EgressDomainTargets(request.Environment.ClientEgressCapabilities.Version, request.Environment.ClientEgressCapabilities.DomainTargetCapable),
 		HTTPLoginAt:                 now,
 		ExpiresAt:                   session.ExpiresAt,
 	}); err != nil {

@@ -645,7 +645,7 @@ func TestClientMessageCapabilitySQLUsesPostgresBooleanValuesAndPredicate(t *test
 
 // A database from v1.2.6 has the session table without the egress column added after it. The
 // startup pass has to add it, or every login fails writing the session.
-func TestStartupMigrationAddsTheClientEgressVersionColumn(t *testing.T) {
+func TestStartupMigrationAddsTheClientEgressColumns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-session.db")
 	legacy, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -683,6 +683,14 @@ func TestStartupMigrationAddsTheClientEgressVersionColumn(t *testing.T) {
 		  channel_id TEXT,
 		  remote_address TEXT
 		);`)
+	if err == nil {
+		// A session written by the old release, which never heard of egress.
+		_, err = legacy.Exec(`INSERT INTO specus_client_session
+			(id, tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status,
+			 machine_fingerprint, os_user, http_login_at, expires_at)
+			VALUES (6, 'tenant-a', 0, 0, 10, 'old', 'old-token', 'DISCONNECTED', 'machine', 'user',
+			 '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')`)
+	}
 	if closeErr := legacy.Close(); err == nil {
 		err = closeErr
 	}
@@ -699,12 +707,16 @@ func TestStartupMigrationAddsTheClientEgressVersionColumn(t *testing.T) {
 	if err := db.InsertClientSession(context.Background(), ClientSession{
 		ID: 7, TenantID: "tenant-a", ClientID: 11, ClientName: "legacy", TokenHash: "legacy-token",
 		Status: "HTTP_AUTHENTICATED", MachineFingerprint: "machine", OSUser: "user",
-		ClientEgressVersion: 1, HTTPLoginAt: now, ExpiresAt: now.Add(time.Hour),
+		ClientEgressVersion: 1, ClientEgressDomainTargets: true, HTTPLoginAt: now, ExpiresAt: now.Add(time.Hour),
 	}); err != nil {
 		t.Fatalf("a login on a migrated database failed: %v", err)
 	}
 	session, err := db.GetClientSession(context.Background(), 7)
-	if err != nil || session == nil || session.ClientEgressVersion != 1 {
+	if err != nil || session == nil || session.ClientEgressVersion != 1 || !session.ClientEgressDomainTargets {
 		t.Fatalf("read session: %+v err=%v", session, err)
+	}
+	old, err := db.GetClientSession(context.Background(), 6)
+	if err != nil || old == nil || old.ClientEgressVersion != 0 || old.ClientEgressDomainTargets {
+		t.Fatalf("a session from before the upgrade must read as taking no part in egress: %+v err=%v", old, err)
 	}
 }

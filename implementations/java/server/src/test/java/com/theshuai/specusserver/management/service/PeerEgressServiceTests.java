@@ -1,26 +1,31 @@
 package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
 import com.theshuai.common.peeregress.PeerEgressProtocol;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.specusserver.management.model.ClientAccount;
+import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshEgressActivity;
 import com.theshuai.specusserver.management.model.PeerMeshEgressSwitch;
 import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressSwitchRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,13 +41,14 @@ class PeerEgressServiceTests {
     private final PeerMeshEgressPolicyRepository policyRepository = mock(PeerMeshEgressPolicyRepository.class);
     private final PeerMeshDeviceRepository deviceRepository = mock(PeerMeshDeviceRepository.class);
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
+    private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
     private final PeerMeshService peerMeshService = mock(PeerMeshService.class);
     private final PeerMeshEgressActivityRepository activityRepository = mock(PeerMeshEgressActivityRepository.class);
     private final PeerMeshEgressSwitchRepository switchRepository = mock(PeerMeshEgressSwitchRepository.class);
 
     private final PeerEgressService service = new PeerEgressService(
             policyRepository, activityRepository, switchRepository, deviceRepository,
-            clientAccountRepository, peerMeshService);
+            clientAccountRepository, clientSessionRepository, peerMeshService);
 
     private final ClientAccount egress = account(2, "office-gateway");
     private final ClientAccount consumer = account(1, "laptop");
@@ -164,6 +170,64 @@ class PeerEgressServiceTests {
                 .thenReturn(List.of(policy));
 
         assertThat(service.buildEgressCatalog(consumer, environment(1)).getEgresses()).isEmpty();
+    }
+
+    /**
+     * {@code domainTargetCapable} is what each egress's current online session announced at login.
+     * It is how a consumer tells which egress can take a domain rule, so nothing remembered about
+     * the device may stand in for it: an egress that did not announce it, or is not online, is
+     * listed without it.
+     */
+    @Test
+    void theCatalogueCarriesWhatEachOnlineEgressAnnouncedForDomainTargets() {
+        tenantEgressOn();
+        ClientAccount resolving = account(2, "office-gateway");
+        ClientAccount addressOnly = account(3, "home-gateway");
+        ClientAccount offline = account(4, "lab-gateway");
+        ClientAccount disabled = account(5, "spare-gateway");
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT))
+                .thenReturn(List.of(consumer, resolving, addressOnly, offline, disabled));
+        List<PeerMeshEgressPolicy> policies = new ArrayList<>();
+        for (ClientAccount egressAccount : List.of(resolving, addressOnly, offline, disabled)) {
+            when(clientAccountRepository.findByIdAndTenantId(egressAccount.getId(), TENANT))
+                    .thenReturn(Optional.of(egressAccount));
+            PeerMeshDevice device = new PeerMeshDevice();
+            device.setEnabled(egressAccount != disabled);
+            when(deviceRepository.findByTenantIdAndClientId(TENANT, egressAccount.getId()))
+                    .thenReturn(Optional.of(device));
+            PeerMeshEgressPolicy policy = policy(List.of(1L));
+            policy.setEgressClientId(egressAccount.getId());
+            policy.setEgressClientName(egressAccount.getClientName());
+            policies.add(policy);
+        }
+        when(policyRepository.findByTenantIdAndEnabledTrueOrderByEgressClientNameAsc(TENANT))
+                .thenReturn(policies);
+        onlineSession(resolving, true);
+        onlineSession(addressOnly, false);
+        // lab-gateway has no online session, whatever an earlier login announced. spare-gateway has
+        // one that announced domain targets, but the catalogue lists the device as offline.
+        onlineSession(disabled, true);
+
+        PeerControlMessage catalog = service.buildEgressCatalog(consumer, environment(1));
+
+        assertThat(catalog.getEgresses().stream().collect(Collectors.toMap(
+                PeerEgressCatalogEntry::getClientId, PeerEgressCatalogEntry::isDomainTargetCapable)))
+                .containsExactlyInAnyOrderEntriesOf(Map.of(2L, true, 3L, false, 4L, false, 5L, false));
+        assertThat(catalog.getEgresses()).noneMatch(PeerEgressCatalogEntry::isIpv6TargetCapable);
+    }
+
+    private void onlineSession(ClientAccount account, boolean domainTargets) {
+        ClientSession session = new ClientSession();
+        session.setTenantId(TENANT);
+        session.setClientId(account.getId());
+        session.setStatus(ClientAuthService.STATUS_NETTY_ONLINE);
+        session.setClientEgressVersion(1);
+        session.setClientEgressDomainTargets(domainTargets);
+        when(clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                TENANT, List.of(account.getId()), ClientAuthService.STATUS_NETTY_ONLINE))
+                .thenReturn(List.of(session));
     }
 
     @Test

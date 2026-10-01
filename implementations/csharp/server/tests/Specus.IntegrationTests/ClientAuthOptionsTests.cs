@@ -104,6 +104,37 @@ public sealed class ClientAuthOptionsTests
         Assert.Equal(123456L, session.MessageMaxAttachmentBytes);
     }
 
+    /// <summary>
+    /// The egress-catalog advertises domain targets from what the egress's session announced, so
+    /// the login has to keep it. It only counts alongside a usable egress version: a client that
+    /// cannot take part at all must not be recorded as resolving names.
+    /// </summary>
+    [Fact]
+    public async Task ClientAuthLoginStoresTheAnnouncedEgressDomainTargets()
+    {
+        await using var server = await TestServerFixture.StartAsync();
+        using var client = server.CreateClient();
+
+        var declared = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-domain",
+            new { version = 1, consumerCapable = true, egressCapable = true, domainTargetCapable = true });
+        Assert.Equal(1, declared.ClientEgressVersion);
+        Assert.True(declared.ClientEgressDomainTargets);
+
+        var undeclared = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-plain",
+            new { version = 1, consumerCapable = true, egressCapable = true });
+        Assert.Equal(1, undeclared.ClientEgressVersion);
+        Assert.False(undeclared.ClientEgressDomainTargets);
+
+        var unversioned = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-v0",
+            new { version = 0, domainTargetCapable = true });
+        Assert.Equal(0, unversioned.ClientEgressVersion);
+        Assert.False(unversioned.ClientEgressDomainTargets);
+
+        var absent = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-absent", null);
+        Assert.Equal(0, absent.ClientEgressVersion);
+        Assert.False(absent.ClientEgressDomainTargets);
+    }
+
     [Fact]
     public async Task CredentialCreateUsesClientAuthDefaultMaxOnlineInstances()
     {
@@ -133,6 +164,45 @@ public sealed class ClientAuthOptionsTests
 
         Assert.NotNull(body);
         Assert.Equal(7, body!.Credential.MaxOnlineInstances);
+    }
+
+    /// <summary>
+    /// Logs in from a fresh machine and returns the stored session. A null
+    /// <paramref name="egressCapabilities"/> leaves the object out of the request entirely.
+    /// </summary>
+    private static async Task<Specus.Server.Data.Entities.ClientSession> LoginWithEgressCapabilitiesAsync(
+        TestServerFixture server, HttpClient client, string machine, object? egressCapabilities)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        var nonce = "nonce-" + Guid.NewGuid().ToString("N");
+        const string osUser = "alice";
+        var environment = new Dictionary<string, object?>
+        {
+            ["machineFingerprint"] = machine,
+            ["hostname"] = "egress-host",
+            ["osUser"] = osUser,
+        };
+        if (egressCapabilities is not null)
+        {
+            environment["clientEgressCapabilities"] = egressCapabilities;
+        }
+        var response = await client.PostAsJsonAsync("/api/client/auth/login", new
+        {
+            apiKey = DatabaseInitializer.DemoCredentialApiKey,
+            timestamp,
+            nonce,
+            signature = Sign(DatabaseInitializer.DemoCredentialApiKey, timestamp, nonce, machine, osUser,
+                DatabaseInitializer.DemoCredentialSecret),
+            environment,
+        });
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<ClientAuthLoginBody>();
+        Assert.NotNull(body);
+
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        return await db.ClientSessions.AsNoTracking()
+            .FirstAsync(row => row.Id == body!.ClientSessionId);
     }
 
     private static string Sign(string apiKey, string timestamp, string nonce, string machineFingerprint,
