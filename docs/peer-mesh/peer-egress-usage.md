@@ -243,7 +243,7 @@ ip rule add fwmark 0x5350 table 100
 
 **可识别边界：** 应用自带 DoH/DoT、使用系统缓存、或直接硬编码 IP 时，域名规则**不会**命中，这类流量只能靠 IP/CIDR 规则覆盖。
 
-> **二期状态。** 下面描述的是当前实现的行为，单元测试与共享向量覆盖了规则、地址池、应答者与接管命令；真机上的完整验收（第六步实验室）尚未完成。
+> **二期状态。** 下面描述的是当前实现的行为。单元测试与共享向量覆盖了规则、地址池、应答者与接管命令；Linux 命名空间实验室（`scripts/peer-egress-lab/lab.py`，CI 里三种消费端 × 三种出口）以 `/etc/resolv.conf` 方式完整跑通了接管、经出口访问、池内无映射与强杀后恢复。Windows 与 macOS 的真机验收（NRPT、networksetup）尚未完成，见 #50。
 
 ### 打开二期
 
@@ -335,6 +335,8 @@ specus-client egress dns restore
   - 某一步失败以 1 退出并说明是哪一步，事务日志保留，修正后再运行一次。
 
 事务日志在 `~/.specus/egress-dns-journal.json`，与路由安装记录在同一目录。
+
+同一台机器上只让一个客户端开启 `peerEgressDnsTakeover`。客户端启动时，不论日志里记录的进程此刻是否在运行，都先按日志改回：断电重启之后那个进程号多半已被别的程序占用，按它判断会让系统 DNS 一直指着一个没人应答的地址。
 
 运行状态（`egress --config ... --json`）里 `consumer.dns` 一节给出同样的信息：`active` 是二期是否在运行，`takeover` 是系统 DNS 此刻是否指向应答者，`journal` 是 `none`、`pending` 或 `committed`，`queries` 是应答、转发与失败的累计数。拦截计数增加四个原因：
 
