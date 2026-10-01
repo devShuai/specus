@@ -71,6 +71,25 @@ func TestEgressRulesAreEncodedOnePerLine(t *testing.T) {
 	}
 }
 
+// With phase two asked for, a domain rule is judged as a name: listed in force and accepted by add.
+// Without it the listing and add refuse it exactly as before.
+func TestEgressDomainRulesFollowTheDNSTakeoverSwitch(t *testing.T) {
+	rule := client.EgressRule{Match: "*.example.com", Action: "egress", EgressClientID: 2}
+	for _, takeover := range []bool{false, true} {
+		config := client.Config{PeerEgressEnabled: true, PeerEgressDNSTakeover: takeover,
+			PeerEgressRules: []client.EgressRule{rule}}
+		listing, _ := egressListing("client.jsonc", config)
+		views, _ := listing["rules"].([]map[string]any)
+		if len(views) != 1 || views[0]["inForce"] != takeover {
+			t.Errorf("takeover=%v: listed %v", takeover, views)
+		}
+		_, failure := egressPlan(config, egressChange{Op: "add", Match: "www.example.org", Action: "block", At: -1})
+		if (failure == "") != takeover {
+			t.Errorf("takeover=%v: adding a domain rule answered %q", takeover, failure)
+		}
+	}
+}
+
 func TestEgressFlagsBelongToTheirCommands(t *testing.T) {
 	cases := map[string]string{
 		"egress rules --index 1 --config c.jsonc":               "--index is not valid for egress rules",

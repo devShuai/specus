@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -89,20 +90,45 @@ func publishState(config string, snapshot func() map[string]any) (func(), error)
 		defer close(done)
 		timer := time.NewTicker(time.Second)
 		defer timer.Stop()
+		publisher := statePublisher{write: write, report: os.Stderr}
 		for {
 			select {
 			case <-stop:
 				return
 			case <-timer.C:
-				if e := write(); e != nil {
-					fmt.Fprintln(os.Stderr, "State publication failed; status will become stale.")
-					return
-				}
+				publisher.tick()
 			}
 		}
 	}()
 	return func() { close(stop); <-done; _ = os.Remove(path) }, nil
 }
+
+// statePublisher writes the state file once a second and keeps doing so after a failure.
+//
+// One failed write is no reason to stop: on Windows a reader holding the file open, or a virus
+// scanner, makes the replace fail now and then, and giving up would leave every status query
+// refused for the rest of the run. The failure is said once, with its reason, and so is the
+// recovery, rather than once a second.
+type statePublisher struct {
+	write   func() error
+	report  io.Writer
+	failing bool
+}
+
+func (p *statePublisher) tick() {
+	if err := p.write(); err != nil {
+		if !p.failing {
+			p.failing = true
+			fmt.Fprintf(p.report, "State publication failed (%v); retrying every second, so status may be stale meanwhile.\n", err)
+		}
+		return
+	}
+	if p.failing {
+		p.failing = false
+		fmt.Fprintln(p.report, "State publication recovered.")
+	}
+}
+
 func queryState(options cliOptions, config string) int {
 	root, err := checkedStateRoot(false)
 	unavailable := func(message string) int {

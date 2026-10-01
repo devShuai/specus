@@ -65,6 +65,32 @@ func tcpVectorScenarios() []tcpScenario {
 				{Do: "tick", AdvanceMs: 1}},
 		},
 		{
+			// Four one-byte segments in flight, the first lost. The ACK its retransmission draws
+			// covers all four, and the three sent beside it waited out the RTO behind the hole: a
+			// sample from them would be that wait, not the path. So the whole ACK is ignored and the
+			// backoff stands (e is resent 400 ms after it went out, not 465 ms), until a clean ACK
+			// for f brings the RTO back to the 200 ms floor for g.
+			Name:        "ack-filling-a-hole-takes-no-rtt-sample",
+			Description: "补洞的累计 ACK 覆盖了重传过的段，整个 ACK 不取 RTT 样本、保留退避；之后的干净 ACK 才把 RTO 收回下限",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "appData", DataHex: hexOf("a")},
+				{Do: "appData", DataHex: hexOf("b")},
+				{Do: "appData", DataHex: hexOf("c")},
+				{Do: "appData", DataHex: hexOf("d")},
+				{Do: "segment", AdvanceMs: 1, Seq: 1001, Ack: 5001, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "tick", AdvanceMs: 199},
+				{Do: "segment", AdvanceMs: 1, Seq: 1001, Ack: 5005, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "appData", DataHex: hexOf("e")},
+				{Do: "tick", AdvanceMs: 399},
+				{Do: "tick", AdvanceMs: 1},
+				{Do: "segment", AdvanceMs: 1, Seq: 1001, Ack: 5006, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "appData", DataHex: hexOf("f")},
+				{Do: "segment", AdvanceMs: 1, Seq: 1001, Ack: 5007, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "appData", DataHex: hexOf("g")},
+				{Do: "tick", AdvanceMs: 199},
+				{Do: "tick", AdvanceMs: 1}},
+		},
+		{
 			Name:        "send-window-and-deferred-fin",
 			Description: "小窗口只发允许的字节，ACK 释放待发数据，FIN 不越过数据或窗口",
 			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),

@@ -154,9 +154,34 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
     }
     private async Task PublishAsync()
     {
-        try { while (true) { await Task.Delay(1000, _stop.Token); Write(); } }
+        var failing = false;
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(1000, _stop.Token);
+                failing = PublishOnce(Write, failing, Console.Error);
+            }
+        }
         catch (OperationCanceledException) { }
-        catch (Exception) { Console.Error.WriteLine("State publication failed; status will become stale."); }
+    }
+
+    /// <summary>
+    /// One publication, returning whether publishing is now failing. A failed write is no reason to
+    /// stop: on Windows a reader holding the file open, or a virus scanner, makes the replace fail
+    /// now and then, and giving up would leave every status query refused for the rest of the run.
+    /// The failure is said once, with its reason, and so is the recovery.
+    /// </summary>
+    internal static bool PublishOnce(Action write, bool failing, TextWriter report)
+    {
+        try { write(); }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            if (!failing) report.WriteLine($"State publication failed ({error.GetType().Name}: {error.Message}); retrying every second, so status may be stale meanwhile.");
+            return true;
+        }
+        if (failing) report.WriteLine("State publication recovered.");
+        return false;
     }
     public void Dispose()
     {

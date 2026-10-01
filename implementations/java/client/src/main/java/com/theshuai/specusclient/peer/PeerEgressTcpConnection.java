@@ -102,8 +102,9 @@ final class PeerEgressTcpConnection {
         long sentAtMs;
         int attempts;
         /**
-         * Marks a segment that was resent, so its round-trip sample is discarded. That is Karn's
-         * algorithm: an ambiguous sample would poison the estimator whenever loss happens.
+         * Marks a segment that was resent, so the acknowledgement that covers it yields no
+         * round-trip sample at all. That is Karn's algorithm: an ambiguous sample would poison the
+         * estimator whenever loss happens.
          */
         boolean retransmitted;
     }
@@ -361,11 +362,25 @@ final class PeerEgressTcpConnection {
             if (sndWnd > 0) { persistAtMs = -1; }
         }
 
+        // Karn applies to the acknowledgement, not only to the segment. An ACK that also covers a
+        // resent segment is the one that filled the hole: whatever went out alongside the lost
+        // segment was waiting behind it, so its "round trip" is the retransmission timeout rather
+        // than the path. Sampling those segments fed every recovery's timeout back into the
+        // estimate, so each loss stretched the next timeout and a lossy flow went quiet for
+        // seconds, then for longer than the application would wait. Linux discards the whole ACK
+        // the same way; the next clean ACK, one round trip later, collapses the backoff.
+        boolean ambiguous = false;
+        for (RetransmitEntry entry : retransmit) {
+            if (PeerEgressSegment.seqLessEqual(entry.seq + entryLength(entry), ack)) {
+                ambiguous |= entry.retransmitted;
+            }
+        }
+
         List<RetransmitEntry> kept = new ArrayList<>(retransmit.size());
         for (RetransmitEntry entry : retransmit) {
             int end = entry.seq + entryLength(entry);
             if (PeerEgressSegment.seqLessEqual(end, ack)) {
-                if (!entry.retransmitted) {
+                if (!ambiguous) {
                     updateRto(nowMs - entry.sentAtMs);
                 }
                 continue;

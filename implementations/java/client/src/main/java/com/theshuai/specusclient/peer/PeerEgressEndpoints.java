@@ -118,6 +118,26 @@ final class PeerEgressEndpoints {
         return List.copyOf(networks);
     }
 
+    /**
+     * This host's own IPv4 interface addresses, as dotted text. Empty when the host will not list
+     * its interfaces, in which case only the mesh address counts as this machine.
+     */
+    static List<String> localInterfaceAddresses() {
+        List<String> addresses = new ArrayList<>();
+        try {
+            for (NetworkInterface device : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                for (InterfaceAddress address : device.getInterfaceAddresses()) {
+                    if (address.getAddress() instanceof Inet4Address) {
+                        addresses.add(address.getAddress().getHostAddress());
+                    }
+                }
+            }
+        } catch (Exception unavailable) {
+            return List.of();
+        }
+        return List.copyOf(addresses);
+    }
+
     /** Masks an address down to its network and renders it as a prefix. */
     static String networkOf(int address, int prefixLength) {
         int mask = prefixLength == 0 ? 0 : 0xFFFFFFFF << (32 - prefixLength);

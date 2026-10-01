@@ -295,6 +295,8 @@ public class SpecusClientApplication {
         specusBean.setPeerEgressRules(startupConfig.getPeerEgressRules() == null
                 ? java.util.List.of() : java.util.List.copyOf(startupConfig.getPeerEgressRules()));
         specusBean.setPeerEgressEnabled(startupConfig.isPeerEgressEnabled());
+        specusBean.setPeerEgressDnsTakeover(startupConfig.isPeerEgressDnsTakeover());
+        specusBean.setPeerEgressFakeIpCidr(startupConfig.getPeerEgressFakeIpCidr());
     }
 
     static ClientEnvironmentInfo collectEnvironment() {

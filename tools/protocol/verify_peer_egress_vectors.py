@@ -215,7 +215,8 @@ used.update(codes_by_index.values())
 
 # Phase two's codes are exercised by its own vector (protocol/spec/peer-egress-dns.md).
 _dns_cases = json.loads((VECTORS / "peer-egress-dns-v1.json").read_text(encoding="utf-8"))
-for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgress", "egressChoice"):
+for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgress", "egressChoice", "phaseTwo",
+                "ruleStatus"):
     used.update(case["code"] for case in _dns_cases[section] if case["code"])
 
 undocumented = used - table_codes

@@ -96,12 +96,29 @@ public final class PeerEgressRoutePlanner {
      * because a single peer went away.
      */
     public static Plan plan(List<PeerEgressRule> rules, List<String> bypass, String meshCidr) {
+        return plan(rules, bypass, meshCidr, null);
+    }
+
+    /** The origin of the route that captures the fake-IP pool while phase two runs. */
+    public static final String ORIGIN_FAKE_IP_POOL = "fake-ip-pool";
+
+    /**
+     * As above while phase two runs with the given pool (null when it does not).
+     *
+     * <p>The pool is one more prefix sent into the TUN, with origin {@link #ORIGIN_FAKE_IP_POOL}:
+     * an address handed out for a name must reach the consumer to be sent by that name, and one
+     * handed out for nothing must reach it to be refused. It is planned, journalled, checked for
+     * conflicts and rolled back exactly as a rule's route is, and it counts as capturing for the
+     * bypass, so an endpoint that happens to sit in the pool is still pinned outside the tunnel.
+     * Domain rules install nothing themselves; the pool route is what carries their traffic.
+     */
+    public static Plan plan(List<PeerEgressRule> rules, List<String> bypass, String meshCidr, String fakeIpCidr) {
         List<PeerEgressRule> ruleList = rules == null ? List.of() : rules;
         List<Refusal> refused = new ArrayList<>();
         Set<Integer> skip = new LinkedHashSet<>();
         for (int index = 0; index < ruleList.size(); index++) {
             PeerEgressRule rule = ruleList.get(index);
-            String code = PeerEgressRules.validate(rule, meshCidr);
+            String code = PeerEgressRules.validate(rule, meshCidr, fakeIpCidr);
             if (code != null) {
                 refused.add(new Refusal(index, rule == null ? "" : rule.getMatch(), code));
                 skip.add(index);
@@ -115,7 +132,7 @@ public final class PeerEgressRoutePlanner {
         // same mechanism that makes unmatched traffic local, so there is one behaviour rather than
         // two that have to agree. A block rule does install one: the packet has to be captured
         // before it can be dropped, and the data plane is what drops it.
-        record Captured(Ipv4Cidr cidr, String match) {
+        record Captured(Ipv4Cidr cidr, String origin) {
         }
         Set<String> seen = new LinkedHashSet<>();
         List<Captured> capturing = new ArrayList<>();
@@ -139,7 +156,12 @@ public final class PeerEgressRoutePlanner {
                 // per packet, and installing the prefix twice would make removal ambiguous.
                 continue;
             }
-            capturing.add(new Captured(cidr, rule.getMatch()));
+            capturing.add(new Captured(cidr, "rule:" + rule.getMatch()));
+        }
+        Ipv4Cidr pool = fakeIpCidr == null ? null : Ipv4Cidr.parse(fakeIpCidr);
+        // No rule shares its prefix: validation refuses every address rule reaching into it.
+        if (pool != null && seen.add(pool.toString())) {
+            capturing.add(new Captured(pool, ORIGIN_FAKE_IP_POOL));
         }
 
         seen = new LinkedHashSet<>();
@@ -174,7 +196,7 @@ public final class PeerEgressRoutePlanner {
         for (Captured entry : capturing) {
             String normalised = entry.cidr().toString();
             if (seen.add(normalised)) {
-                routes.add(new Route(normalised, Kind.TUN, "rule:" + entry.match()));
+                routes.add(new Route(normalised, Kind.TUN, entry.origin()));
             }
         }
 

@@ -12,9 +12,9 @@ import (
 // and the choice of the address a named flow is dialled to. See protocol/spec/peer-egress-dns.md.
 
 // normalizeEgressName is how a query name, a rule match and a bound name are compared: no trailing
-// dot, lower case.
+// dots, lower case.
 func normalizeEgressName(name string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(name), "."))
 }
 
 // validEgressName reports whether a name is one this implementation will resolve: ASCII labels of

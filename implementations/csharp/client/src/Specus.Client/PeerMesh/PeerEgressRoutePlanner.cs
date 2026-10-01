@@ -67,6 +67,9 @@ internal sealed record PeerEgressPlanAttempt(long AtMillis, IReadOnlyList<PeerEg
 /// </remarks>
 internal static class PeerEgressRoutePlanner
 {
+    /// <summary>The origin of the route that sends the fake-IP pool into the TUN while phase two runs.</summary>
+    public const string FakeIpPoolOrigin = "fake-ip-pool";
+
     /// <summary>The name a kind carries in the journal and in the shared vector.</summary>
     public static string WireName(PeerEgressRouteKind kind) =>
         kind == PeerEgressRouteKind.Bypass ? "bypass" : "tun";
@@ -86,13 +89,31 @@ internal static class PeerEgressRoutePlanner
     /// because a single peer went away.</para>
     /// </remarks>
     public static PeerEgressRoutePlan Plan(
-        IReadOnlyList<PeerEgressRule> rules, IReadOnlyList<string>? bypass, string? meshCidr)
+        IReadOnlyList<PeerEgressRule> rules, IReadOnlyList<string>? bypass, string? meshCidr) =>
+        Plan(rules, bypass, meshCidr, null);
+
+    /// <summary>
+    /// Works out the routes, with phase two running over <paramref name="fakeIpPool"/> or, when it
+    /// is null, not running.
+    /// </summary>
+    /// <remarks>
+    /// While phase two runs the pool is one more prefix sent into the TUN, with origin
+    /// <see cref="FakeIpPoolOrigin"/>: an application that was handed a pool address sends to it,
+    /// and only the consumer knows which name it stands for. It is planned like a rule's prefix --
+    /// a conflict with somebody else's route is reported, not preempted, and the installer records
+    /// and rolls it back -- and it covers bypass addresses like one, so the tunnel's own transport
+    /// never lands in it. A domain rule installs nothing of its own: its traffic arrives through
+    /// the pool.
+    /// </remarks>
+    public static PeerEgressRoutePlan Plan(
+        IReadOnlyList<PeerEgressRule> rules, IReadOnlyList<string>? bypass, string? meshCidr,
+        Ipv4Cidr? fakeIpPool)
     {
         var refused = new List<PeerEgressRuleRefusal>();
         var skip = new HashSet<int>();
         for (var index = 0; index < rules.Count; index++)
         {
-            var code = PeerEgressRules.Validate(rules[index], meshCidr);
+            var code = PeerEgressRules.Validate(rules[index], meshCidr, fakeIpPool);
             if (code is not null)
             {
                 refused.Add(new PeerEgressRuleRefusal(index, rules[index].Match, code));
@@ -135,6 +156,13 @@ internal static class PeerEgressRoutePlanner
             }
             capturing.Add((cidr, rule.Match));
         }
+        // No rule can share the pool's prefix: one overlapping it was refused above.
+        var poolIndex = -1;
+        if (fakeIpPool is { } pool)
+        {
+            poolIndex = capturing.Count;
+            capturing.Add((pool, string.Empty));
+        }
 
         seen.Clear();
         var routes = new List<PeerEgressRoute>(capturing.Count + (bypass?.Count ?? 0));
@@ -170,12 +198,14 @@ internal static class PeerEgressRoutePlanner
             }
         }
 
-        foreach (var entry in capturing)
+        for (var index = 0; index < capturing.Count; index++)
         {
+            var entry = capturing[index];
             var normalised = entry.Cidr.ToString();
             if (seen.Add(normalised))
             {
-                routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun, "rule:" + entry.Match));
+                routes.Add(new PeerEgressRoute(normalised, PeerEgressRouteKind.Tun,
+                    index == poolIndex ? FakeIpPoolOrigin : "rule:" + entry.Match));
             }
         }
 
