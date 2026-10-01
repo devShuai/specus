@@ -184,7 +184,7 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
 
         public string TunName => "specus0";
 
-        public string MeshCidr => Mesh;
+        public string MeshCidr { get; set; } = Mesh;
 
         public string VirtualIp => PeerEgressPhaseTwoTests.VirtualIp;
 
@@ -254,7 +254,8 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
         Assert.Equal(1, dns.GetProperty("mappings").GetInt32());
         Assert.Equal(0, dns.GetProperty("quarantined").GetInt32());
         Assert.False(dns.TryGetProperty("code", out _));
-        Assert.Equal(["takeover", "pool", "mappings", "quarantined"], dns.EnumerateObject().Select(field => field.Name));
+        Assert.Equal(["takeover", "listen", "pool", "mappings", "quarantined", "upstreams", "queries"],
+            dns.EnumerateObject().Select(field => field.Name));
         var route = consumer.GetProperty("routes").EnumerateArray().Single();
         Assert.Equal("198.18.0.0/15", route.GetProperty("cidr").GetString());
         Assert.Equal("tun", route.GetProperty("kind").GetString());
@@ -306,10 +307,58 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
         Assert.False(dns.GetProperty("takeover").GetBoolean());
         Assert.Equal(PeerEgressCodes.FakeIpPoolInvalid, dns.GetProperty("code").GetString());
         Assert.Equal(pool, dns.GetProperty("pool").GetString());
+        // Nothing listens, but where it would forward and what it has done are still said.
+        Assert.False(dns.TryGetProperty("listen", out _));
+        Assert.Equal(0, dns.GetProperty("upstreams").GetArrayLength());
+        Assert.Equal(0, dns.GetProperty("queries").GetProperty("answered").GetInt64());
         var rules = consumer.GetProperty("rules").EnumerateArray().ToList();
         Assert.Equal(PeerEgressCodes.RuleDomainUnsupported, rules[0].GetProperty("code").GetString());
         Assert.True(rules[1].GetProperty("inForce").GetBoolean());
         Assert.Equal(["203.0.113.0/24"], consumer.GetProperty("routes").EnumerateArray().Select(route => route.GetProperty("cidr").GetString()));
+    }
+
+    /// <summary>
+    /// Phase two stopping while it runs with no rules -- the server moves the mesh onto the pool --
+    /// takes everything it put in place back out: the pool route, and the consumer's pool and
+    /// responder, so the listen address is no longer answered and pool addresses are no longer
+    /// steered.
+    /// </summary>
+    [Fact]
+    public void PhaseTwoStoppingWithoutRulesTakesThePoolBackOut()
+    {
+        var host = new Host(_directory);
+        var commander = new RecordingCommander();
+        _mesh = new PeerEgressMesh(host, dialer: new RefusingDialer(), commander: commander,
+            dnsForwarder: new NoUpstreamForwarder());
+        _mesh.ReconcileRoutes();
+        Assert.NotNull(_mesh.FakeIpPool);
+        Assert.Contains("198.18.0.0/15", commander.Installed);
+        var query = PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(Address(VirtualIp), Address("198.18.0.1"),
+            53000, 53, Convert.FromHexString("123401000001000000000000076578616d706c65036f72670000010001")));
+        Assert.True(_mesh.HandleOutbound(query));
+        var syn = PeerEgressSegment.Build(new PeerEgressSegment.Segment(Address(VirtualIp), Address("198.18.0.9"),
+            40000, 443, 1000, 0, PeerEgressSegment.FlagSyn, 65535, 0, []));
+        Assert.True(_mesh.HandleOutbound(syn));
+
+        host.MeshCidr = "198.18.0.0/16";
+        _mesh.ReconcileRoutes();
+        Assert.Null(_mesh.FakeIpPool);
+        Assert.Null(_mesh.DnsResponder);
+        Assert.Contains("198.18.0.0/15", commander.Removed);
+        var consumer = Consumer(_mesh);
+        Assert.DoesNotContain(consumer.GetProperty("routes").EnumerateArray(),
+            route => route.GetProperty("origin").GetString() == "fake-ip-pool");
+        Assert.Equal(PeerEgressCodes.FakeIpPoolInvalid, consumer.GetProperty("dns").GetProperty("code").GetString());
+        // Neither the listen address nor a pool address is the consumer's any more.
+        Assert.False(_mesh.HandleOutbound(query));
+        Assert.False(_mesh.HandleOutbound(syn));
+    }
+
+    /// <summary>A forwarder that finds no upstream, for tests that only need the responder to exist.</summary>
+    private sealed class NoUpstreamForwarder : IPeerEgressDnsForwarder
+    {
+        public Task<byte[]?> ForwardAsync(byte[] query, bool tcp, IReadOnlyList<PeerEgressDnsUpstream> upstreams) =>
+            Task.FromResult<byte[]?>(null);
     }
 
     /// <summary>
@@ -373,10 +422,11 @@ public sealed class PeerEgressPhaseTwoTests : IDisposable
             Assert.True(reset is not null && reset.Has(PeerEgressSegment.FlagRst));
         }
 
-        // The responder's port is left to the responder, which is step four's.
+        // The responder's port is the responder's, not an unmapped address: nothing new is counted.
         var query = PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(Address(VirtualIp), Address("198.18.0.1"),
             53000, 53, "query"u8.ToArray()));
-        Assert.False(mesh.HandleOutbound(query));
+        Assert.True(mesh.HandleOutbound(query));
+        Assert.Equal(1, Consumer(mesh).GetProperty("blocked").GetProperty("fake-ip-unmapped").GetInt64());
     }
 
     /// <summary>

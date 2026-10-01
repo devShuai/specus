@@ -37,7 +37,17 @@ internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Ru
 /// <param name="Mappings">Mappings held when the snapshot was taken.</param>
 /// <param name="Quarantined">Addresses still resting when the snapshot was taken.</param>
 /// <param name="Code">Why phase two does not run although it was asked for; null otherwise.</param>
-internal sealed record PeerEgressDnsStatus(bool Takeover, string Pool, int Mappings, int Quarantined, string? Code);
+internal sealed record PeerEgressDnsStatus(bool Takeover, string Pool, int Mappings, int Quarantined, string? Code)
+{
+    /// <summary>The responder's listen address; null while phase two does not run.</summary>
+    public string? Listen { get; init; }
+
+    /// <summary>Where it forwards, as configured; empty when nothing is.</summary>
+    public IReadOnlyList<string>? Upstreams { get; init; }
+
+    /// <summary>What it has done with queries since it started; zeros before it ever ran.</summary>
+    public PeerEgressDnsCounters? Queries { get; init; }
+}
 
 /// <summary>The egress role's own view, taken under its lock.</summary>
 internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int Flows,
@@ -236,18 +246,33 @@ internal static class PeerEgressStatus
     internal const string KindDomain = "domain";
 
     /// <summary>
-    /// <c>consumer.dns</c>. The responder's address and upstreams arrive with step four and the
-    /// journal with step five; until then they are left out rather than written empty.
+    /// <c>consumer.dns</c>, in the order the spec lists it. The responder's fields are there while
+    /// it answers; the journal arrives with step five. What is not delivered is left out rather than
+    /// written empty.
     /// </summary>
     private static Dictionary<string, object?> DnsSection(PeerEgressDnsStatus dns)
     {
-        var section = new Dictionary<string, object?>
+        var section = new Dictionary<string, object?> { ["takeover"] = dns.Takeover };
+        if (dns.Listen is not null)
         {
-            ["takeover"] = dns.Takeover,
-            ["pool"] = dns.Pool,
-            ["mappings"] = dns.Mappings,
-            ["quarantined"] = dns.Quarantined,
-        };
+            section["listen"] = dns.Listen;
+        }
+        section["pool"] = dns.Pool;
+        section["mappings"] = dns.Mappings;
+        section["quarantined"] = dns.Quarantined;
+        if (dns.Upstreams is not null)
+        {
+            section["upstreams"] = dns.Upstreams;
+        }
+        if (dns.Queries is { } queries)
+        {
+            section["queries"] = new Dictionary<string, object?>
+            {
+                ["answered"] = queries.Answered,
+                ["forwarded"] = queries.Forwarded,
+                ["failed"] = queries.Failed,
+            };
+        }
         if (dns.Code is not null)
         {
             section["code"] = dns.Code;

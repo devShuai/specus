@@ -180,6 +180,9 @@ type peerMeshClient struct {
 	// egressLocalNetworks lists the networks this device sits on, for the fake-IP pool's startup
 	// check. Nil means the real interfaces; tests set it.
 	egressLocalNetworks func() []string
+	// egressDNSUpstreams are the resolvers the DNS responder forwards to, kept here so a consumer
+	// built later starts with them. Guarded by mu.
+	egressDNSUpstreams []string
 
 	// The consumer's route plan, kept true on the mesh's own tick. Guarded by egressPlanMu, which
 	// is never taken under mu: a reconcile resolves hostnames and runs route commands.

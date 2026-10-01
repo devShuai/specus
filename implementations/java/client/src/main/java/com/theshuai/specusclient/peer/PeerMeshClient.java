@@ -71,6 +71,7 @@ public class PeerMeshClient implements AutoCloseable {
     /** Phase two's switch and pool, from local configuration (protocol/spec/peer-egress-dns.md). */
     private volatile boolean egressDnsTakeover;
     private volatile String egressFakeIpCidr = PeerEgressDns.DEFAULT_FAKE_IP_CIDR;
+    private volatile List<String> egressDnsUpstreams = List.of();
     /** The control connection's live remote address, for the bypass that keeps it out of the tunnel. */
     private volatile Supplier<SocketAddress> controlRemote;
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
@@ -4226,6 +4227,15 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     /**
+     * The upstreams the DNS responder forwards to, in order, as literal addresses with an optional
+     * port. The system DNS takeover (step five) supplies the ones it recorded; until it does there
+     * are none and every forwarded query is answered SERVFAIL. Taken on the next reconcile.
+     */
+    public void setEgressDnsUpstreams(List<String> upstreams) {
+        egressDnsUpstreams = upstreams == null ? List.of() : List.copyOf(upstreams);
+    }
+
+    /**
      * A control session has logged in. The server numbers its egress catalogues per session, so a
      * new one may start again from 1 and must not be ignored as older than the last.
      */
@@ -4336,6 +4346,11 @@ public class PeerMeshClient implements AutoCloseable {
         @Override
         public String fakeIpCidr() {
             return egressFakeIpCidr;
+        }
+
+        @Override
+        public List<String> dnsUpstreams() {
+            return egressDnsUpstreams;
         }
 
         @Override

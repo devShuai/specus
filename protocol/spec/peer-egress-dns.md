@@ -73,18 +73,62 @@
 
 ## 三、消费端 DNS 应答
 
-应答者监听 fake-IP 池的第一个可用地址（默认 `198.18.0.1`），UDP 与 TCP 53 端口，只接受来自本机的查询。
+应答者占用 fake-IP 池的第一个可用地址（默认 `198.18.0.1`，下称**监听地址**）的 UDP 与 TCP 53 端口。
+**它不开系统 socket**：池段路由把发往监听地址的包送进 TUN，消费端在读包路径上直接处理，把应答写回 TUN。
+这样既不占系统的 53 端口、也不必给 TUN 另加地址，systemd-resolved 按链路发出的查询、Windows NRPT、
+macOS 网络服务的 DNS 设置都经路由到达。发往监听地址其他端口或协议的包，照「池内流量」按无映射阻断。
+
+**只答本机**：查询的源地址必须是本机的 Peer Mesh 虚拟地址，或本机某个接口的地址；否则丢弃不答，
+计入 `blocked` 的 `dns-not-local`。本机发往池段的包，源地址由系统按 TUN 选出，就是虚拟地址；
+别的源地址意味着这台机器在替别人转发，二期不替别人解析。
 
 | 查询 | 应答 |
 | --- | --- |
 | 名字命中 `egress`/`block` 域名规则，类型 `A` | 一条 A 记录：该名字的 fake-IP，TTL 1 秒 |
-| 同上，类型 `AAAA`、`HTTPS`（65）、`SVCB`（64） | `NOERROR`、无答案（NODATA）。不让应用拿到绕过 fake-IP 的地址或端点 |
+| 同上，类型 `AAAA`、`HTTPS`（65）、`SVCB`（64）、`ANY`（255） | `NOERROR`、无答案（NODATA）。不让应用拿到绕过 fake-IP 的地址或端点 |
 | 同上，其他类型 | 原样转发给原上游 |
 | 名字未命中，或命中 `direct` | 原样转发给原上游，**不改写、不缓存**，应答原样返回 |
-| 反向查询 `in-addr.arpa` 落在池内 | 返回该地址映射的名字（PTR），无映射则 `NXDOMAIN` |
+| 反向查询 `in-addr.arpa` 落在池内 | 有映射：类型 `PTR` 返回该地址映射的名字，其他类型 NODATA；无映射 `NXDOMAIN`。不刷新映射。只认四段、不带前导零的十进制写法，其他写法原样转发 |
 
-转发：UDP 查询发往记录的原上游，超时 2 秒换下一个上游；应答截断（TC）时应用自己会改用 TCP，TCP 查询同样转发。
-原上游不可达时返回 `SERVFAIL`，不自行解析。
+### 报文
+
+共享向量 `wire` 给出查询的字节与应得的结果：丢弃、原样转发、或自己构造的应答的**逐字节**内容。
+
+- **只解释一种消息**：QR 为 0、opcode 为 0（QUERY）、恰好一个问题、类为 IN，且名字的每个标签都是可打印 ASCII、不含 `.`。
+  QR 为 1 或不足 12 字节的**丢弃**；opcode 不为 0、问题数不为 1、类不为 IN、名字不可用的**原样转发**。
+  头部完整而问题读不出（越界，或问题里出现压缩指针）时回 `FORMERR`，问题节为空。
+  不认识的东西交给上游，而不是自己编一个答案：上游对它的回答至少是真实的。
+- **自己构造的应答**：ID、opcode、RD、CD 照抄；QR、RA 置位；AA、TC、AD 清零。问题节**逐字节照抄**查询里的，
+  保留应用的大小写（有的解析器用大小写随机化防投毒）。A 与 PTR 记录的名字写成指向问题的压缩指针 `C00C`，TTL 1 秒。
+- 查询的附加节里有 OPT（EDNS）时，应答也附一条 OPT：载荷 1232 字节，扩展 RCODE、版本、标志全为 0（不回 DO）。
+  不附的话，systemd-resolved 这类解析器会把这台上游降级为不带 EDNS，之后转发出去的查询也跟着不带。
+- NODATA 是 `NOERROR`、无答案，不附 SOA。池满回 `SERVFAIL`，日志记「fake-IP 池耗尽」。
+
+### 转发
+
+- 转发的查询**逐字节原样**发往上游，应答逐字节原样交回，含 TC 位；不改写、不缓存。UDP 应答不论多大都原样写回 TUN，
+  不做 IPv4 分片：只有应用自己通告的 EDNS 载荷大于 TUN 的 MTU 时才会遇到。
+- UDP 查询按上游列表的顺序，每个等 2 秒，超时或不可达换下一个；应答按 ID 与来源地址配对。全部失败回 `SERVFAIL`（自己构造，规则同上）。
+  不自行解析：自己解析就是在规则之外再开一条出网的路。
+- 转发的查询不一定读得出问题（问题数不为 1、问题里有压缩指针等）。这样的查询失败时，`SERVFAIL` 只有头部，问题数为 0；
+  读得出唯一一个问题的照抄问题节，查询带 OPT 的照附 OPT。
+- 同时在途的转发最多 256 个；再来的查询不转发，直接回 `SERVFAIL`，计入 `failed`。一个不停发查询的应用
+  不应该让客户端为它开出无限多的 socket。
+- TCP 查询同样的顺序，对每个上游走 TCP，连接加等应答合计 2 秒。
+- 上游列表取第五步记录的原值。第四步单独交付时由调用方传入，为空时所有转发都回 `SERVFAIL`。
+- 发往上游的包按系统路由走。上游地址若落在某条出口规则里，转发就经出口出去，这正是那条规则要的。
+
+### TUN 里的 TCP
+
+应答截断（TC）后应用会改用 TCP，所以监听地址的 TCP 53 也在读包路径上应答，只做 RFC 7766 需要的最小子集：
+
+- 收到 SYN 回 SYN-ACK，MSS 取对方 MSS 与 1360 的较小者，SYN-ACK 里通告的也是这个值；不做窗口缩放、SACK、时间戳，
+  也不看对方通告的窗口（同机应用的接收窗口远大于一条 DNS 应答）。同时存在的连接上限 64，超出的 SYN 回 RST。
+  没有连接的非 SYN 段回 RST。收到 RST 立即丢弃连接。
+- 按序接收；乱序的段丢弃，并重发当前的 ACK。字节流按 2 字节长度前缀切出查询，**按到达顺序**逐个应答；
+  转发出去的查询等上游回来再写，排在它后面的应答跟着等。
+- 应答按 MSS 切段发出。未确认的段 1 秒后重发，同一段重发 3 次仍未确认则回 RST 关闭。
+- 对方 FIN：写完已排队的应答后回 FIN。连接 10 秒既没有新查询也没有未答的查询，主动 FIN。
 
 ## 四、fake-IP 映射
 
@@ -230,14 +274,18 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 ```json
 {"takeover": true, "listen": "198.18.0.1", "pool": "198.18.0.0/15", "mappings": 42,
- "quarantined": 0, "upstreams": ["192.0.2.53"], "journal": "committed"}
+ "quarantined": 0, "upstreams": ["192.0.2.53"], "journal": "committed",
+ "queries": {"answered": 120, "forwarded": 300, "failed": 2}}
 ```
 
 - 开了 `peerEgressDnsTakeover` 这一节才出现。`takeover` 是二期此刻是否在运行；池不可用时为 `false`，
   并带 `"code": "EGRESS_FAKE_IP_POOL_INVALID"`。
 - `mappings` 是存活的映射数，`quarantined` 是还在隔离期的地址数，都在取快照时按当时的时间现算。
-- `listen`、`upstreams` 由第四步填，`journal` 由第五步填；还没交付的字段不输出。
-- 与 fake-IP 有关的阻断计入 `consumer.blocked`，不在这里另记一份：`fake-ip-unmapped`、`fake-ip-stale`、`egress-no-domain`。
+- `listen`、`upstreams`、`queries` 由第四步填，`journal` 由第五步填；还没交付的字段不输出。
+  `listen` 只在二期运行时输出；`upstreams`（没有时为 `[]`）与 `queries` 只要开了 `peerEgressDnsTakeover` 就输出。
+  `queries` 是启动以来的累计：`answered` 自己构造的应答（含 NODATA、`NXDOMAIN`、`FORMERR`），
+  `forwarded` 拿到上游应答并交回的，`failed` 因上游全部失败或池满而回 `SERVFAIL` 的。丢弃的查询不计。
+- 与 fake-IP 有关的阻断计入 `consumer.blocked`，不在这里另记一份：`fake-ip-unmapped`、`fake-ip-stale`、`egress-no-domain`、`dns-not-local`。
 
 规则条目增加 `kind`：`"cidr"` 或 `"domain"`。二期运行时，池段那条路由出现在 `consumer.routes` 里，`origin` 为 `fake-ip-pool`。
 
@@ -254,6 +302,6 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
    服务端只保存了能力的 `version`），消费端据此判定 `EGRESS_RULE_EGRESS_NO_DOMAIN`。
    这一步之后映射只能由第四步的应答者创建，所以单开这一步的开关，域名规则显示生效，却还没有流量会落进池里；
    用户文档在第五步交付之前不介绍这个开关。
-4. 消费端 DNS 应答者与转发。三端。
+4. 消费端 DNS 应答者：读包路径上的 UDP 与 TCP、报文（向量 `wire`）、反向查询、转发（上游由调用方传入）、状态。三端。
 5. 系统 DNS 接管、事务日志、回滚与 `egress dns restore`，三平台。
 6. 实验室：Linux 命名空间里完整跑通（resolv.conf 方式），并增加「池内无映射」与「接管后强杀再启动」用例。

@@ -80,11 +80,21 @@ public final class PeerEgressStatus {
      * Phase two as configured and as it stands, for {@code consumer.dns}; the section is there only
      * when {@code peerEgressDnsTakeover} is on (protocol/spec/peer-egress-dns.md, status).
      *
-     * @param pool    {@code peerEgressFakeIpCidr} as configured
-     * @param running whether phase two runs now
-     * @param code    why it does not although it was asked for, or null
+     * @param pool      {@code peerEgressFakeIpCidr} as configured
+     * @param running   whether phase two runs now
+     * @param code      why it does not although it was asked for, or null
+     * @param listen    the DNS responder's address while phase two runs, else null
+     * @param upstreams where forwarded queries go, as given; empty when none is
+     * @param answered  answers built by the responder since the process started
+     * @param forwarded upstream replies it relayed
+     * @param failed    SERVFAIL it gave for a failed or refused forward, or a full pool
      */
-    public record Dns(String pool, boolean running, String code) {
+    public record Dns(String pool, boolean running, String code, String listen, List<String> upstreams,
+            long answered, long forwarded, long failed) {
+
+        public Dns(String pool, boolean running, String code) {
+            this(pool, running, code, null, List.of(), 0, 0, 0);
+        }
     }
 
     /** The values of a peer entry's path: what carries frames to that egress now. */
@@ -134,17 +144,29 @@ public final class PeerEgressStatus {
     }
 
     /**
-     * {@code consumer.dns}: whether phase two runs, over which pool, and how full the pool is. The
-     * counts are taken when the snapshot is. {@code listen} and {@code upstreams} belong to the DNS
-     * responder and {@code journal} to the system takeover, and are left out until those exist.
+     * {@code consumer.dns}: whether phase two runs, where the responder listens while it does, over
+     * which pool, how full the pool is, whom forwarded queries go to and what the responder has done
+     * since the process started. The pool counts are taken when the snapshot is. {@code journal}
+     * belongs to the system takeover and is left out until that exists.
      */
     static Map<String, Object> dnsSection(Dns dns, ConsumerSnapshot consumer) {
         Map<String, Object> section = new LinkedHashMap<>();
         section.put("takeover", dns.running());
+        if (dns.running() && dns.listen() != null) {
+            section.put("listen", dns.listen());
+        }
         section.put("pool", dns.pool() == null ? "" : dns.pool().trim());
         boolean counted = dns.running() && consumer != null && consumer.fakeIpCidr() != null;
         section.put("mappings", counted ? consumer.mappings() : 0);
         section.put("quarantined", counted ? consumer.quarantined() : 0);
+        section.put("upstreams", dns.upstreams() == null ? List.of() : dns.upstreams());
+        // Answers built here, replies relayed from an upstream, and SERVFAIL for a forward that got
+        // no reply or was refused past the in-flight limit, or for a full pool. Drops are not counted.
+        Map<String, Object> queries = new LinkedHashMap<>();
+        queries.put("answered", dns.answered());
+        queries.put("forwarded", dns.forwarded());
+        queries.put("failed", dns.failed());
+        section.put("queries", queries);
         if (dns.code() != null && !dns.code().isEmpty()) {
             section.put("code", dns.code());
         }
