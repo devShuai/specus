@@ -473,7 +473,18 @@ public partial class MainWindow
                 EgressIssues.Add(new EgressIssueRow("出口设备 " + EgressDeviceLabel(EgressNumber(peer["clientId"])) + " 经中继连接",
                     "可用，但比直连慢；" + EgressNumber(peer["flows"]) + " 个流。直连需要两台设备之间的 UDP 可达。", ""));
             }
-            problems = refused.Count + missing.Count + offline.Count + pathless.Count + (routeError.Length > 0 ? 1 : 0);
+            // The system DNS takeover, when the configuration asks for one and it is not in place:
+            // domain rules depend on it, and nothing else on this page would say why they do nothing.
+            var dns = consumer["dns"] as JsonObject;
+            var dnsCode = dns is null ? string.Empty : EgressText(dns["code"]);
+            if (dnsCode.Length > 0 && !EgressTrue(dns!["takeover"]))
+            {
+                var why = EgressText(dns["reason"]) is { Length: > 0 } reason ? reason : EgressText(dns["error"]);
+                EgressIssues.Add(new EgressIssueRow("系统 DNS 未接管",
+                    "域名规则要靠系统 DNS 指向本功能才生效；" + (why.Length > 0 ? "原因：" + why + "。" : "") + "按地址写的规则不受影响。", dnsCode));
+            }
+            problems = refused.Count + missing.Count + offline.Count + pathless.Count + (routeError.Length > 0 ? 1 : 0)
+                + (dnsCode.Length > 0 && !EgressTrue(dns!["takeover"]) ? 1 : 0);
             if (problems == 0)
             {
                 EgressIssues.Add(new EgressIssueRow("规则均已生效", "路由均已安装，指向的出口设备均在线。", ""));

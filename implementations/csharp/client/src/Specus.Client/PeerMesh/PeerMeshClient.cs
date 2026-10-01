@@ -300,6 +300,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public string FakeIpCidr => owner._config.PeerEgressFakeIpCidr;
 
+        // This machine. Offered whether or not the switch is on: a takeover a killed run left
+        // behind is given back on the first reconcile either way.
+        public IPeerEgressDnsHost? DnsSystem { get; } = new PeerEgressDnsSystem();
+
         public IReadOnlyDictionary<long, bool> EgressAvailability
         {
             get
