@@ -88,8 +88,7 @@ public class SpecusClientApplication {
         // else, whatever the configuration now says (protocol/spec/peer-egress-dns.md, section six).
         com.theshuai.specusclient.peer.PeerEgressDnsTakeover.recoverLeftover(
                 new com.theshuai.specusclient.peer.PeerEgressDnsSystem(),
-                com.theshuai.specusclient.peer.PeerEgressDnsTakeover.defaultJournalPath(), ProcessHandle.current().pid(),
-                pid -> pid > 0 && ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false));
+                com.theshuai.specusclient.peer.PeerEgressDnsTakeover.defaultJournalPath());
         SpringApplication application = new SpringApplication(SpecusClientApplication.class);
         application.setWebApplicationType(WebApplicationType.NONE);
         application.setBannerMode(org.springframework.boot.Banner.Mode.OFF);

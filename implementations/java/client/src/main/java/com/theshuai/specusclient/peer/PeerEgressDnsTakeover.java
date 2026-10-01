@@ -151,7 +151,6 @@ public final class PeerEgressDnsTakeover {
     private final Machine machine;
     private final Path path;
     private final long pid;
-    private final LongPredicate processAlive;
     /** The network's fingerprint; null means no check. */
     private final Supplier<String> fingerprint;
 
@@ -165,12 +164,10 @@ public final class PeerEgressDnsTakeover {
     private volatile Status status = Status.none();
     private volatile List<String> heldUpstreams = List.of();
 
-    public PeerEgressDnsTakeover(Machine machine, Path path, long pid, LongPredicate processAlive,
-            Supplier<String> fingerprint) {
+    public PeerEgressDnsTakeover(Machine machine, Path path, long pid, Supplier<String> fingerprint) {
         this.machine = machine;
         this.path = path;
         this.pid = pid;
-        this.processAlive = processAlive;
         this.fingerprint = fingerprint;
     }
 
@@ -363,10 +360,13 @@ public final class PeerEgressDnsTakeover {
 
     /**
      * Gives back a takeover a previous run left, pending or committed, before anything else is
-     * decided: a process that was killed never gave back, and this is where it happens. A journal
-     * whose process is still running is somebody's live takeover and is left alone.
+     * decided: a process that was killed never gave back, and this is where it happens. Whether the
+     * journal's process id is running does not matter here: after a crash and a reboot that id most
+     * likely belongs to another program, and leaving the journal alone would keep the system pointed
+     * at a responder nobody runs. Only one client per machine takes the DNS over; the liveness check
+     * belongs to {@code egress dns restore}, which a person runs.
      */
-    public static void recoverLeftover(Machine machine, Path path, long ownPid, LongPredicate processAlive) {
+    public static void recoverLeftover(Machine machine, Path path) {
         Journal journal;
         try {
             journal = readJournal(path);
@@ -375,10 +375,6 @@ public final class PeerEgressDnsTakeover {
             return;
         }
         if (journal == null) {
-            return;
-        }
-        if (journal.pid() != ownPid && processAlive.test(journal.pid())) {
-            log.warn("[peer-egress-consumer] DNS takeover journal belongs to running process {}; left as it is", journal.pid());
             return;
         }
         String failure = revert(machine, path, journal);
@@ -451,7 +447,7 @@ public final class PeerEgressDnsTakeover {
 
     /** At start: a journal a previous run left is given back first. */
     public void recoverLeftover() {
-        recoverLeftover(machine, path, pid, processAlive);
+        recoverLeftover(machine, path);
     }
 
     /**
@@ -573,10 +569,6 @@ public final class PeerEgressDnsTakeover {
             return;
         }
         if (leftover != null) {
-            if (leftover.pid() != pid && processAlive.test(leftover.pid())) {
-                fail("the system DNS is taken over by process " + leftover.pid(), leftover.state());
-                return;
-            }
             String failure = revert(machine, path, leftover);
             if (failure != null) {
                 fail(failure, leftover.state());

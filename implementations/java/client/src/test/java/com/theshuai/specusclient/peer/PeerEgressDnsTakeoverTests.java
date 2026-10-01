@@ -145,7 +145,7 @@ class PeerEgressDnsTakeoverTests {
     }
 
     private PeerEgressDnsTakeover takeover(FakeMachine machine) {
-        return new PeerEgressDnsTakeover(machine, journal(), PID, pid -> false, null);
+        return new PeerEgressDnsTakeover(machine, journal(), PID, null);
     }
 
     private static PeerEgressDnsTakeover.Request request(boolean poolRouteInstalled) {
@@ -366,8 +366,8 @@ class PeerEgressDnsTakeoverTests {
     }
 
     /**
-     * A journal a killed client left is given back at start, pending or committed; one whose client
-     * is still running is left alone.
+     * A journal a killed client left is given back at start, pending or committed, whether or not
+     * its process id is running now: after a reboot that id most likely belongs to another program.
      */
     @Test
     void givesBackWhatAKilledClientLeft() throws IOException {
@@ -375,20 +375,17 @@ class PeerEgressDnsTakeoverTests {
         PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved", 1111,
                 LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
 
-        PeerEgressDnsTakeover.recoverLeftover(machine, journal(), PID, pid -> pid == 2222);
+        PeerEgressDnsTakeover.recoverLeftover(machine, journal());
         assertEquals(List.of("resolvectl revert specus0", "resolvectl flush-caches"), machine.changes());
         assertFalse(Files.exists(journal()));
 
+        // A pending one, from a process id that happens to be running now, goes the same way.
         machine.ran.clear();
-        PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("pending", "linux-resolved", 2222,
-                LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
-        PeerEgressDnsTakeover.recoverLeftover(machine, journal(), PID, pid -> pid == 2222);
-        assertTrue(machine.ran.isEmpty(), "a running client's takeover was given back");
-        assertTrue(Files.exists(journal()));
-
+        PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("pending", "linux-resolved",
+                ProcessHandle.current().pid() == 1 ? 2 : 1, LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
         // With its link gone there is nothing to revert on the link, and the journal still goes.
         machine.links.clear();
-        PeerEgressDnsTakeover.recoverLeftover(machine, journal(), PID, pid -> false);
+        PeerEgressDnsTakeover.recoverLeftover(machine, journal());
         assertEquals(List.of("resolvectl flush-caches"), machine.changes());
         assertFalse(Files.exists(journal()));
     }
@@ -448,7 +445,7 @@ class PeerEgressDnsTakeoverTests {
     @Test
     void noticesANewNetwork() {
         AtomicReference<String> network = new AtomicReference<>("eth0|192.168.1.5");
-        PeerEgressDnsTakeover takeover = new PeerEgressDnsTakeover(resolved(), journal(), PID, pid -> false, network::get);
+        PeerEgressDnsTakeover takeover = new PeerEgressDnsTakeover(resolved(), journal(), PID, network::get);
         assertFalse(takeover.networkChanged(EPOCH), "the baseline read as a change");
         network.set("wlan0|10.0.0.7");
         assertFalse(takeover.networkChanged(EPOCH + 9_999), "compared before ten seconds");

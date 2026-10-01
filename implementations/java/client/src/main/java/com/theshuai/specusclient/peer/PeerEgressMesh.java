@@ -637,14 +637,10 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         Supplier<String> fingerprint = networkFingerprint != null ? networkFingerprint : this::defaultFingerprint;
         PeerEgressDnsTakeover built = new PeerEgressDnsTakeover(dnsMachine, dnsJournalPath(),
-                ProcessHandle.current().pid(), PeerEgressMesh::processAlive, fingerprint);
+                ProcessHandle.current().pid(), fingerprint);
         built.recoverLeftover();
         takeover = built;
         return built;
-    }
-
-    static boolean processAlive(long pid) {
-        return pid > 0 && ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
     }
 
     /** Beside the route install record, in the same private directory. */
