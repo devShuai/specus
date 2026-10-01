@@ -30,6 +30,11 @@ const (
 	egressOutcomeBlockedNoEgress
 	// egressOutcomeUnsupported is a packet this version cannot carry, such as IPv6 or ICMP.
 	egressOutcomeUnsupported
+	// egressOutcomeBlockedFakeIP is a packet to a fake address that no name, or no rule, stands
+	// behind any more (phase two).
+	egressOutcomeBlockedFakeIP
+	// egressOutcomeDNS is a packet for the DNS responder, handled whatever became of it.
+	egressOutcomeDNS
 )
 
 func (o egressConsumerOutcome) String() string {
@@ -42,6 +47,10 @@ func (o egressConsumerOutcome) String() string {
 		return "blocked-no-egress"
 	case egressOutcomeUnsupported:
 		return "unsupported"
+	case egressOutcomeBlockedFakeIP:
+		return "blocked-fake-ip"
+	case egressOutcomeDNS:
+		return "dns"
 	default:
 		return "not-mine"
 	}
@@ -69,6 +78,9 @@ type egressConsumerFlow struct {
 	AppAckKnown bool
 	AppAck      uint32
 	AppSeqNext  uint32
+	// replied is set once the egress has sent anything back on this flow. Until then a flow to a
+	// fake address carries its name-bind on every datagram (see handleOutbound).
+	replied bool
 }
 
 type egressConsumer struct {
@@ -78,6 +90,34 @@ type egressConsumer struct {
 	meshCIDR string
 	// virtualIP is this node's mesh address, which every reply must be addressed to.
 	virtualIP string
+
+	// Phase two (protocol/spec/peer-egress-dns.md). fakeIPCIDR is the pool while phase two runs and
+	// "" while it does not; fakeIP hands out its addresses. capable is which egresses the catalogue
+	// says resolve names: a flow to a name goes only to one of those.
+	fakeIPCIDR string
+	fakeIP     *egressFakeIPPool
+	capable    map[int64]bool
+	// clock is what the status reads the pool's counts at, and what the responder's timers and
+	// forwards read when they fire; the data plane takes time as an argument, like everything else
+	// here.
+	clock func() time.Time
+
+	// The DNS responder (step four, peer_egress_dns.go): its counters, the upstreams it forwards
+	// to, how long each gets, how many forwards are waiting, and this device's own addresses for
+	// the source check.
+	dnsQueries        egressDNSQueries
+	dnsUpstreams      []string
+	dnsForwardTimeout time.Duration
+	dnsForwarding     int
+	dnsLocal          map[uint32]bool
+	dnsLocalAt        time.Time
+	dnsLocalAddresses func() []uint32
+	// The responder's TCP connections (peer_egress_dns_tcp.go), and the timer that drives their
+	// retransmission and idle close while any exist. A zero interval leaves the ticking to the
+	// caller, which is how tests drive time.
+	dnsConns        map[egressDNSConnKey]*egressDNSConn
+	dnsTickInterval time.Duration
+	dnsTickArmed    bool
 
 	// online is which egress peers can currently take a flow. Absent means no.
 	online map[int64]bool
@@ -103,8 +143,15 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 	return &egressConsumer{
 		logger:   logger,
 		meshCIDR: egressDefaultMeshCIDR,
-		online:   map[int64]bool{},
-		flows:    map[egressFlowKey]*egressConsumerFlow{},
+		capable:  map[int64]bool{},
+		clock:    time.Now,
+
+		dnsForwardTimeout: egressDNSForwardTimeout,
+		dnsConns:          map[egressDNSConnKey]*egressDNSConn{},
+		dnsTickInterval:   egressDNSTickInterval,
+
+		online: map[int64]bool{},
+		flows:  map[egressFlowKey]*egressConsumerFlow{},
 
 		flowCapacity: egressConsumerFlowCapacity,
 		send:         send,
@@ -120,17 +167,93 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 // the egress would hold the socket until its own idle timer, and the user would see a connection
 // that is dead at one end and open at the other.
 func (c *egressConsumer) configure(rules []egressRule, meshCIDR string, virtualIP string, now time.Time) map[int64][]string {
+	return c.configureIn(rules, meshCIDR, virtualIP, "", now)
+}
+
+// configureIn is configure with phase two: fakeIPCIDR is the pool while phase two runs, "" while it
+// does not. The pool's mappings outlive a rule change, since a name handed out under the old rules
+// may still be in an application's cache and has to be recognised as stale rather than unmapped;
+// they go only with the pool itself.
+func (c *egressConsumer) configureIn(rules []egressRule, meshCIDR, virtualIP, fakeIPCIDR string, now time.Time) map[int64][]string {
 	c.mu.Lock()
 	c.rules = append([]egressRule(nil), rules...)
 	if trimmed := strings.TrimSpace(meshCIDR); trimmed != "" {
 		c.meshCIDR = trimmed
 	}
 	c.virtualIP = strings.TrimSpace(virtualIP)
+	fakeIPCIDR = strings.TrimSpace(fakeIPCIDR)
+	if fakeIPCIDR != c.fakeIPCIDR {
+		c.fakeIPCIDR, c.fakeIP = "", nil
+		if pool, ok := parseEgressCIDR(fakeIPCIDR); ok {
+			c.fakeIPCIDR, c.fakeIP = fakeIPCIDR, newEgressFakeIPPool(pool)
+		}
+		// The responder's connections were to the old pool's listen address.
+		for _, conn := range c.dnsConns {
+			c.dropDNSConnLocked(conn)
+		}
+	}
 	purge, resets := c.purgeInvalidatedLocked(now)
 	toTun := c.toTun
 	c.mu.Unlock()
 	c.writeResets(toTun, resets)
 	return purge
+}
+
+// setDomainCapable replaces which egresses resolve names, from an accepted catalogue, and closes the
+// flows to names that an egress which no longer resolves them was carrying.
+func (c *egressConsumer) setDomainCapable(capable map[int64]bool, now time.Time) map[int64][]string {
+	c.mu.Lock()
+	c.capable = make(map[int64]bool, len(capable))
+	for id, able := range capable {
+		c.capable[id] = able
+	}
+	purge, resets := c.purgeInvalidatedLocked(now)
+	toTun := c.toTun
+	c.mu.Unlock()
+	c.writeResets(toTun, resets)
+	return purge
+}
+
+// assignFakeIP hands out the pool address for a name the DNS responder is answering (step four of
+// protocol/spec/peer-egress-dns.md). ok is false while phase two is not running. Each eviction and
+// an exhausted pool are logged, by fake address and never by name: which names this device looked
+// up is its user's browsing history.
+func (c *egressConsumer) assignFakeIP(name string, now time.Time) (assignment egressFakeIPAssignment, ok bool) {
+	c.mu.Lock()
+	pool := c.fakeIP
+	if pool != nil {
+		assignment = pool.assign(name, now)
+	}
+	c.mu.Unlock()
+	if pool == nil {
+		return egressFakeIPAssignment{}, false
+	}
+	c.logFakeIPAssignment(assignment)
+	return assignment, true
+}
+
+// logFakeIPAssignment says what an assignment cost: a line per evicted mapping and one for an
+// exhausted pool. Both are rare enough to be said under the consumer's lock when that is where the
+// assignment happened.
+func (c *egressConsumer) logFakeIPAssignment(assignment egressFakeIPAssignment) {
+	for _, evicted := range assignment.Evicted {
+		c.logger.Printf("[peer-egress-consumer] fake-IP mapping %s evicted after %s unused",
+			formatEgressAddress(evicted.Address), egressFakeIPMinLifetime)
+	}
+	if assignment.Exhausted {
+		c.logger.Printf("[peer-egress-consumer] fake-IP pool exhausted; the query is answered SERVFAIL")
+	}
+}
+
+// fakeIPName is the name a pool address was handed out for, for the responder's reverse answers.
+// Not a use of the mapping, so it does not refresh it.
+func (c *egressConsumer) fakeIPName(address uint32, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fakeIP == nil {
+		return "", false
+	}
+	return c.fakeIP.nameFor(address, now, false)
 }
 
 // setEgressOnline records whether an egress peer can take flows.
@@ -155,6 +278,11 @@ func (c *egressConsumer) setEgressOnline(egress int64, online bool, now time.Tim
 // and returns the destinations to purge per egress together with the resets that tell the
 // application each flow is over.
 //
+// A flow to a fake address is re-examined by the same decision a new packet gets, without touching
+// the mapping: a rule change is not traffic, and counting it as use would keep a name alive that
+// nothing is using. The purge names the fake address itself, which is what the egress keyed the
+// flow on.
+//
 // The resets are returned rather than written here, so the device is written to with no lock held.
 func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]string, [][]byte) {
 	// A flow already forgotten is not reset: its application stopped waiting long ago.
@@ -162,10 +290,11 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]stri
 	purge := map[int64][]string{}
 	var resets [][]byte
 	for key, flow := range c.flows {
-		decision := matchEgressRules(c.rules, formatEgressAddress(key.remoteIP), c.meshCIDR)
-		stillOurs := decision.Action == egressActionEgress &&
-			decision.EgressClientID == flow.Egress &&
-			c.online[flow.Egress]
+		steering := c.steerLocked(key.remoteIP, now, false)
+		stillOurs := steering.claimed && steering.blocked == "" &&
+			steering.egress == flow.Egress &&
+			c.online[flow.Egress] &&
+			(steering.name == "" || c.capable[flow.Egress])
 		if stillOurs {
 			continue
 		}
@@ -176,7 +305,6 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]stri
 			resets = append(resets, reset)
 		}
 	}
-	_ = now
 	for egress := range purge {
 		purge[egress] = sortedUniqueStrings(purge[egress])
 	}
@@ -209,6 +337,60 @@ func sortedUniqueStrings(values []string) []string {
 	return out
 }
 
+// egressSteering is what the rules say about one destination, before anything about the packet
+// itself is looked at.
+type egressSteering struct {
+	// claimed is false when no rule claims the destination and it is not in the fake-IP pool.
+	claimed bool
+	// blocked is the reason a claimed destination goes nowhere, and answered whether the
+	// application is told so at once.
+	blocked  string
+	answered bool
+	// egress carries the destination otherwise, and name is the name a fake address stands for.
+	egress int64
+	name   string
+}
+
+// steerLocked decides a destination.
+//
+// A destination in the fake-IP pool is steered by the name it was handed out for and never by an
+// address rule, which validation keeps out of the pool. It is always claimed: a pool address sent
+// out locally or to the wrong egress would take the traffic somewhere no rule said, which is the one
+// real leak of the fake-IP scheme. Outside the pool, phase one's address rules decide.
+//
+// touch refreshes the mapping, which traffic does and a rule change re-examining a flow does not.
+func (c *egressConsumer) steerLocked(destination uint32, now time.Time, touch bool) egressSteering {
+	if c.fakeIP != nil && c.fakeIP.contains(destination) {
+		// The responder's own address, the network and the broadcast are never mapped, so they
+		// fall here as well. Step four takes the responder's port 53 before this is reached.
+		name, mapped := c.fakeIP.nameFor(destination, now, touch)
+		if !mapped {
+			return egressSteering{claimed: true, blocked: "fake-ip-unmapped", answered: true}
+		}
+		index := selectEgressDomainRule(c.rules, name, c.meshCIDR, c.fakeIPCIDR)
+		if index < 0 || c.rules[index].Action == egressActionDirect {
+			// The name was handed out under rules that no longer claim it. Its real address is
+			// not known here, so letting it through could only be a guess; answering makes the
+			// application ask again, and the new query goes wherever the rules now say.
+			return egressSteering{claimed: true, blocked: "fake-ip-stale", answered: true}
+		}
+		rule := c.rules[index]
+		if rule.Action == egressActionBlock {
+			return egressSteering{claimed: true, blocked: "rule"}
+		}
+		return egressSteering{claimed: true, egress: rule.EgressClientID, name: name}
+	}
+	decision := matchEgressRulesIn(c.rules, formatEgressAddress(destination), c.meshCIDR, c.fakeIPCIDR)
+	if decision.Reason != egressReasonMatched ||
+		(decision.Action != egressActionEgress && decision.Action != egressActionBlock) {
+		return egressSteering{}
+	}
+	if decision.Action == egressActionBlock {
+		return egressSteering{claimed: true, blocked: "rule"}
+	}
+	return egressSteering{claimed: true, egress: decision.EgressClientID}
+}
+
 // handleOutbound decides what happens to one packet read from the TUN.
 //
 // A destination no rule claims returns egressOutcomeNotMine, so the caller falls through to its own
@@ -221,25 +403,41 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 		// IPv6 has no rules in this version, so nothing can claim it and it is not ours.
 		return egressOutcomeNotMine
 	}
-	destination := peerPacketDestinationIPv4(packet)
-	if destination == "" {
+	destination, parsed := parseEgressAddress(peerPacketDestinationIPv4(packet))
+	if !parsed {
 		return egressOutcomeNotMine
 	}
+	protocol := peerPacketProtocol(packet)
 
 	c.mu.Lock()
-	decision := matchEgressRules(c.rules, destination, c.meshCIDR)
-	if decision.Reason != egressReasonMatched ||
-		(decision.Action != egressActionEgress && decision.Action != egressActionBlock) {
+	// The responder's port comes before steering: the listen address is in the pool and never
+	// mapped, so steering would block its queries as unmapped.
+	if c.isDNSQueryPacketLocked(packet, destination, protocol) {
+		c.mu.Unlock()
+		c.handleDNSPacket(packet, protocol, now)
+		return egressOutcomeDNS
+	}
+	steering := c.steerLocked(destination, now, true)
+	if !steering.claimed {
 		c.mu.Unlock()
 		return egressOutcomeNotMine
 	}
-	if decision.Action == egressActionBlock {
-		c.recordBlockedLocked("rule")
+	if steering.blocked != "" {
+		c.recordBlockedLocked(steering.blocked)
+		toTun := c.toTun
 		c.mu.Unlock()
-		return egressOutcomeBlockedByRule
+		if !steering.answered {
+			// A block rule is a drop, as in phase one.
+			return egressOutcomeBlockedByRule
+		}
+		// A fake address nothing stands behind is answered like an unavailable egress, so the
+		// application fails now and asks again rather than waiting on its own timeout.
+		if answer := egressFailurePacket(packet, protocol); answer != nil && toTun != nil {
+			_ = toTun(answer)
+		}
+		return egressOutcomeBlockedFakeIP
 	}
 
-	protocol := peerPacketProtocol(packet)
 	if egressProtocolName(protocol) == "" {
 		// ICMP and anything else this version does not carry. The rule says this destination
 		// must not go out locally, so it is dropped rather than handed back.
@@ -247,8 +445,18 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 		c.mu.Unlock()
 		return egressOutcomeUnsupported
 	}
-	if !c.online[decision.EgressClientID] {
-		c.recordBlockedLocked("egress-unavailable")
+	unavailable := ""
+	switch {
+	case !c.online[steering.egress]:
+		unavailable = "egress-unavailable"
+	case steering.name != "" && !c.capable[steering.egress]:
+		// Online, but the catalogue does not say it resolves names. Sending the name anyway would
+		// have it refused at the far end; resolving it here would send the traffic from the wrong
+		// network. Answered the same way as an egress that is not there.
+		unavailable = "egress-no-domain"
+	}
+	if unavailable != "" {
+		c.recordBlockedLocked(unavailable)
 		toTun := c.toTun
 		c.mu.Unlock()
 		// Answered, not just dropped. The rule is doing what it should, but the application
@@ -262,6 +470,7 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 	}
 
 	key, ok := consumerFlowKeyFor(packet, protocol)
+	created, unanswered := !ok, false
 	if ok {
 		flow := c.liveFlowLocked(key, now)
 		if flow != nil && protocol == ipv4ProtocolTCP && !flow.closedAt.IsZero() && tcpPacketIsOpening(packet) {
@@ -270,19 +479,45 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 			flow = nil
 		}
 		if flow == nil {
-			flow = c.registerFlowLocked(key, decision.EgressClientID, now)
+			flow = c.registerFlowLocked(key, steering.egress, now)
+			created = true
 		}
 		flow.LastSeen = now
 		if protocol == ipv4ProtocolTCP {
 			flow.noteApplicationProgress(packet)
 			flow.noteTCPFlags(tcpPacketFlags(packet), true, now)
 		}
+		unanswered = protocol == ipv4ProtocolUDP && !flow.replied
 	}
-	egress, send := decision.EgressClientID, c.send
+	// The name goes ahead of the packet whenever the egress may be about to open a flow for it: a
+	// new flow, every SYN including the application's retransmissions, and every datagram until
+	// the egress has answered. Control messages are not reliable, so one copy is not enough; TCP
+	// recovers a lost one on the SYN it retransmits anyway, while UDP retransmits nothing of its
+	// own, so its datagrams carry the name until a reply shows the egress has it.
+	var nameBind []byte
+	if steering.name != "" && (created || unanswered || tcpPacketIsOpening(packet)) {
+		body, err := encodePeerEgressControl(peerEgressControl{
+			Type: peerEgressControlNameBind, Address: formatEgressAddress(destination), Name: steering.name,
+		})
+		if err == nil {
+			nameBind = encodePeerEgressFrame(peerEgressTypeControl, false, body)
+		}
+	}
+	egress, send := steering.egress, c.send
 	c.mu.Unlock()
 
 	if send == nil {
 		return egressOutcomeBlockedNoEgress
+	}
+	// A packet whose name did not leave is not sent either: the egress would open a flow to the
+	// fake address itself, which never works.
+	if nameBind != nil {
+		if err := send(egress, nameBind); err != nil {
+			c.mu.Lock()
+			c.recordBlockedLocked("send-failed")
+			c.mu.Unlock()
+			return egressOutcomeBlockedNoEgress
+		}
 	}
 	// hop stays clear: this node is acting as a consumer, not forwarding on behalf of another
 	// egress. An egress that receives it set refuses, which is what stops multi-hop chains.
@@ -390,6 +625,8 @@ func (c *egressConsumer) hasReturnFlowLocked(inner peerEgressInner, packet []byt
 		return false
 	}
 	flow.LastSeen = now
+	// The egress has the flow, and with it the name: the datagrams that follow need not carry it.
+	flow.replied = true
 	if inner.Protocol == ipv4ProtocolTCP {
 		flow.noteTCPFlags(tcpPacketFlags(packet), false, now)
 	}

@@ -18,11 +18,36 @@ internal sealed record PeerEgressApplyOutcome(long AtMillis,
 }
 
 /// <summary>The consumer's own view, taken under its caller's lock.</summary>
+/// <param name="Capable">Which egresses the last catalogue says resolve names.</param>
+/// <param name="FakeIpPool">The pool while phase two runs, which is what domain rules are validated against.</param>
 internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Rules,
     string MeshCidr, IReadOnlyDictionary<long, bool> Online, int Flows,
     IReadOnlyDictionary<string, long> Blocked,
     IReadOnlyDictionary<long, int>? FlowsByEgress = null,
-    IReadOnlyDictionary<long, string>? Paths = null);
+    IReadOnlyDictionary<long, string>? Paths = null,
+    IReadOnlyDictionary<long, bool>? Capable = null,
+    Ipv4Cidr? FakeIpPool = null);
+
+/// <summary>
+/// The <c>consumer.dns</c> section, present only while <c>peerEgressDnsTakeover</c> is on
+/// (protocol/spec/peer-egress-dns.md, section seven).
+/// </summary>
+/// <param name="Takeover">Whether phase two runs now.</param>
+/// <param name="Pool">The pool as configured, usable or not.</param>
+/// <param name="Mappings">Mappings held when the snapshot was taken.</param>
+/// <param name="Quarantined">Addresses still resting when the snapshot was taken.</param>
+/// <param name="Code">Why phase two does not run although it was asked for; null otherwise.</param>
+internal sealed record PeerEgressDnsStatus(bool Takeover, string Pool, int Mappings, int Quarantined, string? Code)
+{
+    /// <summary>The responder's listen address; null while phase two does not run.</summary>
+    public string? Listen { get; init; }
+
+    /// <summary>Where it forwards, as configured; empty when nothing is.</summary>
+    public IReadOnlyList<string>? Upstreams { get; init; }
+
+    /// <summary>What it has done with queries since it started; zeros before it ever ran.</summary>
+    public PeerEgressDnsCounters? Queries { get; init; }
+}
 
 /// <summary>The egress role's own view, taken under its lock.</summary>
 internal sealed record PeerEgressRuntimeStatus(bool Enabled, long Revision, int Flows,
@@ -70,13 +95,18 @@ internal static class PeerEgressStatus
     /// </summary>
     public static Dictionary<string, object?> Section(PeerEgressConsumerStatus? consumer,
         IReadOnlyList<PeerEgressRoute> installed, PeerEgressApplyOutcome outcome,
-        PeerEgressRuntimeStatus? runtime, bool enabled, IReadOnlyList<PeerEgressRule>? configured)
+        PeerEgressRuntimeStatus? runtime, bool enabled, IReadOnlyList<PeerEgressRule>? configured,
+        PeerEgressDnsStatus? dns = null)
     {
         var consumerSection = ConsumerSection(consumer, installed, outcome);
         consumerSection["enabled"] = enabled;
         if (!enabled && configured is { Count: > 0 })
         {
             consumerSection["rules"] = SwitchedOffRules(configured);
+        }
+        if (dns is not null)
+        {
+            consumerSection["dns"] = DnsSection(dns);
         }
         return new()
         {
@@ -99,6 +129,7 @@ internal static class PeerEgressStatus
             {
                 ["index"] = index,
                 ["match"] = rule.Match?.Trim() ?? string.Empty,
+                ["kind"] = Kind(rule),
                 ["action"] = rule.Action?.Trim() ?? string.Empty,
                 ["inForce"] = false,
                 ["code"] = rule.SwitchedOff ? PeerEgressCodes.RuleDisabled : PeerEgressCodes.ConsumerDisabled,
@@ -140,11 +171,16 @@ internal static class PeerEgressStatus
         for (var index = 0; index < consumer.Rules.Count; index++)
         {
             var rule = consumer.Rules[index];
-            // Validate returns null for a usable rule here, where the Go implementation returns an
+            // RuleStatus returns null for a usable rule here, where the Go implementation returns an
             // empty string. Normalised at the boundary rather than compared against null twice
             // below: "in force" is one condition, and writing it two ways is how the two halves of
-            // this section end up disagreeing about the same rule.
-            var code = PeerEgressRules.Validate(rule, consumer.MeshCidr) ?? string.Empty;
+            // this section end up disagreeing about the same rule. It is the validation steering
+            // uses, plus phase two's one check about the egress rather than the rule: a domain rule
+            // to an online egress that does not resolve names.
+            var code = PeerEgressRules.RuleStatus(rule, consumer.MeshCidr, consumer.FakeIpPool,
+                egress => consumer.Online.TryGetValue(egress, out var up) && up,
+                egress => consumer.Capable is not null && consumer.Capable.TryGetValue(egress, out var able) && able)
+                ?? string.Empty;
             // inForce is the field worth having. A rule that is configured but refused reads false
             // and carries its code, which is the difference between "this rule is protecting me"
             // and "this rule is text in a file".
@@ -152,6 +188,7 @@ internal static class PeerEgressStatus
             {
                 ["index"] = index,
                 ["match"] = (rule.Match ?? string.Empty).Trim(),
+                ["kind"] = Kind(rule),
                 ["action"] = (rule.Action ?? string.Empty).Trim(),
                 ["inForce"] = code.Length == 0,
             };
@@ -197,6 +234,48 @@ internal static class PeerEgressStatus
             {
                 section["routeError"] = outcome.Error;
             }
+        }
+        return section;
+    }
+
+    /// <summary>What a rule's match is written as: a name or an address.</summary>
+    internal static string Kind(PeerEgressRule rule) =>
+        PeerEgressRules.IsDomainMatch(rule.Match) ? KindDomain : KindCidr;
+
+    internal const string KindCidr = "cidr";
+    internal const string KindDomain = "domain";
+
+    /// <summary>
+    /// <c>consumer.dns</c>, in the order the spec lists it. The responder's fields are there while
+    /// it answers; the journal arrives with step five. What is not delivered is left out rather than
+    /// written empty.
+    /// </summary>
+    private static Dictionary<string, object?> DnsSection(PeerEgressDnsStatus dns)
+    {
+        var section = new Dictionary<string, object?> { ["takeover"] = dns.Takeover };
+        if (dns.Listen is not null)
+        {
+            section["listen"] = dns.Listen;
+        }
+        section["pool"] = dns.Pool;
+        section["mappings"] = dns.Mappings;
+        section["quarantined"] = dns.Quarantined;
+        if (dns.Upstreams is not null)
+        {
+            section["upstreams"] = dns.Upstreams;
+        }
+        if (dns.Queries is { } queries)
+        {
+            section["queries"] = new Dictionary<string, object?>
+            {
+                ["answered"] = queries.Answered,
+                ["forwarded"] = queries.Forwarded,
+                ["failed"] = queries.Failed,
+            };
+        }
+        if (dns.Code is not null)
+        {
+            section["code"] = dns.Code;
         }
         return section;
     }

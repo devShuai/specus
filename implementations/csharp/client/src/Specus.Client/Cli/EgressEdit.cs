@@ -95,9 +95,26 @@ internal static class EgressEdit
     /// <summary>Why a rule is not in force as configured, or null; the master switch is not part of it.</summary>
     internal static string? RuleCode(PeerEgressRule rule) => PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr);
 
+    /// <summary>
+    /// Why a rule is not in force under a configuration, or null. Phase two counts as the rule's own
+    /// setting -- with peerEgressDnsTakeover on and a usable pool a domain rule is accepted -- and
+    /// the master switch, as ever, does not.
+    /// </summary>
+    internal static string? RuleCode(SpecusClientConfig config, PeerEgressRule rule) =>
+        PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config));
+
+    /// <summary>The pool domain rules would run over with the master switch on, or null.</summary>
+    internal static Ipv4Cidr? PhaseTwoPool(SpecusClientConfig config) =>
+        PeerEgressRules.PhaseTwo(true, config.PeerEgressDnsTakeover, config.PeerEgressFakeIpCidr,
+            PeerEgressRules.DefaultMeshCidr).RunningPool;
+
     /// <summary>The code a rule reports in status: the master switch off names itself unless the rule was switched off.</summary>
     internal static string? StatusCode(bool enabled, PeerEgressRule rule) =>
         !enabled && !rule.SwitchedOff ? PeerEgressCodes.ConsumerDisabled : RuleCode(rule);
+
+    /// <summary>As <see cref="StatusCode(bool, PeerEgressRule)"/>, under a configuration's phase two.</summary>
+    internal static string? StatusCode(SpecusClientConfig config, PeerEgressRule rule) =>
+        !config.PeerEgressEnabled && !rule.SwitchedOff ? PeerEgressCodes.ConsumerDisabled : RuleCode(config, rule);
 
     /// <summary>One line a person can act on for a rule's code, in the words the Go and Java clients use too.</summary>
     internal static string Explanation(string code) => code switch
@@ -107,6 +124,7 @@ internal static class EgressEdit
         PeerEgressCodes.RuleMalformed => "not an IPv4 address or CIDR range with zero host bits, or an unknown action",
         PeerEgressCodes.RuleDefaultRoute => "0.0.0.0/0 would take over the default route, which is not allowed",
         PeerEgressCodes.RuleMeshOverlap => "overlaps the Peer Mesh network",
+        PeerEgressCodes.RuleFakeIpOverlap => "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out",
         PeerEgressCodes.RulePortUnsupported => "a rule cannot be limited to a port; port limits belong on the egress policy",
         PeerEgressCodes.RuleMissingTarget => "an egress rule needs a positive egress device id",
         PeerEgressCodes.RuleDisabled => "switched off",
@@ -127,9 +145,9 @@ internal static class EgressEdit
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
-            var status = StatusCode(enabled, rule);
+            var status = StatusCode(config, rule);
             // The rule's own problem, told apart from being off: worth fixing before takeover is on.
-            var refusal = RuleCode(rule with { Enabled = null });
+            var refusal = RuleCode(config, rule with { Enabled = null });
             var view = new Dictionary<string, object?>
             {
                 ["index"] = index,
@@ -188,7 +206,8 @@ internal static class EgressEdit
                 preface.Add("Warning: peerMeshDevice is noop, so there is no interface to route into; set it to auto.");
             return new Planned("peerEgressEnabled", "true", preface);
         }
-        return new Planned("peerEgressRules", EncodeRules(ApplyRules(config.PeerEgressRules, change)), []);
+        return new Planned("peerEgressRules",
+            EncodeRules(ApplyRules(config.PeerEgressRules, change, PhaseTwoPool(config))), []);
     }
 
     /// <summary>Whether a peerMeshDevice value leaves takeover no interface to route into.</summary>
@@ -198,8 +217,10 @@ internal static class EgressEdit
     /// <summary>
     /// The rule list after one edit. The commands and the local page write it into the configuration
     /// file; the desktop page keeps it in its own settings. Either way the same edits are refused.
+    /// A domain rule is accepted only with a phase-two pool, which the desktop page never has.
     /// </summary>
-    internal static List<PeerEgressRule> ApplyRules(IReadOnlyList<PeerEgressRule> current, Change change)
+    internal static List<PeerEgressRule> ApplyRules(IReadOnlyList<PeerEgressRule> current, Change change,
+        Ipv4Cidr? fakeIpPool = null)
     {
         var rules = current.ToList();
         var count = rules.Count;
@@ -215,7 +236,8 @@ internal static class EgressEdit
                 };
                 // Refused rules are allowed in the file, where they are warned about, but an edit that
                 // adds one on request would only be writing a rule that steers nothing.
-                if (RuleCode(rule) is { } code) throw new PlanFailure($"Rule not added: {code} ({Explanation(code)})");
+                if (PeerEgressRules.Validate(rule, PeerEgressRules.DefaultMeshCidr, fakeIpPool) is { } code)
+                    throw new PlanFailure($"Rule not added: {code} ({Explanation(code)})");
                 if (change.Disabled) rule = rule with { Enabled = false };
                 var at = count;
                 if (change.At >= 0)
@@ -413,7 +435,7 @@ internal static class EgressEdit
     internal static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines)
     {
         var rules = config.PeerEgressRules;
-        var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr);
+        var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config));
         var matched = match.Matched ? match.MatchedRuleIndex : -1;
         var takeover = config.PeerEgressEnabled;
         var data = new Dictionary<string, object?>

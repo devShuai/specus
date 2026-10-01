@@ -47,6 +47,17 @@ type consumerStatusSnapshot struct {
 	// traffic is on.
 	FlowsByEgress map[int64]int
 	Blocked       map[string]int64
+	// Phase two: the pool while it runs ("" otherwise), which egresses resolve names, and the
+	// pool's live mappings and quarantined addresses as of the snapshot.
+	FakeIPCIDR  string
+	Capable     map[int64]bool
+	Mappings    int
+	Quarantined int
+	// The responder: where it listens ("" while phase two does not run), what it forwards to, and
+	// its counters.
+	Listen     string
+	Upstreams  []string
+	DNSQueries egressDNSQueries
 }
 
 func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
@@ -58,6 +69,10 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	for id, up := range c.online {
 		online[id] = up
 	}
+	capable := make(map[int64]bool, len(c.capable))
+	for id, able := range c.capable {
+		capable[id] = able
+	}
 	blocked := make(map[string]int64, len(c.blocked))
 	for reason, count := range c.blocked {
 		blocked[reason] = count
@@ -66,14 +81,24 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	for _, flow := range c.flows {
 		byEgress[flow.Egress]++
 	}
-	return consumerStatusSnapshot{
+	snapshot := consumerStatusSnapshot{
 		Rules:         append([]egressRule(nil), c.rules...),
 		MeshCIDR:      c.meshCIDR,
 		Online:        online,
 		Flows:         len(c.flows),
 		FlowsByEgress: byEgress,
 		Blocked:       blocked,
+		FakeIPCIDR:    c.fakeIPCIDR,
+		Capable:       capable,
+		Upstreams:     append([]string{}, c.dnsUpstreams...),
+		DNSQueries:    c.dnsQueries,
 	}
+	if c.fakeIP != nil {
+		// Counted at the moment of asking: a quarantine that ended an hour ago is not one.
+		snapshot.Mappings, snapshot.Quarantined = c.fakeIP.counts(c.clock())
+		snapshot.Listen = formatEgressAddress(c.fakeIP.listen)
+	}
+	return snapshot
 }
 
 // runtimeStatusSnapshot is the egress role's own view, taken under its lock.
@@ -131,9 +156,62 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 		// listed all the same: "kept but not taking anything over" is a state to show, not to hide.
 		section["rules"] = switchedOffRulesJSON(mesh.config.PeerEgressRules)
 	}
+	if mesh.config.PeerEgressDNSTakeover {
+		section["dns"] = mesh.egressDNSStatusJSON(consumer)
+	}
 	status["consumer"] = section
 	status["egress"] = egressRoleStatusJSON(runtime)
 	return status
+}
+
+// egressDNSStatusJSON is consumer.dns: whether phase two is running, what its pool holds, and what
+// the responder is doing. Only written when peerEgressDnsTakeover is on, so a node that never asked
+// for phase two reads exactly as before. listen is there only while the responder answers on it;
+// journal belongs to the system DNS takeover, a later step, and a field not delivered yet is left
+// out rather than faked.
+func (mesh *peerMeshClient) egressDNSStatusJSON(consumer *egressConsumer) map[string]any {
+	phase := mesh.currentEgressPhaseTwo()
+	mesh.mu.Lock()
+	upstreams := append([]string{}, mesh.egressDNSUpstreams...)
+	takeover := mesh.egressDNSTakeoverStatusLocked()
+	mesh.mu.Unlock()
+	var queries egressDNSQueries
+	// active is phase two running -- pool, route, responder -- and takeover the system's DNS
+	// pointing at it, with the journal committed. A pool that is not usable stops both and is the
+	// code given; otherwise a refused or failed takeover says why.
+	dns := map[string]any{
+		"active":      phase.Active,
+		"takeover":    phase.Active && takeover.Takeover,
+		"pool":        phase.CIDR,
+		"mappings":    0,
+		"quarantined": 0,
+		"journal":     takeover.Journal,
+	}
+	switch {
+	case phase.Code != "":
+		dns["code"] = phase.Code
+	case phase.Active && takeover.Code == egressCodeDNSTakeoverRefused:
+		dns["code"], dns["reason"] = takeover.Code, takeover.Reason
+	case takeover.Code == egressCodeDNSTakeoverFailed:
+		dns["code"], dns["error"] = takeover.Code, takeover.Error
+	}
+	if consumer != nil {
+		snapshot := consumer.statusSnapshot()
+		upstreams, queries = snapshot.Upstreams, snapshot.DNSQueries
+		if phase.Active {
+			dns["mappings"], dns["quarantined"] = snapshot.Mappings, snapshot.Quarantined
+			if snapshot.Listen != "" {
+				dns["listen"] = snapshot.Listen
+			}
+		}
+	}
+	dns["upstreams"] = upstreams
+	// Totals since start, split the way they are read: built here, relayed from an upstream,
+	// and failed.
+	dns["queries"] = map[string]int64{
+		"answered": queries.Answered, "forwarded": queries.Forwarded, "failed": queries.Failed,
+	}
+	return dns
 }
 
 // switchedOffRulesJSON lists configured rules while the master switch is off. None is in force; a
@@ -148,6 +226,7 @@ func switchedOffRulesJSON(configured []egressRule) []map[string]any {
 		entry := map[string]any{
 			"index":   index,
 			"match":   strings.TrimSpace(rule.Match),
+			"kind":    egressRuleKind(rule.Match),
 			"action":  strings.TrimSpace(rule.Action),
 			"inForce": false,
 			"code":    code,
@@ -190,13 +269,16 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 	rules := make([]map[string]any, 0, len(snapshot.Rules))
 	peers := map[int64]bool{}
 	for index, rule := range snapshot.Rules {
-		code := validateEgressRule(rule, snapshot.MeshCIDR)
+		// With phase two's pool and the catalogue's capabilities, so a domain rule reads as in
+		// force exactly when steering would act on it.
+		code := egressRuleStatusCode(rule, snapshot.MeshCIDR, snapshot.FakeIPCIDR, snapshot.Online, snapshot.Capable)
 		// inForce is the field worth having. A rule that is configured but refused reads
 		// false and carries its code, which is the difference between "this rule is
 		// protecting me" and "this rule is text in a file".
 		entry := map[string]any{
 			"index":   index,
 			"match":   strings.TrimSpace(rule.Match),
+			"kind":    egressRuleKind(rule.Match),
 			"action":  strings.TrimSpace(rule.Action),
 			"inForce": code == "",
 		}
@@ -207,7 +289,8 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 			entry["egressClientId"] = rule.EgressClientID
 			if code == "" {
 				// Only rules that steer contribute a peer. A refused rule naming a peer
-				// would otherwise report an egress this node will never send to.
+				// would otherwise report an egress this node will never send to; so would
+				// a domain rule to an egress that cannot resolve names.
 				peers[rule.EgressClientID] = snapshot.Online[rule.EgressClientID]
 			}
 		}

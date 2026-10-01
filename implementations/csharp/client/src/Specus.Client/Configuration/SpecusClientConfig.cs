@@ -56,6 +56,21 @@ public sealed class SpecusClientConfig
     [JsonPropertyName("peerEgressEnabled")]
     public bool PeerEgressEnabled { get; set; }
 
+    /// <summary>
+    /// Phase two of peer egress: domain rules, answered from the fake-IP pool
+    /// (protocol/spec/peer-egress-dns.md). Off by default, and it needs <see cref="PeerEgressEnabled"/>
+    /// as well; off, a domain rule is refused exactly as before.
+    /// </summary>
+    [JsonPropertyName("peerEgressDnsTakeover")]
+    public bool PeerEgressDnsTakeover { get; set; }
+
+    /// <summary>
+    /// The fake-IP pool: an IPv4 prefix of /8 to /24. One that is not usable stops phase two and
+    /// leaves phase one running.
+    /// </summary>
+    [JsonPropertyName("peerEgressFakeIpCidr")]
+    public string PeerEgressFakeIpCidr { get; set; } = Specus.Protocol.PeerEgress.PeerEgressRules.DefaultFakeIpCidr;
+
     [JsonPropertyName("updateCheckEnabled")]
     public bool UpdateEnabled { get; set; } = true;
 
@@ -81,6 +96,11 @@ public sealed class SpecusClientConfig
         PeerMeshMtu = PeerMeshMtu <= 0
             ? DefaultPeerMeshMtu
             : Math.Clamp(PeerMeshMtu, MinPeerMeshMtu, MaxPeerMeshMtu);
+        // Absent or blank is the default, like the other string settings. Anything else is kept as
+        // written, so an unusable pool is reported as such rather than quietly replaced.
+        PeerEgressFakeIpCidr = string.IsNullOrWhiteSpace(PeerEgressFakeIpCidr)
+            ? Specus.Protocol.PeerEgress.PeerEgressRules.DefaultFakeIpCidr
+            : PeerEgressFakeIpCidr.Trim();
         UpdateCheckIntervalHours = UpdateCheckIntervalHours <= 0
             ? DefaultUpdateCheckIntervalHours
             : Math.Clamp(UpdateCheckIntervalHours, MinUpdateCheckIntervalHours, MaxUpdateCheckIntervalHours);

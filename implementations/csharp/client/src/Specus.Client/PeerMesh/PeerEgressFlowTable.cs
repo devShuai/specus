@@ -60,6 +60,12 @@ internal sealed class PeerEgressFlowTable
         public long BytesFromRemote { get; set; }
 
         /// <summary>
+        /// The name the consumer had bound to the flow's address when the flow opened, normalised;
+        /// null for a flow opened by address. A later name-bind for another name closes it.
+        /// </summary>
+        public string? Name { get; set; }
+
+        /// <summary>
         /// A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
         /// but the entry stays until the timer so a retransmitted FIN is still answered.
         /// </summary>
@@ -268,6 +274,23 @@ internal sealed class PeerEgressFlowTable
             return false;
         });
     }
+
+    /// <summary>
+    /// Closes every flow of one consumer to one address that was not opened for the name now bound
+    /// to it (protocol/spec/peer-egress-dns.md, vector <c>nameBindClosesFlows</c>).
+    /// </summary>
+    /// <remarks>
+    /// A flow opened before its name arrived was dialled to the fake address itself and will never
+    /// work, and the retransmitted SYN or next datagram that follows the name would only be taken as
+    /// more of it. Closed, the next packet opens the flow by name. A flow opened for another name is
+    /// closed for the same reason: the address stands for something else now. The same name bound
+    /// again closes nothing. Whether the consumer hears of a closed flow is the caller's to decide,
+    /// by <see cref="Flow.Name"/>.
+    /// </remarks>
+    public List<Flow> Rebind(long consumer, uint address, string name) =>
+        Reap(flow => flow.Consumer == consumer
+            && flow.Key.RemoteIp == address
+            && !string.Equals(flow.Name, name, StringComparison.Ordinal));
 
     /// <summary>
     /// Reports whether a packet arriving from the real network belongs to a flow this node opened.

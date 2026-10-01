@@ -296,6 +296,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public bool ConsumerEnabled => owner._config.PeerEgressEnabled;
 
+        public bool DnsTakeover => owner._config.PeerEgressDnsTakeover;
+
+        public string FakeIpCidr => owner._config.PeerEgressFakeIpCidr;
+
         public IReadOnlyDictionary<long, bool> EgressAvailability
         {
             get
@@ -769,6 +773,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     // The raw payload rather than the parsed control message: the egress fields are
                     // this feature's own and do not belong on the mesh's signalling type.
                     _egress.ApplyEgressConfig(payload);
+                    break;
+                case PeerEgressCatalogMessage.Type:
+                    // Raw for the same reason. The consumer reads which egresses resolve names.
+                    _egress.ApplyEgressCatalog(payload);
                     break;
                 case TypeSessionGrant:
                     MergeSession(message);
@@ -4700,6 +4708,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     internal void Suspend()
     {
         _egress.ShutdownServing();
+        // Revisions count within one control session; the next session's catalogue starts afresh.
+        _egress.NewControlSession();
         lock (_sync)
         {
             _writer = null;

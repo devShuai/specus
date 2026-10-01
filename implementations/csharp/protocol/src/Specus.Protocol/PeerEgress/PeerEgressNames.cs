@@ -10,25 +10,49 @@ namespace Specus.Protocol.PeerEgress;
 /// </remarks>
 public static class PeerEgressNames
 {
-    /// <summary>No trailing dot, lower case.</summary>
-    public static string Normalize(string? name)
-    {
-        var text = (name ?? string.Empty).Trim();
-        if (text.EndsWith('.'))
-        {
-            text = text[..^1];
-        }
-        return text.ToLowerInvariant();
-    }
+    /// <summary>No trailing dots, lower case.</summary>
+    /// <remarks>
+    /// Every trailing dot goes, as in the reference and the other clients: a name written with two
+    /// would otherwise be a different name here and the same name there.
+    /// </remarks>
+    public static string Normalize(string? name) => (name ?? string.Empty).Trim().TrimEnd('.').ToLowerInvariant();
 
     /// <summary>
     /// Whether a name is one to resolve: ASCII labels of 1-63 bytes from a-z, 0-9 and '-', not
     /// starting or ending with '-', at least two labels, at most 253 bytes, and not all digits (which
     /// would be an address). IDN must arrive as punycode.
     /// </summary>
-    public static bool Valid(string? name)
+    public static bool Valid(string? name) => ValidNormalized(Normalize(name));
+
+    /// <summary>
+    /// Whether a rule's match is a well-formed domain: <c>name</c> or <c>*.name</c>, where the
+    /// name is one <see cref="Valid"/> accepts and the wildcard is the whole leftmost label, once.
+    /// </summary>
+    /// <remarks>
+    /// Anything outside ASCII is refused before the name is lower-cased. IDN must be written as
+    /// punycode, and lower-casing first would let a character such as the Kelvin sign fold into an
+    /// ASCII letter and pass as a name the operator never wrote.
+    /// </remarks>
+    public static bool ValidMatch(string? match)
     {
-        var text = Normalize(name);
+        var raw = match ?? string.Empty;
+        foreach (var c in raw)
+        {
+            if (c > 127)
+            {
+                return false;
+            }
+        }
+        var text = Normalize(raw);
+        if (text.StartsWith("*.", StringComparison.Ordinal))
+        {
+            text = text[2..];
+        }
+        return !text.Contains('*', StringComparison.Ordinal) && ValidNormalized(text);
+    }
+
+    private static bool ValidNormalized(string text)
+    {
         if (text.Length == 0 || text.Length > 253)
         {
             return false;
