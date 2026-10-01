@@ -394,3 +394,5 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
    网络切换、`egress dns status` 与 `egress dns restore`、状态的 `active`/`takeover`，三端三平台。
    用户文档从这一步起介绍 `peerEgressDnsTakeover`，并写明「可识别边界」那句话。
 6. 实验室：Linux 命名空间里完整跑通（resolv.conf 方式），并增加「池内无映射」与「接管后强杀再启动」用例。
+   `scripts/peer-egress-lab/lab.py` 的 `phase_two`：实验室自己的挂载命名空间里给 `/etc` 盖一层 overlay，
+   经 `ip netns exec` 给消费端一份自己的 `resolv.conf`、给出口一份只有它认得目标名字的 `hosts`，宿主机不留文件。
