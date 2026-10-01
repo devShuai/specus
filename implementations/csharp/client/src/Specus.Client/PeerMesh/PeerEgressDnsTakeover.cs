@@ -90,8 +90,18 @@ internal sealed record PeerEgressDnsJournal
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     /// <summary>Beside the route install record, in the same private directory.</summary>
-    public static string DefaultPath =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".specus", "egress-dns-journal.json");
+    public static string DefaultPath => Path.Combine(Home(), ".specus", "egress-dns-journal.json");
+
+    /// <summary>
+    /// The user's home as the other clients find it: <c>USERPROFILE</c> on Windows and <c>HOME</c>
+    /// elsewhere when set, the system's answer otherwise. .NET asks Windows directly and would
+    /// otherwise look somewhere else than the Go client for the same user's journal.
+    /// </summary>
+    private static string Home()
+    {
+        var variable = Environment.GetEnvironmentVariable(OperatingSystem.IsWindows() ? "USERPROFILE" : "HOME");
+        return string.IsNullOrWhiteSpace(variable) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : variable;
+    }
 
     /// <summary>The journal, or null when there is none. One that cannot be read throws: it is the only record of what to put back.</summary>
     public static PeerEgressDnsJournal? Read(string path)

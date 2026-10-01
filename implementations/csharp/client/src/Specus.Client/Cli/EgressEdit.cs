@@ -349,18 +349,16 @@ internal static class EgressEdit
 
     /// <summary>
     /// <c>egress dns enable|disable</c>: sets <c>peerEgressDnsTakeover</c> the way <c>egress
-    /// enable|disable</c> sets the master switch, the change stated every time it is turned on.
+    /// enable|disable</c> sets the master switch. Turning it on states the change every time, even
+    /// when the file already says so: whoever runs it is agreeing to what the switch does to the
+    /// system, not only to a value in a file, and the confirmation cannot depend on what the file
+    /// held before.
     /// </summary>
     private static int DnsToggle(ClientCliOptions options, string path)
     {
         var loaded = Load(options, path);
         var config = loaded.Config;
         var on = options.Command == "egress dns enable";
-        if (config.PeerEgressDnsTakeover == on)
-        {
-            return CliOutput.Result(options.Json, options.Command, 0, DnsData(path, config),
-                $"DNS takeover is already {(on ? "on" : "off")}; nothing was changed.\n{DnsLine(config)}");
-        }
         if (on && !options.Egress.Yes)
             throw Fail(options, string.Join("\n", DnsEnableNotice) + "\nNot changed. Re-run with --yes to confirm.");
         var message = new List<string>();

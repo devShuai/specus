@@ -851,9 +851,19 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         Assert.False(data.GetProperty("dnsTakeover").GetBoolean());
         Assert.Contains("\"peerEgressDnsTakeover\": false", await File.ReadAllTextAsync(path), StringComparison.Ordinal);
 
+        // Said and written again whatever the file already holds: the notice is part of turning it on.
         (code, output, _) = await Cli("egress", "dns", "disable", "--config", path);
         Assert.Equal(0, code);
-        Assert.Equal("DNS takeover is already off; nothing was changed.\ndns takeover: off", output.TrimEnd('\n'));
+        Assert.Equal([$"Saved {path}. A running client applies the change after a restart.", "dns takeover: off"],
+            output.TrimEnd('\n').Split('\n'));
+        (code, _, errors) = await Cli("egress", "dns", "enable", "--config", path);
+        Assert.Equal(2, code);
+        (code, output, _) = await Cli("egress", "dns", "enable", "--yes", "--config", path);
+        Assert.Equal(0, code);
+        (code, output, _) = await Cli("egress", "dns", "enable", "--yes", "--config", path);
+        Assert.Equal(0, code);
+        Assert.Equal(notice, output.Split('\n').Take(4));
+        Assert.EndsWith("dns takeover: on (pool 198.18.0.0/15)\n", output, StringComparison.Ordinal);
 
         var state = Path.Combine(_directory, "state");
         (code, output, _) = await Cli(["egress", "dns", "status", "--config", path], state);
@@ -875,6 +885,9 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
             RedirectStandardError = true,
         };
         start.Environment["SPECUS_CLI_STATE_DIR"] = stateDirectory;
+        // The journal is looked for under the home directory, which is the test's own here.
+        start.Environment["HOME"] = _directory;
+        start.Environment["USERPROFILE"] = _directory;
         start.ArgumentList.Add(typeof(Specus.Client.Control.SpecusControlClient).Assembly.Location);
         foreach (var arg in args)
         {
