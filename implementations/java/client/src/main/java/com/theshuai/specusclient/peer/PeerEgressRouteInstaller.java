@@ -125,6 +125,14 @@ public final class PeerEgressRouteInstaller {
         this.journalPath = journalPath;
     }
 
+    /**
+     * The platform's routing table as the commander reads it, for a reader other than the repair:
+     * the DNS takeover's network fingerprint.
+     */
+    public Table table() throws IOException {
+        return commander.table();
+    }
+
     /** The routes this feature currently owns, in the order they were installed. */
     public List<Route> installed() {
         return List.copyOf(installed);
