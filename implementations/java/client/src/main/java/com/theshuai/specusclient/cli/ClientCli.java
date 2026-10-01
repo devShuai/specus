@@ -273,6 +273,9 @@ public final class ClientCli {
         config.setPeerMeshTunName(peer.tunName());
         config.setPeerMeshMtu(peer.mtu());
         config.setUpdateCheckIntervalHours(config.getUpdateCheckIntervalHours() <= 0 ? 24 : Math.min(168, config.getUpdateCheckIntervalHours()));
+        // Filled in rather than left empty, so what the configuration shows is the pool in use. Not
+        // checked here: an unusable pool stops phase two, not the client.
+        config.setPeerEgressFakeIpCidr(com.theshuai.common.peeregress.PeerEgressDns.effectivePool(config.getPeerEgressFakeIpCidr()));
         ConfigDiagnostics.report(raw, mapper.valueToTree(new ClientStartupConfig()), config, warning);
         return config;
     }

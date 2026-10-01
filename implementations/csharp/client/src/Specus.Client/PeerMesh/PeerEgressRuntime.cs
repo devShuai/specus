@@ -334,9 +334,35 @@ internal sealed class PeerEgressRuntime
         {
             // Validated with the frame; the address parses and the name is well formed.
             Ipv4Cidr.TryParseAddress(control.Address, out var address);
+            var name = PeerEgressNames.Normalize(control.Name);
             lock (_lock)
             {
-                _names.Bind(consumer, address, PeerEgressNames.Normalize(control.Name));
+                _names.Bind(consumer, address, name);
+                // The flows to this address that were not opened for this name are dialled to the
+                // wrong place (protocol/spec/peer-egress-dns.md, vector nameBindClosesFlows). None
+                // is followed by a flow-reject: the consumer's side of the flow is sound, and the
+                // packet right behind this binding reopens it by name, so a rejection arriving after
+                // it would have the consumer forget the flow just reopened and refuse its replies.
+                var closed = _flows.Rebind(consumer, address, name);
+                // One opened before any name arrived went to the fake address itself and never
+                // reached anything. It goes silently, this side only: what follows the binding is
+                // usually the application's own retransmitted SYN, and a reset now would refuse
+                // the very connection the binding was sent to rescue.
+                var silent = closed.Where(flow => flow.Name is null).ToList();
+                foreach (var flow in silent)
+                {
+                    CloseHandle(flow.Handle);
+                }
+                if (silent.Count > 0)
+                {
+                    _logger?.LogDebug("[peer-egress] flows opened ahead of their name closed count={Count} active={Active}",
+                        silent.Count, _flows.Count);
+                }
+                // One opened for another name was a real connection to somewhere the address no
+                // longer means, and is ended like a revoked one: a reset for TCP, the socket
+                // released.
+                ReleaseAll(PeerEgressFlowTable.RevocationsFor(
+                    closed.Where(flow => flow.Name is not null).ToList(), null), nowMs);
             }
             return;
         }
@@ -427,7 +453,14 @@ internal sealed class PeerEgressRuntime
             return;
         }
         Monitor.Enter(_lock);
-        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs);
+        if (BindingMoved(consumer, key, destination.Value.Name))
+        {
+            // Rebound while this SYN was being resolved. Its retransmission opens the flow for the
+            // name the address stands for now.
+            Monitor.Exit(_lock);
+            return;
+        }
+        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs, destination.Value.Name);
         if (code is not null)
         {
             Monitor.Exit(_lock);
@@ -668,7 +701,14 @@ internal sealed class PeerEgressRuntime
                 return;
             }
             Monitor.Enter(_lock);
-            var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs);
+            if (BindingMoved(consumer, key, destination.Value.Name))
+            {
+                // Rebound while this datagram was being resolved; the consumer's next one carries
+                // the new name, as every datagram does until the egress answers.
+                Monitor.Exit(_lock);
+                return;
+            }
+            var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs, destination.Value.Name);
             if (code is not null)
             {
                 Monitor.Exit(_lock);
@@ -882,14 +922,21 @@ internal sealed class PeerEgressRuntime
     /// back from it, and the authorization is of the address actually dialled.
     /// </summary>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) ReserveTo(
-        long consumer, PeerEgressFlowTable.Key key, uint destination, long nowMs)
+        long consumer, PeerEgressFlowTable.Key key, uint destination, long nowMs, string? name = null)
     {
         if (AuthorizeTo(consumer, key, destination) is { } code)
         {
             return (null, code, false);
         }
         var opened = _flows.Open(key, consumer, nowMs);
-        return opened is not null ? (opened, null, true) : (_flows.Lookup(key), null, false);
+        if (opened is not null)
+        {
+            // Remembered so a later name-bind can tell a flow opened for its name from one that
+            // was not.
+            opened.Name = name;
+            return (opened, null, true);
+        }
+        return (_flows.Lookup(key), null, false);
     }
 
     /// <summary>The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held.</summary>
@@ -916,8 +963,11 @@ internal sealed class PeerEgressRuntime
         return decision.Allowed ? null : decision.Code;
     }
 
-    /// <summary>Where a new flow goes: the address to dial, or the code that refuses it.</summary>
-    internal readonly record struct Choice(uint Address, string? Code);
+    /// <summary>
+    /// Where a new flow goes: the address to dial, or the code that refuses it, and the name it is
+    /// dialled for when the consumer bound one to the address.
+    /// </summary>
+    internal readonly record struct Choice(uint Address, string? Code, string? Name = null);
 
     /// <summary>
     /// Picks the address a named flow is dialled to: the first resolved address the authorization
@@ -979,9 +1029,17 @@ internal sealed class PeerEgressRuntime
         lock (_lock)
         {
             _resolving.Remove(key);
-            return ChooseAddress(addresses, address => AuthorizeTo(consumer, key, address));
+            return ChooseAddress(addresses, address => AuthorizeTo(consumer, key, address)) with { Name = name };
         }
     }
+
+    /// <summary>
+    /// Whether the consumer's binding for a flow's address is no longer the name the flow was
+    /// resolved for. Checked under the lock the reservation is made under, so a name-bind either
+    /// closes the flow it makes stale or is in place before the flow opens, never in between.
+    /// </summary>
+    private bool BindingMoved(long consumer, PeerEgressFlowTable.Key key, string? name) =>
+        !string.Equals(_names.Lookup(consumer, key.RemoteIp), name, StringComparison.Ordinal);
 
     /// <summary>
     /// This device's own resolver: the egress resolves in its own network, which is the point of

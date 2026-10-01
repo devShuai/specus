@@ -356,9 +356,11 @@ final class PeerEgressRuntime {
         if (PeerEgressFrame.CONTROL_NAME_BIND.equals(control.type())) {
             // Validated with the frame; the address parses and the name is well formed.
             Integer address = Ipv4Cidr.parseAddress(control.address());
+            String name = com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name());
             lock.lock();
             try {
-                names.bind(consumer, address, com.theshuai.common.peeregress.PeerEgressNames.normalize(control.name()));
+                names.bind(consumer, address, name);
+                closeUnbound(flows.closeUnbound(consumer, address, name), nowMs);
             } finally {
                 lock.unlock();
             }
@@ -442,6 +444,12 @@ final class PeerEgressRuntime {
             return;
         }
         lock.lock();
+        if (bindingMoved(consumer, key, destination)) {
+            // The address was bound (again) while this was resolving; the retransmitted SYN opens
+            // the flow by the name that stands now.
+            lock.unlock();
+            return;
+        }
         Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
         if (reservation.code() != null) {
             lock.unlock();
@@ -458,6 +466,7 @@ final class PeerEgressRuntime {
             return;
         }
         PeerEgressFlowTable.Flow flow = reservation.flow();
+        flow.name = destination.name();
         int mtu = pathMtu;
         lock.unlock();
 
@@ -649,6 +658,12 @@ final class PeerEgressRuntime {
                 return;
             }
             lock.lock();
+            if (bindingMoved(consumer, key, destination)) {
+                // Rebound while this was resolving; the consumer's next datagram carries the name
+                // that stands now, and opens the session by it.
+                lock.unlock();
+                return;
+            }
             Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
             if (reservation.code() != null) {
                 lock.unlock();
@@ -662,6 +677,7 @@ final class PeerEgressRuntime {
                 return;
             }
             PeerEgressFlowTable.Flow reserved = reservation.flow();
+            reserved.name = destination.name();
             lock.unlock();
 
             Socket socket = null;
@@ -877,8 +893,44 @@ final class PeerEgressRuntime {
         return decision.allowed() ? null : decision.code();
     }
 
-    /** Where a new flow goes: the address to dial, or the code that refuses it. */
-    record Choice(int address, String code) {
+    /**
+     * Where a new flow goes: the address to dial, or the code that refuses it, and the name it was
+     * resolved from (null for a flow to the address itself).
+     */
+    record Choice(int address, String code, String name) {
+        Choice(int address, String code) {
+            this(address, code, null);
+        }
+    }
+
+    /**
+     * Whether the name bound to a new flow's address changed between its resolution and its
+     * reservation. A name-bind closes the flows that do not match it, but one reserved after that
+     * would be missed, so it is not reserved at all. Called with the lock held.
+     */
+    private boolean bindingMoved(long consumer, PeerEgressFlowTable.Key key, Choice destination) {
+        return !java.util.Objects.equals(names.lookup(consumer, key.remoteIp()), destination.name());
+    }
+
+    /** The name a flow was opened for, or null; for tests. */
+    String flowName(PeerEgressFlowTable.Key key) {
+        lock.lock();
+        try {
+            PeerEgressFlowTable.Flow flow = flows.lookup(key);
+            return flow == null ? null : flow.name;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Whether a flow is open for a four-tuple; for tests. */
+    boolean hasFlow(PeerEgressFlowTable.Key key) {
+        lock.lock();
+        try {
+            return flows.lookup(key) != null;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -936,7 +988,8 @@ final class PeerEgressRuntime {
         lock.lock();
         try {
             resolving.remove(key);
-            return chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+            Choice chosen = chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+            return new Choice(chosen.address(), chosen.code(), name);
         } finally {
             lock.unlock();
         }
@@ -1089,6 +1142,32 @@ final class PeerEgressRuntime {
         }
         if (!revoked.isEmpty()) {
             log.info("[peer-egress] flows released count={} active={}", revoked.size(), flows.size());
+        }
+    }
+
+    /**
+     * Closes the flows a name-bind found were not opened for its name. Called with the lock held.
+     *
+     * <p>A flow opened before any name arrived is closed silently, on this side only: it dialled the
+     * fake address and never worked, and what follows the name-bind is usually the application's own
+     * retransmitted SYN, which a reset sent now would have it refuse. A flow opened for another name
+     * was a real connection to somewhere the address no longer means, and is reset like a revoked
+     * one. Neither gets a flow-reject, which would have the consumer drop the flow its next packet
+     * reopens here, and its replies refused as return-no-flow.
+     */
+    private void closeUnbound(List<PeerEgressFlowTable.Flow> closed, long nowMs) {
+        List<PeerEgressFlowTable.Flow> named = new ArrayList<>();
+        for (PeerEgressFlowTable.Flow flow : closed) {
+            if (flow.name == null) {
+                closeHandle(flow.handle);
+            } else {
+                named.add(flow);
+            }
+        }
+        releaseAll(PeerEgressFlowTable.revocationsFor(named, null), nowMs);
+        if (named.size() < closed.size()) {
+            log.info("[peer-egress] flows opened before their name closed count={} active={}",
+                    closed.size() - named.size(), flows.size());
         }
     }
 

@@ -301,7 +301,8 @@ class PeerEgressRuntimeTests {
         PeerEgressPolicy built = new PeerEgressPolicy();
         built.setEnabled(true);
         built.setScope(PeerEgressPolicy.SCOPE_PUBLIC);
-        built.setAllowedConsumerClientIds(List.of(7L, 9L));
+        // 1 and 7 are the consumers of the shared nameBindClosesFlows case.
+        built.setAllowedConsumerClientIds(List.of(1L, 7L, 9L));
         built.setDestinationRules(rules);
         return built;
     }
@@ -864,5 +865,122 @@ class PeerEgressRuntimeTests {
         waitFor("the datagram to reach the socket",
                 () -> harness.dialCount() == 1 && !harness.socket(0).written().isEmpty());
         assertEquals(List.of("203.0.113.53:53"), harness.dialed());
+    }
+
+    /**
+     * Which flows a name-bind closes and which of them the application is reset on, bound to the
+     * {@code nameBindClosesFlows} section of {@code peer-egress-dns-v1.json}. Each flow is a real TCP
+     * flow opened through the runtime and answered with a SYN-ACK; the name it remembers is read
+     * back. A flow the case says is closed must be gone with its socket closed; one it says is reset
+     * must have sent the consumer a RST, and no other may have; and no flow-reject goes out, which
+     * would have the consumer drop the flow its next packet reopens.
+     */
+    @Test
+    void nameBindClosesFlowsAsTheSharedVectorSays() throws IOException {
+        com.fasterxml.jackson.databind.JsonNode section =
+                PeerEgressFakeIpPoolTests.vector().path("nameBindClosesFlows");
+        // The fake range is allowed so a flow opened before its name reaches a socket, as it would
+        // under a broad policy; that flow is the one the name-bind has to close.
+        Harness harness = new Harness("203.0.113.0/24", "198.18.0.0/15");
+        harness.runtime.resolve = resolvingTo("203.0.113.10");
+        java.util.Map<String, PeerEgressFlowTable.Key> open = new java.util.LinkedHashMap<>();
+        java.util.Map<String, Integer> socketOf = new java.util.HashMap<>();
+        int sourcePort = 40000;
+        com.fasterxml.jackson.databind.JsonNode events = section.path("events");
+        com.fasterxml.jackson.databind.JsonNode results = section.path("results");
+        assertEquals(events.size(), results.size());
+        assertFalse(events.isEmpty(), "no nameBindClosesFlows events");
+        for (int index = 0; index < events.size(); index++) {
+            com.fasterxml.jackson.databind.JsonNode event = events.get(index);
+            com.fasterxml.jackson.databind.JsonNode expected = results.get(index);
+            String where = "event " + index + " " + event;
+            long consumer = event.path("consumer").asLong();
+            String destination = event.path("address").asText();
+            if (event.has("open")) {
+                int port = sourcePort++;
+                String source = "100.96.0." + consumer;
+                int dialsBefore = harness.dialCount();
+                harness.clearFrames();
+                harness.runtime.handleFrame(consumer, frameFor(PeerEgressSegment.build(
+                        syn(source, port, destination, 443))), EPOCH);
+                PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                        address(source), port, address(destination), 443);
+                assertTrue(harness.runtime.hasFlow(key), where + ": the flow did not open");
+                assertEquals(dialsBefore + 1, harness.dialCount(), where);
+                assertTrue(harness.sawFlag(PeerEgressSegment.FLAG_SYN), where + ": the flow was not answered");
+                com.fasterxml.jackson.databind.JsonNode name = expected.path("name");
+                assertEquals(name.isNull() ? null : name.asText(), harness.runtime.flowName(key), where);
+                open.put(event.path("open").asText(), key);
+                socketOf.put(event.path("open").asText(), dialsBefore);
+            } else {
+                harness.clearFrames();
+                bindName(harness, consumer, destination, event.path("nameBind").asText());
+                List<String> closed = new ArrayList<>();
+                List<String> reset = new ArrayList<>();
+                for (var entry : open.entrySet()) {
+                    PeerEgressFlowTable.Key key = entry.getValue();
+                    if (!harness.runtime.hasFlow(key)) {
+                        closed.add(entry.getKey());
+                    }
+                    boolean wasReset = harness.segments().stream().anyMatch(segment ->
+                            segment.has(PeerEgressSegment.FLAG_RST) && segment.destinationIp() == key.consumerIp()
+                                    && segment.destinationPort() == key.consumerPort());
+                    if (wasReset) {
+                        reset.add(entry.getKey());
+                    }
+                }
+                java.util.Collections.sort(closed);
+                java.util.Collections.sort(reset);
+                List<String> wantClosed = new ArrayList<>();
+                expected.path("closed").forEach(id -> wantClosed.add(id.asText()));
+                List<String> wantReset = new ArrayList<>();
+                expected.path("reset").forEach(id -> wantReset.add(id.asText()));
+                assertEquals(wantClosed, closed, where + ": closed");
+                assertEquals(wantReset, reset, where + ": reset");
+                for (String id : closed) {
+                    assertTrue(harness.socket(socketOf.get(id)).isClosed(), where + ": " + id + "'s socket is open");
+                    open.remove(id);
+                }
+                assertTrue(harness.rejectCodes().isEmpty(), where + ": a name-bind closure told the consumer to drop its side");
+            }
+        }
+    }
+
+    /**
+     * The case the name-bind closure exists for: a SYN reaches the egress before its name, and the
+     * flow it opens dials the fake address itself. The name-bind closes it while the dial is still
+     * in flight, the socket that dial returns is closed, and the retransmitted SYN opens the flow
+     * by name. Before, the retransmitted SYN was taken as part of the flow to nowhere.
+     */
+    @Test
+    void aNameBindAfterTheSynReopensTheFlowByName() throws Exception {
+        Harness harness = new Harness("203.0.113.0/24", "198.18.0.0/15");
+        harness.runtime.resolve = resolvingTo("203.0.113.10");
+        PeerEgressSegment.Segment opening = syn("100.96.0.1", 40000, "198.18.0.5", 443);
+        PeerEgressFlowTable.Key key = new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                address("100.96.0.1"), 40000, address("198.18.0.5"), 443);
+        harness.gate = new CountDownLatch(1);
+        Thread early = Thread.ofVirtual().start(() ->
+                harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH));
+        waitFor("the unbound dial to start", () -> harness.dialCount() == 1);
+        assertTrue(harness.runtime.hasFlow(key));
+
+        bindName(harness, 7, "198.18.0.5", "example.com");
+        assertFalse(harness.runtime.hasFlow(key), "the flow opened before the name survived its name-bind");
+        harness.gate.countDown();
+        early.join(5000);
+        assertTrue(harness.socket(0).isClosed(), "the socket to the fake address was kept");
+
+        harness.gate = null;
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+        assertEquals(List.of("198.18.0.5:443", "203.0.113.10:443"), harness.dialed());
+        assertEquals("example.com", harness.runtime.flowName(key));
+        assertTrue(harness.segments().stream().anyMatch(segment -> segment.has(PeerEgressSegment.FLAG_SYN)
+                && segment.has(PeerEgressSegment.FLAG_ACK) && segment.sourceIp() == address("198.18.0.5")),
+                "the retransmitted SYN was not answered from the fake address");
+        // Closed silently: a reset here would have the application refuse the connection the
+        // name-bind came to rescue.
+        assertFalse(harness.sawReset(), "the flow opened before its name was reset");
+        assertTrue(harness.rejectCodes().isEmpty());
     }
 }

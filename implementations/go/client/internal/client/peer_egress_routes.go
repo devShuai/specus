@@ -94,7 +94,18 @@ func (r egressRoute) key() string { return r.CIDR }
 // Refused rules are returned rather than skipped silently: a rule an operator wrote and this
 // feature ignored is a leak they have no way to notice.
 func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]egressRoute, []egressRuleSetError) {
-	refused := validateEgressRuleSet(rules, meshCIDR)
+	return planEgressRoutesIn(rules, bypass, meshCIDR, "")
+}
+
+// egressRouteOriginFakeIPPool is the origin of the one route phase two adds: the whole fake-IP pool
+// into the tunnel, so a connection to any address a name was answered with reaches the data plane.
+const egressRouteOriginFakeIPPool = "fake-ip-pool"
+
+// planEgressRoutesIn is planEgressRoutes with phase two: fakeIPPool is the pool while phase two runs
+// and "" while it does not. A domain rule installs nothing of its own; the pool's one route carries
+// every name, and it is recorded, refused on conflict and rolled back like any rule's route.
+func planEgressRoutesIn(rules []egressRule, bypass []string, meshCIDR, fakeIPPool string) ([]egressRoute, []egressRuleSetError) {
+	refused := validateEgressRuleSetIn(rules, meshCIDR, fakeIPPool)
 	skip := make(map[int]struct{}, len(refused))
 	for _, entry := range refused {
 		skip[entry.Index] = struct{}{}
@@ -108,11 +119,11 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 	// two that have to agree. A block rule does install one: the packet has to be captured
 	// before it can be dropped, and the data plane is what drops it.
 	type captured struct {
-		cidr  egressCIDR
-		match string
+		cidr   egressCIDR
+		origin string
 	}
 	seen := make(map[string]struct{})
-	capturing := make([]captured, 0, len(rules))
+	capturing := make([]captured, 0, len(rules)+1)
 	for index, rule := range rules {
 		if _, refusedRule := skip[index]; refusedRule {
 			continue
@@ -122,6 +133,7 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 		}
 		cidr, ok := parseEgressRuleMatch(strings.TrimSpace(rule.Match))
 		if !ok {
+			// A domain rule: its traffic arrives through the pool's route.
 			continue
 		}
 		normalised := formatEgressCIDR(cidr)
@@ -131,7 +143,15 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 			continue
 		}
 		seen[normalised] = struct{}{}
-		capturing = append(capturing, captured{cidr: cidr, match: rule.Match})
+		capturing = append(capturing, captured{cidr: cidr, origin: "rule:" + rule.Match})
+	}
+	// The pool captures like a rule does, including for the bypass below: a server or peer whose
+	// address happened to fall inside it must still be reached over the physical network. No rule
+	// can share its prefix, since validation refuses address rules that overlap it.
+	if pool, running := parseEgressCIDR(fakeIPPool); running {
+		if _, duplicate := seen[formatEgressCIDR(pool)]; !duplicate {
+			capturing = append(capturing, captured{cidr: pool, origin: egressRouteOriginFakeIPPool})
+		}
 	}
 
 	routes := make([]egressRoute, 0, len(capturing)+len(bypass))
@@ -171,7 +191,7 @@ func planEgressRoutes(rules []egressRule, bypass []string, meshCIDR string) ([]e
 		}
 		seen[normalised] = struct{}{}
 		routes = append(routes, egressRoute{
-			CIDR: normalised, Kind: egressRouteToTun, Origin: "rule:" + entry.match,
+			CIDR: normalised, Kind: egressRouteToTun, Origin: entry.origin,
 		})
 	}
 

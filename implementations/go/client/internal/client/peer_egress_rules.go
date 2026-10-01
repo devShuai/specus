@@ -67,6 +67,17 @@ type egressRuleDecision struct {
 // vector to imply. The match is the rule's subject: what it is, whether it is legal, whether it is
 // refused as a prefix, and only then the action and the fields it needs.
 func validateEgressRule(rule egressRule, meshCIDR string) string {
+	return validateEgressRuleIn(rule, meshCIDR, "")
+}
+
+// validateEgressRuleIn is validateEgressRule with phase two (protocol/spec/peer-egress-dns.md).
+// fakeIPPool is the fake-IP pool while phase two runs and "" while it does not.
+//
+// Running, a domain rule is checked as a name instead of being refused, and an address rule must
+// stay out of the pool: addresses there are handed out to names, so an address rule over them would
+// compete with the domain rule that handed each one out. Not running, a domain rule is refused
+// exactly as in phase one, and the pool means nothing to an address rule.
+func validateEgressRuleIn(rule egressRule, meshCIDR, fakeIPPool string) string {
 	// First, ahead of anything about the rule's content: switching a rule off is the user's choice,
 	// and a rule should not have to be fixed before it is allowed to sit in the list switched off.
 	if rule.switchedOff() {
@@ -81,21 +92,29 @@ func validateEgressRule(rule egressRule, meshCIDR string) string {
 		return egressCodeRuleIPv6Unsupported
 	}
 	if looksLikeEgressDomainRule(match) {
-		return egressCodeRuleDomainUnsupported
-	}
-
-	cidr, ok := parseEgressRuleMatch(match)
-	if !ok {
-		return egressCodeRuleMalformed
-	}
-	if cidr.prefixLen == 0 {
-		// Taking the default route would override whatever the user configured elsewhere and
-		// contradicts "unmatched means local", which is the whole shape of this feature.
-		return egressCodeRuleDefaultRoute
-	}
-	if overlapsEgressMesh(cidr, meshCIDR) {
-		// A rule covering the mesh would drag the overlay's own traffic into the egress.
-		return egressCodeRuleMeshOverlap
+		if fakeIPPool == "" {
+			return egressCodeRuleDomainUnsupported
+		}
+		if !validEgressDomainMatch(match) {
+			return egressCodeRuleMalformed
+		}
+	} else {
+		cidr, ok := parseEgressRuleMatch(match)
+		if !ok {
+			return egressCodeRuleMalformed
+		}
+		if cidr.prefixLen == 0 {
+			// Taking the default route would override whatever the user configured elsewhere and
+			// contradicts "unmatched means local", which is the whole shape of this feature.
+			return egressCodeRuleDefaultRoute
+		}
+		if overlapsEgressMesh(cidr, meshCIDR) {
+			// A rule covering the mesh would drag the overlay's own traffic into the egress.
+			return egressCodeRuleMeshOverlap
+		}
+		if pool, running := parseEgressCIDR(fakeIPPool); running && egressCIDRsOverlap(cidr, pool) {
+			return egressCodeRuleFakeIPOverlap
+		}
 	}
 	if rule.Port != 0 {
 		return egressCodeRulePortUnsupported
@@ -115,20 +134,110 @@ func validateEgressRule(rule egressRule, meshCIDR string) string {
 // looksLikeEgressDomainRule reports whether a match is a name rather than an address.
 //
 // Anything that is not an IPv4 or IPv6 literal but does contain a letter or a wildcard is a name.
-// Refusing it is the point: resolving a name at configuration time and installing the answer as a
-// static route would silently bind the rule to whatever the DNS said that minute, and phase two is
-// where domain routing gets a real answer.
+// Resolving a name at configuration time and installing the answer as a static route would silently
+// bind the rule to whatever the DNS said that minute, so a name is either refused (phase one) or
+// steered through the fake-IP pool (phase two), never turned into an address here.
+//
+// Any non-ASCII byte counts as well, so a Unicode name is refused as a malformed name rather than
+// read as a broken address: IDN has to be written as punycode.
 func looksLikeEgressDomainRule(match string) bool {
 	if strings.HasPrefix(match, "*") {
 		return true
 	}
 	for index := 0; index < len(match); index++ {
 		character := match[index]
-		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character >= 0x80 {
 			return true
 		}
 	}
 	return false
+}
+
+// validEgressDomainMatch reports whether a domain rule's match is `name` or `*.name`, with the name
+// written the way validEgressName accepts it. The wildcard stands for one or more whole labels and
+// only on the left, so `*.example.com` covers `a.example.com` and `a.b.example.com`, not the apex.
+func validEgressDomainMatch(match string) bool {
+	for index := 0; index < len(match); index++ {
+		// Checked on the bytes before any case folding: a few Unicode letters fold to ASCII ones.
+		if match[index] >= 0x80 {
+			return false
+		}
+	}
+	text := strings.ToLower(strings.TrimRight(match, "."))
+	text = strings.TrimPrefix(text, "*.")
+	if strings.Contains(text, "*") {
+		return false
+	}
+	return validEgressName(text)
+}
+
+// egressDomainRank says whether a domain rule's match covers a normalized name, and how closely:
+// an exact match beats any suffix, and a suffix with more labels beats one with fewer.
+func egressDomainRank(match, name string) (suffix bool, labels int, covers bool) {
+	base := normalizeEgressName(match)
+	if strings.HasPrefix(base, "*.") {
+		base = base[2:]
+		if strings.HasSuffix(name, "."+base) {
+			return true, strings.Count(base, ".") + 1, true
+		}
+		return false, 0, false
+	}
+	return false, 0, name == base
+}
+
+// selectEgressDomainRule picks the domain rule that claims a name, or -1 when none does.
+//
+// Exact before suffix, then the suffix with more labels, then the earlier rule. Rules out of force
+// take no part, as for addresses. A rule pointed at an egress that cannot resolve names still
+// claims its names: that is the egress's state at this moment, not a mistake in the rule, and
+// letting the name fall through to local resolution would send it somewhere no rule said.
+func selectEgressDomainRule(rules []egressRule, name, meshCIDR, fakeIPPool string) int {
+	name = normalizeEgressName(name)
+	best, bestSuffix, bestLabels := -1, false, 0
+	for index, rule := range rules {
+		match := strings.TrimSpace(rule.Match)
+		if !looksLikeEgressDomainRule(match) || validateEgressRuleIn(rule, meshCIDR, fakeIPPool) != "" {
+			continue
+		}
+		suffix, labels, covers := egressDomainRank(match, name)
+		if !covers {
+			continue
+		}
+		better := best < 0 ||
+			(!suffix && bestSuffix) ||
+			(suffix && bestSuffix && labels > bestLabels)
+		if better {
+			best, bestSuffix, bestLabels = index, suffix, labels
+		}
+	}
+	return best
+}
+
+// egressRuleStatusCode is the code the status gives a rule, or "" when it is in force: the
+// validation, then the capability of the egress a domain rule sends to.
+//
+// The capability only counts for an egress that is online. The catalogue says false for one that
+// is not, and a rule to an offline egress is right and waiting, as any rule to an offline egress is;
+// reporting it as pointed at a device that can never take it would send the operator after the rule
+// rather than the device.
+func egressRuleStatusCode(rule egressRule, meshCIDR, fakeIPPool string, online, capable map[int64]bool) string {
+	if code := validateEgressRuleIn(rule, meshCIDR, fakeIPPool); code != "" {
+		return code
+	}
+	if rule.Action == egressActionEgress && looksLikeEgressDomainRule(strings.TrimSpace(rule.Match)) &&
+		online[rule.EgressClientID] && !capable[rule.EgressClientID] {
+		return egressCodeRuleEgressNoDomain
+	}
+	return ""
+}
+
+// egressRuleKind names what a rule matches on, for the status: an address or prefix, or a name.
+func egressRuleKind(match string) string {
+	match = strings.TrimSpace(match)
+	if !strings.Contains(match, ":") && looksLikeEgressDomainRule(match) {
+		return "domain"
+	}
+	return "cidr"
 }
 
 // parseEgressRuleMatch reads a single IPv4 address or a CIDR. A bare address is its own /32.
@@ -157,7 +266,13 @@ func overlapsEgressMesh(cidr egressCIDR, meshCIDR string) bool {
 	}
 	// Either direction counts. A rule inside the mesh captures overlay traffic, and a rule
 	// containing the mesh captures all of it.
-	return mesh.contains(cidr.network) || cidr.contains(mesh.network)
+	return egressCIDRsOverlap(cidr, mesh)
+}
+
+// egressCIDRsOverlap reports whether two prefixes share an address. For prefixes that is the same
+// as one containing the other's network address.
+func egressCIDRsOverlap(left, right egressCIDR) bool {
+	return left.contains(right.network) || right.contains(left.network)
 }
 
 // matchEgressRules selects the rule that governs a destination.
@@ -171,6 +286,13 @@ func overlapsEgressMesh(cidr egressCIDR, meshCIDR string) bool {
 // caller is expected to have refused them at configuration time; skipping here means a single bad
 // rule cannot change what a good one does.
 func matchEgressRules(rules []egressRule, destination string, meshCIDR string) egressRuleDecision {
+	return matchEgressRulesIn(rules, destination, meshCIDR, "")
+}
+
+// matchEgressRulesIn is matchEgressRules with phase two's pool, which only changes which address
+// rules are in force. Domain rules never match an address: a destination in the pool is steered by
+// the name it was handed out for, and one outside it by address rules alone.
+func matchEgressRulesIn(rules []egressRule, destination, meshCIDR, fakeIPPool string) egressRuleDecision {
 	address, ok := parseEgressAddress(strings.TrimSpace(destination))
 	if !ok {
 		return egressRuleDecision{Action: egressActionDirect, MatchedRuleIndex: -1, Reason: egressReasonDefault}
@@ -179,7 +301,7 @@ func matchEgressRules(rules []egressRule, destination string, meshCIDR string) e
 	best := -1
 	bestPrefix := -1
 	for index, rule := range rules {
-		if validateEgressRule(rule, meshCIDR) != "" {
+		if validateEgressRuleIn(rule, meshCIDR, fakeIPPool) != "" {
 			continue
 		}
 		cidr, parsed := parseEgressRuleMatch(strings.TrimSpace(rule.Match))
@@ -215,9 +337,13 @@ type egressRuleSetError struct {
 // Every rule is reported, not just the first failure. An operator fixing a rule list one refusal at
 // a time learns about the second problem only after redeploying for the first.
 func validateEgressRuleSet(rules []egressRule, meshCIDR string) []egressRuleSetError {
+	return validateEgressRuleSetIn(rules, meshCIDR, "")
+}
+
+func validateEgressRuleSetIn(rules []egressRule, meshCIDR, fakeIPPool string) []egressRuleSetError {
 	var refused []egressRuleSetError
 	for index, rule := range rules {
-		if code := validateEgressRule(rule, meshCIDR); code != "" {
+		if code := validateEgressRuleIn(rule, meshCIDR, fakeIPPool); code != "" {
 			refused = append(refused, egressRuleSetError{Index: index, Match: rule.Match, Code: code})
 		}
 	}
