@@ -53,6 +53,10 @@ public final class PeerEgressCodes {
     public static final String RULE_FAKE_IP_OVERLAP = "EGRESS_RULE_FAKE_IP_OVERLAP";
     public static final String FAKE_IP_POOL_INVALID = "EGRESS_FAKE_IP_POOL_INVALID";
     public static final String RULE_EGRESS_NO_DOMAIN = "EGRESS_RULE_EGRESS_NO_DOMAIN";
+    /** The system DNS takeover's checks refused it; the status names the reason. */
+    public static final String DNS_TAKEOVER_REFUSED = "EGRESS_DNS_TAKEOVER_REFUSED";
+    /** A takeover command failed and everything was given back. */
+    public static final String DNS_TAKEOVER_FAILED = "EGRESS_DNS_TAKEOVER_FAILED";
 
     /**
      * Every code this build defines.
@@ -69,7 +73,8 @@ public final class PeerEgressCodes {
             CONSUMER_DISABLED,
             FRAME_BAD_MAGIC, FRAME_UNKNOWN_TYPE, FRAME_RESERVED_SET, FRAME_TRUNCATED,
             FRAME_TRAILING_BYTES, IPV6_UNSUPPORTED, FRAME_MALFORMED_CONTROL, CONTROL_UNSUPPORTED,
-            NAME_UNRESOLVED, NAME_UNSUPPORTED, RULE_FAKE_IP_OVERLAP, FAKE_IP_POOL_INVALID, RULE_EGRESS_NO_DOMAIN);
+            NAME_UNRESOLVED, NAME_UNSUPPORTED, RULE_FAKE_IP_OVERLAP, FAKE_IP_POOL_INVALID, RULE_EGRESS_NO_DOMAIN,
+            DNS_TAKEOVER_REFUSED, DNS_TAKEOVER_FAILED);
 
     /**
      * Reports whether a code is one this build defines.

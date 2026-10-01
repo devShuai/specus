@@ -81,19 +81,24 @@ public final class PeerEgressStatus {
      * when {@code peerEgressDnsTakeover} is on (protocol/spec/peer-egress-dns.md, status).
      *
      * @param pool      {@code peerEgressFakeIpCidr} as configured
-     * @param running   whether phase two runs now
-     * @param code      why it does not although it was asked for, or null
+     * @param running   whether phase two runs now (pool, route, responder): {@code active}
+     * @param code      the pool's EGRESS_FAKE_IP_POOL_INVALID, or while phase two runs the system
+     *                  takeover's EGRESS_DNS_TAKEOVER_REFUSED or _FAILED; null when none applies
      * @param listen    the DNS responder's address while phase two runs, else null
      * @param upstreams where forwarded queries go, as given; empty when none is
      * @param answered  answers built by the responder since the process started
      * @param forwarded upstream replies it relayed
      * @param failed    SERVFAIL it gave for a failed or refused forward, or a full pool
+     * @param takeover  whether the system's DNS points at the responder now: the journal is committed
+     * @param reason    why the takeover was refused, with EGRESS_DNS_TAKEOVER_REFUSED
+     * @param error     the failing command's first line, with EGRESS_DNS_TAKEOVER_FAILED
+     * @param journal   the takeover journal: none, pending or committed
      */
     public record Dns(String pool, boolean running, String code, String listen, List<String> upstreams,
-            long answered, long forwarded, long failed) {
+            long answered, long forwarded, long failed, boolean takeover, String reason, String error, String journal) {
 
         public Dns(String pool, boolean running, String code) {
-            this(pool, running, code, null, List.of(), 0, 0, 0);
+            this(pool, running, code, null, List.of(), 0, 0, 0, false, null, null, PeerEgressDnsTakeover.JOURNAL_NONE);
         }
     }
 
@@ -151,7 +156,9 @@ public final class PeerEgressStatus {
      */
     static Map<String, Object> dnsSection(Dns dns, ConsumerSnapshot consumer) {
         Map<String, Object> section = new LinkedHashMap<>();
-        section.put("takeover", dns.running());
+        // active is phase two running; takeover is the system's DNS pointing at the responder.
+        section.put("active", dns.running());
+        section.put("takeover", dns.takeover());
         if (dns.running() && dns.listen() != null) {
             section.put("listen", dns.listen());
         }
@@ -160,6 +167,7 @@ public final class PeerEgressStatus {
         section.put("mappings", counted ? consumer.mappings() : 0);
         section.put("quarantined", counted ? consumer.quarantined() : 0);
         section.put("upstreams", dns.upstreams() == null ? List.of() : dns.upstreams());
+        section.put("journal", dns.journal() == null ? PeerEgressDnsTakeover.JOURNAL_NONE : dns.journal());
         // Answers built here, replies relayed from an upstream, and SERVFAIL for a forward that got
         // no reply or was refused past the in-flight limit, or for a full pool. Drops are not counted.
         Map<String, Object> queries = new LinkedHashMap<>();
@@ -169,6 +177,12 @@ public final class PeerEgressStatus {
         section.put("queries", queries);
         if (dns.code() != null && !dns.code().isEmpty()) {
             section.put("code", dns.code());
+        }
+        if (dns.reason() != null) {
+            section.put("reason", dns.reason());
+        }
+        if (dns.error() != null) {
+            section.put("error", dns.error());
         }
         return section;
     }

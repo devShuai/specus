@@ -83,6 +83,13 @@ public class SpecusClientApplication {
             CliOutput.result(options.json(),"config show",0,java.util.Map.of("configPath",options.config().toString(),"config",effective),options.config()+"\n"+effective.toPrettyString()); return;
         }
         if ("doctor".equals(options.command())) { System.exit(doctor(options,loaded)); return; }
+        // A DNS takeover a killed client left points the system's DNS at a responder that is no
+        // longer there, which would also break the login below. It is given back before anything
+        // else, whatever the configuration now says (protocol/spec/peer-egress-dns.md, section six).
+        com.theshuai.specusclient.peer.PeerEgressDnsTakeover.recoverLeftover(
+                new com.theshuai.specusclient.peer.PeerEgressDnsSystem(),
+                com.theshuai.specusclient.peer.PeerEgressDnsTakeover.defaultJournalPath(), ProcessHandle.current().pid(),
+                pid -> pid > 0 && ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false));
         SpringApplication application = new SpringApplication(SpecusClientApplication.class);
         application.setWebApplicationType(WebApplicationType.NONE);
         application.setBannerMode(org.springframework.boot.Banner.Mode.OFF);
