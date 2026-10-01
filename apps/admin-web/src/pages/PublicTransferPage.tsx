@@ -3294,7 +3294,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 {sharedRoomActive ? <Chip size="sm" radius="sm" variant="flat">{effectiveRoomRole === "OWNER" ? "协作空间管理员" : effectiveRoomRole === "EDITOR" ? "已加入协作" : "只读访客"}</Chip> : null}
                 <button
                   type="button"
-                  className="max-w-48 truncate rounded px-1.5 py-1 font-mono text-tiny text-zinc-500 hover:bg-black/5 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-white max-sm:min-h-11"
+                  className="max-w-48 truncate rounded-sm px-1.5 py-1 font-mono text-tiny text-zinc-500 hover:bg-black/5 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-white max-sm:min-h-11"
                   title="点击复制设备名称"
                   onClick={() => void copyText(displayName).then(() => setNotice("设备名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制设备名称失败"))}
                 >
@@ -3325,7 +3325,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     <div className="text-tiny font-semibold">
                       {ossFallbackEnabled ? "临时文件链接" : "设备互传"}
                     </div>
-                    <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                    <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
                       {ossFallbackEnabled
                         ? "生成链接会临时存储文件，需要服务端配置存储且账号额度充足。设备传输只有在发送前单独允许时，才会在失败后改用临时存储。"
                         : "文件可直接传输或经中继转发，不会创建云端文件副本。"}
@@ -3413,13 +3413,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           {!isDiagramWorkspace && (activeOutgoingActivity || receivingTransfers.length > 0 || pendingTransfers.length > 0) ? (
             <button
               type="button"
-              className="mt-3 flex w-full items-center gap-3 rounded-md border border-primary-300/70 bg-primary-50/75 px-3 py-2 text-left shadow-sm transition hover:bg-primary-100/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 dark:border-primary-300/20 dark:bg-primary-300/[0.07] dark:hover:bg-primary-300/[0.11]"
+              className="mt-3 flex w-full items-center gap-3 rounded-md border border-primary-300/70 bg-primary-50/75 px-3 py-2 text-left shadow-xs transition hover:bg-primary-100/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary-500 dark:border-primary-300/20 dark:bg-primary-300/[0.07] dark:hover:bg-primary-300/[0.11]"
               onClick={() => {
                 setActivityCenterOpen(true);
                 setOutgoingActivities((activities) => activities.map((activity) => ({ ...activity, unread: false })));
               }}
             >
-              <span className="grid h-8 w-8 shrink-0 place-items-center rounded bg-primary-600 text-small font-semibold text-white" aria-hidden>
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-sm bg-primary-600 text-small font-semibold text-white" aria-hidden>
                 {activeOutgoingCount + receivingTransfers.length + pendingTransfers.length}
               </span>
               <span className="min-w-0 flex-1">
@@ -3444,7 +3444,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           ) : null}
 
           {!isDiagramWorkspace && activeTool !== "whiteboard" ? (
-            <div className="sticky top-0 z-20 mt-3 rounded-lg border border-default-200 bg-background/95 p-3 backdrop-blur" data-testid="transfer-recipient-bar">
+            <div className="sticky top-0 z-20 mt-3 rounded-lg border border-default-200 bg-background/95 p-3 backdrop-blur-sm" data-testid="transfer-recipient-bar">
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <strong className="min-w-0 break-words text-small">{activeTool === "files" && fileDeliveryMode === "link" ? "生成文件链接 · 文件将临时存储" : selectedPeer ? `发送给：${discoveryPeerDisplayName(selectedPeer)}` : selectedPeerId ? `${selectedPeerName || "接收设备"} 已离线 · 请重新选择` : "发送给：请先选择接收设备"}</strong>
                 <div className="flex flex-wrap gap-1">
@@ -3534,7 +3534,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               onDragOver={handleFileDragOver}
               onDragLeave={handleFileDragLeave}
               onDrop={handleFileDrop}
-              className={`app-apple-tool-dropzone transfer-file-stage group relative mt-4 flex min-h-[180px] w-full flex-col items-center justify-center overflow-hidden px-5 py-6 text-center outline-none transition duration-200 motion-reduce:transition-none sm:min-h-[240px] ${
+              className={`app-apple-tool-dropzone transfer-file-stage group relative mt-4 flex min-h-[180px] w-full flex-col items-center justify-center overflow-hidden px-5 py-6 text-center outline-hidden transition duration-200 motion-reduce:transition-none sm:min-h-[240px] ${
                 isFileDragActive ? "is-active" : isTransferBusy ? "is-busy" : ""
               }`}
             >
@@ -3548,7 +3548,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <span
                 id="public-transfer-file-dropzone-detail"
                 aria-live="polite"
-                className="mt-1.5 w-full min-w-0 max-w-xl [overflow-wrap:anywhere] text-tiny leading-5 text-zinc-500 dark:text-zinc-400"
+                className="mt-1.5 w-full min-w-0 max-w-xl [overflow-wrap:anywhere] text-tiny text-zinc-500 dark:text-zinc-400"
               >
                 {fileDropzoneDetail}
               </span>
@@ -3573,7 +3573,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </Button>
               </div>
             ) : null}
-            {volatileFileWork ? <p role="status" data-testid="transfer-leave-warning" className="mt-3 rounded-md border border-warning-200 bg-warning-50/30 p-3 text-tiny leading-5">
+            {volatileFileWork ? <p role="status" data-testid="transfer-leave-warning" className="mt-3 rounded-md border border-warning-200 bg-warning-50/30 p-3 text-tiny">
               当前有待处理文件。离开或刷新会中断传输，文件草稿和未保存的接收文件不会恢复；浏览器可能无法弹出提醒，请先完成传输并保存收到的文件。
             </p> : null}
           </div>
@@ -3620,7 +3620,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 <button
                   type="button"
                   aria-label="关闭错误提示"
-                  className="grid h-6 w-6 place-items-center rounded text-rose-500 transition hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-200 dark:hover:text-rose-50"
+                  className="grid h-6 w-6 place-items-center rounded-sm text-rose-500 transition hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-200 dark:hover:text-rose-50"
                   onClick={() => setError(null)}
                 >
                   <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
@@ -3748,7 +3748,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
-              <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+              <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
                 {discoverable
                   ? "自动发现或通过邀请加入的设备。选择前请核对对方页面上的设备名称。"
                   : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
@@ -3844,7 +3844,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
                   <div>
                     <h3 className="text-small font-semibold text-zinc-900 dark:text-white">允许被发现</h3>
-                    <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                    <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
                       {discoverableDraft
                         ? "同一公网出口的设备可自动发现你，已加入同一空间的成员也可看到你。"
                         : "其它设备看不到你；你仍可以看到它们并主动发送。"}
@@ -3862,7 +3862,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
                     <div>
                       <h3 className="text-small font-semibold text-zinc-900 dark:text-white">接收前确认</h3>
-                      <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                      <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
                         {receiveConfirmationDraft ? "收到文件后由你确认是否接收。" : "收到文件后立即开始接收。"}
                       </p>
                     </div>
@@ -4090,7 +4090,7 @@ function RoomPermissionSetting({
               role="radio"
               aria-checked={displayedRole === role}
               disabled={!canManage}
-              className={`h-7 rounded px-2 text-tiny font-medium transition-colors ${displayedRole === role ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+              className={`h-7 rounded-sm px-2 text-tiny font-medium transition-colors ${displayedRole === role ? "bg-white text-zinc-950 shadow-xs dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
               onClick={() => onInviteRoleChange(role)}
             >
               {label}
@@ -4137,7 +4137,7 @@ function RoomPermissionSetting({
             role="radio"
             aria-checked={displayedRole === "EDITOR"}
             disabled={!canManage}
-            className={`rounded px-3 py-2 text-left transition-colors ${displayedRole === "EDITOR" ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+            className={`rounded-sm px-3 py-2 text-left transition-colors ${displayedRole === "EDITOR" ? "bg-white text-zinc-950 shadow-xs dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
             onClick={() => onInviteRoleChange("EDITOR")}
           >
             <span className="block text-small font-semibold">可编辑</span>
@@ -4148,7 +4148,7 @@ function RoomPermissionSetting({
             role="radio"
             aria-checked={displayedRole === "VIEWER"}
             disabled={!canManage}
-            className={`rounded px-3 py-2 text-left transition-colors ${displayedRole === "VIEWER" ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+            className={`rounded-sm px-3 py-2 text-left transition-colors ${displayedRole === "VIEWER" ? "bg-white text-zinc-950 shadow-xs dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
             onClick={() => onInviteRoleChange("VIEWER")}
           >
             <span className="block text-small font-semibold">只读</span>
@@ -4169,7 +4169,7 @@ function RoomPermissionSetting({
           </Button>
         ) : null}
       </div>
-      <p className="mt-2 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{description}</p>
+      <p className="mt-2 text-tiny text-zinc-500 dark:text-zinc-400">{description}</p>
     </div>
   );
 }
@@ -4588,7 +4588,7 @@ function TransferProgress({
         <span>{state === "waiting" ? `等待对方确认接收（已等待 ${waitingSeconds} 秒）` : stateLabel(state, progress)}</span>
         {pathLabel && (
           <span
-            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+            className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${
               transportPath === "turn"
                 ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
                 : "bg-emerald-500/15 text-emerald-700 dark:text-emerald-200"
@@ -4694,7 +4694,7 @@ function TransferInviteModal({
               {sharedRoomActive ? "已建立协作空间" : "设备互传"}
             </Chip>
           </div>
-          <p className="text-tiny font-normal leading-5 text-zinc-500 dark:text-zinc-400">
+          <p className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
             {sharedRoomActive ? `协作空间 ${transferRoomDisplayName(roomId)} · 仅主动加入的成员共享白板` : "让对方也打开互传页面；未自动出现时，用邀请或配对码连接。"}
           </p>
         </ModalHeader>
@@ -4720,7 +4720,7 @@ function TransferInviteModal({
                     <div className="mt-4 text-center text-small font-semibold text-zinc-900 dark:text-white">
                       扫码立即配对
                     </div>
-                    <div className="mt-1 max-w-56 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                    <div className="mt-1 max-w-56 text-center text-tiny text-zinc-500 dark:text-zinc-400">
                       二维码 5 分钟内单次有效，扫码后自动加入。
                     </div>
                   </>
@@ -4893,7 +4893,7 @@ function ExpandedImagePreview({ url, fileName, onError }: { url: string; fileNam
   return (
     <div className="relative overflow-hidden rounded-lg border border-black/10 bg-zinc-950/[0.04] dark:border-white/10 dark:bg-white/[0.03]">
       <div
-        className="absolute right-2 top-2 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-sm backdrop-blur dark:border-white/[0.1] dark:bg-zinc-900/90"
+        className="absolute right-2 top-2 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-xs backdrop-blur-sm dark:border-white/[0.1] dark:bg-zinc-900/90"
         role="toolbar"
         aria-label="图片预览工具栏"
       >
@@ -4967,7 +4967,7 @@ function FilePreview({
   const previewAction = canOpenPreview ? (
     <button
       type="button"
-      className="absolute right-2 top-2 z-10 flex h-7 items-center gap-1 rounded-md border border-black/[0.08] bg-white/90 px-2 text-tiny font-medium text-zinc-600 shadow-sm backdrop-blur transition hover:text-zinc-900 dark:border-white/[0.1] dark:bg-zinc-900/90 dark:text-zinc-300 dark:hover:text-white"
+      className="absolute right-2 top-2 z-10 flex h-7 items-center gap-1 rounded-md border border-black/[0.08] bg-white/90 px-2 text-tiny font-medium text-zinc-600 shadow-xs backdrop-blur-sm transition hover:text-zinc-900 dark:border-white/[0.1] dark:bg-zinc-900/90 dark:text-zinc-300 dark:hover:text-white"
       aria-label={`预览 ${fileName}`}
       title="预览"
       onClick={() => onPreview?.({ fileName, mimeType, url, blob, sizeBytes: previewSizeBytes })}
@@ -4981,7 +4981,7 @@ function FilePreview({
   ) : null;
   const wrapClass = compact && !expanded ? "relative mt-2" : "relative";
   const frameClass = compact
-    ? "overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
+    ? "overflow-hidden rounded-sm border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
     : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
   const mediaClass = expanded
     ? "max-h-[78dvh] w-full object-contain"
@@ -4996,7 +4996,7 @@ function FilePreview({
   const fallbackClass = expanded
     ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center"
     : compact
-      ? "flex min-h-28 flex-col items-center justify-center rounded glass glass-border border p-3 text-center"
+      ? "flex min-h-28 flex-col items-center justify-center rounded-sm glass glass-border border p-3 text-center"
       : "flex h-64 flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center";
 
   const deferHeavyPreview = !expanded
@@ -5121,7 +5121,7 @@ function TextFilePreview({
   }, [blob]);
 
   return (
-    <div className="overflow-hidden rounded border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10">
+    <div className="overflow-hidden rounded-sm border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10">
       <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
         <span className="min-w-0 truncate text-tiny font-medium">{fileName}</span>
         <span className="shrink-0 text-[10px] uppercase text-zinc-400">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
@@ -5193,7 +5193,7 @@ function FaqItem({ title, children }: { title: string; children: ReactNode }) {
         <span>{title}</span>
         <span className="shrink-0 text-lg leading-none text-zinc-400 transition-transform group-open:rotate-45">+</span>
       </summary>
-      <div className="mt-2 text-tiny leading-5 text-zinc-600 dark:text-zinc-300">
+      <div className="mt-2 text-tiny text-zinc-600 dark:text-zinc-300">
         {children}
       </div>
     </details>
@@ -5226,7 +5226,7 @@ function RoomQrCode({ value, large = false }: { value: string; large?: boolean }
 
   return (
     <svg
-      className={`relative z-10 mx-auto shrink-0 bg-white shadow-sm ring-1 ring-black/10 sm:mx-0 ${large ? "h-52 w-52 rounded-2xl p-3" : "h-36 w-36 rounded-md p-2"}`}
+      className={`relative z-10 mx-auto shrink-0 bg-white shadow-xs ring-1 ring-black/10 sm:mx-0 ${large ? "h-52 w-52 rounded-2xl p-3" : "h-36 w-36 rounded-md p-2"}`}
       viewBox={`0 0 ${viewSize} ${viewSize}`}
       role="img"
       aria-label="当前房间二维码"

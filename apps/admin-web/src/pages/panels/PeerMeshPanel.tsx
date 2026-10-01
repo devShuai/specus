@@ -387,7 +387,7 @@ export function PeerMeshPanel() {
       <>
       <TopologyView devices={devices} sessions={activeSessions} />
 
-      <section className="min-w-0 space-y-2">
+      <section className="flex min-w-0 flex-col gap-2">
         <h3 className="text-base font-semibold">设备与虚拟 IP</h3>
 
         {/* mobile: 卡片 */}
@@ -1021,7 +1021,7 @@ function PeerNatInsight({
                 )}
               </div>
 
-              <div className="min-w-0 space-y-2">
+              <div className="min-w-0">
                 <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_220px] lg:hidden">
                   <Input
                     aria-label="搜索客户端 NAT 结果"
@@ -1042,7 +1042,7 @@ function PeerNatInsight({
                   </Select>
                 </div>
 
-                <div className="lg:hidden">
+                <div className="mt-2 lg:hidden">
                   <MobileListCardList
                     items={devices}
                     isLoading={loading}
@@ -1078,14 +1078,14 @@ function PeerNatInsight({
                             { label: "路径建议", value: profile.reachabilityLabel },
                             { label: "最后上报", value: formatDateTime(peerNatLastReportAt(device)) },
                           ]}
-                          extra={<p className="text-tiny leading-5 text-default-500">{profile.recommendation}</p>}
+                          extra={<p className="text-tiny text-default-500">{profile.recommendation}</p>}
                         />
                       );
                     }}
                   />
                 </div>
 
-                <div className="hidden min-w-0 lg:block">
+                <div className="mt-2 hidden min-w-0 lg:block">
                   <Table
                     aria-label="客户端 NAT 检测结果"
                     classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
@@ -1321,7 +1321,7 @@ function PeerNatTypeFilterHeader({
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold">NAT 状态筛选</div>
             <select
-              className="h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+              className="h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-hidden transition-colors hover:border-default-300 focus:border-primary"
               value={filter}
               onChange={(event) => onFilterChange(event.target.value as PeerNatFilterKey)}
             >
@@ -1410,8 +1410,8 @@ function PeerNatDistributionRow({
           {item.count} · {percent}%
         </span>
       </div>
-      <div className="h-2 overflow-hidden rounded bg-default-100">
-        <div className={`h-full rounded ${peerNatBarColor(item.profile.tone)}`} style={{ width: `${percent}%` }} />
+      <div className="h-2 overflow-hidden rounded-sm bg-default-100">
+        <div className={`h-full rounded-sm ${peerNatBarColor(item.profile.tone)}`} style={{ width: `${percent}%` }} />
       </div>
     </div>
   );

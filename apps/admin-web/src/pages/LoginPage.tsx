@@ -202,7 +202,7 @@ function LoginPageContent() {
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">一水两路 · 组网形态</h2>
-            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
               一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。
             </p>
           </div>
@@ -278,7 +278,7 @@ function LoginPageContent() {
 
           <div className="mb-6 mt-12 max-w-2xl">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">平台特性</h2>
-            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
               从协议字节级兼容到部署形态，specus 把传统反向隧道工具缺失的工程化关切补齐。
             </p>
           </div>
@@ -293,7 +293,7 @@ function LoginPageContent() {
                     {feature.label}
                   </span>
                   <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{feature.title}</h3>
-                  <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{feature.description}</p>
+                  <p className="text-small text-zinc-600 dark:text-zinc-400">{feature.description}</p>
                 </div>
               </article>
             ))}
@@ -318,7 +318,7 @@ function LoginPageContent() {
                 </span>
               ))}
             </div>
-            <p className="text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
+            <p className="text-tiny text-zinc-600 dark:text-zinc-400">
               控制连接 11 字节定长包头（magic / version / serializer / command / length）+ 紧凑二进制载荷。
               不同语言客户端登录到同一台 Server，无须任何字段适配。
             </p>
@@ -450,7 +450,7 @@ function TopologyDiagram() {
         />
         <text x="950" y="226" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">Peer 直连</text>
       </svg>
-      <p className="mt-3 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
+      <p className="mt-3 text-tiny text-zinc-600 dark:text-zinc-400">
         实线（蓝）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
         虚线（绿）= 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面。
       </p>
@@ -461,7 +461,7 @@ function TopologyDiagram() {
 function MobileTopologyDiagram() {
   return (
     <div
-      className="topology-mobile sm:hidden"
+      className="topology-mobile grid sm:hidden"
       role="img"
       aria-label="组网形态移动端动画：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连或 TURN 回退"
     >
@@ -536,7 +536,7 @@ function ClientDownloadEntry() {
         <div className="max-w-2xl">
           <span className="landing-apple-kicker text-tiny font-semibold">CLIENT DOWNLOAD</span>
           <h2 className="mt-2 text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">为这台设备选择客户端</h2>
-          <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
             独立下载页会识别 macOS、Windows 或 Linux 与处理器架构，优先给出最合适的安装方式；也可展开查看全部平台与实现。
           </p>
         </div>
@@ -579,7 +579,7 @@ function PrincipleCard({
 
   return (
     <article
-      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none ${className}`}
+      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-xs dark:text-white dark:shadow-none ${className}`}
       onMouseMove={handleMouseMove}
     >
       <span className="principle-card-accent" aria-hidden="true" />
@@ -592,7 +592,7 @@ function PrincipleCard({
             {preview && <span className="preview-badge">Preview</span>}
           </div>
           <h3 className="text-lg font-semibold text-zinc-950 dark:text-white">{title}</h3>
-          <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{description}</p>
+          <p className="text-small text-zinc-600 dark:text-zinc-400">{description}</p>
         </div>
         {children}
       </div>

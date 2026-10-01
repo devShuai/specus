@@ -324,7 +324,7 @@ sudo firewall-cmd --reload`} />
               key={index}
               className="grid grid-cols-[32px_minmax(0,1fr)] gap-3 rounded-md border border-default-200 bg-default-50 p-2 dark:bg-default-100/10"
             >
-              <span className="flex h-8 w-8 items-center justify-center rounded bg-primary-100 font-mono text-small text-primary">
+              <span className="flex h-8 w-8 items-center justify-center rounded-sm bg-primary-100 font-mono text-small text-primary">
                 {index}
               </span>
               <span className="min-w-0">
@@ -398,7 +398,7 @@ sudo firewall-cmd --reload`} />
               className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10"
             >
               <div className="text-small font-semibold text-foreground">{note.title}</div>
-              <p className="mt-1 text-small leading-6 text-default-500">{note.text}</p>
+              <p className="mt-1 text-small text-default-500">{note.text}</p>
             </div>
           ))}
         </div>
@@ -532,13 +532,13 @@ function DocCard({ title, children }: { title: React.ReactNode; children: React.
       <CardHeader className="px-5 pb-2 pt-4">
         <h3 className="text-base font-semibold">{title}</h3>
       </CardHeader>
-      <CardBody className="px-5 pb-4 pt-1 text-small leading-6">{children}</CardBody>
+      <CardBody className="px-5 pb-4 pt-1 text-small">{children}</CardBody>
     </Card>
   );
 }
 
 function Inline({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-default-100 px-1.5 py-0.5 text-tiny">{children}</code>;
+  return <code className="rounded-sm bg-default-100 px-1.5 py-0.5 text-tiny">{children}</code>;
 }
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
@@ -558,7 +558,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
           {copied ? "已复制" : "复制"}
         </Button>
       </div>
-      <pre className="overflow-x-auto p-3 text-tiny leading-5">
+      <pre className="overflow-x-auto p-3 text-tiny">
         <code className={`language-${language}`}>{code}</code>
       </pre>
     </div>

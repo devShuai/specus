@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { AuthProvider } from "./auth/AuthContext";
 import { App } from "./App";
 import { ThemeProvider } from "./theme/ThemeContext";
-import "./index.css";
+import "./tailwind.css";
 
 applyPlatformClasses();
 

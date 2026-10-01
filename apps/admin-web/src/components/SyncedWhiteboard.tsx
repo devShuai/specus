@@ -1647,7 +1647,7 @@ export function SyncedWhiteboard({
             </Chip>
             {isReadOnly ? <Chip size="sm" radius="sm" variant="flat" color="warning">访客只读</Chip> : null}
           </div>
-          <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
             可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
           </div>
         </div>
@@ -1667,7 +1667,7 @@ export function SyncedWhiteboard({
         className={
           (isExpanded
             ? "absolute inset-0 overflow-hidden bg-zinc-100 dark:bg-zinc-950"
-            : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-sm dark:border-white/10 dark:bg-white/[0.04]")
+            : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-xs dark:border-white/10 dark:bg-white/[0.04]")
         }
       >
         {!isExpanded ? <div className="shrink-0 border-b border-black/10 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/90 sm:p-2.5">
@@ -1718,12 +1718,12 @@ export function SyncedWhiteboard({
               <PopoverTrigger>
                 <button
                   type="button"
-                  className="flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
+                  className="flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
                   aria-label={`样式：${selectedBrushOption.label}，${selectedColorOption.label}，${selectedWidthOption.label}线条`}
                   title="画笔、颜色与线条粗细"
                 >
                   <span
-                    className="h-4 w-4 rounded-full border border-black/15 shadow-sm dark:border-white/20"
+                    className="h-4 w-4 rounded-full border border-black/15 shadow-xs dark:border-white/20"
                     style={{ backgroundColor: selectedColor }}
                     aria-hidden
                   />
@@ -1751,7 +1751,7 @@ export function SyncedWhiteboard({
                           type="button"
                           aria-pressed={selectedBrush === brush.value}
                           className={
-                            "flex h-9 items-center justify-center rounded-md text-tiny transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+                            "flex h-9 items-center justify-center rounded-md text-tiny transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 "
                             + (selectedBrush === brush.value
                               ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
                               : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
@@ -1788,7 +1788,7 @@ export function SyncedWhiteboard({
                             }
                           }}
                           className={
-                            "h-8 w-8 rounded-full border transition-transform focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                            "h-8 w-8 rounded-full border transition-transform focus:outline-hidden focus:ring-2 focus:ring-cyan-400 "
                             + (selectedColor === color.value && selectedTool !== "eraser"
                               ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
                               : "border-black/15 dark:border-white/20")
@@ -1837,7 +1837,7 @@ export function SyncedWhiteboard({
                           type="button"
                           aria-pressed={selectedWidth === width.value}
                           className={
-                            "flex h-9 items-center justify-center rounded-md transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+                            "flex h-9 items-center justify-center rounded-md transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 "
                             + (selectedWidth === width.value
                               ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
                               : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
@@ -1954,7 +1954,7 @@ export function SyncedWhiteboard({
           onDrop={handleImageDrop}
         >
           <div
-            className="relative bg-white shadow-sm"
+            className="relative bg-white shadow-xs"
             style={{
               width: `${canvasZoom * 100}%`,
               minWidth: `min(${WHITEBOARD_SURFACE_MIN_WIDTH}px, 100%)`,
@@ -1965,7 +1965,7 @@ export function SyncedWhiteboard({
           >
             <canvas
               ref={canvasRef}
-              className={"block h-full w-full bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 "
+              className={"block h-full w-full bg-white outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 "
                 + (isReadOnly ? "pointer-events-none " : selectedTool === "select" ? "touch-pan-x touch-pan-y " : "touch-none ")
                 + cursorClass}
               aria-label="多人白板画布"
@@ -1984,10 +1984,10 @@ export function SyncedWhiteboard({
                 }
               }}
             />
-            <div className="absolute right-3 top-3 z-10 flex items-center rounded-md border border-[#e0e2e8] bg-white/95 p-1 text-[#525866] shadow-sm dark:border-white/10 dark:bg-zinc-900/95 dark:text-zinc-300" role="group" aria-label="白板缩放">
+            <div className="absolute right-3 top-3 z-10 flex items-center rounded-md border border-[#e0e2e8] bg-white/95 p-1 text-[#525866] shadow-xs dark:border-white/10 dark:bg-zinc-900/95 dark:text-zinc-300" role="group" aria-label="白板缩放">
               <button
                 type="button"
-                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                className="grid h-11 w-11 place-items-center rounded-sm hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
                 disabled={canvasZoom <= 1}
                 aria-label="缩小白板"
                 title="缩小"
@@ -1997,7 +1997,7 @@ export function SyncedWhiteboard({
               </button>
               <button
                 type="button"
-                className="h-11 min-w-14 rounded px-2 text-[11px] font-semibold hover:bg-black/5 dark:hover:bg-white/10 sm:h-8"
+                className="h-11 min-w-14 rounded-sm px-2 text-[11px] font-semibold hover:bg-black/5 dark:hover:bg-white/10 sm:h-8"
                 aria-label={`白板缩放 ${Math.round(canvasZoom * 100)}%，点击恢复适应宽度`}
                 title="适应宽度"
                 onClick={() => applyCanvasZoom(1)}
@@ -2006,7 +2006,7 @@ export function SyncedWhiteboard({
               </button>
               <button
                 type="button"
-                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                className="grid h-11 w-11 place-items-center rounded-sm hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
                 disabled={canvasZoom >= 2.5}
                 aria-label="放大白板"
                 title="放大"
@@ -2016,7 +2016,7 @@ export function SyncedWhiteboard({
               </button>
               <button
                 type="button"
-                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                className="grid h-11 w-11 place-items-center rounded-sm hover:bg-black/5 dark:hover:bg-white/10 sm:h-8 sm:w-8"
                 aria-label="回到白板原点"
                 title="回到原点"
                 onClick={() => {
@@ -2037,7 +2037,7 @@ export function SyncedWhiteboard({
                 maxLength={MAX_TEXT_LENGTH}
                 placeholder="输入文本..."
                 aria-label="白板文本框内容"
-                className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10 dark:bg-zinc-900/95 dark:text-zinc-100"
+                className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-hidden ring-4 ring-cyan-500/10 dark:bg-zinc-900/95 dark:text-zinc-100"
                 style={{
                   left: Math.min(textDraft.x, 0.26) * 100 + "%",
                   top: Math.min(textDraft.y, 0.88) * 100 + "%",
@@ -2067,7 +2067,7 @@ export function SyncedWhiteboard({
                 value={flowLabelDraft.text}
                 maxLength={MAX_FLOW_LABEL_LENGTH}
                 aria-label="流程图节点文字"
-                className="absolute z-20 h-11 min-w-36 rounded-md border-2 border-[#4262ff] bg-white/95 px-3 text-center text-small font-semibold text-[#1c1c1e] shadow-xl outline-none ring-4 ring-[#4262ff]/10 dark:bg-zinc-900/95 dark:text-zinc-100"
+                className="absolute z-20 h-11 min-w-36 rounded-md border-2 border-[#4262ff] bg-white/95 px-3 text-center text-small font-semibold text-[#1c1c1e] shadow-xl outline-hidden ring-4 ring-[#4262ff]/10 dark:bg-zinc-900/95 dark:text-zinc-100"
                 style={{
                   left: editingFlowNode.x * 100 + "%",
                   top: (editingFlowNode.y + editingFlowNode.height / 2) * 100 + "%",
@@ -2114,9 +2114,9 @@ export function SyncedWhiteboard({
                   type="button"
                   aria-expanded={isFlowchartOpen}
                   className={
-                    "flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[#4262ff] "
+                    "flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-[#4262ff] "
                     + (isFlowchartOpen
-                      ? "bg-[#ffd02f] text-[#1c1c1e] shadow-sm"
+                      ? "bg-[#ffd02f] text-[#1c1c1e] shadow-xs"
                       : "text-zinc-700 hover:bg-[#fff4c4] dark:text-zinc-200 dark:hover:bg-[#ffd02f]/15")
                   }
                   onClick={() => setIsFlowchartOpen((value) => !value)}
@@ -2126,7 +2126,7 @@ export function SyncedWhiteboard({
                 </button>
                 <button
                   type="button"
-                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-cyan-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-cyan-50 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10"
                   onClick={() => imageInputRef.current?.click()}
                   disabled={isImportingImage}
                 >
@@ -2135,7 +2135,7 @@ export function SyncedWhiteboard({
                 </button>
                 <button
                   type="button"
-                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
                   onClick={() => documentInputRef.current?.click()}
                   disabled={isImportingDocument}
                   title="导入可编辑白板文件"
@@ -2145,7 +2145,7 @@ export function SyncedWhiteboard({
                 </button>
                 <button
                   type="button"
-                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
                   onClick={() => void exportBoardDocument()}
                   disabled={strokes.length === 0 && objects.length === 0}
                   title="导出可编辑白板文件"
@@ -2170,7 +2170,7 @@ export function SyncedWhiteboard({
                       }
                     }}
                     className={
-                      "flex h-7 w-7 items-center justify-center rounded-md text-[9px] transition focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      "flex h-7 w-7 items-center justify-center rounded-md text-[9px] transition focus:outline-hidden focus:ring-2 focus:ring-cyan-400 "
                       + (selectedBrush === brush.value
                         ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
                         : "bg-black/5 text-zinc-700 dark:bg-white/10 dark:text-zinc-200")
@@ -2194,7 +2194,7 @@ export function SyncedWhiteboard({
                       }
                     }}
                     className={
-                      "h-5 w-5 rounded-full border transition-transform focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      "h-5 w-5 rounded-full border transition-transform focus:outline-hidden focus:ring-2 focus:ring-cyan-400 "
                       + (selectedColor === color.value && selectedTool !== "eraser"
                         ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
                         : "border-black/15 dark:border-white/20")
@@ -2239,7 +2239,7 @@ export function SyncedWhiteboard({
                     title={width.label + "线条"}
                     onClick={() => setSelectedWidth(width.value)}
                     className={
-                      "flex h-7 w-7 items-center justify-center rounded-md transition focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      "flex h-7 w-7 items-center justify-center rounded-md transition focus:outline-hidden focus:ring-2 focus:ring-cyan-400 "
                       + (selectedWidth === width.value
                         ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
                         : "bg-black/5 text-zinc-700 dark:bg-white/10 dark:text-zinc-200")
@@ -2405,12 +2405,12 @@ function WhiteboardToolButton({
       aria-label={label}
       title={label}
       className={
-        "flex shrink-0 items-center rounded-md font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+        "flex shrink-0 items-center rounded-md font-medium transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 "
         + (compact
           ? "h-11 w-12 flex-col justify-center gap-0.5 px-1 text-[9px] leading-none "
           : "h-11 gap-1.5 px-2.5 text-tiny ")
         + (active
-          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
+          ? "bg-cyan-500 text-white shadow-xs dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-cyan-50 hover:text-cyan-900 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100")
       }
       onClick={() => onSelect(tool)}
@@ -2441,9 +2441,9 @@ const WhiteboardMenuTrigger = forwardRef<HTMLButtonElement, WhiteboardMenuTrigge
       type="button"
       aria-label={label + "菜单"}
       className={
-        "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
+        "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
         + (active
-          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
+          ? "bg-cyan-500 text-white shadow-xs dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
         + (className ? " " + className : "")
       }
@@ -2530,7 +2530,7 @@ function FlowchartPaletteButton({
   return (
     <button
       type="button"
-      className="flex h-9 items-center gap-2 rounded-md border border-[#e0e2e8] bg-white px-2.5 text-tiny font-medium text-[#1c1c1e] transition hover:border-[#4262ff] hover:shadow-sm dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100"
+      className="flex h-9 items-center gap-2 rounded-md border border-[#e0e2e8] bg-white px-2.5 text-tiny font-medium text-[#1c1c1e] transition hover:border-[#4262ff] hover:shadow-xs dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100"
       onClick={onClick}
     >
       <span

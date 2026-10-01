@@ -621,7 +621,7 @@ export function SyncedClipboard({
 
       <div className="flex flex-col gap-3 px-4 py-3">
         <Switch size="sm" isSelected={quickSend} onValueChange={setQuickSend} isDisabled={!canSend || !targetPeerId}>粘贴即发送（仅本次页面，读取剪贴板仍需确认）</Switch>
-        <div className="rounded-xl border border-black/[0.06] bg-gradient-to-b from-white/90 to-white/50 p-3 shadow-sm dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
+        <div className="rounded-xl border border-black/[0.06] bg-linear-to-b from-white/90 to-white/50 p-3 shadow-xs dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
           <textarea
             ref={textareaRef}
             id="public-transfer-clipboard-text"
@@ -646,7 +646,7 @@ export function SyncedClipboard({
               }
             }}
             placeholder="粘贴或输入内容，检查后点击发送；Ctrl/⌘ + Enter 发送"
-            className="min-h-24 w-full resize-y rounded-lg border border-transparent bg-black/[0.035] px-3.5 py-2.5 font-mono text-small leading-6 text-zinc-950 outline-none transition placeholder:text-zinc-400 hover:bg-black/[0.05] focus:border-primary-500/50 focus:bg-white focus:shadow-[0_0_0_4px_rgba(0,102,204,0.08)] dark:bg-white/[0.05] dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:hover:bg-white/[0.07] dark:focus:border-primary-400/50 dark:focus:bg-black/30"
+            className="min-h-24 w-full resize-y rounded-lg border border-transparent bg-black/[0.035] px-3.5 py-2.5 font-mono text-small text-zinc-950 outline-hidden transition placeholder:text-zinc-400 hover:bg-black/[0.05] focus:border-primary-500/50 focus:bg-white focus:shadow-[0_0_0_4px_rgba(0,102,204,0.08)] dark:bg-white/[0.05] dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:hover:bg-white/[0.07] dark:focus:border-primary-400/50 dark:focus:bg-black/30"
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
             <span className={`text-tiny ${composerDraft && !composerWithinLimits ? "font-medium text-rose-600 dark:text-rose-300" : "text-zinc-400 dark:text-zinc-500"}`}>
@@ -752,11 +752,11 @@ export function SyncedClipboard({
                         spellCheck={false}
                         autoFocus
                         onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
-                        className="block min-h-20 w-full resize-y rounded-md bg-black/[0.045] px-3 py-2 pr-10 font-mono text-small leading-5 text-zinc-800 outline-none ring-1 ring-primary-500/50 transition dark:bg-white/[0.06] dark:text-zinc-200"
+                        className="block min-h-20 w-full resize-y rounded-md bg-black/[0.045] px-3 py-2 pr-10 font-mono text-small text-zinc-800 outline-hidden ring-1 ring-primary-500/50 transition dark:bg-white/[0.06] dark:text-zinc-200"
                       />
                     ) : (
                       <div className="rounded-md bg-black/[0.03] px-3 py-2 pr-10 transition hover:bg-black/[0.045] dark:bg-white/[0.04] dark:hover:bg-white/[0.055]">
-                        <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small leading-5 text-zinc-800 dark:text-zinc-200">
+                        <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small text-zinc-800 dark:text-zinc-200">
                           {block.text}
                         </span>
                       </div>
@@ -829,7 +829,7 @@ export function SyncedClipboard({
           )}
         </div>
 
-        <p className="text-tiny leading-5 text-zinc-400 dark:text-zinc-500">
+        <p className="text-tiny text-zinc-400 dark:text-zinc-500">
           文字草稿临时保存在当前浏览器标签页，刷新后可恢复；未发送文件刷新后需重新选择。不会持续读取系统剪贴板，请勿发送密码或令牌。
         </p>
       </div>

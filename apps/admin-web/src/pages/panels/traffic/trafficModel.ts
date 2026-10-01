@@ -62,7 +62,7 @@ export function formatElapsedMs(ms: number): string {
 }
 
 export const trafficFilterControlClass =
-  "h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small text-foreground [color-scheme:light] outline-none transition-colors hover:border-default-300 focus:border-primary dark:[color-scheme:dark] [&>option]:bg-content1 [&>option]:text-foreground";
+  "h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small text-foreground [color-scheme:light] outline-hidden transition-colors hover:border-default-300 focus:border-primary dark:[color-scheme:dark] [&>option]:bg-content1 [&>option]:text-foreground";
 
 export interface TrafficSummary {
   resources: number;
@@ -142,18 +142,18 @@ export function httpResponseTypeChipClass(
 ): string {
   const normalized = normalizeHttpResponseType(value ?? "") || inferHttpResponseType(contentType, bytes);
   if (normalized === "json" || normalized === "html" || normalized === "xml") {
-    return "border !border-blue-500/20 !bg-blue-500/10 !text-blue-700 dark:!border-blue-300/25 dark:!bg-blue-300/15 dark:!text-blue-100";
+    return "border border-blue-500/20! bg-blue-500/10! text-blue-700! dark:border-blue-300/25! dark:bg-blue-300/15! dark:text-blue-100!";
   }
   if (normalized === "image" || normalized === "video" || normalized === "audio") {
-    return "border !border-teal-500/20 !bg-teal-500/10 !text-teal-700 dark:!border-teal-300/25 dark:!bg-teal-300/15 dark:!text-teal-100";
+    return "border border-teal-500/20! bg-teal-500/10! text-teal-700! dark:border-teal-300/25! dark:bg-teal-300/15! dark:text-teal-100!";
   }
   if (normalized === "empty") {
-    return "border !border-emerald-500/20 !bg-emerald-500/10 !text-emerald-700 dark:!border-emerald-300/25 dark:!bg-emerald-300/15 dark:!text-emerald-100";
+    return "border border-emerald-500/20! bg-emerald-500/10! text-emerald-700! dark:border-emerald-300/25! dark:bg-emerald-300/15! dark:text-emerald-100!";
   }
   if (normalized === "binary") {
-    return "border !border-amber-500/25 !bg-amber-500/10 !text-amber-800 dark:!border-amber-300/25 dark:!bg-amber-300/15 dark:!text-amber-100";
+    return "border border-amber-500/25! bg-amber-500/10! text-amber-800! dark:border-amber-300/25! dark:bg-amber-300/15! dark:text-amber-100!";
   }
-  return "border !border-default-300 !bg-default-100 !text-default-700 dark:!border-white/15 dark:!bg-white/10 dark:!text-zinc-100";
+  return "border border-default-300! bg-default-100! text-default-700! dark:border-white/15! dark:bg-white/10! dark:text-zinc-100!";
 }
 
 export function inferHttpResponseType(contentType: string | null | undefined, bytes: number): "" | HttpResponseBodyType {

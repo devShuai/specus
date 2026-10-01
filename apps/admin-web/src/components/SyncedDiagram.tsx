@@ -3851,7 +3851,7 @@ export function SyncedDiagram({
       {!isFullViewport ? (
         <div className="diagram-apple-intro flex flex-wrap items-center justify-between gap-4 px-1 pb-1">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="diagram-apple-intro-icon grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
+            <div className="diagram-apple-intro-icon grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-xs dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
               <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="3" y="4" width="6" height="5" rx="1" /><rect x="15" y="15" width="6" height="5" rx="1" /><path d="M9 6.5h4a3 3 0 0 1 3 3V15M12 12H8a3 3 0 0 0-3 3v1" />
               </svg>
@@ -3863,7 +3863,7 @@ export function SyncedDiagram({
                   <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
                 </div>
                 {onSwitchToWhiteboard ? (
-                  <div className="diagram-apple-mode-switch flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="diagram-apple-mode-switch flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-xs dark:border-white/[0.08] dark:bg-white/[0.04]">
                     <button
                       type="button"
                       className="diagram-apple-mode-option rounded-md px-2.5 py-1 text-[11px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
@@ -3871,7 +3871,7 @@ export function SyncedDiagram({
                     >
                       自由白板
                     </button>
-                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[11px] font-semibold text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
+                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[11px] font-semibold text-white shadow-xs dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
                       专业流程图
                     </button>
                   </div>
@@ -3884,7 +3884,7 @@ export function SyncedDiagram({
               </div>
             </div>
           </div>
-          <button type="button" className="diagram-apple-primary-action inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-sm transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200" onClick={() => setIsExpanded(true)}>
+          <button type="button" className="diagram-apple-primary-action inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-xs transition hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200" onClick={() => setIsExpanded(true)}>
             <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4M10 2h4v4M6 14H2v-4M10 14h4v-4" /></svg>
             全屏编辑
           </button>
@@ -3899,7 +3899,7 @@ export function SyncedDiagram({
           <div className="flex min-w-0 flex-1 items-center gap-1.5">
             <a
               href="/"
-              className="diagram-apple-icon-control grid h-8 w-8 shrink-0 place-items-center rounded-full text-zinc-500 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white"
+              className="diagram-apple-icon-control grid h-8 w-8 shrink-0 place-items-center rounded-full text-zinc-500 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-hidden dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white"
               aria-label="返回控制台"
               title="返回控制台"
             >
@@ -4282,7 +4282,7 @@ export function SyncedDiagram({
                 value={paletteQuery}
                 placeholder="搜索图形"
                 aria-label="搜索图形"
-                className="diagram-apple-search h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-[var(--diagram-apple-blue)] focus:ring-2 focus:ring-[var(--diagram-apple-blue-soft)] dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
+                className="diagram-apple-search h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-xs outline-hidden transition placeholder:text-zinc-400 focus:border-[var(--diagram-apple-blue)] focus:ring-2 focus:ring-[var(--diagram-apple-blue-soft)] dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
                 onChange={(event) => setPaletteQuery(event.currentTarget.value)}
               />
             </label>
@@ -4299,7 +4299,7 @@ export function SyncedDiagram({
                     type="button"
                     role="tab"
                     aria-selected={paletteView === view}
-                    className={`min-h-11 rounded px-1 text-[11px] font-medium sm:min-h-8 ${paletteView === view ? "bg-white text-[var(--diagram-apple-blue)] shadow-sm dark:bg-white/[0.08]" : "text-zinc-500 dark:text-zinc-400"}`}
+                    className={`min-h-11 rounded-sm px-1 text-[11px] font-medium sm:min-h-8 ${paletteView === view ? "bg-white text-[var(--diagram-apple-blue)] shadow-xs dark:bg-white/[0.08]" : "text-zinc-500 dark:text-zinc-400"}`}
                     onClick={() => setPaletteView(view)}
                   >
                     {label}
@@ -4377,7 +4377,7 @@ export function SyncedDiagram({
                                 type="button"
                                 disabled={isReadOnly}
                                 title={`${item.label} · ${item.detail}`}
-                                className="diagram-apple-palette-card group flex min-h-[76px] w-full min-w-0 flex-col items-center gap-1 rounded-md border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
+                                className="diagram-apple-palette-card group flex min-h-[76px] w-full min-w-0 flex-col items-center gap-1 rounded-md border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:border-[var(--diagram-apple-blue)] hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                                 onClick={() => {
                                   insertNode(item.kind);
                                   setCompactPanel(null);
@@ -4391,7 +4391,7 @@ export function SyncedDiagram({
                               </button>
                               <button
                                 type="button"
-                                className={`absolute right-1 top-1 z-[1] grid h-5 w-5 place-items-center rounded-[5px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 ${favorite ? "bg-white/90 text-amber-500 shadow-sm dark:bg-zinc-900/90" : "text-zinc-300 hover:bg-white/90 hover:text-amber-500 dark:text-zinc-600 dark:hover:bg-zinc-900/90"}`}
+                                className={`absolute right-1 top-1 z-[1] grid h-5 w-5 place-items-center rounded-[5px] transition focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 ${favorite ? "bg-white/90 text-amber-500 shadow-xs dark:bg-zinc-900/90" : "text-zinc-300 hover:bg-white/90 hover:text-amber-500 dark:text-zinc-600 dark:hover:bg-zinc-900/90"}`}
                                 aria-label={favorite ? `取消收藏${item.label}` : `收藏${item.label}`}
                                 aria-pressed={favorite}
                                 title={favorite ? "取消收藏" : "收藏"}
@@ -4440,7 +4440,7 @@ export function SyncedDiagram({
                               type="button"
                               disabled={isReadOnly}
                               title={`${library.name} / ${shape.name}`}
-                              className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
+                              className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:border-[var(--diagram-apple-blue)] hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                               onClick={() => {
                                 void insertStencilNode(library, shape);
                                 setCompactPanel(null);
@@ -4518,7 +4518,7 @@ export function SyncedDiagram({
                                             type="button"
                                             disabled={isReadOnly}
                                             title={`${collection.name} / ${library.name} / ${shape.name}`}
-                                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
+                                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:border-[var(--diagram-apple-blue)] hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                                             onClick={() => {
                                               void insertStencilNode(library, shape);
                                               setCompactPanel(null);
@@ -4531,7 +4531,7 @@ export function SyncedDiagram({
                                         );
                                       })}
                                       {collection.shapeCount > stencilShapeLimit ? (
-                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[11px] font-medium text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 dark:border-white/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
+                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[11px] font-medium text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 dark:border-white/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
                                           加载更多 · {collection.shapeCount - stencilShapeLimit} 个
                                         </button>
                                       ) : null}
@@ -4564,7 +4564,7 @@ export function SyncedDiagram({
             <div
               ref={graphContainerRef}
               data-view-epoch={viewEpoch}
-              className="diagram-apple-canvas absolute inset-0 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--diagram-apple-blue)]"
+              className="diagram-apple-canvas absolute inset-0 overflow-auto outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--diagram-apple-blue)]"
               tabIndex={0}
               role="application"
               aria-label="专业流程图画布"
@@ -4595,7 +4595,7 @@ export function SyncedDiagram({
               >
                 <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-[var(--diagram-apple-danger)]" aria-hidden="true" />
                 <span className="min-w-0 flex-1">{status}</span>
-                <button type="button" className="grid h-5 w-5 shrink-0 place-items-center rounded text-current hover:bg-[var(--diagram-apple-danger-soft)]" aria-label="关闭错误提示" onClick={() => setStatusTone("info")}>
+                <button type="button" className="grid h-5 w-5 shrink-0 place-items-center rounded-sm text-current hover:bg-[var(--diagram-apple-danger-soft)]" aria-label="关闭错误提示" onClick={() => setStatusTone("info")}>
                   <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
                 </button>
               </div>
@@ -4630,7 +4630,7 @@ export function SyncedDiagram({
               return (
                 <div key={presence.peerId} className="diagram-apple-remote-cursor pointer-events-none absolute z-30" style={{ left, top }}>
                   <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2" style={{ borderColor: colors.solid }} />
-                  <span className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white shadow" style={{ backgroundColor: colors.solid }}>
+                  <span className="ml-2 rounded-sm px-1.5 py-0.5 text-[11px] font-semibold text-white shadow-sm" style={{ backgroundColor: colors.solid }}>
                     {displayName}{presence.selectedIds.length > 0 ? ` · 已选 ${presence.selectedIds.length}` : ""}
                   </span>
                 </div>
@@ -4645,7 +4645,7 @@ export function SyncedDiagram({
                 onPointerDown={(event) => event.stopPropagation()}
               >
                 <label
-                  className={`relative grid h-7 w-9 place-items-center rounded ${selectionOnlyNodes && !isReadOnly ? "cursor-pointer hover:bg-[var(--diagram-apple-blue-soft)]" : "cursor-not-allowed opacity-35"}`}
+                  className={`relative grid h-7 w-9 place-items-center rounded-sm ${selectionOnlyNodes && !isReadOnly ? "cursor-pointer hover:bg-[var(--diagram-apple-blue-soft)]" : "cursor-not-allowed opacity-35"}`}
                   title={selection.mixedFields.includes("fillColor") ? "填充颜色（混合）" : "填充颜色"}
                   aria-label={selection.mixedFields.includes("fillColor") ? "填充颜色（混合）" : "填充颜色"}
                   style={selection.mixedFields.includes("fillColor")
@@ -4653,7 +4653,7 @@ export function SyncedDiagram({
                     : undefined}
                 >
                   <span
-                    className="h-4 w-4 rounded border border-black/15 dark:border-white/20"
+                    className="h-4 w-4 rounded-sm border border-black/15 dark:border-white/20"
                     style={{ backgroundColor: selection.fillColor === "none" ? "transparent" : colorPickerValue(selection.fillColor, "#ffffff") }}
                     aria-hidden="true"
                   />
@@ -4667,7 +4667,7 @@ export function SyncedDiagram({
                 </label>
                 <button
                   type="button"
-                  className={`grid h-7 w-9 place-items-center rounded transition ${interactionMode === "connect" ? "bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)]" : "text-zinc-500 hover:bg-black/[0.05] dark:text-zinc-300 dark:hover:bg-white/[0.06]"}`}
+                  className={`grid h-7 w-9 place-items-center rounded-sm transition ${interactionMode === "connect" ? "bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)]" : "text-zinc-500 hover:bg-black/[0.05] dark:text-zinc-300 dark:hover:bg-white/[0.06]"}`}
                   disabled={!selectionOnlyNodes || isReadOnly}
                   title={interactionMode === "connect" ? "退出连线模式" : "连接节点"}
                   aria-label={interactionMode === "connect" ? "退出连线模式" : "连接节点"}
@@ -4678,7 +4678,7 @@ export function SyncedDiagram({
                 </button>
                 <button
                   type="button"
-                  className="grid h-7 w-9 place-items-center rounded text-zinc-500 transition hover:bg-black/[0.05] disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-white/[0.06]"
+                  className="grid h-7 w-9 place-items-center rounded-sm text-zinc-500 transition hover:bg-black/[0.05] disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-white/[0.06]"
                   disabled={isReadOnly}
                   title="创建副本"
                   aria-label="创建副本"
@@ -4688,7 +4688,7 @@ export function SyncedDiagram({
                 </button>
                 <button
                   type="button"
-                  className="grid h-7 w-9 place-items-center rounded text-zinc-500 transition hover:bg-black/[0.05] disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-white/[0.06]"
+                  className="grid h-7 w-9 place-items-center rounded-sm text-zinc-500 transition hover:bg-black/[0.05] disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-white/[0.06]"
                   disabled={!selectionOnlyNodes || isReadOnly}
                   title={selection.locked ? "解锁节点" : "锁定节点"}
                   aria-label={selection.locked ? "解锁节点" : "锁定节点"}
@@ -4705,12 +4705,12 @@ export function SyncedDiagram({
                 </div>
               </div>
             ) : null}
-            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2.5 py-1.5 text-[11px] text-zinc-500 shadow-sm backdrop-blur-xl dark:text-zinc-400 sm:flex">
-              <span className="grid h-4 w-4 place-items-center rounded bg-[var(--diagram-apple-blue-soft)] text-[11px] font-bold text-[var(--diagram-apple-blue)]">?</span>
+            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2.5 py-1.5 text-[11px] text-zinc-500 shadow-xs backdrop-blur-xl dark:text-zinc-400 sm:flex">
+              <span className="grid h-4 w-4 place-items-center rounded-sm bg-[var(--diagram-apple-blue-soft)] text-[11px] font-bold text-[var(--diagram-apple-blue)]">?</span>
               Ctrl+Shift 拖动画布 · Ctrl+滚轮缩放 · Shift 点击连线增删折点
             </div>
             {interactionMode === "connect" ? (
-              <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-md border border-[var(--diagram-apple-blue)]/30 bg-[var(--diagram-apple-surface)] px-3 py-1.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)] shadow-sm">
+              <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-md border border-[var(--diagram-apple-blue)]/30 bg-[var(--diagram-apple-surface)] px-3 py-1.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)] shadow-xs">
                 连线模式：从蓝色连接点拖到另一个连接点
               </div>
             ) : null}
@@ -5024,14 +5024,14 @@ export function SyncedDiagram({
                       <span className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">
                         {comment.author === peerId ? "我" : peerDisplayNames[comment.author]?.trim() || "协作者"}{comment.cellId ? " · 已关联元素" : " · 页面评论"}
                       </span>
-                      <span className="mt-1 block whitespace-pre-wrap break-words text-tiny leading-5 text-zinc-600 dark:text-zinc-300">{comment.text}</span>
+                      <span className="mt-1 block whitespace-pre-wrap break-words text-tiny text-zinc-600 dark:text-zinc-300">{comment.text}</span>
                       <span className="mt-1 block text-[11px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(comment.createdAt)}</span>
                     </button>
                     <div className="mt-1.5 flex gap-1">
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => toggleComment(comment)}>
+                      <button type="button" disabled={isReadOnly} className="rounded-sm px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => toggleComment(comment)}>
                         {comment.resolved ? "重新打开" : "标记解决"}
                       </button>
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => deleteComment(comment.id)}>
+                      <button type="button" disabled={isReadOnly} className="rounded-sm px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => deleteComment(comment.id)}>
                         删除
                       </button>
                     </div>
@@ -5056,9 +5056,9 @@ export function SyncedDiagram({
                       <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(version.createdAt)}</span>
                     </span>
                     <span className="flex shrink-0 gap-1">
-                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void restoreVersion(version)}>恢复</button>
+                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded-sm px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void restoreVersion(version)}>恢复</button>
                       {roomRole === "OWNER" && version.serverId !== undefined ? (
-                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => void deleteVersion(version)}>删除</button>
+                        <button type="button" disabled={isVersionLoading} className="rounded-sm px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => void deleteVersion(version)}>删除</button>
                       ) : null}
                     </span>
                   </div>
@@ -5134,8 +5134,8 @@ export function SyncedDiagram({
           backdrop="blur"
           onOpenChange={(open) => { if (!open) setTemplatePreviewId(null); }}
           classNames={{
-            wrapper: "!z-[220] px-4 py-6",
-            backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+            wrapper: "z-[220]! px-4 py-6",
+            backdrop: "z-[210]! bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
             base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
           }}
         >
@@ -5193,8 +5193,8 @@ export function SyncedDiagram({
           backdrop="blur"
           onOpenChange={setExportDialogOpen}
           classNames={{
-            wrapper: "!z-[220] px-4 py-6",
-            backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+            wrapper: "z-[220]! px-4 py-6",
+            backdrop: "z-[210]! bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
             base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
           }}
         >
@@ -5217,7 +5217,7 @@ export function SyncedDiagram({
                       <button
                         key={format}
                         type="button"
-                        className="min-h-16 rounded-md border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] p-2.5 text-left transition hover:border-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]"
+                        className="min-h-16 rounded-md border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] p-2.5 text-left transition hover:border-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]"
                         onClick={() => {
                           if (format === "stdg") exportDiagram();
                           else if (format === "drawio") exportDrawio();
@@ -6058,7 +6058,7 @@ function CompactPanelButton({
       type="button"
       aria-pressed={active}
       className={`diagram-apple-compact-button flex h-11 min-w-[64px] items-center justify-center gap-1.5 rounded-md px-2 text-[11px] font-semibold transition ${active
-        ? "bg-white text-[var(--diagram-apple-blue)] shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950"
+        ? "bg-white text-[var(--diagram-apple-blue)] shadow-xs dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950"
         : "text-zinc-500 hover:bg-white/70 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"}`}
       onClick={onClick}
     >
@@ -6096,7 +6096,7 @@ function DiagramToolbarMenu({
       <DropdownTrigger>
         <button
           type="button"
-          className={`diagram-apple-toolbar-menu flex h-11 shrink-0 items-center gap-1.5 rounded-md text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)] dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white sm:h-8 ${compact ? "px-2" : "px-2.5"}`}
+          className={`diagram-apple-toolbar-menu flex h-11 shrink-0 items-center gap-1.5 rounded-md text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)] dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white sm:h-8 ${compact ? "px-2" : "px-2.5"}`}
           aria-label={`${label}菜单`}
         >
           <span className={mobileLabel ? "hidden sm:inline" : undefined}>{label}</span>
@@ -6196,7 +6196,7 @@ function DrawioStencilGlyph({ stencilName, loaded }: { stencilName: string; load
   return (
     <span className="diagram-apple-stencil-glyph relative flex h-8 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-50 dark:bg-white/[0.04]">
       <svg ref={svgRef} className={`h-full w-full overflow-visible ${rendered ? "block" : "hidden"}`} aria-hidden="true" />
-      {!rendered ? <span className="h-5 w-8 rounded border border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)]" /> : null}
+      {!rendered ? <span className="h-5 w-8 rounded-sm border border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)]" /> : null}
     </span>
   );
 }
@@ -6429,7 +6429,7 @@ function InspectorSection({
         writeDiagramBooleanPreference(preferenceKey, next);
       }}
     >
-      <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 rounded px-1 text-[11px] font-semibold text-zinc-600 outline-none hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)] dark:text-zinc-300 dark:hover:bg-white/[0.045] sm:min-h-8 [&::-webkit-details-marker]:hidden">
+      <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 rounded-sm px-1 text-[11px] font-semibold text-zinc-600 outline-hidden hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)] dark:text-zinc-300 dark:hover:bg-white/[0.045] sm:min-h-8 [&::-webkit-details-marker]:hidden">
         <span className="diagram-apple-field-label">{title}</span>
         <svg className="h-3.5 w-3.5 transition-transform group-open:rotate-180" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
       </summary>
@@ -6470,7 +6470,7 @@ function InspectorTextArea({
         value={draft}
         maxLength={500}
         rows={3}
-        className="diagram-apple-text-field w-full resize-y rounded-md border border-black/10 bg-white px-2.5 py-2 text-[11px] leading-5 text-zinc-900 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
+        className="diagram-apple-text-field w-full resize-y rounded-md border border-black/10 bg-white px-2.5 py-2 text-[11px] leading-5 text-zinc-900 outline-hidden focus:border-[var(--diagram-apple-blue)] dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
         onFocus={() => { editingRef.current = true; }}
         onChange={(event) => setDraft(event.currentTarget.value)}
         onBlur={(event) => {
@@ -6535,7 +6535,7 @@ function InspectorNumberField({
           min={min}
           max={max}
           step={step}
-          className="min-w-0 flex-1 bg-transparent px-2 text-[11px] text-zinc-800 outline-none dark:text-zinc-100"
+          className="min-w-0 flex-1 bg-transparent px-2 text-[11px] text-zinc-800 outline-hidden dark:text-zinc-100"
           onFocus={(event) => {
             editingRef.current = true;
             event.currentTarget.select();
@@ -6577,7 +6577,7 @@ function InspectorSelectField<T extends string>({
       <InspectorFieldLabel>{label}</InspectorFieldLabel>
       <select
         value={mixed ? "" : value}
-        className="mt-1 h-8 w-full rounded-md border border-black/[0.09] bg-white px-2 text-[11px] text-zinc-800 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-100"
+        className="mt-1 h-8 w-full rounded-md border border-black/[0.09] bg-white px-2 text-[11px] text-zinc-800 outline-hidden focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-100"
         onChange={(event) => onChange(event.currentTarget.value as T)}
       >
         {mixed ? <option value="" disabled>混合</option> : null}
@@ -6629,7 +6629,7 @@ function InspectorColorField({
       <InspectorFieldLabel>{label}</InspectorFieldLabel>
       <div className="mt-1 flex h-8 items-center gap-1.5">
         <label
-          className="relative h-8 w-10 shrink-0 cursor-pointer overflow-hidden rounded-md border border-black/[0.12] shadow-sm focus-within:ring-2 focus-within:ring-[var(--diagram-apple-blue)] dark:border-white/[0.14]"
+          className="relative h-8 w-10 shrink-0 cursor-pointer overflow-hidden rounded-md border border-black/[0.12] shadow-xs focus-within:ring-2 focus-within:ring-[var(--diagram-apple-blue)] dark:border-white/[0.14]"
           title={`选择${label}`}
           style={mixed
             ? { background: "linear-gradient(135deg,#e4e4e7 25%,#fff 25% 50%,#e4e4e7 50% 75%,#fff 75%)", backgroundSize: "8px 8px" }
@@ -6653,7 +6653,7 @@ function InspectorColorField({
           placeholder={mixed ? "混合" : undefined}
           inputMode="text"
           aria-label={`${label}色值`}
-          className="h-8 min-w-0 flex-1 rounded-md border border-black/[0.09] bg-white px-2 font-mono text-[11px] uppercase text-zinc-700 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-200"
+          className="h-8 min-w-0 flex-1 rounded-md border border-black/[0.09] bg-white px-2 font-mono text-[11px] uppercase text-zinc-700 outline-hidden focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-200"
           onFocus={(event) => {
             editingRef.current = true;
             event.currentTarget.select();
@@ -6744,8 +6744,8 @@ function InspectorToggle({
     <button type="button" role="switch" aria-checked={mixed ? "mixed" : checked} disabled={disabled} className="flex min-h-8 w-full items-center justify-between gap-2 text-left text-[11px] font-medium text-zinc-600 disabled:cursor-not-allowed disabled:opacity-45 dark:text-zinc-300" onClick={onChange}>
       <span>{label}</span>
       <span className={`relative h-5 w-9 shrink-0 rounded-full transition ${checked && !mixed ? "bg-[var(--diagram-apple-blue)]" : mixed ? "bg-zinc-400 dark:bg-zinc-600" : "bg-zinc-300 dark:bg-zinc-700"}`} aria-hidden>
-        {mixed ? <span className="absolute left-2 top-[9px] h-0.5 w-5 rounded bg-white" /> : (
-          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-[18px] dark:bg-zinc-950" : "translate-x-0.5"}`} />
+        {mixed ? <span className="absolute left-2 top-[9px] h-0.5 w-5 rounded-sm bg-white" /> : (
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-xs transition-transform ${checked ? "translate-x-[18px] dark:bg-zinc-950" : "translate-x-0.5"}`} />
         )}
       </span>
     </button>
@@ -6850,7 +6850,7 @@ function InspectorAction({
       disabled={disabled}
       aria-pressed={active}
       className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[11px] font-medium transition hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] disabled:opacity-35 ${active
-        ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)] shadow-sm"
+        ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)] shadow-xs"
         : "border-black/[0.08] bg-white/70 text-zinc-600 dark:border-white/[0.09] dark:bg-white/[0.025] dark:text-zinc-300"}`}
       onClick={onClick}
     >
