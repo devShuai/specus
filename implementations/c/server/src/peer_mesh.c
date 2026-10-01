@@ -1682,6 +1682,15 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
                                                                consumer->tenant_id,
                                                                policy->egress_client_id, &device) == 0
             && device.enabled;
+        /*
+         * domainTargetCapable is what the egress declared on its current online session: the
+         * client row carries it from the latest NETTY_ONLINE session, so a device with none reads
+         * as 0. The live check covers the departure window, where the logout push runs before that
+         * session is marked disconnected and the row would still show the old declaration.
+         */
+        int domain_targets = online && egress->client_egress_domain_targets
+            && runtime->online != NULL
+            && runtime->online(runtime->ctx, egress->id, egress->client_name);
 
         st_egress_destination_rule rules[ST_EGRESS_MAX_DESTINATION_RULES];
         size_t rules_len = 0U;
@@ -1702,8 +1711,9 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
                   || pm_append_json_string(&message, protocols[p]) != 0) ? -1 : 0;
         }
         if (rc == 0) {
-            /* Both stay false until domain rules and an IPv6 data plane ship. */
-            rc = pm_append(&message, "],\"domainTargetCapable\":false,\"ipv6TargetCapable\":false}");
+            /* ipv6TargetCapable stays false: no client declares it yet. */
+            rc = pm_appendf(&message, "],\"domainTargetCapable\":%s,\"ipv6TargetCapable\":false}",
+                            domain_targets ? "true" : "false");
         }
         first = 0;
     }

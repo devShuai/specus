@@ -130,6 +130,26 @@ public sealed partial class PeerMeshService
         return version ?? 0;
     }
 
+    /// <summary>
+    /// Whether the egress's current online session announced <c>domainTargetCapable</c> at login.
+    /// </summary>
+    /// <remarks>
+    /// Read from the newest online session rather than any session the device ever had: a device
+    /// that reconnects with a build that cannot resolve names must stop being advertised as one
+    /// that can, or consumers would send it name-bind requests it can only refuse. No online
+    /// session means false, so an egress that has gone away is never advertised as capable.
+    /// </remarks>
+    private async Task<bool> EgressDomainTargetsAsync(ClientAccount egress, CancellationToken cancellationToken) =>
+        await _db.ClientSessions.AsNoTracking()
+            .Where(row => row.TenantId == egress.TenantId
+                && row.ClientId == egress.Id
+                && row.Status == "NETTY_ONLINE")
+            .OrderByDescending(row => row.NettyConnectedAt ?? row.HttpLoginAt)
+            .ThenByDescending(row => row.Id)
+            .Select(row => row.ClientEgressDomainTargets)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
     /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
     internal const int MaxEgressReportBytes = 8 * 1024;
 
@@ -664,8 +684,11 @@ public sealed partial class PeerMeshService
                 Online = online,
                 Scope = policy.Scope,
                 Protocols = EgressProtocols(DecodeEgressDestinationRules(policy.DestinationRules)),
-                // Both stay false until domain rules and an IPv6 data plane ship.
-                DomainTargetCapable = false,
+                // Never capable while the entry itself reads offline, so a consumer is not told an
+                // absent egress can resolve names.
+                DomainTargetCapable = online
+                    && await EgressDomainTargetsAsync(egress, cancellationToken).ConfigureAwait(false),
+                // No client announces IPv6 targets yet, so there is nothing to carry.
                 Ipv6TargetCapable = false,
             });
         }

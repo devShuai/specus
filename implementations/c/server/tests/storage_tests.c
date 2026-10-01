@@ -118,6 +118,97 @@ static int test_http_route_auth_migration(void)
 }
 
 /*
+ * A session table from before the egress-catalog carried domainTargetCapable. Startup must add the
+ * column rather than fail on the new SELECT/INSERT lists, and rows already there must read as not
+ * having declared it: the catalogue only offers name resolution a device actually announced.
+ */
+static int test_client_session_domain_targets_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-session-domain-migration-%ld.db", (long)getpid());
+    unlink(path);
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy_schema =
+        "CREATE TABLE specus_client_session ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "tenant_id TEXT NOT NULL DEFAULT 'default',"
+        "credential_id INTEGER NOT NULL,"
+        "identity_id INTEGER NOT NULL,"
+        "client_id INTEGER NOT NULL,"
+        "client_name TEXT NOT NULL,"
+        "token_hash TEXT NOT NULL,"
+        "status TEXT NOT NULL,"
+        "machine_fingerprint TEXT NOT NULL,"
+        "os_user TEXT NOT NULL,"
+        "hostname TEXT,"
+        "os_name TEXT,"
+        "os_version TEXT,"
+        "os_arch TEXT,"
+        "client_version TEXT,"
+        "java_version TEXT,"
+        "local_addresses TEXT,"
+        "message_send_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_receive_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_attachments_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_media_preview_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,"
+        "peer_service_discovery_version INTEGER NOT NULL DEFAULT 0,"
+        "peer_service_applications TEXT,"
+        "http_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "netty_connected_at TEXT,"
+        "disconnected_at TEXT,"
+        "expires_at TEXT NOT NULL,"
+        "channel_id TEXT,"
+        "remote_address TEXT,"
+        "client_egress_version INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO specus_client_session(tenant_id, credential_id, identity_id, client_id, client_name, "
+        "token_hash, status, machine_fingerprint, os_user, expires_at, client_egress_version) "
+        "VALUES('tenant-migration',1,1,7,'legacy-egress','legacy-token','NETTY_ONLINE','machine','user',"
+        "'2026-06-25T08:00:00Z',1);";
+    if (sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_exec(db, legacy_schema, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "client session legacy schema setup failed: %s\n",
+                error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "client session domain targets migration failed\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_client_session legacy;
+    if (st_storage_get_client_session_for_login(path, 1, "legacy-token", &legacy) != 0
+        || legacy.client_egress_version != 1
+        || legacy.client_egress_domain_targets != 0) {
+        fprintf(stderr, "client session migrated domain targets default mismatch\n");
+        unlink(path);
+        return 1;
+    }
+
+    /* The added column is written by new logins like any other. */
+    st_storage_client_session fresh = legacy;
+    snprintf(fresh.token_hash, sizeof(fresh.token_hash), "%s", "fresh-token");
+    snprintf(fresh.status, sizeof(fresh.status), "%s", "HTTP_AUTHENTICATED");
+    snprintf(fresh.http_login_at, sizeof(fresh.http_login_at), "%s", "2026-06-25T00:00:00Z");
+    fresh.client_egress_domain_targets = 1;
+    if (st_storage_create_client_session(path, &fresh, &fresh) != 0
+        || fresh.id == legacy.id
+        || fresh.client_egress_version != 1
+        || !fresh.client_egress_domain_targets) {
+        fprintf(stderr, "client session domain targets after migration mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
+}
+
+/*
  * Egress policy storage. The judgment layer itself is covered by the shared vectors in
  * peer_egress_tests; what is checked here is that a policy survives a round trip and that a
  * disabled one leaves the enabled-only listing that catalogue building reads.
@@ -307,6 +398,9 @@ int main(void)
         return 1;
     }
     if (test_http_route_auth_migration() != 0) {
+        return 1;
+    }
+    if (test_client_session_domain_targets_migration() != 0) {
         return 1;
     }
     if (test_peer_mesh_egress_policy_round_trip() != 0) {
@@ -595,6 +689,8 @@ int main(void)
     session.message_attachments_capable = 1;
     session.message_media_preview_capable = 1;
     session.message_max_attachment_bytes = 16777216;
+    session.client_egress_version = 1;
+    session.client_egress_domain_targets = 1;
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", "2026-06-25T00:00:00Z");
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", "2026-06-25T08:00:00Z");
     if (st_storage_create_client_session(path, &session, &session) != 0
@@ -605,7 +701,9 @@ int main(void)
         || !session.message_receive_capable
         || !session.message_attachments_capable
         || !session.message_media_preview_capable
-        || session.message_max_attachment_bytes != 16777216) {
+        || session.message_max_attachment_bytes != 16777216
+        || session.client_egress_version != 1
+        || !session.client_egress_domain_targets) {
         fprintf(stderr, "client session create mismatch\n");
         unlink(path);
         return 1;
@@ -626,6 +724,8 @@ int main(void)
         || !login_session.message_attachments_capable
         || !login_session.message_media_preview_capable
         || login_session.message_max_attachment_bytes != 16777216
+        || login_session.client_egress_version != 1
+        || !login_session.client_egress_domain_targets
         || st_storage_count_online_sessions_by_machine(path,
                                                        credential.id,
                                                        "machine-1",
@@ -655,6 +755,8 @@ int main(void)
         || !capability_client.message_attachments_capable
         || !capability_client.message_media_preview_capable
         || capability_client.message_max_attachment_bytes != 16777216
+        || capability_client.client_egress_version != 1
+        || !capability_client.client_egress_domain_targets
         || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
         || !capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 16777216) {
@@ -671,6 +773,8 @@ int main(void)
         || capability_client.message_attachments_capable
         || capability_client.message_media_preview_capable
         || capability_client.message_max_attachment_bytes != 0
+        || capability_client.client_egress_version != 0
+        || capability_client.client_egress_domain_targets
         || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
         || capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 0) {

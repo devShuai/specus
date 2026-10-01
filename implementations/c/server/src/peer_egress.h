@@ -118,6 +118,14 @@ int st_egress_cidr_overlaps(const st_egress_cidr *left, const st_egress_cidr *ri
 int st_egress_normalize_version(int version);
 
 /*
+ * Whether a login's clientEgressCapabilities object declared domainTargetCapable. Only an explicit
+ * true counts, and only next to a version this build takes part with (pass the normalized one): an
+ * absent object, an absent field or version 0 all read as 0, so the catalogue never tells consumers
+ * that a device resolves names when it did not say so.
+ */
+int st_egress_declares_domain_targets(const char *capabilities_json, int version);
+
+/*
  * One consumer-side split-routing rule.
  *
  * Rules match on destination address only. The consumer steers traffic by installing routes and a

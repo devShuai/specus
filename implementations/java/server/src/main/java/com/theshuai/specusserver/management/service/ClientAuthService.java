@@ -441,6 +441,10 @@ public class ClientAuthService {
         if (environment.getClientPeerServiceCapabilities() == null) {
             environment.setClientPeerServiceCapabilities(new ClientEnvironmentInfo.ClientPeerServiceCapabilities());
         }
+        if (environment.getClientEgressCapabilities() == null) {
+            // An explicit null reads as "no egress", like an absent object, instead of failing login.
+            environment.setClientEgressCapabilities(new ClientEnvironmentInfo.ClientEgressCapabilities());
+        }
         return environment;
     }
 
@@ -466,8 +470,12 @@ public class ClientAuthService {
         session.setPeerServiceDiscoveryVersion(version);
         session.setPeerServiceApplications(PeerServiceDiscovery.encodeApplications(
                 version < 1 ? List.of() : discovery.getApplications()));
-        session.setClientEgressVersion(PeerEgressProtocol.normalizeVersion(
-                environment.getClientEgressCapabilities().getVersion()));
+        ClientEnvironmentInfo.ClientEgressCapabilities egress = environment.getClientEgressCapabilities();
+        int egressVersion = PeerEgressProtocol.normalizeVersion(egress.getVersion());
+        session.setClientEgressVersion(egressVersion);
+        // A domain-target claim means nothing from a client that does not take part in egress at
+        // all, so it is only kept alongside a version the server will push egress messages for.
+        session.setClientEgressDomainTargets(egressVersion >= 1 && egress.isDomainTargetCapable());
     }
 
     private List<ClientAuthLoginResponse.SpecusEndpoint> loadTcpMappings(ClientAccount account) {
