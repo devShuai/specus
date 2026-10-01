@@ -15,6 +15,25 @@ public final class CliState implements AutoCloseable {
     private final String config;
     private final ScheduledExecutorService publisher;
     private volatile boolean closed;
+    private boolean failing;
+    interface Writer { void write() throws Exception; }
+    /**
+     * One publication, returning whether publishing is now failing. A failed write is no reason to
+     * stop: on Windows a reader holding the file open, or a virus scanner, makes the replace fail now
+     * and then, and giving up would leave every status query refused for the rest of the run. The
+     * failure is said once, with its reason, and so is the recovery. Everything is caught, because
+     * an exception escaping a scheduled task cancels every later run of it.
+     */
+    static boolean publishOnce(Writer write,boolean failing,java.io.PrintStream report) {
+        try { write.write(); }
+        catch (Exception error) {
+            if(!failing) report.println("State publication failed ("+error.getClass().getSimpleName()+": "+error.getMessage()
+                    +"); retrying every second, so status may be stale meanwhile.");
+            return true;
+        }
+        if(failing) report.println("State publication recovered.");
+        return false;
+    }
     private volatile Supplier<Map<String,Object>> snapshot = () -> new LinkedHashMap<>(Map.of(
             "phase","http-login","controlAuthenticated",false,"businessReady",false,"peers",List.of(),"services",List.of()));
     public CliState(Path config) throws IOException {
@@ -22,7 +41,7 @@ public final class CliState implements AutoCloseable {
         file=root.resolve(prefix(this.config)+ProcessHandle.current().pid()+".json");
         write();
         publisher=Executors.newSingleThreadScheduledExecutor(r -> {var t=new Thread(r,"cli-state");t.setDaemon(true);return t;});
-        publisher.scheduleWithFixedDelay(() -> {try{write();}catch(Exception error){System.err.println("State publication failed; status will become stale.");publisher.shutdown();}},1,1,TimeUnit.SECONDS);
+        publisher.scheduleWithFixedDelay(() -> failing=publishOnce(this::write,failing,System.err),1,1,TimeUnit.SECONDS);
     }
     static Path ensureRoot() throws IOException {
         Path root=root();
