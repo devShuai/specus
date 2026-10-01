@@ -494,6 +494,48 @@ func TestTCPSameTickCleanAckCollapsesBackoff(t *testing.T) {
 	h.expectOne(h.conn.onTick(h.now.Add(tcpMinRTO)), "retry at learned RTO")
 }
 
+// The segments sent alongside a lost one are acknowledged only when its retransmission fills the
+// hole, so their send-to-ACK time is the retransmission timeout, not the path. Taking them as
+// round-trip samples made every recovery stretch the next timeout, and in the lab a flow with 64 KiB
+// queued went seconds without resending the hole its consumer was waiting for. The ACK that fills
+// the hole keeps the backoff; the next clean ACK brings the RTO back to the floor.
+func TestTCPTheAckThatFillsAHoleIsNotARoundTripSample(t *testing.T) {
+	h := newTCPHarness(t)
+	mss := h.conn.sndMSS
+
+	// Four segments in flight; the first is lost and the consumer holds the other three.
+	if sent := len(h.conn.onAppData(make([]byte, 4*mss), h.now).Segments); sent != 4 {
+		t.Fatalf("sent %d segments, want a flight of 4", sent)
+	}
+	h.advance(time.Millisecond)
+	for duplicate := 0; duplicate < 3; duplicate++ {
+		if out := h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5001, Flags: tcpFlagACK}); len(out.Segments) != 0 {
+			t.Fatal("a duplicate ACK produced segments")
+		}
+	}
+	h.advance(tcpMinRTO - time.Millisecond)
+	h.expectOne(h.conn.onTick(h.now), "the hole's retransmission")
+	h.advance(time.Millisecond)
+	h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5001 + uint32(4*mss), Flags: tcpFlagACK})
+	if h.conn.rto != 2*tcpMinRTO {
+		t.Fatalf("the ACK that filled the hole moved the RTO to %v; it should keep the backoff", h.conn.rto)
+	}
+
+	// One clean round trip, then the next loss.
+	h.expectOne(h.conn.onAppData(make([]byte, mss), h.now), "the next segment")
+	h.advance(time.Millisecond)
+	h.feed(tcpSegment{Seq: h.peerSeq, Ack: 5001 + uint32(5*mss), Flags: tcpFlagACK})
+	if h.conn.rto != tcpMinRTO {
+		t.Fatalf("a clean ACK after the recovery left the RTO at %v", h.conn.rto)
+	}
+	h.advance(88 * time.Millisecond)
+	h.expectOne(h.conn.onAppData(make([]byte, mss), h.now), "the segment to lose")
+	if len(h.conn.onTick(h.now.Add(tcpMinRTO-time.Millisecond)).Segments) != 0 {
+		t.Fatal("retransmitted before the RTO")
+	}
+	h.expectOne(h.conn.onTick(h.now.Add(tcpMinRTO)), "the retransmission at the 200 ms floor")
+}
+
 // A reset inside the window ends the flow; one outside it is ignored, which is what stops a blind
 // off-path attacker from tearing down flows by guessing sequence numbers.
 func TestTCPAcceptsInWindowResetAndIgnoresOthers(t *testing.T) {
