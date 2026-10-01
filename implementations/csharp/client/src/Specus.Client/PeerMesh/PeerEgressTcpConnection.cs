@@ -110,8 +110,9 @@ internal sealed class PeerEgressTcpConnection
         public int Attempts;
 
         /// <summary>
-        /// Marks a segment that was resent, so its round-trip sample is discarded. That is Karn's
-        /// algorithm: an ambiguous sample would poison the estimator whenever loss happens.
+        /// Marks a segment that was resent, so the acknowledgement that covers it yields no
+        /// round-trip sample at all. That is Karn's algorithm: an ambiguous sample would poison the
+        /// estimator whenever loss happens.
         /// </summary>
         public bool Retransmitted;
     }
@@ -386,6 +387,22 @@ internal sealed class PeerEgressTcpConnection
             if (_sndWnd > 0) { _persistAtMs = -1; }
         }
 
+        // Karn applies to the acknowledgement, not only to the segment. An ACK that also covers a
+        // resent segment is the one that filled the hole: whatever went out alongside the lost
+        // segment was waiting behind it, so its "round trip" is the retransmission timeout rather
+        // than the path. Sampling those segments fed every recovery's timeout back into the
+        // estimate, so each loss stretched the next timeout and a lossy flow went quiet for
+        // seconds, then for longer than the application would wait. Linux discards the whole ACK
+        // the same way; the next clean ACK, one round trip later, collapses the backoff.
+        var ambiguous = false;
+        foreach (var entry in _retransmit)
+        {
+            if (PeerEgressSegment.SeqLessEqual(entry.Seq + EntryLength(entry), ack) && entry.Retransmitted)
+            {
+                ambiguous = true;
+            }
+        }
+
         for (var index = _retransmit.Count - 1; index >= 0; index--)
         {
             var entry = _retransmit[index];
@@ -400,7 +417,7 @@ internal sealed class PeerEgressTcpConnection
                 }
                 continue;
             }
-            if (!entry.Retransmitted)
+            if (!ambiguous)
             {
                 UpdateRto(nowMs - entry.SentAtMs);
             }
