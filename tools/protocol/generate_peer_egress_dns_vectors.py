@@ -2,7 +2,9 @@
 
 Covers what the three clients must decide identically: which domain rules are valid, which rule a
 name selects, how the DNS responder answers, how the fake-IP pool allocates, refreshes, evicts and
-quarantines, how name-bind is encoded, and which resolved address an egress connects to.
+quarantines, how name-bind is encoded, and which resolved address an egress connects to. Step three
+adds the consumer's side: when phase two runs at all, what it reads from egress-catalog, which
+rules the status reports in force, and what happens to each packet sent into the pool.
 
 Every expectation is produced by the reference implementation here and asserted against the case
 before writing, so the file cannot ship internally inconsistent cases. See
@@ -101,8 +103,8 @@ def pool_problem(cidr, mesh=MESH_CIDR):
 
 
 def rule_in_force(rule, takeover, egress_domain_capable):
-    """validate_rule, then the capability check: a domain rule sent to an egress that does not
-    announce domainTargetCapable is out of force rather than resolved locally."""
+    """validate_rule, then the capability check for an egress that is online: a domain rule sent to
+    one that does not announce domainTargetCapable is out of force rather than resolved locally."""
     code = validate_rule(rule, takeover)
     if code is not None:
         return code
@@ -229,6 +231,251 @@ def run_pool(cidr, events):
             results.append(pool.query(event["query"], event["at"]))
         else:
             results.append(pool.traffic(event["traffic"], event["at"]))
+    return results
+
+
+# --------------------------------------------------------------------------------------------------
+# Step three: the consumer's data plane
+# --------------------------------------------------------------------------------------------------
+
+def phase_two(consumer_enabled, takeover, cidr, mesh=MESH_CIDR):
+    """Whether phase two runs: asked for, on top of phase one, with a usable pool. An unusable pool
+    stops phase two alone; phase one carries on, and domain rules read as if takeover were off."""
+    if not consumer_enabled or not takeover:
+        return {"active": False, "code": None}
+    code = pool_problem(cidr, mesh)
+    return {"active": code is None, "code": code}
+
+
+def rule_status(rule, takeover, online, capable):
+    """The code the status gives a rule; None is in force.
+
+    The capability only counts for an egress that is online. The catalogue reads false for an
+    offline egress, and an offline egress is phase one's egress-unavailable -- the rule is right and
+    waiting -- not a rule pointed at a device that can never take it."""
+    code = validate_rule(rule, takeover)
+    if code is not None:
+        return code
+    match = (rule.get("match") or "").strip()
+    if looks_like_domain(match) and rule["action"] == "egress":
+        egress = int(rule["egressClientId"])
+        if online.get(egress, False) and not capable.get(egress, False):
+            return "EGRESS_RULE_EGRESS_NO_DOMAIN"
+    return None
+
+
+def positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+class CatalogReader:
+    """What a consumer keeps from egress-catalog: which egress resolves names.
+
+    The revision works as for egress-config: rising within one control session, a snapshot at or
+    below the last accepted one ignored, the floor reset by a new session. What was learned stays
+    until the next accepted catalogue replaces it."""
+
+    def __init__(self):
+        self.floor = None
+        self.capable = {}
+
+    def new_session(self):
+        self.floor = None
+
+    def read(self, text):
+        try:
+            message = json.loads(text)
+        except ValueError:
+            return False
+        if not isinstance(message, dict) or message.get("type") != "egress-catalog":
+            return False
+        revision = message.get("revision")
+        if not positive_int(revision):
+            return False
+        egresses = message.get("egresses", [])
+        if not isinstance(egresses, list):
+            return False
+        if self.floor is not None and revision <= self.floor:
+            return False
+        self.floor = revision
+        capable = {}
+        for entry in egresses:
+            if not isinstance(entry, dict) or not positive_int(entry.get("clientId")):
+                continue
+            capable[entry["clientId"]] = entry.get("domainTargetCapable") is True
+        self.capable = capable
+        return True
+
+    def capable_ids(self):
+        return sorted(client for client, able in self.capable.items() if able)
+
+
+def in_pool(network, destination):
+    return ipaddress.IPv4Address(destination) in network
+
+
+class Steering:
+    """The consumer's decision for one packet, with phase two running.
+
+    A destination inside the pool is steered by the name it was handed out for, never by address
+    rules (validation keeps address rules out of the pool). Outside the pool phase one decides."""
+
+    def __init__(self, rules, cidr):
+        self.rules = rules
+        self.network = ipaddress.IPv4Network(cidr)
+        self.pool = Pool(cidr)
+        self.online = {}
+        self.capable = {}
+        # (protocol, sourcePort, destination, destinationPort) -> {"egress", "replied"}
+        self.flows = {}
+
+    def decide(self, destination, now, touch):
+        if in_pool(self.network, destination):
+            name = self.pool.by_address.get(int(ipaddress.IPv4Address(destination)))
+            if name is None:
+                return {"outcome": "blocked", "reason": "fake-ip-unmapped", "answered": True}
+            if touch:
+                self.pool.by_name[name]["lastUsed"] = now
+            index = select_domain_rule(self.rules, name)
+            if index is None or self.rules[index]["action"] == "direct":
+                # The name was handed out under a rule that no longer claims it. Its real address is
+                # unknown here, so the only choices are block or guess; the answer makes the
+                # application ask again, and the fresh query goes wherever the rules now say.
+                return {"outcome": "blocked", "reason": "fake-ip-stale", "answered": True}
+            rule = self.rules[index]
+            if rule["action"] == "block":
+                return {"outcome": "blocked", "reason": "rule", "answered": False}
+            return {"egress": int(rule["egressClientId"]), "name": name}
+        address = ipaddress.IPv4Address(destination)
+        best = None
+        for rule in self.rules:
+            match = (rule.get("match") or "").strip()
+            if looks_like_domain(match) or validate_rule(rule, True) is not None:
+                continue
+            network = ipaddress.IPv4Network(match)
+            if address in network and (best is None or network.prefixlen > best[0].prefixlen):
+                best = (network, rule)
+        if best is None or best[1]["action"] == "direct":
+            return {"outcome": "not-mine"}
+        if best[1]["action"] == "block":
+            return {"outcome": "blocked", "reason": "rule", "answered": False}
+        return {"egress": int(best[1]["egressClientId"]), "name": None}
+
+    def packet(self, event, now):
+        destination = event["destination"]
+        decision = self.decide(destination, now, touch=True)
+        if "outcome" in decision:
+            return decision
+        protocol = event["protocol"]
+        if protocol not in ("tcp", "udp"):
+            return {"outcome": "blocked", "reason": "unsupported-protocol", "answered": False}
+        egress = decision["egress"]
+        if not self.online.get(egress, False):
+            return {"outcome": "blocked", "reason": "egress-unavailable", "answered": True}
+        if decision["name"] is not None and not self.capable.get(egress, False):
+            return {"outcome": "blocked", "reason": "egress-no-domain", "answered": True}
+        key = (protocol, event["sourcePort"], destination, event["destinationPort"])
+        flags = event.get("flags", "")
+        opening = protocol == "tcp" and "S" in flags and "A" not in flags
+        new = key not in self.flows
+        if new:
+            self.flows[key] = {"egress": egress, "replied": False}
+        # A lost name-bind has to be recoverable. TCP recovers on the SYN the application
+        # retransmits; UDP has nothing of its own, so until the egress has answered the flow at all,
+        # every datagram carries one.
+        unanswered_udp = protocol == "udp" and not self.flows[key]["replied"]
+        name_bind = None
+        if decision["name"] is not None and (new or opening or unanswered_udp):
+            name_bind = {"address": destination, "name": decision["name"]}
+        return {"outcome": "forwarded", "egressClientId": egress, "nameBind": name_bind}
+
+    def reply(self, event):
+        """A return packet from the flow's egress: the consumer's flow as the reply sees it."""
+        key = (event["protocol"], event["sourcePort"], event["destination"], event["destinationPort"])
+        flow = self.flows.get(key)
+        if flow is None:
+            return {"accepted": False}
+        flow["replied"] = True
+        return {"accepted": True}
+
+    def purge(self, now):
+        """Flows whose destination no longer goes to the egress carrying them, as flow-purge
+        destinations per egress. The decision is re-run without touching the mapping: a rule
+        change is not traffic."""
+        out = {}
+        for key, flow in sorted(self.flows.items()):
+            egress = flow["egress"]
+            decision = self.decide(key[2], now, touch=False)
+            still = ("egress" in decision and decision["egress"] == egress
+                     and self.online.get(egress, False)
+                     and (decision["name"] is None or self.capable.get(egress, False)))
+            if still:
+                continue
+            del self.flows[key]
+            out.setdefault(str(egress), set()).add(key[2] + "/32")
+        return {"purge": {egress: sorted(destinations) for egress, destinations in sorted(out.items())}}
+
+
+class EgressBindings:
+    """An egress's name bindings and the flows it opened, for one question: which flows a name-bind
+    closes, and which of them the application is told about.
+
+    A flow opened before its name arrived went to the fake address itself and will never work; once
+    the name is known it is closed, so the consumer's next packet opens it properly. It is closed
+    silently: that next packet is usually the application's own retransmitted SYN, and a reset sent
+    now would refuse the connection the name-bind came to rescue. A flow opened for another name was
+    a real connection to somewhere the address no longer means, and is reset like a revoked one."""
+
+    def __init__(self):
+        self.names = {}
+        self.flows = {}  # id -> {"consumer", "address", "name"}
+
+    def open(self, flow_id, consumer, address):
+        name = self.names.get((consumer, address))
+        self.flows[flow_id] = {"consumer": consumer, "address": address, "name": name}
+        return {"name": name}
+
+    def bind(self, consumer, address, name):
+        name = normalize_name(name)
+        self.names[(consumer, address)] = name
+        closed = sorted(flow_id for flow_id, flow in self.flows.items()
+                        if flow["consumer"] == consumer and flow["address"] == address and flow["name"] != name)
+        reset = [flow_id for flow_id in closed if self.flows[flow_id]["name"] is not None]
+        for flow_id in closed:
+            del self.flows[flow_id]
+        return {"closed": closed, "reset": reset}
+
+
+def run_egress_binds(events):
+    egress = EgressBindings()
+    results = []
+    for event in events:
+        if "open" in event:
+            results.append(egress.open(event["open"], event["consumer"], event["address"]))
+        else:
+            results.append(egress.bind(event["consumer"], event["address"], event["nameBind"]))
+    return results
+
+
+def run_steering(case):
+    steering = Steering(case["rules"], case["cidr"])
+    results = []
+    for event in case["events"]:
+        now = event["at"]
+        if "map" in event:
+            results.append(steering.pool.query(event["map"], now))
+        elif "packet" in event:
+            results.append(steering.packet(event["packet"], now))
+        elif "reply" in event:
+            results.append(steering.reply(event["reply"]))
+        else:
+            if "rules" in event:
+                steering.rules = event["rules"]
+            if "online" in event:
+                steering.online.update({int(k): v for k, v in event["online"].items()})
+            if "catalog" in event:
+                steering.capable = {int(k): v for k, v in event["catalog"].items()}
+            results.append(steering.purge(now))
     return results
 
 
@@ -390,6 +637,125 @@ POOL_CASES = [
     },
 ]
 
+PHASE_TWO = [
+    ("off-by-default", True, False, DEFAULT_POOL),
+    ("on", True, True, DEFAULT_POOL),
+    ("needs-phase-one", False, True, DEFAULT_POOL),
+    ("unusable-pool-stops-phase-two", True, True, "198.18.0.0/25"),
+    ("pool-over-the-mesh", True, True, "100.96.0.0/16"),
+]
+
+RULE_STATUS = [
+    ("domain-to-online-capable", {"match": "example.com", "action": "egress", "egressClientId": 2}, True, True, True),
+    ("domain-to-online-incapable", {"match": "example.com", "action": "egress", "egressClientId": 2}, True, True,
+     False),
+    ("suffix-to-online-incapable", {"match": "*.example.com", "action": "egress", "egressClientId": 2}, True, True,
+     False),
+    # Offline, the catalogue says false; the rule is right and waiting, as any rule to an offline egress.
+    ("domain-to-offline-egress", {"match": "example.com", "action": "egress", "egressClientId": 2}, True, False,
+     False),
+    ("domain-block-with-incapable-egress", {"match": "example.com", "action": "block"}, True, True, False),
+    ("address-to-online-incapable", {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2}, True, True,
+     False),
+    ("domain-without-phase-two", {"match": "example.com", "action": "egress", "egressClientId": 2}, False, True, True),
+    ("disabled-first", {"match": "example.com", "action": "egress", "egressClientId": 2, "enabled": False}, True,
+     True, False),
+]
+
+
+def catalog_text(revision, egresses, **extra):
+    message = {"type": "egress-catalog", "revision": revision, "egresses": egresses}
+    message.update(extra)
+    return json.dumps(message, separators=(",", ":"))
+
+
+CATALOG_EVENTS = [
+    ("first", catalog_text(4, [
+        {"clientId": 2, "clientName": "office-gateway", "online": True, "scope": "PUBLIC", "protocols": ["tcp"],
+         "domainTargetCapable": True, "ipv6TargetCapable": False},
+        {"clientId": 3, "clientName": "home-gateway", "online": True, "scope": "PUBLIC", "protocols": ["tcp"],
+         "domainTargetCapable": False, "ipv6TargetCapable": False}])),
+    ("same-revision-ignored", catalog_text(4, [{"clientId": 3, "domainTargetCapable": True}])),
+    ("older-revision-ignored", catalog_text(3, [{"clientId": 3, "domainTargetCapable": True}])),
+    ("newer-replaces-everything", catalog_text(5, [{"clientId": 3, "domainTargetCapable": True}])),
+    ("not-a-catalogue", json.dumps({"type": "egress-config", "revision": 9, "enabled": False},
+                                   separators=(",", ":"))),
+    ("only-json-true-counts", catalog_text(6, [{"clientId": 2, "domainTargetCapable": "true"},
+                                                {"clientId": 3, "domainTargetCapable": 1}],
+                                           createdAtMillis=1757000000000)),
+    ("absent-list-is-empty", json.dumps({"type": "egress-catalog", "revision": 7}, separators=(",", ":"))),
+    ("revision-must-be-a-number", catalog_text("8", [{"clientId": 2, "domainTargetCapable": True}])),
+    ("list-must-be-a-list", catalog_text(8, {"clientId": 2, "domainTargetCapable": True})),
+    ("new-session", None),
+    ("floor-reset-by-the-new-session", catalog_text(1, [{"clientId": 2, "domainTargetCapable": True}])),
+    ("entries-without-a-usable-id-skipped", catalog_text(2, [
+        {"clientId": 0, "domainTargetCapable": True}, {"clientId": -3, "domainTargetCapable": True},
+        {"clientId": "2", "domainTargetCapable": True}, {"clientId": True, "domainTargetCapable": True},
+        "gateway", {"clientId": 4, "domainTargetCapable": True}])),
+    ("not-json", "{\"type\":\"egress-catalog\","),
+]
+
+STEERING_RULES = [
+    {"match": "example.com", "action": "egress", "egressClientId": 2},
+    {"match": "*.example.com", "action": "egress", "egressClientId": 3},
+    {"match": "*.ads.example.com", "action": "block"},
+    {"match": "direct.example.com", "action": "direct"},
+    {"match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+]
+
+
+def tcp(source_port, destination, flags, port=443):
+    return {"packet": {"protocol": "tcp", "sourcePort": source_port, "destination": destination,
+                       "destinationPort": port, "flags": flags}}
+
+
+def udp(source_port, destination, port=443):
+    return {"packet": {"protocol": "udp", "sourcePort": source_port, "destination": destination,
+                       "destinationPort": port}}
+
+
+STEERING_EVENTS = [
+    {"online": {"2": True, "3": True}, "catalog": {"2": True, "3": False}},
+    {"map": "example.com"},
+    {"map": "www.example.com"},
+    {"map": "x.ads.example.com"},
+    tcp(40000, "198.18.0.2", "S"),
+    tcp(40000, "198.18.0.2", "S"),
+    tcp(40000, "198.18.0.2", "A"),
+    udp(50000, "198.18.0.2"),
+    udp(50000, "198.18.0.2"),
+    {"reply": {"protocol": "udp", "sourcePort": 50000, "destination": "198.18.0.2", "destinationPort": 443}},
+    udp(50000, "198.18.0.2"),
+    tcp(40001, "198.18.0.3", "S"),
+    tcp(40002, "198.18.0.4", "S"),
+    tcp(40003, "198.18.0.5", "S"),
+    {"packet": {"protocol": "icmp", "destination": "198.18.0.2"}},
+    tcp(40004, "203.0.113.10", "S"),
+    tcp(40005, "192.0.2.1", "S"),
+    {"catalog": {"2": True, "3": True}},
+    tcp(40001, "198.18.0.3", "S"),
+    {"catalog": {"2": False, "3": True}},
+    tcp(40000, "198.18.0.2", "A"),
+    tcp(40004, "203.0.113.10", "A"),
+    {"catalog": {"2": True, "3": True}},
+    tcp(40006, "198.18.0.2", "S"),
+    {"rules": [{"match": "example.com", "action": "block"}] + STEERING_RULES[1:]},
+    tcp(40006, "198.18.0.2", "A"),
+    {"online": {"3": False}},
+    tcp(40001, "198.18.0.3", "A"),
+    {"rules": [{"match": "example.com", "action": "block"}] + STEERING_RULES[2:]},
+    tcp(40007, "198.18.0.3", "S"),
+]
+
+EGRESS_BIND_EVENTS = [
+    {"open": "early", "consumer": 1, "address": "198.18.0.5"},
+    {"open": "other-consumer", "consumer": 7, "address": "198.18.0.5"},
+    {"nameBind": "example.com", "consumer": 1, "address": "198.18.0.5"},
+    {"open": "bound", "consumer": 1, "address": "198.18.0.5"},
+    {"nameBind": "Example.COM.", "consumer": 1, "address": "198.18.0.5"},
+    {"nameBind": "www.example.com", "consumer": 1, "address": "198.18.0.5"},
+]
+
 EGRESS_CHOICES = [
     ("first-allowed-a", ["203.0.113.10", "203.0.113.11"], [], False,
      {"203.0.113.10": "EGRESS_ALLOWED", "203.0.113.11": "EGRESS_ALLOWED"}),
@@ -472,6 +838,77 @@ def build():
         {"name": "incapable-egress-refuses", "domainTargetCapable": False,
          "json": encode_name_bind("198.18.0.5", "example.com"), "code": name_bind_at_egress(False)},
     ]
+    phase = []
+    for name, consumer_enabled, takeover, cidr in PHASE_TWO:
+        phase.append({"name": name, "consumerEnabled": consumer_enabled, "takeover": takeover, "cidr": cidr,
+                      **phase_two(consumer_enabled, takeover, cidr)})
+    assert [case["active"] for case in phase] == [False, True, False, False, False], phase
+    rule_status_cases = []
+    for name, rule, takeover, online, capable in RULE_STATUS:
+        rule_status_cases.append({"name": name, "rule": rule, "takeover": takeover, "egressOnline": online,
+                                  "egressDomainTargetCapable": capable,
+                                  "code": rule_status(rule, takeover, {2: online}, {2: capable})})
+    assert [case["code"] for case in rule_status_cases] == [
+        None, "EGRESS_RULE_EGRESS_NO_DOMAIN", "EGRESS_RULE_EGRESS_NO_DOMAIN", None, None, None,
+        "EGRESS_RULE_DOMAIN_UNSUPPORTED", "EGRESS_RULE_DISABLED"], rule_status_cases
+    reader = CatalogReader()
+    catalog = []
+    for name, text in CATALOG_EVENTS:
+        if text is None:
+            reader.new_session()
+            catalog.append({"name": name, "newSession": True, "domainTargetCapable": reader.capable_ids()})
+            continue
+        accepted = reader.read(text)
+        catalog.append({"name": name, "json": text, "accepted": accepted,
+                        "domainTargetCapable": reader.capable_ids()})
+    # Hand-checked, so the reference itself is pinned.
+    assert [(case.get("accepted"), case["domainTargetCapable"]) for case in catalog] == [
+        (True, [2]), (False, [2]), (False, [2]), (True, [3]), (False, [3]), (True, []), (True, []),
+        (False, []), (False, []), (None, []), (True, [2]), (True, [4]), (False, [4])], catalog
+    events = [{"at": index, **event} for index, event in enumerate(STEERING_EVENTS)]
+    steering_case = {"name": "consumer-steering", "cidr": "198.18.0.0/29", "rules": STEERING_RULES,
+                     "events": events}
+    steering_case["results"] = run_steering(steering_case)
+    outcomes = [result.get("outcome") or result.get("address") or result for result in steering_case["results"]]
+    fake2 = {"address": "198.18.0.2", "name": "example.com"}
+    fake3 = {"address": "198.18.0.3", "name": "www.example.com"}
+    assert steering_case["results"] == [
+        {"purge": {}},
+        {"address": "198.18.0.2", "evicted": []},
+        {"address": "198.18.0.3", "evicted": []},
+        {"address": "198.18.0.4", "evicted": []},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": fake2},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": fake2},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": None},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": fake2},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": fake2},
+        {"accepted": True},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": None},
+        {"outcome": "blocked", "reason": "egress-no-domain", "answered": True},
+        {"outcome": "blocked", "reason": "rule", "answered": False},
+        {"outcome": "blocked", "reason": "fake-ip-unmapped", "answered": True},
+        {"outcome": "blocked", "reason": "unsupported-protocol", "answered": False},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": None},
+        {"outcome": "not-mine"},
+        {"purge": {}},
+        {"outcome": "forwarded", "egressClientId": 3, "nameBind": fake3},
+        {"purge": {"2": ["198.18.0.2/32"]}},
+        {"outcome": "blocked", "reason": "egress-no-domain", "answered": True},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": None},
+        {"purge": {}},
+        {"outcome": "forwarded", "egressClientId": 2, "nameBind": fake2},
+        {"purge": {"2": ["198.18.0.2/32"]}},
+        {"outcome": "blocked", "reason": "rule", "answered": False},
+        {"purge": {"3": ["198.18.0.3/32"]}},
+        {"outcome": "blocked", "reason": "egress-unavailable", "answered": True},
+        {"purge": {}},
+        {"outcome": "blocked", "reason": "fake-ip-stale", "answered": True},
+    ], outcomes
+    bind_events = [dict(event) for event in EGRESS_BIND_EVENTS]
+    bind_results = run_egress_binds(bind_events)
+    assert bind_results == [
+        {"name": None}, {"name": None}, {"closed": ["early"], "reset": []}, {"name": "example.com"},
+        {"closed": [], "reset": []}, {"closed": ["bound"], "reset": ["bound"]}], bind_results
     choices = []
     for name, a_records, aaaa_records, capable, decisions in EGRESS_CHOICES:
         choices.append({"name": name, "a": a_records, "aaaa": aaaa_records, "ipv6TargetCapable": capable,
@@ -493,6 +930,11 @@ def build():
         "nameBind": name_bind,
         "nameBindAtEgress": bind_at_egress,
         "egressChoice": choices,
+        "phaseTwo": phase,
+        "ruleStatus": rule_status_cases,
+        "catalog": catalog,
+        "steering": [steering_case],
+        "nameBindClosesFlows": {"events": bind_events, "results": bind_results},
     }
 
 
@@ -501,7 +943,9 @@ def main():
     path = VECTORS / "peer-egress-dns-v1.json"
     path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {path}: validation={len(document['validation'])} selection={len(document['selection'])} "
-          f"answers={len(document['answers'])} pool={len(document['pool'])} egressChoice={len(document['egressChoice'])}")
+          f"answers={len(document['answers'])} pool={len(document['pool'])} egressChoice={len(document['egressChoice'])} "
+          f"phaseTwo={len(document['phaseTwo'])} ruleStatus={len(document['ruleStatus'])} "
+          f"catalog={len(document['catalog'])} steering={len(document['steering'][0]['events'])}")
 
 
 if __name__ == "__main__":

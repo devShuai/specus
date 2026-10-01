@@ -170,6 +170,16 @@ type peerMeshClient struct {
 	// egressCommander overrides the platform's routing table. Nil means the real one; tests set
 	// it so applying rules never runs a route command on the machine they run on.
 	egressCommander egressRouteCommander
+	// egressCatalog is what the server's egress-catalog said about which egresses resolve names.
+	// Kept across control sessions: a new session resets only its revision floor. Guarded by mu.
+	egressCatalog *egressCatalogReader
+	// egressPhase is phase two as the last reconcile found it, and egressPhaseEvaluated whether one
+	// has. Guarded by mu.
+	egressPhase          egressPhaseTwo
+	egressPhaseEvaluated bool
+	// egressLocalNetworks lists the networks this device sits on, for the fake-IP pool's startup
+	// check. Nil means the real interfaces; tests set it.
+	egressLocalNetworks func() []string
 
 	// The consumer's route plan, kept true on the mesh's own tick. Guarded by egressPlanMu, which
 	// is never taken under mu: a reconcile resolves hostnames and runs route commands.
@@ -186,6 +196,11 @@ type peerMeshClient struct {
 	egressRepairAt         time.Time
 	egressRepairTroubled   bool
 	egressTableErrorLogged string
+	// The fake-IP pool's check against this device's own networks runs once per pool, when phase
+	// two first starts, and its answer is kept; egressPhaseLogged says the outcome once.
+	egressPoolCheckedFor    string
+	egressPoolOverlapsLocal bool
+	egressPhaseLogged       string
 }
 
 type peerMeshPeer struct {
@@ -625,6 +640,9 @@ func (mesh *peerMeshClient) suspend() {
 	}
 	mesh.conn = nil
 	mesh.sender = nil
+	// Every control session ends here, so the next one numbers its catalogues afresh. What the
+	// last one said stays until a new catalogue replaces it.
+	mesh.newEgressCatalogSessionLocked()
 	mesh.mu.Unlock()
 }
 
@@ -738,6 +756,16 @@ func (mesh *peerMeshClient) runtimeConfigKeyFor(peerMesh PeerMeshConfig) string 
 
 func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base RuntimeConfig, sender peerControlSender) {
 	if strings.TrimSpace(payload) == "" {
+		return
+	}
+	// The catalogue is read before the mesh's own decode, which would refuse the whole message
+	// over a key the catalogue ignores (a future field sharing a name with one of the mesh's, say),
+	// and its rules are that unknown keys never stop a catalogue from being read.
+	var head struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(payload), &head) == nil && head.Type == peerControlTypeEgressCatalog {
+		mesh.applyEgressCatalog(payload)
 		return
 	}
 	var message peerControlMessage
