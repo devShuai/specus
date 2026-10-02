@@ -629,7 +629,7 @@ export function PeerMeshServicesTab({
                       <Chip size="sm" color={chip.color} variant="flat">
                         {chip.text}
                       </Chip>
-                      {directoryChecks[row.key] ? <p role="status" className="mt-2 max-w-64 text-tiny leading-5 text-default-500">
+                      {directoryChecks[row.key] ? <p role="status" className="mt-2 max-w-64 text-tiny text-default-500">
                         上次检查：{formatDateTime(directoryChecks[row.key].checkedAt)} · {directoryChecks[row.key].result}<br />{directoryChecks[row.key].detail}
                       </p> : <p className="mt-1 text-tiny text-default-500">目标连通性未检测</p>}
                     </TableCell>

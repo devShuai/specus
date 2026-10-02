@@ -172,7 +172,7 @@ export function PublicDownloadPage() {
       <section className="download-hero relative overflow-hidden pb-14 pt-5 sm:pb-20">
         <div className="download-channel-lines" aria-hidden="true" />
         <header className="landing-apple-header relative z-40 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-5 sm:px-8">
-          <a className="rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" href="/" aria-label="返回 specus 首页">
+          <a className="rounded-md focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary" href="/" aria-label="返回 specus 首页">
             <AppLogo className="min-w-0" label="specus" subtitle="客户端下载" />
           </a>
           <div className="public-header-actions flex shrink-0 items-center gap-2">
@@ -249,7 +249,7 @@ export function PublicDownloadPage() {
               <div key={number} className="download-step px-5 py-4">
                 <span className="font-mono text-tiny text-primary">{number}</span>
                 <strong className="ml-3 text-small font-semibold">{title}</strong>
-                <p className="mt-2 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">{description}</p>
+                <p className="mt-2 text-tiny text-zinc-600 dark:text-zinc-400">{description}</p>
               </div>
             ))}
           </div>
@@ -262,7 +262,7 @@ export function PublicDownloadPage() {
             <div className="max-w-2xl">
               <span className="landing-apple-kicker text-tiny font-semibold">ALL OPTIONS</span>
               <h2 className="mt-2">需要其他安装方式？</h2>
-              <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+              <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
                 展开后可按 macOS、Windows、Linux 与跨平台运行时查看全部可用客户端产物。
               </p>
             </div>
@@ -282,7 +282,7 @@ export function PublicDownloadPage() {
             <div
               ref={allDownloadsRef}
               id="all-download-methods"
-              className="download-all mt-8 scroll-mt-6 focus:outline-none"
+              className="download-all mt-8 scroll-mt-6 focus:outline-hidden"
               tabIndex={-1}
             >
               {loadError && (
@@ -348,7 +348,7 @@ function RecommendedInstall({
           <div>
             <span className="download-match-badge">Android 最佳匹配</span>
             <h3 className="mt-3 text-2xl font-semibold">{recommendation.link.displayName}</h3>
-            <p className="mt-2 max-w-2xl text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            <p className="mt-2 max-w-2xl text-small text-zinc-600 dark:text-zinc-400">
               下载通用 APK 后，Android 会再次确认安装。后续版本可由客户端主动提示。
             </p>
             <div className="mt-4 flex flex-wrap gap-2 text-tiny text-zinc-600 dark:text-zinc-400">
@@ -376,7 +376,7 @@ function RecommendedInstall({
         <div>
           <span className="download-match-badge">还差一步</span>
           <h3 className="mt-3 text-xl font-semibold">选择这台设备的处理器架构</h3>
-          <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
             浏览器没有提供可靠的架构信息。请在系统设置中确认，避免下载无法运行的版本。
           </p>
           <div className="mt-5 grid gap-3 sm:grid-cols-2">
@@ -407,7 +407,7 @@ function RecommendedInstall({
           <div>
             <span className="download-match-badge">最佳匹配</span>
             <h3 className="mt-3 text-2xl font-semibold">{recommendation.link.displayName}</h3>
-            <p className="mt-2 max-w-2xl text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            <p className="mt-2 max-w-2xl text-small text-zinc-600 dark:text-zinc-400">
               {desktop
                 ? "自包含的 Windows 图形客户端，无需另外安装 .NET Runtime。下载压缩包并解压后即可使用。"
                 : recommendation.link.description || "对应当前系统与处理器的静态单文件客户端，无需额外安装运行时。"}
@@ -445,7 +445,7 @@ function RecommendedInstall({
       <div>
         <span className="download-match-badge download-match-badge-neutral">桌面客户端</span>
         <h3 className="mt-3 text-xl font-semibold">请在电脑上打开下载页</h3>
-        <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+        <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
           当前暂未提供 iOS、iPadOS 或 ChromeOS 安装包。请使用 Android、macOS、Windows 或 Linux 设备下载客户端。
         </p>
         <button className="mt-5 font-medium text-primary hover:underline" type="button" onClick={onShowAll}>
@@ -459,7 +459,7 @@ function RecommendedInstall({
     <div>
       <span className="download-match-badge download-match-badge-neutral">未识别设备</span>
       <h3 className="mt-3 text-xl font-semibold">选择你的系统与处理器</h3>
-      <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+      <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
         浏览器没有提供可确认的平台信息。请使用上方设备选择器，或展开全部安装方式。
       </p>
       <div className="mt-5 flex flex-wrap gap-4 text-small">
@@ -529,7 +529,7 @@ function DownloadUnavailable({
       <h3 className="mt-3 text-xl font-semibold">
         {networkError ? "暂时无法获取下载链接" : "当前发布暂无匹配原生包"}
       </h3>
-      <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+      <p className="mt-2 text-small text-zinc-600 dark:text-zinc-400">
         我们不会自动改用其他处理器架构，以免下载后无法运行。
       </p>
       <div className="mt-5 flex flex-wrap gap-4 text-small">
@@ -575,7 +575,7 @@ function DownloadGroup({
     <section className="download-group app-apple-landing-surface overflow-hidden" aria-labelledby={`download-group-${group.key}`}>
       <div className="border-b border-default-200 px-5 py-4">
         <h3 id={`download-group-${group.key}`} className="text-lg font-semibold">{group.title}</h3>
-        <p className="mt-1 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">{group.description}</p>
+        <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{group.description}</p>
       </div>
       <div className="grid gap-2 p-3">
         {group.key === "macos" && <HomebrewDownloadRow />}
@@ -596,7 +596,7 @@ function HomebrewDownloadRow() {
       <span className="download-release-icon" aria-hidden="true"><PackageIcon /></span>
       <span className="min-w-0 flex-1">
         <strong className="block text-small font-semibold">Homebrew Cask</strong>
-        <span className="mt-1 block text-tiny leading-5 text-zinc-600 dark:text-zinc-400">推荐 · 自动选择 Apple Silicon 或 Intel，并支持直接升级</span>
+        <span className="mt-1 block text-tiny text-zinc-600 dark:text-zinc-400">推荐 · 自动选择 Apple Silicon 或 Intel，并支持直接升级</span>
       </span>
       <span className="text-small text-primary" aria-hidden="true">↗</span>
     </a>
@@ -609,7 +609,7 @@ function ReleaseDownloadRow({ link }: { link: ClientDownloadLink }) {
       <span className="download-release-icon" aria-hidden="true"><PackageIcon /></span>
       <span className="min-w-0 flex-1">
         <strong className="block text-small font-semibold">{link.displayName}</strong>
-        <span className="mt-1 block text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
+        <span className="mt-1 block text-tiny text-zinc-600 dark:text-zinc-400">
           {implementationLabel(link)} · {archLabel(link.arch)}{link.description ? ` · ${link.description}` : ""}
         </span>
       </span>

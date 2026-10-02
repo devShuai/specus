@@ -12,8 +12,8 @@ export function MacosInstallGuide({ landing = false }: { landing?: boolean }) {
     <section
       aria-label="macOS Homebrew 安装说明"
       className={landing
-        ? "app-apple-landing-surface glass glass-border rounded-md border p-4 text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
-        : "rounded-md border border-default-200 bg-content1 p-4 shadow-sm"
+        ? "app-apple-landing-surface glass glass-border rounded-md border p-4 text-zinc-950 shadow-xs dark:text-white dark:shadow-none"
+        : "rounded-md border border-default-200 bg-content1 p-4 shadow-xs"
       }
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -25,7 +25,7 @@ export function MacosInstallGuide({ landing = false }: { landing?: boolean }) {
             <span className="text-tiny font-medium text-emerald-700 dark:text-emerald-300">推荐安装方式</span>
           </div>
           <h3 className="mt-2 text-base font-semibold">通过 Homebrew 安装 Specus Client</h3>
-          <p className="mt-1 text-small leading-6 text-default-500">
+          <p className="mt-1 text-small text-default-500">
             同一条命令自动选择 Apple Silicon 或 Intel 版本，并可通过 Homebrew 直接升级。
           </p>
         </div>
@@ -44,7 +44,7 @@ export function MacosInstallGuide({ landing = false }: { landing?: boolean }) {
         <CommandRow command={MACOS_CLIENT_START_COMMAND} label="运行" />
       </div>
 
-      <p className="mt-3 text-tiny leading-5 text-default-500">
+      <p className="mt-3 text-tiny text-default-500">
         将运行命令中的配置路径替换为你的 <code className="font-mono text-foreground">client.jsonc</code>；
         后续执行 <code className="font-mono text-foreground">{MACOS_HOMEBREW_UPGRADE_COMMAND}</code> 即可升级。
         也可以使用 GitHub Release 中对应架构的 macOS 压缩包手动安装。
@@ -80,7 +80,7 @@ function CommandRow({ command, label }: { command: string; label: string }) {
       </code>
       <button
         aria-label={`复制${label}命令`}
-        className="macos-command-copy shrink-0 rounded-md px-2 text-tiny font-medium text-primary transition hover:bg-primary-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-primary-500/10"
+        className="macos-command-copy shrink-0 rounded-md px-2 text-tiny font-medium text-primary transition hover:bg-primary-50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-primary-500/10"
         type="button"
         onClick={() => void copyCommand()}
       >

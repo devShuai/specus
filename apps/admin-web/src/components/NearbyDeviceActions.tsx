@@ -82,7 +82,7 @@ export function NearbyDeviceActions({
                 </span>
                 <span className="min-w-0">
                   <span className="block text-small font-medium text-zinc-900 dark:text-white">{action.label}</span>
-                  <span className="mt-0.5 block text-tiny leading-4 text-zinc-500 dark:text-zinc-400">
+                  <span className="mt-0.5 block text-tiny text-zinc-500 dark:text-zinc-400">
                     {disabled ? "当前房间为只读，无法发送" : action.detail}
                   </span>
                 </span>

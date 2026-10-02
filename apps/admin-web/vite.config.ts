@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import type { OutputChunk } from "rollup";
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 const DEFAULT_CHUNK_BUDGET_KIB = 500;
 const CHUNK_BUDGETS_KIB = new Map([
@@ -99,7 +100,7 @@ export default defineConfig(({ mode }) => {
     Object.fromEntries(paths.map((path) => [path, { target, changeOrigin: true, ws }]));
 
   return {
-    plugins: [react(), enforceChunkBudgets()],
+    plugins: [react(), tailwindcss(), enforceChunkBudgets()],
     base: "/",
     server: {
       port: 5173,

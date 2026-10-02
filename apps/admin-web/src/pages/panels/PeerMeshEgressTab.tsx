@@ -404,12 +404,16 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             />
           </div>
 
-          <Switch
-            isSelected={draft.enabled}
-            onValueChange={(enabled) => setDraft((current) => current && { ...current, enabled })}
-          >
-            启用这条策略
-          </Switch>
+          {/* The switch is inline-level; in a block of its own, space-y's gap no longer eats its line's
+              descender space, now that Tailwind 4 puts that gap in the bottom margin. */}
+          <div>
+            <Switch
+              isSelected={draft.enabled}
+              onValueChange={(enabled) => setDraft((current) => current && { ...current, enabled })}
+            >
+              启用这条策略
+            </Switch>
+          </div>
 
           {check && check.errors.length > 0 && (
             <ul role="alert" className="list-disc space-y-1 rounded-md border border-danger-200 bg-danger-50 p-3 pl-6 text-small text-danger-700">

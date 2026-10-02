@@ -69,8 +69,8 @@ export function DiagramAccountDialog({
         if (!open && !submitting) onClose();
       }}
       classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        wrapper: "z-[220]! px-4 py-6",
+        backdrop: "z-[210]! bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
         base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
       }}
     >
@@ -182,8 +182,8 @@ export function DiagramCloudDocumentsDialog({
         if (!open && !busy) onClose();
       }}
       classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        wrapper: "z-[220]! px-4 py-6",
+        backdrop: "z-[210]! bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
         base: "diagram-apple-dialog max-h-[min(78dvh,720px)] overflow-hidden rounded-2xl border shadow-2xl",
       }}
     >
@@ -222,7 +222,7 @@ export function DiagramCloudDocumentsDialog({
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 items-center gap-2">
                         <span className="truncate text-small font-semibold text-zinc-900 dark:text-zinc-100">{document.name}</span>
-                        {isCurrent ? <span className="shrink-0 rounded bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
+                        {isCurrent ? <span className="shrink-0 rounded-sm bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] text-zinc-500 dark:text-zinc-400">
                         <span>{formatCloudDiagramDate(document.updatedAt)}</span>
@@ -295,8 +295,8 @@ export function DiagramEditorDialog({
       scrollBehavior="inside"
       onClose={() => onResolve(null)}
       classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        wrapper: "z-[220]! px-4 py-6",
+        backdrop: "z-[210]! bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
         base: "diagram-apple-dialog max-h-[min(86dvh,620px)] max-w-[440px] overflow-hidden rounded-2xl border shadow-2xl",
         closeButton: "text-zinc-500 dark:text-zinc-300",
       }}

@@ -8,10 +8,6 @@
   unicode-range: U+0000-00FF, U+2000-206F, U+2190-21FF, U+2200-22FF;
 }
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 html,
 body,
 #root {
@@ -171,14 +167,20 @@ body {
     0 0 0 4px hsl(var(--heroui-primary)) !important;
 }
 
-.light [data-slot="input"],
-.light [data-slot="inner-wrapper"] input {
+/* Filled fields keep HeroUI's group-data-[has-value=true] text color. :where() keeps these rules
+ * below that group variant, which Tailwind 4 emits one class weaker than Tailwind 3 did. */
+:where(.light) [data-slot="input"],
+:where(.light) [data-slot="inner-wrapper"] input {
   color: #09090b;
+}
+
+:where(.dark) [data-slot="input"],
+:where(.dark) [data-slot="inner-wrapper"] input {
+  color: #fafafa;
 }
 
 .dark [data-slot="input"],
 .dark [data-slot="inner-wrapper"] input {
-  color: #fafafa;
   border-color: transparent !important;
   outline: none !important;
   box-shadow: none !important;
@@ -620,9 +622,9 @@ body {
   max-height: 480px;
 }
 
+/* display comes from the markup's `grid sm:hidden`: a display set here would outrank sm:hidden. */
 .topology-mobile {
   position: relative;
-  display: grid;
   gap: 12px;
   overflow: visible;
   border: 1px solid rgba(8, 47, 73, 0.12);
@@ -2048,8 +2050,30 @@ body {
   border-radius: 8px !important;
 }
 
-.app-apple:not(.landing-shell) :where(.shadow-sm, .shadow-lg, .shadow-xl, .shadow-2xl) {
+.app-apple:not(.landing-shell) :where(.shadow-xs, .shadow-lg, .shadow-xl, .shadow-2xl) {
   box-shadow: none !important;
+}
+
+/* HeroUI 2.8 styles keyboard focus with outline-solid, another class Tailwind 3 never generated, so
+ * its fields, tabs and list items showed the browser's own focus ring. Keep that ring; the width,
+ * color and offset still come from HeroUI's focus classes and the rules here, as before. Inline
+ * `outline: none` (react-aria puts it on focusable overlays) still wins, as it did then. */
+.outline-solid:focus-visible,
+.focus-visible\:outline-solid:focus-visible {
+  outline-style: auto;
+}
+
+/* The input slot's !outline-solid is important. :where() leaves the dark-theme input rules near
+ * the top of this file, which remove the outline altogether, in charge. */
+:where(.\!outline-solid):focus-visible {
+  outline-style: auto !important;
+}
+
+/* HeroUI 2.8 gives fields, selects, tab lists and pagination shadow-xs, a class Tailwind 3 never
+ * generated, so those slots have always rendered flat here, including in portaled modals. */
+:where([data-slot]).shadow-xs,
+:where([data-slot]).focus\:shadow-xs:focus {
+  box-shadow: none;
 }
 
 .app-apple:not(.landing-shell) :where([data-slot="input-wrapper"], [data-slot="trigger"]) {
@@ -2098,8 +2122,12 @@ body {
   border-radius: 999px !important;
   box-shadow: none !important;
   font-weight: 600;
+  /* HeroUI's press and open-menu scales are the `scale` property under Tailwind 4, no longer part of
+   * `transform`; animate them as before, which also lets menus position against the resting trigger. */
   transition:
     transform 140ms ease,
+    scale 140ms ease,
+    translate 140ms ease,
     background-color 140ms ease,
     border-color 140ms ease,
     color 140ms ease,
@@ -2189,11 +2217,17 @@ body {
 .app-apple-dashboard :where(button, a).transform-gpu[class~="bg-primary"][class~="text-primary-foreground"]:hover,
 .app-apple-dashboard :where(button, a).transform-gpu[class~="bg-primary"][class~="text-primary-foreground"][data-hover="true"] {
   transform: translateY(-1px);
+  /* As in the pressed rule below: this transform replaced HeroUI's scales before they became a
+   * separate property. */
+  scale: none;
   filter: brightness(0.96);
 }
 
 .app-apple-dashboard :where(button, a).transform-gpu[data-pressed="true"] {
   transform: translateY(0) scale(0.97) !important;
+  /* HeroUI's data-[pressed=true]:scale-[0.97] is a separate `scale` property under Tailwind 4 and
+   * would compound with the transform above. */
+  scale: none !important;
 }
 
 .app-apple-dashboard :where(button, a).transform-gpu[data-disabled="true"] {
@@ -2242,6 +2276,14 @@ body {
 
 .app-apple:not(.landing-shell) :where(button, a, input, textarea, select):focus-visible {
   outline-color: var(--app-apple-blue);
+}
+
+/* Tailwind 3's outline-none left a transparent 2px outline, 2px out, for the rule above to color.
+ * Its Tailwind 4 name, outline-hidden, removes the outline instead, so bring it back on focus. */
+.app-apple:not(.landing-shell)
+  :where(button, a, input, textarea, select):where(.outline-hidden, .focus\:outline-hidden, .focus-visible\:outline-hidden):focus-visible {
+  outline: 2px solid var(--app-apple-blue);
+  outline-offset: 2px;
 }
 
 .app-apple.landing-shell .app-apple-landing-surface,
@@ -5123,10 +5165,6 @@ body {
   box-shadow: none !important;
 }
 
-.diagram-apple-search::placeholder {
-  color: var(--diagram-apple-subtle);
-}
-
 .diagram-apple-template-button,
 .diagram-apple-palette-card,
 .diagram-apple-collection,
@@ -5694,6 +5732,12 @@ main.app-apple-tool.nat-tool-plain {
     transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
     box-shadow 0.35s ease,
     border-color 0.3s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nat-detect-orb {
+    transition: none;
+  }
 }
 
 .dark .nat-detect-orb {

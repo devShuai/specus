@@ -762,7 +762,7 @@ function NatDetectStage({
           <h1 className={embedded ? "text-2xl font-semibold tracking-tight" : "text-3xl font-semibold tracking-tight sm:text-4xl"}>
             {heroTitle}
           </h1>
-          <p className="text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
+          <p className="text-small text-zinc-700 dark:text-zinc-300 sm:text-medium">
             {heroDescription}
           </p>
         </div>
@@ -1077,6 +1077,9 @@ function NatDetectionOrb({
       )}
       <div className="nat-orb-stage" data-state={state}>
         <span className="nat-orb-halo" style={accentStyle} aria-hidden="true" />
+        {/* The focus ring replaces the orb's own box-shadow. index.css sets that shadow for the dark
+            and checking states with a selector as specific as focus-visible:ring-4 and now wins the
+            tie, so those states repeat the ring with a variant that outranks it. */}
         <button
           type="button"
           aria-busy={checking}
@@ -1084,7 +1087,7 @@ function NatDetectionOrb({
           data-state={state}
           onClick={checking ? onCancel : onRun}
           style={accentStyle}
-          className={`nat-detect-orb group relative isolate flex shrink-0 items-center justify-center rounded-full text-center outline-none focus-visible:ring-4 focus-visible:ring-primary-500/30 focus-visible:ring-offset-4 focus-visible:ring-offset-background motion-reduce:transform-none motion-reduce:transition-none ${
+          className={`nat-detect-orb group relative isolate flex shrink-0 items-center justify-center rounded-full text-center outline-hidden focus-visible:ring-4 dark:focus-visible:ring-4 data-[state=checking]:focus-visible:ring-4 focus-visible:ring-primary-500/30 focus-visible:ring-offset-4 focus-visible:ring-offset-background motion-reduce:transform-none ${
             embedded ? "h-28 w-28" : "h-40 w-40"
           } cursor-pointer`}
         >
@@ -1153,7 +1156,7 @@ function NatDetectionOrb({
           </span>
         </button>
       </div>
-      <div className="min-h-9 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+      <div className="min-h-9 text-center text-tiny text-zinc-500 dark:text-zinc-400">
         {checking && (
           <>
             <span className="block font-medium text-zinc-700 dark:text-zinc-200">{progress.label}</span>
@@ -1186,14 +1189,14 @@ function NatOutcomeCard({
   result: BrowserNatResult;
 }) {
   return (
-    <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-sm sm:p-6 ${outcome.frameClass}`}>
+    <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-xs sm:p-6 ${outcome.frameClass}`}>
       <span
         className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}${outcome.tone === "success" || outcome.tone === "primary" ? " nat-outcome-bar-flow" : ""}`}
         aria-hidden="true"
       />
       <div className="flex flex-wrap items-start gap-4 pt-1">
         <div
-          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center shadow-sm ${outcome.markerClass}`}
+          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center shadow-xs ${outcome.markerClass}`}
           aria-hidden="true"
         >
           <StatusGlyph color={outcome.tone} className="h-6 w-6" />
@@ -1209,7 +1212,7 @@ function NatOutcomeCard({
         </div>
         {outcome.level ? <NatDifficultyMeter level={outcome.level} tone={outcome.tone} /> : null}
       </div>
-      <p className="mt-4 max-w-3xl text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
+      <p className="mt-4 max-w-3xl text-small text-zinc-700 dark:text-zinc-300 sm:text-medium">
         {outcome.description}
       </p>
 
@@ -1229,7 +1232,7 @@ function NatOutcomeCard({
 
       <div className="mt-4 rounded-xl border border-black/[0.07] bg-white/45 p-3 dark:border-white/10 dark:bg-black/15">
         <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">建议</p>
-        <p className="mt-1 text-small leading-6 text-zinc-700 dark:text-zinc-300">{result.recommendation}</p>
+        <p className="mt-1 text-small text-zinc-700 dark:text-zinc-300">{result.recommendation}</p>
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-tiny text-zinc-600 dark:text-zinc-400">
@@ -1304,7 +1307,7 @@ function NatImpactCard({ title, icon, experience }: { title: string; icon: React
         <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">{title}</p>
       </div>
       <p className="mt-2 text-base font-semibold text-zinc-950 dark:text-white">{experience.verdict}</p>
-      <p className="mt-2 text-small leading-6 text-zinc-700 dark:text-zinc-300">{experience.description}</p>
+      <p className="mt-2 text-small text-zinc-700 dark:text-zinc-300">{experience.description}</p>
     </section>
   );
 }
@@ -1487,7 +1490,7 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
           placement="bottom"
           content={<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}
         >
-          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
+          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 dark:hover:border-primary-500/30 hover:shadow-xs motion-reduce:transform-none motion-reduce:transition-none">
             <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
               <span>{item.label}</span>
               <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
@@ -1662,7 +1665,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
           </span>
         </div>
         {sharedCandidateDeduplicated && (
-          <p className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-tiny leading-5 text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/[0.08] dark:text-emerald-100">
+          <p className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-tiny text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/[0.08] dark:text-emerald-100">
             四端点均已通过独立预检。共享 ICE 只暴露一个相同公网映射，其余端点标记为候选去重，不代表服务不可达。
           </p>
         )}
@@ -1699,7 +1702,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
                     {endpoints.map((endpoint) => (
                       <code
                         key={endpoint}
-                        className="rounded border border-black/10 bg-black/[0.03] px-1.5 py-0.5 font-mono text-tiny text-zinc-600 dark:border-white/10 dark:bg-white/[0.06] dark:text-zinc-300"
+                        className="rounded-sm border border-black/10 bg-black/[0.03] px-1.5 py-0.5 font-mono text-tiny text-zinc-600 dark:border-white/10 dark:bg-white/[0.06] dark:text-zinc-300"
                       >
                         {endpoint}
                       </code>
@@ -1955,7 +1958,7 @@ function NatTypeGuide({
           <h2 id="nat-type-guide-title" className="mt-1 text-xl font-semibold text-zinc-950 dark:text-white sm:text-2xl">
             映射决定端点是否可预测，过滤决定谁能回包
           </h2>
-          <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-300">
+          <p className="mt-2 text-small text-zinc-600 dark:text-zinc-300">
             NAT1-4 是本页面为了直观展示而使用的分级，不是 IETF 标准类型。现代诊断应把映射行为和过滤行为分开记录。
           </p>
         </div>
@@ -1967,13 +1970,13 @@ function NatTypeGuide({
       <div className="grid border-b border-black/10 dark:border-white/10 md:grid-cols-2">
         <div className="py-4 pr-0 md:pr-6">
           <p className="text-small font-semibold text-zinc-900 dark:text-white">映射行为 Mapping</p>
-          <p className="mt-1 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+          <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
             EIM 不随目标变化；ADM 随目标 IP 变化；APDM 同时随目标 IP 和端口变化。本页面用共享 ICE socket 对四端点进行这一轴的观察。
           </p>
         </div>
         <div className="border-t border-black/10 py-4 md:border-l md:border-t-0 md:pl-6 dark:border-white/10">
           <p className="text-small font-semibold text-zinc-900 dark:text-white">过滤行为 Filtering</p>
-          <p className="mt-1 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+          <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
             EIF 接受任意来源；ADF 要求先联系过来源 IP；APDF 要求先联系过来源 IP:Port。完整判断需要原生客户端发送 CHANGE-REQUEST。
           </p>
         </div>
@@ -2004,7 +2007,7 @@ function NatTypeGuide({
                   <p className="mt-0.5 font-mono text-tiny font-medium">{item.modern}</p>
                 </div>
               </div>
-              <dl className="mt-3 grid gap-2 text-small leading-6">
+              <dl className="mt-3 grid gap-2 text-small">
                 <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">判断依据：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.signal}</dd></div>
                 <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">含义：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.detail}</dd></div>
                 <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">直连影响：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.impact}</dd></div>
@@ -2059,7 +2062,7 @@ function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | nu
     <footer className="mt-10 rounded-xl border glass glass-border p-5">
       <ul className="grid gap-3 sm:grid-cols-3">
         {tips.map((tip) => (
-          <li key={tip.title} className="text-small leading-6">
+          <li key={tip.title} className="text-small">
             <span className="font-semibold text-zinc-900 dark:text-white">{tip.title}</span>
             <span className="text-zinc-500 dark:text-zinc-400"> — </span>
             <span className="text-zinc-600 dark:text-zinc-400">{tip.text}</span>
@@ -2208,7 +2211,7 @@ function ConfidenceBars({ confidence }: { confidence: BrowserNatConfidence }) {
       {heights.map((height, index) => (
         <span
           key={height}
-          className={`w-1 rounded-sm ${height} ${
+          className={`w-1 rounded-xs ${height} ${
             index < filled
               ? "bg-primary-500 dark:bg-primary-300"
               : "bg-zinc-300/80 dark:bg-white/15"
