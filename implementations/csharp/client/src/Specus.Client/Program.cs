@@ -29,6 +29,7 @@ if (options.Version)
 }
 var configPath = Path.GetFullPath(options.ConfigPath ?? "client.jsonc");
 if (options.Command is "status" or "peers" or "services" or "egress") return CliState.Query(configPath, options);
+if (options.Command is "egress dns status" or "egress dns restore") return EgressDns.Run(options, configPath);
 if (options.Command.StartsWith("egress ", StringComparison.Ordinal)) return EgressEdit.Run(options, configPath);
 if (options.Command == "ui") return await LocalUi.RunAsync(options, configPath);
 SpecusClientConfig config;

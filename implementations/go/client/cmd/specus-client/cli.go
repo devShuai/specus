@@ -23,6 +23,10 @@ const cliHelp = `Usage: specus-client [run] [options]
        specus-client egress enable --config PATH [--yes] [--json]
        specus-client egress disable --config PATH [--json]
        specus-client egress test ADDRESS --config PATH [--connect PORT] [--json]
+       specus-client egress dns enable --config PATH [--yes] [--json]
+       specus-client egress dns disable --config PATH [--json]
+       specus-client egress dns status --config PATH [--json]
+       specus-client egress dns restore [--force] [--json]
 
 Options:
   -h, --help            Show help without loading configuration or connecting
@@ -45,6 +49,13 @@ client, which applies the change after a restart. Saving rules and taking over t
 rules take nothing over until egress enable. egress test previews what the rules decide for an IPv4
 address; only --connect PORT makes a connection, and that shows reachability, not the path taken.
 
+With peerEgressDnsTakeover on (egress dns enable), domain rules take effect by pointing the system
+DNS at the client while it runs; that is the one change this feature makes to the system's own
+settings, and it is given back when the client stops. egress dns status shows whether the takeover
+holds and what it forwards to; egress dns restore gives the system DNS back from the journal when
+the client cannot (it was killed), and refuses while that client still runs unless --force.
+Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules.
+
 Examples:
   specus-client --config "/path with spaces/client.jsonc"
   specus-client config validate --config ./client.jsonc
@@ -66,11 +77,13 @@ type cliOptions struct {
 	noOpen                              bool
 	uiPort                              int
 	// The egress editing commands.
-	egressMatch, egressAction, egressAddress   string
-	egressClientID                             int64
-	egressAt, egressIndex, egressTo            int
-	egressDisabled, egressYes                  bool
-	egressConnect                              int
+	egressMatch, egressAction, egressAddress string
+	egressClientID                           int64
+	egressAt, egressIndex, egressTo          int
+	egressDisabled, egressYes                bool
+	egressConnect                            int
+	// egress dns restore: give back even though the journal's process looks alive.
+	egressForce bool
 }
 
 // egressCommand reads the words after "egress" that name an editing command. The plain egress
@@ -87,6 +100,16 @@ func egressCommand(args []string) (string, []string, string, error) {
 			return "", nil, "", errors.New("expected: egress test ADDRESS --config PATH")
 		}
 		return "egress test", args[3:], args[2], nil
+	case "dns":
+		if len(args) < 3 {
+			return "", nil, "", errors.New("expected: egress dns enable|disable|status|restore")
+		}
+		switch args[2] {
+		case "enable", "disable", "status", "restore":
+		default:
+			return "", nil, "", errors.New("expected: egress dns enable|disable|status|restore")
+		}
+		return "egress dns " + args[2], args[3:], "", nil
 	case "rule":
 		if len(args) < 3 {
 			return "", nil, "", errors.New("expected: egress rule add|remove|move|enable|disable --config PATH")
@@ -146,6 +169,7 @@ func parseCLI(args []string) (cliOptions, error) {
 	fs.BoolVar(&o.egressDisabled, "disabled", false, "")
 	fs.BoolVar(&o.egressYes, "yes", false, "")
 	fs.IntVar(&o.egressConnect, "connect", 0, "")
+	fs.BoolVar(&o.egressForce, "force", false, "")
 	// Keep the existing verified Windows updater protocol, but hide it in public help.
 	fs.BoolVar(&o.helper, client.UpdateHelperFlagName, false, "")
 	fs.IntVar(&o.parentPID, client.UpdateParentPIDFlagName, 0, "")
@@ -214,8 +238,10 @@ func checkEgressFlags(o cliOptions, given map[string]bool) error {
 		"egress rule move":    {"index", "to"},
 		"egress enable":       {"yes"},
 		"egress test":         {"connect"},
+		"egress dns restore":  {"force"},
+		"egress dns enable":   {"yes"},
 	}
-	for _, name := range []string{"match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect"} {
+	for _, name := range []string{"match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect", "force"} {
 		if !given[name] {
 			continue
 		}

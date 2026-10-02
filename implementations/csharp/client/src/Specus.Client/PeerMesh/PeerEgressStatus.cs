@@ -32,13 +32,28 @@ internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Ru
 /// The <c>consumer.dns</c> section, present only while <c>peerEgressDnsTakeover</c> is on
 /// (protocol/spec/peer-egress-dns.md, section seven).
 /// </summary>
-/// <param name="Takeover">Whether phase two runs now.</param>
+/// <param name="Takeover">Whether the system's DNS points at the responder now: the journal is committed.</param>
 /// <param name="Pool">The pool as configured, usable or not.</param>
 /// <param name="Mappings">Mappings held when the snapshot was taken.</param>
 /// <param name="Quarantined">Addresses still resting when the snapshot was taken.</param>
-/// <param name="Code">Why phase two does not run although it was asked for; null otherwise.</param>
+/// <param name="Code">
+/// Why phase two does not run although it was asked for, or why the system's DNS is not taken over;
+/// null otherwise.
+/// </param>
 internal sealed record PeerEgressDnsStatus(bool Takeover, string Pool, int Mappings, int Quarantined, string? Code)
 {
+    /// <summary>Whether phase two runs now: pool, route, responder.</summary>
+    public bool Active { get; init; }
+
+    /// <summary>The takeover journal: <c>none</c>, <c>pending</c> or <c>committed</c>.</summary>
+    public string Journal { get; init; } = "none";
+
+    /// <summary>With <c>EGRESS_DNS_TAKEOVER_REFUSED</c>: which check refused.</summary>
+    public string? Reason { get; init; }
+
+    /// <summary>With <c>EGRESS_DNS_TAKEOVER_FAILED</c>: the first line the failing command printed.</summary>
+    public string? Error { get; init; }
+
     /// <summary>The responder's listen address; null while phase two does not run.</summary>
     public string? Listen { get; init; }
 
@@ -252,7 +267,7 @@ internal static class PeerEgressStatus
     /// </summary>
     private static Dictionary<string, object?> DnsSection(PeerEgressDnsStatus dns)
     {
-        var section = new Dictionary<string, object?> { ["takeover"] = dns.Takeover };
+        var section = new Dictionary<string, object?> { ["active"] = dns.Active, ["takeover"] = dns.Takeover };
         if (dns.Listen is not null)
         {
             section["listen"] = dns.Listen;
@@ -264,6 +279,7 @@ internal static class PeerEgressStatus
         {
             section["upstreams"] = dns.Upstreams;
         }
+        section["journal"] = dns.Journal;
         if (dns.Queries is { } queries)
         {
             section["queries"] = new Dictionary<string, object?>
@@ -276,6 +292,14 @@ internal static class PeerEgressStatus
         if (dns.Code is not null)
         {
             section["code"] = dns.Code;
+        }
+        if (dns.Reason is not null)
+        {
+            section["reason"] = dns.Reason;
+        }
+        if (dns.Error is not null)
+        {
+            section["error"] = dns.Error;
         }
         return section;
     }

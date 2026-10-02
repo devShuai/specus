@@ -111,31 +111,43 @@ public final class CliState implements AutoCloseable {
         publisher.shutdownNow();
         synchronized(this){try{Files.deleteIfExists(file);}catch(IOException ignored){}}
     }
+    /**
+     * The fresh state every running client for this configuration published: owner-only files,
+     * written in the last five seconds by a process that is still alive.
+     */
+    static List<com.fasterxml.jackson.databind.JsonNode> liveStates(Path config) throws IOException {
+        var states=new ArrayList<com.fasterxml.jackson.databind.JsonNode>();
+        Path root=root();
+        if(!Files.exists(root,LinkOption.NOFOLLOW_LINKS)) return states;
+        checkPrivate(root);
+        try(var files=Files.newDirectoryStream(root,prefix(config.toString())+"*.json")) {
+            int count=0;
+            for(Path file:files) {
+                if(++count>256) throw new IOException("Too many state files");
+                try {
+                    checkPrivate(file);if(Files.size(file)>1024*1024)continue;
+                    var data=CliOutput.JSON.readTree(Files.readString(file));
+                    long age=System.currentTimeMillis()-data.path("updatedAtUnixMs").asLong();
+                    long pid=data.path("pid").asLong();
+                    boolean matching=System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win")
+                            ? data.path("configPath").asText().equalsIgnoreCase(config.toString()) : data.path("configPath").asText().equals(config.toString());
+                    if(age<0||age>5000||data.path("schemaVersion").asInt()!=1||!matching
+                            ||ProcessHandle.of(pid).filter(ProcessHandle::isAlive).isEmpty())continue;
+                    states.add(data);
+                } catch(NoSuchFileException ignored) { }
+                catch(com.fasterxml.jackson.core.JsonProcessingException ignored) { }
+            }
+        }
+        return states;
+    }
+
     public static int query(ClientCli.Options options) {
         var instances=new ArrayList<Object>();
         try {
-            Path root=root();
-            if(Files.exists(root,LinkOption.NOFOLLOW_LINKS)) {
-                checkPrivate(root);
-                try(var files=Files.newDirectoryStream(root,prefix(options.config().toString())+"*.json")) {
-                    int count=0;
-                    for(Path file:files) {
-                        if(++count>256) throw new IOException("Too many state files");
-                        try {
-                            checkPrivate(file);if(Files.size(file)>1024*1024)continue;
-                            var data=CliOutput.JSON.readTree(Files.readString(file));
-                            long age=System.currentTimeMillis()-data.path("updatedAtUnixMs").asLong();
-                            long pid=data.path("pid").asLong();
-                            boolean matching=System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win")
-                                    ? data.path("configPath").asText().equalsIgnoreCase(options.config().toString()) : data.path("configPath").asText().equals(options.config().toString());
-                            if(age<0||age>5000||data.path("schemaVersion").asInt()!=1||!matching
-                                    ||ProcessHandle.of(pid).filter(ProcessHandle::isAlive).isEmpty())continue;
-                            instances.add(options.command().equals("status") ? data : Map.of("pid",pid,"phase",data.path("phase"),
-                                    "catalogAvailable",data.path("controlAuthenticated"),options.command(),data.path(options.command())));
-                        } catch(NoSuchFileException ignored) { }
-                        catch(com.fasterxml.jackson.core.JsonProcessingException ignored) { }
-                    }
-                }
+            for(var data:liveStates(options.config())) {
+                long pid=data.path("pid").asLong();
+                instances.add(options.command().equals("status") ? data : Map.of("pid",pid,"phase",data.path("phase"),
+                        "catalogAvailable",data.path("controlAuthenticated"),options.command(),data.path(options.command())));
             }
             var result=Map.of("instances",instances);
             return CliOutput.result(options.json(),options.command(),instances.isEmpty()?5:0,result,instances.isEmpty()

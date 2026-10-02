@@ -54,6 +54,9 @@ public final class EgressEdit {
                 case "egress rules" -> list(options);
                 case "egress test" -> test(options);
                 case "egress enable", "egress disable" -> toggle(options);
+                case "egress dns enable", "egress dns disable" -> EgressDns.toggle(options);
+                case "egress dns status" -> EgressDns.status(options);
+                case "egress dns restore" -> EgressDns.restore(options);
                 default -> editRule(options);
             };
         } catch (Done done) {
@@ -568,10 +571,12 @@ public final class EgressEdit {
 
     /**
      * Replaces or adds one top-level value the egress commands own, with the encoded JSON given.
-     * Only peerEgressEnabled and peerEgressRules; everything else goes through the local page's checks.
+     * Only peerEgressEnabled, peerEgressRules and peerEgressDnsTakeover; everything else goes through
+     * the local page's checks.
      */
     static String patch(String text, String key, String value) {
-        if (!key.equals("peerEgressRules") && !key.equals("peerEgressEnabled")) throw UiConfig.invalid();
+        if (!key.equals("peerEgressRules") && !key.equals("peerEgressEnabled") && !key.equals("peerEgressDnsTakeover"))
+            throw UiConfig.invalid();
         UiConfig.Document doc;
         try {
             doc = UiConfig.document(text);

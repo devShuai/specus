@@ -32,6 +32,10 @@ public final class ClientCli {
                    java -jar specus-client-exec.jar egress enable --config PATH [--yes] [--json]
                    java -jar specus-client-exec.jar egress disable --config PATH [--json]
                    java -jar specus-client-exec.jar egress test ADDRESS --config PATH [--connect PORT] [--json]
+                   java -jar specus-client-exec.jar egress dns enable --config PATH [--yes] [--json]
+                   java -jar specus-client-exec.jar egress dns disable --config PATH [--json]
+                   java -jar specus-client-exec.jar egress dns status --config PATH [--json]
+                   java -jar specus-client-exec.jar egress dns restore [--force] [--json]
 
             Options:
               -h, --help            Show help without loading configuration or connecting
@@ -44,6 +48,7 @@ public final class ClientCli {
               --probe              doctor only: 5-second server TCP probe; never authenticates
               --no-open            ui only: print local address without opening a browser
               --port PORT          ui only: loopback port, 0..65535 (default: random)
+              --force              egress dns restore only: give back even if the recorded client still runs
 
             The egress command reports which of this node's egress rules are actually in force,
             which routes were installed, and which were refused because something already owned
@@ -54,6 +59,12 @@ public final class ClientCli {
             traffic are separate: rules take nothing over until egress enable. egress test previews
             what the rules decide for an IPv4 address; only --connect PORT makes a connection, and
             that shows reachability, not the path taken.
+
+            egress dns enable|disable sets peerEgressDnsTakeover, which lets domain rules take effect
+            by pointing the system DNS at this client while it runs. egress dns status reports
+            whether it does, why not, the upstreams and the takeover journal; egress dns restore
+            gives the system DNS back from the journal without a running client.
+            Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules.
 
             Example:
               java -jar specus-client-exec.jar --config "/path with spaces/client.jsonc"
@@ -69,7 +80,7 @@ public final class ClientCli {
 
     /** The egress editing commands' flags; -1 marks an index that was not given. */
     public record EgressOptions(String address, String match, String action, long egressClientId,
-                                int at, int index, int to, boolean disabled, boolean yes, int connect) { }
+                                int at, int index, int to, boolean disabled, boolean yes, int connect, boolean force) { }
 
     /** Each editing flag belongs to the commands it means something to. */
     private static final java.util.Map<String, java.util.Set<String>> EGRESS_FLAGS = java.util.Map.of(
@@ -79,9 +90,11 @@ public final class ClientCli {
             "egress rule disable", java.util.Set.of("index"),
             "egress rule move", java.util.Set.of("index", "to"),
             "egress enable", java.util.Set.of("yes"),
-            "egress test", java.util.Set.of("connect"));
+            "egress test", java.util.Set.of("connect"),
+            "egress dns enable", java.util.Set.of("yes"),
+            "egress dns restore", java.util.Set.of("force"));
     private static final java.util.List<String> EGRESS_FLAG_ORDER = java.util.List.of(
-            "match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect");
+            "match", "action", "egress-client-id", "at", "disabled", "index", "to", "yes", "connect", "force");
 
     public static Options parse(String[] args) {
         Path config = Path.of("client.jsonc");
@@ -94,7 +107,7 @@ public final class ClientCli {
         String egressAddress = "", egressMatch = "", egressAction = "";
         long egressClientId = 0;
         int egressAt = -1, egressIndex = -1, egressTo = -1, egressConnect = 0;
-        boolean egressDisabled = false, egressYes = false;
+        boolean egressDisabled = false, egressYes = false, egressForce = false;
         var given = new java.util.HashSet<String>();
         int i = 0;
         if (args.length > 0 && "run".equals(args[0])) i++;
@@ -107,6 +120,11 @@ public final class ClientCli {
                     if (args.length < 3 || args[2].startsWith("-"))
                         throw new IllegalArgumentException("expected: egress test ADDRESS --config PATH");
                     command = "egress test"; egressAddress = args[2]; i = 3;
+                }
+                case "dns" -> {
+                    if (args.length < 3 || !java.util.Set.of("enable", "disable", "status", "restore").contains(args[2]))
+                        throw new IllegalArgumentException("expected: egress dns enable|disable|status|restore");
+                    command = "egress dns " + args[2]; i = 3;
                 }
                 case "rule" -> {
                     if (args.length < 3 || !java.util.Set.of("add", "remove", "move", "enable", "disable").contains(args[2]))
@@ -138,6 +156,7 @@ public final class ClientCli {
                 }
                 case "--disabled" -> { egressDisabled = true; given.add("disabled"); }
                 case "--yes" -> { egressYes = true; given.add("yes"); }
+                case "--force" -> { egressForce = true; given.add("force"); }
                 case "--match", "--action", "--egress-client-id", "--at", "--index", "--to", "--connect" -> {
                     String name = arg.substring(2);
                     if (++i >= args.length) throw new IllegalArgumentException(arg + " requires a value");
@@ -174,7 +193,7 @@ public final class ClientCli {
         if (command.equals("ui") && (json || debug || noUpdate) && !help && !version) throw new IllegalArgumentException("ui does not accept --json/--debug/update options");
         if (json && command.equals("run") && !help && !version) throw new IllegalArgumentException("--json is for help/version/config/status/doctor/peers/services/egress; use status --json to observe a running client");
         var egress = new EgressOptions(egressAddress, egressMatch, egressAction, egressClientId,
-                egressAt, egressIndex, egressTo, egressDisabled, egressYes, egressConnect);
+                egressAt, egressIndex, egressTo, egressDisabled, egressYes, egressConnect, egressForce);
         checkEgressFlags(command, egress, given);
         return new Options(config.toAbsolutePath().normalize(), command, help, version, noUpdate, debug, loginTimeoutSeconds, json, probe, noOpen, uiPort, egress);
     }

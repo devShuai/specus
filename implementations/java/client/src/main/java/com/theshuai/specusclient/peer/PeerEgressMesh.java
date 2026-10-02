@@ -8,6 +8,7 @@ import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressFrame;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,6 +17,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -208,6 +210,18 @@ final class PeerEgressMesh implements AutoCloseable {
      * forwards to a fake instead of the network.
      */
     PeerEgressDnsResponder.Forwarder dnsForwarder = new PeerEgressDnsForwarder();
+    /**
+     * How the system DNS takeover (step five) reaches this machine, or null to leave the system's
+     * DNS alone. Set to the real one only by the production constructor.
+     */
+    PeerEgressDnsTakeover.Machine dnsMachine;
+    /**
+     * The network's fingerprint for the change check, or null for the default: the default route's
+     * interface from the route installer's table, and this device's IPv4 addresses.
+     */
+    Supplier<String> networkFingerprint;
+    /** The system DNS takeover, built on first use; driven under {@link #planLock}. */
+    private volatile PeerEgressDnsTakeover takeover;
     /** What every responder of this process did, which the status reports running or not. */
     private final PeerEgressDnsResponder.Counters dnsCounters = new PeerEgressDnsResponder.Counters();
     /**
@@ -251,6 +265,9 @@ final class PeerEgressMesh implements AutoCloseable {
     PeerEgressMesh(Host host) {
         this(host, new PeerEgressSocketDialer(PeerEgressSocketBinder.forPlatform(() -> host.tunName())),
                 null, null);
+        // Only here: a mesh a test builds with its own dialer or commander never touches the
+        // machine's DNS unless the test hands it a machine of its own.
+        dnsMachine = new PeerEgressDnsSystem();
     }
 
     PeerEgressMesh(Host host, PeerEgressRuntime.Dialer dialer,
@@ -559,6 +576,117 @@ final class PeerEgressMesh implements AutoCloseable {
         }
     }
 
+    /**
+     * A new network, seen at most every ten seconds while the takeover is asked for: whatever the
+     * takeover holds is given back, and the pool is checked against this device's networks again,
+     * so the reconcile that follows reads the new network's DNS as the upstreams -- or stops phase
+     * two, when the new network's addresses fall in the pool.
+     */
+    private void checkNetwork(long nowMs) {
+        if (dnsMachine == null || !host.dnsTakeover()) {
+            return;
+        }
+        synchronized (planLock) {
+            if (closed.get()) {
+                return;
+            }
+            PeerEgressDnsTakeover dnsTakeover = ensureTakeoverLocked();
+            if (!dnsTakeover.networkChanged(nowMs)) {
+                return;
+            }
+            log.info("[peer-egress-consumer] the network changed; the system DNS is taken over again");
+            dnsTakeover.release("the network changed");
+            dnsTakeover.forgetAttempt();
+            synchronized (phaseLock) {
+                interfacesCheckedFor = null;
+            }
+        }
+    }
+
+    /**
+     * The system DNS takeover after the routes: taken over while phase two runs with its pool route
+     * in place, refused with a reason otherwise, given back when phase two stops. The responder
+     * forwards to the upstreams it recorded.
+     */
+    private void reconcileTakeoverLocked(PeerEgressDns.PhaseTwo phase, PeerEgressFakeIpPool pool,
+            PeerEgressDnsResponder dns, long nowMs) {
+        if (dnsMachine == null || !host.dnsTakeover()) {
+            return;
+        }
+        PeerEgressDnsTakeover dnsTakeover = ensureTakeoverLocked();
+        if (!phase.active() || pool == null || dns == null) {
+            dnsTakeover.idle("phase two is not running");
+            return;
+        }
+        PeerEgressRouteInstaller installer = routes;
+        boolean poolRouteInstalled = installer != null && installer.installed().contains(new PeerEgressRoutePlanner.Route(
+                pool.cidr(), PeerEgressRoutePlanner.Kind.TUN, PeerEgressRoutePlanner.ORIGIN_FAKE_IP_POOL));
+        dnsTakeover.engage(new PeerEgressDnsTakeover.Request(Ipv4Cidr.format(pool.listenAddress()), host.tunName(),
+                pool.cidr(), meshCidrOrDefault(), poolRouteInstalled), nowMs);
+        dns.setUpstreams(dnsUpstreams());
+    }
+
+    /**
+     * The takeover, built once. Built with the journal a previous run may have left given back
+     * first: the client's start does that already, and doing it again here costs a file check.
+     */
+    private PeerEgressDnsTakeover ensureTakeoverLocked() {
+        PeerEgressDnsTakeover existing = takeover;
+        if (existing != null) {
+            return existing;
+        }
+        Supplier<String> fingerprint = networkFingerprint != null ? networkFingerprint : this::defaultFingerprint;
+        PeerEgressDnsTakeover built = new PeerEgressDnsTakeover(dnsMachine, dnsJournalPath(),
+                ProcessHandle.current().pid(), fingerprint);
+        built.recoverLeftover();
+        takeover = built;
+        return built;
+    }
+
+    /** Beside the route install record, in the same private directory. */
+    Path dnsJournalPath() {
+        Path routeJournal = host.routeJournalPath();
+        return routeJournal == null ? PeerEgressDnsTakeover.defaultJournalPath()
+                : routeJournal.resolveSibling(PeerEgressDnsTakeover.JOURNAL_FILE);
+    }
+
+    /** The default route's interface from the installer's table, and this device's IPv4 addresses. */
+    private String defaultFingerprint() {
+        PeerEgressRouteInstaller installer = routes;
+        if (installer == null) {
+            return null;
+        }
+        try {
+            PeerEgressRouteInstaller.Table table = installer.table();
+            return PeerEgressDnsTakeover.fingerprint(table.routes(), table.tunnel(), host.localInterfaceAddresses());
+        } catch (IOException unreadable) {
+            return null;
+        }
+    }
+
+    /**
+     * Where the responder forwards: the upstreams the system DNS takeover recorded while it holds,
+     * otherwise whatever the host names.
+     */
+    private List<String> dnsUpstreams() {
+        PeerEgressDnsTakeover dnsTakeover = takeover;
+        List<String> recorded = dnsTakeover == null ? List.of() : dnsTakeover.upstreams();
+        return recorded.isEmpty() ? host.dnsUpstreams() : recorded;
+    }
+
+    /** Gives the system's DNS back, if it is held; called with the plan lock held. */
+    private void releaseTakeoverLocked(String why) {
+        PeerEgressDnsTakeover dnsTakeover = takeover;
+        if (dnsTakeover != null) {
+            dnsTakeover.release(why);
+        }
+    }
+
+    /** The takeover, for tests. */
+    PeerEgressDnsTakeover dnsTakeover() {
+        return takeover;
+    }
+
     /** Phase two is not running: no pool, and no responder answering from one. */
     private void stopPhaseTwo() {
         synchronized (phaseLock) {
@@ -625,15 +753,24 @@ final class PeerEgressMesh implements AutoCloseable {
             PeerEgressDns.PhaseTwo phase = phaseTwo();
             PeerEgressDnsResponder answering = responder;
             List<String> upstreams = new ArrayList<>();
-            List<String> configured = host.dnsUpstreams();
+            List<String> configured = dnsUpstreams();
             for (String text : configured == null ? List.<String>of() : configured) {
                 if (PeerEgressDnsForwarder.parseUpstream(text) != null) {
                     upstreams.add(text.trim());
                 }
             }
-            dns = new PeerEgressStatus.Dns(PeerEgressDns.effectivePool(host.fakeIpCidr()), phase.active(), phase.code(),
+            PeerEgressDnsTakeover dnsTakeover = takeover;
+            PeerEgressDnsTakeover.Status system = dnsTakeover == null
+                    ? PeerEgressDnsTakeover.Status.none() : dnsTakeover.status();
+            // Phase two's own code first: with the pool unusable nothing is taken over, and a
+            // takeover code is only the story while phase two runs, or while a give-back failed.
+            boolean ownCode = phase.code() == null && system.code() != null;
+            dns = new PeerEgressStatus.Dns(PeerEgressDns.effectivePool(host.fakeIpCidr()), phase.active(),
+                    ownCode ? system.code() : phase.code(),
                     phase.active() && answering != null ? Ipv4Cidr.format(answering.listenAddress()) : null,
-                    List.copyOf(upstreams), dnsCounters.answered(), dnsCounters.forwarded(), dnsCounters.failed());
+                    List.copyOf(upstreams), dnsCounters.answered(), dnsCounters.forwarded(), dnsCounters.failed(),
+                    system.takeover(), ownCode ? system.reason() : null, ownCode ? system.error() : null,
+                    system.journal());
         }
         return PeerEgressStatus.section(consumerSnapshot,
                 installer == null ? List.of() : installer.installed(), applied,
@@ -668,6 +805,7 @@ final class PeerEgressMesh implements AutoCloseable {
 
     void reconcile(List<PeerEgressRule> rules, long nowMs) {
         if (closed.get()) { return; }
+        checkNetwork(nowMs);
         // While phase two runs the pool is routed and the consumer exists whether or not there are
         // rules: an address in the pool has to reach something that answers it, even if all it can
         // be told is that the address stands for nothing.
@@ -678,7 +816,7 @@ final class PeerEgressMesh implements AutoCloseable {
             pool = poolFor(PeerEgressDns.effectivePool(host.fakeIpCidr()));
             dns = responder;
             if (dns != null) {
-                dns.setUpstreams(host.dnsUpstreams());
+                dns.setUpstreams(dnsUpstreams());
             }
         } else {
             stopPhaseTwo();
@@ -696,6 +834,7 @@ final class PeerEgressMesh implements AutoCloseable {
                 return;
             }
             reconcileLocked(rules, pool == null ? null : pool.cidr(), nowMs);
+            reconcileTakeoverLocked(phase, pool, dns, nowMs);
         }
         // Delivered outside the plan lock. A purge reaches a peer through the mesh, and nothing
         // that can wait on the mesh may run while a lock the mesh itself may need is held.
@@ -1025,6 +1164,9 @@ final class PeerEgressMesh implements AutoCloseable {
      */
     void withdrawRoutes() {
         synchronized (planLock) {
+            // The system's DNS first: pointed at a listen address whose route is about to go, every
+            // lookup on the machine would fail.
+            releaseTakeoverLocked("the routes are withdrawn");
             PeerEgressRouteInstaller installer;
             synchronized (this) {
                 installer = routes;
@@ -1053,6 +1195,9 @@ final class PeerEgressMesh implements AutoCloseable {
     public void close() {
         if (!closed.compareAndSet(false, true)) {
             return;
+        }
+        synchronized (planLock) {
+            releaseTakeoverLocked("the client is stopping");
         }
         stopPhaseTwo();
         PeerEgressRuntime plane = runtime;

@@ -147,13 +147,16 @@ final class PeerEgressDnsForwarder implements PeerEgressDnsResponder.Forwarder {
                 String host = value.substring(1, close);
                 String rest = value.substring(close + 1);
                 int port = rest.isEmpty() ? DNS_PORT : rest.startsWith(":") ? port(rest.substring(1)) : -1;
-                return port < 0 || host.indexOf(':') < 0 ? null
-                        : new InetSocketAddress(InetAddress.getByName(host), port);
+                byte[] address = PeerEgressDnsTakeoverParse.parseIpv6(host);
+                return port < 0 || address == null ? null
+                        : new InetSocketAddress(InetAddress.getByAddress(address), port);
             }
             int colon = value.indexOf(':');
             if (colon >= 0 && value.indexOf(':', colon + 1) >= 0) {
-                // Bare IPv6: a literal with colons never goes to a resolver.
-                return new InetSocketAddress(InetAddress.getByName(value), DNS_PORT);
+                // Bare IPv6, parsed here: InetAddress.getByName would hand malformed text to the
+                // resolver, and forwarding must never cause a lookup of its own.
+                byte[] address = PeerEgressDnsTakeoverParse.parseIpv6(value);
+                return address == null ? null : new InetSocketAddress(InetAddress.getByAddress(address), DNS_PORT);
             }
             String host = colon < 0 ? value : value.substring(0, colon);
             int port = colon < 0 ? DNS_PORT : port(value.substring(colon + 1));

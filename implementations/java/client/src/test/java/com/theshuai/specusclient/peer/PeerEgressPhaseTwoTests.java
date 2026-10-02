@@ -150,7 +150,7 @@ class PeerEgressPhaseTwoTests {
         assertFalse(mesh.handleOutbound(dnsQueryFrom(VIRTUAL_IP, "example.com")),
                 "the consumer still steers by a pool phase two let go of");
         JsonNode consumer = consumerStatus();
-        assertFalse(consumer.path("dns").path("takeover").asBoolean());
+        assertFalse(consumer.path("dns").path("active").asBoolean());
         assertEquals(PeerEgressCodes.FAKE_IP_POOL_INVALID, consumer.path("dns").path("code").asText());
         assertNull(route(consumer, POOL));
     }
@@ -274,7 +274,7 @@ class PeerEgressPhaseTwoTests {
 
         JsonNode consumer = consumerStatus();
         assertTrue(consumer.path("active").asBoolean(), "no consumer while phase two runs");
-        assertTrue(consumer.path("dns").path("takeover").asBoolean());
+        assertTrue(consumer.path("dns").path("active").asBoolean());
         assertNotNull(route(consumer, POOL), "no pool route without rules");
         assertTrue(installedCidrs.contains(POOL));
 
@@ -407,7 +407,7 @@ class PeerEgressPhaseTwoTests {
 
         JsonNode consumer = consumerStatus();
         JsonNode dns = consumer.path("dns");
-        assertTrue(dns.path("takeover").asBoolean(), dns.toString());
+        assertTrue(dns.path("active").asBoolean(), dns.toString());
         assertEquals(POOL, dns.path("pool").asText());
         assertEquals(0, dns.path("mappings").asInt());
         assertEquals(0, dns.path("quarantined").asInt());
@@ -484,7 +484,7 @@ class PeerEgressPhaseTwoTests {
         newMesh().applyRules(rules());
 
         JsonNode consumer = consumerStatus();
-        assertFalse(consumer.path("dns").path("takeover").asBoolean());
+        assertFalse(consumer.path("dns").path("active").asBoolean());
         assertEquals(PeerEgressCodes.FAKE_IP_POOL_INVALID, consumer.path("dns").path("code").asText());
         assertEquals(PeerEgressCodes.RULE_DOMAIN_UNSUPPORTED, consumer.path("rules").get(0).path("code").asText());
         assertTrue(consumer.path("rules").get(1).path("inForce").asBoolean());

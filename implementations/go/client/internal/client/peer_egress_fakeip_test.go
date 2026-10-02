@@ -210,11 +210,13 @@ func TestEgressStatusReportsPhaseTwo(t *testing.T) {
 
 	section = mapSection(t, harness.mesh.egressStatusJSON(), "consumer")
 	dns, _ := section["dns"].(map[string]any)
-	if dns["takeover"] != true || dns["pool"] != "198.18.0.0/15" || dns["mappings"] != 1 || dns["quarantined"] != 0 {
+	if dns["active"] != true || dns["pool"] != "198.18.0.0/15" || dns["mappings"] != 1 || dns["quarantined"] != 0 {
 		t.Errorf("dns = %v", dns)
 	}
-	if _, present := dns["code"]; present {
-		t.Errorf("a running phase two carries a code: %v", dns)
+	// This harness's machine refuses every command, so the system DNS takeover fails; whatever
+	// code there is belongs to the takeover, not to the pool.
+	if code, _ := dns["code"].(string); code == egressCodeFakeIPPoolInvalid {
+		t.Errorf("a running phase two carries the pool's code: %v", dns)
 	}
 	rules, _ := section["rules"].([]map[string]any)
 	if len(rules) != 2 || rules[0]["kind"] != "domain" || rules[0]["code"] != egressCodeRuleEgressNoDomain || rules[0]["inForce"] != false {

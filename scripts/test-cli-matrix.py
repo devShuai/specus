@@ -276,6 +276,105 @@ class Matrix:
         self.run_text(["egress", "enable", "--yes", "--config", str(crlf)])
         edited = crlf.read_bytes()
         assert edited.count(b"\n") == edited.count(b"\r\n") and b'"peerEgressEnabled": true' in edited, edited
+        self.egress_dns(url, restart)
+
+    def egress_dns(self, url, restart):
+        # Phase two (protocol/spec/peer-egress-dns.md, 命令): the switch states what it changes every
+        # time it is turned on, domain rules are accepted once it is on, and the status and restore
+        # commands say the same things in every runtime. HOME and the state directory point into the
+        # test directory, so no journal of the machine running the tests is ever read or acted on.
+        path = self.directory / "egress dns.jsonc"
+        path.write_text('{\n  "serverBaseUrl": "' + url + '",\n  "apiKey": "CLI_TEST_KEY_MUST_NOT_LEAK",\n'
+                        '  "secret": "env:CLI_TEST_SECRET"\n}\n', encoding="utf-8")
+        cfg = ["--config", str(path)]
+        notice = [
+            "Turning on DNS takeover for domain rules:",
+            "  - points the system DNS at this client while it runs and gives it back when it stops "
+            "(resolvectl or /etc/resolv.conf on Linux, networksetup on macOS, an NRPT rule on Windows)",
+            "  - keeps a journal in ~/.specus, so a change left by a killed client is undone at its next start "
+            "or by egress dns restore",
+            "  - domain rules do not match applications that bring their own DoH/DoT, use the system cache, "
+            "or connect to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules",
+        ]
+        before = path.read_text(encoding="utf-8")
+        _, err = self.run_text(["egress", "dns", "enable"] + cfg, 2)
+        assert err.rstrip("\n").split("\n") == notice + ["Not changed. Re-run with --yes to confirm."], err
+        assert path.read_text(encoding="utf-8") == before, "dns enable without --yes changed the file"
+        out, _ = self.run_text(["egress", "dns", "enable", "--yes"] + cfg)
+        lines = out.rstrip("\n").split("\n")
+        assert lines[:4] == notice, lines
+        assert lines[4] == "Warning: peerEgressEnabled is false, so domain rules take effect only after egress enable.", lines
+        assert lines[5].startswith("Saved ") and lines[5].endswith(restart), lines
+        assert lines[6:] == ["dns takeover: on (pool 198.18.0.0/15)"], lines
+        assert '"peerEgressDnsTakeover": true' in path.read_text(encoding="utf-8")
+        data = self.run(["egress", "dns", "enable", "--yes"] + cfg)["data"]
+        assert data["dnsTakeover"] is True and data["pool"] == "198.18.0.0/15", data
+
+        # With the switch on, a domain rule is a rule, and an address rule inside the pool is not.
+        out, _ = self.run_text(["egress", "rule", "add", "--match", "example.com", "--action", "egress",
+                                "--egress-client-id", "42"] + cfg)
+        assert "  [0] on example.com egress 42" in out.split("\n"), out
+        _, err = self.run_text(["egress", "rule", "add", "--match", "198.18.0.0/16", "--action", "direct"] + cfg, 2)
+        assert ("Rule not added: EGRESS_RULE_FAKE_IP_OVERLAP (overlaps the fake-IP pool (peerEgressFakeIpCidr), "
+                "whose addresses only domain rules hand out)") in err, err
+        listing = self.run(["egress", "rules"] + cfg)["data"]
+        # Out of force only because peerEgressEnabled is off: as a domain rule it is valid now.
+        assert [rule.get("code") for rule in listing["rules"]] == ["EGRESS_CONSUMER_DISABLED"], listing
+
+        out, _ = self.run_text(["egress", "dns", "status"] + cfg)
+        assert "No running client for this config." in out.split("\n"), out
+        assert "journal: none (the system DNS is not taken over)" in out.split("\n"), out
+        status = self.run(["egress", "dns", "status"] + cfg)["data"]
+        assert status["instances"] == [] and status["journal"]["state"] == "none", status
+
+        journal = self.directory / ".specus" / "egress-dns-journal.json"
+        out, _ = self.run_text(["egress", "dns", "restore"])
+        # The path is spelled by each runtime (short names, case), so only its ends are compared.
+        last = out.rstrip("\n").split("\n")[-1]
+        assert last.startswith("No DNS takeover journal at ") and last.endswith(
+            "egress-dns-journal.json; there is nothing to restore."), out
+        assert self.run(["egress", "dns", "restore"])["data"]["restored"] is False
+        # A journal whose client still runs is refused: this test process stands in for that client,
+        # and --force is never passed, so nothing is given back on the machine running the tests.
+        journal.parent.mkdir(exist_ok=True)
+        if os.name != "nt":
+            os.chmod(journal.parent, 0o700)
+        journal.write_text(json.dumps({"version": 1, "state": "committed", "platform": "windows", "pid": os.getpid(),
+                                       "listen": "198.18.0.1", "upstreams": ["192.0.2.53"],
+                                       "startedAtUnixMs": 1757000000000}), encoding="utf-8")
+        try:
+            _, err = self.run_text(["egress", "dns", "restore"], 1)
+            assert (f"The client that took over the system DNS (PID {os.getpid()}) is still running, and gives it back "
+                    "itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips "
+                    "this check, for when that PID now belongs to another process.") in err, err
+            status = self.run(["egress", "dns", "status"] + cfg)["data"]
+            assert status["journal"]["state"] == "committed" and status["journal"]["pid"] == os.getpid(), status
+        finally:
+            journal.unlink()
+
+        out, _ = self.run_text(["egress", "dns", "disable"] + cfg)
+        lines = out.rstrip("\n").split("\n")
+        assert lines[0].startswith("Saved ") and lines[0].endswith(restart) and lines[1:] == ["dns takeover: off"], lines
+        assert '"peerEgressDnsTakeover": false' in path.read_text(encoding="utf-8")
+
+        # The recognisable boundary is in the help of every runtime.
+        out, _ = self.run_text(["--help"])
+        assert ("Domain rules do not match applications that bring their own DoH/DoT, use the system cache, or connect "
+                "to hard-coded IP addresses; that traffic is covered only by IP/CIDR rules.") in " ".join(out.split()), out
+
+        # An unusable pool asked for is named before anything connects, in the same words everywhere.
+        bad = self.directory / "egress bad pool.jsonc"
+        bad.write_text(json.dumps(dict(serverBaseUrl=url, apiKey="CLI_TEST_KEY_MUST_NOT_LEAK",
+                                       secret="env:CLI_TEST_SECRET", peerEgressDnsTakeover=True,
+                                       peerEgressFakeIpCidr="100.96.0.0/16")), encoding="utf-8")
+        result = subprocess.run(self.command + ["config", "validate", "--config", str(bad)], cwd=self.directory,
+                                env=self.env, capture_output=True, timeout=20)
+        err = result.stderr.decode("utf-8", "replace")
+        assert result.returncode == 0, ("an unusable pool failed the whole configuration", err)
+        assert ("peerEgressFakeIpCidr is not usable: EGRESS_FAKE_IP_POOL_INVALID; domain rules are not in force"
+                in err), err
+        assert "100.96.0.0/16" not in err, ("a configuration value was printed in a warning", err)
+        self.checks += 1
 
     def run(self, args, code=0, machine=True):
         command = self.command + args + (["--json"] if machine else [])
