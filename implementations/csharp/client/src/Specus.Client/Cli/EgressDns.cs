@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -25,8 +24,8 @@ internal static class EgressDns
     internal static int Run(ClientCliOptions options, string configPath)
     {
         var answer = options.Command == "egress dns restore"
-            ? Restore(options, PeerEgressDnsJournal.DefaultPath, new PeerEgressDnsSystem(), ProcessRunning)
-            : Status(options, configPath, PeerEgressDnsJournal.DefaultPath, CliState.Fresh);
+            ? Restore(options, PeerEgressDnsJournal.DefaultPath, new PeerEgressDnsSystem(), CliState.ClientRunning)
+            : Status(options, configPath, PeerEgressDnsJournal.DefaultPath, CliState.Fresh, CliState.ClientRunning);
         foreach (var warning in answer.Warnings ?? [])
         {
             Console.Error.WriteLine("Warning: " + warning);
@@ -34,28 +33,12 @@ internal static class EgressDns
         return CliOutput.Result(options.Json, options.Command, answer.Code, answer.Data, answer.Message);
     }
 
-    /// <summary>Whether a process with that ID runs now. It may be another program that reused the ID; --force is for that.</summary>
-    internal static bool ProcessRunning(int pid)
-    {
-        if (pid <= 0)
-        {
-            return false;
-        }
-        try
-        {
-            using var process = Process.GetProcessById(pid);
-            return !process.HasExited;
-        }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
-        {
-            return false;
-        }
-    }
-
     /// <summary>
     /// Gives back the takeover the journal describes: 0 when there was nothing to give back or it
     /// was all given back, 1 when the client that made it still runs (without --force) or a step
-    /// failed, which is named.
+    /// failed, which is named. <paramref name="running"/> says whether a client runs as a process
+    /// id -- whether it publishes fresh state (<see cref="CliState.ClientRunning(int)"/>) -- since a
+    /// process id alone may belong to another program after a reboot.
     /// </summary>
     internal static Answer Restore(ClientCliOptions options, string journalPath, IPeerEgressDnsHost host, Func<int, bool> running)
     {
@@ -78,7 +61,7 @@ internal static class EgressDns
         {
             return new Answer(1, new { journal = journalPath, restored = false, pid = journal.Pid },
                 $"The client that took over the system DNS (PID {journal.Pid}) is still running, and gives it back itself when it stops. "
-                + "Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another process.");
+                + "Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another client.");
         }
         var warnings = new Collector();
         var failure = PeerEgressDnsTakeover.Revert(host, journalPath, journal, warnings);
@@ -98,10 +81,10 @@ internal static class EgressDns
     /// <summary>
     /// Whether the system's DNS is taken over, and why not; the upstreams, the journal, the mappings
     /// and how full the pool is. From the running client's state when there is one, and from the
-    /// journal either way.
+    /// journal either way; restore is suggested when no client runs as the journal's process id.
     /// </summary>
     internal static Answer Status(ClientCliOptions options, string configPath, string journalPath,
-        Func<string, List<JsonElement>> fresh)
+        Func<string, List<JsonElement>> fresh, Func<int, bool> running)
     {
         PeerEgressDnsJournal? journal = null;
         string? journalError = null;
@@ -142,7 +125,7 @@ internal static class EgressDns
                 ? "journal: none (the system DNS is not taken over)"
                 : $"journal: unreadable ({journalError})"
             : $"journal: {journal.State} (PID {journal.Pid}, {journal.Platform}, upstreams {Join(journal.Upstreams)})"
-              + (states.Count == 0 ? "; egress dns restore gives it back" : ""));
+              + (running(journal.Pid) ? "" : "; egress dns restore gives it back"));
         var journalData = new Dictionary<string, object?>
         {
             ["path"] = journalPath,

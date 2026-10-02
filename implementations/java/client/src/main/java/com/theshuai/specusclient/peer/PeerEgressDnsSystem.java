@@ -1,5 +1,6 @@
 package com.theshuai.specusclient.peer;
 
+import com.theshuai.specusclient.cli.CliState;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.Inet4Address;
@@ -117,6 +118,15 @@ public final class PeerEgressDnsSystem implements PeerEgressDnsTakeover.Machine 
         } catch (SocketException unknown) {
             return false;
         }
+    }
+
+    /**
+     * Read from the CLI state directory, which the clients of all three runtimes publish to: a process
+     * id alone may belong to another program since a reboot.
+     */
+    @Override
+    public boolean clientRunning(long pid) {
+        return CliState.clientRunning(pid);
     }
 
     @Override

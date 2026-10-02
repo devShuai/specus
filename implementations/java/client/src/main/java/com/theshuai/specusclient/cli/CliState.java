@@ -43,8 +43,8 @@ public final class CliState implements AutoCloseable {
         publisher=Executors.newSingleThreadScheduledExecutor(r -> {var t=new Thread(r,"cli-state");t.setDaemon(true);return t;});
         publisher.scheduleWithFixedDelay(() -> failing=publishOnce(this::write,failing,System.err),1,1,TimeUnit.SECONDS);
     }
-    static Path ensureRoot() throws IOException {
-        Path root=root();
+    static Path ensureRoot() throws IOException { return ensureRoot(root()); }
+    static Path ensureRoot(Path root) throws IOException {
         if (!Files.exists(root,LinkOption.NOFOLLOW_LINKS)) {
             if (posix()) Files.createDirectory(root,PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
             else {
@@ -127,18 +127,52 @@ public final class CliState implements AutoCloseable {
                 try {
                     checkPrivate(file);if(Files.size(file)>1024*1024)continue;
                     var data=CliOutput.JSON.readTree(Files.readString(file));
-                    long age=System.currentTimeMillis()-data.path("updatedAtUnixMs").asLong();
-                    long pid=data.path("pid").asLong();
                     boolean matching=System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win")
                             ? data.path("configPath").asText().equalsIgnoreCase(config.toString()) : data.path("configPath").asText().equals(config.toString());
-                    if(age<0||age>5000||data.path("schemaVersion").asInt()!=1||!matching
-                            ||ProcessHandle.of(pid).filter(ProcessHandle::isAlive).isEmpty())continue;
+                    if(!matching||!fresh(data))continue;
                     states.add(data);
                 } catch(NoSuchFileException ignored) { }
                 catch(com.fasterxml.jackson.core.JsonProcessingException ignored) { }
             }
         }
         return states;
+    }
+
+    /** Whether a state is fresh: format version 1, written in the last five seconds, by a process still alive. */
+    private static boolean fresh(com.fasterxml.jackson.databind.JsonNode data) {
+        long age=System.currentTimeMillis()-data.path("updatedAtUnixMs").asLong();
+        long pid=data.path("pid").asLong();
+        return age>=0&&age<=5000&&data.path("schemaVersion").asInt()==1
+                &&ProcessHandle.of(pid).filter(ProcessHandle::isAlive).isPresent();
+    }
+
+    /**
+     * Whether a client runs as {@code pid}: whether the state directory holds fresh state that process
+     * published, for any configuration and from any of the three runtimes, which share the directory.
+     * It is what "the client that took over the system DNS still runs" means
+     * (protocol/spec/peer-egress-dns.md, section six, 事务日志): after a crash and a reboot a journal's
+     * process id most likely belongs to another program, and that program publishes no state here. A
+     * file that is not private is no evidence and is passed over; so is a directory that is missing or
+     * not safe.
+     */
+    public static boolean clientRunning(long pid) { return clientRunning(pid,root()); }
+
+    static boolean clientRunning(long pid,Path root) {
+        if(pid<=0||!Files.exists(root,LinkOption.NOFOLLOW_LINKS)) return false;
+        try {
+            checkPrivate(root);
+            try(var files=Files.newDirectoryStream(root,"*.json")) {
+                for(Path file:files) {
+                    try {
+                        checkPrivate(file);if(Files.size(file)>1024*1024)continue;
+                        var data=CliOutput.JSON.readTree(Files.readString(file));
+                        // The id first: it costs nothing, and the process lookup is for the one that matches.
+                        if(data!=null&&data.path("pid").isIntegralNumber()&&data.path("pid").asLong()==pid&&fresh(data)) return true;
+                    } catch(IOException|RuntimeException ignored) { }
+                }
+            }
+        } catch(IOException|RuntimeException ignored) { }
+        return false;
     }
 
     public static int query(ClientCli.Options options) {

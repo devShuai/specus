@@ -101,6 +101,12 @@ internal sealed class PeerEgressDnsSystem : IPeerEgressDnsHost
     public IReadOnlyList<string> TunnelInterfaceAddresses(string ownTunnel) =>
         TunnelAddresses(Platform, Interfaces(), ownTunnel);
 
+    /// <summary>
+    /// Read from the CLI state directory, which the clients of all three runtimes publish to: a
+    /// process id alone may belong to another program since a reboot.
+    /// </summary>
+    public bool ClientRunning(int pid) => Cli.CliState.ClientRunning(pid);
+
     public string NetworkFingerprint(string ownTunnel)
     {
         IReadOnlyList<PeerEgressBindRoute> routes;

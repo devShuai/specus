@@ -41,6 +41,13 @@ internal interface IPeerEgressDnsHost
 
     /// <summary>The network as the change check compares it: the default route's interface and every local IPv4 address.</summary>
     string NetworkFingerprint(string ownTunnel);
+
+    /// <summary>
+    /// Whether a client runs as <paramref name="pid"/>: whether that process publishes fresh CLI state
+    /// (protocol/spec/peer-egress-dns.md, section six, 事务日志). A journal such a client owns is its
+    /// live takeover, not a leftover. A machine that cannot tell recognises no client.
+    /// </summary>
+    bool ClientRunning(int pid) => false;
 }
 
 /// <summary>A command that failed, with what it printed.</summary>
@@ -165,7 +172,8 @@ internal sealed record PeerEgressDnsTakeoverStatus(bool Takeover, string? Code, 
 /// with everything giving back needs; the takeover is marked committed only when every step
 /// succeeded; any failure runs the whole give-back, which is safe whatever part of the takeover
 /// happened; and a journal found at start is given back before anything else, which is how a
-/// killed process's takeover is undone. Giving back leaves alone what somebody else wrote after us.
+/// killed process's takeover is undone -- unless another client that is running owns it. Giving
+/// back leaves alone what somebody else wrote after us.
 ///
 /// <para>Not safe for concurrent use except for <see cref="Status"/>: the mesh drives it under its
 /// plan lock.</para>
@@ -237,8 +245,20 @@ internal sealed class PeerEgressDnsTakeover
     public IReadOnlyList<string>? RecordedUpstreams { get; private set; }
 
     /// <summary>
+    /// Whether a journal is another running client's live takeover: not this process's, and its
+    /// process publishes fresh CLI state. A process id that merely runs is not enough: after a crash
+    /// and a reboot it most likely belongs to another program, and leaving the journal for it would
+    /// keep the system's DNS pointed at a responder nobody runs.
+    /// </summary>
+    private bool OwnedElsewhere(PeerEgressDnsJournal journal) => journal.Pid != _pid && _host.ClientRunning(journal.Pid);
+
+    /// <summary>The status error while another running client holds the takeover.</summary>
+    internal static string TakenElsewhere(int pid) => $"the system DNS is taken over by another running client (PID {pid})";
+
+    /// <summary>
     /// Gives back a takeover a previous run left, pending or committed, before this run decides
-    /// anything. A killed process never gave back; this is where it happens.
+    /// anything. A killed process never gave back; this is where it happens. Another running
+    /// client's takeover is left as it is.
     /// </summary>
     public void RecoverLeftover()
     {
@@ -255,6 +275,12 @@ internal sealed class PeerEgressDnsTakeover
         }
         if (journal is null)
         {
+            return;
+        }
+        if (OwnedElsewhere(journal))
+        {
+            _logger?.LogInformation("[peer-egress-dns] takeover journal belongs to the running client PID {Pid}, left as it is",
+                journal.Pid);
             return;
         }
         if (Revert(_host, _path, journal, _logger) is { } failure)
@@ -395,8 +421,10 @@ internal sealed class PeerEgressDnsTakeover
     /// <summary>Reads the system, decides, and takes over.</summary>
     private void Attempt(PeerEgressDnsTakeoverRequest request, long nowMs)
     {
-        // A journal still on disk is a give-back that failed. It is the only record of what the
-        // system had, so it is given back first and never written over.
+        // A journal still on disk is a give-back that failed, one a killed process left, or another
+        // running client's takeover. The first two are the only record of what the system had, so
+        // they are given back first and never written over; the third is left to its owner, who
+        // gives it back when it stops, and this run tries again after RetryMs.
         PeerEgressDnsJournal? leftover;
         try
         {
@@ -405,6 +433,16 @@ internal sealed class PeerEgressDnsTakeover
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
         {
             Fail("the takeover journal cannot be read: " + FirstLine(error), PeerEgressDnsJournal.StatePending);
+            return;
+        }
+        if (leftover is not null && OwnedElsewhere(leftover))
+        {
+            var taken = TakenElsewhere(leftover.Pid);
+            if (Status.Error != taken)
+            {
+                _logger?.LogWarning("[peer-egress-dns] system DNS not taken over: {Error}", taken);
+            }
+            Fail(taken, PeerEgressDnsJournal.StateNone);
             return;
         }
         if (leftover is not null && Revert(_host, _path, leftover, _logger) is { } leftoverFailure)

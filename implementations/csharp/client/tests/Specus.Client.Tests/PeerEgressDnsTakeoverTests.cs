@@ -83,6 +83,9 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         /// <summary>Called before each command runs, for a test that looks at the machine at that moment.</summary>
         public Action<string>? BeforeRun { get; set; }
 
+        /// <summary>The process ids a client runs as, by the fresh CLI state it publishes.</summary>
+        public Func<int, bool> Running { get; set; } = _ => false;
+
         public List<string> Ran
         {
             get
@@ -136,6 +139,8 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         public IReadOnlyList<string> TunnelInterfaceAddresses(string ownTunnel) => TunnelAddresses;
 
         public string NetworkFingerprint(string ownTunnel) => Fingerprint;
+
+        public bool ClientRunning(int pid) => Running(pid);
     }
 
     private sealed class Warnings : ILogger
@@ -484,6 +489,127 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         Assert.Contains("resolvectl revert specus0", takeover.Status.Error, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A journal whose process id runs but publishes no CLI state is a leftover: after a crash and a
+    /// reboot the id most likely belongs to another program. It is given back at start and before a
+    /// takeover, and so is one with this process's own id whatever the check says.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AReusedProcessIdIsGivenBack(bool own)
+    {
+        // The test process runs, but it is no client: it publishes no state of its own.
+        var pid = own ? 4242 : Environment.ProcessId;
+        var machine = Resolved();
+        machine.Running = _ => own;
+        var takeover = Takeover(machine);
+        WriteResolvedJournal(pid);
+        takeover.RecoverLeftover();
+        Assert.Equal([$"resolvectl revert {Tunnel}", "resolvectl flush-caches"], machine.Ran);
+        Assert.Null(Journal());
+
+        WriteResolvedJournal(pid);
+        takeover.Engage(Request(), T0);
+        Assert.Equal([$"resolvectl revert {Tunnel}", "resolvectl flush-caches"], machine.Ran[2..4]);
+        Assert.True(takeover.Status.Takeover);
+        Assert.Equal(4242, Journal()!.Pid);
+    }
+
+    /// <summary>
+    /// A journal another running client owns -- its process publishes fresh CLI state -- is that
+    /// client's live takeover. It is left alone at start and before a takeover, which fails naming
+    /// the client and is tried again after the interval; once that client is gone the journal is a
+    /// leftover like any other.
+    /// </summary>
+    [Fact]
+    public void ARunningClientsJournalIsLeftAlone()
+    {
+        WriteResolvedJournal(777);
+        var machine = Resolved();
+        var running = true;
+        machine.Running = pid => running && pid == 777;
+        var takeover = Takeover(machine);
+        takeover.RecoverLeftover();
+        Assert.Empty(machine.Ran);
+        Assert.Equal(777, Journal()!.Pid);
+
+        takeover.Engage(Request(), T0);
+        Assert.Empty(machine.Ran);
+        Assert.Equal(777, Journal()!.Pid);
+        Assert.Equal(new PeerEgressDnsTakeoverStatus(false, PeerEgressDnsTakeover.CodeFailed, null,
+            "the system DNS is taken over by another running client (PID 777)", PeerEgressDnsJournal.StateNone), takeover.Status);
+        // Nothing of it is this run's: with phase two stopped there is nothing to report.
+        takeover.Idle("test");
+        Assert.Equal(PeerEgressDnsTakeoverStatus.Idle, takeover.Status);
+        takeover.Engage(Request(), T0);
+        Assert.Empty(machine.Ran);
+
+        // That client is killed: its state goes stale, and the attempt after the interval gives its
+        // journal back and takes over.
+        running = false;
+        takeover.Engage(Request(), T0 + PeerEgressDnsTakeover.RetryMs - 1);
+        Assert.Empty(machine.Ran);
+        takeover.Engage(Request(), T0 + PeerEgressDnsTakeover.RetryMs);
+        Assert.Equal([$"resolvectl revert {Tunnel}", "resolvectl flush-caches"], machine.Ran[..2]);
+        Assert.True(takeover.Status.Takeover);
+        Assert.Equal(4242, Journal()!.Pid);
+    }
+
+    /// <summary>
+    /// A client runs as a process id when fresh state from that process is in the state directory:
+    /// the status command's rule, for any configuration and runtime, matched on the id inside.
+    /// </summary>
+    [Fact]
+    public void AClientRunsWhileItPublishesFreshState()
+    {
+        var root = Path.Combine(_directory, "state");
+        var self = Environment.ProcessId;
+        Assert.False(CliState.ClientRunning(self, root));
+        CliState.EnsureRoot(root);
+        // Named for another process: the id inside is what counts.
+        PublishState(root, "java-0123-1.json", self, DateTimeOffset.UtcNow);
+        Assert.True(CliState.ClientRunning(self, root));
+        Assert.False(CliState.ClientRunning(self + 1, root));
+        Assert.False(CliState.ClientRunning(0, root));
+
+        PublishState(root, "java-0123-1.json", self, DateTimeOffset.UtcNow.AddSeconds(-6));
+        Assert.False(CliState.ClientRunning(self, root));
+        PublishState(root, "java-0123-1.json", self, DateTimeOffset.UtcNow.AddMinutes(1));
+        Assert.False(CliState.ClientRunning(self, root));
+        PublishState(root, "java-0123-1.json", self, DateTimeOffset.UtcNow, schemaVersion: 2);
+        Assert.False(CliState.ClientRunning(self, root));
+        // No such process: an id Windows never hands out and far above any Unix pid_max.
+        PublishState(root, "dotnet-4567-1.json", int.MaxValue, DateTimeOffset.UtcNow);
+        Assert.False(CliState.ClientRunning(int.MaxValue, root));
+        if (!OperatingSystem.IsWindows())
+        {
+            PublishState(root, "go-89ab-1.json", self, DateTimeOffset.UtcNow);
+            File.SetUnixFileMode(Path.Combine(root, "go-89ab-1.json"),
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+            Assert.False(CliState.ClientRunning(self, root));
+        }
+    }
+
+    /// <summary>Writes a state file the way a running client does: private, in the state directory.</summary>
+    private static void PublishState(string root, string name, int pid, DateTimeOffset at, int schemaVersion = 1)
+    {
+        var path = Path.Combine(root, name);
+        File.WriteAllText(path, JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["schemaVersion"] = schemaVersion,
+            ["pid"] = pid,
+            ["updatedAtUnixMs"] = at.ToUnixTimeMilliseconds(),
+            ["configPath"] = Path.Combine(root, "another.jsonc"),
+            ["processRunning"] = true,
+        }));
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        CliState.ProtectNewFile(path);
+    }
+
     [Fact]
     public void TheNetworkIsComparedEveryTenSeconds()
     {
@@ -691,6 +817,33 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         Assert.False(JsonSerializer.SerializeToElement(mesh.Status()).GetProperty("consumer").TryGetProperty("dns", out _));
     }
 
+    /// <summary>The first reconcile leaves alone a journal another running client owns, and says why it does not take over.</summary>
+    [Fact]
+    public void TheFirstReconcileLeavesARunningClientsJournal()
+    {
+        var journal = Path.Combine(_directory, "egress-dns-journal.json");
+        PeerEgressDnsJournal.Write(journal, new PeerEgressDnsJournal
+        {
+            State = PeerEgressDnsJournal.StateCommitted,
+            Platform = PeerEgressDnsTakeoverRules.PlatformResolved,
+            Pid = 777,
+            Listen = Listen,
+            Tunnel = Tunnel,
+        });
+        var machine = Resolved();
+        machine.Running = pid => pid == 777;
+        var mesh = MeshFor(new Host(_directory, machine));
+        mesh.Reconcile([], T0);
+        Assert.Empty(machine.Ran);
+        Assert.Equal(777, PeerEgressDnsJournal.Read(journal)!.Pid);
+        var dns = Dns(mesh);
+        Assert.True(dns.GetProperty("active").GetBoolean());
+        Assert.False(dns.GetProperty("takeover").GetBoolean());
+        Assert.Equal(PeerEgressDnsTakeover.CodeFailed, dns.GetProperty("code").GetString());
+        Assert.Equal("the system DNS is taken over by another running client (PID 777)", dns.GetProperty("error").GetString());
+        Assert.Equal("none", dns.GetProperty("journal").GetString());
+    }
+
     // ----------------------------------------------------------------------------------------------
     // The commands
     // ----------------------------------------------------------------------------------------------
@@ -734,7 +887,7 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         var live = EgressDns.Restore(restore, JournalPath, machine, pid => pid == 4242);
         Assert.Equal(1, live.Code);
         Assert.Equal("The client that took over the system DNS (PID 4242) is still running, and gives it back itself when it stops. "
-            + "Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another process.",
+            + "Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another client.",
             live.Message);
         Assert.Empty(machine.Ran);
         Assert.NotNull(Journal());
@@ -759,6 +912,54 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         Assert.True(data.RootElement.GetProperty("restored").GetBoolean());
         Assert.Null(Journal());
         Assert.Equal([$"resolvectl revert {Tunnel}", "resolvectl flush-caches"], machine.Ran[^2..]);
+    }
+
+    /// <summary>
+    /// A journal whose process id may well run but publishes no fresh state is given back without
+    /// --force: since a reboot that id most likely belongs to another program.
+    /// </summary>
+    [Fact]
+    public void RestoreGivesBackAReusedProcessIdWithoutForce()
+    {
+        WriteResolvedJournal(4242);
+        var machine = Resolved();
+        var answer = EgressDns.Restore(ClientCliOptions.Parse(["egress", "dns", "restore"]), JournalPath, machine, _ => false);
+        Assert.Equal(0, answer.Code);
+        Assert.Equal("System DNS given back (linux-resolved, taken over by PID 4242); journal removed.", answer.Message);
+        Assert.Equal([$"resolvectl revert {Tunnel}", "resolvectl flush-caches"], machine.Ran);
+        Assert.Null(Journal());
+    }
+
+    /// <summary>
+    /// restore through the real command line knows the client by the state it publishes. The test
+    /// process stands in for the client that took over: its process id runs, yet without its state
+    /// restore goes on to give back; with fresh state it is refused. The journal names a platform no
+    /// client knows how to give back, so even the first never touches this machine's DNS.
+    /// </summary>
+    [Fact]
+    public async Task RestoreKnowsTheClientByItsState()
+    {
+        var state = Path.Combine(_directory, "state");
+        var journal = Path.Combine(_directory, ".specus", "egress-dns-journal.json");
+        PeerEgressDnsJournal.Write(journal, new PeerEgressDnsJournal
+        {
+            State = PeerEgressDnsJournal.StateCommitted,
+            Platform = "specus-test-none",
+            Pid = Environment.ProcessId,
+            Listen = Listen,
+            Tunnel = Tunnel,
+        });
+        var (code, _, errors) = await Cli(["egress", "dns", "restore"], state);
+        Assert.Equal(1, code);
+        Assert.StartsWith("Giving the system DNS back failed at the journal names platform 'specus-test-none'", errors, StringComparison.Ordinal);
+
+        CliState.EnsureRoot(state);
+        PublishState(state, "go-0123-1.json", Environment.ProcessId, DateTimeOffset.UtcNow);
+        (code, _, errors) = await Cli(["egress", "dns", "restore"], state);
+        Assert.Equal(1, code);
+        Assert.StartsWith($"The client that took over the system DNS (PID {Environment.ProcessId}) is still running", errors,
+            StringComparison.Ordinal);
+        Assert.Equal(Environment.ProcessId, PeerEgressDnsJournal.Read(journal)!.Pid);
     }
 
     /// <summary>restore over somebody else's resolv.conf keeps theirs and says so.</summary>
@@ -788,7 +989,7 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
     public void StatusReadsTheStateAndTheJournal()
     {
         var options = ClientCliOptions.Parse(["egress", "dns", "status", "--config", "c.jsonc"]);
-        var alone = EgressDns.Status(options, "c.jsonc", JournalPath, _ => []);
+        var alone = EgressDns.Status(options, "c.jsonc", JournalPath, _ => [], _ => false);
         Assert.Equal(0, alone.Code);
         Assert.Equal("No running client for this config.\njournal: none (the system DNS is not taken over)", alone.Message);
         using (var data = JsonDocument.Parse(JsonSerializer.Serialize(alone.Data)))
@@ -797,7 +998,7 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
             Assert.Equal(JournalPath, data.RootElement.GetProperty("journal").GetProperty("path").GetString());
             Assert.Equal("none", data.RootElement.GetProperty("journal").GetProperty("state").GetString());
         }
-        Assert.Equal(2, EgressDns.Status(options, "c.jsonc", JournalPath, _ => throw new IOException("not private")).Code);
+        Assert.Equal(2, EgressDns.Status(options, "c.jsonc", JournalPath, _ => throw new IOException("not private"), _ => false).Code);
 
         WriteResolvedJournal(4242);
         using var state = JsonDocument.Parse("""
@@ -806,7 +1007,7 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
              "queries": {"answered": 0, "forwarded": 0, "failed": 0},
              "code": "EGRESS_DNS_TAKEOVER_REFUSED", "reason": "system-dns-loopback"}}}}
             """);
-        var running = EgressDns.Status(options, "c.jsonc", JournalPath, _ => [state.RootElement.Clone()]);
+        var running = EgressDns.Status(options, "c.jsonc", JournalPath, _ => [state.RootElement.Clone()], pid => pid == 4242);
         Assert.Equal(0, running.Code);
         var lines = running.Message.Split('\n');
         Assert.Equal("PID 4242 | DNS takeover: off (EGRESS_DNS_TAKEOVER_REFUSED: system-dns-loopback)", lines[0]);
@@ -814,6 +1015,13 @@ public sealed class PeerEgressDnsTakeoverTests : IDisposable
         Assert.Contains("  mappings: 3 of 131069 (0.0%), 1 resting", lines);
         Assert.Contains("journal: committed (PID 4242, linux-resolved, upstreams 192.168.1.1)", lines);
         Assert.Equal(131069, EgressDns.Capacity("198.18.0.0/15"));
+        // Restore is suggested only when no client runs as the journal's process id, whichever
+        // configuration that client runs.
+        var other = EgressDns.Status(options, "c.jsonc", JournalPath, _ => [], _ => false);
+        Assert.EndsWith("journal: committed (PID 4242, linux-resolved, upstreams 192.168.1.1); egress dns restore gives it back",
+            other.Message, StringComparison.Ordinal);
+        var elsewhere = EgressDns.Status(options, "c.jsonc", JournalPath, _ => [], pid => pid == 4242);
+        Assert.EndsWith("journal: committed (PID 4242, linux-resolved, upstreams 192.168.1.1)", elsewhere.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

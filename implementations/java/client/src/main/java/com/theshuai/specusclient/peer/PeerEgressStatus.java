@@ -91,7 +91,8 @@ public final class PeerEgressStatus {
      * @param failed    SERVFAIL it gave for a failed or refused forward, or a full pool
      * @param takeover  whether the system's DNS points at the responder now: the journal is committed
      * @param reason    why the takeover was refused, with EGRESS_DNS_TAKEOVER_REFUSED
-     * @param error     the failing command's first line, with EGRESS_DNS_TAKEOVER_FAILED
+     * @param error     the failing command's first line, or which running client holds the takeover, with
+     *                  EGRESS_DNS_TAKEOVER_FAILED
      * @param journal   the takeover journal: none, pending or committed
      */
     public record Dns(String pool, boolean running, String code, String listen, List<String> upstreams,

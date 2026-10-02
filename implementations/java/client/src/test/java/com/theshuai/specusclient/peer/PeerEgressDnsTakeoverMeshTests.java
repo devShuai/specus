@@ -246,6 +246,24 @@ class PeerEgressDnsTakeoverMeshTests {
         mesh = null;
     }
 
+    /** A journal another running client owns is left alone, and the status says why this one does not take over. */
+    @Test
+    void leavesARunningClientsJournalAlone() throws IOException {
+        PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved", 777,
+                "198.18.0.1", "specus0", List.of("192.168.1.1"), EPOCH, null, List.of()));
+        PeerEgressDnsTakeoverTests.FakeMachine machine = newMesh();
+        machine.running = pid -> pid == 777;
+        mesh.reconcile(rules(), EPOCH);
+        assertTrue(machine.changes().isEmpty(), "a running client's takeover was touched: " + machine.changes());
+        assertEquals(777, PeerEgressDnsTakeover.readJournal(journal()).pid());
+        JsonNode dns = dns();
+        assertTrue(dns.path("active").asBoolean(), dns.toString());
+        assertFalse(dns.path("takeover").asBoolean(), dns.toString());
+        assertEquals("EGRESS_DNS_TAKEOVER_FAILED", dns.path("code").asText(), dns.toString());
+        assertEquals("the system DNS is taken over by another running client (PID 777)", dns.path("error").asText());
+        assertEquals("none", dns.path("journal").asText());
+    }
+
     /** A journal a killed client left is given back before this client takes over. */
     @Test
     void givesBackALeftoverJournalFirst() throws IOException {

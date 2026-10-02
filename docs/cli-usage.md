@@ -64,7 +64,7 @@ Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus
 | 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 地址的去向，不建连；`--connect` 才做一次 TCP 可达性测试 |
 | DNS 接管开关 | `egress dns enable --yes\|disable --config PATH` | 设置 `peerEgressDnsTakeover`（二期域名规则）；每次开启先说明它会改系统 DNS，缺 `--yes` 时不修改。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#五二期域名规则与系统-dns-接管) |
 | DNS 接管状态 | `egress dns status --config PATH` | 二期是否运行、系统 DNS 是否已接管及原因、转发的上游、事务日志、映射数与池使用率；客户端没在运行也能用 |
-| 恢复系统 DNS | `egress dns restore [--force]` | 按事务日志把系统 DNS 改回，客户端被强杀后用；记录的客户端进程仍在运行时拒绝，`--force` 跳过这一检查 |
+| 恢复系统 DNS | `egress dns restore [--force]` | 按事务日志把系统 DNS 改回，客户端被强杀后用；记录的客户端仍在运行（仍在发布状态，只看进程号不算）时拒绝，`--force` 跳过这一检查 |
 | 离线排错 | `doctor --config PATH` | 检查配置与密钥引用，不联网 |
 | 主动排错 | `doctor --probe --config PATH` | 最多 5 秒的服务端 DNS/TCP 探测；不发送登录、不校验 TLS、不探测转发目标 |
 | 机器输出 | 上述单次命令加 `--json` | stdout 只有一个版本化 JSON 文档，日志/警告仍写 stderr；帮助/版本也支持 |

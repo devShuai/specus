@@ -334,19 +334,17 @@ class Matrix:
         assert last.startswith("No DNS takeover journal at ") and last.endswith(
             "egress-dns-journal.json; there is nothing to restore."), out
         assert self.run(["egress", "dns", "restore"])["data"]["restored"] is False
-        # A journal whose client still runs is refused: this test process stands in for that client,
-        # and --force is never passed, so nothing is given back on the machine running the tests.
-        journal.parent.mkdir(exist_ok=True)
-        if os.name != "nt":
-            os.chmod(journal.parent, 0o700)
-        journal.write_text(json.dumps({"version": 1, "state": "committed", "platform": "windows", "pid": os.getpid(),
-                                       "listen": "198.18.0.1", "upstreams": ["192.0.2.53"],
-                                       "startedAtUnixMs": 1757000000000}), encoding="utf-8")
+        # A running process id is not a running client (peer-egress-dns.md, 事务日志): with no state
+        # published as this test process, restore goes on to give its journal back. The journal names
+        # a platform no client knows, which stops that before anything runs on the machine running the
+        # tests; --force is never passed. The refusal for a client that does publish is in
+        # dns_restore_refused, once a client has made the state directory.
+        self.write_test_journal(journal)
         try:
             _, err = self.run_text(["egress", "dns", "restore"], 1)
-            assert (f"The client that took over the system DNS (PID {os.getpid()}) is still running, and gives it back "
-                    "itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips "
-                    "this check, for when that PID now belongs to another process.") in err, err
+            assert any(line.startswith("Giving the system DNS back failed at ") and "specus-test-none" in line
+                       and line.endswith(". The journal is kept; fix what the step reports and run egress dns restore again.")
+                       for line in err.split("\n")), err
             status = self.run(["egress", "dns", "status"] + cfg)["data"]
             assert status["journal"]["state"] == "committed" and status["journal"]["pid"] == os.getpid(), status
         finally:
@@ -374,6 +372,43 @@ class Matrix:
         assert ("peerEgressFakeIpCidr is not usable: EGRESS_FAKE_IP_POOL_INVALID; domain rules are not in force"
                 in err), err
         assert "100.96.0.0/16" not in err, ("a configuration value was printed in a warning", err)
+        self.checks += 1
+
+    @staticmethod
+    def write_test_journal(journal):
+        # Taken over by this test process, on a platform no client knows how to give back.
+        journal.parent.mkdir(exist_ok=True)
+        if os.name != "nt":
+            os.chmod(journal.parent, 0o700)
+        journal.write_text(json.dumps({"version": 1, "state": "committed", "platform": "specus-test-none",
+                                       "pid": os.getpid(), "listen": "198.18.0.1", "upstreams": ["192.0.2.53"],
+                                       "startedAtUnixMs": 1757000000000}), encoding="utf-8")
+
+    def dns_restore_refused(self, state, snapshot):
+        # The client that took over still runs when it publishes fresh state, whatever its runtime
+        # and configuration (peer-egress-dns.md, 事务日志). This test process stands in for it through
+        # a state file a client wrote, rewritten in place so it keeps that client's private owner and
+        # ACL. Should the refusal be missed, the journal's unknown platform still runs nothing.
+        journal = self.directory / ".specus" / "egress-dns-journal.json"
+        self.write_test_journal(journal)
+        refused = (f"The client that took over the system DNS (PID {os.getpid()}) is still running, and gives it back "
+                   "itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips "
+                   "this check, for when that PID now belongs to another client.")
+        try:
+            for _ in range(3):
+                # Fresh is the last five seconds by the CLI's clock: stamped just before each run, and
+                # run again should a cold start (a JVM on a slow runner) outlast it.
+                state.write_text(json.dumps(dict(snapshot, pid=os.getpid(), configPath=str(self.directory / "another.jsonc"),
+                                                 updatedAtUnixMs=int(time.time() * 1000))), encoding="utf-8")
+                _, err = self.run_text(["egress", "dns", "restore"], 1)
+                if refused in err:
+                    break
+            else:
+                raise AssertionError(("a client publishing fresh state was not recognised", err))
+            assert journal.exists(), "a refused restore removed the journal"
+        finally:
+            state.write_text(json.dumps(dict(snapshot, pid=os.getpid(), updatedAtUnixMs=0)), encoding="utf-8")
+            journal.unlink()
         self.checks += 1
 
     def run(self, args, code=0, machine=True):
@@ -568,6 +603,10 @@ class Matrix:
                     preserved.update(pid=os.getpid(), updatedAtUnixMs=0)
                     prefix.write_text(json.dumps(preserved), encoding="utf-8")
                     self.run(["status"] + cfg, 5)
+                    self.dns_restore_refused(prefix, preserved)
+                    self.run(["status"] + cfg, 5)
+                else:
+                    raise AssertionError("no state file was left by the killed instances")
                 if os.name != "nt":
                     self.tty_ctrl_c()
                 # Stable credential rejection vs transient failure/first-login timeout codes.
