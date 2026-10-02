@@ -443,6 +443,114 @@ func TestEgressDNSTakeoverRecoversAKilledProcess(t *testing.T) {
 	}
 }
 
+// A journal whose process id runs but publishes no CLI state is a leftover: after a crash and a
+// reboot the id most likely belongs to another program. It is given back at start and before a
+// takeover, and so is one with this process's own id whatever the check says.
+func TestEgressDNSTakeoverGivesBackAReusedProcessID(t *testing.T) {
+	original := "nameserver 192.168.1.1\n"
+	leftover := func(pid int) EgressDNSJournal {
+		return EgressDNSJournal{Version: 1, State: egressDNSJournalCommitted, Platform: egressDNSPlatformResolvConf,
+			PID: pid, Listen: "198.18.0.1", Tunnel: "specus0", Upstreams: []string{"192.168.1.1"}, ResolvConf: original}
+	}
+	for _, owner := range []string{"reused", "self"} {
+		host := newFakeDNSHost()
+		host.files[egressDNSResolvConf] = egressDNSResolvConfWritten
+		takeover := newTestTakeover(t, host, "linux")
+		// The parent process runs, but it is no client: no fresh state of its own.
+		pid := os.Getppid()
+		takeover.clientRunning = func(int) bool { return false }
+		if owner == "self" {
+			pid = takeover.pid
+			takeover.clientRunning = func(int) bool { return true }
+		}
+		if err := writeEgressDNSJournal(takeover.path, leftover(pid)); err != nil {
+			t.Fatal(err)
+		}
+		takeover.recoverLeftover()
+		if host.files[egressDNSResolvConf] != original || readTestJournal(t, takeover) != nil {
+			t.Errorf("%s: at start resolv.conf is %q and the journal %v", owner, host.files[egressDNSResolvConf],
+				readTestJournal(t, takeover))
+		}
+
+		host.files[egressDNSResolvConf] = egressDNSResolvConfWritten
+		if err := writeEgressDNSJournal(takeover.path, leftover(pid)); err != nil {
+			t.Fatal(err)
+		}
+		upstreams, committed := takeover.engage(takeoverRequest(), flowEpoch)
+		if !committed || !reflect.DeepEqual(upstreams, []string{"192.168.1.1"}) {
+			t.Fatalf("%s: before a takeover committed=%v upstreams=%q status %+v", owner, committed, upstreams,
+				takeover.statusSnapshot())
+		}
+		// Given back first, so the original is what was read and recorded again.
+		if journal := readTestJournal(t, takeover); journal.PID != takeover.pid || journal.ResolvConf != original {
+			t.Errorf("%s: journal after the takeover %+v", owner, journal)
+		}
+	}
+}
+
+// A journal another running client owns -- its process publishes fresh CLI state -- is that
+// client's live takeover. It is left alone at start and before a takeover, which fails naming the
+// client and is tried again after the interval; once that client is gone the journal is a leftover
+// like any other.
+func TestEgressDNSTakeoverLeavesARunningClientsJournal(t *testing.T) {
+	host := linuxResolvConfHost()
+	original := host.files[egressDNSResolvConf]
+	host.files[egressDNSResolvConf] = egressDNSResolvConfWritten
+	takeover := newTestTakeover(t, host, "linux")
+	running := true
+	takeover.clientRunning = func(pid int) bool { return running && pid == 4242 }
+	if err := writeEgressDNSJournal(takeover.path, EgressDNSJournal{Version: 1, State: egressDNSJournalCommitted,
+		Platform: egressDNSPlatformResolvConf, PID: 4242, Listen: "198.18.0.1", Tunnel: "specus0",
+		Upstreams: []string{"192.168.1.1"}, ResolvConf: original}); err != nil {
+		t.Fatal(err)
+	}
+	untouched := func(when string) {
+		t.Helper()
+		if got := host.commands(); len(got) != 0 || host.files[egressDNSResolvConf] != egressDNSResolvConfWritten {
+			t.Fatalf("%s: a running client's takeover was touched: ran %q, resolv.conf %q", when, got,
+				host.files[egressDNSResolvConf])
+		}
+		if kept := readTestJournal(t, takeover); kept == nil || kept.PID != 4242 {
+			t.Fatalf("%s: a running client's journal became %+v", when, kept)
+		}
+	}
+
+	takeover.recoverLeftover()
+	untouched("at start")
+	if _, committed := takeover.engage(takeoverRequest(), flowEpoch); committed {
+		t.Fatal("took over on top of a running client's takeover")
+	}
+	untouched("before a takeover")
+	failed := egressDNSTakeoverStatus{Code: egressCodeDNSTakeoverFailed,
+		Error: "the system DNS is taken over by another running client (PID 4242)", Journal: egressDNSJournalNone}
+	if status := takeover.statusSnapshot(); status != failed {
+		t.Errorf("status %+v, want %+v", status, failed)
+	}
+	// Nothing of it is this run's: with phase two stopped there is nothing to report.
+	takeover.idle("test")
+	if status := takeover.statusSnapshot(); status != (egressDNSTakeoverStatus{Journal: egressDNSJournalNone}) {
+		t.Errorf("idle status %+v", status)
+	}
+	takeover.engage(takeoverRequest(), flowEpoch)
+	untouched("again")
+
+	// That client is killed: its state goes stale, and the attempt after the interval gives its
+	// journal back and takes over.
+	running = false
+	if _, committed := takeover.engage(takeoverRequest(), flowEpoch.Add(egressDNSRetryInterval-time.Second)); committed {
+		t.Fatal("tried again before the interval")
+	}
+	untouched("within the interval")
+	upstreams, committed := takeover.engage(takeoverRequest(), flowEpoch.Add(egressDNSRetryInterval))
+	if !committed || !reflect.DeepEqual(upstreams, []string{"192.168.1.1"}) {
+		t.Fatalf("after the client went: committed=%v upstreams=%q status %+v", committed, upstreams,
+			takeover.statusSnapshot())
+	}
+	if journal := readTestJournal(t, takeover); journal.PID != takeover.pid || journal.ResolvConf != original {
+		t.Errorf("journal after the takeover %+v", journal)
+	}
+}
+
 // The network is compared at most every ten seconds, the first reading being the baseline.
 func TestEgressDNSNetworkChangeIsSeenEveryTenSeconds(t *testing.T) {
 	takeover := newTestTakeover(t, newFakeDNSHost(), "linux")
@@ -588,6 +696,37 @@ func TestMeshGivesBackAKilledProcessJournalFirst(t *testing.T) {
 	}
 	if journal, _ := ReadEgressDNSJournal(harness.mesh.egressDNSJournalPath); journal != nil {
 		t.Error("the killed process's journal is still there")
+	}
+}
+
+// On its first reconcile the mesh leaves alone a journal that another running client owns, and says
+// why it does not take over. The CLI hands the check in through the client.
+func TestMeshLeavesARunningClientsTakeoverAlone(t *testing.T) {
+	host := linuxResolvedHost()
+	harness, _, _ := phaseTwoTakeoverHarness(t, host)
+	app := New(Config{}, log.New(io.Discard, "", 0))
+	app.SetEgressDNSClientCheck(func(pid int) bool { return pid == 4242 })
+	harness.mesh.egressDNSClientRunning = app.peerMesh.egressDNSClientRunning
+	if harness.mesh.egressDNSClientRunning == nil {
+		t.Fatal("the client did not hand the check to its mesh")
+	}
+	if err := writeEgressDNSJournal(harness.mesh.egressDNSJournalPath, EgressDNSJournal{Version: 1,
+		State: egressDNSJournalCommitted, Platform: egressDNSPlatformResolved, PID: 4242, Listen: "198.18.0.1",
+		Tunnel: "specus0", Upstreams: []string{"192.168.1.1"}}); err != nil {
+		t.Fatal(err)
+	}
+	harness.tick(0)
+	if got := host.commands(); contains(got, "resolvectl revert specus0") || contains(got, "resolvectl dns specus0 198.18.0.1") {
+		t.Errorf("a running client's takeover was given back or taken over: %q", got)
+	}
+	if journal, _ := ReadEgressDNSJournal(harness.mesh.egressDNSJournalPath); journal == nil || journal.PID != 4242 {
+		t.Errorf("the running client's journal became %+v", journal)
+	}
+	dns, _ := mapSection(t, harness.mesh.egressStatusJSON(), "consumer")["dns"].(map[string]any)
+	if dns["active"] != true || dns["takeover"] != false || dns["code"] != egressCodeDNSTakeoverFailed ||
+		dns["error"] != "the system DNS is taken over by another running client (PID 4242)" ||
+		dns["journal"] != egressDNSJournalNone {
+		t.Errorf("dns = %v", dns)
 	}
 }
 

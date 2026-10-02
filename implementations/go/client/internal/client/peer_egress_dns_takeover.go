@@ -22,7 +22,8 @@ import (
 // everything needed to give back; the takeover is marked committed only once every step succeeded;
 // any failure runs the whole give-back, which is safe whatever part of the takeover happened; and a
 // journal found at start is given back before anything else, which is how a killed process's
-// takeover is undone. Giving back leaves alone whatever somebody else wrote after us.
+// takeover is undone -- unless another client that is running owns it. Giving back leaves alone
+// whatever somebody else wrote after us.
 //
 // The decisions -- what to read, what counts as a refusal, the exact commands -- are the pure
 // functions of peer_egress_dns_takeover_parse.go, pinned by the shared vector. What is here is the
@@ -230,6 +231,10 @@ type egressDNSTakeover struct {
 	// fingerprint describes the network: the default route's interface and every local IPv4
 	// address. Nil means no check.
 	fingerprint func() (string, error)
+	// clientRunning reports whether a client is running as a process id: whether it publishes
+	// fresh CLI state (the CLI's state directory, which this package does not read itself). Nil
+	// recognises no client, so every leftover journal is given back.
+	clientRunning func(pid int) bool
 
 	// held is the journal of the takeover in place, nil when there is none.
 	held *EgressDNSJournal
@@ -276,8 +281,22 @@ func (t *egressDNSTakeover) journalState() string {
 	return egressDNSJournalNone
 }
 
+// ownedElsewhere is whether a journal is another running client's live takeover: not this process's,
+// and its process publishes fresh CLI state. A process id that is merely running is not enough --
+// after a crash and a reboot it most likely belongs to another program, and leaving the journal for
+// it would keep the system's DNS pointed at a responder nobody runs.
+func (t *egressDNSTakeover) ownedElsewhere(journal *EgressDNSJournal) bool {
+	return journal.PID != t.pid && t.clientRunning != nil && t.clientRunning(journal.PID)
+}
+
+// egressDNSTakenElsewhere is the status error while another running client holds the takeover.
+func egressDNSTakenElsewhere(pid int) string {
+	return fmt.Sprintf("the system DNS is taken over by another running client (PID %d)", pid)
+}
+
 // recoverLeftover gives back a takeover a previous run left, pending or committed, before this run
-// decides anything. A process that was killed never gave back; this is where it happens.
+// decides anything. A process that was killed never gave back; this is where it happens. Another
+// running client's takeover is left as it is.
 func (t *egressDNSTakeover) recoverLeftover() {
 	journal, err := ReadEgressDNSJournal(t.path)
 	if err != nil {
@@ -285,6 +304,11 @@ func (t *egressDNSTakeover) recoverLeftover() {
 		return
 	}
 	if journal == nil {
+		return
+	}
+	if t.ownedElsewhere(journal) {
+		t.logger.Printf("[peer-egress-consumer] DNS takeover journal belongs to the running client PID %d, left as it is",
+			journal.PID)
 		return
 	}
 	if err := revertEgressDNSJournal(t.host, t.path, journal, t.logger); err != nil {
@@ -382,9 +406,20 @@ func (t *egressDNSTakeover) fail(err error) {
 
 // attempt reads the system, decides, and takes over.
 func (t *egressDNSTakeover) attempt(request egressDNSTakeoverRequest, now time.Time) ([]string, bool) {
-	// A journal still on disk is a give-back that failed. It is the only record of what the system
-	// had, so it is given back first and never written over.
+	// A journal still on disk is a give-back that failed, one a killed process left, or another
+	// running client's takeover. The first two are the only record of what the system had, so they
+	// are given back first and never written over; the third is left to its owner, who gives it
+	// back when it stops, and this run tries again after the retry interval.
 	if leftover, err := ReadEgressDNSJournal(t.path); err != nil || leftover != nil {
+		if err == nil && t.ownedElsewhere(leftover) {
+			message := egressDNSTakenElsewhere(leftover.PID)
+			if status := t.statusSnapshot(); status.Error != message {
+				t.logger.Printf("[peer-egress-consumer] system DNS not taken over: %s", message)
+			}
+			t.setStatus(egressDNSTakeoverStatus{Code: egressCodeDNSTakeoverFailed, Error: message,
+				Journal: egressDNSJournalNone})
+			return nil, false
+		}
 		if err == nil {
 			err = revertEgressDNSJournal(t.host, t.path, leftover, t.logger)
 		}

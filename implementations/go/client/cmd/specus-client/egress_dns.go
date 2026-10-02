@@ -84,15 +84,17 @@ func egressDNSJournalView() (map[string]any, string, error) {
 	if journal == nil {
 		return map[string]any{"path": path, "state": "none"}, "journal: none (the system DNS is not taken over)", nil
 	}
-	running := processAlive(journal.PID)
+	// Whether the client that took over runs, by the state it publishes: a process id alone may
+	// belong to another program since a reboot.
+	running := stateClientRunning(journal.PID)
 	view := map[string]any{
 		"path": path, "state": journal.State, "platform": journal.Platform, "pid": journal.PID,
-		"processRunning": running, "listen": journal.Listen, "upstreams": journal.Upstreams,
+		"clientRunning": running, "listen": journal.Listen, "upstreams": journal.Upstreams,
 	}
 	line := fmt.Sprintf("journal: %s by PID %d (%s), upstreams %s", journal.State, journal.PID, journal.Platform,
 		strings.Join(journal.Upstreams, ", "))
 	if !running {
-		line += fmt.Sprintf("\n  PID %d is not running, so nothing will give the system DNS back by itself\n"+
+		line += fmt.Sprintf("\n  no client is running as PID %d, so nothing will give the system DNS back by itself\n"+
 			"  fix: run egress dns restore", journal.PID)
 	}
 	return view, line, nil
@@ -193,7 +195,8 @@ func listOfStrings(value any) []string {
 
 // egressDNSRestore is `egress dns restore`: give the system DNS back as the journal says. Exit 0
 // when there is nothing to give back or it was given back; 1 when the client that took it over still
-// runs (without --force) or a step failed, which is named.
+// runs (without --force) or a step failed, which is named. The client runs when it publishes fresh
+// state (stateClientRunning), not merely when its process id does.
 func egressDNSRestore(options cliOptions) int {
 	path := client.EgressDNSJournalPath()
 	journal, err := client.ReadEgressDNSJournal(path)
@@ -205,11 +208,11 @@ func egressDNSRestore(options cliOptions) int {
 			"No DNS takeover journal at "+path+"; there is nothing to restore.")
 	}
 	data := map[string]any{"journal": path, "platform": journal.Platform, "pid": journal.PID, "restored": false}
-	if !options.egressForce && journal.PID != os.Getpid() && processAlive(journal.PID) {
+	if !options.egressForce && journal.PID != os.Getpid() && stateClientRunning(journal.PID) {
 		return resultOutput(options.json, options.command, 1, data, fmt.Sprintf(
 			"The client that took over the system DNS (PID %d) is still running, and gives it back itself when it stops. "+
 				"Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID "+
-				"now belongs to another process.", journal.PID))
+				"now belongs to another client.", journal.PID))
 	}
 	logger := log.New(os.Stderr, "", 0)
 	if err := client.RevertEgressDNSJournal(newEgressDNSHost(), path, journal, logger); err != nil {

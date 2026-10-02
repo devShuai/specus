@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongPredicate;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -47,6 +48,8 @@ class PeerEgressDnsTakeoverTests {
         final List<String> ran = new ArrayList<>();
         final List<String> written = new ArrayList<>();
         List<PeerEgressDnsTakeoverParse.LocalInterface> interfaces = List.of();
+        /** The process ids a client runs as, by the fresh CLI state it publishes. */
+        LongPredicate running = pid -> false;
 
         FakeMachine(String platform) {
             this.platform = platform;
@@ -109,6 +112,11 @@ class PeerEgressDnsTakeoverTests {
         @Override
         public List<PeerEgressDnsTakeoverParse.LocalInterface> interfaces() {
             return interfaces;
+        }
+
+        @Override
+        public boolean clientRunning(long pid) {
+            return running.test(pid);
         }
 
         /** The commands that changed something, reads left out. */
@@ -367,7 +375,8 @@ class PeerEgressDnsTakeoverTests {
 
     /**
      * A journal a killed client left is given back at start, pending or committed, whether or not
-     * its process id is running now: after a reboot that id most likely belongs to another program.
+     * its process id is running now: after a reboot that id most likely belongs to another program,
+     * which publishes no CLI state.
      */
     @Test
     void givesBackWhatAKilledClientLeft() throws IOException {
@@ -375,7 +384,7 @@ class PeerEgressDnsTakeoverTests {
         PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved", 1111,
                 LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
 
-        PeerEgressDnsTakeover.recoverLeftover(machine, journal());
+        PeerEgressDnsTakeover.recoverLeftover(machine, journal(), PID);
         assertEquals(List.of("resolvectl revert specus0", "resolvectl flush-caches"), machine.changes());
         assertFalse(Files.exists(journal()));
 
@@ -385,9 +394,80 @@ class PeerEgressDnsTakeoverTests {
                 ProcessHandle.current().pid() == 1 ? 2 : 1, LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
         // With its link gone there is nothing to revert on the link, and the journal still goes.
         machine.links.clear();
-        PeerEgressDnsTakeover.recoverLeftover(machine, journal());
+        PeerEgressDnsTakeover.recoverLeftover(machine, journal(), PID);
         assertEquals(List.of("resolvectl flush-caches"), machine.changes());
         assertFalse(Files.exists(journal()));
+    }
+
+    /**
+     * Before a takeover too, a journal whose process id runs but publishes no CLI state is a leftover
+     * and is given back first; so is one with this process's own id whatever the check says.
+     */
+    @Test
+    void givesBackAReusedProcessIdBeforeTakingOver() throws IOException {
+        for (boolean own : new boolean[] {false, true}) {
+            FakeMachine machine = resolved();
+            // The test process runs, but it is no client: it publishes no state of its own.
+            long pid = own ? PID : ProcessHandle.current().pid();
+            machine.running = candidate -> own;
+            PeerEgressDnsTakeover takeover = takeover(machine);
+            PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved",
+                    pid, LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
+            takeover.recoverLeftover();
+            assertEquals(List.of("resolvectl revert specus0", "resolvectl flush-caches"), machine.changes(), "own=" + own);
+            assertFalse(Files.exists(journal()), "own=" + own);
+
+            machine.ran.clear();
+            PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved",
+                    pid, LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
+            takeover.engage(request(true), EPOCH);
+            assertEquals(List.of("resolvectl revert specus0", "resolvectl flush-caches"), machine.changes().subList(0, 2),
+                    "own=" + own);
+            assertTrue(takeover.status().takeover(), "own=" + own + ": " + takeover.status());
+            assertEquals(PID, PeerEgressDnsTakeover.readJournal(journal()).pid());
+            takeover.release("test");
+        }
+    }
+
+    /**
+     * A journal another running client owns -- its process publishes fresh CLI state -- is that
+     * client's live takeover. It is left alone at start and before a takeover, which fails naming the
+     * client and is tried again after the interval; once that client is gone the journal is a leftover
+     * like any other.
+     */
+    @Test
+    void leavesARunningClientsJournalAlone() throws IOException {
+        FakeMachine machine = resolved();
+        boolean[] running = {true};
+        machine.running = pid -> running[0] && pid == 777;
+        PeerEgressDnsTakeover.writeJournal(journal(), new PeerEgressDnsTakeover.Journal("committed", "linux-resolved", 777,
+                LISTEN, TUNNEL, List.of("192.168.1.1"), EPOCH, null, List.of()));
+        PeerEgressDnsTakeover takeover = takeover(machine);
+        takeover.recoverLeftover();
+        assertTrue(machine.ran.isEmpty(), "a running client's takeover was touched at start: " + machine.ran);
+        assertEquals(777, PeerEgressDnsTakeover.readJournal(journal()).pid());
+
+        takeover.engage(request(true), EPOCH);
+        assertTrue(machine.ran.isEmpty(), "a running client's takeover was touched: " + machine.ran);
+        assertEquals(777, PeerEgressDnsTakeover.readJournal(journal()).pid());
+        assertEquals(new PeerEgressDnsTakeover.Status(false, PeerEgressDnsTakeoverParse.CODE_FAILED, null,
+                "the system DNS is taken over by another running client (PID 777)", PeerEgressDnsTakeover.JOURNAL_NONE),
+                takeover.status());
+        // Nothing of it is this run's: with phase two stopped there is nothing to report.
+        takeover.idle("test");
+        assertEquals(PeerEgressDnsTakeover.Status.none(), takeover.status());
+        takeover.engage(request(true), EPOCH);
+        assertTrue(machine.ran.isEmpty());
+
+        // That client is killed: its state goes stale, and the attempt after the interval gives its
+        // journal back and takes over.
+        running[0] = false;
+        takeover.engage(request(true), EPOCH + PeerEgressDnsTakeover.RETRY_MS - 1);
+        assertTrue(machine.ran.isEmpty(), "tried again before the interval");
+        takeover.engage(request(true), EPOCH + PeerEgressDnsTakeover.RETRY_MS);
+        assertEquals(List.of("resolvectl revert specus0", "resolvectl flush-caches"), machine.changes().subList(0, 2));
+        assertTrue(takeover.status().takeover(), takeover.status().toString());
+        assertEquals(PID, PeerEgressDnsTakeover.readJournal(journal()).pid());
     }
 
     /** The journal as written: private, pretty, and read back the same. */

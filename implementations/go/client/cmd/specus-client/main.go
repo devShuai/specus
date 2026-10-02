@@ -124,6 +124,7 @@ func runCLI(args []string) int {
 	runErrors := make(chan error, 1)
 	appClient := client.New(config, logger)
 	appClient.SetInitialLoginTimeout(time.Duration(options.loginTimeout) * time.Second)
+	appClient.SetEgressDNSClientCheck(stateClientRunning)
 	stopState, stateErr := publishState(path, appClient.DiagnosticSnapshot)
 	if stateErr != nil {
 		logger.Printf("Cannot create private CLI state. Check SPECUS_CLI_STATE_DIR permissions: %v", stateErr)

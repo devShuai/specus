@@ -126,6 +126,7 @@ func (u *uiRuntime) start(ctx context.Context, revision string) error {
 	// must not orphan the local management process or broaden update consent.
 	app := client.New(config, log.New(io.Discard, "", 0))
 	app.SetInitialLoginTimeout(time.Duration(u.loginTimeout) * time.Second)
+	app.SetEgressDNSClientCheck(stateClientRunning)
 	stopState, err := publishState(u.path, app.DiagnosticSnapshot)
 	if err != nil {
 		return errors.New("无法创建安全的 CLI 状态文件")

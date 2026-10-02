@@ -51,7 +51,10 @@ internal sealed record PeerEgressDnsStatus(bool Takeover, string Pool, int Mappi
     /// <summary>With <c>EGRESS_DNS_TAKEOVER_REFUSED</c>: which check refused.</summary>
     public string? Reason { get; init; }
 
-    /// <summary>With <c>EGRESS_DNS_TAKEOVER_FAILED</c>: the first line the failing command printed.</summary>
+    /// <summary>
+    /// With <c>EGRESS_DNS_TAKEOVER_FAILED</c>: the first line the failing command printed, or which
+    /// running client holds the takeover.
+    /// </summary>
     public string? Error { get; init; }
 
     /// <summary>The responder's listen address; null while phase two does not run.</summary>

@@ -40,9 +40,10 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         Write();
         _publisher = PublishAsync();
     }
-    internal static string EnsureRoot()
+    internal static string EnsureRoot() => EnsureRoot(Root);
+
+    internal static string EnsureRoot(string root)
     {
-        var root = Root;
         if (!Directory.Exists(root))
         {
             if (OperatingSystem.IsWindows())
@@ -208,16 +209,67 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
             try
             {
                 using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
-                long age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.GetProperty("updatedAtUnixMs").GetInt64();
-                int pid = data.GetProperty("pid").GetInt32();
-                if (age is < 0 or > 5000 || !string.Equals(data.GetProperty("configPath").GetString(),config,
-                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) || data.GetProperty("schemaVersion").GetInt32() != 1) continue;
-                using var process = Process.GetProcessById(pid); if (process.HasExited) continue;
+                if (!string.Equals(data.GetProperty("configPath").GetString(), config,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) || FreshPid(data) is null) continue;
                 fresh.Add(data.Clone());
             }
             catch (Exception e) when (e is JsonException or ArgumentException or InvalidOperationException or KeyNotFoundException or FileNotFoundException) { }
         }
         return fresh;
+    }
+
+    /// <summary>
+    /// The process that published a state, when the state is fresh: format version 1, written in the
+    /// last five seconds, by a process that is still alive; null otherwise. Throws as <see cref="JsonElement"/>
+    /// and <see cref="Process.GetProcessById(int)"/> do for a state missing a field or naming no process.
+    /// </summary>
+    private static int? FreshPid(JsonElement data)
+    {
+        long age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.GetProperty("updatedAtUnixMs").GetInt64();
+        int pid = data.GetProperty("pid").GetInt32();
+        if (age is < 0 or > 5000 || data.GetProperty("schemaVersion").GetInt32() != 1) return null;
+        using var process = Process.GetProcessById(pid);
+        return process.HasExited ? null : pid;
+    }
+
+    /// <summary>
+    /// Whether a client runs as <paramref name="pid"/>: whether the state directory holds fresh state
+    /// that process published, for any configuration and from any of the three runtimes, which share
+    /// the directory.
+    /// </summary>
+    /// <remarks>
+    /// It is what "the client that took over the system DNS still runs" means
+    /// (protocol/spec/peer-egress-dns.md, section six, 事务日志): after a crash and a reboot a
+    /// journal's process id most likely belongs to another program, and that program publishes no
+    /// state here. A file that is not private is no evidence and is passed over; so is a directory
+    /// that is missing or not safe.
+    /// </remarks>
+    internal static bool ClientRunning(int pid) => ClientRunning(pid, Root);
+
+    internal static bool ClientRunning(int pid, string root)
+    {
+        if (pid <= 0) return false;
+        try
+        {
+            if (!Directory.Exists(root)) return false;
+            CheckPrivate(root);
+            foreach (var path in Directory.GetFiles(root, "*.json"))
+            {
+                try
+                {
+                    CheckPrivate(path);
+                    if (new FileInfo(path).Length > 1024 * 1024) continue;
+                    using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
+                    // The id first: it costs nothing, and the process lookup is for the one that matches.
+                    if (data.TryGetProperty("pid", out var id) && id.ValueKind == JsonValueKind.Number && id.TryGetInt32(out var published)
+                        && published == pid && FreshPid(data) == pid) return true;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or ArgumentException
+                    or InvalidOperationException or KeyNotFoundException or FormatException) { }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return false;
     }
 
     internal static int Query(string config, ClientCliOptions options)

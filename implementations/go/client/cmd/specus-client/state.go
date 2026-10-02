@@ -149,31 +149,77 @@ func freshStates(config string) ([]map[string]any, int, string) {
 		if err = checkPrivate(path, false); err != nil {
 			return nil, 2, "Unsafe local state file; refusing to read it."
 		}
-		info, e := os.Stat(path)
-		if e != nil || info.Size() > 1024*1024 {
+		data, ok := readStateFile(path)
+		if !ok {
 			continue
 		}
-		bytes, e := os.ReadFile(path)
-		if e != nil {
-			continue
-		}
-		var data map[string]any
-		if json.Unmarshal(bytes, &data) != nil {
-			continue
-		}
-		at, ok := data["updatedAtUnixMs"].(float64)
-		pid, pidOK := data["pid"].(float64)
-		age := time.Now().UnixMilli() - int64(at)
 		storedConfig, _ := data["configPath"].(string)
 		matches := storedConfig == config || runtime.GOOS == "windows" && strings.EqualFold(storedConfig, config)
 		_, controlOK := data["controlAuthenticated"].(bool)
 		_, readyOK := data["businessReady"].(bool)
-		if !ok || !pidOK || !controlOK || !readyOK || age < 0 || age > 5000 || !processAlive(int(pid)) || !matches || data["schemaVersion"] != float64(1) {
+		if _, fresh := freshStatePID(data); !fresh || !controlOK || !readyOK || !matches {
 			continue
 		}
 		states = append(states, data)
 	}
 	return states, 0, ""
+}
+
+// readStateFile reads one state file: false for one that is gone, over 1 MiB or not JSON.
+func readStateFile(path string) (map[string]any, bool) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > 1024*1024 {
+		return nil, false
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var data map[string]any
+	if json.Unmarshal(bytes, &data) != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// freshStatePID is the process that published a state, when the state is fresh: format version 1,
+// written in the last five seconds, by a process that is still alive.
+func freshStatePID(data map[string]any) (int, bool) {
+	at, atOK := data["updatedAtUnixMs"].(float64)
+	pid, pidOK := data["pid"].(float64)
+	age := time.Now().UnixMilli() - int64(at)
+	if !atOK || !pidOK || age < 0 || age > 5000 || data["schemaVersion"] != float64(1) || !processAlive(int(pid)) {
+		return 0, false
+	}
+	return int(pid), true
+}
+
+// stateClientRunning reports whether a client runs as pid: whether the state directory holds fresh
+// state that process published, for any configuration and from any of the three runtimes, which
+// share the directory. It is what "the client that took over the system DNS still runs" means
+// (protocol/spec/peer-egress-dns.md, 六, 事务日志): after a crash and a reboot a journal's process id
+// most likely belongs to another program, and that program publishes no state here. A file that is
+// not private is no evidence and is passed over; so is a directory that is missing or not safe.
+func stateClientRunning(pid int) bool {
+	root, err := checkedStateRoot(false)
+	if err != nil || pid <= 0 {
+		return false
+	}
+	paths, err := filepath.Glob(filepath.Join(root, "*.json"))
+	if err != nil {
+		return false
+	}
+	for _, path := range paths {
+		if checkPrivate(path, false) != nil {
+			continue
+		}
+		if data, ok := readStateFile(path); ok {
+			if published, fresh := freshStatePID(data); fresh && published == pid {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func queryState(options cliOptions, config string) int {

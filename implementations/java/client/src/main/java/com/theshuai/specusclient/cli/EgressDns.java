@@ -103,11 +103,14 @@ public final class EgressDns {
     // ----------------------------------------------------------------------------------------------
 
     static int status(ClientCli.Options options) {
-        return status(options, PeerEgressDnsTakeover.defaultJournalPath());
+        return status(options, PeerEgressDnsTakeover.defaultJournalPath(), CliState::clientRunning);
     }
 
-    /** With the journal where a test put it. */
-    static int status(ClientCli.Options options, Path journalPath) {
+    /**
+     * With the journal and the client check a test chose. Restore is suggested when no client runs as
+     * the journal's process id, whatever configuration it runs.
+     */
+    static int status(ClientCli.Options options, Path journalPath, LongPredicate clientRunning) {
         List<JsonNode> states;
         try {
             states = CliState.liveStates(options.config());
@@ -145,7 +148,7 @@ public final class EgressDns {
                 journal.put("upstreams", recorded.upstreams());
                 lines.add("journal: " + recorded.state() + " (" + recorded.platform() + ", taken over by PID "
                         + recorded.pid() + ", upstreams " + joinOrNone(recorded.upstreams()) + ")");
-                if (states.isEmpty()) {
+                if (!clientRunning.test(recorded.pid())) {
                     // Nothing is running to give it back when it stops: that is what restore is for.
                     lines.add("  the system DNS may still point at the responder; run egress dns restore");
                 }
@@ -211,16 +214,20 @@ public final class EgressDns {
     // restore
     // ----------------------------------------------------------------------------------------------
 
+    /**
+     * The client that took over runs when it publishes fresh state ({@link CliState#clientRunning}):
+     * a process id alone may belong to another program since a reboot.
+     */
     static int restore(ClientCli.Options options) {
         return restore(options, new PeerEgressDnsSystem(), PeerEgressDnsTakeover.defaultJournalPath(),
-                pid -> pid > 0 && ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false));
+                CliState::clientRunning);
     }
 
-    /** With the machine, journal and process check a test chose. */
+    /** With the machine, journal and client check a test chose. */
     static int restore(ClientCli.Options options, PeerEgressDnsTakeover.Machine machine, Path journalPath,
-            LongPredicate processAlive) {
+            LongPredicate clientRunning) {
         PeerEgressDnsTakeover.RestoreResult result =
-                PeerEgressDnsTakeover.restore(machine, journalPath, options.egress().force(), processAlive);
+                PeerEgressDnsTakeover.restore(machine, journalPath, options.egress().force(), clientRunning);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("journal", journalPath.toString());
         data.put("restored", result.exitCode() == 0 && result.journal() != null);

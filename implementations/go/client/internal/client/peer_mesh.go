@@ -195,6 +195,10 @@ type peerMeshClient struct {
 	egressDNSJournalPath     string
 	egressDNSTunnelAddresses func(tunnel string) []string
 	egressDNSFingerprint     func() (string, error)
+	// egressDNSClientRunning tells whether a client runs as a process id, by the CLI state it
+	// publishes: a journal such a client owns is its live takeover, not a leftover. Set by the CLI
+	// (Client.SetEgressDNSClientCheck); nil recognises no client.
+	egressDNSClientRunning func(pid int) bool
 
 	// The consumer's route plan, kept true on the mesh's own tick. Guarded by egressPlanMu, which
 	// is never taken under mu: a reconcile resolves hostnames and runs route commands.

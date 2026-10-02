@@ -291,9 +291,18 @@ Windows 接口类型为 53（虚拟）或 131（隧道）的接口。本客户�
 - PowerShell 退出码为 0、标准错误却有输出，也按失败处理：`A; Clear-DnsClientCache` 的退出码只反映最后一条语句。
 - 被拒或失败后 60 秒再重新读取系统；网络指纹、监听地址、TUN 或池变化时立即重试。`pool-route-not-installed`
   不执行任何命令，每次协调都重新看。
-- 进程启动时若发现事务日志，不论 `pending` 还是 `committed`、也不论日志里的进程号此刻是否在运行，**先按日志回滚**，再按当前配置决定是否重新接管。
-  断电重启之后那个进程号多半已被别的程序占用，按它判断会让接管一直停在失败上，而系统 DNS 还指着一个没人应答的地址。
-  因此一台机器上只应有一个开启 `peerEgressDnsTakeover` 的客户端；进程号检查只留给人手动运行的 `egress dns restore`。
+- **日志的主人在运行**，指状态目录（`SPECUS_CLI_STATE_DIR`，默认 `~/.specus-cli`）里有日志的 `pid` 发布的新鲜状态文件：
+  文件里的 `pid` 等于日志的 `pid`，其余按 `status` 列出运行中实例的同一条规则——属主私有、`schemaVersion` 为 1、
+  `updatedAtUnixMs` 在 5 秒之内、发布它的进程仍然存活。不看 `configPath`，也不看文件出自哪个运行时（三端共用这个目录与这份日志）。
+  不私有的文件跳过；状态目录不存在或不安全时视同没有。只看进程号不行：断电重启之后那个进程号多半已被别的程序占用，
+  按它判断会让接管一直停在失败上，而系统 DNS 还指着一个没人应答的地址；别的程序不会往状态目录里发布状态。
+- 进程启动时、以及每次接管之前，若发现事务日志：
+  - 主人在运行、且不是本进程：那是它正在进行的接管，原样不动。启动时只记日志；接管时本次不接管，状态写
+    `EGRESS_DNS_TAKEOVER_FAILED`，`error` 为 `the system DNS is taken over by another running client (PID <pid>)`，
+    `journal` 为 `none`（本实例什么也没持有），与其他失败一样 60 秒后再看。那个客户端退出时交还并删日志；被强杀时它的状态文件
+    5 秒后就不再新鲜，下一次再看时按日志回滚。
+  - 否则不论 `pending` 还是 `committed`，**先按日志回滚**，再按当前配置决定是否重新接管。
+  不发布状态文件的宿主（例如桌面应用）里运行的接管认不出来，所以一台机器上仍只应有一个开启 `peerEgressDnsTakeover` 的客户端。
 - 正常退出回滚；被强杀后的回滚在下次启动时完成，或由 `egress dns restore` 完成。
 - 应答者转发用的上游就是日志里的 `upstreams`，在日志提交时设置；系统 DNS 交还之后保留，手动把 DNS 指向监听地址的用法照样能转发。
 
@@ -349,7 +358,7 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
   没有在跑的客户端时写 `No running client for this config.`；没有日志时日志一行写 `journal: none (the system DNS is not taken over)`。
 - `egress dns restore [--force]`：按事务日志回滚，不需要客户端在运行。
   - 日志不存在：`No DNS takeover journal at <path>; there is nothing to restore.`，以 0 退出。
-  - 日志里记的 `pid` 仍在运行：`The client that took over the system DNS (PID <pid>) is still running, and gives it back itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another process.`，以 1 退出。
+  - 日志的主人在运行（「事务日志」一节的判定；只有进程号在运行不算）：`The client that took over the system DNS (PID <pid>) is still running, and gives it back itself when it stops. Stop it, or set peerEgressDnsTakeover to false and restart it. --force skips this check, for when that PID now belongs to another client.`，以 1 退出。
   - 某一步失败：`Giving the system DNS back failed at <step>. The journal is kept; fix what the step reports and run egress dns restore again.`，以 1 退出。
   - 成功：`System DNS given back (<platform>, taken over by PID <pid>); journal removed.`，以 0 退出。
   - `--json` 的 `data` 至少含 `journal`（路径）与 `restored`。

@@ -592,7 +592,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `EGRESS_FAKE_IP_POOL_INVALID` | 二期配置校验：`peerEgressFakeIpCidr` 不合法，或与 Peer Mesh 网段、本机接口地址重叠 |
 | `EGRESS_RULE_EGRESS_NO_DOMAIN` | 二期配置校验：域名规则指向的出口未声明 `domainTargetCapable` |
 | `EGRESS_DNS_TAKEOVER_REFUSED` | 二期系统 DNS 接管：开启前检查不通过，原因见 `reason` |
-| `EGRESS_DNS_TAKEOVER_FAILED` | 二期系统 DNS 接管：接管命令失败，已回滚 |
+| `EGRESS_DNS_TAKEOVER_FAILED` | 二期系统 DNS 接管：接管命令失败，已回滚；或事务日志属于另一个仍在运行的客户端（见 `peer-egress-dns.md` 第六节「事务日志」） |
 
 ## 状态查询
 

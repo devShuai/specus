@@ -24,8 +24,8 @@ import lombok.extern.slf4j.Slf4j;
  * before anything is touched, with everything giving back needs; the takeover is marked committed
  * only once every step succeeded; any failure runs the whole give-back, which is safe whatever part
  * of the takeover happened; and a journal found at start is given back before anything else, which
- * is how a killed process's takeover is undone. Giving back leaves alone what somebody else wrote
- * after us.
+ * is how a killed process's takeover is undone -- unless another client that is running owns it.
+ * Giving back leaves alone what somebody else wrote after us.
  *
  * <p>The decisions -- what to read, what refuses, the exact commands -- are the pure functions of
  * {@link PeerEgressDnsTakeoverParse}, pinned by the shared vector. What is here is the order they
@@ -58,6 +58,15 @@ public final class PeerEgressDnsTakeover {
 
         /** This machine's interfaces, for finding the tunnel-type ones. */
         List<PeerEgressDnsTakeoverParse.LocalInterface> interfaces() throws IOException;
+
+        /**
+         * Whether a client runs as {@code pid}: whether that process publishes fresh CLI state
+         * (protocol/spec/peer-egress-dns.md, section six, 事务日志). A journal such a client owns is
+         * its live takeover, not a leftover. A machine that cannot tell recognises no client.
+         */
+        default boolean clientRunning(long pid) {
+            return false;
+        }
     }
 
     /** A command that failed, with what it printed. */
@@ -359,14 +368,26 @@ public final class PeerEgressDnsTakeover {
     }
 
     /**
-     * Gives back a takeover a previous run left, pending or committed, before anything else is
-     * decided: a process that was killed never gave back, and this is where it happens. Whether the
-     * journal's process id is running does not matter here: after a crash and a reboot that id most
-     * likely belongs to another program, and leaving the journal alone would keep the system pointed
-     * at a responder nobody runs. Only one client per machine takes the DNS over; the liveness check
-     * belongs to {@code egress dns restore}, which a person runs.
+     * Whether a journal is another running client's live takeover: not this process's, and its process
+     * publishes fresh CLI state. A process id that merely runs is not enough: after a crash and a
+     * reboot it most likely belongs to another program, and leaving the journal for it would keep the
+     * system's DNS pointed at a responder nobody runs.
      */
-    public static void recoverLeftover(Machine machine, Path path) {
+    private static boolean ownedElsewhere(Machine machine, Journal journal, long ownPid) {
+        return journal.pid() != ownPid && machine.clientRunning(journal.pid());
+    }
+
+    /** The status error while another running client holds the takeover. */
+    static String takenElsewhere(long pid) {
+        return "the system DNS is taken over by another running client (PID " + pid + ")";
+    }
+
+    /**
+     * Gives back a takeover a previous run left, pending or committed, before anything else is
+     * decided: a process that was killed never gave back, and this is where it happens. Another
+     * running client's takeover -- its process publishes fresh CLI state -- is left as it is.
+     */
+    public static void recoverLeftover(Machine machine, Path path, long ownPid) {
         Journal journal;
         try {
             journal = readJournal(path);
@@ -375,6 +396,11 @@ public final class PeerEgressDnsTakeover {
             return;
         }
         if (journal == null) {
+            return;
+        }
+        if (ownedElsewhere(machine, journal, ownPid)) {
+            log.info("[peer-egress-consumer] DNS takeover journal belongs to the running client PID {}, left as it is",
+                    journal.pid());
             return;
         }
         String failure = revert(machine, path, journal);
@@ -388,10 +414,11 @@ public final class PeerEgressDnsTakeover {
 
     /**
      * {@code egress dns restore}: gives the journal back without a running client. No journal is
-     * nothing to do (0); a journal whose process is still running is refused unless forced (1), as
-     * the process id may since belong to another program; a step that fails keeps the journal (1).
+     * nothing to do (0); a journal whose client still runs -- {@code clientRunning}, by the fresh
+     * state it publishes, not merely its process id -- is refused unless forced (1); a step that
+     * fails keeps the journal (1).
      */
-    public static RestoreResult restore(Machine machine, Path path, boolean force, LongPredicate processAlive) {
+    public static RestoreResult restore(Machine machine, Path path, boolean force, LongPredicate clientRunning) {
         Journal journal;
         try {
             journal = readJournal(path);
@@ -402,11 +429,11 @@ public final class PeerEgressDnsTakeover {
         if (journal == null) {
             return new RestoreResult(0, "No DNS takeover journal at " + path + "; there is nothing to restore.", null);
         }
-        if (!force && processAlive.test(journal.pid())) {
+        if (!force && clientRunning.test(journal.pid())) {
             return new RestoreResult(1, "The client that took over the system DNS (PID " + journal.pid()
                     + ") is still running, and gives it back itself when it stops. Stop it, or set peerEgressDnsTakeover"
                     + " to false and restart it. --force skips this check, for when that PID now belongs to another"
-                    + " process.", journal);
+                    + " client.", journal);
         }
         String failure = revert(machine, path, journal);
         if (failure != null) {
@@ -447,7 +474,7 @@ public final class PeerEgressDnsTakeover {
 
     /** At start: a journal a previous run left is given back first. */
     public void recoverLeftover() {
-        recoverLeftover(machine, path);
+        recoverLeftover(machine, path, pid);
     }
 
     /**
@@ -559,13 +586,23 @@ public final class PeerEgressDnsTakeover {
 
     /** Reads the system, decides, and takes over. */
     private void attempt(Request request, long nowMs) {
-        // A journal still on disk is a give-back that failed, or one a killed process left. It is
-        // the only record of what the system had, so it is given back first and never written over.
+        // A journal still on disk is a give-back that failed, one a killed process left, or another
+        // running client's takeover. The first two are the only record of what the system had, so
+        // they are given back first and never written over; the third is left to its owner, who gives
+        // it back when it stops, and this run tries again after RETRY_MS.
         Journal leftover;
         try {
             leftover = readJournal(path);
         } catch (IOException unreadable) {
             fail(unreadable.getMessage(), JOURNAL_PENDING);
+            return;
+        }
+        if (leftover != null && ownedElsewhere(machine, leftover, pid)) {
+            String taken = takenElsewhere(leftover.pid());
+            if (!taken.equals(status.error())) {
+                log.warn("[peer-egress-consumer] system DNS not taken over: {}", taken);
+            }
+            fail(taken, JOURNAL_NONE);
             return;
         }
         if (leftover != null) {

@@ -14,7 +14,9 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -58,6 +60,54 @@ class EgressDnsCommandTests {
         Files.writeString(config, "{\n  // kept across edits\n  \"serverBaseUrl\": \"http://127.0.0.1:1\",\n"
                 + "  \"apiKey\": \"test\",\n  \"secret\": \"secret\"" + extra + "\n}\n");
         return config;
+    }
+
+    /**
+     * Writes a state file the way a running client does -- private, in the state directory the
+     * commands run here read -- for another configuration, so only the process id can match.
+     */
+    private Path publishState(String name, long pid, long updatedAtUnixMs, int schemaVersion) throws IOException {
+        Path root = CliState.ensureRoot(temporary.resolve("state"));
+        Path file = root.resolve(name);
+        Files.writeString(file, CliOutput.JSON.writeValueAsString(Map.of("schemaVersion", schemaVersion, "pid", pid,
+                "updatedAtUnixMs", updatedAtUnixMs, "configPath", root.resolve("another.jsonc").toString(),
+                "processRunning", true)));
+        if (CliState.posix()) {
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        }
+        CliState.protectNew(file, false);
+        return file;
+    }
+
+    /**
+     * A client runs as a process id when fresh state from that process is in the state directory: the
+     * status command's rule, for any configuration and runtime, matched on the id inside the file.
+     */
+    @Test
+    void aClientRunsWhileItPublishesFreshState() throws Exception {
+        Path root = temporary.resolve("state");
+        long self = ProcessHandle.current().pid();
+        assertThat(CliState.clientRunning(self, root)).as("no state directory").isFalse();
+        // Named for another process: the id inside is what counts.
+        publishState("go-0123-1.json", self, System.currentTimeMillis(), 1);
+        assertThat(CliState.clientRunning(self, root)).isTrue();
+        assertThat(CliState.clientRunning(self + 1, root)).isFalse();
+        assertThat(CliState.clientRunning(0, root)).isFalse();
+
+        publishState("go-0123-1.json", self, System.currentTimeMillis() - 6_000, 1);
+        assertThat(CliState.clientRunning(self, root)).as("stale").isFalse();
+        publishState("go-0123-1.json", self, System.currentTimeMillis() + 60_000, 1);
+        assertThat(CliState.clientRunning(self, root)).as("from later").isFalse();
+        publishState("go-0123-1.json", self, System.currentTimeMillis(), 2);
+        assertThat(CliState.clientRunning(self, root)).as("version 2").isFalse();
+        // No such process: an id Windows never hands out and far above any Unix pid_max.
+        publishState("dotnet-4567-1.json", Integer.MAX_VALUE, System.currentTimeMillis(), 1);
+        assertThat(CliState.clientRunning(Integer.MAX_VALUE, root)).as("exited").isFalse();
+        if (CliState.posix()) {
+            Path open = publishState("java-89ab-1.json", self, System.currentTimeMillis(), 1);
+            Files.setPosixFilePermissions(open, PosixFilePermissions.fromString("rw-r--r--"));
+            assertThat(CliState.clientRunning(self, root)).as("readable by others").isFalse();
+        }
     }
 
     /** A message as the CLI prints it: its lines joined by \n, then println's own line separator. */
@@ -137,6 +187,16 @@ class EgressDnsCommandTests {
         Run text = run("egress", "dns", "status", "--config", config.toString());
         assertThat(text.out()).contains("journal: committed (linux-resolved, taken over by PID 999999, upstreams 192.168.1.1)",
                 "run egress dns restore");
+
+        // A client publishing fresh state as that process id gives it back itself, whatever
+        // configuration it runs: restore is not suggested.
+        long self = ProcessHandle.current().pid();
+        Files.writeString(journal, "{\"version\":1,\"state\":\"committed\",\"platform\":\"linux-resolved\",\"pid\":" + self
+                + ",\"listen\":\"198.18.0.1\",\"tunnel\":\"specus0\",\"upstreams\":[\"192.168.1.1\"],\"startedAtUnixMs\":1}");
+        publishState("go-0123-1.json", self, System.currentTimeMillis(), 1);
+        Run elsewhere = run("egress", "dns", "status", "--config", config.toString());
+        assertThat(elsewhere.out()).contains("No running client for this config.", "taken over by PID " + self)
+                .doesNotContain("run egress dns restore");
     }
 
     @Test
@@ -153,11 +213,19 @@ class EgressDnsCommandTests {
         Files.createDirectories(journal.getParent());
         Files.writeString(journal, "{\"version\":1,\"state\":\"committed\",\"platform\":\"plan9\",\"pid\":" + pid
                 + ",\"listen\":\"198.18.0.1\",\"tunnel\":\"specus0\",\"upstreams\":[],\"startedAtUnixMs\":1}");
+        // A running process id is not a running client: without its state, restore goes on to give
+        // back, which the unknown platform stops before anything runs.
+        Run reused = run("egress", "dns", "restore");
+        assertThat(reused.exit()).isEqualTo(1);
+        assertThat(reused.err()).startsWith("Giving the system DNS back failed at the journal names platform plan9");
+        assertThat(journal).exists();
+
+        publishState("dotnet-0123-1.json", pid, System.currentTimeMillis(), 1);
         Run running = run("egress", "dns", "restore");
         assertThat(running.exit()).isEqualTo(1);
         assertThat(running.err()).isEqualTo(lines(List.of("The client that took over the system DNS (PID " + pid
                 + ") is still running, and gives it back itself when it stops. Stop it, or set peerEgressDnsTakeover to"
-                + " false and restart it. --force skips this check, for when that PID now belongs to another process.")));
+                + " false and restart it. --force skips this check, for when that PID now belongs to another client.")));
         assertThat(journal).exists();
     }
 

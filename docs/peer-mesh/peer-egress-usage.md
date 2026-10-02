@@ -292,7 +292,7 @@ specus-client egress dns disable --config ./client.jsonc
 | `EGRESS_FAKE_IP_POOL_INVALID` | `peerEgressFakeIpCidr` 不合法，或与组网网段、本机网段重叠。二期不启动，一期照常 |
 | `EGRESS_RULE_EGRESS_NO_DOMAIN` | 域名规则指向的出口在线，却没有声明支持域名 |
 | `EGRESS_DNS_TAKEOVER_REFUSED` | 开启前检查不通过，没有改系统 DNS，原因见 `reason` |
-| `EGRESS_DNS_TAKEOVER_FAILED` | 改系统 DNS 的命令失败，已经改回，失败命令的输出见 `error` |
+| `EGRESS_DNS_TAKEOVER_FAILED` | 改系统 DNS 的命令失败，已经改回，失败命令的输出见 `error`；或系统 DNS 正由本机另一个仍在运行的客户端接管，`error` 写明它的 PID，那个客户端退出后本客户端在一分钟内接管 |
 
 ### 系统 DNS 怎么被接管
 
@@ -331,10 +331,10 @@ specus-client egress dns restore
 - `egress dns status`：二期是否在运行、系统 DNS 是否已接管（不接管时给出原因）、转发的上游、事务日志状态、映射数与池使用率。读状态文件与事务日志，客户端没在运行也能用。
 - `egress dns restore`：按事务日志把系统 DNS 改回，客户端不需要在运行。客户端被强杀、断电之后用它恢复网络；下次正常启动客户端也会先按日志改回。
   - 没有事务日志时说明无需恢复，以 0 退出；改回成功以 0 退出。
-  - 日志里记录的客户端进程还在运行时拒绝并以 1 退出：先停止客户端，或把 `peerEgressDnsTakeover` 改为 `false` 后重启它。`--force` 跳过这一检查（进程号可能已被别的进程重用）。
+  - 日志里记录的客户端还在运行时拒绝并以 1 退出：先停止客户端，或把 `peerEgressDnsTakeover` 改为 `false` 后重启它。「还在运行」指它仍在往状态目录（`SPECUS_CLI_STATE_DIR`，默认 `~/.specus-cli`）发布状态；只是进程号在运行不算，断电重启后进程号常被别的程序占用。`--force` 跳过这一检查（那个进程号如今属于另一个客户端时用）。
   - 某一步失败以 1 退出并说明是哪一步，事务日志保留，修正后再运行一次。
 
-事务日志在 `~/.specus/egress-dns-journal.json`，与路由安装记录在同一目录。
+事务日志在 `~/.specus/egress-dns-journal.json`，与路由安装记录在同一目录。客户端启动时、以及每次接管之前，按同一个判定处理找到的日志：属于另一个仍在运行的客户端就不动它（自己也不接管），否则先按日志改回。桌面应用不发布状态，认不出来，所以一台机器上只应有一个客户端开启 `peerEgressDnsTakeover`。
 
 运行状态（`egress --config ... --json`）里 `consumer.dns` 一节给出同样的信息：`active` 是二期是否在运行，`takeover` 是系统 DNS 此刻是否指向应答者，`journal` 是 `none`、`pending` 或 `committed`，`queries` 是应答、转发与失败的累计数。拦截计数增加四个原因：
 

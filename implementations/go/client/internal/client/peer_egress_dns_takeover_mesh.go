@@ -9,6 +9,15 @@ import (
 // that already serialises the route installer: the takeover follows the pool's route, runs commands,
 // and must never be held up by, or hold up, the mesh's own lock.
 
+// SetEgressDNSClientCheck tells the DNS takeover how to recognise another client that is running:
+// running(pid) reports whether that process publishes fresh CLI state. A journal such a client owns
+// is its live takeover and is left alone; any other journal found is given back
+// (protocol/spec/peer-egress-dns.md, 六, 事务日志). Called before Run; without it every journal is
+// given back.
+func (client *Client) SetEgressDNSClientCheck(running func(pid int) bool) {
+	client.peerMesh.egressDNSClientRunning = running
+}
+
 // ensureEgressDNSTakeover builds the takeover on first use and gives back whatever a previous run
 // left in the journal. Called under egressPlanMu with no mesh lock held.
 func (mesh *peerMeshClient) ensureEgressDNSTakeover() *egressDNSTakeover {
@@ -39,6 +48,7 @@ func (mesh *peerMeshClient) ensureEgressDNSTakeover() *egressDNSTakeover {
 	if takeover.fingerprint == nil {
 		takeover.fingerprint = mesh.systemNetworkFingerprint
 	}
+	takeover.clientRunning = mesh.egressDNSClientRunning
 	takeover.recoverLeftover()
 	mesh.mu.Lock()
 	mesh.egressDNS = takeover
