@@ -741,7 +741,7 @@
                                         </Grid.ColumnDefinitions>
                                         <TextBox x:Name="EgressTestAddressBox"
                                                  Margin="0,0,8,6"
-                                                 ToolTip="要测试的 IPv4 地址"
+                                                 ToolTip="要测试的 IPv4 地址或域名；连通测试只接受 IPv4 地址"
                                                  AutomationProperties.Name="测试地址" />
                                         <Button x:Name="EgressPreviewButton"
                                                 Grid.Column="1"

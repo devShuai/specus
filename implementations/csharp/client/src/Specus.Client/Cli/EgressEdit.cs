@@ -9,7 +9,7 @@ namespace Specus.Client.Cli;
 
 /// <summary>
 /// The egress editing commands: list the rules, add, remove, move and switch them, turn takeover on
-/// and off, and preview what the rules do for one address.
+/// and off, and preview what the rules do for one address or name.
 /// </summary>
 /// <remarks>
 /// They edit the configuration file the way the local page does: the one top-level value they own is
@@ -420,19 +420,41 @@ internal static class EgressEdit
         return config;
     }
 
-    /// <summary>Why an address cannot be previewed, or null when it can.</summary>
+    /// <summary>The refusal for a name no domain rule could match (protocol/spec/peer-egress-dns.md, 预演一个域名).</summary>
+    internal const string NameProblem =
+        "ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, with punycode (xn--) for international names.";
+
+    /// <summary>The refusal for a connection test asked for with a name.</summary>
+    internal const string ConnectNeedsAddress =
+        "--connect needs an IPv4 address: a name would be resolved here, not by the egress.";
+
+    /// <summary>Why an address cannot be previewed, or null when it can: an IPv4 address, or a name a domain rule could match.</summary>
     internal static string? AddressProblem(string address)
     {
-        if (Ipv4Cidr.TryParseAddress(address, out _) && !address.Contains('/')) return null;
-        return LooksLikeDomain(address) && !address.Contains(':')
-            ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-            : "ADDRESS must be an IPv4 address.";
+        if (IsAddress(address)) return null;
+        if (!LooksLikeDomain(address) || address.Contains(':')) return "ADDRESS must be an IPv4 address.";
+        return PreviewName(address) is null ? NameProblem : null;
     }
+
+    /// <summary>Whether what was given to preview is an IPv4 address rather than a name.</summary>
+    internal static bool IsAddress(string address) => Ipv4Cidr.TryParseAddress(address, out _) && !address.Contains('/');
+
+    /// <summary>
+    /// The name as a domain rule compares it -- trailing dots gone, lower case -- or null when no
+    /// domain rule could match it. A rule's own check, less the wildcard: <c>*.example.com</c> is
+    /// how a rule is written, not a name anything looks up. Anything outside ASCII is refused before
+    /// lower-casing, as for a rule, so a name only punycode can spell is never folded into another.
+    /// </summary>
+    internal static string? PreviewName(string address) =>
+        !address.Contains('*') && PeerEgressNames.ValidMatch(address) ? PeerEgressNames.Normalize(address) : null;
 
     private static int Test(ClientCliOptions options, string path)
     {
         var address = options.Egress.Address.Trim();
         if (AddressProblem(address) is { } problem) throw Fail(options, problem);
+        // A connection to a name would test whatever this device resolves it to, which is not where a
+        // domain rule sends it: the egress resolves the name on its own network.
+        if (options.Egress.Connect > 0 && !IsAddress(address)) throw Fail(options, ConnectNeedsAddress);
         var loaded = Load(options, path);
         var lines = new List<string>();
         var data = Preview(path, loaded.Config, address, lines);
@@ -485,8 +507,18 @@ internal static class EgressEdit
         return probe;
     }
 
+    /// <summary>
+    /// What the configured rules decide for one IPv4 address or name, one an
+    /// <see cref="AddressProblem"/> check has let through. The command, the local page and the
+    /// desktop page all preview through here, so a name says the same in each of them.
+    /// </summary>
+    internal static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines) =>
+        IsAddress(address)
+            ? AddressPreview(path, config, address, lines)
+            : NamePreview(path, config, PreviewName(address) ?? throw new ArgumentException(NameProblem, nameof(address)), lines);
+
     /// <summary>What the configured rules decide for one IPv4 address, and what takeover being on would change.</summary>
-    internal static Dictionary<string, object?> Preview(string path, SpecusClientConfig config, string address, List<string> lines)
+    private static Dictionary<string, object?> AddressPreview(string path, SpecusClientConfig config, string address, List<string> lines)
     {
         var rules = config.PeerEgressRules;
         var match = PeerEgressRules.Match(rules, address, PeerEgressRules.DefaultMeshCidr, PhaseTwoPool(config));
@@ -494,7 +526,8 @@ internal static class EgressEdit
         var takeover = config.PeerEgressEnabled;
         var data = new Dictionary<string, object?>
         {
-            ["configPath"] = path, ["address"] = address, ["takeover"] = takeover, ["matchedRuleIndex"] = matched,
+            ["configPath"] = path, ["address"] = address, ["kind"] = "address", ["takeover"] = takeover,
+            ["matchedRuleIndex"] = matched,
         };
         lines.Add($"Preview for {address} from the configuration (no connection is made; --connect PORT tests one)");
         lines.Add(takeover ? "  takeover: on" : "  takeover: off");
@@ -534,6 +567,105 @@ internal static class EgressEdit
             lines.Add("  result: takeover is off, so it stays local (direct); with takeover on: " + would);
             data["result"] = "direct";
             data["resultWithTakeover"] = result;
+        }
+        return data;
+    }
+
+    /// <summary>
+    /// The pool a name's rule is selected over while phase two does not run. Any pool would do: it
+    /// decides whether an address rule overlaps it, never whether a domain rule is acceptable.
+    /// </summary>
+    private static readonly Ipv4Cidr SelectionPool =
+        Ipv4Cidr.TryParse(PeerEgressRules.DefaultFakeIpCidr, out var pool) ? pool : default;
+
+    /// <summary>
+    /// What the configuration decides for a name (protocol/spec/peer-egress-dns.md, 预演一个域名): the
+    /// domain rule that claims it, what the DNS responder would do with the query, and where the name
+    /// ends up, or why domain rules are not in force. Nothing is looked up.
+    /// </summary>
+    /// <remarks>
+    /// Phase two is judged the way config validate judges it: peerEgressDnsTakeover on and the pool
+    /// usable against the default mesh network, with the master switch counted separately. The rule
+    /// is selected as the responder selects it, also while domain rules are not in force, so the
+    /// preview can say what turning them on would do. Whether the egress announced
+    /// domainTargetCapable is known only once connected, so it takes no part.
+    /// </remarks>
+    private static Dictionary<string, object?> NamePreview(string path, SpecusClientConfig config, string name, List<string> lines)
+    {
+        var rules = config.PeerEgressRules;
+        var takeover = config.PeerEgressEnabled;
+        var dnsTakeover = config.PeerEgressDnsTakeover;
+        var phaseTwo = PeerEgressRules.PhaseTwo(true, dnsTakeover, config.PeerEgressFakeIpCidr, PeerEgressRules.DefaultMeshCidr);
+        var matched = PeerEgressRules.SelectDomainRule(rules, name, PeerEgressRules.DefaultMeshCidr,
+            phaseTwo.RunningPool ?? SelectionPool);
+        var data = new Dictionary<string, object?>
+        {
+            ["configPath"] = path, ["address"] = name, ["kind"] = "domain", ["takeover"] = takeover,
+            ["dnsTakeover"] = dnsTakeover, ["matchedRuleIndex"] = matched,
+        };
+        lines.Add($"Preview for {name} from the configuration (no connection is made)");
+        lines.Add($"  takeover: {(takeover ? "on" : "off")} | dns takeover: {(dnsTakeover ? "on" : "off")}");
+        var action = PeerEgressRules.ActionDirect;
+        long egress = 0;
+        if (matched < 0)
+        {
+            lines.Add("  rule: none");
+        }
+        else
+        {
+            var rule = rules[matched];
+            action = rule.Action.Trim();
+            var line = $"  rule: [{matched}] {rule.Match.Trim()} {action}";
+            data["ruleAction"] = action;
+            if (action == PeerEgressRules.ActionEgress)
+            {
+                egress = Id(rule.EgressClientId);
+                line += " " + egress;
+                data["egressClientId"] = egress;
+            }
+            lines.Add(line);
+        }
+        // A name claimed by an egress or block rule is answered from the pool; any other is passed on.
+        var claimed = action is PeerEgressRules.ActionEgress or PeerEgressRules.ActionBlock;
+        if (!phaseTwo.Active)
+        {
+            var why = dnsTakeover ? "peerEgressFakeIpCidr is not usable" : "peerEgressDnsTakeover is off";
+            lines.Add($"  dns: not taken over ({why}), so the name is resolved by the system's DNS");
+            data["dns"] = "local";
+        }
+        else if (claimed)
+        {
+            lines.Add(action == PeerEgressRules.ActionEgress
+                ? $"  dns: answered with a fake IP from {phaseTwo.Pool}; the egress resolves the name"
+                : $"  dns: answered with a fake IP from {phaseTwo.Pool}");
+            data["dns"] = "fake";
+        }
+        else
+        {
+            lines.Add("  dns: forwarded to the system's DNS; the address it returns is then decided by the IPv4 rules");
+            data["dns"] = "forward";
+        }
+        var would = action switch
+        {
+            PeerEgressRules.ActionEgress => $"through egress {egress}, which resolves the name itself",
+            PeerEgressRules.ActionBlock => "blocked",
+            _ => "resolved by the system's DNS; egress test <that address> previews where it goes",
+        };
+        // The first that holds, in this order: the master switch, then the DNS switch, then the pool.
+        var notInForce = !takeover ? "takeover is off"
+            : !dnsTakeover ? "dns takeover is off"
+            : !phaseTwo.Active ? "peerEgressFakeIpCidr is not usable"
+            : null;
+        if (!claimed || notInForce is null)
+        {
+            lines.Add("  result: " + would);
+            data["result"] = claimed ? action : PeerEgressRules.ActionDirect;
+        }
+        else
+        {
+            lines.Add($"  result: domain rules are not in force ({notInForce}); with them on: {would}");
+            data["result"] = PeerEgressRules.ActionDirect;
+            data["resultWithTakeover"] = action;
         }
         return data;
     }
@@ -621,8 +753,10 @@ internal static class EgressEdit
     {
         var address = UiValue(body, "address", "").Trim();
         if (AddressProblem(address) is { } problem) throw new LocalUi.Failure(422, problem);
-        // A port asks for a real connection as well; without one the answer is the preview alone.
+        // A port asks for a real connection as well; without one the answer is the preview alone. A
+        // name is previewed but never connected to, as with the command.
         var asked = body.ContainsKey("connect");
+        if (asked && !IsAddress(address)) throw new LocalUi.Failure(422, ConnectNeedsAddress);
         var port = UiValue(body, "connect", -1);
         if (asked && port is < 1 or > 65535) throw new LocalUi.Failure(422, "connect must be a TCP port between 1 and 65535");
         var loaded = UiLoad(path);
@@ -632,8 +766,13 @@ internal static class EgressEdit
         return data;
     }
 
+    /// <summary>
+    /// Whether what was given to preview is meant as a name: a leading wildcard, a letter anywhere, or a
+    /// character outside ASCII, so a name written in Unicode is told it needs punycode rather than that
+    /// it is not an address.
+    /// </summary>
     private static bool LooksLikeDomain(string value) =>
-        value.StartsWith('*') || value.Any(c => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z');
+        value.StartsWith('*') || value.Any(c => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or > '\x7f');
 
     /// <summary>
     /// The rule list written the same way in every runtime: one rule per line, fields in a fixed order,
