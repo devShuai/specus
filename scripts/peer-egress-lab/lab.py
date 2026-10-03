@@ -64,6 +64,20 @@ DIRECT_URL = f"http://{TARGET_DIRECT_IP}"
 
 CURL_OK, CURL_CONNECT_FAILED, CURL_PARTIAL, CURL_TIMEOUT, CURL_RECV_FAILED = 0, 7, 18, 28, 56
 
+# Phase two (protocol/spec/peer-egress-dns.md). The name exists only in the egress's /etc/hosts: the
+# consumer can reach it through the takeover or not at all. The consumer's original nameserver is an
+# address nothing answers on, so a name the rules do not claim fails rather than resolving locally.
+NAMED_HOST = "named.lab.test"
+DOMAIN_RULE = "*.lab.test"
+CONSUMER_NAMESERVER = "198.51.100.53"
+FAKE_IP_POOL = "198.18.0.0/15"
+UNMAPPED_FAKE_IP = "198.18.0.77"
+RESOLV_CONF_WRITTEN = (
+    "# Written by specus for peer egress DNS takeover. The original is kept in the journal\n"
+    "# and is put back when the client stops or when `egress dns restore` runs.\n"
+    "nameserver 198.18.0.1\n"
+)
+
 # Issue #50's performance thresholds for this lab. They were agreed before a baseline was taken and
 # are not to be moved towards whatever a run produces: a gate that follows the numbers gates nothing.
 GATE_REPEATS = 5
@@ -417,7 +431,7 @@ class Lab:
                                  lambda: self.http_alive(f"http://{SERVER_IP}:{ADMIN_PORT}/"), 60)
         return bool(ready)
 
-    def client_config(self, role, rules=None):
+    def client_config(self, role, rules=None, dns_takeover=False):
         config = {
             "serverBaseUrl": f"http://{SERVER_IP}:{ADMIN_PORT}",
             "apiKey": f"lab-{role}",
@@ -431,6 +445,8 @@ class Lab:
             config["peerEgressRules"] = rules
             # Rules are only saved until the master switch is on (#49).
             config["peerEgressEnabled"] = True
+        if dns_takeover:
+            config["peerEgressDnsTakeover"] = True
         path = self.work / f"{role}.jsonc"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path
@@ -1276,6 +1292,168 @@ class Lab:
                    not leftover and user_present, "\n".join(leftover) if leftover else "clean")
         self.sh(ns("con", "ip", "route", "del", USER_ROUTE), check=False)
 
+    # -- phase two: domain rules through the DNS takeover (#52) -----------------------------------
+
+    def private_etc(self):
+        """Gives the consumer its own /etc/resolv.conf and the egress its own /etc/hosts.
+
+        `ip netns exec NAME` bind-mounts every file in /etc/netns/NAME over its namesake in /etc. An
+        overlay on /etc in this lab's own mount namespace makes room for those directories without
+        writing to the host. /etc/resolv.conf is replaced by a plain file first: on most hosts it is a
+        symlink into systemd-resolved, which the takeover refuses to rewrite (resolv-conf-managed), and
+        the lab's /run tmpfs has hidden its target anyway. It is replaced by a rename over it, because
+        deleting a lower entry would need a whiteout device a user namespace cannot create."""
+        upper, workdir = Path("/run/lab-etc/upper"), Path("/run/lab-etc/work")
+        upper.mkdir(parents=True, exist_ok=True)
+        workdir.mkdir(parents=True, exist_ok=True)
+        self.sh(["mount", "-t", "overlay", "overlay", "-o",
+                 f"lowerdir=/etc,upperdir={upper},workdir={workdir}", "/etc"])
+        staged = Path("/etc/resolv.conf.lab")
+        staged.write_text(f"nameserver {CONSUMER_NAMESERVER}\n", encoding="utf-8")
+        os.replace(staged, "/etc/resolv.conf")
+        files = {"con": {"resolv.conf": f"nameserver {CONSUMER_NAMESERVER}\n"},
+                 "egr": {"hosts": f"127.0.0.1 localhost\n{TARGET_IP} {NAMED_HOST}\n"}}
+        for name, contents in files.items():
+            directory = Path("/etc/netns") / name
+            directory.mkdir(parents=True, exist_ok=True)
+            for file, content in contents.items():
+                (directory / file).write_text(content, encoding="utf-8")
+        self.note("phase two: an overlay on /etc in the lab's mount namespace holds /etc/netns/con/resolv.conf "
+                  f"(nameserver {CONSUMER_NAMESERVER}) and /etc/netns/egr/hosts ({NAMED_HOST} -> {TARGET_IP}); "
+                  "nothing is written to the host")
+
+    @staticmethod
+    def consumer_resolv_conf():
+        return Path("/etc/netns/con/resolv.conf").read_text(encoding="utf-8")
+
+    def dns_journal(self):
+        path = self.work / "home-consumer" / ".specus" / "egress-dns-journal.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def taken_over(self):
+        journal = self.dns_journal()
+        return (self.consumer_resolv_conf() == RESOLV_CONF_WRITTEN and journal is not None
+                and journal.get("state") == "committed")
+
+    def named_request(self, timeout=8):
+        """The name, fetched from the consumer: through the responder, the pool and the egress."""
+        body = self.work / f"curl-{next(self.counter)}.out"
+        completed = self.sh(ns("con", "curl", "-sS", "--max-time", str(timeout), "-o", str(body),
+                               "-w", "%{remote_ip}", f"http://{NAMED_HOST}/whoami"), check=False, timeout=timeout + 30)
+        src = None
+        if completed.returncode == CURL_OK:
+            try:
+                src = json.loads(body.read_text())["src"]
+            except (json.JSONDecodeError, KeyError, OSError):
+                src = None
+        body.unlink(missing_ok=True)
+        return {"code": completed.returncode, "remote": completed.stdout.strip(), "src": src,
+                "stderr": completed.stderr.strip()}
+
+    def dns_section(self):
+        status = self.client_status("consumer")
+        for instance in (status or {}).get("data", {}).get("instances", []):
+            consumer = ((instance.get("egress") or {}).get("consumer") or {})
+            if consumer.get("dns") is not None:
+                return consumer
+        return None
+
+    def phase_two(self):
+        self.say("phase two: domain rules through the DNS takeover")
+        self.private_etc()
+        # Restarted so that both see the files above: a process sees the mounts of the namespace it
+        # was started in.
+        for role in ("consumer", "egress"):
+            proc = self.procs.get(role)
+            if proc is not None and proc.alive:
+                proc.stop()
+        egress = self.start_client("egress", self.work / "egress.jsonc")
+        if not egress.wait_log(r"policy applied enabled=true", 60):
+            raise LabAbort("phase two: the restarted egress never applied the policy:\n" + egress.log_since()[-4000:])
+        rules = [{"match": DOMAIN_RULE, "action": "egress", "egressClientId": self.egress_id}]
+        original = self.consumer_resolv_conf()
+        consumer = self.start_client("consumer", self.client_config("consumer", rules, dns_takeover=True))
+        taken, elapsed = self.wait_for("the DNS takeover", self.taken_over, 90)
+        self.snapshots["phase two: consumer resolv.conf while taken over"] = self.consumer_resolv_conf()
+        self.check("phase two: the consumer's resolv.conf points at the responder and the journal is committed",
+                   bool(taken), f"after {elapsed:.1f}s" if taken else
+                   "not taken over:\n" + self.consumer_resolv_conf() + "\n--- consumer\n" + consumer.log_since()[-3000:])
+        if not taken:
+            return
+        mark = self.target_mark()
+        got, _ = self.wait_for("the name through the egress",
+                               lambda: (lambda r: r if r["src"] == EGRESS_IP else None)(self.named_request()), 60, 1.0)
+        got = got or self.named_request()
+        in_pool = False
+        try:
+            in_pool = ipaddress.ip_address(got["remote"]) in ipaddress.ip_network(FAKE_IP_POOL)
+        except ValueError:
+            pass
+        self.check("phase two: a name under a domain rule resolves to a fake IP and leaves from the egress, "
+                   "which resolved it itself",
+                   got["src"] == EGRESS_IP and in_pool,
+                   f"curl exit {got['code']}, connected to {got['remote'] or '-'}, target saw src={got['src']}"
+                   + (f" ({got['stderr'][:120]})" if got["stderr"] else ""))
+        self.leak_check("phase two: nothing reached the target from the consumer's own address", mark)
+
+        started = time.time()
+        body = self.work / f"curl-{next(self.counter)}.out"
+        refused = self.sh(ns("con", "curl", "-sS", "--max-time", "5", "-o", str(body), f"http://{UNMAPPED_FAKE_IP}/"),
+                          check=False, timeout=40)
+        body.unlink(missing_ok=True)
+        took = time.time() - started
+        self.check("phase two: a fake IP nothing maps is refused at once, not sent anywhere",
+                   refused.returncode == CURL_CONNECT_FAILED and took < 3,
+                   f"curl exit {refused.returncode} after {took:.1f}s ({refused.stderr.strip()[:120]})")
+        section, _ = self.wait_for("the consumer status to count the unmapped address",
+                                   lambda: (lambda c: c if c and (c.get("blocked") or {}).get("fake-ip-unmapped") else None)(
+                                       self.dns_section()), 30, 1.0)
+        dns = (section or {}).get("dns") or {}
+        if section:
+            self.snapshots["phase two: consumer.dns"] = json.dumps(dns, indent=2)
+        self.check("phase two: status says phase two runs, the system DNS is taken over, and counts the unmapped address",
+                   dns.get("active") is True and dns.get("takeover") is True and dns.get("journal") == "committed"
+                   and (section or {}).get("blocked", {}).get("fake-ip-unmapped", 0) >= 1,
+                   json.dumps({"dns": dns, "blocked": (section or {}).get("blocked")}))
+
+        # Killed: the takeover outlives the process, and the journal is what gives it back.
+        killed_pid = (self.dns_journal() or {}).get("pid")
+        consumer.kill()
+        time.sleep(1)
+        self.check("phase two: kill -9 leaves the takeover and its journal behind",
+                   self.consumer_resolv_conf() == RESOLV_CONF_WRITTEN and self.dns_journal() is not None,
+                   self.consumer_resolv_conf())
+        restore = self.sh(ns("con", *self.client_env("consumer"), self.client_binary("consumer"),
+                             "egress", "dns", "restore"), check=False)
+        self.check("phase two: egress dns restore gives the original resolv.conf back and removes the journal",
+                   restore.returncode == 0 and self.consumer_resolv_conf() == original and self.dns_journal() is None,
+                   f"exit {restore.returncode}: {(restore.stdout + restore.stderr).strip()[:300]}")
+
+        # Killed again, then started: the leftover is rolled back before the new takeover.
+        consumer = self.start_client("consumer", self.work / "consumer.jsonc")
+        taken, _ = self.wait_for("the DNS takeover after a restart", self.taken_over, 90)
+        killed_pid = (self.dns_journal() or {}).get("pid")
+        consumer.kill()
+        time.sleep(1)
+        consumer = self.start_client("consumer", self.work / "consumer.jsonc")
+        retaken, _ = self.wait_for("the takeover by the next process",
+                                   lambda: self.taken_over() and (self.dns_journal() or {}).get("pid") != killed_pid, 90)
+        got, _ = self.wait_for("the name again",
+                               lambda: (lambda r: r if r["src"] == EGRESS_IP else None)(self.named_request()), 60, 1.0)
+        self.check("phase two: a start after kill -9 rolls the leftover back and takes the DNS over afresh",
+                   bool(taken) and bool(retaken) and bool(got),
+                   f"journal pid {killed_pid} -> {(self.dns_journal() or {}).get('pid')}; "
+                   f"name {'through the egress' if got else 'not reached'}")
+
+        consumer.stop()
+        self.snapshots["phase two: consumer resolv.conf after normal exit"] = self.consumer_resolv_conf()
+        self.check("phase two: a normal exit gives the system DNS back",
+                   self.consumer_resolv_conf() == original and self.dns_journal() is None,
+                   self.consumer_resolv_conf())
+
     # -- report -----------------------------------------------------------------------------------
 
     def report(self, aborted=None):
@@ -1341,6 +1519,8 @@ class Lab:
                 self.fault_server_restart()
                 self.fault_rule_block()
                 self.fault_kill_9()
+            if not self.args.skip_dns:
+                self.phase_two()
         except LabAbort as error:
             aborted = str(error)
             self.say("aborted: " + aborted)
@@ -1379,6 +1559,7 @@ def main():
     parser.add_argument("--loss-percent", type=float, default=2.0)
     parser.add_argument("--skip-lossy", action="store_true")
     parser.add_argument("--skip-faults", action="store_true")
+    parser.add_argument("--skip-dns", action="store_true", help="skip phase two (domain rules, DNS takeover)")
     parser.add_argument("--switch-off-repetitions", type=int, choices=range(1, 21), default=1,
                         help="repeat established-flow revocation (1-20 rounds)")
     parser.add_argument("--performance-gate", action="store_true",

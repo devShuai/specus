@@ -100,7 +100,9 @@ jobs:
           ln -s "$RUNNER_TEMP/specus-client" "$RUNNER_TEMP/clients/Go"
           if [ "$USES_JAVA" = true ]; then
             jar="$GITHUB_WORKSPACE/implementations/java/client/target/specus-client-exec.jar"
-            printf '#!/bin/sh\nexec %s -jar %s "$@"\n' "$(command -v java)" "$jar" > "$RUNNER_TEMP/clients/Java"
+            # The lab gives each role a HOME of its own, where the route record and the DNS takeover
+            # journal live; the JVM reads its home from the password database instead, so it is told.
+            printf '#!/bin/sh\nexec %s -Duser.home="$HOME" -jar %s "$@"\n' "$(command -v java)" "$jar" > "$RUNNER_TEMP/clients/Java"
             chmod +x "$RUNNER_TEMP/clients/Java"
           fi
           if [ "$USES_DOTNET" = true ]; then
