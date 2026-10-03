@@ -332,3 +332,36 @@ func TestUIRejectsOversizedAndReadOnlyConfigWithoutWriting(t *testing.T) {
 		t.Fatal("read-only config changed")
 	}
 }
+
+// The page's preview is egress test's: a name is previewed the same way, and an unusable name and a
+// connection test to a name are refused with the command's words.
+func TestUIEgressPreviewTakesAName(t *testing.T) {
+	u, s, path := uiFixture(t)
+	if err := os.WriteFile(path, []byte(egressNameTestConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	token := uiSession(t, u, s)
+	status, data := uiRequest(t, s, "POST", "/api/egress/test", token, map[string]any{"address": "Example.COM."})
+	if status != 200 || data["kind"] != "domain" || data["address"] != "example.com" || data["dns"] != "fake" ||
+		data["result"] != "direct" || data["resultWithTakeover"] != "egress" || data["matchedRuleIndex"] != float64(0) ||
+		data["egressClientId"] != float64(42) || data["dnsTakeover"] != true || data["schemaVersion"] != float64(1) {
+		t.Fatalf("a name: %d %v", status, data)
+	}
+	if status, data = uiRequest(t, s, "POST", "/api/egress/test", token, map[string]any{"address": "203.0.113.9"}); status != 200 || data["kind"] != "address" {
+		t.Fatalf("an address: %d %v", status, data)
+	}
+	refusals := []struct {
+		body map[string]any
+		want string
+	}{
+		{map[string]any{"address": "bad_name.example"}, egressNameUnusableText},
+		{map[string]any{"address": "*.example.com"}, egressNameUnusableText},
+		{map[string]any{"address": "example.com", "connect": 443}, egressConnectNameRefusal},
+		{map[string]any{"address": "10.0.0.0/8"}, egressNotAnAddressText},
+	}
+	for _, r := range refusals {
+		if status, data := uiRequest(t, s, "POST", "/api/egress/test", token, r.body); status != 422 || data["error"] != r.want {
+			t.Errorf("%v: %d %v", r.body, status, data)
+		}
+	}
+}

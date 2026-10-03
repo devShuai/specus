@@ -60,6 +60,49 @@ func PreviewEgressDestination(rules []EgressRule, destination string) EgressPrev
 	}
 }
 
+// EgressNamePreview is what the configured domain rules decide for one name, judged without a
+// connection.
+type EgressNamePreview struct {
+	// PhaseTwo reports whether phase two would run with the master switch on, judged the way
+	// config validate judges it: peerEgressDnsTakeover on and the pool usable against the default
+	// mesh network. The master switch itself is the caller's to state.
+	PhaseTwo bool
+	// Pool is the fake-IP pool as configured, or the default.
+	Pool             string
+	Action           string
+	MatchedRuleIndex int
+	EgressClientID   int64
+}
+
+// PreviewEgressName picks the domain rule that claims a name, with the selection the DNS responder
+// uses. The rule is picked even while phase two would not run, so the caller can say what turning it
+// on would change. Whether the egress can resolve names is only known once connected and is not
+// judged here.
+func PreviewEgressName(config Config, name string) EgressNamePreview {
+	pool := effectiveEgressFakeIPCIDR(config.PeerEgressFakeIPCIDR)
+	// Any pool has domain rules judged as names, and which one it is means nothing to them, so the
+	// configured pool is given whether it is usable or not: an unusable pool hides no rule.
+	index := selectEgressDomainRule(config.PeerEgressRules, name, egressDefaultMeshCIDR, pool)
+	preview := EgressNamePreview{PhaseTwo: offlineEgressFakeIPPool(config) != "", Pool: pool, MatchedRuleIndex: index}
+	if index >= 0 {
+		preview.Action = config.PeerEgressRules[index].Action
+		preview.EgressClientID = config.PeerEgressRules[index].EgressClientID
+	}
+	return preview
+}
+
+// EgressPreviewName reads a destination as a name a domain rule could match: normalized the way
+// rules compare names (no trailing dots, lower case), and false when it is not written the way a
+// domain rule's match must be (ASCII labels of a-z, 0-9 and '-', IDN as punycode). A wildcard
+// belongs to a rule, not to a name.
+func EgressPreviewName(destination string) (string, bool) {
+	value := strings.TrimSpace(destination)
+	if strings.Contains(value, "*") || !validEgressDomainMatch(value) {
+		return "", false
+	}
+	return normalizeEgressName(value), true
+}
+
 // EgressCodeExplanation is one line a person can act on for a rule's code, in the words the Java
 // and .NET clients use too. Empty for a code it has nothing to add to.
 func EgressCodeExplanation(code string) string {
@@ -88,8 +131,8 @@ func EgressCodeExplanation(code string) string {
 	return ""
 }
 
-// ValidEgressAddress reports whether a destination is one the rule engine can decide: a plain IPv4
-// address. A domain name is told apart so the answer can say why.
+// ValidEgressAddress reports whether a destination is one the address rules can decide: a plain IPv4
+// address. Something that reads as a name is told apart, for EgressPreviewName to judge.
 func ValidEgressAddress(destination string) (ok bool, domain bool) {
 	value := strings.TrimSpace(destination)
 	if _, parsed := parseEgressRuleMatch(value); parsed && !strings.Contains(value, "/") {
