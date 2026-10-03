@@ -195,17 +195,32 @@ $("rule-form").addEventListener("submit", event => { event.preventDefault(); egr
 }); });
 // A real connection from this device, told apart from the preview: it says whether the address
 // answers, not which path carried it.
+// The preview's refusals, in the words of the CLI (protocol/spec/peer-egress-dns.md, 预演一个域名).
+function previewError(message) {
+  if (/needs an IPv4 address/.test(message)) return "连通测试只接受 IPv4 地址：名字会在本机解析，不代表出口那边的解析结果。";
+  if (/not a name a domain rule can match/.test(message)) return "这个名字不是域名规则能匹配的写法：标签只能用 a-z、0-9 和 -，国际化域名写成 punycode（xn--）。";
+  return /IPv4/.test(message) ? "请填写一个 IPv4 地址或域名。" : message;
+}
 $("preview-connect").addEventListener("click", () => egressAction(async () => {
   const port = Number($("preview-port").value.trim());
   if (!Number.isInteger(port) || port < 1 || port > 65535) { $("preview-result").textContent = "请填写 1–65535 之间的端口。"; return; }
   let data; try { data = await api("/api/egress/test", {address: $("preview-address").value.trim(), connect: port}); }
-  catch (error) { $("preview-result").textContent = /domain name/.test(error.message) ? "这是域名；规则目前只匹配 IPv4 地址，请填写它解析到的地址。" : /IPv4/.test(error.message) ? "请填写一个 IPv4 地址。" : error.message; return; }
+  catch (error) { $("preview-result").textContent = previewError(error.message); return; }
   const probe = data.connect || {}, target = data.address + ":" + port;
   $("preview-result").textContent = probe.ok === true ? "连通测试：" + target + " 在 " + count(probe.millis) + " ms 内连上。这只说明能连上，不说明走了哪条路径；去向请用预演查看。" : "连通测试：" + target + " 连接失败（" + (probe.error || "未知原因") + "）。";
 }));
 $("preview-form").addEventListener("submit", event => { event.preventDefault(); egressAction(async () => {
   let data; try { data = await api("/api/egress/test", {address: $("preview-address").value.trim()}); }
-  catch (error) { $("preview-result").textContent = /domain name/.test(error.message) ? "这是域名；规则目前只匹配 IPv4 地址，请填写它解析到的地址。" : /IPv4/.test(error.message) ? "请填写一个 IPv4 地址。" : error.message; return; }
+  catch (error) { $("preview-result").textContent = previewError(error.message); return; }
+  if (data.kind === "domain") {
+    // A name is never resolved here: the preview says what the responder would answer and where the
+    // name then goes, or why domain rules are not in force.
+    const rule = data.matchedRuleIndex >= 0 ? "命中域名规则 #" + data.matchedRuleIndex : "未命中任何域名规则";
+    const dns = {fake: "DNS 查询由本机应答者回一个 fake-IP，名字交给出口解析", forward: "DNS 查询转发给系统原来的 DNS，返回的地址再按 IPv4 规则判断"}[data.dns] || "DNS 未接管，名字由系统 DNS 解析";
+    const outcome = value => value === "egress" ? "经出口设备 " + count(data.egressClientId) + "（由它解析名字）" : value === "block" ? "阻断" : "由系统 DNS 解析，之后的去向请用预演查看解析出的地址";
+    $("preview-result").textContent = data.address + "：" + rule + "；" + dns + "；" + (data.resultWithTakeover ? "域名规则当前不生效，开启后" + outcome(data.resultWithTakeover) : outcome(data.result)) + "。仅按配置判断，未查询 DNS，也未建立连接。";
+    return;
+  }
   const rule = data.matchedRuleIndex >= 0 ? "命中规则 #" + data.matchedRuleIndex : "未命中任何规则";
   const outcome = value => value === "egress" ? "经出口设备 " + count(data.egressClientId) : value === "block" ? "阻断" : "本地直连";
   $("preview-result").textContent = data.address + "：" + rule + "，" + (data.resultWithTakeover ? "系统接管未开启，当前本地直连；开启后" + outcome(data.resultWithTakeover) : outcome(data.result)) + "。仅按配置判断，未建立连接。";
