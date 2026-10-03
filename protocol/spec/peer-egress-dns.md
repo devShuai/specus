@@ -370,7 +370,8 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 - 名字按第二节的规则判断：末尾的 `.` 去掉、转小写；写成 Unicode、含下划线等第二节不接受的写法，报
   `ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, with punycode (xn--) for international names.`，以 2 退出。
-  既不是域名也不是 IPv4 地址的，仍报 `ADDRESS must be an IPv4 address.`。
+  既不是域名也不是 IPv4 地址的，仍报 `ADDRESS must be an IPv4 address.`。`*.example.com` 这样的写法是规则的模式，
+  不是一个名字，按不可用的名字拒绝。
 - 二期是否运行按离线校验的口径判断（第二节「离线校验」：`peerEgressDnsTakeover` 打开、池按默认 mesh 网段可用），
   规则按 `select_domain_rule` 选（与应答时同一套）。出口是否声明 `domainTargetCapable` 要连上才知道，预演不判断。
 - 输出五行：
