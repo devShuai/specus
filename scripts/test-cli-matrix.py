@@ -242,8 +242,20 @@ class Matrix:
         assert out.endswith("  takeover: on\n  rule: [0] 203.0.113.0/24 egress 42\n  result: through egress 42\n"), out
         out, _ = self.run_text(["egress", "test", "8.8.8.8"] + cfg)
         assert out.endswith("  rule: none\n  result: not covered by any rule; stays local (direct)\n"), out
-        _, err = self.run_text(["egress", "test", "example.com"] + cfg, 2)
-        assert "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to." in err, err
+        # A name is previewed too; with DNS takeover off it is simply resolved by the system's DNS.
+        out, _ = self.run_text(["egress", "test", "example.com"] + cfg)
+        assert out.rstrip("\n").split("\n") == [
+            "Preview for example.com from the configuration (no connection is made)",
+            "  takeover: on | dns takeover: off",
+            "  rule: none",
+            "  dns: not taken over (peerEgressDnsTakeover is off), so the name is resolved by the system's DNS",
+            "  result: resolved by the system's DNS; egress test <that address> previews where it goes"], out
+        _, err = self.run_text(["egress", "test", "bad_name.example"] + cfg, 2)
+        assert ("ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, with punycode (xn--) "
+                "for international names.") in err, err
+        _, err = self.run_text(["egress", "test", "example.com", "--connect", "443"] + cfg, 2)
+        assert "--connect needs an IPv4 address: a name would be resolved here, not by the egress." in err, err
+        assert self.run(["egress", "test", "203.0.113.9"] + cfg)["data"]["kind"] == "address"
 
         written(["egress", "rule", "disable", "--index", "0"],
                 ["takeover: on", "  [0] off 203.0.113.0/24 egress 42", "  [1] off 198.51.100.0/24 block"])
@@ -317,6 +329,23 @@ class Matrix:
         _, err = self.run_text(["egress", "rule", "add", "--match", "198.18.0.0/16", "--action", "direct"] + cfg, 2)
         assert ("Rule not added: EGRESS_RULE_FAKE_IP_OVERLAP (overlaps the fake-IP pool (peerEgressFakeIpCidr), "
                 "whose addresses only domain rules hand out)") in err, err
+        out, _ = self.run_text(["egress", "test", "Example.COM."] + cfg)
+        assert out.rstrip("\n").split("\n") == [
+            "Preview for example.com from the configuration (no connection is made)",
+            "  takeover: off | dns takeover: on",
+            "  rule: [0] example.com egress 42",
+            "  dns: answered with a fake IP from 198.18.0.0/15; the egress resolves the name",
+            "  result: domain rules are not in force (takeover is off); with them on: through egress 42, "
+            "which resolves the name itself"], out
+        data = self.run(["egress", "test", "example.com"] + cfg)["data"]
+        assert (data["kind"], data["address"], data["dns"], data["result"], data["resultWithTakeover"],
+                data["matchedRuleIndex"], data["egressClientId"]) == (
+            "domain", "example.com", "fake", "direct", "egress", 0, 42), data
+        out, _ = self.run_text(["egress", "test", "www.example.com"] + cfg)
+        assert out.rstrip("\n").split("\n")[2:] == [
+            "  rule: none",
+            "  dns: forwarded to the system's DNS; the address it returns is then decided by the IPv4 rules",
+            "  result: resolved by the system's DNS; egress test <that address> previews where it goes"], out
         listing = self.run(["egress", "rules"] + cfg)["data"]
         # Out of force only because peerEgressEnabled is off: as a domain rule it is valid now.
         assert [rule.get("code") for rule in listing["rules"]] == ["EGRESS_CONSUMER_DISABLED"], listing
