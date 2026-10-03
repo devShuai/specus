@@ -3,6 +3,7 @@ package com.theshuai.specusclient.cli;
 import com.theshuai.common.peeregress.Ipv4Cidr;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressDns;
+import com.theshuai.common.peeregress.PeerEgressNames;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import com.theshuai.specusclient.bean.ClientStartupConfig;
@@ -17,7 +18,7 @@ import java.util.Map;
 
 /**
  * The egress editing commands: list the rules, add, remove, move and switch them, turn takeover on
- * and off, and preview what the rules do for one address.
+ * and off, and preview what the rules do for one address or name.
  *
  * <p>They edit the configuration file the way the local page does: the one top-level value they
  * own is replaced in place and everything else in the file is kept, the write is atomic and refused
@@ -343,18 +344,33 @@ public final class EgressEdit {
         return CliOutput.result(options.json(), options.command(), 0, data, String.join("\n", message));
     }
 
-    /** Why an address cannot be previewed, or null when it can. */
+    static final String NOT_AN_ADDRESS = "ADDRESS must be an IPv4 address.";
+    static final String UNUSABLE_NAME = "ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -,"
+            + " with punycode (xn--) for international names.";
+    static final String CONNECT_NEEDS_ADDRESS = "--connect needs an IPv4 address: a name would be resolved here, not by the egress.";
+
+    /** Whether ADDRESS is an IPv4 address rather than a name. */
+    static boolean isAddress(String address) {
+        return Ipv4Cidr.parseAddress(address) != null && !address.contains("/");
+    }
+
+    /**
+     * Why an address cannot be previewed, or null when it can: an IPv4 address, or a name a domain
+     * rule could match exactly, judged as a rule's match is (trailing dots and case ignored, IDN as
+     * punycode). A wildcard is a rule's pattern rather than a name, so it is refused as one.
+     */
     static String addressProblem(String address) {
-        if (Ipv4Cidr.parseAddress(address) != null && !address.contains("/")) return null;
-        return looksLikeDomain(address) && !address.contains(":")
-                ? "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-                : "ADDRESS must be an IPv4 address.";
+        if (isAddress(address)) return null;
+        if (!PeerEgressNames.namesDomain(address) || address.contains(":")) return NOT_AN_ADDRESS;
+        return PeerEgressNames.validMatch(address) && !address.startsWith("*") ? null : UNUSABLE_NAME;
     }
 
     private static int test(ClientCli.Options options) {
         String address = trim(options.egress().address());
         String problem = addressProblem(address);
         if (problem != null) return fail(options, problem);
+        // This device's DNS answering for a name says nothing of what the egress would resolve it to.
+        if (!isAddress(address) && options.egress().connect() > 0) return fail(options, CONNECT_NEEDS_ADDRESS);
         Loaded loaded = load(options);
         var lines = new ArrayList<String>();
         var data = preview(options.config(), loaded.config(), address, lines);
@@ -401,8 +417,16 @@ public final class EgressEdit {
         return probe;
     }
 
+    /**
+     * What the configuration does with an ADDRESS addressProblem accepted, an IPv4 address or a name.
+     * The command and the local page preview through here, so they say the same.
+     */
+    static LinkedHashMap<String, Object> preview(Path path, ClientStartupConfig config, String address, List<String> lines) {
+        return isAddress(address) ? addressPreview(path, config, address, lines) : namePreview(path, config, address, lines);
+    }
+
     /** What the configured rules decide for one IPv4 address, and what takeover being on would change. */
-    private static LinkedHashMap<String, Object> preview(Path path, ClientStartupConfig config, String address, List<String> lines) {
+    private static LinkedHashMap<String, Object> addressPreview(Path path, ClientStartupConfig config, String address, List<String> lines) {
         var rules = rules(config);
         var match = PeerEgressRules.match(rules, address, PeerEgressRules.DEFAULT_MESH_CIDR, pool(config));
         int matched = match.matched() ? match.matchedRuleIndex() : -1;
@@ -410,6 +434,7 @@ public final class EgressEdit {
         var data = new LinkedHashMap<String, Object>();
         data.put("configPath", path.toString());
         data.put("address", address);
+        data.put("kind", "address");
         data.put("takeover", takeover);
         data.put("matchedRuleIndex", matched);
         lines.add("Preview for " + address + " from the configuration (no connection is made; --connect PORT tests one)");
@@ -441,6 +466,87 @@ public final class EgressEdit {
         } else {
             lines.add("  result: takeover is off, so it stays local (direct); with takeover on: " + would);
             data.put("result", "direct");
+            data.put("resultWithTakeover", result);
+        }
+        return data;
+    }
+
+    /**
+     * What the configuration does with one name: the domain rule the responder would select, what it
+     * would do with the query, and where the name ends up. Nothing is resolved. Phase two is judged
+     * offline, as config validate judges it: peerEgressDnsTakeover on and the pool usable against
+     * the default mesh, the master switch taken as on. Whether the egress announced
+     * domainTargetCapable is only known once connected, so it is not judged here.
+     */
+    private static LinkedHashMap<String, Object> namePreview(Path path, ClientStartupConfig config, String address, List<String> lines) {
+        String name = PeerEgressNames.normalize(address);
+        var rules = rules(config);
+        boolean takeover = config.isPeerEgressEnabled();
+        boolean dnsTakeover = config.isPeerEgressDnsTakeover();
+        String running = pool(config);
+        // Selected as though phase two ran, so that what turning it on would do can be said; with it
+        // running this is the pool it runs with, and only domain rules take part either way.
+        Integer selected = PeerEgressDns.selectDomainRule(rules, name, PeerEgressRules.DEFAULT_MESH_CIDR,
+                PeerEgressDns.effectivePool(config.getPeerEgressFakeIpCidr()));
+        int matched = selected == null ? -1 : selected;
+        var data = new LinkedHashMap<String, Object>();
+        data.put("configPath", path.toString());
+        data.put("address", name);
+        data.put("kind", "domain");
+        data.put("takeover", takeover);
+        data.put("dnsTakeover", dnsTakeover);
+        data.put("matchedRuleIndex", matched);
+        lines.add("Preview for " + name + " from the configuration (no connection is made)");
+        lines.add("  takeover: " + (takeover ? "on" : "off") + " | dns takeover: " + (dnsTakeover ? "on" : "off"));
+        String action = PeerEgressRule.ACTION_DIRECT;
+        long egress = 0;
+        if (matched < 0) {
+            lines.add("  rule: none");
+        } else {
+            PeerEgressRule rule = rules.get(matched);
+            action = trim(rule.getAction());
+            var line = new StringBuilder("  rule: [").append(matched).append("] ")
+                    .append(trim(rule.getMatch())).append(' ').append(action);
+            data.put("ruleAction", action);
+            if (action.equals(PeerEgressRule.ACTION_EGRESS)) {
+                egress = id(rule.getEgressClientId());
+                line.append(' ').append(egress);
+                data.put("egressClientId", egress);
+            }
+            lines.add(line.toString());
+        }
+        // A name under an egress or block rule gets a fake IP; anything else is handed on untouched.
+        boolean claimed = action.equals(PeerEgressRule.ACTION_EGRESS) || action.equals(PeerEgressRule.ACTION_BLOCK);
+        if (running == null) {
+            lines.add("  dns: not taken over (" + (dnsTakeover ? "peerEgressFakeIpCidr is not usable" : "peerEgressDnsTakeover is off")
+                    + "), so the name is resolved by the system's DNS");
+            data.put("dns", "local");
+        } else if (claimed) {
+            lines.add("  dns: answered with a fake IP from " + running
+                    + (action.equals(PeerEgressRule.ACTION_EGRESS) ? "; the egress resolves the name" : ""));
+            data.put("dns", "fake");
+        } else {
+            lines.add("  dns: forwarded to the system's DNS; the address it returns is then decided by the IPv4 rules");
+            data.put("dns", "forward");
+        }
+        String result = claimed ? action : PeerEgressRule.ACTION_DIRECT;
+        String would = switch (result) {
+            case PeerEgressRule.ACTION_EGRESS -> "through egress " + egress + ", which resolves the name itself";
+            case PeerEgressRule.ACTION_BLOCK -> "blocked";
+            default -> "resolved by the system's DNS; egress test <that address> previews where it goes";
+        };
+        // Of the reasons that hold, the first in the order the spec gives them.
+        String reason = !claimed ? null
+                : !takeover ? "takeover is off"
+                : !dnsTakeover ? "dns takeover is off"
+                : running == null ? "peerEgressFakeIpCidr is not usable"
+                : null;
+        if (reason == null) {
+            lines.add("  result: " + would);
+            data.put("result", result);
+        } else {
+            lines.add("  result: domain rules are not in force (" + reason + "); with them on: " + would);
+            data.put("result", PeerEgressRule.ACTION_DIRECT);
             data.put("resultWithTakeover", result);
         }
         return data;
@@ -519,20 +625,12 @@ public final class EgressEdit {
         if (connect != null && (port < 1 || port > 65535)) {
             throw new LocalUi.Failure(422, "connect must be a TCP port between 1 and 65535");
         }
+        if (connect != null && !isAddress(address)) throw new LocalUi.Failure(422, CONNECT_NEEDS_ADDRESS);
         Loaded loaded = uiLoad(path);
         var data = preview(path, loaded.config(), address, new ArrayList<>());
         if (connect != null) data.put("connect", connectProbe(address, port, new ArrayList<>()));
         data.put("schemaVersion", 1);
         return data;
-    }
-
-    private static boolean looksLikeDomain(String value) {
-        if (value.startsWith("*")) return true;
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
-        }
-        return false;
     }
 
     /**

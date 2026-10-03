@@ -145,11 +145,12 @@ specus-client egress test 203.0.113.5 --config client.jsonc
 - `egress rule add` 会先按上表校验，会被拒绝的规则不写入（`Rule not added: EGRESS_RULE_DOMAIN_UNSUPPORTED (...)`，退出码 2）。`--at` 指定插入位置，`--disabled` 以停用状态加入。
 - `egress rule remove|enable|disable --index N` 与 `egress rule move --index N --to M` 按 `egress rules` 显示的序号操作。
 - `egress enable` 每次都先说明接管意味着什么（需要创建虚拟网卡与安装路由的权限、只接管命中规则的目标、出口不可用时阻断而不改走本机），不加 `--yes` 时不做任何修改、退出码 2。`peerMeshDevice` 为 `noop` 时另有一行提醒。`egress disable` 直接关闭。
-- `egress test ADDRESS` 只根据配置预演该 IPv4 地址会命中哪条规则、结果是经哪个出口、阻断还是本地直连，**不建立任何连接**；开关关闭时同时给出"开启后会怎样"。加 `--connect PORT` 才会做一次 5 秒内的 TCP 连接测试，它只说明地址可达，不说明走的是哪条路径。域名会被明确拒绝，请先解析成地址。
+- `egress test ADDRESS` 只根据配置预演该 IPv4 地址会命中哪条规则、结果是经哪个出口、阻断还是本地直连，**不建立任何连接**；开关关闭时同时给出"开启后会怎样"。加 `--connect PORT` 才会做一次 5 秒内的 TCP 连接测试，它只说明地址可达，不说明走的是哪条路径。
+- `egress test NAME` 预演一个域名（二期，见第五节）：命中哪条域名规则、DNS 查询会被回 fake-IP 还是转发给系统原来的 DNS、最后经哪个出口或阻断；DNS 接管没开时说明名字由系统 DNS 解析、开启后会怎样。预演不查询 DNS；`--connect` 只接受 IPv4 地址，因为名字在本机解析的结果不代表出口那边。
 
 编辑只替换 `peerEgressRules` 或 `peerEgressEnabled` 这一个值，文件里其他内容与注释原样保留，换行风格（LF/CRLF）跟随原文件；写入是原子的，文件在读取后被别处改过则拒绝写入。`peerEgressRules` 列表内部的注释在编辑后不保留，因为整个列表会按每行一条规则重写。所有子命令都支持 `--json`。
 
-本地管理页（`specus-client ui`）的「出口规则」页提供同样的编辑：列表中逐条启用/停用、上移/下移、删除，表单添加规则，开关开启前弹出同样的影响说明，另可预演地址去向。页面与命令走同一段逻辑，写出的文件相同。
+本地管理页（`specus-client ui`）的「出口规则」页提供同样的编辑：列表中逐条启用/停用、上移/下移、删除，表单添加规则，开关开启前弹出同样的影响说明，另可预演地址或域名的去向。页面与命令走同一段逻辑，写出的文件相同。
 
 ### 用 Windows 桌面端编辑规则
 

@@ -61,7 +61,7 @@ Go / .NET 使用 `specus-client` 可执行文件；Java 使用 `java -jar specus
 | 出口分流 | `egress --config PATH` | 本机出口分流状态：哪些规则在生效、哪些路由装上了、哪些被拒及原因、出口设备是否在线、本机是否正作为出口。只读，不连接服务端 |
 | 编辑出口规则 | `egress rules\|rule add\|rule remove\|rule move\|rule enable\|rule disable --config PATH` | 列出、增删、排序、停用或恢复 `peerEgressRules`；只改配置文件，运行中的客户端重启后应用。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#用命令编辑规则) |
 | 出口接管开关 | `egress enable --yes\|disable --config PATH` | 设置 `peerEgressEnabled`；开启前先说明影响，缺 `--yes` 时不修改 |
-| 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 地址的去向，不建连；`--connect` 才做一次 TCP 可达性测试 |
+| 出口预演 | `egress test ADDRESS --config PATH [--connect PORT]` | 按配置预演某个 IPv4 地址或域名的去向，不建连、不查询 DNS；域名给出命中的域名规则与 DNS 处理方式；`--connect` 只接受 IPv4 地址，做一次 TCP 可达性测试 |
 | DNS 接管开关 | `egress dns enable --yes\|disable --config PATH` | 设置 `peerEgressDnsTakeover`（二期域名规则）；每次开启先说明它会改系统 DNS，缺 `--yes` 时不修改。见 [出口分流使用说明](peer-mesh/peer-egress-usage.md#五二期域名规则与系统-dns-接管) |
 | DNS 接管状态 | `egress dns status --config PATH` | 二期是否运行、系统 DNS 是否已接管及原因、转发的上游、事务日志、映射数与池使用率；客户端没在运行也能用 |
 | 恢复系统 DNS | `egress dns restore [--force]` | 按事务日志把系统 DNS 改回，客户端被强杀后用；记录的客户端仍在运行（仍在发布状态，只看进程号不算）时拒绝，`--force` 跳过这一检查 |
