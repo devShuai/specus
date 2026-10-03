@@ -298,9 +298,10 @@ public partial class MainWindow
     {
         var address = EgressTestAddressBox.Text.Trim();
         if (EgressEdit.AddressProblem(address) is not { } problem) return address;
-        EgressTestResultText.Text = problem.Contains("domain name", StringComparison.Ordinal)
-            ? "这是域名；规则目前只匹配 IPv4 地址，请填写它解析到的地址。"
-            : "请填写一个 IPv4 地址。";
+        // The local page's words for the same refusals.
+        EgressTestResultText.Text = problem == EgressEdit.NameProblem
+            ? "这个名字不是域名规则能匹配的写法：标签只能用 a-z、0-9 和 -，国际化域名写成 punycode（xn--）。"
+            : "请填写一个 IPv4 地址或域名。";
         return null;
     }
 
@@ -308,6 +309,11 @@ public partial class MainWindow
     {
         if (EgressTestAddress() is not { } address) return;
         var data = EgressEdit.Preview(string.Empty, EgressConfig(), address, []);
+        if (data["kind"] is "domain")
+        {
+            EgressTestResultText.Text = EgressNamePreviewText(data);
+            return;
+        }
         var matched = data["matchedRuleIndex"] is int index ? index : -1;
         var egress = data.TryGetValue("egressClientId", out var id) && id is long value ? value : 0L;
         string Outcome(object? result) => (result as string) switch
@@ -323,9 +329,50 @@ public partial class MainWindow
         EgressTestResultText.Text = address + "：" + rule + "，" + result + "。仅按已保存的规则判断，未建立连接。";
     }
 
+    /// <summary>
+    /// A name's preview from the same judgment as egress test, in the local page's words: the domain
+    /// rule that claims it, what the DNS responder would do with the query, and where the name ends
+    /// up. Where domain rules are not in force it also says why, which the five lines say too.
+    /// </summary>
+    private string EgressNamePreviewText(IReadOnlyDictionary<string, object?> data)
+    {
+        var name = data["address"] as string ?? string.Empty;
+        var matched = data["matchedRuleIndex"] is int index ? index : -1;
+        var egress = data.TryGetValue("egressClientId", out var id) && id is long value ? value : 0L;
+        var takeover = data["takeover"] is true;
+        var dnsTakeover = data["dnsTakeover"] is true;
+        string Outcome(object? result) => (result as string) switch
+        {
+            "egress" => "经出口设备 " + EgressDeviceLabel(egress) + "（由它解析名字）",
+            "block" => "阻断",
+            _ => "由系统 DNS 解析，之后的去向请用预演查看解析出的地址",
+        };
+        var rule = matched >= 0 ? "命中域名规则 #" + matched : "未命中任何域名规则";
+        var dns = (data["dns"] as string) switch
+        {
+            "fake" => data.GetValueOrDefault("ruleAction") is PeerEgressRules.ActionEgress
+                ? "DNS 查询由本机应答者回一个 fake-IP，名字交给出口解析"
+                : "DNS 查询由本机应答者回一个 fake-IP",
+            "forward" => "DNS 查询转发给系统原来的 DNS，返回的地址再按 IPv4 规则判断",
+            _ => "DNS 未接管（" + (dnsTakeover ? "fake-IP 池不可用" : "DNS 接管未开启") + "），名字由系统 DNS 解析",
+        };
+        // The reasons in the order egress test gives them: the master switch, the DNS switch, the pool.
+        var result = data.TryGetValue("resultWithTakeover", out var withTakeover)
+            ? "域名规则当前不生效（" + (!takeover ? "系统接管未开启" : !dnsTakeover ? "DNS 接管未开启" : "fake-IP 池不可用")
+              + "），开启后" + Outcome(withTakeover)
+            : Outcome(data["result"]);
+        return name + "：" + rule + "；" + dns + "；" + result + "。仅按已保存的规则判断，未查询 DNS，也未建立连接。";
+    }
+
     private async void EgressConnectButton_Click(object sender, RoutedEventArgs e)
     {
         if (EgressTestAddress() is not { } address) return;
+        if (!EgressEdit.IsAddress(address))
+        {
+            // Connecting to a name would test what this device resolves it to, not where the egress would go.
+            EgressTestResultText.Text = "连通测试只接受 IPv4 地址：名字会在本机解析，不代表出口那边的解析结果。";
+            return;
+        }
         if (!int.TryParse(EgressTestPortBox.Text.Trim(), out var port) || port is < 1 or > 65535)
         {
             EgressTestResultText.Text = "请填写 1–65535 之间的端口。";
