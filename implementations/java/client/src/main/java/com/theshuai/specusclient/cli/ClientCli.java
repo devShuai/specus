@@ -57,8 +57,9 @@ public final class ClientCli {
             The egress rules/rule/enable/disable commands edit the configuration file and never a
             running client, which applies the change after a restart. Saving rules and taking over
             traffic are separate: rules take nothing over until egress enable. egress test previews
-            what the rules decide for an IPv4 address; only --connect PORT makes a connection, and
-            that shows reachability, not the path taken.
+            what the rules decide for an IPv4 address or a domain name, which it never resolves; only
+            --connect PORT makes a connection, to an address, and that shows reachability, not the
+            path taken.
 
             egress dns enable|disable sets peerEgressDnsTakeover, which lets domain rules take effect
             by pointing the system DNS at this client while it runs. egress dns status reports
