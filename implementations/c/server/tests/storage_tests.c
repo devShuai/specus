@@ -392,9 +392,168 @@ static int test_peer_egress_known_codes(void)
     return failures;
 }
 
+static int create_lifecycle_session(const char *path,
+                                    const st_storage_client_credential *credential,
+                                    const st_storage_client_identity *identity,
+                                    const char *token_hash,
+                                    st_storage_client_session *out)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->tenant_id, sizeof(out->tenant_id), "%s", identity->tenant_id);
+    out->credential_id = credential->id;
+    out->identity_id = identity->id;
+    out->client_id = identity->client_id;
+    snprintf(out->client_name, sizeof(out->client_name), "%s", identity->client_name);
+    snprintf(out->token_hash, sizeof(out->token_hash), "%s", token_hash);
+    snprintf(out->status, sizeof(out->status), "%s", "HTTP_AUTHENTICATED");
+    snprintf(out->machine_fingerprint, sizeof(out->machine_fingerprint), "%s", identity->machine_fingerprint);
+    snprintf(out->os_user, sizeof(out->os_user), "%s", identity->os_user);
+    snprintf(out->http_login_at, sizeof(out->http_login_at), "%s", "2026-06-25T00:00:00Z");
+    snprintf(out->expires_at, sizeof(out->expires_at), "%s", "2026-06-25T08:00:00Z");
+    return st_storage_create_client_session(path, out, out);
+}
+
+/*
+ * The queries the control login and the shutdown path rely on: a later HTTP login of the same
+ * machine user supersedes a session, the NETTY_ONLINE ids of a credential feed the stale-row
+ * cleanup, and the open-record sweep ends only rows that are still open.
+ */
+static int test_client_session_lifecycle_queries(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-session-lifecycle-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "storage init failed\n");
+        return 1;
+    }
+    int failures = 0;
+    st_storage_client_credential credential;
+    st_storage_client_identity machine_one;
+    st_storage_client_identity machine_two;
+    st_storage_client_session older;
+    st_storage_client_session newer;
+    st_storage_client_session other_machine;
+    if (st_storage_upsert_client_credential(path, 0, "default", "owner", "ck_lifecycle",
+                                            "0000000000000000000000000000000000000000000000000000000000000000",
+                                            1, 3, &credential) != 0
+        || st_storage_find_or_create_client_identity(path, &credential, "machine-1", "tester", "host",
+                                                     &machine_one) != 0
+        || st_storage_find_or_create_client_identity(path, &credential, "machine-2", "tester", "host",
+                                                     &machine_two) != 0
+        || create_lifecycle_session(path, &credential, &machine_one,
+                                    "1111111111111111111111111111111111111111111111111111111111111111", &older) != 0
+        || create_lifecycle_session(path, &credential, &machine_one,
+                                    "2222222222222222222222222222222222222222222222222222222222222222", &newer) != 0
+        || create_lifecycle_session(path, &credential, &machine_two,
+                                    "3333333333333333333333333333333333333333333333333333333333333333",
+                                    &other_machine) != 0) {
+        fprintf(stderr, "lifecycle fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+
+    int superseded = -1;
+    if (st_storage_client_session_superseded(path, credential.id, "machine-1", "tester", older.id, &superseded) != 0
+        || superseded != 1) {
+        fprintf(stderr, "a session followed by a later login of the same machine user must be superseded\n");
+        failures++;
+    }
+    if (st_storage_client_session_superseded(path, credential.id, "machine-1", "tester", newer.id, &superseded) != 0
+        || superseded != 0) {
+        fprintf(stderr, "the newest session of a machine user must not be superseded\n");
+        failures++;
+    }
+    /* other_machine was created after newer, but for a different machine user. */
+    if (st_storage_client_session_superseded(path, credential.id, "machine-2", "tester",
+                                             other_machine.id, &superseded) != 0
+        || superseded != 0) {
+        fprintf(stderr, "another machine's login must not supersede a session\n");
+        failures++;
+    }
+
+    long long ids[4];
+    size_t id_count = 99U;
+    if (st_storage_list_online_session_ids_by_credential(path, credential.id, ids, 4U, &id_count) != 0
+        || id_count != 0U) {
+        fprintf(stderr, "no session is online yet, got %zu\n", id_count);
+        failures++;
+    }
+    if (st_storage_mark_client_session_online(path, other_machine.id, "c2", "127.0.0.1:2", "2026-06-25T00:01:00Z") != 0
+        || st_storage_mark_client_session_online(path, older.id, "c1", "127.0.0.1:1", "2026-06-25T00:01:00Z") != 0
+        || st_storage_list_online_session_ids_by_credential(path, credential.id, ids, 4U, &id_count) != 0
+        || id_count != 2U || ids[0] != older.id || ids[1] != other_machine.id) {
+        fprintf(stderr, "online session ids mismatch: count=%zu\n", id_count);
+        failures++;
+    }
+    if (st_storage_list_online_session_ids_by_credential(path, credential.id, ids, 1U, &id_count) != 0
+        || id_count != 1U || ids[0] != older.id) {
+        fprintf(stderr, "online session ids must respect the caller's capacity\n");
+        failures++;
+    }
+
+    long long open_id = 0;
+    long long stamped_open_id = 0;
+    long long closed_id = 0;
+    if (st_storage_record_connection_detail_with_tenant_and_id(path, "default", machine_one.client_id,
+                                                               machine_one.client_name, NULL, "127.0.0.1:1", 1,
+                                                               NULL, NULL, "2026-06-25T00:01:00Z", NULL,
+                                                               &open_id) != 0
+        || st_storage_record_connection_detail_with_tenant_and_id(path, "default", machine_one.client_id,
+                                                                  machine_one.client_name, NULL, "127.0.0.1:1", 1,
+                                                                  NULL, "IDLE_TIMEOUT", "2026-06-25T00:01:00Z",
+                                                                  NULL, &stamped_open_id) != 0
+        || st_storage_record_connection_detail_with_tenant_and_id(path, "default", machine_one.client_id,
+                                                                  machine_one.client_name, NULL, "127.0.0.1:1", 1,
+                                                                  NULL, "CLIENT_CLOSED", "2026-06-25T00:01:00Z",
+                                                                  "2026-06-25T00:02:00Z", &closed_id) != 0) {
+        fprintf(stderr, "connection record fixture failed\n");
+        unlink(path);
+        return failures + 1;
+    }
+    int closed = -1;
+    if (st_storage_close_open_connections(path, "SERVER_SHUTDOWN", "2026-06-25T00:03:00Z", &closed) != 0
+        || closed != 2) {
+        fprintf(stderr, "open-record sweep closed %d row(s), expected 2\n", closed);
+        failures++;
+    }
+    st_storage_connection connections[4];
+    size_t connection_count = 0U;
+    long long total_count = 0;
+    if (st_storage_list_connections(path, machine_one.client_id, -1, NULL, NULL, 0, 10,
+                                    connections, 4U, &connection_count, &total_count) != 0
+        || connection_count != 3U) {
+        fprintf(stderr, "connection list after sweep mismatch: %zu\n", connection_count);
+        failures++;
+    } else {
+        for (size_t i = 0; i < connection_count; ++i) {
+            const st_storage_connection *row = &connections[i];
+            const char *expected_reason = row->id == open_id ? "SERVER_SHUTDOWN"
+                : row->id == stamped_open_id ? "IDLE_TIMEOUT" : "CLIENT_CLOSED";
+            const char *expected_end = row->id == closed_id ? "2026-06-25T00:02:00Z" : "2026-06-25T00:03:00Z";
+            if (strcmp(row->disconnect_reason, expected_reason) != 0
+                || strcmp(row->disconnected_at, expected_end) != 0) {
+                fprintf(stderr, "record %lld swept to %s/%s, expected %s/%s\n", row->id,
+                        row->disconnect_reason, row->disconnected_at, expected_reason, expected_end);
+                failures++;
+            }
+        }
+    }
+    if (st_storage_close_open_connections(path, "SERVER_SHUTDOWN", "2026-06-25T00:04:00Z", &closed) != 0
+        || closed != 0) {
+        fprintf(stderr, "a second sweep must find nothing open, closed %d\n", closed);
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
+    if (test_client_session_lifecycle_queries() != 0) {
         return 1;
     }
     if (test_http_route_auth_migration() != 0) {

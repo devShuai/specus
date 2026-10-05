@@ -686,6 +686,22 @@ int st_storage_count_online_sessions_by_credential(const char *path,
                                                    long long credential_id,
                                                    long long exclude_session_id,
                                                    int *count);
+/*
+ * Reports whether a later HTTP login issued another session to the same credential + machine +
+ * OS user. Such a session is retired: its token must not open a control channel again.
+ */
+int st_storage_client_session_superseded(const char *path,
+                                         long long credential_id,
+                                         const char *machine_fingerprint,
+                                         const char *os_user,
+                                         long long session_id,
+                                         int *superseded);
+/* Lists up to max_ids NETTY_ONLINE session ids of a credential, oldest first. */
+int st_storage_list_online_session_ids_by_credential(const char *path,
+                                                     long long credential_id,
+                                                     long long *ids,
+                                                     size_t max_ids,
+                                                     size_t *id_count);
 int st_storage_mark_client_session_online(const char *path,
                                           long long id,
                                           const char *channel_id,
@@ -833,6 +849,15 @@ int st_storage_mark_connection_disconnected(const char *path,
                                             long long id,
                                             const char *disconnect_reason,
                                             const char *disconnected_at);
+/*
+ * Ends every connection record that is still open, keeping a reason already stamped on it. Used at
+ * startup (SERVER_RESTARTED) for rows a killed process left behind and after the graceful shutdown
+ * drain (SERVER_SHUTDOWN) for channels that did not finish in time. closed_count may be NULL.
+ */
+int st_storage_close_open_connections(const char *path,
+                                      const char *disconnect_reason,
+                                      const char *disconnected_at,
+                                      int *closed_count);
 int st_storage_list_connections(const char *path,
                                 long long client_id,
                                 int success_filter,

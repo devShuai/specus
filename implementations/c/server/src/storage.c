@@ -2933,6 +2933,61 @@ int st_storage_count_online_sessions_by_credential(const char *path,
         count);
 }
 
+int st_storage_client_session_superseded(const char *path,
+                                         long long credential_id,
+                                         const char *machine_fingerprint,
+                                         const char *os_user,
+                                         long long session_id,
+                                         int *superseded)
+{
+    /* Session ids are AUTOINCREMENT, so a larger id for the same machine user is a later HTTP login. */
+    int newer = 0;
+    int rc = count_online_client_sessions(path,
+        "SELECT COUNT(*) FROM specus_client_session "
+        "WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ? AND id > ?",
+        credential_id,
+        machine_fingerprint == NULL ? "" : machine_fingerprint,
+        os_user == NULL ? "" : os_user,
+        session_id,
+        &newer);
+    *superseded = rc == 0 && newer > 0;
+    return rc;
+}
+
+int st_storage_list_online_session_ids_by_credential(const char *path,
+                                                     long long credential_id,
+                                                     long long *ids,
+                                                     size_t max_ids,
+                                                     size_t *id_count)
+{
+    *id_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT id FROM specus_client_session WHERE credential_id = ? AND status = 'NETTY_ONLINE' "
+        "ORDER BY id",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, credential_id);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (*id_count < max_ids) {
+                ids[(*id_count)++] = sqlite3_column_int64(stmt, 0);
+            }
+        }
+        rc = rc == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
 int st_storage_mark_client_session_online(const char *path,
                                           long long id,
                                           const char *channel_id,
@@ -3957,6 +4012,42 @@ int st_storage_mark_connection_disconnected(const char *path,
         }
         sqlite3_bind_int64(stmt, 3, id);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+int st_storage_close_open_connections(const char *path,
+                                      const char *disconnect_reason,
+                                      const char *disconnected_at,
+                                      int *closed_count)
+{
+    if (closed_count != NULL) {
+        *closed_count = 0;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    /* A reason already stamped on an open row is kept, as Java and Go do; only the end time is missing. */
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE connection_record SET disconnected_at = ?, "
+        "disconnect_reason = COALESCE(NULLIF(disconnect_reason, ''), ?) "
+        "WHERE disconnected_at IS NULL OR disconnected_at = ''",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, disconnected_at == NULL ? "" : disconnected_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, disconnect_reason == NULL ? "" : disconnect_reason, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        if (rc == 0 && closed_count != NULL) {
+            *closed_count = sqlite3_changes(db);
+        }
     } else {
         rc = -1;
     }
