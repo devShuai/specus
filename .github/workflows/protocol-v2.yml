@@ -177,6 +177,10 @@ jobs:
           (cd implementations/go/client && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-client-go" ./cmd/specus-client)
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+      - name: Go client SQLite runtime configuration E2E
+        run: |
+          SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Set up .NET 10 for the .NET client
         uses: actions/setup-dotnet@v4
         with:
@@ -187,6 +191,11 @@ jobs:
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+      - name: .NET client SQLite runtime configuration E2E
+        run: |
+          dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
+          SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh
