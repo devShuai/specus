@@ -301,6 +301,7 @@ Linux 侧前缀与地址作为 argv 条目传给 `ip`，从来没有 shell 看�
 | `enabled` | 出口设备总开关，默认 `false` |
 | `allowedConsumerClientIds` | 允许使用该出口的设备 |
 | `destinationRules[]` | `cidr` + `protocols[]` + `portRanges[][]`。**默认空 = 全拒绝**，不存在「未配置即放行」 |
+| `domainRules[]` | `match` + `protocols[]` + `portRanges[][]`，按名字授权，只对带名字的流（二期 `name-bind`）起作用，见下文「按域名授权」。默认空 |
 | `scope` | `PUBLIC` 或 `LAN`。公网访问与对端局域网访问分开授权，互不隐含 |
 | `limits` | `maxConcurrentFlows`、`maxFlowsPerConsumer`、`idleTimeoutSeconds` 等 |
 
@@ -309,6 +310,21 @@ Linux 侧前缀与地址作为 argv 条目传给 `ip`，从来没有 shell 看�
 **服务端保存策略时校验目的规则**，与出口读取时的规则一致，不合格的整个请求以 400 拒绝、不做部分保存：`cidr` 去掉首尾空白后必须是出口能解析的 IPv4 地址或网段（点分十进制无前导零、前缀 0–32、主机位为零；单个地址即 `/32`，按原样保存）；`protocols` 去空白、转小写、按出现顺序去重后只能是 `tcp` 或 `udp`；`portRanges` 每项必须是 `[起, 止]` 两个整数、`0 ≤ 起 ≤ 止 ≤ 65535`，每条规则最多 32 段；最多 64 条规则，存储后的 JSON 不超过 4096 字节。空的 `protocols` 或 `portRanges` 仍然允许（等于全拒绝），缺省的列表按空列表保存。此前各服务端把这些输入原样保存，出口永远不会匹配它们。固定向量：`protocol/test-vectors/peer-egress-management-v1.json`。
 
 管理接口的错误状态码：请求体无法解析、字段不合法（包括开关请求缺少 `enabled`、部署端未启用 Peer Mesh 时开启）为 400，非租户 ADMIN 修改为 403，出口设备或策略不存在为 404。
+
+### 按域名授权
+
+目的规则授权的是地址。消费端用 `name-bind` 交给出口的名字，由出口自己解析，解析出的地址运维事先很难知道（CDN 会换），于是想放行一个站点的策略只能放行 `0.0.0.0/0`。`domainRules` 授权的是名字：一条带名字的流，除了包含其地址的目的规则，覆盖这个名字的域名规则也参与判定，用那条规则的协议与端口。
+
+- `match` 的写法与消费端的域名规则相同（[peer-egress-dns.md](peer-egress-dns.md#域名规则的写法与校验)）：`example.com` 只覆盖这个名字，`*.example.com` 覆盖它的任意子域、不含它本身；名字比较前去掉末尾的 `.` 并转小写。
+- 只有**带名字的流**看域名规则：名字是这条流按 `name-bind` 建立时绑定的那个。只按地址到达的流，域名规则一概不授权，哪怕它的地址恰好是某个被授权名字的解析结果——那样等于把名字授权变成了地址授权。
+- 解析出的地址照常先过**强制拒绝清单与 `scope`**，域名规则不能越过它们。名字解析到回环、云元数据、mesh 网段或（`PUBLIC` 下的）私有网段，仍在这两步被拒，DNS 重绑定的防线不变。
+- 目的、协议、端口三步看的是「包含地址的目的规则」与「覆盖名字的域名规则」的并集，错误码不变：两类规则都不命中为 `EGRESS_DEST_DENIED`，命中的规则都不允许该协议为 `EGRESS_PROTOCOL_DENIED`，允许该协议的都不允许该端口为 `EGRESS_PORT_DENIED`。域名规则只会多放行，不会收窄目的规则已经放行的流。
+
+服务端保存策略时校验 `domainRules`，规则不合格的整个请求以 400 拒绝：`match` 去掉首尾空白后必须是上述写法，按去掉末尾 `.`、转小写后的形式保存；看起来是地址或网段的写法（应写进 `destinationRules`）、单标签名字、单独的 `*` 与 `*.com` 这类只有一个标签的后缀都拒绝；`protocols` 与 `portRanges` 的规则与目的规则相同；最多 64 条，存储后的 JSON 不超过 4096 字节（与目的规则分别计算）。缺省按空列表保存。
+
+服务端在 `egress-config` 里随目的规则一起下发 `domainRules`，没有时为空数组。出口读这个字段：缺失或不是数组即没有域名规则；条目不是对象、或 `match` 不是合法写法的，跳过这一条，其余照常——读不懂的规则不能授权任何东西。旧出口不认识这个字段，照旧只看目的规则，结果只会更严。
+
+固定向量：`protocol/test-vectors/peer-egress-domain-policy-v1.json`，`management` 为服务端的保存与拒绝，`authorize` 为出口对带名字的流的判定。
 
 ### 强制拒绝清单
 
@@ -333,6 +349,8 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 ```
 
 `scope` 分类：`LAN` 为 RFC 1918 私有地址与 RFC 6598 共享地址空间；其余可路由地址为 `PUBLIC`。
+
+二期带名字的流，目的、协议、端口三步同时看覆盖其名字的 `domainRules`，见「按域名授权」；其余各步只看地址。
 
 授权撤销、出口关闭或设备停用时，**立即拒绝新流并清理受影响的已有流**，不等待空闲超时。
 
@@ -409,6 +427,9 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
   "allowedConsumerClientIds": [1, 5],
   "destinationRules": [
     {"cidr": "203.0.113.0/24", "protocols": ["tcp"], "portRanges": [[80, 80], [443, 443]]}
+  ],
+  "domainRules": [
+    {"match": "*.example.com", "protocols": ["tcp"], "portRanges": [[443, 443]]}
   ],
   "limits": {"maxConcurrentFlows": 256, "maxFlowsPerConsumer": 64, "idleTimeoutSeconds": 60}
 }

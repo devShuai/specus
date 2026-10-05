@@ -80,6 +80,41 @@
         }
       }
     },
+    "EgressDomainRule": {
+      "type": "object",
+      "required": [
+        "match"
+      ],
+      "properties": {
+        "match": {
+          "type": "string",
+          "description": "example.com 只覆盖这个名字，*.example.com 覆盖其任意子域、不含它本身；小写、无末尾点，IDN 用 punycode。"
+        },
+        "protocols": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          }
+        },
+        "portRanges": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          },
+          "description": "闭区间 [起, 止]。"
+        }
+      }
+    },
     "EgressConfig": {
       "description": "服务端 → 出口设备。开关或策略变更后立即下发。revision 在同一控制 session 内单调递增，不大于上次接受值的快照被忽略。不认识的键一律忽略。",
       "allOf": [
@@ -121,6 +156,13 @@
                 "$ref": "#/$defs/EgressDestinationRule"
               },
               "description": "空 = 全部拒绝，不存在「未配置即放行」。"
+            },
+            "domainRules": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EgressDomainRule"
+              },
+              "description": "按名字授权，只对带名字（name-bind）的流起作用；解析出的地址仍先过强制拒绝清单与 scope。缺失即没有域名规则。"
             },
             "limits": {
               "type": "object",

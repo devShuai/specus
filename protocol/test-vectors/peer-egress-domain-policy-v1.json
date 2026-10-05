@@ -1,0 +1,3896 @@
+{
+  "description": "Domain rules of an egress policy: what a server stores and refuses with 400 when the policy is saved, and what an egress decides for a flow that carries a name. A case without its own config uses the top-level config. See protocol/spec/peer-egress.md, 出口授权模型.",
+  "limits": {
+    "rules": 64,
+    "portRangesPerRule": 32,
+    "storedJsonBytes": 4096
+  },
+  "management": {
+    "accept": [
+      {
+        "name": "exact",
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "stored": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "suffix",
+        "domainRules": [
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "stored": [
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "spelling-normalised",
+        "domainRules": [
+          {
+            "match": " *.CDN.Example. ",
+            "protocols": [
+              " UDP ",
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "stored": [
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "udp",
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "punycode",
+        "domainRules": [
+          {
+            "match": "xn--fiqs8s.example",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "stored": [
+          {
+            "match": "xn--fiqs8s.example",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "deny-all-kept",
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [],
+            "portRanges": []
+          }
+        ],
+        "stored": [
+          {
+            "match": "example.com",
+            "protocols": [],
+            "portRanges": []
+          }
+        ]
+      },
+      {
+        "name": "absent-lists",
+        "domainRules": [
+          {
+            "match": "example.org"
+          }
+        ],
+        "stored": [
+          {
+            "match": "example.org",
+            "protocols": [],
+            "portRanges": []
+          }
+        ]
+      },
+      {
+        "name": "no-rules",
+        "domainRules": [],
+        "stored": []
+      },
+      {
+        "name": "most-rules",
+        "domainRules": [
+          {
+            "match": "h0.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h1.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h2.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h3.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h4.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h5.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h6.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h7.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h8.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h9.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h10.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h11.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h12.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h13.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h14.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h15.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h16.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h17.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h18.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h19.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h20.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h21.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h22.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h23.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h24.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h25.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h26.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h27.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h28.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h29.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h30.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h31.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h32.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h33.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h34.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h35.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h36.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h37.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h38.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h39.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h40.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h41.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h42.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h43.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h44.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h45.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h46.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h47.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h48.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h49.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h50.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h51.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h52.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h53.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h54.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h55.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h56.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h57.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h58.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h59.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h60.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h61.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h62.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h63.example",
+            "protocols": [],
+            "portRanges": []
+          }
+        ],
+        "stored": [
+          {
+            "match": "h0.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h1.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h2.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h3.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h4.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h5.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h6.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h7.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h8.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h9.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h10.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h11.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h12.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h13.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h14.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h15.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h16.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h17.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h18.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h19.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h20.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h21.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h22.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h23.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h24.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h25.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h26.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h27.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h28.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h29.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h30.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h31.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h32.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h33.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h34.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h35.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h36.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h37.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h38.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h39.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h40.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h41.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h42.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h43.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h44.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h45.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h46.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h47.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h48.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h49.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h50.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h51.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h52.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h53.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h54.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h55.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h56.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h57.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h58.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h59.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h60.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h61.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h62.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h63.example",
+            "protocols": [],
+            "portRanges": []
+          }
+        ]
+      }
+    ],
+    "reject": [
+      {
+        "name": "bare-wildcard",
+        "domainRules": [
+          {
+            "match": "*",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "wildcard-of-a-top-level-label",
+        "domainRules": [
+          {
+            "match": "*.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "single-label",
+        "domainRules": [
+          {
+            "match": "localhost",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "wildcard-inside",
+        "domainRules": [
+          {
+            "match": "a.*.example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "unicode",
+        "domainRules": [
+          {
+            "match": "中国.example",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "underscore",
+        "domainRules": [
+          {
+            "match": "_srv.example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "label-too-long",
+        "domainRules": [
+          {
+            "match": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "address-is-a-destination-rule",
+        "domainRules": [
+          {
+            "match": "203.0.113.5",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "cidr-is-a-destination-rule",
+        "domainRules": [
+          {
+            "match": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "with-port",
+        "domainRules": [
+          {
+            "match": "example.com:443",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "empty-match",
+        "domainRules": [
+          {
+            "match": "",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "missing-match",
+        "domainRules": [
+          {
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "unknown-protocol",
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "icmp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "reversed-range",
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                80
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "too-many-rules",
+        "domainRules": [
+          {
+            "match": "h0.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h1.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h2.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h3.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h4.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h5.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h6.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h7.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h8.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h9.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h10.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h11.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h12.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h13.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h14.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h15.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h16.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h17.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h18.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h19.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h20.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h21.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h22.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h23.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h24.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h25.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h26.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h27.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h28.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h29.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h30.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h31.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h32.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h33.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h34.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h35.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h36.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h37.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h38.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h39.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h40.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h41.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h42.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h43.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h44.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h45.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h46.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h47.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h48.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h49.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h50.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h51.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h52.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h53.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h54.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h55.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h56.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h57.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h58.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h59.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h60.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h61.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h62.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h63.example",
+            "protocols": [],
+            "portRanges": []
+          },
+          {
+            "match": "h64.example",
+            "protocols": [],
+            "portRanges": []
+          }
+        ]
+      },
+      {
+        "name": "too-many-port-ranges",
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                1000,
+                1000
+              ],
+              [
+                1001,
+                1001
+              ],
+              [
+                1002,
+                1002
+              ],
+              [
+                1003,
+                1003
+              ],
+              [
+                1004,
+                1004
+              ],
+              [
+                1005,
+                1005
+              ],
+              [
+                1006,
+                1006
+              ],
+              [
+                1007,
+                1007
+              ],
+              [
+                1008,
+                1008
+              ],
+              [
+                1009,
+                1009
+              ],
+              [
+                1010,
+                1010
+              ],
+              [
+                1011,
+                1011
+              ],
+              [
+                1012,
+                1012
+              ],
+              [
+                1013,
+                1013
+              ],
+              [
+                1014,
+                1014
+              ],
+              [
+                1015,
+                1015
+              ],
+              [
+                1016,
+                1016
+              ],
+              [
+                1017,
+                1017
+              ],
+              [
+                1018,
+                1018
+              ],
+              [
+                1019,
+                1019
+              ],
+              [
+                1020,
+                1020
+              ],
+              [
+                1021,
+                1021
+              ],
+              [
+                1022,
+                1022
+              ],
+              [
+                1023,
+                1023
+              ],
+              [
+                1024,
+                1024
+              ],
+              [
+                1025,
+                1025
+              ],
+              [
+                1026,
+                1026
+              ],
+              [
+                1027,
+                1027
+              ],
+              [
+                1028,
+                1028
+              ],
+              [
+                1029,
+                1029
+              ],
+              [
+                1030,
+                1030
+              ],
+              [
+                1031,
+                1031
+              ],
+              [
+                1032,
+                1032
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "too-large",
+        "domainRules": [
+          {
+            "match": "host-00.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-01.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-02.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-03.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-04.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-05.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-06.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-07.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-08.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-09.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-10.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-11.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-12.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-13.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-14.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-15.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-16.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-17.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-18.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-19.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-20.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-21.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-22.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-23.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-24.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-25.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-26.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-27.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-28.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-29.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-30.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-31.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-32.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-33.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-34.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-35.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-36.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-37.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-38.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          },
+          {
+            "match": "host-39.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                8000,
+                8000
+              ],
+              [
+                8001,
+                8001
+              ],
+              [
+                8002,
+                8002
+              ],
+              [
+                8003,
+                8003
+              ],
+              [
+                8004,
+                8004
+              ],
+              [
+                8005,
+                8005
+              ],
+              [
+                8006,
+                8006
+              ],
+              [
+                8007,
+                8007
+              ]
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "config": {
+    "type": "egress-config",
+    "enabled": true,
+    "revision": 1,
+    "scope": "PUBLIC",
+    "allowedConsumerClientIds": [
+      1
+    ],
+    "destinationRules": [
+      {
+        "cidr": "203.0.113.0/24",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            443,
+            443
+          ]
+        ]
+      }
+    ],
+    "domainRules": [
+      {
+        "match": "example.com",
+        "protocols": [
+          "tcp"
+        ],
+        "portRanges": [
+          [
+            443,
+            443
+          ]
+        ]
+      },
+      {
+        "match": "*.cdn.example",
+        "protocols": [
+          "tcp",
+          "udp"
+        ],
+        "portRanges": [
+          [
+            443,
+            443
+          ]
+        ]
+      },
+      {
+        "match": "api.example.org",
+        "protocols": [
+          "udp"
+        ],
+        "portRanges": [
+          [
+            53,
+            53
+          ]
+        ]
+      }
+    ],
+    "limits": {
+      "maxConcurrentFlows": 256,
+      "maxFlowsPerConsumer": 64,
+      "idleTimeoutSeconds": 60
+    }
+  },
+  "authorize": [
+    {
+      "name": "name-granted-by-exact-rule",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "name-compared-normalised",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "Example.COM."
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "exact-rule-does-not-cover-subdomain",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "www.example.com"
+      },
+      "code": "EGRESS_DEST_DENIED"
+    },
+    {
+      "name": "suffix-rule-covers-deep-subdomain",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "a.b.cdn.example"
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "suffix-rule-does-not-cover-apex",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "cdn.example"
+      },
+      "code": "EGRESS_DEST_DENIED"
+    },
+    {
+      "name": "suffix-rule-needs-a-label-boundary",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "xcdn.example"
+      },
+      "code": "EGRESS_DEST_DENIED"
+    },
+    {
+      "name": "suffix-rule-grants-udp",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "udp",
+        "name": "v.cdn.example"
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "name-rule-protocol-denied",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "udp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_PROTOCOL_DENIED"
+    },
+    {
+      "name": "name-rule-port-denied",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 80,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_PORT_DENIED"
+    },
+    {
+      "name": "flow-without-name-not-granted-by-domain",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp"
+      },
+      "code": "EGRESS_DEST_DENIED"
+    },
+    {
+      "name": "rebinding-to-loopback-refused",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "127.0.0.1",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_FORBIDDEN_DESTINATION"
+    },
+    {
+      "name": "rebinding-to-mesh-refused",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "100.96.0.9",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_FORBIDDEN_DESTINATION"
+    },
+    {
+      "name": "rebinding-to-metadata-refused",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "100.100.100.200",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_FORBIDDEN_DESTINATION"
+    },
+    {
+      "name": "rebinding-to-private-refused-by-scope",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "10.0.0.5",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_SCOPE_DENIED"
+    },
+    {
+      "name": "unlisted-consumer-refused-first",
+      "request": {
+        "consumerClientId": 9,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_CONSUMER_DENIED"
+    },
+    {
+      "name": "destination-rule-still-grants-any-name",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.9",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "other.example"
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "rules-combine-for-protocol",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.9",
+        "destinationPort": 53,
+        "protocol": "udp",
+        "name": "api.example.org"
+      },
+      "code": "EGRESS_ALLOWED"
+    },
+    {
+      "name": "rules-combine-for-port",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "203.0.113.9",
+        "destinationPort": 80,
+        "protocol": "tcp",
+        "name": "api.example.org"
+      },
+      "code": "EGRESS_PORT_DENIED"
+    },
+    {
+      "name": "disabled-policy-grants-nothing",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DISABLED",
+      "config": {
+        "type": "egress-config",
+        "enabled": false,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "api.example.org",
+            "protocols": [
+              "udp"
+            ],
+            "portRanges": [
+              [
+                53,
+                53
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "lan-scope-name-to-private",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.168.1.20",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_ALLOWED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "LAN",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "api.example.org",
+            "protocols": [
+              "udp"
+            ],
+            "portRanges": [
+              [
+                53,
+                53
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "lan-scope-name-to-public-refused",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_SCOPE_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "LAN",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "*.cdn.example",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "api.example.org",
+            "protocols": [
+              "udp"
+            ],
+            "portRanges": [
+              [
+                53,
+                53
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "absent-domain-rules",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DEST_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "domain-rules-not-an-array",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DEST_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": {
+          "match": "example.com"
+        },
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "unreadable-entries-skipped",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_ALLOWED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          "example.com",
+          {
+            "match": "*",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": 7,
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          },
+          {
+            "match": "EXAMPLE.com.",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "wildcard-entry-grants-nothing",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DEST_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "*",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    }
+  ]
+}
