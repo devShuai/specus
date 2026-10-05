@@ -161,6 +161,10 @@ jobs:
         run: timeout --preserve-status 120s bash implementations/c/server/scripts/java_c_discovery_interop.sh build/c-server/specus-server-c
       - name: Build Java reference client
         run: mvn -pl :specus-client -am package -DskipTests
+      # nat_e2e_smoke.sh, runtime_config_e2e.sh and direct_route_e2e.sh copy their server, client and
+      # upstream logs here on exit, passed or failed; the last step uploads them for review.
+      - name: Keep client E2E logs
+        run: echo "SPECUS_E2E_LOG_DIR=$RUNNER_TEMP/c-server-e2e-logs" >> "$GITHUB_ENV"
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
@@ -210,6 +214,14 @@ jobs:
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh
+      - name: Upload client E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-server-e2e-logs
+          path: ${{ runner.temp }}/c-server-e2e-logs
+          if-no-files-found: warn
+          retention-days: 14
 
   admin-web:
     name: Admin web
