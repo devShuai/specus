@@ -478,7 +478,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 服务端为每台出口只保存最新的一份上报，在管理接口 `GET /api/admin/peer-mesh/egress/activity` 展示，新的一份整体替换旧的；`revision` 小于已存值的上报被忽略。客户端据此这样发（共享向量 `protocol/test-vectors/peer-egress-report-v1.json`）：
 
-- **取值与本机状态 `egress` 一节同源同口径**：`activeFlows` 为状态的 `flows`，`totalFlows`、`bytesIn`、`bytesOut` 同名字段，`rejectedFlows` 为状态的 `refused`（计数为零的不列）。都是累计值，不是区间值：服务端只留最新一份，区间值会让管理页上的数字只描述「上次上报以来」，且一段时间没有新上报时那个区间永远停在页面上。出口进程重启后计数从零开始，页面上的上报时间说明这一点。
+- **取值与本机状态 `egress` 一节同源同口径**：`activeFlows` 为状态的 `flows`，`totalFlows`、`bytesIn`、`bytesOut` 同名字段，`rejectedFlows` 为状态的 `refused`（计数为零的不列）。都是累计值，不是区间值：服务端只留最新一份，区间值会让管理页上的数字只描述「上次上报以来」，且一段时间没有新上报时那个区间永远停在页面上。计数从出口这一次开始服务算起，与状态一样：出口进程重启后从零开始，在控制连接断开时停下出口、下一次收到 `egress-config` 再重建它的实现里（如 Go 客户端），重连之后也从零开始。`revision` 跨这些边界照样递增，服务端照常接受；页面上的上报时间说明数字从何时起算。
 - **`revision` 取本机墙钟毫秒数，并保持严格递增**（不大于上次的值时取上次加一）。从 1 开始的计数器在出口重启后会小于服务端存着的旧值，新上报会被当作过时的丢掉。
 - **时机**：出口在运行（收到 `enabled: true` 的 `egress-config`，且本次登录声明了出口能力）时每 **60 秒**检查一次（向量的 `intervalSeconds`）。本控制 session 里还没有发过、或任一取值与上次发出的不同，就发送；否则不发。出口关闭期间不发，重新开启后的第一次检查照发。新的控制 session 之后的第一次检查也照发：服务端可能重启过。
 - 发送失败或服务端拒绝（例如限频）只记日志，不重试，下一次检查照常进行。服务端对每个控制 session 限每分钟 20 份，60 秒一次远低于此。
