@@ -15,6 +15,26 @@ public sealed record PeerEgressDestinationRule
     public IReadOnlyList<int[]> PortRanges { get; init; } = [];
 }
 
+/// <summary>
+/// One entry of an egress policy's domain rules: a grant by name rather than by address.
+/// </summary>
+/// <remarks>
+/// <c>example.com</c> covers that name only, <c>*.example.com</c> its subdomains and not the name
+/// itself. It takes part only for a flow that carries a name (protocol/spec/peer-egress.md,
+/// 按域名授权); a flow that arrived by address is never granted by one.
+/// </remarks>
+public sealed record PeerEgressDomainRule
+{
+    [JsonPropertyName("match")]
+    public string Match { get; init; } = string.Empty;
+
+    [JsonPropertyName("protocols")]
+    public IReadOnlyList<string> Protocols { get; init; } = [];
+
+    [JsonPropertyName("portRanges")]
+    public IReadOnlyList<int[]> PortRanges { get; init; } = [];
+}
+
 /// <summary>Limits that keep an egress node from acting as an open proxy.</summary>
 public sealed record PeerEgressLimits
 {
@@ -51,6 +71,10 @@ public sealed record PeerEgressPolicy
     [JsonPropertyName("destinationRules")]
     public IReadOnlyList<PeerEgressDestinationRule> DestinationRules { get; init; } = [];
 
+    /// <remarks>Empty by default: a policy that names no domain rule grants nothing by name.</remarks>
+    [JsonPropertyName("domainRules")]
+    public IReadOnlyList<PeerEgressDomainRule> DomainRules { get; init; } = [];
+
     [JsonPropertyName("limits")]
     public PeerEgressLimits Limits { get; init; } = new();
 }
@@ -69,6 +93,15 @@ public sealed record PeerEgressRequest
 
     [JsonPropertyName("protocol")]
     public string Protocol { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The name the flow was opened for, when the consumer bound one to the address with
+    /// <c>name-bind</c>; null for a flow that arrived by address. Only a flow with a name is looked
+    /// at by the policy's domain rules, and <see cref="DestinationIp"/> is then the address the name
+    /// resolved to, which the forced-deny list and the scope still judge on their own.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public string? Name { get; init; }
 
     [JsonPropertyName("hop")]
     public bool Hop { get; init; }

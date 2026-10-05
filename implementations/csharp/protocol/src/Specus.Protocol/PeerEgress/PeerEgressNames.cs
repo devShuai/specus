@@ -51,6 +51,28 @@ public static class PeerEgressNames
         return !text.Contains('*', StringComparison.Ordinal) && ValidNormalized(text);
     }
 
+    /// <summary>
+    /// Whether a rule's match covers a name: <c>example.com</c> only that name, <c>*.example.com</c>
+    /// any subdomain at a label boundary (<c>a.b.example.com</c>, not <c>xexample.com</c>) and not
+    /// <c>example.com</c> itself. Both sides are compared normalised.
+    /// </summary>
+    /// <remarks>
+    /// A match <see cref="ValidMatch"/> refuses covers nothing, so a rule nobody could have written
+    /// (an empty match, a bare <c>*</c>) cannot grant by accident whoever assembled the list.
+    /// </remarks>
+    public static bool Covers(string? match, string? name)
+    {
+        if (!ValidMatch(match))
+        {
+            return false;
+        }
+        var rule = Normalize(match);
+        var query = Normalize(name);
+        return rule.StartsWith("*.", StringComparison.Ordinal)
+            ? query.EndsWith(rule[1..], StringComparison.Ordinal)
+            : string.Equals(query, rule, StringComparison.Ordinal);
+    }
+
     private static bool ValidNormalized(string text)
     {
         if (text.Length == 0 || text.Length > 253)

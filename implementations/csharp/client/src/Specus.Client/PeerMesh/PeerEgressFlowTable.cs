@@ -66,6 +66,13 @@ internal sealed class PeerEgressFlowTable
         public string? Name { get; set; }
 
         /// <summary>
+        /// The address the socket was dialled to. The key's remote address for a flow that arrived by
+        /// address; for a flow opened for a name, the address the name resolved to, while the key
+        /// keeps the consumer's fake address. Re-authorization judges this one, as admission did.
+        /// </summary>
+        public uint Dialed { get; set; } = key.RemoteIp;
+
+        /// <summary>
         /// A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
         /// but the entry stays until the timer so a retransmitted FIN is still answered.
         /// </summary>
@@ -313,6 +320,11 @@ internal sealed class PeerEgressFlowTable
     /// <para>The limit fields are deliberately not re-checked. Lowering a quota should stop the
     /// next flow, not pick live ones to kill, and a limit breach is not a permission the flow
     /// lost.</para>
+    ///
+    /// <para>A flow opened for a name is judged as it was admitted: on the address it was dialled
+    /// to, with the name it was opened for, so a domain rule still covering the name keeps it and
+    /// one taken away revokes it. Judging the key's fake address instead would put a pool address
+    /// through the forced-deny list and the scope.</para>
     /// </remarks>
     public List<Revocation> Reauthorize(
         PeerEgressPolicy policy,
@@ -328,9 +340,10 @@ internal sealed class PeerEgressFlowTable
                 new PeerEgressRequest
                 {
                     ConsumerClientId = flow.Consumer,
-                    DestinationIp = Ipv4Cidr.FormatAddress(flow.Key.RemoteIp),
+                    DestinationIp = Ipv4Cidr.FormatAddress(flow.Dialed),
                     DestinationPort = flow.Key.RemotePort,
                     Protocol = flow.Key.ProtocolName(),
+                    Name = flow.Name,
                     LocalInterfaceCidrs = localInterfaceCidrs ?? []
                 },
                 policy, allowed, context);

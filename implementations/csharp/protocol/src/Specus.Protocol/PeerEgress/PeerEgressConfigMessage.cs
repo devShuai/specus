@@ -86,6 +86,36 @@ public sealed record PeerEgressConfigMessage(long Revision, PeerEgressPolicy Pol
                 }
             }
 
+            // Grants by name (protocol/spec/peer-egress.md, 按域名授权). An absent or non-array
+            // field is no domain rules, which is also what an older server sends by omission. An
+            // entry that is not an object, or whose match is not a name or *.name as a consumer's
+            // domain rule is written, is skipped and the rest kept: a rule this node cannot read
+            // must grant nothing, and must not take the readable ones down with it. The match is
+            // kept normalised, the protocols and port ranges as a destination rule's are.
+            var domainRules = new List<PeerEgressDomainRule>();
+            if (message.TryGetProperty("domainRules", out var rawDomains)
+                && rawDomains.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var node in rawDomains.EnumerateArray())
+                {
+                    if (node.ValueKind != JsonValueKind.Object)
+                    {
+                        continue;
+                    }
+                    var match = Text(node, "match").Trim();
+                    if (!PeerEgressNames.ValidMatch(match))
+                    {
+                        continue;
+                    }
+                    domainRules.Add(new PeerEgressDomainRule
+                    {
+                        Match = PeerEgressNames.Normalize(match),
+                        Protocols = Strings(node, "protocols"),
+                        PortRanges = PortRanges(node),
+                    });
+                }
+            }
+
             // Absent limits decode as zeros rather than as the record's defaults. Whether a zero
             // means "use the default" or "no limit" is the runtime's decision, and inventing a
             // number here would hide from it that the server named none.
@@ -102,6 +132,7 @@ public sealed record PeerEgressConfigMessage(long Revision, PeerEgressPolicy Pol
                 Scope = Text(message, "scope").Trim().ToUpperInvariant(),
                 AllowedConsumerClientIds = consumers,
                 DestinationRules = rules,
+                DomainRules = domainRules,
                 Limits = new PeerEgressLimits
                 {
                     MaxConcurrentFlows = Number(limits, "maxConcurrentFlows"),
