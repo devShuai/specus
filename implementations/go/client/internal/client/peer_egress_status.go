@@ -46,7 +46,9 @@ type consumerStatusSnapshot struct {
 	// FlowsByEgress counts the live flows each egress carries, so an operator can see which one the
 	// traffic is on.
 	FlowsByEgress map[int64]int
-	Blocked       map[string]int64
+	// Standing is each egress's catalogue standing, for every egress the rules name.
+	Standing map[int64]string
+	Blocked  map[string]int64
 	// Phase two: the pool while it runs ("" otherwise), which egresses resolve names, and the
 	// pool's live mappings and quarantined addresses as of the snapshot.
 	FakeIPCIDR  string
@@ -81,12 +83,19 @@ func (c *egressConsumer) statusSnapshot() consumerStatusSnapshot {
 	for _, flow := range c.flows {
 		byEgress[flow.Egress]++
 	}
+	standing := map[int64]string{}
+	for _, rule := range c.rules {
+		if rule.EgressClientID != 0 {
+			standing[rule.EgressClientID] = c.standingLocked(rule.EgressClientID)
+		}
+	}
 	snapshot := consumerStatusSnapshot{
 		Rules:         append([]egressRule(nil), c.rules...),
 		MeshCIDR:      c.meshCIDR,
 		Online:        online,
 		Flows:         len(c.flows),
 		FlowsByEgress: byEgress,
+		Standing:      standing,
 		Blocked:       blocked,
 		FakeIPCIDR:    c.fakeIPCIDR,
 		Capable:       capable,
@@ -131,6 +140,7 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	mesh.mu.Lock()
 	consumer, runtime, installer := mesh.egressConsumer, mesh.egress, mesh.egressRoutes
 	outcome := mesh.egressApplied
+	catalog := mesh.egressCatalogStateLocked()
 	mesh.mu.Unlock()
 
 	// The path each egress peer's traffic takes now, read the way sendEncryptedPayload chooses it:
@@ -151,6 +161,9 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	status := map[string]any{}
 	section := consumerStatusJSON(consumer, installer, outcome, paths)
 	section["enabled"] = mesh.config.PeerEgressEnabled
+	// Whether this control session has heard the server's egress catalogue: a server too old to send
+	// one leaves every standing unknown, and only this says why.
+	section["catalog"] = catalog
 	if !mesh.config.PeerEgressEnabled && len(mesh.config.PeerEgressRules) > 0 {
 		// The switch off builds no consumer, so the rules come from the configuration. They are
 		// listed all the same: "kept but not taking anything over" is a state to show, not to hide.
@@ -300,7 +313,7 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 		rules = append(rules, entry)
 	}
 	section["rules"] = rules
-	section["peers"] = egressPeersJSON(peers, snapshot.FlowsByEgress, paths)
+	section["peers"] = egressPeersJSON(peers, snapshot.Standing, snapshot.FlowsByEgress, paths)
 	section["flows"] = snapshot.Flows
 	section["blocked"] = snapshot.Blocked
 	section["routes"] = routesStatusJSON(installer, outcome)
@@ -353,7 +366,11 @@ func routesStatusJSON(installer *egressRouteInstaller, outcome egressApplyOutcom
 	return routes
 }
 
-func egressPeersJSON(peers map[int64]bool, flows map[int64]int, paths map[int64]string) []map[string]any {
+// egressPeersJSON lists each egress peer: whether it is online, what the catalogue says of it, the
+// path to it, and its flows. standing is what tells an online egress that takes nothing apart from
+// one that is working: online alone was all an operator saw of an egress whose client could not
+// take a flow.
+func egressPeersJSON(peers map[int64]bool, standing map[int64]string, flows map[int64]int, paths map[int64]string) []map[string]any {
 	ids := make([]int64, 0, len(peers))
 	for id := range peers {
 		ids = append(ids, id)
@@ -365,7 +382,12 @@ func egressPeersJSON(peers map[int64]bool, flows map[int64]int, paths map[int64]
 		if path == "" {
 			path = egressPathNone
 		}
-		entries = append(entries, map[string]any{"clientId": id, "online": peers[id], "path": path, "flows": flows[id]})
+		state := standing[id]
+		if state == "" {
+			state = egressStandingUnknown
+		}
+		entries = append(entries, map[string]any{"clientId": id, "online": peers[id], "standing": state,
+			"path": path, "flows": flows[id]})
 	}
 	return entries
 }
