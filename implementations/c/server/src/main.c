@@ -4020,6 +4020,7 @@ static void *client_thread(void *arg)
 
     int logged_in = 0;
     const char *disconnect_reason = "CLIENT_CLOSED";
+    int heartbeat_logged = 0;
     for (;;) {
         st_frame_header header;
         uint8_t *body = NULL;
@@ -4133,6 +4134,14 @@ static void *client_thread(void *arg)
             if (session_send_packet(session, &response) != 0) {
                 disconnect_reason = "HEARTBEAT_WRITE_FAILED";
                 break;
+            }
+            /* Only the first one per connection is logged: it shows the client's keepalive reaches
+             * the server and is answered, without a line every few seconds for every channel. */
+            if (!heartbeat_logged) {
+                heartbeat_logged = 1;
+                printf("[%s] first heartbeat answered client=%s remote=%s\n",
+                       session->is_data_connection ? "data" : "control",
+                       session->config.client_name, session->remote);
             }
             continue;
         }

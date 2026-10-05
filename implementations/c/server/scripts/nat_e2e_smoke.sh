@@ -12,6 +12,10 @@ HTTP_UPSTREAM_PORT="${HTTP_UPSTREAM_PORT:-19091}"
 WS_UPSTREAM_PORT="${WS_UPSTREAM_PORT:-19092}"
 JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-exec.jar"
 ACCESS_TOKEN="${ACCESS_TOKEN:-c-smoke-access-token}"
+# Every client heartbeats a channel after 5 s without writing on it. A read-idle timeout this short
+# closes any channel whose heartbeats stop, so the heartbeat check below can watch the session
+# outlive it twice over within a short run.
+CONTROL_READ_IDLE_SECONDS="${CONTROL_READ_IDLE_SECONDS:-10}"
 UPSTREAM_HOST="127.0.0.1"
 # SPECUS_CLIENT_COMMAND runs another client against the C server, e.g. the Go binary or
 # "dotnet /path/specus-client.dll"; it is split on spaces. Without it the Java reference client
@@ -205,6 +209,7 @@ SPECUS_ENV=dev \
 SPECUS_CLIENT_NAME="Demo client" \
 SPECUS_CLIENT_SESSION_ID="1" \
 SPECUS_CLIENT_ACCESS_TOKEN="$ACCESS_TOKEN" \
+SPECUS_CONTROL_READ_IDLE_SECONDS="$CONTROL_READ_IDLE_SECONDS" \
 SPECUS_ADMIN_PORT="$ADMIN_PORT" \
 SPECUS_TCP_MAPPINGS="$PUBLIC_PORT=$UPSTREAM_HOST:$ECHO_PORT" \
 SPECUS_HTTP_ROUTES="api=http://$UPSTREAM_HOST:$HTTP_UPSTREAM_PORT,ws=ws://$UPSTREAM_HOST:$WS_UPSTREAM_PORT" \
@@ -224,6 +229,17 @@ JSON
 # death would leave the client running.
 (cd "$TMP_DIR" && exec "${CLIENT_COMMAND[@]}" run --config client.jsonc --no-update-check >"$TMP_DIR/client.log" 2>&1) &
 CLIENT_PID=$!
+
+dump_logs() {
+  echo "--- C server log ---" >&2
+  tail -n 200 "$TMP_DIR/server.log" >&2 || true
+  echo "--- $CLIENT_LABEL client log ---" >&2
+  tail -n 200 "$TMP_DIR/client.log" >&2 || true
+  echo "--- HTTP upstream log ---" >&2
+  tail -n 200 "$TMP_DIR/http-upstream.log" >&2 || true
+  echo "--- WebSocket upstream log ---" >&2
+  tail -n 200 "$TMP_DIR/ws-upstream.log" >&2 || true
+}
 
 if ! python3 - "$PUBLIC_PORT" "$ADMIN_PORT" <<'PY'
 import base64
@@ -351,13 +367,70 @@ print(f"NAT smoke failed: {last}", file=sys.stderr)
 raise SystemExit(1)
 PY
 then
-  echo "--- C server log ---" >&2
-  tail -n 200 "$TMP_DIR/server.log" >&2 || true
-  echo "--- $CLIENT_LABEL client log ---" >&2
-  tail -n 200 "$TMP_DIR/client.log" >&2 || true
-  echo "--- HTTP upstream log ---" >&2
-  tail -n 200 "$TMP_DIR/http-upstream.log" >&2 || true
-  echo "--- WebSocket upstream log ---" >&2
-  tail -n 200 "$TMP_DIR/ws-upstream.log" >&2 || true
+  dump_logs
+  exit 1
+fi
+
+# Heartbeats: from here on the script sends nothing, so the only frames either channel carries are
+# the client's heartbeats. The server answers each one and logs the first per connection; with the
+# short read-idle timeout a channel whose heartbeats stopped would be closed and the client would
+# log in again, so the session must come through the whole window on its original login.
+if ! python3 - "$TMP_DIR/server.log" "$CONTROL_READ_IDLE_SECONDS" "$PUBLIC_PORT" "$ADMIN_PORT" <<'PY'
+import http.client
+import socket
+import sys
+import time
+
+server_log = sys.argv[1]
+read_idle, port, admin_port = map(int, sys.argv[2:5])
+
+
+def log_text():
+    with open(server_log, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def logins(text):
+    return text.count("[control] login ok"), text.count("[data] login ok")
+
+
+before = logins(log_text())
+window = 2 * read_idle + 2
+time.sleep(window)
+text = log_text()
+for role in ("control", "data"):
+    if f"[{role}] first heartbeat answered" not in text:
+        raise SystemExit(f"heartbeat check failed: no {role} heartbeat answered within {window} s")
+if "read idle timeout" in text:
+    raise SystemExit(f"heartbeat check failed: a channel hit the {read_idle} s read-idle timeout")
+if logins(text) != before:
+    raise SystemExit(f"heartbeat check failed: the client logged in again while idle "
+                     f"(control, data logins {before} -> {logins(text)})")
+
+# The session that idled is still the one carrying traffic, both TCP and Direct HTTP.
+payload = b"specus-c-after-heartbeats"
+with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+    s.sendall(payload)
+    got = bytearray()
+    while len(got) < len(payload):
+        chunk = s.recv(len(payload) - len(got))
+        if not chunk:
+            break
+        got.extend(chunk)
+if got != payload:
+    raise SystemExit(f"heartbeat check failed: TCP echo after idling returned {bytes(got)!r}")
+direct = http.client.HTTPConnection("127.0.0.1", admin_port, timeout=10)
+direct.request("POST", "/http/Demo%20client/api/after-idle", body=b"still-online")
+response = direct.getresponse()
+body = response.read()
+direct.close()
+if response.status != 201 or body != b"upstream:/after-idle:still-online":
+    raise SystemExit(f"heartbeat check failed: Direct HTTP after idling: {response.status} {body!r}")
+
+print(f"Heartbeat check passed (control and data heartbeats answered; one login held through "
+      f"{window} s of idling with a {read_idle} s read-idle timeout, then TCP + Direct HTTP)")
+PY
+then
+  dump_logs
   exit 1
 fi
