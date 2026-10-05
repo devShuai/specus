@@ -61,8 +61,8 @@ type egressConfigMessage struct {
 	Limits                   egressLimits            `json:"limits"`
 }
 
-// ensureEgress lazily builds the plane and the goroutines that carry its frames and its clock.
-// Called with no mesh lock held.
+// ensureEgress lazily builds the plane and the goroutines that carry its frames, its clock and its
+// reports to the server. Called with no mesh lock held.
 func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 	mesh.mu.Lock()
 	if mesh.egress != nil {
@@ -83,10 +83,12 @@ func (mesh *peerMeshClient) ensureEgress() *egressRuntime {
 	mesh.egress = runtime
 	mesh.egressQueue = queue
 	mesh.egressDone = done
+	reportTicks, stopReportTicks := mesh.newEgressReportTickerLocked()
 	mesh.mu.Unlock()
 
 	go mesh.egressSendLoop(queue, done)
 	go mesh.egressTickLoop(runtime, done)
+	go mesh.egressReportLoop(runtime, reportTicks, stopReportTicks, done)
 	return runtime
 }
 
