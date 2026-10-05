@@ -79,6 +79,54 @@ public sealed class PeerEgressManagementApiTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The domain-policy vector's accepted cases, posted as raw JSON: each answers with exactly the
+    /// vector's <c>stored</c> rules, in the compact form the 4096-byte limit is measured on.
+    /// </summary>
+    [Fact]
+    public async Task EveryAcceptedDomainPolicyCaseIsStoredAsTheVectorSays()
+    {
+        var egressId = await AddClientAsync("domain-vector-accept-egress");
+        using var client = AdminClient();
+
+        foreach (var vectorCase in PeerEgressDomainPolicyVector.Cases("accept"))
+        {
+            var name = vectorCase.GetProperty("name").GetString();
+            using var response = await PostDomainPolicyAsync(client, egressId, vectorCase.GetProperty("domainRules"));
+            Assert.True(response.StatusCode == HttpStatusCode.OK,
+                $"{name}: {response.StatusCode} {await response.Content.ReadAsStringAsync()}");
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.True(PeerEgressManagementVector.Compact(vectorCase.GetProperty("stored"))
+                    == PeerEgressManagementVector.Compact(body.RootElement.GetProperty("domainRules")),
+                $"{name}: returned {body.RootElement.GetProperty("domainRules").GetRawText()}");
+        }
+    }
+
+    /// <summary>
+    /// The domain-policy vector's refused cases: each is a 400 with the usual error body, and no
+    /// policy appears for the device.
+    /// </summary>
+    [Fact]
+    public async Task EveryRefusedDomainPolicyCaseIsABadRequestThatSavesNothing()
+    {
+        var egressId = await AddClientAsync("domain-vector-reject-egress");
+        using var client = AdminClient();
+
+        foreach (var vectorCase in PeerEgressDomainPolicyVector.Cases("reject"))
+        {
+            var name = vectorCase.GetProperty("name").GetString();
+            using var response = await PostDomainPolicyAsync(client, egressId, vectorCase.GetProperty("domainRules"));
+            Assert.True(response.StatusCode == HttpStatusCode.BadRequest, $"{name}: {response.StatusCode}");
+            await AssertErrorBodyAsync(response);
+        }
+
+        using var list = await client.GetAsync(PoliciesPath);
+        list.EnsureSuccessStatusCode();
+        using var policies = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        Assert.DoesNotContain(policies.RootElement.EnumerateArray(),
+            policy => policy.GetProperty("egressClientId").GetInt64() == egressId);
+    }
+
+    /// <summary>
     /// A switch request without <c>enabled</c> used to be read as "off". It is refused instead, and
     /// the stored switch is left as it was.
     /// </summary>
@@ -231,6 +279,12 @@ public sealed class PeerEgressManagementApiTests : IAsyncLifetime
             $"{{\"egressClientId\":{egressId},\"enabled\":true,\"scope\":\"PUBLIC\","
             + $"\"destinationRules\":{destinationRules.GetRawText()}}}"));
 
+    private static Task<HttpResponseMessage> PostDomainPolicyAsync(HttpClient client, long egressId,
+        JsonElement domainRules) =>
+        client.PostAsync(PoliciesPath, Json(
+            $"{{\"egressClientId\":{egressId},\"enabled\":true,\"scope\":\"PUBLIC\","
+            + $"\"domainRules\":{domainRules.GetRawText()}}}"));
+
     private static StringContent Json(string body) => new(body, Encoding.UTF8, "application/json");
 
     private static async Task AssertErrorBodyAsync(HttpResponseMessage response)
@@ -286,5 +340,52 @@ internal static class PeerEgressManagementVector
             }
         }
         throw new FileNotFoundException("cannot locate peer-egress-management-v1.json");
+    }
+}
+
+/// <summary>
+/// protocol/test-vectors/peer-egress-domain-policy-v1.json, shared with the other servers. Only its
+/// <c>management</c> half concerns a server.
+/// </summary>
+internal static class PeerEgressDomainPolicyVector
+{
+    private static readonly Lazy<JsonElement> Root = new(() =>
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(FindVector()));
+        return document.RootElement.Clone();
+    });
+
+    public static JsonElement Limits => Root.Value.GetProperty("limits");
+
+    /// <summary>The management cases of one kind, <c>accept</c> or <c>reject</c>.</summary>
+    public static IEnumerable<JsonElement> Cases(string kind) =>
+        Root.Value.GetProperty("management").GetProperty(kind).EnumerateArray();
+
+    public static JsonElement Case(string kind, string name) =>
+        Cases(kind).Single(item => item.GetProperty("name").GetString() == name);
+
+    public static TheoryData<string> Names(string kind)
+    {
+        var names = new TheoryData<string>();
+        foreach (var item in Cases(kind))
+        {
+            names.Add(item.GetProperty("name").GetString()!);
+        }
+        return names;
+    }
+
+    private static string FindVector()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        for (var depth = 0; directory is not null && depth < 12; depth++, directory = directory.Parent)
+        {
+            var candidate = Path.Combine(directory.FullName, "protocol", "test-vectors",
+                "peer-egress-domain-policy-v1.json");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        throw new FileNotFoundException("cannot locate peer-egress-domain-policy-v1.json");
     }
 }

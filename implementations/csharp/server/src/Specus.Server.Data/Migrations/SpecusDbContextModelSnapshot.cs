@@ -1668,6 +1668,14 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("destination_rules");
 
+                    b.Property<string>("DomainRules")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("domain_rules");
+
                     b.Property<long>("EgressClientId")
                         .HasColumnType("INTEGER")
                         .HasColumnName("egress_client_id");

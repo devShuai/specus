@@ -2330,6 +2330,15 @@ public sealed class PeerControlMessage
     public IReadOnlyList<PeerEgressDestinationRule>? DestinationRules { get; set; }
 
     /// <summary>
+    /// egress-config: names granted to flows that carry one. An enabled push always carries the
+    /// list, empty when there are none; left out when null, so the disabling push and every other
+    /// message keep their shape.
+    /// </summary>
+    [JsonPropertyName("domainRules")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<PeerEgressDomainRule>? DomainRules { get; set; }
+
+    /// <summary>
     /// egress-config: concurrency, per-consumer and idle limits that keep the node from acting as
     /// an open proxy.
     /// </summary>

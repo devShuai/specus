@@ -15,6 +15,24 @@ public sealed record PeerEgressDestinationRule
     public IReadOnlyList<int[]> PortRanges { get; init; } = [];
 }
 
+/// <summary>One domain rule of an egress policy: it grants a name rather than an address.</summary>
+/// <remarks>
+/// <c>example.com</c> covers that name only, <c>*.example.com</c> its subdomains but not itself. It
+/// only ever admits a flow that carries a name, and the address the name resolves to still has to
+/// pass the forced-deny list and the scope (protocol/spec/peer-egress.md, 按域名授权).
+/// </remarks>
+public sealed record PeerEgressDomainRule
+{
+    [JsonPropertyName("match")]
+    public string Match { get; init; } = string.Empty;
+
+    [JsonPropertyName("protocols")]
+    public IReadOnlyList<string> Protocols { get; init; } = [];
+
+    [JsonPropertyName("portRanges")]
+    public IReadOnlyList<int[]> PortRanges { get; init; } = [];
+}
+
 /// <summary>Limits that keep an egress node from acting as an open proxy.</summary>
 public sealed record PeerEgressLimits
 {
