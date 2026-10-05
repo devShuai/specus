@@ -104,6 +104,8 @@ add_test(NAME login_rate_limiter_tests COMMAND specus_c_login_rate_limiter_tests
 add_executable(specus_c_object_storage_tests tests/object_storage_tests.c)
 target_link_libraries(specus_c_object_storage_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_object_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_object_storage_tests PRIVATE
+    ST_TRANSFER_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME object_storage_tests COMMAND specus_c_object_storage_tests)
 add_test(NAME object_storage_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/object_storage_e2e.sh
