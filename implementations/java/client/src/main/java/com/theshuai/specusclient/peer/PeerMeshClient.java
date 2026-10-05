@@ -4237,7 +4237,8 @@ public class PeerMeshClient implements AutoCloseable {
 
     /**
      * A control session has logged in. The server numbers its egress catalogues per session, so a
-     * new one may start again from 1 and must not be ignored as older than the last.
+     * new one may start again from 1 and must not be ignored as older than the last; and an egress
+     * reports to it at the next check whether or not its numbers moved.
      */
     public void onControlSession() {
         egress.newControlSession();
@@ -4275,6 +4276,13 @@ public class PeerMeshClient implements AutoCloseable {
                 return false;
             }
             return sendEncryptedPayload(peer.virtualIp(), frame);
+        }
+
+        @Override
+        public void sendControl(String message) {
+            // No target: the server is the recipient, and it binds the reporter from this
+            // connection. A target name, like any identity in the body, is refused.
+            controlSender.send("", message);
         }
 
         @Override

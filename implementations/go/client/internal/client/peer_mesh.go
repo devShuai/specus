@@ -160,6 +160,17 @@ type peerMeshClient struct {
 	egressDone         chan struct{}
 	egressConsumer     *egressConsumer
 	egressRoutes       *egressRouteInstaller
+	// egressReport decides when the egress reports to the server and numbers the reports, for the
+	// life of the process. Guarded by mu.
+	egressReport egressReporter
+	// egressReportSend writes a report to the server over the current control connection, nil
+	// between control sessions. Set on every login whether or not the mesh runs: the server pushes
+	// egress-config to any device that announced the role. Guarded by mu.
+	egressReportSend func(any) error
+	// egressReportTicks makes the ticker report checks run on and the function that stops it. Nil
+	// means a real one every egressReportInterval; tests set it so a check runs when they say, at
+	// the time they say.
+	egressReportTicks func() (<-chan time.Time, func())
 	// egressApplied is what the last route apply left behind that cannot be recomputed later:
 	// which prefixes were refused because somebody else already owned them, and whether the
 	// whole plan had to be rolled back. Guarded by mu.
@@ -512,6 +523,10 @@ func (mesh *peerMeshClient) updateTurnAuthLocked(peerMesh PeerMeshConfig) bool {
 func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender peerControlSender) {
 	mesh.mu.Lock()
 	mesh.updateTurnAuthLocked(runtime.PeerMesh)
+	mesh.egressReportSend = func(message any) error {
+		// No target and no identity: the server binds the reporter to this connection.
+		return sender(conn, "", message)
+	}
 	mesh.mu.Unlock()
 	mesh.ensureServices().setSend(func(msg any) error {
 		return sender(conn, "", msg)
@@ -662,6 +677,9 @@ func (mesh *peerMeshClient) suspend() {
 	// Every control session ends here, so the next one numbers its catalogues afresh. What the
 	// last one said stays until a new catalogue replaces it.
 	mesh.newEgressCatalogSessionLocked()
+	// And the next one hears the egress's report at its first check, changed or not.
+	mesh.egressReportSend = nil
+	mesh.egressReport.newSession()
 	mesh.mu.Unlock()
 }
 
