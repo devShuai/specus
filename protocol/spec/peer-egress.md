@@ -699,7 +699,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。具体到三端的出口日志：
 
 - 出口拒绝一条流：`[peer-egress] refused consumer=<id> protocol=<tcp|udp> code=<码>`（限频时附 `suppressed=<n>`），不写目标地址与端口；目标随拒绝控制消息告诉消费端本身。
-- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。
+- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。Java 客户端因缺 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED` 拿不到 socket 句柄时（Windows 与 macOS 上每次建流都会这样失败，见[出站 socket](#出站-socket)），原因仍为 `error`，其后附 `missing="--add-exports java.base/sun.nio.ch=ALL-UNNAMED"`。
 - 消费端运行时跳过被拒的规则：`[peer-egress-consumer] rule <序号> refused: <码>`，不写 `match`，与离线校验的告警同一约定。
 
 ## 对系统的改动

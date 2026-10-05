@@ -1072,8 +1072,25 @@ final class PeerEgressRuntime {
      * which is what the application waits on anyway.
      */
     private void unreachable(long consumer, PeerEgressFlowTable.Key key, Exception cause) {
-        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}",
-                consumer, key.protocolName(), connectReason(cause));
+        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}{}",
+                consumer, key.protocolName(), connectReason(cause), connectDetail(cause));
+    }
+
+    /**
+     * What follows the reason: the JVM option the egress lacks when that is why the dial failed,
+     * otherwise nothing.
+     *
+     * <p>Without {@value PeerEgressSocketHandles#EXPORT_OPTION} every dial on Windows and macOS is
+     * refused, and {@code reason=error} alone would leave an operator nothing to go on. The reason
+     * stays {@code error}, one of the words every runtime shares; the option is a field after it.
+     */
+    static String connectDetail(Throwable cause) {
+        for (Throwable error = cause; error != null; error = error.getCause()) {
+            if (error instanceof PeerEgressSocketHandles.MissingExportException) {
+                return " missing=\"" + PeerEgressSocketHandles.EXPORT_OPTION + "\"";
+            }
+        }
+        return "";
     }
 
     /**

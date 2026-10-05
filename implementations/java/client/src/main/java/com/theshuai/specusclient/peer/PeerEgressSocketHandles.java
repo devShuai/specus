@@ -49,10 +49,19 @@ final class PeerEgressSocketHandles {
         try {
             return (int) FD_VAL.invoke(channel);
         } catch (IllegalAccessException denied) {
-            throw new IOException("binding the egress socket to an interface needs the JVM option "
-                    + EXPORT_OPTION, denied);
+            throw new MissingExportException(denied);
         } catch (InvocationTargetException | IllegalArgumentException | ClassCastException failed) {
             throw new IOException("cannot read the socket handle of " + channel.getClass().getName(), failed);
+        }
+    }
+
+    /**
+     * The JVM was started without {@value #EXPORT_OPTION}. A type of its own so the dial's log line
+     * can name the option without matching on a message.
+     */
+    static final class MissingExportException extends IOException {
+        MissingExportException(IllegalAccessException denied) {
+            super("binding the egress socket to an interface needs the JVM option " + EXPORT_OPTION, denied);
         }
     }
 }
