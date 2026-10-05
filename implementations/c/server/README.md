@@ -279,7 +279,11 @@ The exact Java attachment paths—public/admin `presign-upload`, `/{attachmentId
 `/{attachmentId}/presign-download` under `/api/public/transfer/attachments` or
 `/api/admin/client-messages/attachments`—return `409 OBJECT_STORAGE_DISABLED` only when no provider is
 configured. Configured S3-compatible and Aliyun OSS providers return signed URLs and enforce ownership,
-room role, size, quota, state, and expiry semantics.
+room role, size, quota, state, and expiry semantics. `GET /api/public/transfer/attachments/capabilities`
+implements `protocol/spec/transfer-capabilities.md` v1: an authenticated, `private, no-store` snapshot of
+the caller's own storage and monthly download quota, read over a read-only SQLite connection from the same
+tables. It answers `200` with `storageEnabled:false` while storage is disabled, never signs or contacts
+the object store, and fails with `5xx` instead of reporting zero usage when the database cannot be read.
 The management auth login endpoint validates the built-in admin password from
 `SPECUS_AUTH_USERNAME` / `SPECUS_AUTH_PASSWORD`; when `SPECUS_DATABASE_PATH` is configured, it also
 validates enabled rows in `specus_management_user` using the shared

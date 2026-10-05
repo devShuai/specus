@@ -98,6 +98,7 @@ type egressRuntime struct {
 	localInterfaces []string
 
 	flows      *egressFlowTable
+	flowRate   *egressFlowRate
 	rejections *egressRejectionLog
 	stats      egressStats
 
@@ -127,6 +128,7 @@ func newEgressRuntime(logger *log.Logger, send egressSendFunc, dial egressDialFu
 		context:    newEgressContext(),
 		pathMTU:    egressDefaultPathMTU,
 		flows:      newEgressFlowTable(0),
+		flowRate:   newEgressFlowRate(),
 		rejections: newEgressRejectionLog(),
 		dial:       dial,
 		send:       send,
@@ -691,6 +693,12 @@ func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time
 func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination uint32, now time.Time) (*egressFlow, string, bool) {
 	if code := r.authorizeTo(consumer, key, destination); code != egressCodeAllowed {
 		return nil, code, false
+	}
+	// The rate token comes last, so a flow any other check refused costs nothing, and only for an
+	// entry this call creates: a retransmitted SYN or a second datagram racing the first finds the
+	// reservation already there and is not a new flow.
+	if _, exists := r.flows.lookup(key); !exists && !r.flowRate.take(consumer) {
+		return nil, egressCodeLimitExceeded, false
 	}
 	flow, opened := r.flows.open(key, consumer, now)
 	return flow, egressCodeAllowed, opened
