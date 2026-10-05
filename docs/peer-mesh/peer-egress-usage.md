@@ -4,7 +4,7 @@
 
 关联 [#42](https://github.com/devShuai/specus/issues/42)。线协议与语义见 [peer-egress.md](../../protocol/spec/peer-egress.md)；本文只讲怎么用、怎么确认生效、怎么排查。
 
-> **一期状态。** 下面描述的是当前实现的行为。三端单元测试、共享向量与 CLI 进程矩阵覆盖了规则、路由接管、状态与登录声明；**跨平台真机验收（P7，[#50](https://github.com/devShuai/specus/issues/50)）尚未完成**，吞吐也还没有实测数据。生产使用前请先在自己的网络里验证，并阅读文末的限制。
+> **一期状态。** 下面描述的是当前实现的行为。三端单元测试、共享向量与 CLI 进程矩阵覆盖了规则、路由接管、状态与登录声明；Linux 命名空间实验室（[真机实验室](../../scripts/peer-egress-lab/README.md)，CI 里三种消费端 × 三种出口）另外以出口自己的拒绝计数验证了 #42 的拒绝项：`0.0.0.0/0` 下的云元数据地址、目录尚未送达时已被移出允许列表的消费端、每消费端并发上限与新建流速率。跨租户的设备在服务端就建立不了对端会话，这一项留给服务端单元测试。**跨平台真机验收（P7，[#50](https://github.com/devShuai/specus/issues/50)）尚未完成**，吞吐也还没有实测数据。生产使用前请先在自己的网络里验证，并阅读文末的限制。
 
 ## 先看它不做什么
 
@@ -254,7 +254,7 @@ ip rule add fwmark 0x5350 table 100
 
 **可识别边界：** 应用自带 DoH/DoT、使用系统缓存、或直接硬编码 IP 时，域名规则**不会**命中，这类流量只能靠 IP/CIDR 规则覆盖。
 
-> **二期状态。** 下面描述的是当前实现的行为。单元测试与共享向量覆盖了规则、地址池、应答者与接管命令；Linux 命名空间实验室（`scripts/peer-egress-lab/lab.py`，CI 里三种消费端 × 三种出口）以 `/etc/resolv.conf` 方式完整跑通了接管、经出口访问、池内无映射与强杀后恢复。Windows 与 macOS 的真机验收（NRPT、networksetup）尚未完成，见 #50。
+> **二期状态。** 下面描述的是当前实现的行为。单元测试与共享向量覆盖了规则、地址池、应答者与接管命令；Linux 命名空间实验室（`scripts/peer-egress-lab/lab.py`，CI 里三种消费端 × 三种出口）以 `/etc/resolv.conf` 方式完整跑通了接管、经出口访问、池内无映射与强杀后恢复，并验证了 DNS 重绑定：策略的 `domainRules` 放行了名字，出口把它解析到云元数据或内网地址时仍以 `EGRESS_FORBIDDEN_DESTINATION` / `EGRESS_SCOPE_DENIED` 拒绝。Windows 与 macOS 的真机验收（NRPT、networksetup）尚未完成，见 #50。
 
 ### 打开二期
 
