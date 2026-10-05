@@ -1,0 +1,221 @@
+{
+  "description": "When an egress sends egress-report and its body. A tick runs every intervalSeconds; `egress` is the egress section of the local status at that tick, `report` the message sent or null. See protocol/spec/peer-egress.md, egress-report.",
+  "intervalSeconds": 60,
+  "events": [
+    {
+      "wallMs": 1791000000000,
+      "active": true,
+      "egress": {
+        "flows": 0,
+        "totalFlows": 0,
+        "refused": {},
+        "bytesIn": 0,
+        "bytesOut": 0
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000000000,
+        "activeFlows": 0,
+        "totalFlows": 0,
+        "rejectedFlows": {},
+        "bytesIn": 0,
+        "bytesOut": 0
+      }
+    },
+    {
+      "wallMs": 1791000060000,
+      "active": true,
+      "egress": {
+        "flows": 0,
+        "totalFlows": 0,
+        "refused": {},
+        "bytesIn": 0,
+        "bytesOut": 0
+      },
+      "report": null
+    },
+    {
+      "wallMs": 1791000120000,
+      "active": true,
+      "egress": {
+        "flows": 2,
+        "totalFlows": 5,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 900,
+        "bytesOut": 1200
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000120000,
+        "activeFlows": 2,
+        "totalFlows": 5,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 900,
+        "bytesOut": 1200
+      }
+    },
+    {
+      "wallMs": 1791000180000,
+      "active": true,
+      "egress": {
+        "flows": 2,
+        "totalFlows": 5,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 900,
+        "bytesOut": 1200
+      },
+      "report": null
+    },
+    {
+      "wallMs": 1791000240000,
+      "active": true,
+      "egress": {
+        "flows": 2,
+        "totalFlows": 5,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 4096,
+        "bytesOut": 1200
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000240000,
+        "activeFlows": 2,
+        "totalFlows": 5,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 4096,
+        "bytesOut": 1200
+      }
+    },
+    {
+      "newSession": true
+    },
+    {
+      "wallMs": 1791000300000,
+      "active": true,
+      "egress": {
+        "flows": 2,
+        "totalFlows": 5,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 4096,
+        "bytesOut": 1200
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000300000,
+        "activeFlows": 2,
+        "totalFlows": 5,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1
+        },
+        "bytesIn": 4096,
+        "bytesOut": 1200
+      }
+    },
+    {
+      "wallMs": 1791000200000,
+      "active": true,
+      "egress": {
+        "flows": 1,
+        "totalFlows": 6,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1300
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000300001,
+        "activeFlows": 1,
+        "totalFlows": 6,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1300
+      }
+    },
+    {
+      "wallMs": 1791000360000,
+      "active": false,
+      "egress": {
+        "flows": 0,
+        "totalFlows": 6,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1300
+      },
+      "report": null
+    },
+    {
+      "wallMs": 1791000420000,
+      "active": true,
+      "egress": {
+        "flows": 0,
+        "totalFlows": 6,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1300
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000420000,
+        "activeFlows": 0,
+        "totalFlows": 6,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1300
+      }
+    },
+    {
+      "wallMs": 1791000480000,
+      "active": true,
+      "egress": {
+        "flows": 0,
+        "totalFlows": 6,
+        "refused": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2,
+          "EGRESS_SCOPE_DENIED": 0
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1301
+      },
+      "report": {
+        "type": "egress-report",
+        "revision": 1791000480000,
+        "activeFlows": 0,
+        "totalFlows": 6,
+        "rejectedFlows": {
+          "EGRESS_DEST_DENIED": 1,
+          "EGRESS_PORT_DENIED": 2
+        },
+        "bytesIn": 5000,
+        "bytesOut": 1301
+      }
+    }
+  ]
+}
