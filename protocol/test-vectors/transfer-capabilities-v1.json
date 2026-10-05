@@ -1,0 +1,470 @@
+{
+  "description": "Capability snapshots every server must compute from the same rows at the same instant. Put the rows into the server's own store, fix its clock at `now`, read the snapshot for `account`, and compare every field (timestamps as instants). See protocol/spec/transfer-capabilities.md.",
+  "cases": [
+    {
+      "name": "counts-only-live-rows-of-this-account",
+      "now": "2026-09-15T12:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "PENDING",
+          "sizeBytes": 100,
+          "uploadExpiresAt": "2026-09-15T13:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "PENDING",
+          "sizeBytes": 200,
+          "uploadExpiresAt": "2026-09-15T12:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "PENDING",
+          "sizeBytes": 70,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "LINK",
+          "status": "UPLOADED",
+          "sizeBytes": 300,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 400,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-15T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "EXPIRED",
+          "sizeBytes": 500,
+          "uploadExpiresAt": "2026-09-15T13:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t1",
+          "username": "bob",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 50,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        },
+        {
+          "tenantId": "t2",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 60,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        }
+      ],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-09",
+          "sizeBytes": 256
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-09",
+          "sizeBytes": 64
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-08",
+          "sizeBytes": 1000
+        },
+        {
+          "tenantId": "t1",
+          "username": "bob",
+          "usageMonth": "2026-09",
+          "sizeBytes": 99
+        },
+        {
+          "tenantId": "t2",
+          "username": "alice",
+          "usageMonth": "2026-09",
+          "sizeBytes": 77
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-09-15T12:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 400,
+        "storageRemainingBytes": 600,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 320,
+        "monthlyDownloadRemainingBytes": 180,
+        "downloadUsageMonth": "2026-09",
+        "downloadResetsAt": "2026-10-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "usage-above-quota-is-not-capped",
+      "now": "2026-09-15T12:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 100,
+        "monthlyDownloadQuotaBytes": 100
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 150,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        }
+      ],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-09",
+          "sizeBytes": 120
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-09-15T12:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 100,
+        "storageUsedBytes": 150,
+        "storageRemainingBytes": 0,
+        "monthlyDownloadQuotaBytes": 100,
+        "monthlyDownloadUsedBytes": 120,
+        "monthlyDownloadRemainingBytes": 0,
+        "downloadUsageMonth": "2026-09",
+        "downloadResetsAt": "2026-10-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "last-second-of-the-year",
+      "now": "2026-12-31T23:59:59Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 10,
+          "uploadExpiresAt": "2026-12-31T00:00:00Z",
+          "expiresAt": "2027-01-01T00:00:00Z"
+        }
+      ],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-12",
+          "sizeBytes": 11
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2027-01",
+          "sizeBytes": 13
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-12-31T23:59:59Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 10,
+        "storageRemainingBytes": 990,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 11,
+        "monthlyDownloadRemainingBytes": 489,
+        "downloadUsageMonth": "2026-12",
+        "downloadResetsAt": "2027-01-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "first-second-of-the-year",
+      "now": "2027-01-01T00:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 10,
+          "uploadExpiresAt": "2026-12-31T00:00:00Z",
+          "expiresAt": "2027-01-01T00:00:00Z"
+        }
+      ],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-12",
+          "sizeBytes": 11
+        },
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2027-01",
+          "sizeBytes": 13
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2027-01-01T00:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 0,
+        "storageRemainingBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 13,
+        "monthlyDownloadRemainingBytes": 487,
+        "downloadUsageMonth": "2027-01",
+        "downloadResetsAt": "2027-02-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "leap-day",
+      "now": "2028-02-29T10:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2028-02",
+          "sizeBytes": 5
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2028-02-29T10:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 0,
+        "storageRemainingBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 5,
+        "monthlyDownloadRemainingBytes": 495,
+        "downloadUsageMonth": "2028-02",
+        "downloadResetsAt": "2028-03-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "unconfigured-quotas-fall-back-to-one-gib",
+      "now": "2026-09-15T12:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 0,
+        "monthlyDownloadQuotaBytes": -5
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 1,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        }
+      ],
+      "downloadUsage": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "usageMonth": "2026-09",
+          "sizeBytes": 2
+        }
+      ],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-09-15T12:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1073741824,
+        "storageUsedBytes": 1,
+        "storageRemainingBytes": 1073741823,
+        "monthlyDownloadQuotaBytes": 1073741824,
+        "monthlyDownloadUsedBytes": 2,
+        "monthlyDownloadRemainingBytes": 1073741822,
+        "downloadUsageMonth": "2026-09",
+        "downloadResetsAt": "2026-10-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "storage-disabled-still-reports-usage",
+      "now": "2026-09-15T12:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": false,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [
+        {
+          "tenantId": "t1",
+          "username": "alice",
+          "scope": "ROOM",
+          "status": "UPLOADED",
+          "sizeBytes": 3,
+          "uploadExpiresAt": "2026-09-15T11:00:00Z",
+          "expiresAt": "2026-09-18T12:00:00Z"
+        }
+      ],
+      "downloadUsage": [],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-09-15T12:00:00Z",
+        "storageEnabled": false,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 3,
+        "storageRemainingBytes": 997,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 0,
+        "monthlyDownloadRemainingBytes": 500,
+        "downloadUsageMonth": "2026-09",
+        "downloadResetsAt": "2026-10-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    },
+    {
+      "name": "no-rows",
+      "now": "2026-09-15T12:00:00Z",
+      "account": {
+        "tenantId": "t1",
+        "username": "alice"
+      },
+      "config": {
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500
+      },
+      "attachments": [],
+      "downloadUsage": [],
+      "expect": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-09-15T12:00:00Z",
+        "storageEnabled": true,
+        "maxAttachmentBytes": 536870912,
+        "retentionHours": 72,
+        "storageQuotaBytes": 1000,
+        "storageUsedBytes": 0,
+        "storageRemainingBytes": 1000,
+        "monthlyDownloadQuotaBytes": 500,
+        "monthlyDownloadUsedBytes": 0,
+        "monthlyDownloadRemainingBytes": 500,
+        "downloadUsageMonth": "2026-09",
+        "downloadResetsAt": "2026-10-01T00:00:00Z",
+        "downloadGrantSingleUse": true
+      }
+    }
+  ]
+}
