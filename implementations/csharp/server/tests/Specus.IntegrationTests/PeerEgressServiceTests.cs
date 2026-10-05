@@ -251,6 +251,53 @@ public sealed class PeerEgressServiceTests
         Assert.False(entry.DomainTargetCapable);
     }
 
+    /// <summary>
+    /// <c>egressVersion</c> is how a consumer tells an egress that cannot take a flow (an old
+    /// client, 0) from one that can. It comes from what each egress's online session announced, and
+    /// it is written even when 0, because a consumer reads an absent field as an old server instead.
+    /// </summary>
+    [Fact]
+    public async Task TheCatalogueCarriesEachEgressAnnouncedVersion()
+    {
+        const long OldEgressId = 4004;
+        const long OfflineEgressId = 5005;
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var current = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        var old = fixture.AddClient(OldEgressId, "egress-owner", "old-gateway");
+        var offline = fixture.AddClient(OfflineEgressId, "egress-owner", "offline-gateway");
+        foreach (var egress in new[] { current, old, offline })
+        {
+            fixture.AllowPeering(consumer, egress);
+        }
+        fixture.AddOnlineSession(current, 4601, egressVersion: 1);
+        // An old client is online but announced no clientEgressCapabilities.
+        fixture.AddOnlineSession(old, 4602, egressVersion: 0);
+        // It announced version 1, but that session has ended: nothing online can take the flow.
+        fixture.AddSession(offline, 4603, egressVersion: 1, domainTargets: false, status: "DISCONNECTED");
+        await fixture.SaveChangesAsync();
+        foreach (var egressId in new[] { EgressId, OldEgressId, OfflineEgressId })
+        {
+            await fixture.UpsertAsync(egressId, enabled: true, consumers: [ConsumerId]);
+        }
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+
+        Assert.NotNull(catalog);
+        var entries = catalog.Egresses!.ToDictionary(entry => entry.ClientId);
+        Assert.Equal(3, entries.Count);
+        Assert.Equal(1, entries[EgressId].EgressVersion);
+        Assert.Equal(0, entries[OldEgressId].EgressVersion);
+        Assert.Equal(0, entries[OfflineEgressId].EgressVersion);
+
+        // Serialised the way the server sends a control message.
+        using var wire = JsonDocument.Parse(JsonSerializer.Serialize(catalog));
+        var encoded = wire.RootElement.GetProperty("egresses").EnumerateArray().ToList();
+        Assert.Equal(3, encoded.Count);
+        Assert.All(encoded, entry =>
+            Assert.True(entry.TryGetProperty("egressVersion", out _), entry.GetRawText()));
+    }
+
     [Fact]
     public void DestinationRulesRoundTripAndRejectOversizedInput()
     {

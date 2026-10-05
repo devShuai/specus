@@ -75,10 +75,11 @@ static int egress_is_online(void *raw, long long client_id, const char *client_n
 }
 
 /* Logs a client in the way the HTTP login and the control connection leave its session row. */
-static int open_egress_session(const char *path,
-                               const st_storage_client *client,
-                               int domain_targets,
-                               long long *session_id)
+static int open_egress_session_announcing(const char *path,
+                                          const st_storage_client *client,
+                                          int egress_version,
+                                          int domain_targets,
+                                          long long *session_id)
 {
     static int logins;
     st_storage_client_session session;
@@ -94,13 +95,21 @@ static int open_egress_session(const char *path,
     snprintf(session.os_user, sizeof(session.os_user), "%s", "tester");
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", "2026-06-25T00:00:00Z");
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", "2099-06-25T08:00:00Z");
-    session.client_egress_version = 1;
+    session.client_egress_version = egress_version;
     session.client_egress_domain_targets = domain_targets;
     if (st_storage_create_client_session(path, &session, &session) != 0
         || st_storage_mark_client_session_online(path, session.id, "channel", "127.0.0.1:7000",
                                                  "2026-06-25T00:01:00Z") != 0) return -1;
     *session_id = session.id;
     return 0;
+}
+
+static int open_egress_session(const char *path,
+                               const st_storage_client *client,
+                               int domain_targets,
+                               long long *session_id)
+{
+    return open_egress_session_announcing(path, client, 1, domain_targets, session_id);
 }
 
 static int add_egress_policy(const char *path, const st_storage_client *egress, long long consumer_id)
@@ -152,6 +161,23 @@ static int catalog_entry_flag(const char *message, const char *client_name, cons
     if (strncmp(value, "true", 4) == 0) return 1;
     if (strncmp(value, "false", 5) == 0) return 0;
     return -1;
+}
+
+/* A non-negative integer field of one catalogue entry, or -1 when the entry or field is missing. */
+static long catalog_entry_int(const char *message, const char *client_name, const char *field)
+{
+    char needle[160];
+    char key[64];
+    snprintf(needle, sizeof(needle), "\"clientName\":\"%s\"", client_name);
+    snprintf(key, sizeof(key), "\"%s\":", field);
+    const char *entry = message == NULL ? NULL : strstr(message, needle);
+    const char *end = entry == NULL ? NULL : strchr(entry, '}');
+    const char *value = entry == NULL ? NULL : strstr(entry, key);
+    if (end == NULL || value == NULL || value > end) return -1;
+    value += strlen(key);
+    char *parsed_end = NULL;
+    long parsed = strtol(value, &parsed_end, 10);
+    return parsed_end == value || parsed < 0 ? -1 : parsed;
 }
 
 /*
@@ -268,6 +294,89 @@ static int test_egress_catalog_domain_targets(void)
     if (catalog_entry_flag(catalog, "egress-dns", "domainTargetCapable") != 0
         || catalog_entry_flag(catalog, "egress-plain", "domainTargetCapable") != 0) {
         fprintf(stderr, "egress catalog advertised domain targets without an online session: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
+}
+
+/* The version fixture: every device is connected except the two whose egress has gone away. */
+static int version_egress_is_online(void *raw, long long client_id, const char *client_name)
+{
+    (void)raw;
+    (void)client_id;
+    return strcmp(client_name, "egress-gone") != 0 && strcmp(client_name, "egress-departing") != 0;
+}
+
+/*
+ * egressVersion in the egress-catalog is the version each egress announced on its current online
+ * session, and 0 for an old client or an egress with no live session. It is always written: a
+ * consumer reads 0 as an egress that cannot take a flow, but an absent field as an old server.
+ */
+static int test_egress_catalog_egress_version(void)
+{
+    char path[] = "/tmp/specus_c_peer_egress_version_tests.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) return 1;
+
+    static const char *const names[] = { "egress-current", "egress-old", "egress-gone", "egress-departing" };
+    st_storage_client consumer;
+    st_storage_client egresses[4];
+    st_storage_peer_mesh_device device;
+    long long session_id = 0;
+    st_storage_peer_mesh_egress_switch egress_switch;
+    memset(&egress_switch, 0, sizeof(egress_switch));
+    snprintf(egress_switch.tenant_id, sizeof(egress_switch.tenant_id), "%s", "tenant-egress-version");
+    egress_switch.enabled = 1;
+    snprintf(egress_switch.updated_by, sizeof(egress_switch.updated_by), "%s", "admin");
+    int failed = st_storage_upsert_client(path, 0, "tenant-egress-version", "egress-consumer", "owner", 1, 60,
+                                          &consumer) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &consumer, 1, &device) != 0
+        || st_storage_upsert_peer_mesh_egress_switch(path, &egress_switch) != 0
+        || open_egress_session(path, &consumer, 0, &session_id) != 0;
+    for (size_t i = 0; !failed && i < 4U; ++i) {
+        failed = st_storage_upsert_client(path, 0, "tenant-egress-version", names[i], "owner", 1, 60,
+                                          &egresses[i]) != 0
+            || st_storage_update_peer_mesh_device_enabled(path, &egresses[i], 1, &device) != 0
+            || add_egress_policy(path, &egresses[i], consumer.id) != 0;
+    }
+    /*
+     * egress-current announced version 1. egress-old is an old client that announced none.
+     * egress-gone announced 1 on a session that has since ended. egress-departing still has its
+     * session row online, as during the logout push, but its connection is already gone.
+     */
+    failed = failed
+        || open_egress_session_announcing(path, &egresses[0], 1, 0, &session_id) != 0
+        || open_egress_session_announcing(path, &egresses[1], 0, 0, &session_id) != 0
+        || open_egress_session_announcing(path, &egresses[2], 1, 0, &session_id) != 0
+        || st_storage_mark_client_session_disconnected(path, session_id, "2026-06-25T00:02:00Z") != 0
+        || open_egress_session_announcing(path, &egresses[3], 1, 0, &session_id) != 0;
+    if (failed) {
+        fprintf(stderr, "egress version fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+
+    peer_test_context capture;
+    memset(&capture, 0, sizeof(capture));
+    st_peer_mesh_runtime runtime = {path, capture_signal, version_egress_is_online, &capture, 0, 2};
+    if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress-version") != 0) {
+        fprintf(stderr, "egress version catalog refresh failed\n");
+        unlink(path);
+        return 1;
+    }
+    const char *catalog = last_egress_catalog(&capture, "egress-consumer");
+    /* -1 would mean the field is missing, so each 0 below also proves it was written. */
+    if (catalog_entry_int(catalog, "egress-current", "egressVersion") != 1
+        || catalog_entry_int(catalog, "egress-old", "egressVersion") != 0
+        || catalog_entry_int(catalog, "egress-gone", "egressVersion") != 0
+        || catalog_entry_int(catalog, "egress-departing", "egressVersion") != 0) {
+        fprintf(stderr, "egress catalog did not carry each online egress's announced version: %s\n",
                 catalog == NULL ? "(none)" : catalog);
         unlink(path);
         return 1;
@@ -570,6 +679,7 @@ int main(void)
 
     unlink(path);
     if (test_egress_catalog_domain_targets() != 0) return 1;
+    if (test_egress_catalog_egress_version() != 0) return 1;
     printf("peer mesh tests passed\n");
     return 0;
 }
