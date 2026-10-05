@@ -88,10 +88,10 @@ public sealed record PeerEgressConfigMessage(long Revision, PeerEgressPolicy Pol
 
             // Grants by name (protocol/spec/peer-egress.md, 按域名授权). An absent or non-array
             // field is no domain rules, which is also what an older server sends by omission. An
-            // entry that is not an object, or whose match is not a name or *.name as a consumer's
-            // domain rule is written, is skipped and the rest kept: a rule this node cannot read
-            // must grant nothing, and must not take the readable ones down with it. The match is
-            // kept normalised, the protocols and port ranges as a destination rule's are.
+            // entry that is not an object, whose match is not a name or *.name as a consumer's
+            // domain rule is written, or whose lists are not the shapes a destination rule's are,
+            // is skipped and the rest kept: a rule this node cannot read must grant nothing, and
+            // must not take the readable ones down with it. The match is kept normalised.
             var domainRules = new List<PeerEgressDomainRule>();
             if (message.TryGetProperty("domainRules", out var rawDomains)
                 && rawDomains.ValueKind == JsonValueKind.Array)
@@ -103,15 +103,17 @@ public sealed record PeerEgressConfigMessage(long Revision, PeerEgressPolicy Pol
                         continue;
                     }
                     var match = Text(node, "match").Trim();
-                    if (!PeerEgressNames.ValidMatch(match))
+                    if (!PeerEgressNames.ValidMatch(match)
+                        || StrictStrings(node, "protocols") is not { } protocols
+                        || StrictPortRanges(node) is not { } ranges)
                     {
                         continue;
                     }
                     domainRules.Add(new PeerEgressDomainRule
                     {
                         Match = PeerEgressNames.Normalize(match),
-                        Protocols = Strings(node, "protocols"),
-                        PortRanges = PortRanges(node),
+                        Protocols = protocols,
+                        PortRanges = ranges,
                     });
                 }
             }
@@ -196,5 +198,84 @@ public sealed record PeerEgressConfigMessage(long Revision, PeerEgressPolicy Pol
             }
         }
         return ranges;
+    }
+
+    /// <summary>
+    /// A domain rule's protocols: an array of strings, absent or null read as empty, anything else
+    /// null. Read leniently, a bare string would be a list nobody wrote, and a single non-string
+    /// entry would stand for a protocol the server never named.
+    /// </summary>
+    private static List<string>? StrictStrings(JsonElement parent, string name)
+    {
+        var values = new List<string>();
+        if (!parent.TryGetProperty(name, out var array) || array.ValueKind == JsonValueKind.Null)
+        {
+            return values;
+        }
+        if (array.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+        foreach (var entry in array.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+            values.Add(entry.GetString()!);
+        }
+        return values;
+    }
+
+    /// <summary>
+    /// A domain rule's port ranges: an array of [integer, integer] pairs, absent or null read as
+    /// empty, anything else null. A pair of another length, or a bound that is not an integer
+    /// (443.0 included, as the reference reads JSON), makes the whole list unreadable rather than
+    /// being read as a zero.
+    /// </summary>
+    private static List<int[]>? StrictPortRanges(JsonElement node)
+    {
+        var ranges = new List<int[]>();
+        if (!node.TryGetProperty("portRanges", out var array) || array.ValueKind == JsonValueKind.Null)
+        {
+            return ranges;
+        }
+        if (array.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+        foreach (var pair in array.EnumerateArray())
+        {
+            if (pair.ValueKind != JsonValueKind.Array || pair.GetArrayLength() != 2
+                || !Integer(pair[0], out var low) || !Integer(pair[1], out var high))
+            {
+                return null;
+            }
+            ranges.Add([low, high]);
+        }
+        return ranges;
+    }
+
+    /// <summary>
+    /// A JSON integer: a number written without a fraction or an exponent. One outside the range of
+    /// an int is clamped to it, which keeps every comparison against a port as the written value
+    /// would decide it.
+    /// </summary>
+    private static bool Integer(JsonElement value, out int result)
+    {
+        result = 0;
+        if (value.ValueKind != JsonValueKind.Number)
+        {
+            return false;
+        }
+        var raw = value.GetRawText();
+        if (raw.AsSpan().IndexOfAny('.', 'e', 'E') >= 0)
+        {
+            return false;
+        }
+        result = value.TryGetInt64(out var wide)
+            ? (int)Math.Clamp(wide, int.MinValue, int.MaxValue)
+            : raw.StartsWith('-') ? int.MinValue : int.MaxValue;
+        return true;
     }
 }

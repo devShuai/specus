@@ -76,7 +76,8 @@ public class PeerEgressDomainPolicyVectorTests
 
     /// <summary>
     /// What the decoder keeps: a match normalised, an unreadable entry skipped without taking the
-    /// readable ones with it, and an absent or non-array field read as no rules.
+    /// readable ones with it, lists of the wrong shape skipped the same way, absent lists read as
+    /// empty, and an absent or non-array field read as no rules.
     /// </summary>
     [Fact]
     public void DomainRulesDecodeAsTheReferenceKeepsThem()
@@ -96,5 +97,56 @@ public class PeerEgressDomainPolicyVectorTests
         Assert.Empty(PolicyFor(vector, cases["absent-domain-rules"]).DomainRules);
         Assert.Empty(PolicyFor(vector, cases["domain-rules-not-an-array"]).DomainRules);
         Assert.Empty(PolicyFor(vector, cases["wildcard-entry-grants-nothing"]).DomainRules);
+        Assert.Empty(PolicyFor(vector, cases["protocols-not-an-array-skipped"]).DomainRules);
+        Assert.Empty(PolicyFor(vector, cases["port-range-not-integers-skipped"]).DomainRules);
+
+        var absent = Assert.Single(PolicyFor(vector, cases["absent-lists-allow-no-protocol"]).DomainRules);
+        Assert.Equal("example.com", absent.Match);
+        Assert.Empty(absent.Protocols);
+        Assert.Empty(absent.PortRanges);
+    }
+
+    /// <summary>
+    /// Shapes the vector does not spell out, each against the reference's reading: a null list is an
+    /// absent one, a pair of another length or a non-integer bound makes the entry unreadable, and an
+    /// integer too wide for an int is still an integer that bounds every port.
+    /// </summary>
+    [Theory]
+    [InlineData("\"protocols\": null, \"portRanges\": null", true, 0)]
+    [InlineData("\"protocols\": [\"tcp\", 6], \"portRanges\": [[443, 443]]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [[443]]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [[443, 443, 443]]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [[true, 443]]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [[4.43e2, 443]]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [443, 443]", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": {\"0\": [443, 443]}", false, 0)]
+    [InlineData("\"protocols\": [\"tcp\"], \"portRanges\": [[0, 99999999999]]", true, 1)]
+    public void DomainRuleListsAreReadStrictly(string lists, bool kept, int ranges)
+    {
+        var decoded = PeerEgressConfigMessage.Decode(
+            $"{{\"type\": \"egress-config\", \"domainRules\": [{{\"match\": \"example.com\", {lists}}}]}}");
+        Assert.NotNull(decoded);
+        Assert.Equal(kept ? 1 : 0, decoded!.Policy.DomainRules.Count);
+        if (kept)
+        {
+            Assert.Equal(ranges, decoded.Policy.DomainRules[0].PortRanges.Count);
+        }
+    }
+
+    /// <summary>An integer bound wider than an int still allows the ports it spans, as the reference reads it.</summary>
+    [Fact]
+    public void AWideIntegerBoundStillAllowsThePortsItSpans()
+    {
+        var decoded = PeerEgressConfigMessage.Decode(
+            "{\"type\": \"egress-config\", \"enabled\": true, \"scope\": \"PUBLIC\", \"allowedConsumerClientIds\": [1], "
+            + "\"domainRules\": [{\"match\": \"example.com\", \"protocols\": [\"tcp\"], \"portRanges\": [[0, 99999999999]]}]}");
+        var decision = PeerEgressAuthorization.Authorize(
+            new PeerEgressRequest
+            {
+                ConsumerClientId = 1, DestinationIp = "192.0.2.10", DestinationPort = 65535, Protocol = "tcp",
+                Name = "example.com",
+            },
+            decoded!.Policy, true, PeerEgressContext.Default);
+        Assert.Equal(PeerEgressCodes.Allowed, decision.Code);
     }
 }
