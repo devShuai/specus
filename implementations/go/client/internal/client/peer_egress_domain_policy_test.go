@@ -103,6 +103,8 @@ func TestEgressConfigDecodesDomainRules(t *testing.T) {
 			[]egressDomainRule{{Match: "*.cdn.example", Protocols: []string{"tcp"}, PortRanges: [][]int{{443, 443}}}}},
 		{"absent lists", `,"domainRules":[{"match":"example.org"}]`,
 			[]egressDomainRule{{Match: "example.org"}}},
+		{"null lists", `,"domainRules":[{"match":"example.org","protocols":null,"portRanges":null}]`,
+			[]egressDomainRule{{Match: "example.org"}}},
 		{"unreadable entries skipped", `,"domainRules":[
 			"example.com", null, 7, ["example.com"],
 			{"match":"*","protocols":["tcp"],"portRanges":[[443,443]]},
@@ -113,8 +115,19 @@ func TestEgressConfigDecodesDomainRules(t *testing.T) {
 			{"match":"a.*.example.com","protocols":["tcp"],"portRanges":[[443,443]]},
 			{"match":7,"protocols":["tcp"],"portRanges":[[443,443]]},
 			{"protocols":["tcp"],"portRanges":[[443,443]]},
+			{"match":"*. example.com","protocols":["tcp"],"portRanges":[[443,443]]},
+			{"match":"example.com .","protocols":["tcp"],"portRanges":[[443,443]]},
 			{"match":"shape.example","protocols":"tcp","portRanges":[[443,443]]},
+			{"match":"shape.example","protocols":["tcp",null],"portRanges":[[443,443]]},
+			{"match":"shape.example","protocols":[6],"portRanges":[[443,443]]},
 			{"match":"shape.example","protocols":["tcp"],"portRanges":[[443.5,443]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[[443.0,443.0]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[[443]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[[443,443,443]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[[443,null]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[null]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":[[true,443]]},
+			{"match":"shape.example","protocols":["tcp"],"portRanges":"443"},
 			{"match":"EXAMPLE.com.","protocols":["tcp"],"portRanges":[[443,443]]}]`,
 			[]egressDomainRule{{Match: "example.com", Protocols: []string{"tcp"}, PortRanges: [][]int{{443, 443}}}}},
 	}
@@ -132,6 +145,25 @@ func TestEgressConfigDecodesDomainRules(t *testing.T) {
 		if got, want := fmt.Sprintf("%+v", policy.DomainRules), fmt.Sprintf("%+v", c.want); got != want {
 			t.Errorf("%s: domain rules %s, want %s", c.name, got, want)
 		}
+	}
+}
+
+// A domain match is read as written once trimmed: space left inside it, beside the wildcard or
+// before a trailing dot, makes it malformed, as the reference generator reads it. The same check
+// serves a consumer's domain rule, which is refused for it too.
+func TestEgressDomainMatchRefusesSpaceInsideTheName(t *testing.T) {
+	for match, valid := range map[string]bool{
+		"example.com": true, "*.example.com": true, "Example.COM.": true, "*.CDN.Example.": true,
+		"*. example.com": false, "example.com .": false, "*.\texample.com": false, "exa mple.com": false,
+		"example.com. .": false,
+	} {
+		if validEgressDomainMatch(match) != valid {
+			t.Errorf("validEgressDomainMatch(%q) = %v, want %v", match, !valid, valid)
+		}
+	}
+	rule := egressRule{Match: "*. example.com", Action: egressActionEgress, EgressClientID: 2}
+	if code := validateEgressRuleIn(rule, egressDefaultMeshCIDR, egressDefaultFakeIPCIDR); code != egressCodeRuleMalformed {
+		t.Errorf("a consumer rule %q is %q, want %s", rule.Match, code, egressCodeRuleMalformed)
 	}
 }
 

@@ -854,11 +854,12 @@ func decodeEgressConfig(payload []byte) (egressPolicy, int64, bool) {
 // decodeEgressDomainRules reads the domainRules of an egress-config push (protocol/spec/peer-egress.md,
 // 按域名授权).
 //
-// A field that is absent, null or not an array is no domain rules. An entry that is not an object,
-// or whose match is not a name or *.name as a consumer's domain rule is written, is skipped and the
-// rest are kept: a rule this node cannot read must grant nothing, and refusing the whole push over
-// it would also throw away the destination rules that came with it. An entry whose protocols or
-// port ranges do not have a destination rule's shape is skipped for the same reason. The match is
+// A field that is absent, null or not an array is no domain rules. An entry is skipped, and the
+// rest kept, when it is not an object, when its match is not a name or *.name as a consumer's
+// domain rule is written, when its protocols is not an array of strings, or when its portRanges is
+// not an array of pairs of integers: a rule this node cannot read must grant nothing, and refusing
+// the whole push over it would also throw away the destination rules that came with it. Absent or
+// null lists are empty ones, so such a rule covers its names and allows no protocol. The match is
 // kept trimmed, without its trailing dot and in lower case, the form names are compared in.
 //
 // Shared vector: protocol/test-vectors/peer-egress-domain-policy-v1.json.
@@ -872,23 +873,38 @@ func decodeEgressDomainRules(raw json.RawMessage) []egressDomainRule {
 		if trimmed := strings.TrimSpace(string(entry)); !strings.HasPrefix(trimmed, "{") {
 			continue
 		}
-		var rule struct {
-			Match      string   `json:"match"`
-			Protocols  []string `json:"protocols"`
-			PortRanges [][]int  `json:"portRanges"`
+		// Pointers, because the JSON library reads a null element as the zero value: a protocol ""
+		// or a port 0 that nobody wrote.
+		var wire struct {
+			Match      string    `json:"match"`
+			Protocols  []*string `json:"protocols"`
+			PortRanges [][]*int  `json:"portRanges"`
 		}
-		if json.Unmarshal(entry, &rule) != nil {
+		if json.Unmarshal(entry, &wire) != nil {
 			continue
 		}
-		match := strings.TrimSpace(rule.Match)
+		match := strings.TrimSpace(wire.Match)
 		if !looksLikeEgressDomainRule(match) || !validEgressDomainMatch(match) {
 			continue
 		}
-		rules = append(rules, egressDomainRule{
-			Match:      normalizeEgressName(match),
-			Protocols:  rule.Protocols,
-			PortRanges: rule.PortRanges,
-		})
+		rule, readable := egressDomainRule{Match: normalizeEgressName(match)}, true
+		for _, protocol := range wire.Protocols {
+			if protocol == nil {
+				readable = false
+				break
+			}
+			rule.Protocols = append(rule.Protocols, *protocol)
+		}
+		for _, pair := range wire.PortRanges {
+			if len(pair) != 2 || pair[0] == nil || pair[1] == nil {
+				readable = false
+				break
+			}
+			rule.PortRanges = append(rule.PortRanges, []int{*pair[0], *pair[1]})
+		}
+		if readable {
+			rules = append(rules, rule)
+		}
 	}
 	return rules
 }
