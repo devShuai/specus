@@ -373,9 +373,30 @@ each binds one control connection plus one data connection. Ordinary HTTP reques
 data connection: request/response metadata is carried once in `OPEN`, body bytes are streamed with
 `DATA`, and `FIN`, `RST`, and `WINDOW_UPDATE` propagate half-close, cancellation, and flow control.
 WebSocket upgrades use the same NAT stream and preserve frame semantics in the mandatory 12-byte
-`SWS2` envelope. The validator consumes the shared `application-protocol-v2.json` vectors and rejects
-bad magic, truncation, trailing bytes, reserved flag bits, unknown opcodes, and forbidden close codes
-`1004/1005/1006/1015`. The C
+`SWS2` envelope. The codec replays every sample of the shared `application-protocol-v2.json` vector
+and rejects bad magic, truncation, trailing bytes, reserved flag bits, unknown opcodes, envelopes over
+the NAT chunk limit, and forbidden close codes `1004/1005/1006/1015`. The bridge enforces a strict
+state machine aligned with the Java/Go/.NET servers:
+
+- browser frames are checked (masking, zero RSV since no extension is negotiated, known opcodes,
+  shortest length encoding, unfragmented control frames of at most 125 bytes, the
+  continuation/FIN message sequence, UTF-8 text, close codes and reasons) and a raw data frame of
+  up to 16 MiB is normalised into SWS2 envelopes: the first keeps the opcode, the rest are
+  continuations and only the last carries FIN. Browser PING is answered locally; violations close
+  the browser with `1002`, `1007` or `1009` (message over 16 MiB) and send the client the same code
+  as its terminal SWS2 CLOSE;
+- client envelopes are written as raw frames with their fragment boundaries kept (as the .NET server
+  does), behind the same message rules (no orphan continuation, no new message inside an open one,
+  16 MiB per message, UTF-8 text, zero RSV); control frames may sit between fragments. A violation
+  resets the stream (`RST` 30, or 7 for DATA after FIN) and closes the browser with `1002`;
+- the browser's CLOSE is echoed and forwarded as SWS2 CLOSE + FIN; a client CLOSE (or a FIN without
+  one, which the browser hears as `1001`) waits up to 5 seconds for the browser's reply and returns
+  it as SWS2 CLOSE + FIN. CLOSE is terminal in each direction: nothing is written after it, the
+  browser is not read after its CLOSE, and a client frame after its CLOSE resets the stream. A client
+  RST closes the browser with `1011`; a CLOSE that cannot get NAT credit within 5 seconds resets the
+  stream. `tests/direct_websocket_tests.c` drives all of this through a real listener.
+
+The C
 implementation currently provides the basic data bridge, summary traffic accounting,
 SQLite-backed detail capture/query path, Java-shaped DB credential startup login, and
 Java-shaped response path rewriting for `text/html`
