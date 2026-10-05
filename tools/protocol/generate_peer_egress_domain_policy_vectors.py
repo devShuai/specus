@@ -119,10 +119,29 @@ REJECT = [
 # Egress: decoding the pushed policy and deciding a flow
 # --------------------------------------------------------------------------------------------------
 
+def readable_lists(entry):
+    """protocols must be an array of strings and portRanges an array of [integer, integer] pairs;
+    absent means empty. Anything else makes the entry unreadable."""
+    protocols = entry.get("protocols", [])
+    ranges = entry.get("portRanges", [])
+    if protocols is None:
+        protocols = []
+    if ranges is None:
+        ranges = []
+    if not isinstance(protocols, list) or not all(isinstance(value, str) for value in protocols):
+        return None
+    if not isinstance(ranges, list) or not all(
+            isinstance(pair, list) and len(pair) == 2
+            and all(isinstance(port, int) and not isinstance(port, bool) for port in pair) for pair in ranges):
+        return None
+    return protocols, ranges
+
+
 def decode_domain_rules(config):
     """What an egress keeps from egress-config: an absent or non-array field is no domain rules; an
-    entry that is not an object, or whose match is not a valid name, is skipped and the rest kept.
-    A skipped entry grants nothing, which is what a rule the egress cannot read must do."""
+    entry that is not an object, whose match is not a valid name, or whose protocols or portRanges
+    are not the shapes destinationRules use, is skipped and the rest kept. A skipped entry grants
+    nothing, which is what a rule the egress cannot read must do."""
     value = config.get("domainRules")
     if not isinstance(value, list):
         return []
@@ -134,8 +153,10 @@ def decode_domain_rules(config):
             match = stored_match(entry.get("match"))
         except Refused:
             continue
-        kept.append({"match": match, "protocols": entry.get("protocols") or [],
-                     "portRanges": entry.get("portRanges") or []})
+        lists = readable_lists(entry)
+        if lists is None:
+            continue
+        kept.append({"match": match, "protocols": lists[0], "portRanges": lists[1]})
     return kept
 
 
@@ -238,6 +259,16 @@ AUTHORIZE = [
      flow("192.0.2.10", "example.com"), "EGRESS_ALLOWED"),
     ("wildcard-entry-grants-nothing", {"domainRules": [{"match": "*", "protocols": ["tcp"], "portRanges": [[443, 443]]}]},
      flow("192.0.2.10", "example.com"), "EGRESS_DEST_DENIED"),
+    # A protocols string is not a list of protocols: read as one, "tcp" in "tcp" would grant.
+    ("protocols-not-an-array-skipped", {"domainRules": [{"match": "example.com", "protocols": "tcp",
+                                                          "portRanges": [[443, 443]]}]},
+     flow("192.0.2.10", "example.com"), "EGRESS_DEST_DENIED"),
+    ("port-range-not-integers-skipped", {"domainRules": [{"match": "example.com", "protocols": ["tcp"],
+                                                           "portRanges": [[443.0, 443.0]]}]},
+     flow("192.0.2.10", "example.com"), "EGRESS_DEST_DENIED"),
+    # Absent lists are empty ones: the rule covers the name and allows no protocol.
+    ("absent-lists-allow-no-protocol", {"domainRules": [{"match": "example.com"}]},
+     flow("192.0.2.10", "example.com"), "EGRESS_PROTOCOL_DENIED"),
 ]
 
 
