@@ -467,7 +467,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 }
 ```
 
-`revision` 在同一控制 session 内单调递增，小于或等于上次接受值的快照幂等忽略。`enabled` 转为 `false` 时出口必须立即停止接受新流并关闭全部已建流。
+`revision` 在同一控制 session 内单调递增，小于或等于上次接受值的快照幂等忽略。新的控制 session 重新计：服务端重启后从 1 开始编号，沿用上一 session 的已接受值会把新 session 的推送都当成旧的忽略掉，出口一直执行重启前的策略。`enabled` 转为 `false` 时出口必须立即停止接受新流并关闭全部已建流。
 
 客户端读取这条消息时：
 

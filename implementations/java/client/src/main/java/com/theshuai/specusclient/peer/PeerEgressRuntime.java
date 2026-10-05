@@ -1265,6 +1265,21 @@ final class PeerEgressRuntime {
     }
 
     /**
+     * A new control session. Revisions count within one, and a restarted server numbers its pushes
+     * from 1 again; the last session's revision would hold every push of the new one back until the
+     * count caught up, leaving the policy from before the restart in force. Go and .NET get the same
+     * by building a new plane for each session.
+     */
+    void newControlSession() {
+        lock.lock();
+        try {
+            revision = 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Picks an initial send sequence number.
      *
      * <p>Random rather than counted: a predictable value lets anyone who can guess the four-tuple
