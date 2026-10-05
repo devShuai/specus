@@ -14,7 +14,8 @@ import java.util.Locale;
  * decides rather than the protocol: what an absent field becomes, and whether a value is normalised
  * before it is compared.
  *
- * <p>Shared vector: {@code protocol/test-vectors/peer-egress-control-v1.json}.
+ * <p>Shared vectors: {@code protocol/test-vectors/peer-egress-control-v1.json}, and for the domain
+ * rules {@code protocol/test-vectors/peer-egress-domain-policy-v1.json}.
  *
  * @param revision the snapshot number, for the caller's monotonic guard
  */
@@ -66,23 +67,12 @@ public record PeerEgressConfigMessage(long revision, PeerEgressPolicy policy) {
             PeerEgressPolicy.PeerEgressDestinationRule rule =
                     new PeerEgressPolicy.PeerEgressDestinationRule();
             rule.setCidr(raw.path("cidr").asText(""));
-            List<String> protocols = new ArrayList<>();
-            for (JsonNode protocol : raw.path("protocols")) {
-                protocols.add(protocol.asText(""));
-            }
-            rule.setProtocols(List.copyOf(protocols));
-            List<List<Integer>> ranges = new ArrayList<>();
-            for (JsonNode pair : raw.path("portRanges")) {
-                List<Integer> bounds = new ArrayList<>();
-                for (JsonNode bound : pair) {
-                    bounds.add(bound.asInt());
-                }
-                ranges.add(List.copyOf(bounds));
-            }
-            rule.setPortRanges(List.copyOf(ranges));
+            rule.setProtocols(protocolsOf(raw));
+            rule.setPortRanges(portRangesOf(raw));
             rules.add(rule);
         }
         policy.setDestinationRules(List.copyOf(rules));
+        policy.setDomainRules(domainRulesOf(message.path("domainRules")));
 
         // Absent limits decode as zeros rather than as this class's defaults. Whether a zero means
         // "use the default" or "no limit" is the runtime's decision, and inventing a number here
@@ -95,5 +85,54 @@ public record PeerEgressConfigMessage(long revision, PeerEgressPolicy policy) {
         policy.setLimits(decoded);
 
         return new PeerEgressConfigMessage(message.path("revision").asLong(0), policy);
+    }
+
+    /**
+     * The domain rules a push carries. An absent field, or one that is not an array, is no domain
+     * rules: an older server sends none, and the destination rules alone then decide. An entry that
+     * is not an object, or whose match is not a name or {@code *.name} as a consumer's domain rule
+     * would write it, is skipped and the rest kept. A rule this egress cannot read must grant
+     * nothing, not void the policy around it.
+     */
+    private static List<PeerEgressPolicy.PeerEgressDomainRule> domainRulesOf(JsonNode value) {
+        if (!value.isArray()) {
+            return List.of();
+        }
+        List<PeerEgressPolicy.PeerEgressDomainRule> rules = new ArrayList<>();
+        for (JsonNode raw : value) {
+            if (!raw.isObject() || !raw.path("match").isTextual()) {
+                continue;
+            }
+            String match = raw.path("match").asText().trim();
+            if (!PeerEgressNames.validMatch(match)) {
+                continue;
+            }
+            PeerEgressPolicy.PeerEgressDomainRule rule = new PeerEgressPolicy.PeerEgressDomainRule();
+            rule.setMatch(PeerEgressNames.normalize(match));
+            rule.setProtocols(protocolsOf(raw));
+            rule.setPortRanges(portRangesOf(raw));
+            rules.add(rule);
+        }
+        return List.copyOf(rules);
+    }
+
+    private static List<String> protocolsOf(JsonNode rule) {
+        List<String> protocols = new ArrayList<>();
+        for (JsonNode protocol : rule.path("protocols")) {
+            protocols.add(protocol.asText(""));
+        }
+        return List.copyOf(protocols);
+    }
+
+    private static List<List<Integer>> portRangesOf(JsonNode rule) {
+        List<List<Integer>> ranges = new ArrayList<>();
+        for (JsonNode pair : rule.path("portRanges")) {
+            List<Integer> bounds = new ArrayList<>();
+            for (JsonNode bound : pair) {
+                bounds.add(bound.asInt());
+            }
+            ranges.add(List.copyOf(bounds));
+        }
+        return List.copyOf(ranges);
     }
 }
