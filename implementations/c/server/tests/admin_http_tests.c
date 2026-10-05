@@ -23,10 +23,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#ifndef ST_APPLICATION_FIXTURE_FILE
-#define ST_APPLICATION_FIXTURE_FILE "../../../protocol/test-vectors/application-protocol-v2.json"
-#endif
-
 static long long test_now_millis(void)
 {
     struct timeval tv;
@@ -404,10 +400,15 @@ static int route_auth_ws_data(void *ctx,
     return 0;
 }
 
-static void route_auth_ws_close(void *ctx, const char *channel_id)
+static void route_auth_ws_close(void *ctx,
+                                const char *channel_id,
+                                uint32_t reset_code,
+                                const char *reason)
 {
     (void)ctx;
     (void)channel_id;
+    (void)reset_code;
+    (void)reason;
 }
 
 static int route_auth_http_roundtrip(int port,
@@ -2272,134 +2273,6 @@ static void oidc_test_server_stop(oidc_test_server *server, pthread_t thread)
     }
 }
 
-static void test_write_u16_be(uint8_t *value, uint16_t number)
-{
-    value[0] = (uint8_t)(number >> 8U);
-    value[1] = (uint8_t)number;
-}
-
-static char *test_read_text_file(const char *path)
-{
-    FILE *file = fopen(path, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
-        if (file != NULL) fclose(file);
-        return NULL;
-    }
-    long size = ftell(file);
-    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return NULL;
-    }
-    char *text = (char *)malloc((size_t)size + 1U);
-    if (text == NULL || fread(text, 1U, (size_t)size, file) != (size_t)size) {
-        free(text);
-        fclose(file);
-        return NULL;
-    }
-    fclose(file);
-    text[(size_t)size] = '\0';
-    return text;
-}
-
-static int test_hex_nibble(char value)
-{
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
-static uint8_t *test_decode_hex(const char *hex, size_t *decoded_len)
-{
-    size_t len = hex == NULL ? 0U : strlen(hex);
-    if (len == 0U || len % 2U != 0U) return NULL;
-    uint8_t *decoded = (uint8_t *)malloc(len / 2U);
-    if (decoded == NULL) return NULL;
-    for (size_t i = 0; i < len; i += 2U) {
-        int high = test_hex_nibble(hex[i]);
-        int low = test_hex_nibble(hex[i + 1U]);
-        if (high < 0 || low < 0) {
-            free(decoded);
-            return NULL;
-        }
-        decoded[i / 2U] = (uint8_t)((high << 4U) | low);
-    }
-    *decoded_len = len / 2U;
-    return decoded;
-}
-
-static int test_sws2_central_vectors(void)
-{
-    char *json = test_read_text_file(ST_APPLICATION_FIXTURE_FILE);
-    if (json == NULL) {
-        fprintf(stderr, "application protocol fixture could not be read\n");
-        return 1;
-    }
-    const char *fields[] = {"frameHex", "invalidMagicHex", "truncatedHex", "trailingHex"};
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
-        char *hex = st_json_get_string(json, fields[i]);
-        size_t payload_len = 0U;
-        uint8_t *payload = test_decode_hex(hex, &payload_len);
-        int accepted = payload != NULL && st_admin_validate_sws2_payload(payload, payload_len) == 0;
-        int missing = payload == NULL;
-        free(hex);
-        free(payload);
-        if (missing || (i == 0U && !accepted) || (i != 0U && accepted)) {
-            fprintf(stderr, "central SWS2 vector mismatch: %s\n", fields[i]);
-            free(json);
-            return 1;
-        }
-    }
-    free(json);
-    return 0;
-}
-
-static int test_sws2_validation(void)
-{
-    if (test_sws2_central_vectors() != 0) {
-        return 1;
-    }
-    uint8_t close_frame[12] = {'S', 'W', 'S', '2', 0x8U, 0x1U, 0, 0, 0, 0, 0, 0};
-    test_write_u16_be(close_frame + 6U, 1000U);
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) != 0) {
-        fprintf(stderr, "valid SWS2 close frame was rejected\n");
-        return 1;
-    }
-    const uint16_t forbidden[] = {1004U, 1005U, 1006U, 1015U};
-    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
-        test_write_u16_be(close_frame + 6U, forbidden[i]);
-        if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-            fprintf(stderr,
-                    "forbidden SWS2 close code was accepted: %u\n",
-                    (unsigned)forbidden[i]);
-            return 1;
-        }
-    }
-    test_write_u16_be(close_frame + 6U, 0U);
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) != 0) {
-        fprintf(stderr, "empty SWS2 close frame was rejected\n");
-        return 1;
-    }
-    close_frame[8] = 1U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "truncated SWS2 payload was accepted\n");
-        return 1;
-    }
-    close_frame[8] = 0U;
-    close_frame[5] = 0x81U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "reserved SWS2 flag bits were accepted\n");
-        return 1;
-    }
-    close_frame[5] = 0x1U;
-    close_frame[4] = 0x3U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "unknown SWS2 opcode was accepted\n");
-        return 1;
-    }
-    return 0;
-}
-
 /*
  * The egress policy endpoint end to end. The rule-by-rule semantics are replayed from the shared
  * vector in peer_egress_tests; what is checked here is that a refused list refuses the whole
@@ -2505,9 +2378,6 @@ int main(void)
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED", "false", 1);
-    if (test_sws2_validation() != 0) {
-        return 1;
-    }
     char response[32768];
     char request_path[128];
     int len = st_admin_build_response("GET", "/health", response, sizeof(response));

@@ -30,6 +30,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,8 +54,6 @@
 #define ST_ADMIN_MAX_HTTP_HEADERS 96U
 #define ST_ADMIN_MAX_DIRECT_HTTP_BODY (16U * 1024U * 1024U)
 #define ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES (10U * 1024U * 1024U)
-#define ST_ADMIN_SWS2_HEADER_BYTES 12U
-#define ST_ADMIN_SWS2_MAX_PAYLOAD ((64U * 1024U) - ST_ADMIN_SWS2_HEADER_BYTES)
 #define ST_ADMIN_STREAM_INITIAL_WINDOW (1024U * 1024U)
 #define ST_ADMIN_STREAM_MAX_WINDOW (16U * 1024U * 1024U)
 #define ST_ADMIN_WS_TICKET_BYTES 32U
@@ -64,6 +63,17 @@
 #define ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES (3U * ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS)
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES 1024U
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES_PER_SOCKET 64U
+/* Bounds the close handshake on both sides, like the Go/Java/.NET close credit timeout. */
+#define ST_ADMIN_WS_CLOSE_TIMEOUT_MS 5000LL
+/* How often an idle direct WebSocket re-checks whether a close deadline was armed meanwhile. */
+#define ST_ADMIN_WS_IDLE_POLL_MS 1000
+/* How long a finished direct WebSocket keeps draining input so its CLOSE is not lost to an RST. */
+#define ST_ADMIN_WS_LINGER_MS 1000LL
+#define ST_ADMIN_WS_CLOSE_GOING_AWAY 1001U
+#define ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR 1002U
+#define ST_ADMIN_WS_CLOSE_INVALID_PAYLOAD 1007U
+#define ST_ADMIN_WS_CLOSE_TOO_BIG 1009U
+#define ST_ADMIN_WS_CLOSE_INTERNAL_ERROR 1011U
 
 static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
 static const char *admin_reason_phrase(int status);
@@ -127,19 +137,58 @@ typedef struct st_admin_ws_ticket {
     struct st_admin_ws_ticket *next;
 } st_admin_ws_ticket;
 
+/*
+ * Incremental UTF-8 validation: WebSocket text may split a code point across frames, so the
+ * state carries how many continuation bytes are still due and the range the next one must fall
+ * in (which is how overlong forms, surrogates and code points above U+10FFFF are refused).
+ */
+typedef struct {
+    uint8_t need;
+    uint8_t lower;
+    uint8_t upper;
+} st_admin_utf8_state;
+
+/*
+ * One browser WebSocket bridged to a NAT stream. The admin thread reads the browser and sends
+ * SWS2 to the client; the NAT session thread writes the client's SWS2 to the browser. send_lock
+ * serialises browser writes together with the close state, so a frame can never follow a CLOSE.
+ */
 struct st_admin_direct_ws_stream {
     int fd;
     pthread_mutex_t send_lock;
+    pthread_cond_t handshake_cond;
     pthread_mutex_t flow_lock;
     pthread_cond_t flow_cond;
     uint64_t send_credit;
+    /* The 101 response is still being written: client frames must wait behind it. */
+    int handshake_pending;
+    /* Client-to-browser message in progress (0 when none), checked before every write. */
     uint8_t outbound_fragment_opcode;
     size_t outbound_fragment_bytes;
+    st_admin_utf8_state outbound_utf8;
+    /* A CLOSE went to the browser; nothing may be written after it. */
     int close_sent;
+    /* Monotonic bound on waiting for the browser's CLOSE reply once close_sent is set (flow_lock). */
+    long long close_deadline_ms;
+    /* The client's SWS2 CLOSE arrived: it is the client's terminal frame, only FIN may follow. */
+    int peer_close_received;
+    /* The client's FIN arrived: no DATA may follow. */
+    int peer_finished;
+    /*
+     * The failed result that dropped the browser (ST_ADMIN_DIRECT_WS_ACCEPTED while none). The NAT
+     * thread and this socket's admin thread race to unmap the stream once the browser is dropped;
+     * whichever wins must send the RST that result maps to.
+     */
+    int abort_result;
     int flow_closed;
+    /* The socket must not be touched any more (aborted, or the admin thread is done with it). */
     int closed;
+    /* The admin thread and the NAT stream map each hold one; see admin_direct_ws_ref_lock. */
+    unsigned int refs;
 };
 
+/* Guards st_admin_direct_ws_stream.refs; the stream's own locks die with its last reference. */
+static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
 static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -10809,112 +10858,461 @@ static uint8_t *admin_sws2_encode(uint8_t opcode,
     return encoded;
 }
 
-int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len)
+uint8_t *st_admin_sws2_encode(const st_admin_sws2_frame *frame, size_t *encoded_len)
 {
-    if (payload == NULL || payload_len < ST_ADMIN_SWS2_HEADER_BYTES
-        || memcmp(payload, "SWS2", 4U) != 0) {
+    if (frame == NULL || (frame->payload_len > 0U && frame->payload == NULL)) {
+        return NULL;
+    }
+    return admin_sws2_encode(frame->opcode,
+                             frame->fin,
+                             frame->rsv,
+                             frame->close_code,
+                             frame->payload,
+                             frame->payload_len,
+                             encoded_len);
+}
+
+int st_admin_sws2_decode(const uint8_t *encoded, size_t encoded_len, st_admin_sws2_frame *frame)
+{
+    if (encoded == NULL || encoded_len < ST_ADMIN_SWS2_HEADER_BYTES
+        || memcmp(encoded, "SWS2", 4U) != 0) {
         return -1;
     }
-    uint8_t flags = payload[5];
+    uint8_t flags = encoded[5];
     if ((flags & 0xf0U) != 0U) {
         return -1;
     }
-    uint32_t data_len = admin_read_u32_be(payload + 8U);
-    return data_len <= ST_ADMIN_SWS2_MAX_PAYLOAD
-            && (size_t)data_len == payload_len - ST_ADMIN_SWS2_HEADER_BYTES
-            && admin_sws2_validate(payload[4],
-                                   (flags & 1U) != 0U,
-                                   (uint8_t)((flags >> 1U) & 7U),
-                                   admin_read_u16_be(payload + 6U),
-                                   data_len) == 0
-        ? 0
-        : -1;
+    /* The declared length must cover exactly the rest: truncation and trailing bytes both fail. */
+    uint32_t data_len = admin_read_u32_be(encoded + 8U);
+    if (data_len > ST_ADMIN_SWS2_MAX_PAYLOAD
+        || (size_t)data_len != encoded_len - ST_ADMIN_SWS2_HEADER_BYTES) {
+        return -1;
+    }
+    st_admin_sws2_frame decoded = {
+        .opcode = encoded[4],
+        .fin = (flags & 1U) != 0U,
+        .rsv = (uint8_t)((flags >> 1U) & 7U),
+        .close_code = admin_read_u16_be(encoded + 6U),
+        .payload = encoded + ST_ADMIN_SWS2_HEADER_BYTES,
+        .payload_len = data_len
+    };
+    if (admin_sws2_validate(decoded.opcode, decoded.fin, decoded.rsv, decoded.close_code,
+                            decoded.payload_len) != 0) {
+        return -1;
+    }
+    if (frame != NULL) {
+        *frame = decoded;
+    }
+    return 0;
 }
 
-static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream, size_t bytes)
+int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len)
+{
+    return st_admin_sws2_decode(payload, payload_len, NULL);
+}
+
+static void admin_utf8_reset(st_admin_utf8_state *state)
+{
+    state->need = 0U;
+    state->lower = 0x80U;
+    state->upper = 0xbfU;
+}
+
+static int admin_utf8_feed(st_admin_utf8_state *state, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0U; i < len; ++i) {
+        uint8_t byte = data[i];
+        if (state->need > 0U) {
+            if (byte < state->lower || byte > state->upper) {
+                return -1;
+            }
+            --state->need;
+            state->lower = 0x80U;
+            state->upper = 0xbfU;
+            continue;
+        }
+        if (byte <= 0x7fU) {
+            continue;
+        }
+        if (byte >= 0xc2U && byte <= 0xdfU) {
+            state->need = 1U;
+        } else if (byte >= 0xe0U && byte <= 0xefU) {
+            state->need = 2U;
+            if (byte == 0xe0U) {
+                state->lower = 0xa0U;
+            } else if (byte == 0xedU) {
+                state->upper = 0x9fU;
+            }
+        } else if (byte >= 0xf0U && byte <= 0xf4U) {
+            state->need = 3U;
+            if (byte == 0xf0U) {
+                state->lower = 0x90U;
+            } else if (byte == 0xf4U) {
+                state->upper = 0x8fU;
+            }
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int admin_utf8_complete(const uint8_t *data, size_t len)
+{
+    st_admin_utf8_state state;
+    admin_utf8_reset(&state);
+    return admin_utf8_feed(&state, data, len) == 0 && state.need == 0U ? 0 : -1;
+}
+
+static long long admin_monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L);
+}
+
+static size_t admin_ws_close_payload(uint16_t code, const char *reason, uint8_t out[125])
+{
+    size_t reason_len = reason == NULL ? 0U : strlen(reason);
+    if (reason_len > 123U) {
+        reason_len = 123U;
+    }
+    admin_write_u16_be(out, code);
+    if (reason_len > 0U) {
+        memcpy(out + 2U, reason, reason_len);
+    }
+    return 2U + reason_len;
+}
+
+/* Writes one frame to the browser unless a CLOSE already ended that direction; send_lock held. */
+static int admin_direct_ws_write_locked(st_admin_direct_ws_stream *stream,
+                                        int fin,
+                                        uint8_t opcode,
+                                        const uint8_t *payload,
+                                        size_t payload_len)
+{
+    if (stream->closed || stream->close_sent || stream->handshake_pending) {
+        return -1;
+    }
+    if (admin_send_websocket_frame_ex(stream->fd, fin, 0U, opcode, payload, payload_len) != 0) {
+        return -1;
+    }
+    if (opcode == 0x8U) {
+        /*
+         * The browser now owes a CLOSE reply; waiting for it is bounded like the peers' timeout.
+         * The deadline lives under flow_lock, which is never held across socket I/O, so the
+         * reading thread can check it while this lock is busy with a slow browser write.
+         */
+        stream->close_sent = 1;
+        pthread_mutex_lock(&stream->flow_lock);
+        stream->close_deadline_ms = admin_monotonic_ms() + ST_ADMIN_WS_CLOSE_TIMEOUT_MS;
+        pthread_cond_broadcast(&stream->flow_cond);
+        pthread_mutex_unlock(&stream->flow_lock);
+    }
+    return 0;
+}
+
+static void admin_direct_ws_close_browser_locked(st_admin_direct_ws_stream *stream,
+                                                 uint16_t code,
+                                                 const char *reason)
+{
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(code, reason, payload);
+    (void)admin_direct_ws_write_locked(stream, 1, 0x8U, payload, payload_len);
+}
+
+/* Drops the browser socket: the admin thread's read loop sees EOF and finishes. */
+static void admin_direct_ws_abort_locked(st_admin_direct_ws_stream *stream)
+{
+    if (!stream->closed) {
+        stream->closed = 1;
+        shutdown(stream->fd, SHUT_RDWR);
+    }
+    pthread_cond_broadcast(&stream->handshake_cond);
+}
+
+static void admin_direct_ws_close_flow(st_admin_direct_ws_stream *stream)
+{
+    pthread_mutex_lock(&stream->flow_lock);
+    stream->flow_closed = 1;
+    pthread_cond_broadcast(&stream->flow_cond);
+    pthread_mutex_unlock(&stream->flow_lock);
+}
+
+/* Client frames may race the 101 response, so they queue behind it rather than precede it. */
+static int admin_direct_ws_wait_handshake_locked(st_admin_direct_ws_stream *stream)
+{
+    while (stream->handshake_pending && !stream->closed) {
+        pthread_cond_wait(&stream->handshake_cond, &stream->send_lock);
+    }
+    return stream->closed ? -1 : 0;
+}
+
+/* Non-zero once a CLOSE went to the browser: the monotonic bound on waiting for its reply. */
+static long long admin_direct_ws_close_deadline(st_admin_direct_ws_stream *stream)
+{
+    pthread_mutex_lock(&stream->flow_lock);
+    long long deadline = stream->close_deadline_ms;
+    pthread_mutex_unlock(&stream->flow_lock);
+    return deadline;
+}
+
+static void admin_monotonic_timespec_after(long long delay_ms, struct timespec *out)
+{
+    clock_gettime(CLOCK_MONOTONIC, out);
+    out->tv_sec += (time_t)(delay_ms / 1000LL);
+    out->tv_nsec += (long)((delay_ms % 1000LL) * 1000000LL);
+    if (out->tv_nsec >= 1000000000L) {
+        out->tv_sec += 1;
+        out->tv_nsec -= 1000000000L;
+    }
+}
+
+/*
+ * Takes NAT send credit for one SWS2 envelope. Returns 0 on success, -1 once the stream is shut
+ * and -2 when deadline_ms (or the close-reply deadline, once a CLOSE went to the browser) passes:
+ * a client that withholds credit must not hold the close handshake open forever.
+ */
+static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream,
+                                               size_t bytes,
+                                               long long deadline_ms)
 {
     if (stream == NULL || bytes == 0U || bytes > ST_ADMIN_STREAM_MAX_WINDOW) {
         return -1;
     }
-    pthread_mutex_lock(&stream->flow_lock);
-    while (!stream->flow_closed && stream->send_credit < bytes) {
-        pthread_cond_wait(&stream->flow_cond, &stream->flow_lock);
-    }
-    if (stream->flow_closed) {
+    for (;;) {
+        pthread_mutex_lock(&stream->flow_lock);
+        long long limit = deadline_ms;
+        if (stream->close_deadline_ms > 0 && (limit == 0 || stream->close_deadline_ms < limit)) {
+            limit = stream->close_deadline_ms;
+        }
+        if (stream->flow_closed) {
+            pthread_mutex_unlock(&stream->flow_lock);
+            return -1;
+        }
+        if (stream->send_credit >= bytes) {
+            stream->send_credit -= bytes;
+            pthread_mutex_unlock(&stream->flow_lock);
+            return 0;
+        }
+        long long wait_ms = ST_ADMIN_WS_IDLE_POLL_MS;
+        if (limit > 0) {
+            long long remaining = limit - admin_monotonic_ms();
+            if (remaining <= 0) {
+                pthread_mutex_unlock(&stream->flow_lock);
+                return -2;
+            }
+            if (remaining < wait_ms) {
+                wait_ms = remaining;
+            }
+        }
+        struct timespec until;
+        admin_monotonic_timespec_after(wait_ms, &until);
+        (void)pthread_cond_timedwait(&stream->flow_cond, &stream->flow_lock, &until);
         pthread_mutex_unlock(&stream->flow_lock);
-        return -1;
     }
-    stream->send_credit -= bytes;
-    pthread_mutex_unlock(&stream->flow_lock);
-    return 0;
+}
+
+/*
+ * Writes one decoded client envelope to the browser as a raw frame. Physical fragmentation is
+ * kept (the browser reassembles), as the .NET server does, but the message state machine the Go
+ * and Java servers apply while reassembling still holds: a continuation needs an open message, a
+ * new text/binary frame needs none, and a message stays within 16 MiB. Text must also stay valid
+ * UTF-8 across fragments (as .NET checks), since the browser would fail the connection on it.
+ * Control frames may sit between fragments. send_lock held.
+ */
+static int admin_direct_ws_forward_to_browser_locked(st_admin_direct_ws_stream *stream,
+                                                     const st_admin_sws2_frame *frame)
+{
+    if (frame->rsv != 0U) {
+        /* No extension is negotiated with the browser, so RFC 6455 requires RSV to stay zero. */
+        return ST_ADMIN_DIRECT_WS_INVALID;
+    }
+    if (frame->opcode == 0x8U) {
+        if (admin_utf8_complete(frame->payload, frame->payload_len) != 0) {
+            return ST_ADMIN_DIRECT_WS_INVALID;
+        }
+        uint8_t payload[125];
+        size_t payload_len = 0U;
+        if (frame->close_code != 0U) {
+            admin_write_u16_be(payload, frame->close_code);
+            if (frame->payload_len > 0U) {
+                memcpy(payload + 2U, frame->payload, frame->payload_len);
+            }
+            payload_len = 2U + frame->payload_len;
+        }
+        /* The client's CLOSE is its terminal frame whether or not the browser can still take it. */
+        stream->peer_close_received = 1;
+        return admin_direct_ws_write_locked(stream, 1, 0x8U, payload, payload_len) == 0
+            ? ST_ADMIN_DIRECT_WS_ACCEPTED
+            : ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+    }
+    if (frame->opcode == 0x9U || frame->opcode == 0xAU) {
+        return admin_direct_ws_write_locked(stream, 1, frame->opcode, frame->payload,
+                                            frame->payload_len) == 0
+            ? ST_ADMIN_DIRECT_WS_ACCEPTED
+            : ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+    }
+    int continuation = frame->opcode == 0x0U;
+    if (continuation ? stream->outbound_fragment_opcode == 0U : stream->outbound_fragment_opcode != 0U) {
+        return ST_ADMIN_DIRECT_WS_INVALID;
+    }
+    size_t message_bytes = continuation ? stream->outbound_fragment_bytes : 0U;
+    if (frame->payload_len > ST_ADMIN_WS_MAX_MESSAGE_BYTES - message_bytes) {
+        return ST_ADMIN_DIRECT_WS_INVALID;
+    }
+    uint8_t message_opcode = continuation ? stream->outbound_fragment_opcode : frame->opcode;
+    st_admin_utf8_state utf8;
+    if (continuation) {
+        utf8 = stream->outbound_utf8;
+    } else {
+        admin_utf8_reset(&utf8);
+    }
+    if (message_opcode == 0x1U
+        && (admin_utf8_feed(&utf8, frame->payload, frame->payload_len) != 0
+            || (frame->fin && utf8.need != 0U))) {
+        return ST_ADMIN_DIRECT_WS_INVALID;
+    }
+    if (admin_direct_ws_write_locked(stream, frame->fin, frame->opcode, frame->payload,
+                                     frame->payload_len) != 0) {
+        return ST_ADMIN_DIRECT_WS_BROWSER_FAILED;
+    }
+    if (frame->fin) {
+        stream->outbound_fragment_opcode = 0U;
+        stream->outbound_fragment_bytes = 0U;
+        admin_utf8_reset(&stream->outbound_utf8);
+    } else {
+        stream->outbound_fragment_opcode = message_opcode;
+        stream->outbound_fragment_bytes = message_bytes + frame->payload_len;
+        stream->outbound_utf8 = utf8;
+    }
+    return ST_ADMIN_DIRECT_WS_ACCEPTED;
+}
+
+uint32_t st_admin_direct_ws_reset_code(int result, const char **reason)
+{
+    const char *text = "WebSocket browser write failed";
+    uint32_t code = ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
+    if (result == ST_ADMIN_DIRECT_WS_AFTER_FIN) {
+        text = "WebSocket stream already finished";
+        code = ST_ADMIN_DIRECT_WS_RST_STREAM_STATE;
+    } else if (result == ST_ADMIN_DIRECT_WS_INVALID) {
+        text = "invalid WebSocket SWS2 frame";
+        code = ST_ADMIN_DIRECT_WS_RST_INVALID_SWS2;
+    }
+    if (reason != NULL) {
+        *reason = text;
+    }
+    return code;
+}
+
+/* Fails the browser side after a client-side violation, as the .NET server does (1002). */
+static void admin_direct_ws_fail_locked(st_admin_direct_ws_stream *stream, int result)
+{
+    if (stream->abort_result == ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        stream->abort_result = result;
+    }
+    if (result != ST_ADMIN_DIRECT_WS_BROWSER_FAILED) {
+        admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR,
+                                             "invalid WebSocket frame");
+    }
+    admin_direct_ws_abort_locked(stream);
 }
 
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len)
 {
-    if (stream == NULL || st_admin_validate_sws2_payload(payload, payload_len) != 0) {
-        return -1;
+    if (stream == NULL) {
+        return ST_ADMIN_DIRECT_WS_INVALID;
     }
-    uint8_t opcode = payload[4];
-    uint8_t flags = payload[5];
-    int fin = (flags & 1U) != 0U;
-    uint8_t rsv = (uint8_t)((flags >> 1U) & 7U);
-    uint16_t close_code = admin_read_u16_be(payload + 6U);
-    uint32_t data_len = admin_read_u32_be(payload + 8U);
-    const uint8_t *data = payload + ST_ADMIN_SWS2_HEADER_BYTES;
-    uint8_t close_payload[125];
-    if (opcode == 0x8U && close_code != 0U) {
-        admin_write_u16_be(close_payload, close_code);
-        if (data_len > 0U) {
-            memcpy(close_payload + 2U, data, data_len);
+    st_admin_sws2_frame frame;
+    int decoded = st_admin_sws2_decode(payload, payload_len, &frame) == 0;
+    pthread_mutex_lock(&stream->send_lock);
+    (void)admin_direct_ws_wait_handshake_locked(stream);
+    int result;
+    if (stream->peer_finished) {
+        result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
+    } else if (!decoded || stream->peer_close_received) {
+        /* A malformed envelope, or anything after the client's own CLOSE. */
+        result = ST_ADMIN_DIRECT_WS_INVALID;
+    } else if (stream->closed || stream->close_sent) {
+        /*
+         * The browser side is already closing, so nothing more may reach it. A client CLOSE here is
+         * the tunnel half of a browser-initiated handshake; data still in flight is dropped, as the
+         * Go and Java servers drop it once their browser session is closed.
+         */
+        if (frame.opcode == 0x8U) {
+            stream->peer_close_received = 1;
         }
-        data = close_payload;
-        data_len += 2U;
+        result = ST_ADMIN_DIRECT_WS_ACCEPTED;
+    } else {
+        result = admin_direct_ws_forward_to_browser_locked(stream, &frame);
+    }
+    if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        admin_direct_ws_fail_locked(stream, result);
+    }
+    pthread_mutex_unlock(&stream->send_lock);
+    if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        admin_direct_ws_close_flow(stream);
+    }
+    return result;
+}
+
+int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream)
+{
+    if (stream == NULL) {
+        return ST_ADMIN_DIRECT_WS_INVALID;
     }
     pthread_mutex_lock(&stream->send_lock);
-    int invalid_sequence = 0;
-    size_t next_fragment_bytes = stream->outbound_fragment_bytes;
-    if (stream->close_sent) {
-        invalid_sequence = 1;
-    } else if (opcode == 0x0U) {
-        invalid_sequence = stream->outbound_fragment_opcode == 0U;
-        if (!invalid_sequence) {
-            if (next_fragment_bytes > ST_ADMIN_MAX_DIRECT_HTTP_BODY - data_len) {
-                invalid_sequence = 1;
-            } else {
-                next_fragment_bytes += data_len;
+    int result = ST_ADMIN_DIRECT_WS_ACCEPTED;
+    if (stream->peer_finished) {
+        result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
+        admin_direct_ws_fail_locked(stream, result);
+    } else {
+        stream->peer_finished = 1;
+        /*
+         * FIN without CLOSE means the upstream went away. The browser hears 1001 like Go, Java and
+         * .NET send, and its CLOSE reply still travels back as SWS2 CLOSE + FIN (our direction of
+         * the stream stays open until then).
+         */
+        if (admin_direct_ws_wait_handshake_locked(stream) == 0 && !stream->close_sent) {
+            admin_direct_ws_close_browser_locked(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
+            if (!stream->close_sent) {
+                admin_direct_ws_abort_locked(stream);
             }
-        }
-        if (!invalid_sequence && fin) {
-            next_fragment_bytes = 0U;
-        }
-    } else if (opcode == 0x1U || opcode == 0x2U) {
-        invalid_sequence = stream->outbound_fragment_opcode != 0U;
-        if (!invalid_sequence && !fin) {
-            next_fragment_bytes = data_len;
-        }
-    }
-    int rc = stream->closed || invalid_sequence
-        ? -1
-        : admin_send_websocket_frame_ex(stream->fd, fin, rsv, opcode, data, data_len);
-    if (rc == 0) {
-        if (opcode == 0x8U) {
-            stream->close_sent = 1;
-            stream->outbound_fragment_opcode = 0U;
-            stream->outbound_fragment_bytes = 0U;
-        } else if (opcode == 0x0U) {
-            stream->outbound_fragment_bytes = next_fragment_bytes;
-            if (fin) {
-                stream->outbound_fragment_opcode = 0U;
-            }
-        } else if ((opcode == 0x1U || opcode == 0x2U) && !fin) {
-            stream->outbound_fragment_opcode = opcode;
-            stream->outbound_fragment_bytes = next_fragment_bytes;
         }
     }
     pthread_mutex_unlock(&stream->send_lock);
-    return rc;
+    if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        admin_direct_ws_close_flow(stream);
+    }
+    return result;
+}
+
+static void admin_direct_ws_shutdown(st_admin_direct_ws_stream *stream,
+                                     uint16_t code,
+                                     const char *reason)
+{
+    if (stream == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&stream->send_lock);
+    /* Abort paths never wait for the handshake: a socket still waiting for 101 just closes. */
+    if (!stream->handshake_pending) {
+        admin_direct_ws_close_browser_locked(stream, code, reason);
+    }
+    admin_direct_ws_abort_locked(stream);
+    pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_close_flow(stream);
+}
+
+void st_admin_direct_ws_peer_reset(st_admin_direct_ws_stream *stream)
+{
+    /* .NET reports an aborted tunnel as 1011; FIN/control loss stay 1001 below. */
+    admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_INTERNAL_ERROR, "WebSocket tunnel reset");
 }
 
 int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit)
@@ -10923,31 +11321,51 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
         return -1;
     }
     pthread_mutex_lock(&stream->flow_lock);
-    if (stream->flow_closed || stream->send_credit > ST_ADMIN_STREAM_MAX_WINDOW - credit) {
+    /* Checked in two steps so a huge credit cannot wrap the subtraction and slip through. */
+    if (credit > ST_ADMIN_STREAM_MAX_WINDOW
+        || stream->send_credit > ST_ADMIN_STREAM_MAX_WINDOW - credit) {
         pthread_mutex_unlock(&stream->flow_lock);
         return -1;
     }
-    stream->send_credit += credit;
-    pthread_cond_broadcast(&stream->flow_cond);
+    /* Credit racing the stream's own shutdown is harmless; only window overflow is a violation. */
+    if (!stream->flow_closed) {
+        stream->send_credit += credit;
+        pthread_cond_broadcast(&stream->flow_cond);
+    }
     pthread_mutex_unlock(&stream->flow_lock);
     return 0;
 }
 
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
 {
+    admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
+}
+
+void st_admin_direct_ws_retain(st_admin_direct_ws_stream *stream)
+{
     if (stream == NULL) {
         return;
     }
-    pthread_mutex_lock(&stream->send_lock);
-    if (!stream->closed) {
-        stream->closed = 1;
-        shutdown(stream->fd, SHUT_RDWR);
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    ++stream->refs;
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
+}
+
+void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream)
+{
+    if (stream == NULL) {
+        return;
     }
-    pthread_mutex_unlock(&stream->send_lock);
-    pthread_mutex_lock(&stream->flow_lock);
-    stream->flow_closed = 1;
-    pthread_cond_broadcast(&stream->flow_cond);
-    pthread_mutex_unlock(&stream->flow_lock);
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    int last = --stream->refs == 0U;
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
+    if (last) {
+        pthread_cond_destroy(&stream->flow_cond);
+        pthread_mutex_destroy(&stream->flow_lock);
+        pthread_cond_destroy(&stream->handshake_cond);
+        pthread_mutex_destroy(&stream->send_lock);
+        free(stream);
+    }
 }
 
 static st_admin_ws_client *admin_ws_add(int fd,
@@ -11847,209 +12265,396 @@ static void free_header_array(char **headers, size_t headers_len)
     free(headers);
 }
 
-static int admin_direct_ws_send_frame(st_admin_direct_ws_stream *stream,
-                                      uint8_t opcode,
-                                      const uint8_t *payload,
-                                      size_t payload_len)
+static void admin_direct_ws_mark_closed(st_admin_direct_ws_stream *stream)
 {
     pthread_mutex_lock(&stream->send_lock);
-    int rc;
-    if (stream->closed) {
-        rc = -1;
-    } else if (opcode == 0x8U && stream->close_sent) {
-        rc = 0;
-    } else {
-        rc = admin_send_websocket_frame(stream->fd, opcode, payload, payload_len);
-        if (rc == 0 && opcode == 0x8U) {
-            stream->close_sent = 1;
-            stream->outbound_fragment_opcode = 0U;
-            stream->outbound_fragment_bytes = 0U;
+    stream->closed = 1;
+    stream->handshake_pending = 0;
+    pthread_cond_broadcast(&stream->handshake_cond);
+    pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_close_flow(stream);
+}
+
+/*
+ * Closing a socket with unread input makes the kernel send RST, which can destroy the CLOSE frame
+ * just written before the browser reads it. Half-close instead and drain for a bounded time so the
+ * browser reliably sees the close code (a lingering close).
+ */
+static void admin_direct_ws_linger(int fd)
+{
+    (void)shutdown(fd, SHUT_WR);
+    long long deadline = admin_monotonic_ms() + ST_ADMIN_WS_LINGER_MS;
+    uint8_t sink[4096];
+    for (;;) {
+        long long remaining = deadline - admin_monotonic_ms();
+        if (remaining <= 0) {
+            return;
+        }
+        struct pollfd ready = {.fd = fd, .events = POLLIN, .revents = 0};
+        int rc = poll(&ready, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if (rc <= 0) {
+            return;
+        }
+        ssize_t got = recv(fd, sink, sizeof(sink), 0);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            return;
         }
     }
-    pthread_mutex_unlock(&stream->send_lock);
+}
+
+/*
+ * Waits until the browser socket is readable: 0 when it is, -1 on error, 1 once the bounded wait
+ * for the browser's CLOSE reply has run out. Polling in slices lets a deadline that the NAT thread
+ * arms meanwhile (a client CLOSE or FIN) take effect while this thread is idle.
+ */
+static int admin_direct_ws_wait_readable(st_admin_direct_ws_stream *stream)
+{
+    for (;;) {
+        int timeout_ms = ST_ADMIN_WS_IDLE_POLL_MS;
+        long long deadline = admin_direct_ws_close_deadline(stream);
+        if (deadline > 0) {
+            long long remaining = deadline - admin_monotonic_ms();
+            if (remaining <= 0) {
+                return 1;
+            }
+            if (remaining < timeout_ms) {
+                timeout_ms = (int)remaining;
+            }
+        }
+        struct pollfd ready = {.fd = stream->fd, .events = POLLIN, .revents = 0};
+        int rc = poll(&ready, 1, timeout_ms);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc < 0 && errno != EINTR) {
+            return -1;
+        }
+    }
+}
+
+static int admin_direct_ws_recv(st_admin_direct_ws_stream *stream, uint8_t *buffer, size_t len)
+{
+    size_t offset = 0U;
+    while (offset < len) {
+        int ready = admin_direct_ws_wait_readable(stream);
+        if (ready != 0) {
+            return ready;
+        }
+        ssize_t got = recv(stream->fd, buffer + offset, len - offset, 0);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            return -1;
+        }
+        offset += (size_t)got;
+    }
+    return 0;
+}
+
+/*
+ * Sends one browser-to-client SWS2 envelope once it has NAT credit: 0 when sent, -1 when the
+ * tunnel side is gone, -2 when credit did not arrive in time. A CLOSE waits at most
+ * ST_ADMIN_WS_CLOSE_TIMEOUT_MS; data waits for as long as the stream lives, unless a close
+ * handshake with the browser is already running out its own deadline.
+ */
+static int admin_direct_ws_forward_to_client(st_admin_server *server,
+                                             st_admin_direct_ws_stream *stream,
+                                             const char *channel_id,
+                                             uint8_t opcode,
+                                             int fin,
+                                             uint16_t close_code,
+                                             const uint8_t *payload,
+                                             size_t payload_len)
+{
+    size_t framed_len = 0U;
+    uint8_t *framed = admin_sws2_encode(opcode,
+                                        fin,
+                                        0U,
+                                        close_code,
+                                        payload_len == 0U ? NULL : payload,
+                                        payload_len,
+                                        &framed_len);
+    if (framed == NULL) {
+        return -1;
+    }
+    long long deadline = opcode == 0x8U ? admin_monotonic_ms() + ST_ADMIN_WS_CLOSE_TIMEOUT_MS : 0;
+    int rc = admin_direct_ws_consume_send_credit(stream, framed_len, deadline);
+    if (rc == 0
+        && server->direct_ws_data(server->direct_ws_ctx, channel_id, framed, framed_len) != 0) {
+        rc = -1;
+    }
+    free(framed);
     return rc;
 }
 
-static int admin_direct_ws_mark_closed(st_admin_direct_ws_stream *stream)
+/*
+ * The browser left without sending CLOSE. If a CLOSE had already gone to it, the handshake simply
+ * went unanswered and the stream still ends with FIN; otherwise the tunnel is aborted with RST.
+ */
+static uint32_t admin_direct_ws_browser_gone(st_admin_direct_ws_stream *stream,
+                                             const char **reset_reason)
 {
-    int notify = 0;
+    int closing = admin_direct_ws_close_deadline(stream) > 0;
+    *reset_reason = closing ? NULL : "WebSocket browser closed";
+    return closing ? 0U : ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
+}
+
+/* The tunnel side vanished mid-stream; the browser still learns why if nobody told it yet. */
+static uint32_t admin_direct_ws_tunnel_gone(st_admin_direct_ws_stream *stream,
+                                            const char **reset_reason)
+{
     pthread_mutex_lock(&stream->send_lock);
-    if (!stream->closed) {
-        stream->closed = 1;
-        notify = 1;
-    }
+    admin_direct_ws_close_browser_locked(stream,
+                                         ST_ADMIN_WS_CLOSE_INTERNAL_ERROR,
+                                         "WebSocket tunnel reset");
     pthread_mutex_unlock(&stream->send_lock);
-    return notify;
+    *reset_reason = "WebSocket tunnel closed";
+    return ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
 }
 
-static void admin_direct_ws_destroy(st_admin_direct_ws_stream *stream)
+/*
+ * Sends the SWS2 CLOSE that ends the browser-to-client direction. Nothing follows it on the
+ * stream but FIN; if it cannot be delivered in time the stream is reset instead (Java's close
+ * credit timeout).
+ */
+static uint32_t admin_direct_ws_finish_with_close(st_admin_server *server,
+                                                  st_admin_direct_ws_stream *stream,
+                                                  const char *channel_id,
+                                                  uint16_t close_code,
+                                                  const uint8_t *reason,
+                                                  size_t reason_len,
+                                                  const char **reset_reason)
 {
-    if (stream == NULL) {
-        return;
+    int rc = admin_direct_ws_forward_to_client(server, stream, channel_id, 0x8U, 1, close_code,
+                                               reason, reason_len);
+    if (rc == 0) {
+        *reset_reason = NULL;
+        return 0U;
     }
-    pthread_cond_destroy(&stream->flow_cond);
-    pthread_mutex_destroy(&stream->flow_lock);
-    pthread_mutex_destroy(&stream->send_lock);
-    free(stream);
+    *reset_reason = rc == -2 ? "WebSocket close credit timeout" : "WebSocket tunnel closed";
+    return ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
 }
 
-static void admin_drain_direct_websocket(st_admin_server *server,
-                                         st_admin_direct_ws_stream *stream,
-                                         const char *channel_id)
+/*
+ * Fails the browser connection (RFC 6455 7.1.7) and tells the client the same close code:
+ * 1002 for protocol errors, 1007 for invalid UTF-8 and 1009 past the 16 MiB message limit.
+ */
+static uint32_t admin_direct_ws_fail_browser(st_admin_server *server,
+                                             st_admin_direct_ws_stream *stream,
+                                             const char *channel_id,
+                                             uint16_t close_code,
+                                             const char *reason,
+                                             const char **reset_reason)
 {
-    uint8_t incoming_fragment_opcode = 0U;
-    size_t incoming_fragment_bytes = 0U;
+    pthread_mutex_lock(&stream->send_lock);
+    admin_direct_ws_close_browser_locked(stream, close_code, reason);
+    pthread_mutex_unlock(&stream->send_lock);
+    return admin_direct_ws_finish_with_close(server, stream, channel_id, close_code,
+                                             (const uint8_t *)reason, strlen(reason),
+                                             reset_reason);
+}
+
+/*
+ * Browser-to-client pump. Each raw frame is validated (masking, RSV, opcode, minimal length,
+ * control-frame rules, the message sequence, UTF-8 for text, the 16 MiB message limit) and then
+ * normalised into SWS2: a data frame becomes envelopes of at most ST_ADMIN_SWS2_MAX_PAYLOAD
+ * bytes, the first keeping the frame's opcode, the rest continuation, and only the last carrying
+ * the frame's FIN. Control frames are single envelopes. PING is answered here and not forwarded,
+ * like the Spring, gorilla and Kestrel endpoints of the other servers. The browser's CLOSE is
+ * echoed (unless a CLOSE already went to it) and forwarded as the terminal SWS2 CLOSE; nothing is
+ * read after it. Returns the NAT reset code (0 for FIN) that ends the stream.
+ */
+static uint32_t admin_drain_direct_websocket(st_admin_server *server,
+                                             st_admin_direct_ws_stream *stream,
+                                             const char *channel_id,
+                                             const char **reset_reason)
+{
+    uint8_t *chunk = (uint8_t *)malloc(ST_ADMIN_SWS2_MAX_PAYLOAD);
+    if (chunk == NULL) {
+        return admin_direct_ws_fail_browser(server, stream, channel_id,
+                                            ST_ADMIN_WS_CLOSE_INTERNAL_ERROR, "", reset_reason);
+    }
+    uint8_t message_opcode = 0U;
+    size_t message_bytes = 0U;
+    st_admin_utf8_state utf8;
+    admin_utf8_reset(&utf8);
+    uint32_t result = 0U;
     for (;;) {
         uint8_t header[2];
-        if (admin_recv_all(stream->fd, header, sizeof(header)) != 0) {
-            return;
+        if (admin_direct_ws_recv(stream, header, sizeof(header)) != 0) {
+            result = admin_direct_ws_browser_gone(stream, reset_reason);
+            break;
         }
         int fin = (header[0] & 0x80U) != 0U;
         uint8_t rsv = (uint8_t)((header[0] >> 4U) & 0x07U);
         uint8_t opcode = header[0] & 0x0fU;
-        int masked = (header[1] & 0x80U) != 0;
-        if (!masked) {
-            uint8_t close_payload[2] = {0x03U, 0xeaU};
-            admin_direct_ws_send_frame(stream, 0x8U, close_payload, sizeof(close_payload));
-            return;
-        }
+        int control = opcode >= 0x8U;
+        int known = opcode <= 0x2U || (opcode >= 0x8U && opcode <= 0xaU);
         uint64_t payload_len = header[1] & 0x7fU;
-        if (payload_len == 126U) {
-            uint8_t extended[2];
-            if (admin_recv_all(stream->fd, extended, sizeof(extended)) != 0) {
-                return;
-            }
-            payload_len = ((uint64_t)extended[0] << 8U) | (uint64_t)extended[1];
-        } else if (payload_len == 127U) {
+        /* Browsers must mask, and with no extension negotiated every RSV bit must stay zero. */
+        int protocol_error = (header[1] & 0x80U) == 0U || rsv != 0U || !known
+            || (control && (!fin || payload_len > 125U))
+            || (!control && (opcode == 0x0U ? message_opcode == 0U : message_opcode != 0U));
+        if (!protocol_error && payload_len >= 126U) {
             uint8_t extended[8];
-            if (admin_recv_all(stream->fd, extended, sizeof(extended)) != 0) {
-                return;
+            size_t extended_len = payload_len == 126U ? 2U : 8U;
+            if (admin_direct_ws_recv(stream, extended, extended_len) != 0) {
+                result = admin_direct_ws_browser_gone(stream, reset_reason);
+                break;
             }
-            payload_len = 0;
-            for (size_t i = 0; i < sizeof(extended); ++i) {
-                payload_len = (payload_len << 8U) | (uint64_t)extended[i];
+            payload_len = 0U;
+            for (size_t i = 0U; i < extended_len; ++i) {
+                payload_len = (payload_len << 8U) | extended[i];
             }
+            /* Lengths must use their shortest encoding, and the 64-bit form keeps its top bit 0. */
+            protocol_error = extended_len == 2U
+                ? payload_len < 126U
+                : (extended[0] & 0x80U) != 0U || payload_len <= 0xffffU;
         }
-        uint8_t mask[4] = {0};
-        if (masked && admin_recv_all(stream->fd, mask, sizeof(mask)) != 0) {
-            return;
+        if (protocol_error) {
+            result = admin_direct_ws_fail_browser(server, stream, channel_id,
+                                                  ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR,
+                                                  "invalid WebSocket frame", reset_reason);
+            break;
         }
-        if (payload_len > ST_ADMIN_MAX_DIRECT_HTTP_BODY) {
-            uint8_t close_payload[2] = {0x03U, 0xf1U};
-            admin_direct_ws_send_frame(stream, 0x8U, close_payload, sizeof(close_payload));
-            return;
+        if (!control && payload_len > ST_ADMIN_WS_MAX_MESSAGE_BYTES - message_bytes) {
+            result = admin_direct_ws_fail_browser(server, stream, channel_id,
+                                                  ST_ADMIN_WS_CLOSE_TOO_BIG,
+                                                  "WebSocket message too big", reset_reason);
+            break;
         }
-        uint8_t *payload = NULL;
-        if (payload_len > 0) {
-            payload = (uint8_t *)malloc((size_t)payload_len);
-            if (payload == NULL) {
-                return;
+        uint8_t mask[4];
+        if (admin_direct_ws_recv(stream, mask, sizeof(mask)) != 0) {
+            result = admin_direct_ws_browser_gone(stream, reset_reason);
+            break;
+        }
+
+        if (control) {
+            size_t control_len = (size_t)payload_len;
+            if (control_len > 0U && admin_direct_ws_recv(stream, chunk, control_len) != 0) {
+                result = admin_direct_ws_browser_gone(stream, reset_reason);
+                break;
             }
-            if (admin_recv_all(stream->fd, payload, (size_t)payload_len) != 0) {
-                free(payload);
-                return;
+            for (size_t i = 0U; i < control_len; ++i) {
+                chunk[i] ^= mask[i & 3U];
             }
-            if (masked) {
-                for (size_t i = 0; i < (size_t)payload_len; ++i) {
-                    payload[i] ^= mask[i % 4U];
+            if (opcode == 0x9U) {
+                pthread_mutex_lock(&stream->send_lock);
+                int failed = !stream->close_sent && !stream->closed
+                    && admin_direct_ws_write_locked(stream, 1, 0xAU, chunk, control_len) != 0;
+                pthread_mutex_unlock(&stream->send_lock);
+                if (failed) {
+                    result = admin_direct_ws_browser_gone(stream, reset_reason);
+                    break;
                 }
+                continue;
             }
+            if (opcode == 0xAU) {
+                int rc = admin_direct_ws_forward_to_client(server, stream, channel_id, 0xAU, 1, 0U,
+                                                           chunk, control_len);
+                if (rc != 0) {
+                    result = rc == -2
+                        ? admin_direct_ws_browser_gone(stream, reset_reason)
+                        : admin_direct_ws_tunnel_gone(stream, reset_reason);
+                    break;
+                }
+                continue;
+            }
+            uint16_t close_code = 0U;
+            const uint8_t *close_reason = chunk;
+            size_t close_reason_len = control_len;
+            if (control_len >= 2U) {
+                close_code = admin_read_u16_be(chunk);
+                close_reason += 2U;
+                close_reason_len -= 2U;
+            }
+            if (control_len == 1U || (control_len >= 2U && !admin_sws2_close_code_valid(close_code))) {
+                result = admin_direct_ws_fail_browser(server, stream, channel_id,
+                                                      ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR,
+                                                      "invalid WebSocket frame", reset_reason);
+                break;
+            }
+            if (admin_utf8_complete(close_reason, close_reason_len) != 0) {
+                result = admin_direct_ws_fail_browser(server, stream, channel_id,
+                                                      ST_ADMIN_WS_CLOSE_INVALID_PAYLOAD,
+                                                      "invalid WebSocket close reason", reset_reason);
+                break;
+            }
+            /*
+             * Echo before forwarding: once close_sent is set, the client's own CLOSE reply is
+             * recognised as the tunnel half of this handshake and never reaches the browser.
+             */
+            pthread_mutex_lock(&stream->send_lock);
+            if (!stream->close_sent && !stream->closed) {
+                (void)admin_direct_ws_write_locked(stream, 1, 0x8U, chunk, control_len);
+            }
+            pthread_mutex_unlock(&stream->send_lock);
+            result = admin_direct_ws_finish_with_close(server, stream, channel_id, close_code,
+                                                       close_reason, close_reason_len, reset_reason);
+            break;
         }
 
-        if (opcode != 0x0U && opcode != 0x1U && opcode != 0x2U
-            && opcode != 0x8U && opcode != 0x9U && opcode != 0xAU) {
-            free(payload);
-            return;
+        int text = (opcode == 0x0U ? message_opcode : opcode) == 0x1U;
+        if (opcode != 0x0U) {
+            message_opcode = opcode;
+            message_bytes = 0U;
+            admin_utf8_reset(&utf8);
         }
-        if (opcode >= 0x8U && (!fin || rsv != 0U || payload_len > 125U)) {
-            free(payload);
-            return;
-        }
-        if (opcode == 0x0U) {
-            if (incoming_fragment_opcode == 0U) {
-                free(payload);
-                return;
-            }
-            if (incoming_fragment_bytes > ST_ADMIN_MAX_DIRECT_HTTP_BODY - (size_t)payload_len) {
-                uint8_t close_payload[2] = {0x03U, 0xf1U};
-                admin_direct_ws_send_frame(stream, 0x8U, close_payload, sizeof(close_payload));
-                free(payload);
-                return;
-            }
-            incoming_fragment_bytes += (size_t)payload_len;
-            if (fin) {
-                incoming_fragment_opcode = 0U;
-                incoming_fragment_bytes = 0U;
-            }
-        } else if (opcode == 0x1U || opcode == 0x2U) {
-            if (incoming_fragment_opcode != 0U) {
-                free(payload);
-                return;
-            }
-            if (!fin) {
-                incoming_fragment_opcode = opcode;
-                incoming_fragment_bytes = (size_t)payload_len;
-            }
-        }
-
-        if (opcode == 0x9U) {
-            admin_direct_ws_send_frame(stream, 0xAU, payload, (size_t)payload_len);
-            free(payload);
-            continue;
-        }
-
-        uint16_t close_code = 0U;
-        const uint8_t *frame_payload = payload;
-        size_t frame_payload_len = (size_t)payload_len;
-        if (opcode == 0x8U) {
-            if (payload_len == 1U) {
-                free(payload);
-                return;
-            }
-            if (payload_len >= 2U) {
-                close_code = admin_read_u16_be(payload);
-                frame_payload = payload + 2U;
-                frame_payload_len -= 2U;
-            }
-        }
-
-        size_t offset = 0U;
-        int first = 1;
+        size_t remaining = (size_t)payload_len;
+        size_t consumed = 0U;
+        uint8_t chunk_opcode = opcode;
+        int ended = 0;
         do {
-            size_t chunk_len = frame_payload_len - offset;
-            if (chunk_len > ST_ADMIN_SWS2_MAX_PAYLOAD) {
-                chunk_len = ST_ADMIN_SWS2_MAX_PAYLOAD;
+            size_t chunk_len = remaining < ST_ADMIN_SWS2_MAX_PAYLOAD ? remaining : ST_ADMIN_SWS2_MAX_PAYLOAD;
+            if (chunk_len > 0U && admin_direct_ws_recv(stream, chunk, chunk_len) != 0) {
+                result = admin_direct_ws_browser_gone(stream, reset_reason);
+                ended = 1;
+                break;
             }
-            int last = offset + chunk_len == frame_payload_len;
-            size_t framed_len = 0U;
-            uint8_t *framed = admin_sws2_encode(
-                first ? opcode : 0x0U,
-                fin && last,
-                first ? rsv : 0U,
-                first ? close_code : 0U,
-                chunk_len == 0U ? NULL : frame_payload + offset,
-                chunk_len,
-                &framed_len);
-            if (framed == NULL
-                || admin_direct_ws_consume_send_credit(stream, framed_len) != 0
-                || server->direct_ws_data == NULL
-                || server->direct_ws_data(server->direct_ws_ctx, channel_id, framed, framed_len) != 0) {
-                free(framed);
-                free(payload);
-                return;
+            for (size_t i = 0U; i < chunk_len; ++i) {
+                chunk[i] ^= mask[(consumed + i) & 3U];
             }
-            free(framed);
-            offset += chunk_len;
-            first = 0;
-        } while (offset < frame_payload_len);
-
-        if (opcode == 0x8U) {
-            admin_direct_ws_send_frame(stream, 0x8U, payload, (size_t)payload_len);
-            free(payload);
-            return;
+            consumed += chunk_len;
+            remaining -= chunk_len;
+            int last = remaining == 0U;
+            /* Checked before the envelope leaves, so invalid text never reaches the client. */
+            if (text
+                && (admin_utf8_feed(&utf8, chunk, chunk_len) != 0 || (last && fin && utf8.need != 0U))) {
+                result = admin_direct_ws_fail_browser(server, stream, channel_id,
+                                                      ST_ADMIN_WS_CLOSE_INVALID_PAYLOAD,
+                                                      "invalid UTF-8 in WebSocket text", reset_reason);
+                ended = 1;
+                break;
+            }
+            int rc = admin_direct_ws_forward_to_client(server, stream, channel_id, chunk_opcode,
+                                                       fin && last, 0U, chunk, chunk_len);
+            if (rc != 0) {
+                result = rc == -2
+                    ? admin_direct_ws_browser_gone(stream, reset_reason)
+                    : admin_direct_ws_tunnel_gone(stream, reset_reason);
+                ended = 1;
+                break;
+            }
+            chunk_opcode = 0x0U;
+        } while (remaining > 0U);
+        if (ended) {
+            break;
         }
-        free(payload);
+        message_bytes += (size_t)payload_len;
+        if (fin) {
+            message_opcode = 0U;
+            message_bytes = 0U;
+        }
     }
+    free(chunk);
+    return result;
 }
 
 static int handle_direct_http_websocket_request(st_admin_server *server,
@@ -12147,9 +12752,18 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
     }
     stream->fd = fd;
     stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
+    stream->handshake_pending = 1;
+    stream->refs = 1U;
+    admin_utf8_reset(&stream->outbound_utf8);
     pthread_mutex_init(&stream->send_lock, NULL);
+    pthread_cond_init(&stream->handshake_cond, NULL);
     pthread_mutex_init(&stream->flow_lock, NULL);
-    pthread_cond_init(&stream->flow_cond, NULL);
+    /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
+    pthread_condattr_t flow_cond_attr;
+    pthread_condattr_init(&flow_cond_attr);
+    pthread_condattr_setclock(&flow_cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
+    pthread_condattr_destroy(&flow_cond_attr);
 
     char channel_id[37];
     admin_generate_request_id(channel_id);
@@ -12168,7 +12782,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
-        admin_direct_ws_destroy(stream);
+        st_admin_direct_ws_release(stream);
         free(accept_key);
         free_header_array(headers, headers_len);
         free(client_name);
@@ -12195,25 +12809,36 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                 "\r\n",
                                 accept_key);
     free(accept_key);
-    if (response_len <= 0 || (size_t)response_len >= sizeof(response)
-        || send_all(fd, response, (size_t)response_len) != 0) {
-        if (admin_direct_ws_mark_closed(stream)) {
-            server->direct_ws_close(server->direct_ws_ctx, channel_id);
-        }
-        admin_direct_ws_destroy(stream);
-        free_header_array(headers, headers_len);
-        free(client_name);
-        free(route);
-        free(relative_path);
-        free(raw_query);
-        return 1;
+    /*
+     * The client may already be answering the OPEN. Its frames wait on handshake_pending, and the
+     * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
+     */
+    pthread_mutex_lock(&stream->send_lock);
+    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
+        && send_all(fd, response, (size_t)response_len) == 0;
+    stream->handshake_pending = 0;
+    if (!upgraded) {
+        admin_direct_ws_abort_locked(stream);
     }
+    pthread_cond_broadcast(&stream->handshake_cond);
+    pthread_mutex_unlock(&stream->send_lock);
 
-    admin_drain_direct_websocket(server, stream, channel_id);
-    if (admin_direct_ws_mark_closed(stream)) {
-        server->direct_ws_close(server->direct_ws_ctx, channel_id);
+    const char *reset_reason = "WebSocket handshake failed";
+    uint32_t reset_code = upgraded
+        ? admin_drain_direct_websocket(server, stream, channel_id, &reset_reason)
+        : ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
+    pthread_mutex_lock(&stream->send_lock);
+    int abort_result = stream->abort_result;
+    pthread_mutex_unlock(&stream->send_lock);
+    if (abort_result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        /* A client-side violation dropped the socket: if the stream is still mapped, reset it. */
+        reset_code = st_admin_direct_ws_reset_code(abort_result, &reset_reason);
     }
-    admin_direct_ws_destroy(stream);
+    /* After this no thread writes to the fd, which handle_client closes once we return. */
+    admin_direct_ws_mark_closed(stream);
+    server->direct_ws_close(server->direct_ws_ctx, channel_id, reset_code, reset_reason);
+    st_admin_direct_ws_release(stream);
+    admin_direct_ws_linger(fd);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);

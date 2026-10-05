@@ -58,13 +58,26 @@ typedef struct {
     st_admin_direct_ws_stream *stream;
 } st_admin_direct_ws_request;
 
+/*
+ * After a successful open the NAT side keeps request->stream for as long as the NAT stream is
+ * mapped: it takes its own reference with st_admin_direct_ws_retain and drops it with
+ * st_admin_direct_ws_release, so neither side frees the stream under the other.
+ */
 typedef int (*st_admin_direct_ws_open_handler)(void *ctx,
                                                const st_admin_direct_ws_request *request);
+/* Sends one browser-to-client SWS2 envelope as NAT DATA; non-zero means the tunnel side is gone. */
 typedef int (*st_admin_direct_ws_data_handler)(void *ctx,
                                                const char *channel_id,
                                                const uint8_t *payload,
                                                size_t payload_len);
-typedef void (*st_admin_direct_ws_close_handler)(void *ctx, const char *channel_id);
+/*
+ * Ends the NAT stream once the browser side is finished: reset_code 0 sends FIN (after the SWS2
+ * CLOSE that was already sent as DATA), any other value aborts the stream with that RST code.
+ */
+typedef void (*st_admin_direct_ws_close_handler)(void *ctx,
+                                                 const char *channel_id,
+                                                 uint32_t reset_code,
+                                                 const char *reason);
 typedef int (*st_admin_nat_control_handler)(void *ctx,
                                             long long client_id,
                                             const char *client_name);
@@ -162,11 +175,54 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
 void st_admin_broadcast_connection_event(const char *tenant_id,
                                          const char *type,
                                          const st_storage_connection *connection);
+/* One SWS2 envelope (protocol/spec/http-route.md section 7); payload points into the encoding. */
+typedef struct {
+    uint8_t opcode;
+    int fin;
+    uint8_t rsv;
+    uint16_t close_code;
+    const uint8_t *payload;
+    size_t payload_len;
+} st_admin_sws2_frame;
+
+#define ST_ADMIN_SWS2_HEADER_BYTES 12U
+#define ST_ADMIN_SWS2_MAX_PAYLOAD ((64U * 1024U) - ST_ADMIN_SWS2_HEADER_BYTES)
+/* A WebSocket message (one raw frame or a fragmented sequence) is capped at 16 MiB either way. */
+#define ST_ADMIN_WS_MAX_MESSAGE_BYTES (16U * 1024U * 1024U)
+
+/* Decodes and fully validates one envelope; frame may be NULL to validate only. */
+int st_admin_sws2_decode(const uint8_t *encoded, size_t encoded_len, st_admin_sws2_frame *frame);
+/* Encodes a valid envelope into a malloc'd buffer, or returns NULL for an invalid frame. */
+uint8_t *st_admin_sws2_encode(const st_admin_sws2_frame *frame, size_t *encoded_len);
+int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len);
+
+/*
+ * Result of handing the browser side something the client sent on the stream. Every failure has
+ * already closed the browser socket; the NAT side drops the stream and resets it with the code
+ * below (30 and 31 as the .NET server uses them for WebSocket streams, 7 as for its stream-state
+ * violations).
+ */
+#define ST_ADMIN_DIRECT_WS_ACCEPTED 0
+#define ST_ADMIN_DIRECT_WS_INVALID (-1)        /* malformed SWS2 or a broken message sequence */
+#define ST_ADMIN_DIRECT_WS_AFTER_FIN (-2)      /* DATA or a second FIN after the client's FIN */
+#define ST_ADMIN_DIRECT_WS_BROWSER_FAILED (-3) /* the browser socket could not be written */
+#define ST_ADMIN_DIRECT_WS_RST_STREAM_STATE 7U
+#define ST_ADMIN_DIRECT_WS_RST_INVALID_SWS2 30U
+#define ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE 31U
+/* The RST code (and reason, when reason is not NULL) for one of the failed results above. */
+uint32_t st_admin_direct_ws_reset_code(int result, const char **reason);
+
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len);
-int st_admin_validate_sws2_payload(const uint8_t *payload, size_t payload_len);
+/* The client's FIN: without an earlier SWS2 CLOSE the browser is closed with 1001. */
+int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream);
+/* The client's RST: the browser is closed with 1011 and the socket is dropped. */
+void st_admin_direct_ws_peer_reset(st_admin_direct_ws_stream *stream);
 int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit);
+/* The control connection is gone: the browser is closed with 1001 and the socket is dropped. */
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream);
+void st_admin_direct_ws_retain(st_admin_direct_ws_stream *stream);
+void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream);
 
 #endif
