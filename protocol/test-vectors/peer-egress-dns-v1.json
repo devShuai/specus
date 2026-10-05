@@ -955,7 +955,12 @@
       "accepted": true,
       "domainTargetCapable": [
         2
-      ]
+      ],
+      "listed": [
+        2,
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "same-revision-ignored",
@@ -963,7 +968,12 @@
       "accepted": false,
       "domainTargetCapable": [
         2
-      ]
+      ],
+      "listed": [
+        2,
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "older-revision-ignored",
@@ -971,7 +981,12 @@
       "accepted": false,
       "domainTargetCapable": [
         2
-      ]
+      ],
+      "listed": [
+        2,
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "newer-replaces-everything",
@@ -979,7 +994,11 @@
       "accepted": true,
       "domainTargetCapable": [
         3
-      ]
+      ],
+      "listed": [
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "not-a-catalogue",
@@ -987,36 +1006,53 @@
       "accepted": false,
       "domainTargetCapable": [
         3
-      ]
+      ],
+      "listed": [
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "only-json-true-counts",
       "json": "{\"type\":\"egress-catalog\",\"revision\":6,\"egresses\":[{\"clientId\":2,\"domainTargetCapable\":\"true\"},{\"clientId\":3,\"domainTargetCapable\":1}],\"createdAtMillis\":1757000000000}",
       "accepted": true,
-      "domainTargetCapable": []
+      "domainTargetCapable": [],
+      "listed": [
+        2,
+        3
+      ],
+      "egressVersion": {}
     },
     {
       "name": "absent-list-is-empty",
       "json": "{\"type\":\"egress-catalog\",\"revision\":7}",
       "accepted": true,
-      "domainTargetCapable": []
+      "domainTargetCapable": [],
+      "listed": [],
+      "egressVersion": {}
     },
     {
       "name": "revision-must-be-a-number",
       "json": "{\"type\":\"egress-catalog\",\"revision\":\"8\",\"egresses\":[{\"clientId\":2,\"domainTargetCapable\":true}]}",
       "accepted": false,
-      "domainTargetCapable": []
+      "domainTargetCapable": [],
+      "listed": [],
+      "egressVersion": {}
     },
     {
       "name": "list-must-be-a-list",
       "json": "{\"type\":\"egress-catalog\",\"revision\":8,\"egresses\":{\"clientId\":2,\"domainTargetCapable\":true}}",
       "accepted": false,
-      "domainTargetCapable": []
+      "domainTargetCapable": [],
+      "listed": [],
+      "egressVersion": {}
     },
     {
       "name": "new-session",
       "newSession": true,
-      "domainTargetCapable": []
+      "domainTargetCapable": [],
+      "listed": [],
+      "egressVersion": {}
     },
     {
       "name": "floor-reset-by-the-new-session",
@@ -1024,7 +1060,11 @@
       "accepted": true,
       "domainTargetCapable": [
         2
-      ]
+      ],
+      "listed": [
+        2
+      ],
+      "egressVersion": {}
     },
     {
       "name": "entries-without-a-usable-id-skipped",
@@ -1032,15 +1072,47 @@
       "accepted": true,
       "domainTargetCapable": [
         4
-      ]
+      ],
+      "listed": [
+        4
+      ],
+      "egressVersion": {}
+    },
+    {
+      "name": "egress-versions-only-non-negative-integers",
+      "json": "{\"type\":\"egress-catalog\",\"revision\":3,\"egresses\":[{\"clientId\":2,\"egressVersion\":1},{\"clientId\":3,\"egressVersion\":0},{\"clientId\":4,\"egressVersion\":\"1\"},{\"clientId\":5,\"egressVersion\":-1},{\"clientId\":6,\"egressVersion\":true},{\"clientId\":7}]}",
+      "accepted": true,
+      "domainTargetCapable": [],
+      "listed": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "egressVersion": {
+        "2": 1,
+        "3": 0
+      }
     },
     {
       "name": "not-json",
       "json": "{\"type\":\"egress-catalog\",",
       "accepted": false,
-      "domainTargetCapable": [
-        4
-      ]
+      "domainTargetCapable": [],
+      "listed": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "egressVersion": {
+        "2": 1,
+        "3": 0
+      }
     }
   ],
   "steering": [
