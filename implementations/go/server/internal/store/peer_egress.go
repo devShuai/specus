@@ -23,7 +23,9 @@ type PeerMeshEgressPolicy struct {
 	AllowedConsumerClientIDs string
 	// DestinationRules is a canonical JSON array. Empty denies everything; there is no
 	// unconfigured-therefore-open state.
-	DestinationRules    string
+	DestinationRules string
+	// DomainRules is a canonical JSON array of {match, protocols, portRanges}. Empty grants no name.
+	DomainRules         string
 	MaxConcurrentFlows  int
 	MaxFlowsPerConsumer int
 	IdleTimeoutSeconds  int
@@ -32,8 +34,8 @@ type PeerMeshEgressPolicy struct {
 }
 
 const peerEgressPolicyColumns = `id, tenant_id, owner_username, egress_client_id, egress_client_name, enabled,
-	scope, allowed_consumer_client_ids, destination_rules, max_concurrent_flows, max_flows_per_consumer,
-	idle_timeout_seconds, created_at, updated_at`
+	scope, allowed_consumer_client_ids, destination_rules, domain_rules, max_concurrent_flows,
+	max_flows_per_consumer, idle_timeout_seconds, created_at, updated_at`
 
 type egressPolicyScanner interface {
 	Scan(dest ...any) error
@@ -43,11 +45,12 @@ func scanPeerMeshEgressPolicy(scanner egressPolicyScanner) (PeerMeshEgressPolicy
 	var (
 		row                  PeerMeshEgressPolicy
 		consumers, rules     sql.NullString
+		domainRules          sql.NullString
 		enabled              databaseBoolean
 		createdAt, updatedAt string
 	)
 	err := scanner.Scan(&row.ID, &row.TenantID, &row.OwnerUsername, &row.EgressClientID, &row.EgressClientName,
-		&enabled, &row.Scope, &consumers, &rules, &row.MaxConcurrentFlows, &row.MaxFlowsPerConsumer,
+		&enabled, &row.Scope, &consumers, &rules, &domainRules, &row.MaxConcurrentFlows, &row.MaxFlowsPerConsumer,
 		&row.IdleTimeoutSeconds, &createdAt, &updatedAt)
 	if err != nil {
 		return PeerMeshEgressPolicy{}, err
@@ -57,6 +60,9 @@ func scanPeerMeshEgressPolicy(scanner egressPolicyScanner) (PeerMeshEgressPolicy
 	}
 	if rules.Valid {
 		row.DestinationRules = rules.String
+	}
+	if domainRules.Valid {
+		row.DomainRules = domainRules.String
 	}
 	row.Enabled = bool(enabled)
 	row.CreatedAt = parseTime(createdAt)
@@ -125,12 +131,13 @@ func (db *DB) FindPeerMeshEgressPolicyByClient(ctx context.Context, tenantID str
 func (db *DB) InsertPeerMeshEgressPolicy(ctx context.Context, row PeerMeshEgressPolicy) error {
 	query := db.rebind(`INSERT INTO peer_mesh_egress_policy
 		(id, tenant_id, owner_username, egress_client_id, egress_client_name, enabled, scope,
-		 allowed_consumer_client_ids, destination_rules, max_concurrent_flows, max_flows_per_consumer,
-		 idle_timeout_seconds, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		 allowed_consumer_client_ids, destination_rules, domain_rules, max_concurrent_flows,
+		 max_flows_per_consumer, idle_timeout_seconds, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, row.ID, defaultTenant(row.TenantID), row.OwnerUsername,
 		row.EgressClientID, row.EgressClientName, db.clientMessageCapabilityValue(row.Enabled), row.Scope,
-		row.AllowedConsumerClientIDs, row.DestinationRules, row.MaxConcurrentFlows, row.MaxFlowsPerConsumer,
+		row.AllowedConsumerClientIDs, row.DestinationRules, storedDomainRules(row.DomainRules),
+		row.MaxConcurrentFlows, row.MaxFlowsPerConsumer,
 		row.IdleTimeoutSeconds, formatTime(row.CreatedAt), formatTime(row.UpdatedAt))
 	return err
 }
@@ -138,14 +145,22 @@ func (db *DB) InsertPeerMeshEgressPolicy(ctx context.Context, row PeerMeshEgress
 // UpdatePeerMeshEgressPolicy replaces the mutable fields of an existing policy.
 func (db *DB) UpdatePeerMeshEgressPolicy(ctx context.Context, row PeerMeshEgressPolicy) error {
 	query := db.rebind(`UPDATE peer_mesh_egress_policy SET owner_username = ?, egress_client_name = ?, enabled = ?,
-		scope = ?, allowed_consumer_client_ids = ?, destination_rules = ?, max_concurrent_flows = ?,
-		max_flows_per_consumer = ?, idle_timeout_seconds = ?, updated_at = ?
+		scope = ?, allowed_consumer_client_ids = ?, destination_rules = ?, domain_rules = ?,
+		max_concurrent_flows = ?, max_flows_per_consumer = ?, idle_timeout_seconds = ?, updated_at = ?
 		WHERE tenant_id = ? AND id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, row.OwnerUsername, row.EgressClientName,
 		db.clientMessageCapabilityValue(row.Enabled), row.Scope, row.AllowedConsumerClientIDs, row.DestinationRules,
-		row.MaxConcurrentFlows, row.MaxFlowsPerConsumer, row.IdleTimeoutSeconds, formatTime(row.UpdatedAt),
+		storedDomainRules(row.DomainRules), row.MaxConcurrentFlows, row.MaxFlowsPerConsumer, row.IdleTimeoutSeconds, formatTime(row.UpdatedAt),
 		defaultTenant(row.TenantID), row.ID)
 	return err
+}
+
+// storedDomainRules keeps the NOT NULL column readable as a JSON array when a caller left it unset.
+func storedDomainRules(raw string) string {
+	if raw == "" {
+		return "[]"
+	}
+	return raw
 }
 
 // DeletePeerMeshEgressPolicy removes a policy. New flows stop being authorised immediately; callers

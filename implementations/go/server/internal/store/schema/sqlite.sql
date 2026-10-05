@@ -661,6 +661,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_policy (
   scope TEXT NOT NULL DEFAULT 'PUBLIC',
   allowed_consumer_client_ids TEXT,
   destination_rules TEXT,
+  domain_rules TEXT NOT NULL DEFAULT '[]',
   max_concurrent_flows INTEGER NOT NULL DEFAULT 256,
   max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,
   idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,

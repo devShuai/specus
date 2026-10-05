@@ -173,14 +173,17 @@ func (db *DB) ensureCompatibleColumns() error {
 	boolType := "INTEGER NOT NULL DEFAULT 0"
 	clientCapabilityBoolType := boolType
 	ticketAttributesType := "TEXT"
+	egressDomainRulesType := "TEXT NOT NULL DEFAULT '[]'"
 	switch db.dialect {
 	case DialectPostgres:
 		boolType = "SMALLINT NOT NULL DEFAULT 0"
 		clientCapabilityBoolType = "BOOLEAN NOT NULL DEFAULT FALSE"
+		egressDomainRulesType = "VARCHAR(4096) NOT NULL DEFAULT '[]'"
 	case DialectMySQL:
 		boolType = "TINYINT(1) NOT NULL DEFAULT 0"
 		clientCapabilityBoolType = boolType
 		ticketAttributesType = "LONGTEXT"
+		egressDomainRulesType = "VARCHAR(4096) NOT NULL DEFAULT '[]'"
 	}
 	columns := []struct {
 		table      string
@@ -213,6 +216,8 @@ func (db *DB) ensureCompatibleColumns() error {
 		// its session table as it was, and every login fails writing a column that is not there.
 		{"specus_client_session", "client_egress_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"specus_client_session", "client_egress_domain_targets", clientCapabilityBoolType},
+		// Domain rules of an egress policy. A policy saved before them reads as granting no name.
+		{"peer_mesh_egress_policy", "domain_rules", egressDomainRulesType},
 		{"peer_mesh_service_sharing", "mdns_import_enabled", boolType},
 		{"peer_mesh_shared_service", "allowed_client_ids", "VARCHAR(512) NOT NULL DEFAULT ''"},
 		{"client_download_link", "version", "VARCHAR(32)"},
