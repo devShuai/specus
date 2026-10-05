@@ -968,6 +968,12 @@ _domain_policy_spec.loader.exec_module(_domain_policy_module)
 if (json.loads((VECTORS / "peer-egress-domain-policy-v1.json").read_text(encoding="utf-8"))
         != _domain_policy_module.build()):
     failures.append("peer-egress-domain-policy-v1.json differs from what its generator produces; regenerate it")
+_rate_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_rate_vectors", Path(__file__).with_name("generate_peer_egress_rate_vectors.py"))
+_rate_module = importlib.util.module_from_spec(_rate_spec)
+_rate_spec.loader.exec_module(_rate_module)
+if json.loads((VECTORS / "peer-egress-rate-v1.json").read_text(encoding="utf-8")) != _rate_module.build():
+    failures.append("peer-egress-rate-v1.json differs from what its generator produces; regenerate it")
 _management_spec = importlib.util.spec_from_file_location(
     "generate_peer_egress_management_vectors", Path(__file__).with_name("generate_peer_egress_management_vectors.py"))
 _management_module = importlib.util.module_from_spec(_management_spec)
