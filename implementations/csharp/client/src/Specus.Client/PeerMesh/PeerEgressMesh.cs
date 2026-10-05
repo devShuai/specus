@@ -319,7 +319,11 @@ internal sealed class PeerEgressMesh(
             _runtime = built;
             EnsureLoops();
             // The tick only exists for the egress role: retransmission and idle expiry belong to
-            // flows this node opened on somebody else's behalf.
+            // flows this node opened on somebody else's behalf. It ticks whichever plane is current
+            // at each turn. A control reconnect shuts the plane down and the next policy builds a
+            // new one, while this loop lives on; bound to the plane that started it, it went on
+            // ticking that shut-down one, and the new plane's retransmissions and idle expiry never
+            // ran again.
             _tickLoop ??= Start(() =>
             {
                 while (!_stopping.IsCancellationRequested)
@@ -328,7 +332,7 @@ internal sealed class PeerEgressMesh(
                     {
                         return;
                     }
-                    built.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    Volatile.Read(ref _runtime)?.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 }
             });
             // From the first policy on, whatever it says: a check while the egress is switched off

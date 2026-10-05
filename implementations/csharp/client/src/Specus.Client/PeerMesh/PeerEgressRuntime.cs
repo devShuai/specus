@@ -138,6 +138,13 @@ internal sealed class PeerEgressRuntime
     private long _bytesIn;
     private long _bytesOut;
     private bool _closed;
+    private long _ticks;
+
+    /// <summary>
+    /// Visible for tests: how many ticks have reached this plane, a shut-down one included, so a test
+    /// can tell a plane nobody ticks from one whose ticks find nothing to do.
+    /// </summary>
+    internal long Ticks => Interlocked.Read(ref _ticks);
 
     public PeerEgressRuntime(
         Action<long, byte[]>? send,
@@ -826,6 +833,7 @@ internal sealed class PeerEgressRuntime
     /// </summary>
     public void OnTick(long nowMs)
     {
+        Interlocked.Increment(ref _ticks);
         lock (_lock)
         {
             if (_closed)
