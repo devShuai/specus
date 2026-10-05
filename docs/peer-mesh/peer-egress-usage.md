@@ -209,6 +209,9 @@ PID 12345 | ready
 | 日志有 `route X lost to another route, not taken back` | 日志；`egress` 里的 `NOT INSTALLED` | 本功能的路由不在了，而同一前缀上出现了别人的路由。本功能不抢占：这条前缀从此按冲突处理，每 60 秒查一次，对方撤了就装回。删掉或调整那条路由 |
 | 日志有 `bypass host X did not resolve` | 日志 | 服务端、STUN 或 TURN 的主机名解析失败，它的旁路没装。若某条规则的前缀覆盖了它的地址，去它的连接会走进隧道。检查 DNS；解析恢复后一分钟内自动补上 |
 | 命中规则的目标连接立刻被拒绝（TCP `connection refused` / UDP 报主机不可达），状态里出口离线 | `egress peer N: offline`，拦截计数 `egress-unavailable` | 出口设备不在线、服务端未打开租户开关或出口策略、或这台消费端不在允许列表里。出口设备上 `egress` 显示 `not serving` 说明它没收到策略 |
+| 同样立刻被拒绝，但出口在线 | `egress peer N: not offered to this device by the server's egress catalog`，拦截计数 `egress-not-offered` | 服务端的出口目录没有把这台出口提供给本机：它不是出口、出口策略未启用、没有允许本机，或基础 ACL、租户开关不允许。请管理员在出口策略里启用它并允许本机 |
+| 同样立刻被拒绝，出口在线 | `egress peer N: online, but its client does not support peer egress`，拦截计数 `egress-unsupported` | 出口设备的客户端版本太旧，登录时没有声明出口能力，发给它的流量不会被处理。升级那台设备的客户端 |
+| `egress` 里有 `server: sent no egress catalog` | 状态里 `catalog` 为 `none` | 控制连接认证后 30 秒内没收到出口目录，服务端可能太旧、不支持出口，升级服务端。在此之前出口能否接流以出口的拒绝为准 |
 | 出口在线但特定目标不通 | 拦截计数 `rejected-egress_dest_denied` 等；出口上的 `refused` | 出口策略拒绝了这个目标，检查 `destinationRules`、`scope`、协议与端口 |
 | ping 不通但 TCP 正常 | 拦截计数 `unsupported-protocol` | 一期不转发 ICMP，符合预期 |
 | 出口设备收不到策略 | 出口上 `egress: not serving` | 确认客户端版本包含登录能力声明；更早的客户端服务端不会下发策略 |
@@ -221,6 +224,8 @@ PID 12345 | ready
 | `rule` | 命中 `block` 规则 |
 | `unsupported-protocol` | 命中出口规则但协议不承载，如 ICMP |
 | `egress-unavailable` | 指向的出口当前不可用 |
+| `egress-not-offered` | 指向的出口在线，但服务端的出口目录没有向本机提供它 |
+| `egress-unsupported` | 指向的出口在线，但它的客户端不支持出口（旧版本） |
 | `send-failed` | 交给出口的帧没能发出 |
 | `return-mesh-source` / `return-no-flow` | 回程包来源异常，被拒收 |
 | `rejected-<错误码>` | 出口拒绝了这个连接 |
@@ -353,8 +358,7 @@ specus-client egress dns restore
 完整列表见规范的[当前限制](../../protocol/spec/peer-egress.md#当前限制)。影响使用的几条：
 
 - **下行只有有界发送窗口，没有自适应拥塞控制。** 此前经出口下载大响应会被复位的问题已修复（#74）：出口按消费端通告的窗口发送，并对目标 socket 施加背压。Linux 上三种语言两两组合的 9 种组合在每次 PR 上用真 TUN 验证 8 MiB 上下行、64 条并发流与 2% 丢包下的完整性（见[真机实验室](../../scripts/peer-egress-lab/README.md)）；Windows 与 macOS 的真 TUN 验收仍在 #50 中进行。
-- **客户端只从服务端下发的出口目录里读出口是否支持域名，也不上报出口计数。** 出口是否可用取自组网在线状态；管理接口的活动页现在总是空的。
-- **遇到版本过旧的对端时没有专门提示**，只会表现为出口离线。
+- **客户端不上报出口计数**，管理接口的活动页现在总是空的。出口是否在线取自组网在线状态，出口目录只用来判断出口是否提供给本机、能否接流与能否解析域名。
 - **出口侧没有字节速率限制**，只有并发数与空闲超时上限。
 - **切网或休眠恢复后，路由最多在 5 秒内补回；这 5 秒内命中规则的目标会从本机直连出去，而不是被阻断。** 日志里的 `route … put back` 说明发生过一次补回；如果它频繁出现，说明有别的东西在反复改路由表。Linux 上只对照主表，另一个 VPN 用策略路由把流量导走时发现不了。
 - **控制连接断开重连时路由保持不变**，不再有窗口。断开期间客户端只挂起：路由与虚拟网卡都留着，命中规则的流量仍然被接管，由出口承载或被拒绝；已建立的对端流量走 UDP，不受影响。只有真正退出时才撤回路由。
