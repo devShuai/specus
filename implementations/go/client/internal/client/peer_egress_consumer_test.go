@@ -348,11 +348,63 @@ func TestConsumerPurgesFlowsWhenTheEgressGoesOffline(t *testing.T) {
 	}
 }
 
-// A rejection must reset the application even when the egress's RST is lost or arrives later.
-func TestConsumerDropsAFlowTheEgressRejected(t *testing.T) {
+// A connection still opening has nothing the consumer could reset it with, so the egress's own RST
+// is what ends the application's connect. The egress sends its flow-reject first; forgetting the
+// flow on it dropped the RST behind it as return-no-flow, and the application retransmitted its SYN
+// into the same refusal until it timed out (the peer egress lab, #42).
+func TestConsumerKeepsAnOpeningFlowTheEgressRejectedForItsReset(t *testing.T) {
 	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
-	harness.consumer.handleOutbound(consumerPacket(t, "203.0.113.10", 443), flowEpoch)
+	syn := consumerPacket(t, "203.0.113.10", 443)
+	harness.consumer.handleOutbound(syn, flowEpoch)
 
+	body, err := encodePeerEgressControl(peerEgressControl{
+		Type: peerEgressControlFlowReject, Protocol: "tcp",
+		SourceIP: "100.96.0.1", SourcePort: 40000,
+		DestinationIP: "203.0.113.10", DestinationPort: 443,
+		Code: egressCodeLimitExceeded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject := encodePeerEgressFrame(peerEgressTypeControl, false, body)
+	harness.consumer.handleInbound(reject, 2, flowEpoch)
+	if harness.consumer.flowCount() != 1 || len(harness.toTun) != 0 {
+		t.Fatalf("after the reject: %d flows, %d packets to the TUN; want the flow kept and nothing made up",
+			harness.consumer.flowCount(), len(harness.toTun))
+	}
+
+	// The egress's reset, exactly as it answers a refused SYN, reaches the application.
+	parsed, ok := parseTCPSegment(syn)
+	if !ok {
+		t.Fatal("the SYN does not parse")
+	}
+	reset := buildTCPReset(parsed)
+	harness.consumer.handleInbound(encodePeerEgressFrame(peerEgressTypeIPPacket, false, reset), 2, flowEpoch)
+	if len(harness.toTun) != 1 {
+		t.Fatalf("the egress's reset did not reach the application: blocked %v", harness.consumer.blockedCounts())
+	}
+	if got, ok := parseTCPSegment(harness.toTun[0]); !ok || got.Flags&tcpFlagRST == 0 || got.Ack != 1001 {
+		t.Fatalf("delivered %+v, want the egress's RST acknowledging the SYN", got)
+	}
+
+	// A repeated reject, as for a retransmitted SYN, is neither counted again nor acted on.
+	harness.consumer.handleInbound(reject, 2, flowEpoch)
+	if counts := harness.consumer.blockedCounts(); counts["rejected-egress_limit_exceeded"] != 1 ||
+		counts["return-no-flow"] != 0 {
+		t.Errorf("blocked counts = %v", counts)
+	}
+	if len(harness.toTun) != 1 {
+		t.Errorf("%d packets to the TUN after a repeated reject", len(harness.toTun))
+	}
+}
+
+// The order can also be the other way round: the reset first, then the reject for a flow it closed.
+func TestConsumerTakesTheEgressResetBeforeItsReject(t *testing.T) {
+	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
+	syn := consumerPacket(t, "203.0.113.10", 443)
+	harness.consumer.handleOutbound(syn, flowEpoch)
+	parsed, _ := parseTCPSegment(syn)
+	harness.consumer.handleInbound(encodePeerEgressFrame(peerEgressTypeIPPacket, false, buildTCPReset(parsed)), 2, flowEpoch)
 	body, err := encodePeerEgressControl(peerEgressControl{
 		Type: peerEgressControlFlowReject, Protocol: "tcp",
 		SourceIP: "100.96.0.1", SourcePort: 40000,
@@ -363,7 +415,32 @@ func TestConsumerDropsAFlowTheEgressRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	harness.consumer.handleInbound(encodePeerEgressFrame(peerEgressTypeControl, false, body), 2, flowEpoch)
+	if len(harness.toTun) != 1 {
+		t.Errorf("%d packets to the TUN, want only the egress's reset", len(harness.toTun))
+	}
+	if counts := harness.consumer.blockedCounts(); counts["rejected-egress_port_denied"] != 1 {
+		t.Errorf("blocked counts = %v", counts)
+	}
+}
 
+// A rejected datagram flow is forgotten: UDP has no reset to wait for, and the next datagram is
+// judged afresh.
+func TestConsumerForgetsADatagramFlowTheEgressRejected(t *testing.T) {
+	harness := newConsumerHarness(t, consumerRules(), map[int64]bool{2: true})
+	harness.consumer.handleOutbound(buildUDPDatagram(udpDatagram{
+		SourceIP: testAddr(t, "100.96.0.1"), DestinationIP: testAddr(t, "203.0.113.10"),
+		SourcePort: 40000, DestinationPort: 53, Payload: []byte("query"),
+	}), flowEpoch)
+	body, err := encodePeerEgressControl(peerEgressControl{
+		Type: peerEgressControlFlowReject, Protocol: "udp",
+		SourceIP: "100.96.0.1", SourcePort: 40000,
+		DestinationIP: "203.0.113.10", DestinationPort: 53,
+		Code: egressCodePortDenied,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.consumer.handleInbound(encodePeerEgressFrame(peerEgressTypeControl, false, body), 2, flowEpoch)
 	if harness.consumer.flowCount() != 0 {
 		t.Errorf("%d flows survived a flow-reject", harness.consumer.flowCount())
 	}

@@ -150,6 +150,12 @@ final class PeerEgressConsumer {
          * one with.
          */
         boolean replied;
+        /**
+         * Set by a flow-reject for a TCP flow the application has acknowledged nothing on yet: one
+         * still opening. Such a flow is kept rather than forgotten (see {@link #handleFlowReject}),
+         * and the mark keeps a repeated rejection from being counted again.
+         */
+        boolean rejected;
 
         Flow(int protocol, long egress, long registration, long nowMs) {
             this.protocol = protocol;
@@ -965,7 +971,8 @@ final class PeerEgressConsumer {
 
     /**
      * A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
-     * the flow, and only accept its actual egress as the sender.
+     * the flow, and only accept its actual egress as the sender. A TCP flow still opening cannot be
+     * reset locally and is kept for the egress's RST instead.
      */
     private void handleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs) {
         Integer remote = Ipv4Cidr.parseAddress(control.destinationIp());
@@ -981,6 +988,21 @@ final class PeerEgressConsumer {
             return;
         }
         byte[] reset = flowResetPacket(key, flow);
+        if (reset == null && key.protocol() == PeerEgressSegment.IPV4_PROTOCOL_TCP) {
+            // Still opening: the application has acknowledged nothing, so there is no reset to make
+            // here, and the egress's own RST is what ends its connect. That RST may arrive behind
+            // this message and reaches the application only past the return check, which needs the
+            // flow. Forgetting the flow here dropped it as return-no-flow, and the application
+            // retransmitted its SYN into the same refusal until its own timeout. The RST closes the
+            // flow like any other; if it is lost, the retransmitted SYN draws another.
+            if (flow.rejected) {
+                return;
+            }
+            flow.rejected = true;
+            recordBlocked("rejected-" + control.code().toLowerCase(Locale.ROOT));
+            log.info("[peer-egress-consumer] egress={} refused flow code={}", fromEgress, control.code());
+            return;
+        }
         flows.remove(key);
         recordBlocked("rejected-" + control.code().toLowerCase(Locale.ROOT));
         if (reset != null && tunWriter != null) {
