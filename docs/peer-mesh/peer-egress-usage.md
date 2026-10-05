@@ -73,7 +73,7 @@ Content-Type: application/json
 - 实际允许的消费端是 `allowedConsumerClientIds` 与基础 Peer ACL 的**交集**，出口在每次建立连接前还会再校验一次。
 - 回环、链路本地与云元数据地址、组播广播、Peer Mesh 网段、本部署的控制与 STUN/TURN 端点、出口本机虚拟网卡网段**永远拒绝**，写 `0.0.0.0/0` 也不会放行它们。
 
-其余接口：`GET /api/admin/peer-mesh/egress/switch` 查看开关，`GET /api/admin/peer-mesh/egress/policies` 列出策略（含与 ACL 取交集后的实际消费端），`DELETE /api/admin/peer-mesh/egress/policies/{id}` 删除策略。`GET /api/admin/peer-mesh/egress/activity` 展示每台出口最近一次上报的计数：出口运行时每 60 秒检查一次，有变化才上报，数字是自出口进程启动以来的累计值（活动流数除外），与出口设备上 `specus-client egress` 看到的相同。
+其余接口：`GET /api/admin/peer-mesh/egress/switch` 查看开关，`GET /api/admin/peer-mesh/egress/policies` 列出策略（含与 ACL 取交集后的实际消费端），`DELETE /api/admin/peer-mesh/egress/policies/{id}` 删除策略。`GET /api/admin/peer-mesh/egress/activity` 展示每台出口最近一次上报的计数：出口运行时每 60 秒检查一次，有变化才上报，数字是这台出口这一次开始服务以来的累计值（活动流数除外；出口重启或重连后重新计），与出口设备上 `specus-client egress` 看到的相同。
 
 ## 二、消费端：写规则
 
