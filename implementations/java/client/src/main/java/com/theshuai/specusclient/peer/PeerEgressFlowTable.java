@@ -76,6 +76,13 @@ final class PeerEgressFlowTable {
         String name;
 
         /**
+         * The address the socket was dialled to. The key's remote address for a flow to an address;
+         * for a flow to a name, the resolved address it was authorised for, while the key keeps the
+         * consumer's fake address. Re-authorization judges this one, as the opening did.
+         */
+        int address;
+
+        /**
          * Whatever the caller attached: a connection, a socket, a cancellation handle. Stored so
          * that everything needed to tear a flow down travels with the entry that authorises it, and
          * never read here.
@@ -87,6 +94,7 @@ final class PeerEgressFlowTable {
             this.consumer = consumer;
             this.openedAtMs = nowMs;
             this.lastSeenMs = nowMs;
+            this.address = key.remoteIp();
         }
     }
 
@@ -309,6 +317,10 @@ final class PeerEgressFlowTable {
      *
      * <p>The limit fields are deliberately not re-checked. Lowering a quota should stop the next
      * flow, not pick live ones to kill, and a limit breach is not a permission the flow lost.
+     *
+     * <p>A flow opened under a name is judged as it was opened: the address it was dialled to, with
+     * its name, so a domain rule that admitted it keeps it and one that is gone revokes it. Judging
+     * the key's fake address instead would test an address nothing was ever dialled to.
      */
     List<Revocation> reauthorize(
             PeerEgressPolicy policy,
@@ -321,7 +333,8 @@ final class PeerEgressFlowTable {
             boolean allowed = peerAclAllows == null || peerAclAllows.test(flow.consumer);
             PeerEgressRequest request = new PeerEgressRequest();
             request.setConsumerClientId(flow.consumer);
-            request.setDestinationIp(Ipv4Cidr.format(flow.key.remoteIp()));
+            request.setDestinationIp(Ipv4Cidr.format(flow.address));
+            request.setName(flow.name);
             request.setDestinationPort(flow.key.remotePort());
             request.setProtocol(flow.key.protocolName());
             request.setLocalInterfaceCidrs(
