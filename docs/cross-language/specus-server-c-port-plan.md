@@ -29,7 +29,7 @@ implementations/c/server/
 - `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`REGISTER_RESULT`、`OPEN`、`DATA`、`FIN`、`RST`、`WINDOW_UPDATE`、`UNREGISTER`、`KEEPALIVE` 核心流程可用。
 - SQLite mapping/route 变更会重载完整配置并向在线 control session 热推 `NAT_CONTROL`；手工推送在线返回 `200`、离线返回 `409`。客户端管理 view 从活跃 control session 投影 `online/connectedSinceMs`，在线时返回持久化版本与消息能力，并聚合上下行总量。
 - 管理 HTTP listener 已覆盖本地密码/邮件验证注册、OIDC、HS256 管理 JWT、管理用户、客户端凭证/包、客户端、TCP 映射、HTTP route、连接记录/归档、流量汇总、SQLite/Elasticsearch 明细、对象存储、媒体采集、公共房间/流程图和 Peer Mesh 管理接口。
-- Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge；SQLite route 的 `insecureSkipVerify` 与 `mediaCaptureEnabled` 会经管理 API、登录快照和 `NAT_CONTROL` 下发。响应路径改写覆盖 HTML/CSS、gzip/deflate 解码及同源外链 runtime，公网 query 的裸 `{}` 会在进入 NAT `OPEN` 前编码。SWS2 校验读取中央应用协议向量并拒绝保留 close code；启用媒体采集时使用经启动校验的专用 S3-compatible/RustFS 存储。
+- Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge；SQLite route 的 `insecureSkipVerify` 与 `mediaCaptureEnabled` 会经管理 API、登录快照和 `NAT_CONTROL` 下发。响应路径改写覆盖 HTML/CSS、gzip/deflate 解码及同源外链 runtime，公网 query 的裸 `{}` 会在进入 NAT `OPEN` 前编码。SWS2 重放中央应用协议向量的全部样例，并按严格状态机处理双向分片、控制帧、close 握手与终止态；启用媒体采集时使用经启动校验的专用 S3-compatible/RustFS 存储。
 - gzip/x-gzip、zlib deflate 与 raw deflate 已共用 Java 同值的有界解压模块：64 MiB 绝对上限、100:1 膨胀比、微小输入 64 KiB 固定额度；超限或损坏响应保持原始压缩字节，不进入路径改写。
 - OIDC 浏览器配置接口已对齐 Java；`/oidc/token` 支持 HTTP/HTTPS token endpoint 的 Authorization Code + PKCE 代理交换，HTTPS 默认校验证书链和主机名，并支持显式私有 CA。
 - control/data listener 已接入 OpenSSL TLS 1.2+，支持 PKCS#12、PEM 与开发期自签证书；prod 拒绝自签证书和公网明文监听，仅允许受信 L4 终止后绑定 loopback/私网。
@@ -75,6 +75,7 @@ implementations/c/server/
 │   └── main.c                    # 控制连接 listener + TCP NAT listener
 └── tests/
     ├── admin_http_tests.c
+    ├── direct_websocket_tests.c
     ├── client_address_tests.c
     ├── crypto_tests.c
     ├── decompression_limits_tests.c
@@ -488,7 +489,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 | SQLite 持久化 | `storage_tests.c` + 管理 API + 跨进程 E2E | 单元测试与 SQLite credential、在线投影、动态配置 E2E 均通过；并发打开设置 5 秒 busy timeout |
 | 管理 API / 启动安全 | `admin_http_tests.c`、`client_address_tests.c`、`security_baseline_tests.c` | PBKDF2、无默认口令、登录限流、可信代理、prod 弱凭据拒绝/演示数据禁用及既有 API 用例在 Ubuntu 24.04 WSL 通过 |
 | 管理页面 | 静态文件服务 + 浏览器手测/API E2E | 静态文件服务已接线；浏览器完整流程待验收 |
-| Direct HTTP | 协议/改写测试 + Java client E2E | POST/path/query 与 WebSocket/SWS2 text/continuation/ping/pong/close 已通过 |
+| Direct HTTP | 协议/改写测试 + `direct_websocket_tests.c` + Java/Go/.NET client E2E | POST/path/query 与 WebSocket/SWS2 text/continuation/ping/pong/close 已通过；SWS2 中央向量全部样例重放与严格消息/关闭状态机（双向分片、控制帧穿插、两向 close 握手与终止态、超时、16 MiB 上限、RSV/opcode/close code/UTF-8 违规）由真实监听端口单测覆盖 |
 | OIDC | HTTP/HTTPS mock token endpoint + API 测试 | Authorization Code + PKCE、严格证书链/主机名、私有 CA 正反例已通过 |
 | TLS | TLS listener E2E | TLS 1.2+、PKCS#12/PEM、自签开发模式及 prod 公网明文/自签拒绝已通过 |
 | 公共 ICE / 对象存储附件 | `admin_http_tests.c` + `object_storage_tests.c` + `object_storage_e2e.sh` | 内置 STUN/TURN 配置、临时 credential、6 路径 storage-disabled 失败关闭、S3-compatible presign/HEAD complete/download、授权/配额/过期清理均通过 |

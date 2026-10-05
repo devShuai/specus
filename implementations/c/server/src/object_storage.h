@@ -26,6 +26,15 @@ int st_object_storage_validate_current(void);
 int st_object_storage_cleanup_expired(void);
 void st_object_storage_reset_for_tests(void);
 
+/*
+ * Capability snapshot evaluated at a fixed instant, so tests can cross month and expiry
+ * boundaries deterministically. Writes the same HTTP response as the live route.
+ */
+int st_object_storage_capabilities_for_tests(const st_object_storage_identity *identity,
+                                             long long epoch_seconds,
+                                             char *out,
+                                             size_t out_len);
+
 /* Deterministic OSS V4 vector hook. Returned strings are owned by the caller. */
 char *st_object_storage_presign_for_tests(const char *method,
                                           const char *object_key,

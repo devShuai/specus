@@ -34,10 +34,22 @@ import urllib.parse
 
 objects = {}
 lock = threading.Lock()
+# Every request the server sends to the object store; read back through a control path so the
+# E2E can prove the capability snapshot never contacts storage.
+request_count = 0
+COUNT_PATH = "/__specus-e2e/request-count"
 
 class Handler(BaseHTTPRequestHandler):
     def key(self):
         return urllib.parse.urlsplit(self.path).path
+
+    def parse_request(self):
+        global request_count
+        parsed = super().parse_request()
+        if parsed and self.path != COUNT_PATH:
+            with lock:
+                request_count += 1
+        return parsed
 
     def do_PUT(self):
         size = int(self.headers.get("Content-Length", "0"))
@@ -60,6 +72,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == COUNT_PATH:
+            with lock:
+                body = str(request_count).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         with lock:
             value = objects.get(self.key())
         if value is None:
@@ -103,12 +123,15 @@ SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID=test-access-key \
 SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET=test-secret-key \
 SPECUS_OBJECT_STORAGE_PREFIX=prefix \
 SPECUS_OBJECT_STORAGE_TEST_RESOLVE_ADDRESS=127.0.0.1 \
+SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP=1 \
 stdbuf -oL -eL "$SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 python3 - "$ADMIN_PORT" "$OSS_PORT" "$ADMIN_USER" "$ADMIN_PASSWORD" "$TMP_DIR/specus.db" <<'PY'
+import contextlib
 import http.client
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -117,6 +140,8 @@ import urllib.parse
 admin_port, oss_port = map(int, sys.argv[1:3])
 username, password, database = sys.argv[3:]
 payload_bytes = b"C attachment e2e payload"
+CAPABILITIES = "/api/public/transfer/attachments/capabilities"
+GIB = 1024 * 1024 * 1024
 
 def api(method, path, body=None, token=None):
     connection = http.client.HTTPConnection("127.0.0.1", admin_port, timeout=10)
@@ -133,6 +158,62 @@ def api(method, path, body=None, token=None):
     parsed = json.loads(data) if data else None
     return status, result_headers, parsed
 
+def oss_request_count():
+    connection = http.client.HTTPConnection("127.0.0.1", oss_port, timeout=10)
+    connection.request("GET", "/__specus-e2e/request-count")
+    response = connection.getresponse()
+    count = int(response.read())
+    connection.close()
+    return count
+
+def attachment_state():
+    with contextlib.closing(sqlite3.connect(database)) as db:
+        tables = [row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'transfer_attachment%' ORDER BY name")]
+        return {table: db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in tables}
+
+def charged_downloads(month):
+    with contextlib.closing(sqlite3.connect(database)) as db:
+        try:
+            return db.execute("SELECT COALESCE(SUM(size_bytes),0) FROM transfer_attachment_download_usage "
+                              "WHERE tenant_id='default' AND username=? AND usage_month=?",
+                              (username, month)).fetchone()[0]
+        except sqlite3.OperationalError as error:
+            # The attachment schema is created by the first attachment operation.
+            if "no such table" not in str(error):
+                raise
+            return 0
+
+def capabilities(storage_used, label):
+    """Reads the snapshot over HTTP and proves the read touched neither OSS nor the database."""
+    oss_before, state_before = oss_request_count(), attachment_state()
+    # Selector-looking parameters are ignored: the account comes from the bearer token only.
+    status, headers, snapshot = api("GET", CAPABILITIES + "?tenantId=other&username=intruder", token=token)
+    if status != 200 or headers.get("Cache-Control") != "private, no-store":
+        raise RuntimeError(f"capabilities {label}: {status} {headers} {snapshot}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", snapshot.get("checkedAt", "")):
+        raise RuntimeError(f"capabilities {label} checkedAt: {snapshot}")
+    month = snapshot["checkedAt"][:7]
+    year, number = map(int, month.split("-"))
+    resets = f"{year + number // 12:04d}-{number % 12 + 1:02d}-01T00:00:00Z"
+    downloaded = charged_downloads(month)
+    expected = {
+        "schemaVersion": 1, "storageEnabled": True, "maxAttachmentBytes": 512 * 1024 * 1024,
+        "retentionHours": 72, "storageQuotaBytes": GIB, "storageUsedBytes": storage_used,
+        "storageRemainingBytes": GIB - storage_used, "monthlyDownloadQuotaBytes": GIB,
+        "monthlyDownloadUsedBytes": downloaded, "monthlyDownloadRemainingBytes": GIB - downloaded,
+        "downloadUsageMonth": month, "downloadResetsAt": resets, "downloadGrantSingleUse": True,
+    }
+    actual = {key: snapshot.get(key) for key in expected}
+    if (actual != expected or set(snapshot) != set(expected) | {"checkedAt"}
+            or any(type(actual[key]) is not type(value) for key, value in expected.items())):
+        raise RuntimeError(f"capabilities {label} mismatch: {snapshot} != {expected}")
+    if oss_request_count() != oss_before:
+        raise RuntimeError(f"capabilities {label} contacted the object store")
+    if attachment_state() != state_before:
+        raise RuntimeError(f"capabilities {label} changed attachment persistence")
+    return snapshot
+
 deadline = time.time() + 30
 while True:
     try:
@@ -146,19 +227,33 @@ while True:
         raise RuntimeError("C server did not become ready")
     time.sleep(0.2)
 
+status, headers, anonymous = api("GET", CAPABILITIES)
+if status != 401 or "storageUsedBytes" in json.dumps(anonymous):
+    raise RuntimeError(f"anonymous capabilities must be rejected: {status} {anonymous}")
+status, headers, _ = api("POST", CAPABILITIES, {}, token)
+if status != 405 or headers.get("Allow") != "GET":
+    raise RuntimeError(f"capabilities POST contract mismatch: {status} {headers}")
+# The server allows one presign upload per source address in this run. Reading the snapshot
+# first must not consume it, so the upload below only succeeds if these reads reserved nothing.
+for _ in range(3):
+    capabilities(0, "before any upload")
+
 room_token = "object-storage-owner-token"
-status, _, upload = api("POST", "/api/public/transfer/attachments/presign-upload", {
+upload_request = {
     "fileName": "folder/demo.txt",
     "mimeType": "text/plain",
     "sizeBytes": 1,
     "sha256": "a" * 64,
     "roomId": "object-e2e-room",
     "roomToken": room_token,
-}, token)
+}
+status, _, upload = api("POST", "/api/public/transfer/attachments/presign-upload", upload_request, token)
 if status != 200:
     raise RuntimeError(f"presign upload failed: {status} {upload}")
 if upload["attachment"]["fileName"] != "demo.txt" or upload["attachment"]["status"] != "PENDING":
     raise RuntimeError(f"upload response mismatch: {upload}")
+# The unexpired reservation counts with its declared size until completion replaces it.
+capabilities(1, "with a pending reservation")
 
 direct = urllib.parse.urlsplit(upload["uploadUrl"])
 connection = http.client.HTTPConnection("127.0.0.1", oss_port, timeout=10)
@@ -178,6 +273,7 @@ status, _, completed = api("POST", f"/api/public/transfer/attachments/{attachmen
                            {"roomToken": room_token}, token)
 if status != 200 or completed["status"] != "UPLOADED" or completed["sizeBytes"] != len(payload_bytes):
     raise RuntimeError(f"complete mismatch: {status} {completed}")
+capabilities(len(payload_bytes), "after completion")
 
 status, _, grant = api("POST", f"/api/public/transfer/attachments/{attachment_id}/presign-download",
                        {"roomToken": room_token}, token)
@@ -204,6 +300,9 @@ downloaded = response.read()
 connection.close()
 if response.status != 200 or downloaded != payload_bytes:
     raise RuntimeError("downloaded attachment does not match uploaded bytes")
+snapshot = capabilities(len(payload_bytes), "after a charged download")
+if snapshot["monthlyDownloadUsedBytes"] != len(payload_bytes):
+    raise RuntimeError(f"charged download missing from capabilities: {snapshot}")
 
 status, _, replay = api("GET", grant["downloadUrl"])
 if status != 410:
@@ -212,11 +311,32 @@ status, headers, _ = api("HEAD", grant["downloadUrl"])
 if status != 405 or headers.get("Allow") != "GET":
     raise RuntimeError(f"download HEAD contract mismatch: {status} {headers}")
 
+# The limiter is really active: a second upload from this address is refused.
+status, _, limited = api("POST", "/api/public/transfer/attachments/presign-upload", upload_request, token)
+if status != 429:
+    raise RuntimeError(f"presign rate limit was not enforced: {status} {limited}")
+capabilities(len(payload_bytes), "after a rate-limited upload")
+
 with sqlite3.connect(database) as db:
     row = db.execute("SELECT status,size_bytes FROM transfer_attachment WHERE id=?", (attachment_id,)).fetchone()
     usage = db.execute("SELECT COUNT(*),SUM(size_bytes) FROM transfer_attachment_download_usage").fetchone()
 if row != ("UPLOADED", len(payload_bytes)) or usage != (1, len(payload_bytes)):
     raise RuntimeError(f"attachment persistence mismatch: {row} {usage}")
+
+# Another account in the same tenant never leaks into this account's snapshot.
+with contextlib.closing(sqlite3.connect(database)) as db:
+    db.execute("INSERT INTO transfer_attachment(id,tenant_id,scope,owner_username,object_key,file_name,"
+               "mime_type,size_bytes,status,created_at,updated_at,upload_expires_at,expires_at) "
+               "VALUES(7,'default','PUBLIC_TRANSFER','someone-else','prefix/e2e/other.bin','other.bin',"
+               "'application/octet-stream',4096,'UPLOADED','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z',"
+               "'2999-01-01T00:00:00Z','2999-01-01T00:00:00Z')")
+    db.execute("INSERT INTO transfer_attachment_download_usage(id,tenant_id,username,attachment_id,"
+               "size_bytes,usage_month,created_at) VALUES(7,'default','someone-else',7,2048,?,"
+               "'2000-01-01T00:00:00Z')", (snapshot["downloadUsageMonth"],))
+    db.commit()
+snapshot = capabilities(len(payload_bytes), "beside another account")
+if snapshot["monthlyDownloadUsedBytes"] != len(payload_bytes):
+    raise RuntimeError(f"another account leaked into capabilities: {snapshot}")
 
 print("object storage e2e passed")
 PY

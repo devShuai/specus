@@ -255,6 +255,7 @@ static int send_ws_data(specus_session *session, uint32_t stream_id,
                         const uint8_t *data, size_t data_len);
 static ws_conn *find_ws_conn_locked(specus_session *session, const char *channel_id);
 static ws_conn *remove_ws_conn_locked(specus_session *session, const char *channel_id);
+static void free_ws_conn(ws_conn *conn);
 static int current_utc_timestamp(char out[64]);
 
 static char *dup_string(const char *value)
@@ -1919,7 +1920,9 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         return -2;
     }
     snprintf(conn->channel_id, sizeof(conn->channel_id), "%s", request->channel_id);
+    /* The map's own reference: the stream outlives the browser thread while it is mapped here. */
     conn->stream = request->stream;
+    st_admin_direct_ws_retain(conn->stream);
 
     pthread_mutex_lock(&session->map_lock);
     conn->stream_id = session->next_stream_id++;
@@ -1934,7 +1937,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         pthread_mutex_lock(&session->map_lock);
         ws_conn *removed = remove_ws_conn_locked(session, request->channel_id);
         pthread_mutex_unlock(&session->map_lock);
-        free(removed);
+        free_ws_conn(removed);
         session_reference_release(session);
         return -1;
     }
@@ -1985,11 +1988,11 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
     if (stream_to_close != NULL) {
         st_admin_direct_ws_close(stream_to_close);
     }
-    free(removed);
+    free_ws_conn(removed);
     return rc;
 }
 
-static void direct_ws_close(void *ctx, const char *channel_id)
+static void direct_ws_close(void *ctx, const char *channel_id, uint32_t reset_code, const char *reason)
 {
     (void)ctx;
     specus_session *target_session = NULL;
@@ -2006,11 +2009,16 @@ static void direct_ws_close(void *ctx, const char *channel_id)
         }
     }
     pthread_mutex_unlock(&active_session_lock);
+    /* Not mapped any more means the client side already ended the stream (RST, violation). */
     if (target_session != NULL) {
-        send_ws_fin(target_session, removed->stream_id);
-        printf("[ws-specus] close client=%s channel=%s\n",
-               target_session->config.client_name, channel_id);
-        free(removed);
+        if (reset_code == 0U) {
+            send_ws_fin(target_session, removed->stream_id);
+        } else {
+            send_reset(target_session, removed->stream_id, reset_code, reason);
+        }
+        printf("[ws-specus] close client=%s channel=%s reset=%u\n",
+               target_session->config.client_name, channel_id, (unsigned)reset_code);
+        free_ws_conn(removed);
         session_reference_release(target_session);
     }
 }
@@ -3151,6 +3159,104 @@ static ws_conn *remove_ws_stream_locked(specus_session *session, uint32_t stream
     return NULL;
 }
 
+/* Gives back the map's reference to the browser stream along with the unmapped entry. */
+static void free_ws_conn(ws_conn *conn)
+{
+    if (conn == NULL) {
+        return;
+    }
+    st_admin_direct_ws_release(conn->stream);
+    free(conn);
+}
+
+/*
+ * Looks a WebSocket stream up and takes a temporary reference, so the browser socket can be
+ * written (which may block, or wait for the 101 response) without holding map_lock.
+ */
+static st_admin_direct_ws_stream *acquire_ws_stream(specus_session *session, uint32_t stream_id)
+{
+    pthread_mutex_lock(&session->map_lock);
+    ws_conn *ws = find_ws_stream_locked(session, stream_id);
+    st_admin_direct_ws_stream *stream = ws == NULL ? NULL : ws->stream;
+    st_admin_direct_ws_retain(stream);
+    pthread_mutex_unlock(&session->map_lock);
+    return stream;
+}
+
+/*
+ * The browser side refused what the client sent on the stream and has already closed the browser
+ * socket; unmap the stream and reset it. If it is no longer mapped, the browser thread unmapped it
+ * first and sent the same RST.
+ */
+static void reset_ws_stream(specus_session *session, uint32_t stream_id, int result)
+{
+    pthread_mutex_lock(&session->map_lock);
+    ws_conn *removed = remove_ws_stream_locked(session, stream_id);
+    pthread_mutex_unlock(&session->map_lock);
+    if (removed == NULL) {
+        return;
+    }
+    const char *reason = NULL;
+    uint32_t code = st_admin_direct_ws_reset_code(result, &reason);
+    fprintf(stderr, "[ws-specus] reset stream=%u client=%s code=%u reason=%s\n",
+            stream_id, session->config.client_name, (unsigned)code, reason);
+    (void)send_reset(session, stream_id, code, reason);
+    free_ws_conn(removed);
+}
+
+/* DATA or DATA|END_STREAM for a WebSocket stream; returns 0 when the stream id is not one. */
+static int process_ws_data(specus_session *session, const st_nat_message *message)
+{
+    st_admin_direct_ws_stream *stream = acquire_ws_stream(session, message->stream_id);
+    if (stream == NULL) {
+        return 0;
+    }
+    int end_stream = (message->flags & ST_NAT_FLAG_END_STREAM) != 0U;
+    int result = ST_ADMIN_DIRECT_WS_ACCEPTED;
+    /* An empty DATA carries no SWS2 envelope; it is only meaningful as a bare END_STREAM. */
+    if (message->data_len > 0U || !end_stream) {
+        result = st_admin_direct_ws_send_framed_payload(stream, message->data, message->data_len);
+        if (result == ST_ADMIN_DIRECT_WS_ACCEPTED) {
+            (void)send_window_update(session, message->stream_id, message->data_len);
+        }
+    }
+    if (result == ST_ADMIN_DIRECT_WS_ACCEPTED && end_stream) {
+        result = st_admin_direct_ws_peer_finished(stream);
+    }
+    st_admin_direct_ws_release(stream);
+    if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        reset_ws_stream(session, message->stream_id, result);
+    }
+    return 1;
+}
+
+/* FIN or RST for a WebSocket stream; returns 0 when the stream id is not one. */
+static int process_ws_closed(specus_session *session, const st_nat_message *message)
+{
+    if (message->type == ST_NAT_RST) {
+        pthread_mutex_lock(&session->map_lock);
+        ws_conn *removed = remove_ws_stream_locked(session, message->stream_id);
+        pthread_mutex_unlock(&session->map_lock);
+        if (removed == NULL) {
+            return 0;
+        }
+        st_admin_direct_ws_peer_reset(removed->stream);
+        free_ws_conn(removed);
+        return 1;
+    }
+    st_admin_direct_ws_stream *stream = acquire_ws_stream(session, message->stream_id);
+    if (stream == NULL) {
+        return 0;
+    }
+    /* The stream stays mapped: the browser's CLOSE reply still goes back as SWS2 CLOSE + FIN. */
+    int result = st_admin_direct_ws_peer_finished(stream);
+    st_admin_direct_ws_release(stream);
+    if (result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        reset_ws_stream(session, message->stream_id, result);
+    }
+    return 1;
+}
+
 static void release_external_count(external_conn *conn)
 {
     if (!conn->counted) {
@@ -3674,14 +3780,14 @@ static void process_register(specus_session *session, const st_nat_message *mess
 
 static void process_control_data(specus_session *session, const st_nat_message *message)
 {
+    if (process_ws_data(session, message)) {
+        return;
+    }
     if (message->data == NULL || message->data_len == 0) {
         return;
     }
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
-    ws_conn *ws = NULL;
-    ws_conn *removed_ws = NULL;
-    st_admin_direct_ws_stream *stream_to_close = NULL;
     int reset_overflow = 0;
     if (conn != NULL && conn->fd >= 0) {
         if (enqueue_external_write(conn,
@@ -3697,31 +3803,17 @@ static void process_control_data(specus_session *session, const st_nat_message *
                     message->data_len);
         }
     }
-    if (conn == NULL) {
-        ws = find_ws_stream_locked(session, message->stream_id);
-        if (ws != NULL
-            && st_admin_direct_ws_send_framed_payload(ws->stream, message->data, message->data_len) != 0) {
-            removed_ws = remove_ws_stream_locked(session, message->stream_id);
-            if (removed_ws != NULL) {
-                stream_to_close = removed_ws->stream;
-            }
-        }
-    }
     pthread_mutex_unlock(&session->map_lock);
-    if (stream_to_close != NULL) {
-        st_admin_direct_ws_close(stream_to_close);
-    }
-    free(removed_ws);
     if (reset_overflow) {
         (void)send_reset(session, message->stream_id, 6U, "stream send queue exceeded");
-    }
-    if (ws != NULL) {
-        send_window_update(session, message->stream_id, message->data_len);
     }
 }
 
 static void process_control_closed(specus_session *session, const st_nat_message *message)
 {
+    if (process_ws_closed(session, message)) {
+        return;
+    }
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
     if (conn != NULL) {
@@ -3733,15 +3825,7 @@ static void process_control_closed(specus_session *session, const st_nat_message
             }
         }
     }
-    ws_conn *removed_ws = NULL;
-    if (conn == NULL) {
-        removed_ws = remove_ws_stream_locked(session, message->stream_id);
-    }
     pthread_mutex_unlock(&session->map_lock);
-    if (removed_ws != NULL) {
-        st_admin_direct_ws_close(removed_ws->stream);
-        free(removed_ws);
-    }
 }
 
 static void process_unregister(specus_session *session, const st_nat_message *message)
@@ -3870,7 +3954,7 @@ static void session_shutdown(specus_session *session)
     ws_conn *ws = session->ws_conns;
     while (ws != NULL) {
         ws_conn *next = ws->next;
-        free(ws);
+        free_ws_conn(ws);
         ws = next;
     }
     session->ws_conns = NULL;

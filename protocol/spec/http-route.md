@@ -148,7 +148,7 @@ suffix range 或其它未识别表达式原样交给 upstream 处理，最终响
 
 ## 7. WebSocket SWS2
 
-Java、Go、.NET server 的完整对齐实现与 C server 的兼容子集都使用 `/http/{clientName}/{route}/**` 接收
+Java、Go、.NET 与 C server 都使用 `/http/{clientName}/{route}/**` 接收
 WebSocket Upgrade，并与普通 HTTP 共用 route Basic gate；认证失败必须在返回 `101 Switching Protocols` 之前拒绝，
 且不得创建 NAT stream。建立后，WebSocket frame 放入 NAT DATA 的 SWS2 二进制 envelope：
 
@@ -191,6 +191,7 @@ data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
 | .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
 | Android | — | `SpecusCore.HttpStreamForwarder`、`SpecusCore.LocalWebSocketSpecus` |
-| C server | `admin_http.c`、`main.c` v2 NAT + SWS2 兼容子集；未通过完整 SWS2 向量与严格状态机门禁 | 使用 Java/Go/.NET/Android v2 客户端 |
+| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET） | 使用 Java/Go/.NET/Android v2 客户端 |
 
-中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。
+中央合法与 malformed NAT frame 位于 `protocol/test-vectors/control-v2/frames`；SWS2 的 canonical 与 malformed 样例位于
+`protocol/test-vectors/application-protocol-v2.json` 的 `webSocket`。
