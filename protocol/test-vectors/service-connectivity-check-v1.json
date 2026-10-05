@@ -1,0 +1,2271 @@
+{
+  "name": "service-connectivity-check-v1",
+  "version": 1,
+  "description": "What POST /api/admin/http-routes/{id}/connectivity-check returns for one explicitly selected route: the API status, and for a check that ran, four stages in fixed order with result, stable code and the elapsed ms at which each was decided, stopping at the first stage that did not pass. See protocol/spec/service-connectivity-check.md.",
+  "notes": [
+    "input.answers 是设备对每个探测请求的回应，按发送顺序：response（设备转来的响应头，status 为状态码）、rst（响应头之前的 RST，failure 为 metadata.failure，缺省表示没有分类）、link-lost（回应之前数据连接断开）、open-failed（探测流没能交给设备：cause 为 write-failed 或 stream-limit）、none（预算内没有回应）。atMs 是自检查开始的毫秒数，由测试注入的单调时钟给出。",
+    "device.httpRouteCapability 是该会话登录时声明的 environment.clientHttpRouteCapabilities.version；缺省或 0 表示旧客户端，此时 RST 一律不可信分类，目标阶段为 unverified。",
+    "HEAD 只在 405 或 501 时追加一次 GET；两次请求共用一个预算。GET 的响应体从不读取：收到响应头立即 RST。",
+    "stages[].atMs 是该阶段结论确定的时刻；skipped 的阶段没有 code 与 atMs。totalMs 等于最后一个已决阶段的 atMs。",
+    "rate.events 按时间顺序重放，同一个限流器实例贯穿全部事件；两个键都放行才算放行，被拒的请求不消耗任何一个键。",
+    "expect.body 不含运行时字段 routeId 与 checkedAt；实现返回它们，其余字段逐一相等。"
+  ],
+  "checkBudgetMs": 10000,
+  "stages": [
+    "configured",
+    "device-online",
+    "target-reachable",
+    "access-succeeded"
+  ],
+  "stageCodes": {
+    "configured": [
+      "CONFIGURED",
+      "ROUTE_DISABLED",
+      "CLIENT_DISABLED",
+      "ROUTE_TARGET_INVALID"
+    ],
+    "device-online": [
+      "DEVICE_ONLINE",
+      "DEVICE_OFFLINE",
+      "DEVICE_DATA_CHANNEL_DOWN",
+      "DEVICE_BUSY",
+      "DEVICE_ROUTE_NOT_LOADED",
+      "DEVICE_LINK_LOST"
+    ],
+    "target-reachable": [
+      "TARGET_ANSWERED",
+      "TARGET_CONNECT_REFUSED",
+      "TARGET_CONNECT_TIMEOUT",
+      "TARGET_DNS_FAILED",
+      "TARGET_TLS_FAILED",
+      "TARGET_UNREACHABLE",
+      "TARGET_ADDRESS_INVALID",
+      "TARGET_PROTOCOL_ERROR",
+      "TARGET_TIMEOUT",
+      "TARGET_UNVERIFIED"
+    ],
+    "access-succeeded": [
+      "ACCESS_OK",
+      "ACCESS_AUTH_REQUIRED",
+      "ACCESS_NOT_FOUND",
+      "ACCESS_CLIENT_ERROR",
+      "ACCESS_SERVER_ERROR",
+      "ACCESS_NO_ANSWER"
+    ]
+  },
+  "rstFailures": {
+    "route-not-loaded": {
+      "stage": "device-online",
+      "code": "DEVICE_ROUTE_NOT_LOADED"
+    },
+    "target-invalid": {
+      "stage": "target-reachable",
+      "code": "TARGET_ADDRESS_INVALID"
+    },
+    "connect-refused": {
+      "stage": "target-reachable",
+      "code": "TARGET_CONNECT_REFUSED"
+    },
+    "connect-timeout": {
+      "stage": "target-reachable",
+      "code": "TARGET_CONNECT_TIMEOUT"
+    },
+    "dns-failed": {
+      "stage": "target-reachable",
+      "code": "TARGET_DNS_FAILED"
+    },
+    "tls-failed": {
+      "stage": "target-reachable",
+      "code": "TARGET_TLS_FAILED"
+    },
+    "unreachable": {
+      "stage": "target-reachable",
+      "code": "TARGET_UNREACHABLE"
+    },
+    "protocol-error": {
+      "stage": "target-reachable",
+      "code": "TARGET_PROTOCOL_ERROR"
+    }
+  },
+  "headFallbackStatuses": [
+    405,
+    501
+  ],
+  "apiRefusals": [
+    {
+      "order": 1,
+      "when": "no valid management session",
+      "httpStatus": 401
+    },
+    {
+      "order": 2,
+      "when": "body or path invalid",
+      "httpStatus": 400,
+      "code": "CHECK_REQUEST_INVALID"
+    },
+    {
+      "order": 3,
+      "when": "route, client or online state cannot be read",
+      "httpStatus": 503,
+      "code": "CHECK_UNAVAILABLE"
+    },
+    {
+      "order": 4,
+      "when": "route absent or not visible to the caller",
+      "httpStatus": 404,
+      "code": "CHECK_TARGET_NOT_FOUND"
+    },
+    {
+      "order": 5,
+      "when": "a check of the same route is running",
+      "httpStatus": 429,
+      "code": "CHECK_IN_PROGRESS"
+    },
+    {
+      "order": 6,
+      "when": "the process runs its maximum of concurrent checks",
+      "httpStatus": 503,
+      "code": "CHECK_BUSY"
+    },
+    {
+      "order": 7,
+      "when": "rate limit (see rate)",
+      "httpStatus": 429,
+      "code": "CHECK_RATE_LIMITED"
+    }
+  ],
+  "cases": [
+    {
+      "name": "head-200",
+      "note": "The common case: HEAD answered 2xx. One request, every stage passed at the moment the head arrived.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 200,
+            "atMs": 42
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "succeeded",
+          "stoppedAt": null,
+          "code": "ACCESS_OK",
+          "totalMs": 42,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 42
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 42
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "passed",
+              "code": "ACCESS_OK",
+              "atMs": 42
+            }
+          ],
+          "statusClass": "2xx"
+        }
+      }
+    },
+    {
+      "name": "head-redirect-not-followed",
+      "note": "A redirect is an answer. It is not followed: the Location may point anywhere.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 302,
+            "atMs": 30
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "succeeded",
+          "stoppedAt": null,
+          "code": "ACCESS_OK",
+          "totalMs": 30,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 30
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 30
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "passed",
+              "code": "ACCESS_OK",
+              "atMs": 30
+            }
+          ],
+          "statusClass": "3xx"
+        }
+      }
+    },
+    {
+      "name": "head-405-get-200",
+      "note": "HEAD refused by method: one GET follows, its body is never read. The target stage is decided by the HEAD answer, the access stage by the GET.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 405,
+            "atMs": 25
+          },
+          {
+            "kind": "response",
+            "status": 200,
+            "atMs": 61
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "succeeded",
+          "stoppedAt": null,
+          "code": "ACCESS_OK",
+          "totalMs": 61,
+          "requests": [
+            "HEAD",
+            "GET"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 25
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 25
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "passed",
+              "code": "ACCESS_OK",
+              "atMs": 61
+            }
+          ],
+          "statusClass": "2xx"
+        }
+      }
+    },
+    {
+      "name": "head-501-get-404",
+      "note": "Only 405 and 501 trigger the fallback; the GET status decides the access stage.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 501,
+            "atMs": 25
+          },
+          {
+            "kind": "response",
+            "status": 404,
+            "atMs": 50
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_NOT_FOUND",
+          "totalMs": 50,
+          "requests": [
+            "HEAD",
+            "GET"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 25
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 25
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_NOT_FOUND",
+              "atMs": 50
+            }
+          ],
+          "statusClass": "4xx"
+        }
+      }
+    },
+    {
+      "name": "head-405-get-timeout",
+      "note": "The GET shares the one budget with the HEAD: it has what is left.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 405,
+            "atMs": 9000
+          },
+          {
+            "kind": "none"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_NO_ANSWER",
+          "totalMs": 10000,
+          "requests": [
+            "HEAD",
+            "GET"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 9000
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 9000
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_NO_ANSWER",
+              "atMs": 10000
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "head-405-get-reset",
+      "note": "The target answered the HEAD, so it is reachable; the access did not complete.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 405,
+            "atMs": 20
+          },
+          {
+            "kind": "rst",
+            "atMs": 40,
+            "failure": "connect-refused"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_NO_ANSWER",
+          "totalMs": 40,
+          "requests": [
+            "HEAD",
+            "GET"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 20
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 20
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_NO_ANSWER",
+              "atMs": 40
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "head-404",
+      "note": "404 on HEAD does not trigger GET: the path is the problem, not the method.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 404,
+            "atMs": 18
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_NOT_FOUND",
+          "totalMs": 18,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 18
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 18
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_NOT_FOUND",
+              "atMs": 18
+            }
+          ],
+          "statusClass": "4xx"
+        }
+      }
+    },
+    {
+      "name": "head-401",
+      "note": "The target asks for its own credentials. The check never sends any.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 401,
+            "atMs": 18
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_AUTH_REQUIRED",
+          "totalMs": 18,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 18
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 18
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_AUTH_REQUIRED",
+              "atMs": 18
+            }
+          ],
+          "statusClass": "4xx"
+        }
+      }
+    },
+    {
+      "name": "head-400",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 400,
+            "atMs": 18
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_CLIENT_ERROR",
+          "totalMs": 18,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 18
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 18
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_CLIENT_ERROR",
+              "atMs": 18
+            }
+          ],
+          "statusClass": "4xx"
+        }
+      }
+    },
+    {
+      "name": "head-502-from-target",
+      "note": "A capable client never makes up a response head, so a 502 here came from the target (a proxy in front of a dead backend): reachable, access failed.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 502,
+            "atMs": 18
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "access-succeeded",
+          "code": "ACCESS_SERVER_ERROR",
+          "totalMs": 18,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 18
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 18
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "failed",
+              "code": "ACCESS_SERVER_ERROR",
+              "atMs": 18
+            }
+          ],
+          "statusClass": "5xx"
+        }
+      }
+    },
+    {
+      "name": "route-disabled",
+      "note": "Stops at the first stage; nothing is sent to the device.",
+      "input": {
+        "route": {
+          "enabled": false,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": []
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "configured",
+          "code": "ROUTE_DISABLED",
+          "totalMs": 0,
+          "requests": [],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "failed",
+              "code": "ROUTE_DISABLED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "skipped"
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "client-disabled",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": false,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": []
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "configured",
+          "code": "CLIENT_DISABLED",
+          "totalMs": 0,
+          "requests": [],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "failed",
+              "code": "CLIENT_DISABLED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "skipped"
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "target-invalid",
+      "note": "Defensive: management rejects such a target on save, but a stored row may predate that check.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": false
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": []
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "configured",
+          "code": "ROUTE_TARGET_INVALID",
+          "totalMs": 0,
+          "requests": [],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "failed",
+              "code": "ROUTE_TARGET_INVALID",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "skipped"
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "device-offline",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": false,
+          "dataOnline": false,
+          "httpRouteCapability": 1
+        },
+        "answers": []
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_OFFLINE",
+          "totalMs": 0,
+          "requests": [],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_OFFLINE",
+              "atMs": 0
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "data-channel-down",
+      "note": "Control session present, no data connection: the device cannot carry a stream.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": false,
+          "httpRouteCapability": 1
+        },
+        "answers": []
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_DATA_CHANNEL_DOWN",
+          "totalMs": 0,
+          "requests": [],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_DATA_CHANNEL_DOWN",
+              "atMs": 0
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "route-not-loaded",
+      "note": "The device has not applied the route yet (configuration push lagging or failed).",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 3,
+            "failure": "route-not-loaded"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_ROUTE_NOT_LOADED",
+          "totalMs": 3,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_ROUTE_NOT_LOADED",
+              "atMs": 3
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "link-lost",
+      "note": "The data connection closed before any answer: the device stage fails, the target is unknown.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "link-lost",
+            "atMs": 700
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_LINK_LOST",
+          "totalMs": 700,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_LINK_LOST",
+              "atMs": 700
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "open-write-failed",
+      "note": "Writing the OPEN failed: the connection went away between the online check and the write.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "open-failed",
+            "cause": "write-failed",
+            "atMs": 0
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_LINK_LOST",
+          "totalMs": 0,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_LINK_LOST",
+              "atMs": 0
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "open-stream-limit",
+      "note": "The device's data connection already carries as many streams as this server allows. The probe shares that limit with public requests and does not get a reserved slot.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "open-failed",
+            "cause": "stream-limit",
+            "atMs": 0
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "device-online",
+          "code": "DEVICE_BUSY",
+          "totalMs": 0,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "failed",
+              "code": "DEVICE_BUSY",
+              "atMs": 0
+            },
+            {
+              "stage": "target-reachable",
+              "result": "skipped"
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "connect-refused",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 4,
+            "failure": "connect-refused"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_CONNECT_REFUSED",
+          "totalMs": 4,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 4
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_CONNECT_REFUSED",
+              "atMs": 4
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "connect-timeout",
+      "note": "The client's own connect timeout fired inside the budget.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 5004,
+            "failure": "connect-timeout"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_CONNECT_TIMEOUT",
+          "totalMs": 5004,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 5004
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_CONNECT_TIMEOUT",
+              "atMs": 5004
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "dns-failed",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 80,
+            "failure": "dns-failed"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_DNS_FAILED",
+          "totalMs": 80,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 80
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_DNS_FAILED",
+              "atMs": 80
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "tls-failed",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 33,
+            "failure": "tls-failed"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_TLS_FAILED",
+          "totalMs": 33,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 33
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_TLS_FAILED",
+              "atMs": 33
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unreachable",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 2,
+            "failure": "unreachable"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_UNREACHABLE",
+          "totalMs": 2,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 2
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_UNREACHABLE",
+              "atMs": 2
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "target-invalid-on-device",
+      "note": "The device has the route but cannot build a usable target from it, e.g. its parser is stricter than the server's validation.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 1,
+            "failure": "target-invalid"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_ADDRESS_INVALID",
+          "totalMs": 1,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 1
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_ADDRESS_INVALID",
+              "atMs": 1
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "protocol-error",
+      "note": "Connected, but no HTTP response head came back: typically http:// pointed at a TLS port, or a port that is not HTTP at all.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 15,
+            "failure": "protocol-error"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_PROTOCOL_ERROR",
+          "totalMs": 15,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 15
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_PROTOCOL_ERROR",
+              "atMs": 15
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "budget-expired",
+      "note": "No answer within the budget. The device was online and the stream was written; the target did not produce a response head in time.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "none"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "failed",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_TIMEOUT",
+          "totalMs": 10000,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 10000
+            },
+            {
+              "stage": "target-reachable",
+              "result": "failed",
+              "code": "TARGET_TIMEOUT",
+              "atMs": 10000
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "capable-unknown-failure",
+      "note": "A classification this server does not know is not a success and not a guess: unverified.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 9,
+            "failure": "something-newer"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "unverified",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_UNVERIFIED",
+          "totalMs": 9,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 9
+            },
+            {
+              "stage": "target-reachable",
+              "result": "unverified",
+              "code": "TARGET_UNVERIFIED",
+              "atMs": 9
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "capable-unclassified",
+      "note": "A capable client resetting for a reason outside the closed set (internal error, local limit).",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 1
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 9
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "unverified",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_UNVERIFIED",
+          "totalMs": 9,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 9
+            },
+            {
+              "stage": "target-reachable",
+              "result": "unverified",
+              "code": "TARGET_UNVERIFIED",
+              "atMs": 9
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "legacy-client-reset",
+      "note": "An older client: its reset carries only free text, so the target stage is unverified, never passed.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 0
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 4
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "unverified",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_UNVERIFIED",
+          "totalMs": 4,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 4
+            },
+            {
+              "stage": "target-reachable",
+              "result": "unverified",
+              "code": "TARGET_UNVERIFIED",
+              "atMs": 4
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "legacy-client-reset-ignores-failure",
+      "note": "A failure value from a session that did not announce the capability is not trusted.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": 0
+        },
+        "answers": [
+          {
+            "kind": "rst",
+            "atMs": 4,
+            "failure": "connect-refused"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "unverified",
+          "stoppedAt": "target-reachable",
+          "code": "TARGET_UNVERIFIED",
+          "totalMs": 4,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 4
+            },
+            {
+              "stage": "target-reachable",
+              "result": "unverified",
+              "code": "TARGET_UNVERIFIED",
+              "atMs": 4
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "skipped"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "legacy-client-answer",
+      "note": "An older client relays a real response head unchanged; a head is proof the target answered.",
+      "input": {
+        "route": {
+          "enabled": true,
+          "targetValid": true
+        },
+        "device": {
+          "enabled": true,
+          "controlOnline": true,
+          "dataOnline": true,
+          "httpRouteCapability": null
+        },
+        "answers": [
+          {
+            "kind": "response",
+            "status": 204,
+            "atMs": 12
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "schemaVersion": 1,
+          "kind": "http-route",
+          "outcome": "succeeded",
+          "stoppedAt": null,
+          "code": "ACCESS_OK",
+          "totalMs": 12,
+          "requests": [
+            "HEAD"
+          ],
+          "stages": [
+            {
+              "stage": "configured",
+              "result": "passed",
+              "code": "CONFIGURED",
+              "atMs": 0
+            },
+            {
+              "stage": "device-online",
+              "result": "passed",
+              "code": "DEVICE_ONLINE",
+              "atMs": 12
+            },
+            {
+              "stage": "target-reachable",
+              "result": "passed",
+              "code": "TARGET_ANSWERED",
+              "atMs": 12
+            },
+            {
+              "stage": "access-succeeded",
+              "result": "passed",
+              "code": "ACCESS_OK",
+              "atMs": 12
+            }
+          ],
+          "statusClass": "2xx"
+        }
+      }
+    },
+    {
+      "name": "unauthenticated",
+      "input": {
+        "authenticated": false
+      },
+      "expect": {
+        "httpStatus": 401
+      }
+    },
+    {
+      "name": "bad-request",
+      "note": "Unknown fields, a body that is not a JSON object, or a probe path that breaks the rules.",
+      "input": {
+        "requestValid": false
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "CHECK_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "not-visible",
+      "note": "A route that does not exist and a route of another tenant or owner answer alike.",
+      "input": {
+        "routeVisible": false
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "CHECK_TARGET_NOT_FOUND"
+      }
+    },
+    {
+      "name": "config-unreadable",
+      "note": "A read failure is not reported as 'not configured'.",
+      "input": {
+        "configReadable": false
+      },
+      "expect": {
+        "httpStatus": 503,
+        "code": "CHECK_UNAVAILABLE"
+      }
+    },
+    {
+      "name": "route-in-progress",
+      "input": {
+        "admission": "route-in-progress"
+      },
+      "expect": {
+        "httpStatus": 429,
+        "code": "CHECK_IN_PROGRESS",
+        "retryAfterSeconds": 1
+      }
+    },
+    {
+      "name": "server-busy",
+      "input": {
+        "admission": "server-busy"
+      },
+      "expect": {
+        "httpStatus": 503,
+        "code": "CHECK_BUSY",
+        "retryAfterSeconds": 1
+      }
+    }
+  ],
+  "rate": {
+    "algorithm": "gcra",
+    "perRoute": {
+      "key": "tenantId+routeId",
+      "intervalMs": 10000,
+      "burst": 1
+    },
+    "perUser": {
+      "key": "tenantId+username",
+      "intervalMs": 30000,
+      "burst": 10
+    },
+    "maxConcurrentPerRoute": 1,
+    "maxConcurrentPerServer": 32,
+    "events": [
+      {
+        "atMs": 0,
+        "username": "alice",
+        "routeId": 1,
+        "admitted": true
+      },
+      {
+        "atMs": 1,
+        "username": "alice",
+        "routeId": 1,
+        "admitted": false,
+        "httpStatus": 429,
+        "code": "CHECK_RATE_LIMITED",
+        "limitedBy": "route",
+        "retryAfterSeconds": 10
+      },
+      {
+        "atMs": 9999,
+        "username": "alice",
+        "routeId": 1,
+        "admitted": false,
+        "httpStatus": 429,
+        "code": "CHECK_RATE_LIMITED",
+        "limitedBy": "route",
+        "retryAfterSeconds": 1
+      },
+      {
+        "atMs": 10000,
+        "username": "alice",
+        "routeId": 1,
+        "admitted": true
+      },
+      {
+        "atMs": 10000,
+        "username": "admin",
+        "routeId": 1,
+        "admitted": false,
+        "httpStatus": 429,
+        "code": "CHECK_RATE_LIMITED",
+        "limitedBy": "route",
+        "retryAfterSeconds": 10
+      },
+      {
+        "atMs": 10000,
+        "username": "alice",
+        "routeId": 2,
+        "admitted": true
+      },
+      {
+        "atMs": 10001,
+        "username": "alice",
+        "routeId": 3,
+        "admitted": true
+      },
+      {
+        "atMs": 10002,
+        "username": "alice",
+        "routeId": 4,
+        "admitted": true
+      },
+      {
+        "atMs": 10003,
+        "username": "alice",
+        "routeId": 5,
+        "admitted": true
+      },
+      {
+        "atMs": 10004,
+        "username": "alice",
+        "routeId": 6,
+        "admitted": true
+      },
+      {
+        "atMs": 10005,
+        "username": "alice",
+        "routeId": 7,
+        "admitted": true
+      },
+      {
+        "atMs": 10006,
+        "username": "alice",
+        "routeId": 8,
+        "admitted": true
+      },
+      {
+        "atMs": 10007,
+        "username": "alice",
+        "routeId": 9,
+        "admitted": true
+      },
+      {
+        "atMs": 10008,
+        "username": "alice",
+        "routeId": 10,
+        "admitted": false,
+        "httpStatus": 429,
+        "code": "CHECK_RATE_LIMITED",
+        "limitedBy": "user",
+        "retryAfterSeconds": 20
+      },
+      {
+        "atMs": 20000,
+        "username": "admin",
+        "routeId": 1,
+        "admitted": true
+      },
+      {
+        "atMs": 40000,
+        "username": "alice",
+        "routeId": 10,
+        "admitted": true
+      },
+      {
+        "atMs": 40000,
+        "username": "alice",
+        "routeId": 11,
+        "admitted": false,
+        "httpStatus": 429,
+        "code": "CHECK_RATE_LIMITED",
+        "limitedBy": "user",
+        "retryAfterSeconds": 20
+      }
+    ]
+  }
+}
