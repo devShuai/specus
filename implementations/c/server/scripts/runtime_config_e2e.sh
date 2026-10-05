@@ -227,17 +227,37 @@ status, route = request("POST", f"/api/admin/clients/{client_id}/http-routes", {
 })
 if status != 201:
     raise RuntimeError(f"route create failed: {status} {route}")
+route_id = route["id"]
 
-for _ in range(80):
-    status, pushed = request("POST", f"/api/admin/clients/{client_id}/nat-control")
-    if status == 200 \
-            and pushed.get("pushed") == 1 \
-            and pushed.get("specusMappings") == 1 \
-            and pushed.get("httpRoutes") == 1:
-        break
-    time.sleep(0.25)
-else:
-    raise RuntimeError(f"manual NAT_CONTROL push failed: {status} {pushed}")
+encoded_name = urllib.parse.quote(client_name, safe="")
+
+
+def direct_http():
+    connection = http.client.HTTPConnection("127.0.0.1", admin_port, timeout=10)
+    try:
+        connection.request("POST", f"/http/{encoded_name}/api/live?shape={{ok}}", body=b"hot-route")
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def wait_direct_http(expected, what):
+    # No manual NAT_CONTROL push: the client learns where a route goes only from the push the
+    # mutation itself sends, so an answer through the route is that push arriving.
+    last = None
+    for _ in range(80):
+        try:
+            last = direct_http()
+            if last == (202, expected):
+                return
+        except Exception as error:
+            last = error
+        time.sleep(0.25)
+    raise RuntimeError(f"{what}: Direct HTTP never answered through the pushed route: {last!r}")
+
+
+wait_direct_http(b"runtime:/live?shape=%7Bok%7D:hot-route", "route create")
 
 def echo(payload, timeout=5):
     with socket.create_connection(("127.0.0.1", public_port), timeout=timeout) as connection:
@@ -264,14 +284,14 @@ for _ in range(60):
 if last_error is not None:
     raise last_error
 
-encoded_name = urllib.parse.quote(client_name, safe="")
-connection = http.client.HTTPConnection("127.0.0.1", admin_port, timeout=10)
-connection.request("POST", f"/http/{encoded_name}/api/live?shape={{ok}}", body=b"hot-route")
-response = connection.getresponse()
-payload = response.read()
-connection.close()
-if response.status != 202 or payload != b"runtime:/live?shape=%7Bok%7D:hot-route":
-    raise RuntimeError(f"runtime Direct HTTP mismatch: {response.status} {payload!r}")
+# A changed target reaches the running client the same way: the upstream echoes the path, so the
+# new base path shows the client is forwarding with what the update pushed.
+status, updated = request("PUT", f"/api/admin/http-routes/{route_id}", {
+    "targetBaseUrl": f"http://{upstream_host}:{http_port}/v2",
+})
+if status != 200:
+    raise RuntimeError(f"route update failed: {status} {updated}")
+wait_direct_http(b"runtime:/v2/live?shape=%7Bok%7D:hot-route", "route update")
 
 status, _ = request("DELETE", f"/api/admin/specus-mappings/{mapping_id}")
 if status != 204:
@@ -303,7 +323,14 @@ for _ in range(60):
 else:
     raise RuntimeError("recreated mapping never became reachable")
 
-print(f"Runtime NAT_CONTROL smoke passed (client={client_name}, create/delete/recreate + Direct HTTP)")
+# The explicit push endpoint still answers with what it sent.
+status, pushed = request("POST", f"/api/admin/clients/{client_id}/nat-control")
+if status != 200 or pushed.get("pushed") != 1 or pushed.get("specusMappings") != 1 \
+        or pushed.get("httpRoutes") != 1:
+    raise RuntimeError(f"manual NAT_CONTROL push failed: {status} {pushed}")
+
+print(f"Runtime NAT_CONTROL smoke passed (client={client_name}, pushed on route create/update and "
+      "mapping create/delete/recreate + Direct HTTP + manual push)")
 PY
 then
   echo "--- C server log ---" >&2
