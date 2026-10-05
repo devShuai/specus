@@ -122,8 +122,8 @@ internal interface IPeerEgressMeshHost
 /// <remarks>
 /// Four joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
 /// <c>egress-config</c> becomes the policy the plane enforces, the pushed <c>egress-catalog</c>
-/// says which egresses the consumer may send names to, and a closing session revokes that peer's
-/// flows.
+/// says which egresses the consumer may send flows and names to, and a closing session revokes that
+/// peer's flows.
 ///
 /// <para>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and
 /// the egress plane takes its own, and the plane holds its lock while emitting frames. So frames
@@ -146,13 +146,19 @@ internal interface IPeerEgressMeshHost
 /// How the DNS responder reaches its upstreams, or null for real sockets. Injected so a test can
 /// answer in place of a resolver.
 /// </param>
+/// <param name="catalogClock">
+/// The clock, in milliseconds, that the wait for a control session's <c>egress-catalog</c> is
+/// measured on, or null for the wall clock. Injected so a test can step past the 30 seconds after
+/// which the status says the server sent none.
+/// </param>
 internal sealed class PeerEgressMesh(
     IPeerEgressMeshHost host,
     ILogger? logger = null,
     IPeerEgressDialer? dialer = null,
     IPeerEgressRouteCommander? commander = null,
     Func<string, IPAddress[]>? lookup = null,
-    IPeerEgressDnsForwarder? dnsForwarder = null) : IDisposable
+    IPeerEgressDnsForwarder? dnsForwarder = null,
+    Func<long>? catalogClock = null) : IDisposable
 {
     /// <summary>
     /// Drives the DNS responder's TCP retransmission and idle close. Well under the one-second
@@ -223,8 +229,11 @@ internal sealed class PeerEgressMesh(
     private bool _repairTroubled;
     private string _tableErrorLogged = "";
 
-    /// <summary>Which egresses resolve names, from <c>egress-catalog</c>; locked on its own.</summary>
-    private readonly PeerEgressCatalog _catalog = new();
+    /// <summary>
+    /// What <c>egress-catalog</c> says -- which egresses are offered here, their versions, which
+    /// resolve names -- and whether this control session has had one; locked on its own.
+    /// </summary>
+    private readonly PeerEgressCatalog _catalog = new(catalogClock);
 
     /// <summary>
     /// Guards phase two's state below. Never held while anything that can wait on the mesh runs.
@@ -538,13 +547,14 @@ internal sealed class PeerEgressMesh(
     }
 
     /// <summary>
-    /// Takes a pushed <c>egress-catalog</c>: which egresses resolve names.
+    /// Takes a pushed <c>egress-catalog</c>: which egresses are offered to this device, the version
+    /// each announced, and which resolve names.
     /// </summary>
     /// <remarks>
     /// Its revision is guarded as <c>egress-config</c>'s is, per control session. An accepted
-    /// catalogue can take away an egress's capability, and the flows to pool addresses it carried
-    /// are then closed at once rather than left to fail: the consumer re-decides them and the purges
-    /// go out here.
+    /// catalogue can stop an egress from taking flows, or take away its capability, and the flows it
+    /// carried are then closed at once rather than left to fail: the consumer re-decides them and the
+    /// purges go out here.
     /// </remarks>
     public void ApplyEgressCatalog(string? payload)
     {
@@ -554,8 +564,34 @@ internal sealed class PeerEgressMesh(
             return;
         }
         logger?.LogInformation(
-            "[peer-egress-consumer] egress catalog applied revision={Revision} domainTargetCapable=[{Capable}]",
-            _catalog.Revision, string.Join(",", _catalog.CapableIds()));
+            "[peer-egress-consumer] egress catalog applied revision={Revision} domainTargetCapable=[{Capable}] listed=[{Listed}] egressVersion=[{Versions}]",
+            _catalog.Revision, string.Join(",", _catalog.CapableIds()), string.Join(",", _catalog.ListedIds()),
+            string.Join(",", _catalog.EgressVersions().Select(entry => entry.Key + ":" + entry.Value)));
+        HandCatalogToConsumer();
+    }
+
+    /// <summary>
+    /// A new control session is starting: the next <c>egress-catalog</c> is accepted whatever its
+    /// revision, since the revision counts within one session, and until it arrives no egress is
+    /// judged by the last session's catalogue. What the last one said about names is kept.
+    /// </summary>
+    public void NewControlSession()
+    {
+        _catalog.NewSession();
+        // Every standing turns back to unknown, which blocks nothing, so this purges nothing today;
+        // it goes through the same path as a catalogue so that stays true by construction.
+        HandCatalogToConsumer();
+    }
+
+    /// <summary>
+    /// The control session authenticated: the 30 seconds after which the status says the server sent
+    /// no catalogue start now.
+    /// </summary>
+    public void ControlAuthenticated() => _catalog.ControlAuthenticated();
+
+    /// <summary>Gives the consumer the catalogue as it stands and delivers the purges that produces.</summary>
+    private void HandCatalogToConsumer()
+    {
         if (_consumer is not { } consumerRole)
         {
             // Nothing built yet; the consumer reads the catalogue when it is.
@@ -566,17 +602,10 @@ internal sealed class PeerEgressMesh(
         {
             // Read inside the consumer's lock, as ConfigureConsumer reads it, so whichever of the two
             // runs last hands the consumer the newest catalogue.
-            purge = consumerRole.SetEgressCapabilities(_catalog.Capabilities(),
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            purge = consumerRole.SetCatalog(_catalog.Snapshot(), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         }
         DeliverPurges(purge);
     }
-
-    /// <summary>
-    /// A new control session is starting: the next <c>egress-catalog</c> is accepted whatever its
-    /// revision, since the revision counts within one session. What the last one said is kept.
-    /// </summary>
-    public void NewControlSession() => _catalog.NewSession();
 
     /// <summary>The egress section of the diagnostic snapshot.</summary>
     /// <remarks>
@@ -597,7 +626,10 @@ internal sealed class PeerEgressMesh(
                 consumerStatus = consumerRole.StatusSnapshot(nowMs);
             }
         }
-        if (consumerStatus is not null) consumerStatus = consumerStatus with { Paths = host.EgressPaths };
+        if (consumerStatus is not null)
+        {
+            consumerStatus = consumerStatus with { Paths = host.EgressPaths, CatalogState = _catalog.State() };
+        }
         return PeerEgressStatus.Section(consumerStatus,
             installer?.Installed ?? [], _applied, plane?.StatusSnapshot(), host.ConsumerEnabled, host.ConsumerRules,
             DnsStatus(nowMs));
@@ -1039,7 +1071,7 @@ internal sealed class PeerEgressMesh(
             // A consumer built after the catalogue arrived has not heard it yet. Read inside the
             // consumer's lock, as ApplyEgressCatalog reads it, so the newest catalogue wins.
             var purge = Merge(
-                consumerRole.SetEgressCapabilities(_catalog.Capabilities(), nowMs),
+                consumerRole.SetCatalog(_catalog.Snapshot(), nowMs),
                 consumerRole.Configure(rules, meshCidr, virtualIp, nowMs, fakeIpPool));
             return purge;
         }

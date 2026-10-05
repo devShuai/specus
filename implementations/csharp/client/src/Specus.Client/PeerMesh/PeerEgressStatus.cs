@@ -26,7 +26,21 @@ internal sealed record PeerEgressConsumerStatus(IReadOnlyList<PeerEgressRule> Ru
     IReadOnlyDictionary<long, int>? FlowsByEgress = null,
     IReadOnlyDictionary<long, string>? Paths = null,
     IReadOnlyDictionary<long, bool>? Capable = null,
-    Ipv4Cidr? FakeIpPool = null);
+    Ipv4Cidr? FakeIpPool = null)
+{
+    /// <summary>
+    /// What the consumer decides each egress's standing by; null reads as no catalogue, every
+    /// standing unknown.
+    /// </summary>
+    public PeerEgressCatalogSnapshot? Catalog { get; init; }
+
+    /// <summary>
+    /// <c>consumer.catalog</c>: <c>waiting</c>, <c>none</c> or <c>received</c>
+    /// (<see cref="PeerEgressCatalog.State"/>). It depends on the clock and the control session,
+    /// which the consumer knows nothing of, so the mesh sets it; null leaves the field out.
+    /// </summary>
+    public string? CatalogState { get; init; }
+}
 
 /// <summary>
 /// The <c>consumer.dns</c> section, present only while <c>peerEgressDnsTakeover</c> is on
@@ -231,15 +245,23 @@ internal static class PeerEgressStatus
             rules.Add(entry);
         }
         section["rules"] = rules;
+        var catalog = consumer.Catalog ?? PeerEgressCatalogSnapshot.None;
         section["peers"] = peers
             .Select(peer => new Dictionary<string, object?>
             {
                 ["clientId"] = peer.Key,
                 ["online"] = peer.Value,
+                // What the catalogue says about it, whether or not it is online: an offline egress
+                // that is also not offered here will not take a flow when it comes back either.
+                ["standing"] = catalog.StandingOf(peer.Key),
                 ["path"] = consumer.Paths is not null && consumer.Paths.TryGetValue(peer.Key, out var path) ? path : PathNone,
                 ["flows"] = consumer.FlowsByEgress is not null && consumer.FlowsByEgress.TryGetValue(peer.Key, out var count) ? count : 0,
             })
             .ToList();
+        if (consumer.CatalogState is { } catalogState)
+        {
+            section["catalog"] = catalogState;
+        }
         section["flows"] = consumer.Flows;
         section["blocked"] = new SortedDictionary<string, long>(
             consumer.Blocked.ToDictionary(entry => entry.Key, entry => entry.Value));

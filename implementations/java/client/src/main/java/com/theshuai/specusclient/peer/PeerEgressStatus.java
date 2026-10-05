@@ -60,11 +60,15 @@ public final class PeerEgressStatus {
      * @param domainCapable the egresses the catalogue says resolve names
      * @param mappings      the fake-IP mappings held when the snapshot was taken
      * @param quarantined   the pool addresses still in quarantine then
+     * @param standings     what the catalogue says about each egress a rule names or the mesh
+     *                      reported: unknown, not-offered, unsupported or offered
+     * @param catalog       {@code consumer.catalog}: waiting, none or received
      */
     public record ConsumerSnapshot(List<PeerEgressRule> rules, String meshCidr,
             Map<Long, Boolean> online, int flows, Map<String, Long> blocked,
             Map<Long, Integer> flowsByEgress, Map<Long, String> paths,
-            String fakeIpCidr, Set<Long> domainCapable, int mappings, int quarantined) {
+            String fakeIpCidr, Set<Long> domainCapable, int mappings, int quarantined,
+            Map<Long, String> standings, String catalog) {
 
         /**
          * The same view with the path each egress peer's traffic takes now, which the mesh knows
@@ -72,7 +76,17 @@ public final class PeerEgressStatus {
          */
         public ConsumerSnapshot withPaths(Map<Long, String> paths) {
             return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths,
-                    fakeIpCidr, domainCapable, mappings, quarantined);
+                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog);
+        }
+
+        /**
+         * The same view with the catalogue's state as of now. Whether the wait for one is over
+         * depends on when the control session authenticated, which the mesh knows and the consumer
+         * does not.
+         */
+        public ConsumerSnapshot withCatalog(String catalog) {
+            return new ConsumerSnapshot(rules, meshCidr, online, flows, blocked, flowsByEgress, paths,
+                    fakeIpCidr, domainCapable, mappings, quarantined, standings, catalog);
         }
     }
 
@@ -223,6 +237,13 @@ public final class PeerEgressStatus {
         section.put("rules", List.of());
         section.put("routes", List.of());
         section.put("peers", List.of());
+        if (consumer != null) {
+            // Whether this control session's server sent an egress catalogue. none is a problem of
+            // its own: the server may be too old for peer egress, and then nothing here can tell an
+            // online egress that takes flows from one that drops them. Placed here so the key sits
+            // where the spec's example has it.
+            section.put("catalog", consumer.catalog() == null ? PeerEgressCatalog.STATE_WAITING : consumer.catalog());
+        }
         section.put("flows", 0);
         // Counted by reason rather than totalled: "no egress online" and "denied by the egress"
         // are the same number and completely different problems.
@@ -280,6 +301,10 @@ public final class PeerEgressStatus {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("clientId", peer.getKey());
             entry.put("online", peer.getValue());
+            // Reported whether or not the egress is online: offline says why nothing goes now,
+            // the standing says whether anything will once it is back.
+            String standing = consumer.standings() == null ? null : consumer.standings().get(peer.getKey());
+            entry.put("standing", standing == null ? PeerEgressCatalog.Standing.UNKNOWN.wireName() : standing);
             String path = consumer.paths() == null ? null : consumer.paths().get(peer.getKey());
             entry.put("path", path == null ? PATH_NONE : path);
             Integer flowCount = consumer.flowsByEgress() == null ? null : consumer.flowsByEgress().get(peer.getKey());
