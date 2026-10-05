@@ -3891,6 +3891,154 @@
           "idleTimeoutSeconds": 60
         }
       }
+    },
+    {
+      "name": "protocols-not-an-array-skipped",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DEST_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": "tcp",
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "port-range-not-integers-skipped",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_DEST_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443.0,
+                443.0
+              ]
+            ]
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
+    },
+    {
+      "name": "absent-lists-allow-no-protocol",
+      "request": {
+        "consumerClientId": 1,
+        "destinationIp": "192.0.2.10",
+        "destinationPort": 443,
+        "protocol": "tcp",
+        "name": "example.com"
+      },
+      "code": "EGRESS_PROTOCOL_DENIED",
+      "config": {
+        "type": "egress-config",
+        "enabled": true,
+        "revision": 1,
+        "scope": "PUBLIC",
+        "allowedConsumerClientIds": [
+          1
+        ],
+        "destinationRules": [
+          {
+            "cidr": "203.0.113.0/24",
+            "protocols": [
+              "tcp"
+            ],
+            "portRanges": [
+              [
+                443,
+                443
+              ]
+            ]
+          }
+        ],
+        "domainRules": [
+          {
+            "match": "example.com"
+          }
+        ],
+        "limits": {
+          "maxConcurrentFlows": 256,
+          "maxFlowsPerConsumer": 64,
+          "idleTimeoutSeconds": 60
+        }
+      }
     }
   ]
 }
