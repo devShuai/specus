@@ -89,10 +89,12 @@ public record PeerEgressConfigMessage(long revision, PeerEgressPolicy policy) {
 
     /**
      * The domain rules a push carries. An absent field, or one that is not an array, is no domain
-     * rules: an older server sends none, and the destination rules alone then decide. An entry that
-     * is not an object, or whose match is not a name or {@code *.name} as a consumer's domain rule
-     * would write it, is skipped and the rest kept. A rule this egress cannot read must grant
-     * nothing, not void the policy around it.
+     * rules: an older server sends none, and the destination rules alone then decide. An entry is
+     * skipped, and the rest kept, when it is not an object, when its match is not a name or
+     * {@code *.name} as a consumer's domain rule would write it, or when its protocols is not an
+     * array of strings or its portRanges not an array of {@code [integer, integer]} pairs. A rule
+     * this egress cannot read must grant nothing, not void the policy around it. Absent or null
+     * lists read as empty, and such a rule allows no flow.
      */
     private static List<PeerEgressPolicy.PeerEgressDomainRule> domainRulesOf(JsonNode value) {
         if (!value.isArray()) {
@@ -107,13 +109,71 @@ public record PeerEgressConfigMessage(long revision, PeerEgressPolicy policy) {
             if (!PeerEgressNames.validMatch(match)) {
                 continue;
             }
+            List<String> protocols = strictProtocolsOf(raw.path("protocols"));
+            List<List<Integer>> ranges = strictPortRangesOf(raw.path("portRanges"));
+            if (protocols == null || ranges == null) {
+                continue;
+            }
             PeerEgressPolicy.PeerEgressDomainRule rule = new PeerEgressPolicy.PeerEgressDomainRule();
             rule.setMatch(PeerEgressNames.normalize(match));
-            rule.setProtocols(protocolsOf(raw));
-            rule.setPortRanges(portRangesOf(raw));
+            rule.setProtocols(protocols);
+            rule.setPortRanges(ranges);
             rules.add(rule);
         }
         return List.copyOf(rules);
+    }
+
+    /**
+     * A domain rule's protocols, or null when they are not an array of strings. Stricter than the
+     * destination rules' reading on purpose: a rule in a shape the server could not have stored is
+     * one this egress does not understand, and every implementation skips it rather than each
+     * guessing what a bare {@code "tcp"} or a number was meant to say.
+     */
+    private static List<String> strictProtocolsOf(JsonNode value) {
+        if (value.isMissingNode() || value.isNull()) {
+            return List.of();
+        }
+        if (!value.isArray()) {
+            return null;
+        }
+        List<String> protocols = new ArrayList<>();
+        for (JsonNode protocol : value) {
+            if (!protocol.isTextual()) {
+                return null;
+            }
+            protocols.add(protocol.asText());
+        }
+        return List.copyOf(protocols);
+    }
+
+    /** A domain rule's port ranges, or null when they are not an array of two-integer arrays. */
+    private static List<List<Integer>> strictPortRangesOf(JsonNode value) {
+        if (value.isMissingNode() || value.isNull()) {
+            return List.of();
+        }
+        if (!value.isArray()) {
+            return null;
+        }
+        List<List<Integer>> ranges = new ArrayList<>();
+        for (JsonNode pair : value) {
+            if (!pair.isArray() || pair.size() != 2
+                    || !pair.get(0).isIntegralNumber() || !pair.get(1).isIntegralNumber()) {
+                return null;
+            }
+            ranges.add(List.of(saturated(pair.get(0)), saturated(pair.get(1))));
+        }
+        return List.copyOf(ranges);
+    }
+
+    /**
+     * An integral bound as an int. One beyond the int range is held at the nearest end, which
+     * compares against every port in 0-65535 exactly as the value itself would.
+     */
+    private static int saturated(JsonNode bound) {
+        if (bound.canConvertToInt()) {
+            return bound.intValue();
+        }
+        return bound.bigIntegerValue().signum() > 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE;
     }
 
     private static List<String> protocolsOf(JsonNode rule) {

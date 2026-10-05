@@ -112,7 +112,10 @@ class PeerEgressDomainPolicyVectorTests {
                 "absent-domain-rules", List.of(),
                 "domain-rules-not-an-array", List.of(),
                 "unreadable-entries-skipped", List.of("example.com"),
-                "wildcard-entry-grants-nothing", List.of());
+                "wildcard-entry-grants-nothing", List.of(),
+                "protocols-not-an-array-skipped", List.of(),
+                "port-range-not-integers-skipped", List.of(),
+                "absent-lists-allow-no-protocol", List.of("example.com"));
         for (var entry : expected.entrySet()) {
             JsonNode testCase = byName.get(entry.getKey());
             assertNotNull(testCase, "the vector no longer has " + entry.getKey());
@@ -123,6 +126,11 @@ class PeerEgressDomainPolicyVectorTests {
                 decode(vector, byName.get("unreadable-entries-skipped")).getDomainRules().get(0);
         assertEquals(List.of("tcp"), kept.getProtocols());
         assertEquals(List.of(List.of(443, 443)), kept.getPortRanges());
+
+        PeerEgressPolicy.PeerEgressDomainRule bare =
+                decode(vector, byName.get("absent-lists-allow-no-protocol")).getDomainRules().get(0);
+        assertEquals(List.of(), bare.getProtocols());
+        assertEquals(List.of(), bare.getPortRanges());
     }
 
     private static PeerEgressPolicy decodeConfig(JsonNode config) throws IOException {
