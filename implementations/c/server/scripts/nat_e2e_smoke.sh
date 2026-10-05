@@ -44,16 +44,29 @@ if [[ -n "${SPECUS_CLIENT_COMMAND:-}" && "${CLIENT_COMMAND[0]}" == *.exe ]]; the
   UPSTREAM_HOST="${UPSTREAM_HOST_OVERRIDE:-$(hostname -I | awk '{print $1}')}"
 fi
 
+# Stops a background process and waits until it is gone. CI runs these scripts back to back on the
+# same ports with the same client identity, so a client left running would log in to the next
+# run's server and take over (or fight over) the session that run is testing.
+stop_process() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   set +e
-  if [[ -n "${CLIENT_PID:-}" ]]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
-  if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
-  if [[ -n "${ECHO_PID:-}" ]]; then kill "$ECHO_PID" 2>/dev/null || true; fi
-  if [[ -n "${HTTP_PID:-}" ]]; then kill "$HTTP_PID" 2>/dev/null || true; fi
-  if [[ -n "${WS_PID:-}" ]]; then kill "$WS_PID" 2>/dev/null || true; fi
+  for pid in "${CLIENT_PID:-}" "${SERVER_PID:-}" "${ECHO_PID:-}" "${HTTP_PID:-}" "${WS_PID:-}"; do
+    if [[ -n "$pid" ]]; then stop_process "$pid"; fi
+  done
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 if [[ -z "${SPECUS_CLIENT_COMMAND:-}" && ! -f "$JAVA_CLIENT_JAR" ]]; then
   echo "missing Java client jar: $JAVA_CLIENT_JAR" >&2
@@ -207,8 +220,9 @@ cat >"$TMP_DIR/client.jsonc" <<JSON
 JSON
 
 # The configuration is named relative to the working directory, so a Windows JVM reached through
-# WSL interop finds it too.
-(cd "$TMP_DIR" && "${CLIENT_COMMAND[@]}" run --config client.jsonc --no-update-check >"$TMP_DIR/client.log" 2>&1) &
+# WSL interop finds it too. exec makes CLIENT_PID the client itself rather than a subshell whose
+# death would leave the client running.
+(cd "$TMP_DIR" && exec "${CLIENT_COMMAND[@]}" run --config client.jsonc --no-update-check >"$TMP_DIR/client.log" 2>&1) &
 CLIENT_PID=$!
 
 if ! python3 - "$PUBLIC_PORT" "$ADMIN_PORT" <<'PY'
