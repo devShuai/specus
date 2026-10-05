@@ -372,7 +372,7 @@ func TestEgressRoleRefusesThisNodesOwnPool(t *testing.T) {
 			"destinationRules":[{"cidr":"198.18.0.0/15","protocols":["tcp"],"portRanges":[[443,443]]}]}`)
 		runtime := mesh.ensureEgress()
 		runtime.mu.Lock()
-		code := runtime.authorizeTo(5, egressFlowKey{protocol: ipv4ProtocolTCP, remotePort: 443}, testAddr(t, "198.18.0.5"))
+		code := runtime.authorizeTo(5, egressFlowKey{protocol: ipv4ProtocolTCP, remotePort: 443}, testAddr(t, "198.18.0.5"), "")
 		runtime.mu.Unlock()
 		mesh.shutdownEgress()
 		want := egressCodeAllowed

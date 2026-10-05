@@ -58,7 +58,10 @@ type egressConfigMessage struct {
 	Scope                    string                  `json:"scope"`
 	AllowedConsumerClientIDs []int64                 `json:"allowedConsumerClientIds"`
 	DestinationRules         []egressDestinationRule `json:"destinationRules"`
-	Limits                   egressLimits            `json:"limits"`
+	// Raw, so that decodeEgressDomainRules decides what an entry it cannot read means rather than
+	// the JSON library refusing the whole push over it.
+	DomainRules json.RawMessage `json:"domainRules"`
+	Limits      egressLimits    `json:"limits"`
 }
 
 // ensureEgress lazily builds the plane and the goroutines that carry its frames and its clock.
@@ -843,8 +846,51 @@ func decodeEgressConfig(payload []byte) (egressPolicy, int64, bool) {
 		Scope:                    strings.ToUpper(strings.TrimSpace(message.Scope)),
 		AllowedConsumerClientIDs: message.AllowedConsumerClientIDs,
 		DestinationRules:         message.DestinationRules,
+		DomainRules:              decodeEgressDomainRules(message.DomainRules),
 		Limits:                   message.Limits,
 	}, message.Revision, true
+}
+
+// decodeEgressDomainRules reads the domainRules of an egress-config push (protocol/spec/peer-egress.md,
+// 按域名授权).
+//
+// A field that is absent, null or not an array is no domain rules. An entry that is not an object,
+// or whose match is not a name or *.name as a consumer's domain rule is written, is skipped and the
+// rest are kept: a rule this node cannot read must grant nothing, and refusing the whole push over
+// it would also throw away the destination rules that came with it. An entry whose protocols or
+// port ranges do not have a destination rule's shape is skipped for the same reason. The match is
+// kept trimmed, without its trailing dot and in lower case, the form names are compared in.
+//
+// Shared vector: protocol/test-vectors/peer-egress-domain-policy-v1.json.
+func decodeEgressDomainRules(raw json.RawMessage) []egressDomainRule {
+	var entries []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil {
+		return nil
+	}
+	var rules []egressDomainRule
+	for _, entry := range entries {
+		if trimmed := strings.TrimSpace(string(entry)); !strings.HasPrefix(trimmed, "{") {
+			continue
+		}
+		var rule struct {
+			Match      string   `json:"match"`
+			Protocols  []string `json:"protocols"`
+			PortRanges [][]int  `json:"portRanges"`
+		}
+		if json.Unmarshal(entry, &rule) != nil {
+			continue
+		}
+		match := strings.TrimSpace(rule.Match)
+		if !looksLikeEgressDomainRule(match) || !validEgressDomainMatch(match) {
+			continue
+		}
+		rules = append(rules, egressDomainRule{
+			Match:      normalizeEgressName(match),
+			Protocols:  rule.Protocols,
+			PortRanges: rule.PortRanges,
+		})
+	}
+	return rules
 }
 
 // revokeEgressConsumer closes a peer's flows when its session ends. The plane cannot poll for this:
