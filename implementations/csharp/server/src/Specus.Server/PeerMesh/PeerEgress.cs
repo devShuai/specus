@@ -31,6 +31,12 @@ public sealed partial class PeerMeshService
     /// <summary>Matches the column width in every schema dialect.</summary>
     internal const int MaxEgressDestinationRulesBytes = 4096;
 
+    /// <summary>Caps a stored list of domain rules; enforced before persisting.</summary>
+    internal const int MaxEgressDomainRules = 64;
+
+    /// <summary>Caps the stored domain rules, counted apart from the destination rules.</summary>
+    internal const int MaxEgressDomainRulesBytes = 4096;
+
     private const int MaxEgressPort = 65535;
 
     private static readonly JsonSerializerOptions EgressRuleJsonOptions = new(JsonSerializerDefaults.Web);
@@ -515,6 +521,9 @@ public sealed partial class PeerMeshService
         var destinationRules = mutation.DestinationRules is null
             ? null
             : EncodeEgressDestinationRules(mutation.DestinationRules);
+        var domainRules = mutation.DomainRules is null
+            ? null
+            : EncodeEgressDomainRules(mutation.DomainRules);
         var maxConcurrentFlows = mutation.MaxConcurrentFlows is null
             ? (int?)null
             : RequirePositive(mutation.MaxConcurrentFlows.Value, "maxConcurrentFlows");
@@ -560,6 +569,10 @@ public sealed partial class PeerMeshService
         if (destinationRules is not null)
         {
             policy.DestinationRules = destinationRules;
+        }
+        if (domainRules is not null)
+        {
+            policy.DomainRules = domainRules;
         }
         if (maxConcurrentFlows is not null)
         {
@@ -636,6 +649,8 @@ public sealed partial class PeerMeshService
         message.AllowedConsumerClientIds =
             await AllowedEgressConsumerIdsAsync(account, policy, cancellationToken).ConfigureAwait(false);
         message.DestinationRules = DecodeEgressDestinationRules(policy.DestinationRules);
+        // Always present on an enabled push, empty when the policy has none.
+        message.DomainRules = DecodeEgressDomainRules(policy.DomainRules);
         message.Limits = new PeerEgressLimits
         {
             MaxConcurrentFlows = policy.MaxConcurrentFlows,
@@ -772,6 +787,7 @@ public sealed partial class PeerMeshService
             DecodeClientIds(policy.AllowedConsumerClientIds),
             effective,
             DecodeEgressDestinationRules(policy.DestinationRules),
+            DecodeEgressDomainRules(policy.DomainRules),
             policy.MaxConcurrentFlows,
             policy.MaxFlowsPerConsumer,
             policy.IdleTimeoutSeconds,
@@ -832,48 +848,198 @@ public sealed partial class PeerMeshService
                 throw new ArgumentException(
                     $"destinationRules[{index}].cidr must be an IPv4 address or CIDR");
             }
-            var protocols = new List<string>(2);
-            foreach (var protocol in rule.Protocols ?? [])
-            {
-                var value = protocol?.Trim().ToLowerInvariant();
-                if (value is not ("tcp" or "udp"))
-                {
-                    throw new ArgumentException($"destinationRules[{index}].protocols accepts only tcp and udp");
-                }
-                if (!protocols.Contains(value, StringComparer.Ordinal))
-                {
-                    protocols.Add(value);
-                }
-            }
-            var portRanges = rule.PortRanges ?? [];
-            if (portRanges.Count > MaxEgressPortRangesPerRule)
-            {
-                throw new ArgumentException(
-                    $"destinationRules[{index}] has more than {MaxEgressPortRangesPerRule} port ranges");
-            }
-            var ranges = new List<int[]>(portRanges.Count);
-            foreach (var pair in portRanges)
-            {
-                if (pair is not { Length: 2 })
-                {
-                    throw new ArgumentException(
-                        $"destinationRules[{index}].portRanges entries must be [low, high]");
-                }
-                if (pair[0] < 0 || pair[1] > MaxEgressPort || pair[0] > pair[1])
-                {
-                    throw new ArgumentException(
-                        $"destinationRules[{index}].portRanges entries need 0 <= low <= high <= {MaxEgressPort}");
-                }
-                ranges.Add([pair[0], pair[1]]);
-            }
+            var field = $"destinationRules[{index}]";
             normalized.Add(new PeerEgressDestinationRule
             {
                 Cidr = cidr,
-                Protocols = protocols,
-                PortRanges = ranges,
+                Protocols = NormalizeEgressProtocols(rule.Protocols, field),
+                PortRanges = NormalizeEgressPortRanges(rule.PortRanges, field),
             });
         }
         return normalized;
+    }
+
+    /// <summary>
+    /// The protocols of one destination or domain rule: trimmed, lowercased and de-duplicated in
+    /// order, tcp or udp only. An absent list is an empty one, which still grants nothing.
+    /// </summary>
+    private static List<string> NormalizeEgressProtocols(IReadOnlyList<string>? raw, string field)
+    {
+        var protocols = new List<string>(2);
+        foreach (var protocol in raw ?? [])
+        {
+            var value = protocol?.Trim().ToLowerInvariant();
+            if (value is not ("tcp" or "udp"))
+            {
+                throw new ArgumentException($"{field}.protocols accepts only tcp and udp");
+            }
+            if (!protocols.Contains(value, StringComparer.Ordinal))
+            {
+                protocols.Add(value);
+            }
+        }
+        return protocols;
+    }
+
+    /// <summary>
+    /// The port ranges of one destination or domain rule: each <c>[low, high]</c> within 0-65535, at
+    /// most <see cref="MaxEgressPortRangesPerRule"/> of them. An absent list is an empty one.
+    /// </summary>
+    private static List<int[]> NormalizeEgressPortRanges(IReadOnlyList<int[]>? raw, string field)
+    {
+        var portRanges = raw ?? [];
+        if (portRanges.Count > MaxEgressPortRangesPerRule)
+        {
+            throw new ArgumentException($"{field} has more than {MaxEgressPortRangesPerRule} port ranges");
+        }
+        var ranges = new List<int[]>(portRanges.Count);
+        foreach (var pair in portRanges)
+        {
+            if (pair is not { Length: 2 })
+            {
+                throw new ArgumentException($"{field}.portRanges entries must be [low, high]");
+            }
+            if (pair[0] < 0 || pair[1] > MaxEgressPort || pair[0] > pair[1])
+            {
+                throw new ArgumentException(
+                    $"{field}.portRanges entries need 0 <= low <= high <= {MaxEgressPort}");
+            }
+            ranges.Add([pair[0], pair[1]]);
+        }
+        return ranges;
+    }
+
+    /// <summary>Validates, normalises and serialises domain rules for storage.</summary>
+    /// <remarks>
+    /// The size limit applies to what is stored, after normalisation, and is counted apart from the
+    /// destination rules.
+    /// </remarks>
+    internal static string EncodeEgressDomainRules(IReadOnlyList<PeerEgressDomainRule> rules)
+    {
+        var normalized = NormalizeEgressDomainRules(rules);
+        var encoded = JsonSerializer.Serialize(normalized, EgressRuleJsonOptions);
+        if (Encoding.UTF8.GetByteCount(encoded) > MaxEgressDomainRulesBytes)
+        {
+            throw new ArgumentException(
+                $"domain rules exceed {MaxEgressDomainRulesBytes} bytes once stored");
+        }
+        return encoded;
+    }
+
+    /// <summary>
+    /// The domain rules as they are stored, or <see cref="ArgumentException"/> for the whole list.
+    /// </summary>
+    /// <remarks>
+    /// A match is written the way a consumer writes a domain rule (protocol/spec/peer-egress-dns.md)
+    /// and stored trimmed, without its trailing dot and in lower case. What would grant more than a
+    /// name refuses the whole request: an address or CIDR, which belongs in the destination rules, a
+    /// single label, a bare <c>*</c> or a wildcard over one label. Protocols and port ranges follow
+    /// the destination rules. Shared vector: protocol/test-vectors/peer-egress-domain-policy-v1.json
+    /// (<c>management</c>).
+    /// </remarks>
+    internal static IReadOnlyList<PeerEgressDomainRule> NormalizeEgressDomainRules(
+        IReadOnlyList<PeerEgressDomainRule> rules)
+    {
+        if (rules.Count > MaxEgressDomainRules)
+        {
+            throw new ArgumentException($"too many domain rules: {rules.Count}");
+        }
+        var normalized = new List<PeerEgressDomainRule>(rules.Count);
+        for (var index = 0; index < rules.Count; index++)
+        {
+            // Nullable annotations are not enforced by the deserializer, so a JSON null element or
+            // an explicit null field arrives here as null despite the declared types.
+            var rule = rules[index]
+                ?? throw new ArgumentException($"domainRules[{index}] must be an object");
+            var match = NormalizeEgressDomainMatch(rule.Match?.Trim() ?? string.Empty)
+                ?? throw new ArgumentException(
+                    $"domainRules[{index}].match must be a name or *.name with at least two labels");
+            var field = $"domainRules[{index}]";
+            normalized.Add(new PeerEgressDomainRule
+            {
+                Match = match,
+                Protocols = NormalizeEgressProtocols(rule.Protocols, field),
+                PortRanges = NormalizeEgressPortRanges(rule.PortRanges, field),
+            });
+        }
+        return normalized;
+    }
+
+    /// <summary>
+    /// The consumer's domain-rule syntax: <c>name</c> or <c>*.name</c>, every label 1-63 of a-z, 0-9
+    /// and an inner <c>-</c>, at most 253 bytes after the <c>*.</c> part, at least two labels and not
+    /// all of them digits, punycode for IDN. Text with neither a leading <c>*</c> nor a letter is an
+    /// address, not a name. Returns the stored form, or null.
+    /// </summary>
+    private static string? NormalizeEgressDomainMatch(string text)
+    {
+        if (text.Length == 0)
+        {
+            return null;
+        }
+        var letter = false;
+        foreach (var c in text)
+        {
+            if (c > '\u007f')
+            {
+                // Unicode has to be written as punycode; it is refused rather than read as an address.
+                return null;
+            }
+            letter |= c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z');
+        }
+        if (!letter && !text.StartsWith('*'))
+        {
+            return null;
+        }
+        var name = text.TrimEnd('.').ToLowerInvariant();
+        var host = name.StartsWith("*.", StringComparison.Ordinal) ? name[2..] : name;
+        if (host.Length == 0 || host.Length > 253 || host.Contains('*', StringComparison.Ordinal))
+        {
+            return null;
+        }
+        var labels = host.Split('.');
+        if (labels.Length < 2)
+        {
+            return null;
+        }
+        var allDigits = true;
+        foreach (var label in labels)
+        {
+            if (!IsEgressDomainLabel(label))
+            {
+                return null;
+            }
+            allDigits &= label.All(char.IsAsciiDigit);
+        }
+        return allDigits ? null : name;
+    }
+
+    private static bool IsEgressDomainLabel(string label) =>
+        label.Length is >= 1 and <= 63
+        && label[0] != '-'
+        && label[^1] != '-'
+        && label.All(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-');
+
+    /// <summary>
+    /// Reads stored domain rules. A row that cannot be parsed grants no name: a domain rule only
+    /// ever adds to what the destination rules allow, so no rules is the narrow reading.
+    /// </summary>
+    internal IReadOnlyList<PeerEgressDomainRule> DecodeEgressDomainRules(string? raw)
+    {
+        var trimmed = raw?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return [];
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<List<PeerEgressDomainRule>>(trimmed, EgressRuleJsonOptions) ?? [];
+        }
+        catch (JsonException)
+        {
+            _logger.LogWarning("peer egress domain rules are unreadable; granting no names");
+            return [];
+        }
     }
 
     /// <summary>
@@ -936,7 +1102,8 @@ public sealed record PeerEgressPolicyMutation(
     [property: JsonPropertyName("destinationRules")] IReadOnlyList<PeerEgressDestinationRule>? DestinationRules = null,
     [property: JsonPropertyName("maxConcurrentFlows")] int? MaxConcurrentFlows = null,
     [property: JsonPropertyName("maxFlowsPerConsumer")] int? MaxFlowsPerConsumer = null,
-    [property: JsonPropertyName("idleTimeoutSeconds")] int? IdleTimeoutSeconds = null);
+    [property: JsonPropertyName("idleTimeoutSeconds")] int? IdleTimeoutSeconds = null,
+    [property: JsonPropertyName("domainRules")] IReadOnlyList<PeerEgressDomainRule>? DomainRules = null);
 
 /// <summary>
 /// Management projection of an egress policy.
@@ -955,6 +1122,7 @@ public sealed record PeerMeshEgressPolicyView(
     [property: JsonPropertyName("allowedConsumerClientIds")] IReadOnlyList<long> AllowedConsumerClientIds,
     [property: JsonPropertyName("effectiveConsumerClientIds")] IReadOnlyList<long> EffectiveConsumerClientIds,
     [property: JsonPropertyName("destinationRules")] IReadOnlyList<PeerEgressDestinationRule> DestinationRules,
+    [property: JsonPropertyName("domainRules")] IReadOnlyList<PeerEgressDomainRule> DomainRules,
     [property: JsonPropertyName("maxConcurrentFlows")] int MaxConcurrentFlows,
     [property: JsonPropertyName("maxFlowsPerConsumer")] int MaxFlowsPerConsumer,
     [property: JsonPropertyName("idleTimeoutSeconds")] int IdleTimeoutSeconds,

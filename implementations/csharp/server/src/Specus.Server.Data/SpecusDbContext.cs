@@ -748,6 +748,9 @@ public sealed class SpecusDbContext : DbContext
                 .HasMaxLength(512).IsRequired();
             b.Property(x => x.DestinationRules).HasColumnName("destination_rules").HasMaxLength(4096)
                 .IsRequired();
+            // The default is what a policy saved before domain rules reads as: no name granted.
+            b.Property(x => x.DomainRules).HasColumnName("domain_rules").HasMaxLength(4096)
+                .IsRequired().HasDefaultValue("[]");
             b.Property(x => x.MaxConcurrentFlows).HasColumnName("max_concurrent_flows").IsRequired();
             b.Property(x => x.MaxFlowsPerConsumer).HasColumnName("max_flows_per_consumer").IsRequired();
             b.Property(x => x.IdleTimeoutSeconds).HasColumnName("idle_timeout_seconds").IsRequired();

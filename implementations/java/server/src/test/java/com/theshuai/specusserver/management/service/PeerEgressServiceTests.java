@@ -136,6 +136,50 @@ class PeerEgressServiceTests {
     }
 
     /**
+     * The egress-config an enabled egress receives carries the saved domain rules next to the
+     * destination rules, and an empty list when there are none. The disabling push keeps its shape.
+     */
+    @Test
+    void anEnabledPolicyPushesItsDomainRules() {
+        tenantEgressOn();
+        PeerMeshEgressPolicy policy = policy(List.of(1L));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT)).thenReturn(List.of(consumer, egress));
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(policyRepository.findByTenantIdAndEgressClientId(TENANT, 2L)).thenReturn(Optional.of(policy));
+
+        PeerControlMessage config = service.buildEgressConfig(egress, environment(1));
+        assertThat(config.getDomainRules()).isNotNull().isEmpty();
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(config)).contains("\"domainRules\":[]");
+
+        policy.setDomainRules(PeerEgressService.encodeDomainRules(PeerEgressService.normalizeDomainRules(List.of(
+                new PeerEgressService.DomainRuleMutation("*.CDN.example.", List.of("UDP", "tcp"),
+                        List.of(List.of(443, 443)))))));
+        config = service.buildEgressConfig(egress, environment(1));
+        assertThat(config.getDomainRules()).hasSize(1);
+        assertThat(config.getDomainRules().get(0).getMatch()).isEqualTo("*.cdn.example");
+        assertThat(config.getDomainRules().get(0).getProtocols()).containsExactly("udp", "tcp");
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(config)).contains(
+                "\"domainRules\":[{\"match\":\"*.cdn.example\",\"protocols\":[\"udp\",\"tcp\"],\"portRanges\":[[443,443]]}]");
+        assertThat(config.getDestinationRules()).hasSize(1);
+
+        policy.setEnabled(false);
+        PeerControlMessage disabled = service.buildEgressConfig(egress, environment(1));
+        assertThat(disabled.getEnabled()).isFalse();
+        assertThat(disabled.getDomainRules()).isNull();
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(disabled)).doesNotContain("domainRules");
+    }
+
+    /** An unreadable stored list grants no name rather than failing the push or the view. */
+    @Test
+    void unreadableStoredDomainRulesGrantNothing() {
+        assertThat(PeerEgressService.decodeDomainRules("{not json")).isEmpty();
+        assertThat(PeerEgressService.decodeDomainRules("")).isEmpty();
+        assertThat(PeerEgressService.decodeDomainRules(null)).isEmpty();
+        assertThat(PeerEgressService.encodeDomainRules(List.of())).isEqualTo("[]");
+    }
+
+    /**
      * A consumer learns which egress nodes exist, never what they are permitted to reach. Shipping
      * the destination allowlist would hand every peer a map of that node's network.
      */
@@ -159,6 +203,7 @@ class PeerEgressServiceTests {
         assertThat(catalog.getEgresses().get(0).getProtocols()).containsExactly("tcp");
         assertThat(catalog.getEgresses().get(0).isDomainTargetCapable()).isFalse();
         assertThat(catalog.getDestinationRules()).isNull();
+        assertThat(catalog.getDomainRules()).isNull();
     }
 
     @Test

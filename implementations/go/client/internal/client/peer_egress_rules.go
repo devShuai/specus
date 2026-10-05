@@ -165,7 +165,10 @@ func validEgressDomainMatch(match string) bool {
 	}
 	text := strings.ToLower(strings.TrimRight(match, "."))
 	text = strings.TrimPrefix(text, "*.")
-	if strings.Contains(text, "*") {
+	// validEgressName trims before it looks, which is right for a name and wrong here: the match has
+	// been trimmed already, so space left at either end of the name sits inside it, as in
+	// `*. example.com` or `example.com .`, and makes it malformed.
+	if strings.Contains(text, "*") || text != normalizeEgressName(text) {
 		return false
 	}
 	return validEgressName(text)

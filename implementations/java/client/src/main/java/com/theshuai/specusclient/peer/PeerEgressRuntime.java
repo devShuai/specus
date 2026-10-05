@@ -458,7 +458,7 @@ final class PeerEgressRuntime {
             lock.unlock();
             return;
         }
-        Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
+        Reservation reservation = reserveTo(consumer, key, destination.address(), destination.name(), nowMs);
         if (reservation.code() != null) {
             lock.unlock();
             refuse(consumer, key, reservation.code(), nowMs);
@@ -474,7 +474,6 @@ final class PeerEgressRuntime {
             return;
         }
         PeerEgressFlowTable.Flow flow = reservation.flow();
-        flow.name = destination.name();
         int mtu = pathMtu;
         lock.unlock();
 
@@ -672,7 +671,7 @@ final class PeerEgressRuntime {
                 lock.unlock();
                 return;
             }
-            Reservation reservation = reserveTo(consumer, key, destination.address(), nowMs);
+            Reservation reservation = reserveTo(consumer, key, destination.address(), destination.name(), nowMs);
             if (reservation.code() != null) {
                 lock.unlock();
                 refuse(consumer, key, reservation.code(), nowMs);
@@ -685,7 +684,6 @@ final class PeerEgressRuntime {
                 return;
             }
             PeerEgressFlowTable.Flow reserved = reservation.flow();
-            reserved.name = destination.name();
             lock.unlock();
 
             Socket socket = null;
@@ -861,16 +859,19 @@ final class PeerEgressRuntime {
      * reservation already there, and must not dial again.
      */
     private Reservation reserve(long consumer, PeerEgressFlowTable.Key key, long nowMs) {
-        return reserveTo(consumer, key, key.remoteIp(), nowMs);
+        return reserveTo(consumer, key, key.remoteIp(), null, nowMs);
     }
 
     /**
      * reserve for a flow whose socket goes to destination, which differs from the key's remote
      * address only for a flow to a name: the key keeps the consumer's fake address, so replies come
-     * back from it, and the authorization is of the address actually dialled.
+     * back from it, and the authorization is of the address actually dialled, with the name it was
+     * resolved from (null for a flow to the address itself). The flow this opens remembers both, so
+     * a policy refresh judges it the same way.
      */
-    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, int destination, long nowMs) {
-        String code = authorizeTo(consumer, key, destination);
+    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, int destination, String name,
+            long nowMs) {
+        String code = authorizeTo(consumer, key, destination, name);
         if (code != null) {
             return new Reservation(null, code, false);
         }
@@ -880,13 +881,20 @@ final class PeerEgressRuntime {
             return new Reservation(null, PeerEgressCodes.LIMIT_EXCEEDED, false);
         }
         PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
-        return opened != null
-                ? new Reservation(opened, null, true)
-                : new Reservation(flows.lookup(key), null, false);
+        if (opened == null) {
+            return new Reservation(flows.lookup(key), null, false);
+        }
+        opened.address = destination;
+        opened.name = name;
+        return new Reservation(opened, null, true);
     }
 
-    /** The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held. */
-    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, int destination) {
+    /**
+     * The judgment layer for a flow dialled to destination; null when allowed. name is the one the
+     * flow is opened under, which lets a domain rule covering it admit the flow; null for a flow to
+     * the address itself, which no domain rule admits. Called with the lock held.
+     */
+    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, int destination, String name) {
         if (closed || !enabled) {
             return PeerEgressCodes.DISABLED;
         }
@@ -895,6 +903,7 @@ final class PeerEgressRuntime {
         PeerEgressRequest request = new PeerEgressRequest();
         request.setConsumerClientId(consumer);
         request.setDestinationIp(Ipv4Cidr.format(destination));
+        request.setName(name);
         request.setDestinationPort(key.remotePort());
         request.setProtocol(key.protocolName());
         request.setActiveFlowsForConsumer(flows.countFor(consumer));
@@ -1001,7 +1010,7 @@ final class PeerEgressRuntime {
         lock.lock();
         try {
             resolving.remove(key);
-            Choice chosen = chooseAddress(addresses, address -> authorizeTo(consumer, key, address));
+            Choice chosen = chooseAddress(addresses, address -> authorizeTo(consumer, key, address, name));
             return new Choice(chosen.address(), chosen.code(), name);
         } finally {
             lock.unlock();

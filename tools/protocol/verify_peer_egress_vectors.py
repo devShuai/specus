@@ -966,6 +966,14 @@ _report_module = importlib.util.module_from_spec(_report_spec)
 _report_spec.loader.exec_module(_report_module)
 if json.loads((VECTORS / "peer-egress-report-v1.json").read_text(encoding="utf-8")) != _report_module.build():
     failures.append("peer-egress-report-v1.json differs from what its generator produces; regenerate it")
+_domain_policy_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_domain_policy_vectors",
+    Path(__file__).with_name("generate_peer_egress_domain_policy_vectors.py"))
+_domain_policy_module = importlib.util.module_from_spec(_domain_policy_spec)
+_domain_policy_spec.loader.exec_module(_domain_policy_module)
+if (json.loads((VECTORS / "peer-egress-domain-policy-v1.json").read_text(encoding="utf-8"))
+        != _domain_policy_module.build()):
+    failures.append("peer-egress-domain-policy-v1.json differs from what its generator produces; regenerate it")
 _standing_spec = importlib.util.spec_from_file_location(
     "generate_peer_egress_standing_vectors",
     Path(__file__).with_name("generate_peer_egress_standing_vectors.py"))
