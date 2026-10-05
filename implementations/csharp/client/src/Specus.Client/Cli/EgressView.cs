@@ -9,9 +9,10 @@ namespace Specus.Client.Cli;
 /// <remarks>
 /// The JSON form carries everything; this decides what a person is shown. The rule it follows is to
 /// print the problems and count the rest: a rule that is configured but not in force, a route this
-/// feature wanted and did not get, an egress peer a rule names that is offline. Those are the three
-/// ways the feature can be doing nothing while every other surface looks healthy, and they are the
-/// reason the section exists.
+/// feature wanted and did not get, an egress peer a rule names that is offline -- or online and
+/// still unable to take a flow, because the catalogue does not offer it or its client is too old.
+/// Those are the ways the feature can be doing nothing while every other surface looks healthy, and
+/// they are the reason the section exists.
 ///
 /// <para>So a working node prints two lines and a broken one prints those two plus exactly what is
 /// wrong. Listing the healthy rules too would push the one line that matters off the screen on any
@@ -82,20 +83,42 @@ internal static class EgressView
         }
         // Each problem is followed by what to do about it, in the same words in every runtime and on
         // the local page. A peer that is online with no path yet is a problem too: its rules are in
-        // force and have nowhere to send.
+        // force and have nowhere to send. So is one the catalogue does not offer to this device, or
+        // whose client does not support peer egress: online, and its destinations blocked all the
+        // same. One line pair per peer, the first that holds, in the order protocol/spec/peer-egress.md
+        // pins (能力不支持): offline, not offered, unsupported, no path.
         foreach (var peer in peers)
         {
             var id = Number(peer, "clientId");
+            var standing = Text(peer, "standing");
             if (!Flag(peer, "online"))
             {
                 lines.Add($"    egress peer {id}: offline, so its rules have nowhere to send");
                 lines.Add($"      fix: start egress device {id} or restore its connection; until then its destinations are blocked, not sent locally");
+            }
+            else if (standing == "not-offered")
+            {
+                lines.Add($"    egress peer {id}: not offered to this device by the server's egress catalog");
+                lines.Add("      fix: ask an administrator to enable its egress policy and allow this device, and check the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally");
+            }
+            else if (standing == "unsupported")
+            {
+                lines.Add($"    egress peer {id}: online, but its client does not support peer egress");
+                lines.Add($"      fix: upgrade the client on egress device {id}; until then its destinations are blocked, not sent locally");
             }
             else if (Text(peer, "path") == "none")
             {
                 lines.Add($"    egress peer {id}: online but no path to it yet");
                 lines.Add("      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP");
             }
+        }
+        // Once, not per peer: it is about the server. Only "none" says it; "waiting" is the first
+        // 30 seconds of every session, and a state file without the field is from a build that did
+        // not know to ask.
+        if (Text(present, "catalog") == "none")
+        {
+            lines.Add("    server: sent no egress catalog; it may be too old for peer egress");
+            lines.Add("      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself");
         }
 
         var error = Text(present, "routeError");

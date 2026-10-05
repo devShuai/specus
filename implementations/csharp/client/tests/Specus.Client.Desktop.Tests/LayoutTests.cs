@@ -129,6 +129,32 @@ public class LayoutTests
                     root.UpdateLayout();
                     if (screenshots) Capture(root, size, Path.Combine(output, $"windows-egress-status-{theme}-{size.Width}"));
 
+                    // Egresses that are online and still take no flow, by what the catalogue says, and a
+                    // server that sent none: one problem per egress, the first that holds, in the
+                    // order the command line prints them.
+                    window.RenderEgressStatus((JsonObject)JsonNode.Parse("""
+                        {"consumer":{"enabled":true,"active":true,"flows":0,"catalog":"none",
+                          "rules":[{"index":0,"match":"203.0.113.0/24","action":"egress","inForce":true,"egressClientId":41}],
+                          "routes":[],
+                          "peers":[{"clientId":41,"online":false,"standing":"not-offered","path":"none","flows":0},
+                                   {"clientId":42,"online":true,"standing":"not-offered","path":"none","flows":0},
+                                   {"clientId":43,"online":true,"standing":"unsupported","path":"direct","flows":0},
+                                   {"clientId":44,"online":true,"standing":"offered","path":"none","flows":0},
+                                   {"clientId":45,"online":true,"standing":"unknown","path":"direct","flows":0}],
+                          "blocked":{"egress-not-offered":2,"egress-unsupported":1}},
+                         "egress":{"active":false}}
+                        """)!);
+                    Assert.Equal("5 个问题", ((TextBlock)window.FindName("EgressProblemsText")).Text);
+                    Assert.Equal(["出口设备 41 离线", "出口设备 42 未提供给本机", "出口设备 43 的客户端不支持出口", "出口设备 44 在线但尚无路径",
+                            "服务端没有下发出口目录", "拦截计数"],
+                        window.EgressIssues.Select(issue => issue.Title).ToArray());
+                    Assert.Contains("请管理员在出口策略里启用它并允许本机，同时确认基础 ACL 与总开关", window.EgressIssues[1].Detail);
+                    Assert.Contains("把那台设备的客户端升级到支持出口的版本", window.EgressIssues[2].Detail);
+                    Assert.Contains("升级服务端；在此之前出口能否使用以出口的拒绝为准", window.EgressIssues[4].Detail);
+                    Assert.Equal("egress-not-offered=2，egress-unsupported=1", window.EgressIssues[^1].Code);
+                    root.UpdateLayout();
+                    if (screenshots) Capture(root, size, Path.Combine(output, $"windows-egress-standing-{theme}-{size.Width}"));
+
                     // The rule tester previews a name through the same judgment as egress test: the
                     // rule that would claim it is named, and since this page has no DNS takeover the
                     // name is left to the system's DNS. A name no domain rule could match is refused,

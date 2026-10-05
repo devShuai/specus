@@ -480,7 +480,15 @@ public partial class MainWindow
             var missing = routes.Where(route => !EgressTrue(route["installed"])).ToList();
             var offline = peers.Where(peer => !EgressTrue(peer["online"])).ToList();
             var relayed = peers.Where(peer => EgressText(peer["path"]) == "relay").ToList();
-            var pathless = peers.Where(peer => EgressTrue(peer["online"]) && EgressText(peer["path"]) == "none").ToList();
+            // An online egress the catalogue stops is a problem of its own, named before a missing
+            // path: with a path it would still not take a flow. One problem per egress, the first
+            // that holds, as the command line and the spec order them.
+            bool Stopped(JsonObject peer) => EgressText(peer["standing"]) is "not-offered" or "unsupported";
+            var notOffered = peers.Where(peer => EgressTrue(peer["online"]) && EgressText(peer["standing"]) == "not-offered").ToList();
+            var unsupported = peers.Where(peer => EgressTrue(peer["online"]) && EgressText(peer["standing"]) == "unsupported").ToList();
+            var pathless = peers.Where(peer => EgressTrue(peer["online"]) && !Stopped(peer) && EgressText(peer["path"]) == "none").ToList();
+            // Said once, about the server; "waiting" is only the first 30 seconds of a session.
+            var noCatalog = EgressText(consumer["catalog"]) == "none";
             EgressSummaryText.Text = $"{rules.Count} 条规则，{refused.Count} 条未生效 · {routes.Count} 条路由，{missing.Count} 条未安装 · "
                 + $"{EgressNumber(consumer["flows"])} 个流 · {peers.Count} 个出口设备，{offline.Count} 个离线，{relayed.Count} 个经中继";
             foreach (var rule in refused)
@@ -501,10 +509,27 @@ public partial class MainWindow
                 EgressIssues.Add(new EgressIssueRow("出口设备 " + EgressDeviceLabel(EgressNumber(peer["clientId"])) + " 离线",
                     "指向它的规则已经生效，但流量没有出口可发，会被阻断而不是改走本机。处理：启动该设备或恢复它的网络连接。", ""));
             }
+            foreach (var peer in notOffered)
+            {
+                EgressIssues.Add(new EgressIssueRow("出口设备 " + EgressDeviceLabel(EgressNumber(peer["clientId"])) + " 未提供给本机",
+                    "它在线，但服务端的出口目录没有向本机提供它，指向它的流量会被阻断而不是改走本机。"
+                    + "处理：请管理员在出口策略里启用它并允许本机，同时确认基础 ACL 与总开关。", "egress-not-offered"));
+            }
+            foreach (var peer in unsupported)
+            {
+                EgressIssues.Add(new EgressIssueRow("出口设备 " + EgressDeviceLabel(EgressNumber(peer["clientId"])) + " 的客户端不支持出口",
+                    "它在线，但运行的客户端没有声明支持出口，指向它的流量会被阻断而不是改走本机。"
+                    + "处理：把那台设备的客户端升级到支持出口的版本。", "egress-unsupported"));
+            }
             foreach (var peer in pathless)
             {
                 EgressIssues.Add(new EgressIssueRow("出口设备 " + EgressDeviceLabel(EgressNumber(peer["clientId"])) + " 在线但尚无路径",
                     "直连与中继路径都还没建立，指向它的流量暂时发不出去。处理：稍候；持续如此时检查两台设备到服务端的 UDP 是否可达。", ""));
+            }
+            if (noCatalog)
+            {
+                EgressIssues.Add(new EgressIssueRow("服务端没有下发出口目录",
+                    "连接 30 秒后仍未收到出口目录，服务端可能太旧，不支持出口。处理：升级服务端；在此之前出口能否使用以出口的拒绝为准。", ""));
             }
             var routeError = EgressText(consumer["routeError"]);
             if (routeError.Length > 0)
@@ -530,7 +555,8 @@ public partial class MainWindow
                 EgressIssues.Add(new EgressIssueRow("系统 DNS 未接管",
                     "域名规则要靠系统 DNS 指向本功能才生效；" + (why.Length > 0 ? "原因：" + why + "。" : "") + "按地址写的规则不受影响。", dnsCode));
             }
-            problems = refused.Count + missing.Count + offline.Count + pathless.Count + (routeError.Length > 0 ? 1 : 0)
+            problems = refused.Count + missing.Count + offline.Count + notOffered.Count + unsupported.Count + pathless.Count
+                + (noCatalog ? 1 : 0) + (routeError.Length > 0 ? 1 : 0)
                 + (dnsCode.Length > 0 && !EgressTrue(dns!["takeover"]) ? 1 : 0);
             if (problems == 0)
             {
@@ -540,7 +566,8 @@ public partial class MainWindow
             if (blocked.Length > 0)
             {
                 EgressIssues.Add(new EgressIssueRow("拦截计数",
-                    "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝。", blocked));
+                    "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，"
+                    + "egress-not-offered 为出口未提供给本机，egress-unsupported 为出口客户端不支持出口，rejected- 开头为出口拒绝。", blocked));
             }
         }
         EgressProblemsText.Text = problems > 0 ? problems + " 个问题" : "正常";
