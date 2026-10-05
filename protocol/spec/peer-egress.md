@@ -408,9 +408,9 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 然后决定流量：出口离线时照旧阻断并计 `egress-unavailable`（目录说不了一台不在的设备）；在线时，`not-offered` 阻断并计 `egress-not-offered`，`unsupported` 阻断并计 `egress-unsupported`；`unknown` 与 `offered` 照常发往出口。`unknown` 不阻断，是为了不让旧服务端下已经可用的部署在升级客户端后失效。
 这两种新的阻断与 `egress-unavailable` 一样**应答**应用（TCP 回 RST、UDP 回 ICMP 不可达），并在目录状态变成阻断时像出口下线一样断开该出口上的流、发送 `flow-purge`。
 
-控制认证后 **30 秒**（向量里的 `catalogWaitSeconds`）仍没有接受过任何目录，状态里 `catalog` 记为 `none`，说明服务端可能太旧、不支持出口；在此之前为 `waiting`，接受过目录后为 `received`。
+控制认证后 **30 秒**（向量里的 `catalogWaitSeconds`）仍没有接受过任何目录，状态里 `catalog` 记为 `none`，说明服务端可能太旧、不支持出口；在此之前为 `waiting`，接受过目录后为 `received`。还没有控制认证过、或控制连接断开到下一次认证之间，也是 `waiting`。`catalog` 与 `peers` 一样，只在消费端运行时出现。
 
-`egress` 命令面向人的输出给这三种情况各两行，三端逐字一致（`N` 是出口的 `clientId`），排在出口离线之后、在线无路径之前，一个出口只报第一种成立的：
+`egress` 命令面向人的输出给这三种情况各两行，三端逐字一致（`N` 是出口的 `clientId`）。出口仍按 `clientId` 逐个列出，每个出口按「离线、未提供、不支持、在线无路径」的顺序只报第一种成立的：
 
 ```text
     egress peer N: not offered to this device by the server's egress catalog
@@ -421,7 +421,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
       fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself
 ```
 
-最后一种只在 `catalog` 为 `none` 时出现一次。本地页面与 Windows 桌面端用同样的意思列出这些问题。
+最后一种只在 `catalog` 为 `none` 时出现一次，位于全部出口之后、路由下发失败之前。本地页面与 Windows 桌面端用同样的意思列出这些问题，顺序不作要求。
 
 ## 控制信令
 
