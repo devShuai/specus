@@ -2,6 +2,7 @@ package peermesh
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -231,10 +232,10 @@ func TestCatalogueCarriesWhatEachOnlineEgressDeclaredAboutDomainTargets(t *testi
 	for _, egress := range []store.ClientAccount{resolver, plain, gone} {
 		upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
 	}
-	insertEgressSession(t, db, resolver, 91, "NETTY_ONLINE", true)
-	insertEgressSession(t, db, plain, 92, "NETTY_ONLINE", false)
+	insertEgressSession(t, db, resolver, 91, "NETTY_ONLINE", EgressProtocolVersion, true)
+	insertEgressSession(t, db, plain, 92, "NETTY_ONLINE", EgressProtocolVersion, false)
 	// It declared the capability, but that session has ended: nothing online can resolve a name.
-	insertEgressSession(t, db, gone, 93, "DISCONNECTED", true)
+	insertEgressSession(t, db, gone, 93, "DISCONNECTED", EgressProtocolVersion, true)
 
 	catalog, err := service.BuildEgressCatalog(ctx, consumer, capableClient())
 	if err != nil {
@@ -254,6 +255,67 @@ func TestCatalogueCarriesWhatEachOnlineEgressDeclaredAboutDomainTargets(t *testi
 	for id, capable := range want {
 		if got[id] != capable {
 			t.Errorf("egress %d: domainTargetCapable = %v, want %v", id, got[id], capable)
+		}
+	}
+}
+
+// egressVersion is how a consumer tells an egress that cannot take a flow (an old client, 0) from
+// one that can. It comes from what the egress's current online session announced, and only that, and
+// it is written even when 0: a consumer reads an absent field as an old server and does not block.
+func TestCatalogueCarriesTheEgressVersionEachOnlineEgressAnnounced(t *testing.T) {
+	ctx := context.Background()
+	service, db := newEgressTestService(t)
+	consumer := insertPeerClient(t, db, 1001, "tenant-a", "alice", "alice-laptop")
+	current := insertPeerClient(t, db, 1002, "tenant-a", "alice", "current-gateway")
+	old := insertPeerClient(t, db, 1003, "tenant-a", "alice", "old-gateway")
+	gone := insertPeerClient(t, db, 1004, "tenant-a", "alice", "gone-gateway")
+	insertPeerDevice(t, db, consumer, "100.96.0.10", "consumer-key")
+	insertPeerDevice(t, db, current, "100.96.0.11", "current-key")
+	insertPeerDevice(t, db, old, "100.96.0.12", "old-key")
+	insertPeerDevice(t, db, gone, "100.96.0.13", "gone-key")
+	for _, egress := range []store.ClientAccount{current, old, gone} {
+		upsertTestPolicy(t, service, egress.ID, []int64{consumer.ID}, true)
+	}
+	insertEgressSession(t, db, current, 91, "NETTY_ONLINE", 1, false)
+	// An old client is online but announced no clientEgressCapabilities.
+	insertEgressSession(t, db, old, 92, "NETTY_ONLINE", 0, false)
+	// It announced version 1, but that session has ended: nothing online can take the flow.
+	insertEgressSession(t, db, gone, 93, "DISCONNECTED", 1, false)
+
+	catalog, err := service.BuildEgressCatalog(ctx, consumer, capableClient())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]int{}
+	for _, entry := range catalog.Egresses {
+		got[entry.ClientID] = entry.EgressVersion
+	}
+	want := map[int64]int{current.ID: 1, old.ID: 0, gone.ID: 0}
+	if len(got) != len(want) {
+		t.Fatalf("catalogue = %+v", catalog.Egresses)
+	}
+	for id, version := range want {
+		if got[id] != version {
+			t.Errorf("egress %d: egressVersion = %d, want %d", id, got[id], version)
+		}
+	}
+
+	encoded, err := json.Marshal(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Egresses []map[string]json.RawMessage `json:"egresses"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Egresses) != len(want) {
+		t.Fatalf("encoded catalogue = %s", encoded)
+	}
+	for _, entry := range wire.Egresses {
+		if _, present := entry["egressVersion"]; !present {
+			t.Errorf("catalogue entry left out egressVersion: %s", encoded)
 		}
 	}
 }
@@ -341,14 +403,14 @@ func insertEgressCapableSession(t *testing.T, db *store.DB, account store.Client
 	}
 }
 
-func insertEgressSession(t *testing.T, db *store.DB, account store.ClientAccount, sessionID int64, status string, domainTargets bool) {
+func insertEgressSession(t *testing.T, db *store.DB, account store.ClientAccount, sessionID int64, status string, version int, domainTargets bool) {
 	t.Helper()
 	now := time.Now().UTC()
 	if err := db.InsertClientSession(context.Background(), store.ClientSession{
 		ID: sessionID, TenantID: account.TenantID, ClientID: account.ID,
-		ClientName: account.ClientName, TokenHash: fmt.Sprintf("egress-domain-test-%d", sessionID),
+		ClientName: account.ClientName, TokenHash: fmt.Sprintf("egress-session-test-%d", sessionID),
 		Status: status, MachineFingerprint: "machine", OSUser: "user",
-		ClientEgressVersion: EgressProtocolVersion, ClientEgressDomainTargets: domainTargets,
+		ClientEgressVersion: version, ClientEgressDomainTargets: domainTargets,
 		HTTPLoginAt: now, NettyConnectedAt: &now, ExpiresAt: now.Add(time.Hour),
 	}); err != nil {
 		t.Fatal(err)

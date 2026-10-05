@@ -70,11 +70,13 @@ type dnsPhaseTwoVector struct {
 		Code     *string    `json:"code"`
 	} `json:"ruleStatus"`
 	Catalog []struct {
-		Name       string  `json:"name"`
-		JSON       *string `json:"json"`
-		NewSession bool    `json:"newSession"`
-		Accepted   *bool   `json:"accepted"`
-		Capable    []int64 `json:"domainTargetCapable"`
+		Name          string           `json:"name"`
+		JSON          *string          `json:"json"`
+		NewSession    bool             `json:"newSession"`
+		Accepted      *bool            `json:"accepted"`
+		Capable       []int64          `json:"domainTargetCapable"`
+		Listed        []int64          `json:"listed"`
+		EgressVersion map[string]int64 `json:"egressVersion"`
 	} `json:"catalog"`
 	Steering []struct {
 		Name    string           `json:"name"`
@@ -295,6 +297,25 @@ func TestEgressCatalogMatchesTheSharedVector(t *testing.T) {
 		}
 		if ids := reader.capableIDs(); !reflect.DeepEqual(ids, append([]int64{}, c.Capable...)) {
 			t.Errorf("%s: capable %v, want %v", c.Name, ids, c.Capable)
+		}
+		// Which egresses are listed and the egressVersion each announced decide their standing
+		// (peer-egress.md, 能力不支持); a version that is not a non-negative integer is left out.
+		if c.Listed == nil || c.EgressVersion == nil {
+			t.Fatalf("%s: the vector predates listed and egressVersion", c.Name)
+		}
+		// What is listed outlives a new session; that one was accepted in this session does not.
+		if (c.NewSession && reader.received) || (c.Accepted != nil && *c.Accepted && !reader.received) {
+			t.Errorf("%s: received = %v", c.Name, reader.received)
+		}
+		if ids := reader.listedIDs(); !reflect.DeepEqual(ids, append([]int64{}, c.Listed...)) {
+			t.Errorf("%s: listed %v, want %v", c.Name, ids, c.Listed)
+		}
+		versions := map[string]int64{}
+		for id, version := range reader.egressVersions() {
+			versions[strconv.FormatInt(id, 10)] = version
+		}
+		if !reflect.DeepEqual(versions, c.EgressVersion) {
+			t.Errorf("%s: egressVersion %v, want %v", c.Name, versions, c.EgressVersion)
 		}
 	}
 }

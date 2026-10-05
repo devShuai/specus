@@ -329,6 +329,9 @@ public sealed class SpecusControlClient : IAsyncDisposable
         var controlLogin = await ReadLoginResponseAsync(controlReader, controlWatchdog, session).ConfigureAwait(false);
         EnsureLoginSucceeded(controlLogin, ConnectionRole.Control);
         _observer?.OnControlAuthenticated();
+        // Before any control message is read, so the wait for this session's egress catalogue
+        // starts no later than the catalogue could arrive.
+        _peerMesh.ControlAuthenticated();
         _activeWriter = controlWriter;
         _peerMesh.ControlRemoteEndPoint = controlConnection.RemoteEndPoint;
         // The client's own token, not this session's. The mesh outlives a reconnect now: its

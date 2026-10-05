@@ -204,6 +204,11 @@ public class PeerEgressPhaseTwoVectorTests
         }
     }
 
+    /// <summary>
+    /// Each event of the <c>catalog</c> section: whether the push is accepted, and after it which
+    /// egresses resolve names, which are listed, and the egressVersion of each that carried a usable
+    /// one. A new session keeps all three; only the revision floor and "a catalogue arrived" reset.
+    /// </summary>
     [Fact]
     public void CatalogMatchesTheSharedVector()
     {
@@ -215,15 +220,51 @@ public class PeerEgressPhaseTwoVectorTests
             if (testCase.TryGetProperty("newSession", out _))
             {
                 catalog.NewSession();
+                Assert.False(catalog.Snapshot().Received, $"{name}: a new session still counts the last one's catalogue");
             }
             else
             {
+                var receivedBefore = catalog.Snapshot().Received;
                 var accepted = catalog.Read(testCase.GetProperty("json").GetString());
                 Assert.True(testCase.GetProperty("accepted").GetBoolean() == accepted, $"{name}: accepted {accepted}");
+                Assert.True(catalog.Snapshot().Received == (receivedBefore || accepted), $"{name}: received {catalog.Snapshot().Received}");
             }
             var expected = testCase.GetProperty("domainTargetCapable").EnumerateArray().Select(item => item.GetInt64());
             Assert.True(expected.SequenceEqual(catalog.CapableIds()), $"{name}: {string.Join(",", catalog.CapableIds())}");
+            var listed = testCase.GetProperty("listed").EnumerateArray().Select(item => item.GetInt64());
+            Assert.True(listed.SequenceEqual(catalog.ListedIds()), $"{name}: listed {string.Join(",", catalog.ListedIds())}");
+            var versions = testCase.GetProperty("egressVersion").EnumerateObject()
+                .Select(entry => (long.Parse(entry.Name), entry.Value.GetInt64())).OrderBy(entry => entry.Item1);
+            Assert.True(versions.SequenceEqual(catalog.EgressVersions().Select(entry => (entry.Key, entry.Value))),
+                $"{name}: egressVersion {JsonSerializer.Serialize(catalog.EgressVersions())}");
+            // The snapshot the consumer decides by says the same.
+            var snapshot = catalog.Snapshot();
+            Assert.True(listed.SequenceEqual(snapshot.Listed.Keys.Order()), $"{name}: snapshot listed");
+            Assert.True(versions.SequenceEqual(snapshot.Listed.Where(entry => entry.Value.EgressVersion is not null)
+                .Select(entry => (entry.Key, entry.Value.EgressVersion!.Value)).OrderBy(entry => entry.Key)), $"{name}: snapshot versions");
         }
+    }
+
+    /// <summary>
+    /// The decoder on its own, for the one event that carries egressVersion in every spelling: only a
+    /// non-negative JSON integer is a version, and every entry with a usable id is listed either way.
+    /// </summary>
+    [Fact]
+    public void TheDecoderReadsOnlyNonNegativeIntegerVersions()
+    {
+        using var vector = Vector();
+        var testCase = vector.RootElement.GetProperty("catalog").EnumerateArray()
+            .Single(item => item.GetProperty("name").GetString() == "egress-versions-only-non-negative-integers");
+        var message = PeerEgressCatalogMessage.Decode(testCase.GetProperty("json").GetString());
+        Assert.NotNull(message);
+        Assert.Equal(testCase.GetProperty("listed").EnumerateArray().Select(item => item.GetInt64()), message.Egresses.Keys.Order());
+        Assert.Equal(1L, message.Egresses[2].EgressVersion);
+        Assert.Equal(0L, message.Egresses[3].EgressVersion);
+        foreach (var unusable in new long[] { 4, 5, 6, 7 })
+        {
+            Assert.Null(message.Egresses[unusable].EgressVersion);
+        }
+        Assert.All(message.DomainTargetCapable.Values, capable => Assert.False(capable));
     }
 
     /// <summary>The consumer itself, on the vector's clock.</summary>
@@ -342,7 +383,10 @@ public class PeerEgressPhaseTwoVectorTests
             }
             if (catalog is not null)
             {
-                Add(_consumer.SetEgressCapabilities(catalog, nowMs));
+                // A catalogue accepted in this session, listing these egresses as a server without
+                // egressVersion does: every one offered, so only the domain capability decides.
+                Add(_consumer.SetCatalog(new PeerEgressCatalogSnapshot(true, catalog.ToDictionary(
+                    entry => entry.Key, entry => new PeerEgressCatalogListing(entry.Value, null))), nowMs));
             }
             foreach (var (egress, destinations) in purge)
             {
