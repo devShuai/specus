@@ -111,7 +111,15 @@ public class PeerEgressRuntimeTests
 
         public PeerEgressRuntime Runtime { get; }
 
-        public Harness(params string[] destinations)
+        public Harness(params string[] destinations) : this(null, null, destinations)
+        {
+        }
+
+        /// <summary>
+        /// Puts the new-flow bucket on a clock the test moves. A test that opens a bucket's worth of
+        /// flows can also leave their readers unstarted, since nothing it checks needs them.
+        /// </summary>
+        public Harness(Func<long>? rateClock, Action<Action>? executor, params string[] destinations)
         {
             Runtime = new PeerEgressRuntime(
                 (_, frame) =>
@@ -122,8 +130,9 @@ public class PeerEgressRuntimeTests
                     }
                 },
                 this,
-                reader => new Thread(() => reader()) { IsBackground = true }.Start(),
-                () => Epoch);
+                executor ?? (reader => new Thread(() => reader()) { IsBackground = true }.Start()),
+                () => Epoch,
+                rateClock: rateClock);
             Runtime.ApplyPolicy(Policy(destinations), PeerEgressContext.Default, Epoch);
         }
 
@@ -870,5 +879,92 @@ public class PeerEgressRuntimeTests
 
         WaitFor("the datagram to reach the socket", () => harness.DialCount == 1 && harness.Socket(0).Written.Count > 0);
         Assert.Equal(["203.0.113.53:53"], harness.Dialed);
+    }
+
+    private static byte[] SynFrame(string source, ushort sourcePort) =>
+        FrameFor(PeerEgressSegment.Build(Syn(source, sourcePort, "203.0.113.10", 443)));
+
+    private static byte[] DatagramFrame(ushort sourcePort) =>
+        FrameFor(PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(
+            Address("100.96.0.1"), Address("203.0.113.53"), sourcePort, 53, Encoding.ASCII.GetBytes("query"))));
+
+    /// <summary>
+    /// Each consumer draws new flows from a bucket of 128 that refills 64 a second
+    /// (protocol/spec/peer-egress.md, 资源上限). Only a flow that would otherwise open takes a token,
+    /// so a retransmitted SYN and a refused attempt take none, and an empty bucket refuses through
+    /// the same path as the concurrency caps.
+    /// </summary>
+    [Fact]
+    public void LimitsTheRateOfNewFlowsPerConsumer()
+    {
+        var rateNowMs = 0L;
+        var harness = new Harness(() => rateNowMs, _ => { });
+
+        for (var port = 0; port < PeerEgressFlowRate.Capacity - 1; port++)
+        {
+            harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", (ushort)(40000 + port)), Epoch);
+        }
+        Assert.Equal(PeerEgressFlowRate.Capacity - 1, harness.DialCount);
+
+        for (var retransmission = 0; retransmission < 3; retransmission++)
+        {
+            harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", 40000), Epoch);
+        }
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 41000, "198.51.100.10", 443))), Epoch);
+        Assert.Equal(PeerEgressFlowRate.Capacity - 1, harness.DialCount);
+        Assert.Equal([PeerEgressCodes.DestinationDenied], harness.RejectCodes());
+
+        // A new UDP mapping is a new flow as much as a SYN is; this one takes the last token.
+        harness.Runtime.HandleFrame(7, DatagramFrame(50000), Epoch);
+        Assert.Equal(PeerEgressFlowRate.Capacity, harness.DialCount);
+        harness.ClearFrames();
+
+        harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", 42000), Epoch);
+        harness.Runtime.HandleFrame(7, DatagramFrame(50001), Epoch);
+        Assert.True(harness.DialCount == PeerEgressFlowRate.Capacity, "a flow past the bucket was dialled");
+        Assert.Equal([PeerEgressCodes.LimitExceeded, PeerEgressCodes.LimitExceeded], harness.RejectCodes());
+        Assert.True(harness.SawReset(), "the refused SYN left the consumer without a reset");
+        Assert.Equal(2, harness.Runtime.StatusSnapshot().Refused[PeerEgressCodes.LimitExceeded]);
+
+        // Another consumer has a bucket of its own.
+        harness.Runtime.HandleFrame(9, SynFrame("100.96.0.2", 40000), Epoch);
+        Assert.Equal(PeerEgressFlowRate.Capacity + 1, harness.DialCount);
+
+        // A token takes 15.625 ms to come back, on the bucket's own clock rather than the frames'.
+        rateNowMs = 15;
+        harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", 42001), Epoch);
+        Assert.Equal(PeerEgressFlowRate.Capacity + 1, harness.DialCount);
+        rateNowMs = 16;
+        harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", 42002), Epoch);
+        Assert.Equal(PeerEgressFlowRate.Capacity + 2, harness.DialCount);
+    }
+
+    /// <summary>
+    /// A frame that races the one opening its flow finds the reservation already made. It opens
+    /// nothing, so it must not take a token either.
+    /// </summary>
+    [Fact]
+    public void ARacingFrameForAReservedFlowTakesNoToken()
+    {
+        var harness = new Harness(() => 0, _ => { }) { Gate = new ManualResetEventSlim(false) };
+        var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+        var key = new PeerEgressFlowTable.Key(
+            PeerEgressSegment.Ipv4ProtocolTcp, opening.SourceIp, opening.SourcePort,
+            opening.DestinationIp, opening.DestinationPort);
+
+        var first = StartBlocking(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
+        WaitFor("the first connect to start", () => harness.DialCount == 1);
+        var second = StartBlocking(() => harness.Runtime.OpenTcpFlow(7, key, opening, Epoch));
+        Assert.True(second.Join(TimeSpan.FromSeconds(2)), "the racing frame dialled again");
+        harness.Gate.Set();
+        Assert.True(first.Join(TimeSpan.FromSeconds(2)), "the first connect never finished");
+
+        for (var port = 1; port < PeerEgressFlowRate.Capacity + 1; port++)
+        {
+            harness.Runtime.HandleFrame(7, SynFrame("100.96.0.1", (ushort)(40000 + port)), Epoch);
+        }
+        Assert.Equal(PeerEgressFlowRate.Capacity, harness.DialCount);
+        Assert.Equal([PeerEgressCodes.LimitExceeded], harness.RejectCodes());
     }
 }

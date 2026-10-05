@@ -216,22 +216,13 @@ static void object_normalize_prefix(char *prefix)
     while (len > 0U && prefix[len - 1U] == '/') prefix[--len] = '\0';
 }
 
-static int object_load_config(st_object_config *config)
+/*
+ * Limits are parsed independently of the provider so the capability snapshot reports the same
+ * effective quotas, size limit and retention while storage is disabled or misconfigured. Upload,
+ * complete and download only ever read them after the provider has been enabled.
+ */
+static void object_load_limits(st_object_config *config)
 {
-    memset(config, 0, sizeof(*config));
-    const char *provider = object_env_text("SPECUS_OBJECT_STORAGE_PROVIDER", "disabled");
-    if (strcasecmp(provider, "disabled") == 0) return 0;
-    if (strcasecmp(provider, "aliyun-oss") != 0) return -1;
-    if (object_parse_endpoint(getenv("SPECUS_OBJECT_STORAGE_ENDPOINT"), config) != 0
-        || object_copy_trimmed(config->region, sizeof(config->region), getenv("SPECUS_OBJECT_STORAGE_REGION")) != 0
-        || object_copy_trimmed(config->bucket, sizeof(config->bucket), getenv("SPECUS_OBJECT_STORAGE_BUCKET")) != 0
-        || object_copy_trimmed(config->access_key_id, sizeof(config->access_key_id), getenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID")) != 0
-        || object_copy_trimmed(config->access_key_secret, sizeof(config->access_key_secret), getenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET")) != 0
-        || object_copy_trimmed(config->prefix, sizeof(config->prefix), object_env_text("SPECUS_OBJECT_STORAGE_PREFIX", "specus/attachments")) != 0
-        || object_copy_trimmed(config->callback_url, sizeof(config->callback_url), getenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL")) != 0
-        || config->bucket[0] == '\0' || config->access_key_id[0] == '\0'
-        || config->access_key_secret[0] == '\0' || object_infer_region(config) != 0) return -1;
-    object_normalize_prefix(config->prefix);
     config->upload_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS", 900), 900);
     config->download_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS", 600), 600);
     config->direct_download_ttl = object_clamp_ttl(object_env_i64("SPECUS_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", 30), 30);
@@ -249,6 +240,25 @@ static int object_load_config(st_object_config *config)
     if (config->presign_rate_window <= 0) config->presign_rate_window = 300;
     config->max_pending_per_room = (int)object_env_i64("SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", 50);
     if (config->max_pending_per_room <= 0) config->max_pending_per_room = 50;
+}
+
+static int object_load_config(st_object_config *config)
+{
+    memset(config, 0, sizeof(*config));
+    object_load_limits(config);
+    const char *provider = object_env_text("SPECUS_OBJECT_STORAGE_PROVIDER", "disabled");
+    if (strcasecmp(provider, "disabled") == 0) return 0;
+    if (strcasecmp(provider, "aliyun-oss") != 0) return -1;
+    if (object_parse_endpoint(getenv("SPECUS_OBJECT_STORAGE_ENDPOINT"), config) != 0
+        || object_copy_trimmed(config->region, sizeof(config->region), getenv("SPECUS_OBJECT_STORAGE_REGION")) != 0
+        || object_copy_trimmed(config->bucket, sizeof(config->bucket), getenv("SPECUS_OBJECT_STORAGE_BUCKET")) != 0
+        || object_copy_trimmed(config->access_key_id, sizeof(config->access_key_id), getenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID")) != 0
+        || object_copy_trimmed(config->access_key_secret, sizeof(config->access_key_secret), getenv("SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET")) != 0
+        || object_copy_trimmed(config->prefix, sizeof(config->prefix), object_env_text("SPECUS_OBJECT_STORAGE_PREFIX", "specus/attachments")) != 0
+        || object_copy_trimmed(config->callback_url, sizeof(config->callback_url), getenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL")) != 0
+        || config->bucket[0] == '\0' || config->access_key_id[0] == '\0'
+        || config->access_key_secret[0] == '\0' || object_infer_region(config) != 0) return -1;
+    object_normalize_prefix(config->prefix);
     config->enabled = 1;
     return 0;
 }
@@ -530,20 +540,39 @@ error:
     return NULL;
 }
 
+static int object_write_response_cached(char *out,
+                                        size_t out_len,
+                                        int status,
+                                        const char *reason,
+                                        const char *cache_control,
+                                        const char *body)
+{
+    size_t body_len = body == NULL ? 0U : strlen(body);
+    int written = snprintf(out, out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: %s\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Content-Length: %zu\r\n\r\n%s",
+                           status, reason, cache_control, body_len, body == NULL ? "" : body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
 static int object_write_response(char *out,
                                  size_t out_len,
                                  int status,
                                  const char *reason,
                                  const char *body)
 {
-    size_t body_len = body == NULL ? 0U : strlen(body);
+    return object_write_response_cached(out, out_len, status, reason, "no-store", body);
+}
+
+static int object_method_not_allowed(char *out, size_t out_len)
+{
+    const char *body = "{\"error\":\"method not allowed\"}";
     int written = snprintf(out, out_len,
-                           "HTTP/1.1 %d %s\r\n"
-                           "Content-Type: application/json\r\n"
-                           "Cache-Control: no-store\r\n"
-                           "X-Content-Type-Options: nosniff\r\n"
-                           "Content-Length: %zu\r\n\r\n%s",
-                           status, reason, body_len, body == NULL ? "" : body);
+        "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Type: application/json\r\n"
+        "Cache-Control: no-store\r\nContent-Length: %zu\r\n\r\n%s", strlen(body), body);
     return written < 0 || (size_t)written >= out_len ? -1 : written;
 }
 
@@ -780,10 +809,15 @@ static int object_insert_attachment(sqlite3 *db, const st_attachment *value)
     return rc ? 0 : -1;
 }
 
+/*
+ * Account-wide usage across every attachment scope. The caller passes the instant so the
+ * capability snapshot evaluates expiry at the same moment it reports in checkedAt.
+ */
 static int object_active_storage_bytes(sqlite3 *db,
                                        const char *tenant,
                                        const char *username,
                                        long long excluded_id,
+                                       time_t at,
                                        long long *bytes)
 {
     static const char sql[] =
@@ -791,7 +825,7 @@ static int object_active_storage_bytes(sqlite3 *db,
         "WHERE tenant_id=? AND owner_username=? AND id<>? AND "
         "((status='PENDING' AND upload_expires_at>?) OR (status='UPLOADED' AND expires_at>?))";
     char now[41];
-    if (object_iso_time(time(NULL), now) != 0) return -1;
+    if (object_iso_time(at, now) != 0) return -1;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK
         || object_bind_text(stmt, 1, tenant) != 0
@@ -1403,7 +1437,7 @@ static int object_create_upload(const st_object_config *config,
         return object_error(out, out_len, 503, "attachment persistence is busy");
     }
     long long used = 0;
-    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, &used) != 0
+    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, time(NULL), &used) != 0
         || !object_quota_allows(used, size_bytes, config->storage_quota_bytes)) {
         object_rollback(db);
         sqlite3_close(db);
@@ -1514,7 +1548,7 @@ static int object_complete(const st_object_config *config,
     }
     long long used = 0;
     if (object_active_storage_bytes(db, attachment.tenant_id, attachment.owner_username,
-                                    attachment.id, &used) != 0
+                                    attachment.id, time(NULL), &used) != 0
         || !object_quota_allows(used, attachment.size_bytes, config->storage_quota_bytes)) {
         object_rollback(db); sqlite3_close(db); (void)object_delete(config, attachment.object_key);
         return object_error(out, out_len, 429, "OSS storage quota is insufficient");
@@ -1574,10 +1608,10 @@ static int object_download_usage(sqlite3 *db,
     return 0;
 }
 
-static int object_month(char out[8])
+/* UTC calendar month that download usage is charged to; shared with the capability snapshot. */
+static int object_month(time_t now, char out[8])
 {
     struct tm value;
-    time_t now = time(NULL);
     return gmtime_r(&now, &value) != NULL && strftime(out, 8U, "%Y-%m", &value) == 7U ? 0 : -1;
 }
 
@@ -1603,7 +1637,7 @@ static int object_create_download(const st_object_config *config,
     int access = object_attachment_access(&attachment, identity, room_token, 0);
     free(room_token);
     char now[41], month[8];
-    if (access != 0 || object_iso_time(time(NULL), now) != 0 || object_month(month) != 0) {
+    if (access != 0 || object_iso_time(time(NULL), now) != 0 || object_month(time(NULL), month) != 0) {
         sqlite3_close(db);
         return object_error(out, out_len, access == 1 ? 401 : access == 2 ? 403 : 500, "attachment access is forbidden");
     }
@@ -1695,13 +1729,7 @@ static int object_consume_download(const st_object_config *config,
     const char *token_end = strchr(token_start, '?');
     if (token_end == NULL) token_end = token_start + strlen(token_start);
     size_t token_len = (size_t)(token_end - token_start);
-    if (strcmp(method, "GET") != 0) {
-        const char *body = "{\"error\":\"method not allowed\"}";
-        int written = snprintf(out, out_len,
-            "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Type: application/json\r\n"
-            "Cache-Control: no-store\r\nContent-Length: %zu\r\n\r\n%s", strlen(body), body);
-        return written < 0 || (size_t)written >= out_len ? -1 : written;
-    }
+    if (strcmp(method, "GET") != 0) return object_method_not_allowed(out, out_len);
     if (token_len == 0U || token_len > 128U) return object_error(out, out_len, 410, "download link is expired or already used");
     char token[129];
     memcpy(token, token_start, token_len);
@@ -1730,7 +1758,7 @@ static int object_consume_download(const st_object_config *config,
     char now[41], month[8];
     st_attachment attachment;
     if (!selected || consumed[0] != '\0' || object_iso_time(time(NULL), now) != 0
-        || object_month(month) != 0 || strcmp(expires, now) <= 0
+        || object_month(time(NULL), month) != 0 || strcmp(expires, now) <= 0
         || object_find_attachment_any(db, attachment_id, &attachment) != 0
         || strcmp(attachment.status, "UPLOADED") != 0 || strcmp(attachment.expires_at, now) <= 0) {
         object_rollback(db); sqlite3_close(db);
@@ -1980,7 +2008,7 @@ static int object_complete_callback(const st_object_config *config,
     if (object_begin(db) != 0) { sqlite3_close(db); free(key); return object_error(out, out_len, 503, "attachment persistence is busy"); }
     long long used = 0;
     if (object_active_storage_bytes(db, attachment.tenant_id, attachment.owner_username,
-                                    attachment.id, &used) != 0
+                                    attachment.id, time(NULL), &used) != 0
         || !object_quota_allows(used, size, config->storage_quota_bytes)) {
         object_rollback(db); sqlite3_close(db); (void)object_delete(config, key); free(key);
         return object_error(out, out_len, 429, "OSS storage quota is insufficient");
@@ -2007,6 +2035,137 @@ static int object_complete_callback(const st_object_config *config,
     return object_write_response(out, out_len, 200, "OK", response);
 }
 
+/*
+ * Read-only connection for the capability snapshot. Without SQLITE_OPEN_CREATE and without the
+ * schema bootstrap in object_open, the snapshot can neither create a database file nor tables,
+ * and SQLite itself rejects any write instead of relying on this path staying careful.
+ */
+static int object_open_read_only(sqlite3 **db)
+{
+    const char *path = getenv("SPECUS_DATABASE_PATH");
+    if (path == NULL || *path == '\0') return 1;
+    if (sqlite3_open_v2(path, db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK
+        || sqlite3_busy_timeout(*db, 5000) != SQLITE_OK) {
+        if (*db != NULL) sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int object_table_exists(sqlite3 *db, const char *table, int *exists)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                           -1, &stmt, NULL) != SQLITE_OK
+        || object_bind_text(stmt, 1, table) != 0 || sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    *exists = sqlite3_column_int64(stmt, 0) > 0;
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+/*
+ * Reads both sums in one read transaction so storage and download usage come from the same
+ * database snapshot. A table that was never created (object_open creates both on the first
+ * attachment operation) is a successful read of zero records; any other failure is an error
+ * so a broken database can never be reported as zero usage. Returns 0, 1 when persistence is
+ * unavailable, or -1 when the read itself failed.
+ */
+static int object_read_account_usage(const st_object_storage_identity *identity,
+                                     time_t now,
+                                     const char *month,
+                                     long long *storage_used,
+                                     long long *download_used)
+{
+    sqlite3 *db = NULL;
+    if (object_open_read_only(&db) != 0) return 1;
+    int has_attachments = 0, has_usage = 0;
+    int ok = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK;
+    if (ok) {
+        ok = object_table_exists(db, "transfer_attachment", &has_attachments) == 0
+            && object_table_exists(db, "transfer_attachment_download_usage", &has_usage) == 0
+            && (!has_attachments
+                || object_active_storage_bytes(db, identity->tenant_id, identity->username,
+                                               -1, now, storage_used) == 0)
+            && (!has_usage
+                || object_download_usage(db, identity->tenant_id, identity->username,
+                                         month, download_used) == 0);
+        if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) ok = 0;
+    }
+    sqlite3_close(db);
+    return ok ? 0 : -1;
+}
+
+/* Download usage resets at midnight UTC on the first day of the month after the charged one. */
+static int object_usage_period(time_t now, char month[8], char resets_at[41])
+{
+    struct tm value;
+    if (object_month(now, month) != 0 || gmtime_r(&now, &value) == NULL) return -1;
+    int year = value.tm_year + 1900 + (value.tm_mon == 11 ? 1 : 0);
+    int next_month = value.tm_mon == 11 ? 1 : value.tm_mon + 2;
+    int written = snprintf(resets_at, 41U, "%04d-%02d-01T00:00:00Z", year, next_month);
+    return written == 20 ? 0 : -1;
+}
+
+/*
+ * GET /api/public/transfer/attachments/capabilities (protocol/spec/transfer-capabilities.md).
+ * An advisory, read-only snapshot for the authenticated account only: it never creates rooms,
+ * attachments, grants or usage rows, never signs or sends object-store requests and never
+ * touches the presign rate limiter. Every field derives from the single instant `now`.
+ */
+static int object_capabilities(const st_object_storage_identity *identity,
+                               time_t now,
+                               char *out,
+                               size_t out_len)
+{
+    /* Tenant and account come only from the verified token; the request carries no selector,
+     * so administrators also see their own usage and never another account's. */
+    if (!object_identity_valid(identity)) return object_error(out, out_len, 401, "missing or invalid bearer token");
+    st_object_config config;
+    /* Same rule as upload: a misconfigured provider is disabled there too. No network access. */
+    int storage_enabled = object_load_config(&config) == 0 && config.enabled;
+    char checked_at[41], month[8], resets_at[41];
+    if (object_iso_time(now, checked_at) != 0 || object_usage_period(now, month, resets_at) != 0)
+        return object_error(out, out_len, 500, "failed to resolve the usage period");
+    long long storage_used = 0, download_used = 0;
+    int read = object_read_account_usage(identity, now, month, &storage_used, &download_used);
+    if (read != 0) {
+        return read > 0 ? object_error(out, out_len, 503, "attachment persistence is unavailable")
+                        : object_error(out, out_len, 500, "failed to read attachment usage");
+    }
+    if (storage_used < 0) storage_used = 0;
+    if (download_used < 0) download_used = 0;
+    /* object_load_limits already resolved nonpositive settings to the defaults that upload and
+     * download enforce (512 MiB, 72 h, 1 GiB), so these are the effective limits; the clamps only
+     * keep the contract's floors should that resolution ever change. */
+    long long max_bytes = config.max_attachment_bytes > 0 ? config.max_attachment_bytes : 0;
+    long long retention = config.retention_hours > 0 ? config.retention_hours : 1;
+    long long storage_quota = config.storage_quota_bytes > 0
+        ? config.storage_quota_bytes : ST_OBJECT_DEFAULT_QUOTA_BYTES;
+    long long download_quota = config.download_quota_bytes > 0
+        ? config.download_quota_bytes : ST_OBJECT_DEFAULT_QUOTA_BYTES;
+    /* Usage is reported uncapped; only the remaining figures floor at zero. */
+    long long storage_remaining = storage_used >= storage_quota ? 0 : storage_quota - storage_used;
+    long long download_remaining = download_used >= download_quota ? 0 : download_quota - download_used;
+    char body[1024];
+    int written = snprintf(body, sizeof(body),
+        "{\"schemaVersion\":1,\"checkedAt\":\"%s\",\"storageEnabled\":%s,"
+        "\"maxAttachmentBytes\":%lld,\"retentionHours\":%lld,"
+        "\"storageQuotaBytes\":%lld,\"storageUsedBytes\":%lld,\"storageRemainingBytes\":%lld,"
+        "\"monthlyDownloadQuotaBytes\":%lld,\"monthlyDownloadUsedBytes\":%lld,"
+        "\"monthlyDownloadRemainingBytes\":%lld,\"downloadUsageMonth\":\"%s\","
+        "\"downloadResetsAt\":\"%s\",\"downloadGrantSingleUse\":true}",
+        checked_at, storage_enabled ? "true" : "false", max_bytes, retention,
+        storage_quota, storage_used, storage_remaining,
+        download_quota, download_used, download_remaining, month, resets_at);
+    if (written < 0 || (size_t)written >= sizeof(body))
+        return object_error(out, out_len, 500, "failed to encode attachment capabilities");
+    return object_write_response_cached(out, out_len, 200, "OK", "private, no-store", body);
+}
+
 int st_object_storage_build_response(const char *method,
                                      const char *path,
                                      const char *body,
@@ -2018,6 +2177,10 @@ int st_object_storage_build_response(const char *method,
                                      size_t out_len)
 {
     if (method == NULL || path == NULL) return 0;
+    if (object_path_equals(path, "/api/public/transfer/attachments/capabilities")) {
+        if (strcmp(method, "GET") != 0) return object_method_not_allowed(out, out_len);
+        return object_capabilities(identity, time(NULL), out, out_len);
+    }
     static const char downloads[] = "/api/public/transfer/downloads/";
     int consume_download = strncmp(path, downloads, sizeof(downloads) - 1U) == 0;
 
@@ -2063,6 +2226,14 @@ void st_object_storage_reset_for_tests(void)
         object_rate_windows = next;
     }
     pthread_mutex_unlock(&object_rate_lock);
+}
+
+int st_object_storage_capabilities_for_tests(const st_object_storage_identity *identity,
+                                             long long epoch_seconds,
+                                             char *out,
+                                             size_t out_len)
+{
+    return object_capabilities(identity, (time_t)epoch_seconds, out, out_len);
 }
 
 char *st_object_storage_presign_for_tests(const char *method,

@@ -4237,8 +4237,9 @@ public class PeerMeshClient implements AutoCloseable {
 
     /**
      * A control session has logged in. The server numbers its egress catalogues per session, so a
-     * new one may start again from 1 and must not be ignored as older than the last; and an egress
-     * reports to it at the next check whether or not its numbers moved.
+     * new one may start again from 1 and must not be ignored as older than the last; and until it
+     * sends one, no egress is refused on the catalogue's account. The status's wait for a catalogue
+     * starts here, and an egress reports at the next check whether or not its numbers moved.
      */
     public void onControlSession() {
         egress.newControlSession();

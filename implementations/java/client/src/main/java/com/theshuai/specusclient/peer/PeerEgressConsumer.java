@@ -19,10 +19,11 @@ import lombok.extern.slf4j.Slf4j;
  * The consumer data plane: packets leaving the TUN, and the replies coming back.
  *
  * <p>The rule that shapes this class is that a destination matched by an egress rule must never
- * quietly go out locally. If the egress is offline, its authorization has been withdrawn, or the
- * flow cannot be opened, the packet is dropped. Falling back to the local stack would send the
- * user's traffic from the address they arranged for it not to come from, which is worse than the
- * connection failing, because it fails silently and in the direction they were guarding against.
+ * quietly go out locally. If the egress is offline, its authorization has been withdrawn, the
+ * server's egress catalogue says it cannot take the flow, or the flow cannot be opened, the packet
+ * is dropped. Falling back to the local stack would send the user's traffic from the address they
+ * arranged for it not to come from, which is worse than the connection failing, because it fails
+ * silently and in the direction they were guarding against.
  *
  * <p>While phase two runs (protocol/spec/peer-egress-dns.md) a destination inside the fake-IP pool
  * is decided by the name it stands for, by domain rules only, and goes to its egress preceded by a
@@ -258,6 +259,13 @@ final class PeerEgressConsumer {
     private PeerEgressFakeIpPool fakeIps;
     /** The egresses the catalogue says resolve names; any other gets no traffic for a name. */
     private Set<Long> domainCapable = Set.of();
+    /**
+     * What the catalogue says about each egress (protocol/spec/peer-egress.md, "能力不支持"): an
+     * online egress it does not offer to this device, or whose client announced no peer egress,
+     * would silently drop whatever it is sent, so its flows are refused here instead. Empty -- every
+     * egress unknown, nothing refused -- until a catalogue arrives in this control session.
+     */
+    private PeerEgressCatalog.Snapshot catalog = PeerEgressCatalog.Snapshot.empty();
     /** Phase two's DNS responder, which takes port 53 of the pool's listen address; or null. */
     private PeerEgressDnsResponder dnsResponder;
     /** This node's mesh address, parsed: the source a local DNS query normally has. */
@@ -295,11 +303,27 @@ final class PeerEgressConsumer {
             byEgress.merge(flow.egress, 1, Integer::sum);
         }
         PeerEgressFakeIpPool pool = fakeIps;
+        // The standing of every egress a rule names or the mesh has reported, whichever rules the
+        // status ends up counting as in force.
+        Map<Long, String> standings = new TreeMap<>();
+        for (PeerEgressRule rule : rules) {
+            Long target = rule.getEgressClientId();
+            if (target != null && target != 0L) {
+                standings.put(target, catalog.standing(target).wireName());
+            }
+        }
+        for (Long egress : online.keySet()) {
+            standings.put(egress, catalog.standing(egress).wireName());
+        }
+        // Without the time of the control login this only knows whether one came; the mesh, which
+        // has it, says when the wait is over.
+        String catalogState = catalog.received() ? PeerEgressCatalog.STATE_RECEIVED : PeerEgressCatalog.STATE_WAITING;
         return new PeerEgressStatus.ConsumerSnapshot(List.copyOf(rules), meshCidr,
                 new java.util.LinkedHashMap<>(online), flows.size(),
                 new java.util.TreeMap<>(blocked), byEgress, Map.of(),
                 pool == null ? null : pool.cidr(), domainCapable,
-                pool == null ? 0 : pool.mappings(), pool == null ? 0 : pool.quarantined(nowMs));
+                pool == null ? 0 : pool.mappings(), pool == null ? 0 : pool.quarantined(nowMs),
+                standings, catalogState);
     }
 
     /**
@@ -357,6 +381,57 @@ final class PeerEgressConsumer {
         return purgeInvalidated(nowMs);
     }
 
+    /**
+     * Takes everything the catalogue says at once: the standing of each egress and which resolve
+     * names. An egress whose standing turns into one that blocks has its flows closed as though it
+     * had gone offline: every packet they would carry from here on is one it would drop. A standing
+     * that stops blocking (a new control session, a catalogue that offers it again) closes nothing,
+     * and the next packet simply goes.
+     */
+    Map<Long, List<String>> setCatalog(PeerEgressCatalog.Snapshot snapshot, long nowMs) {
+        PeerEgressCatalog.Snapshot next = snapshot == null ? PeerEgressCatalog.Snapshot.empty() : snapshot;
+        Set<Long> capable = next.domainCapable() == null ? Set.of() : Set.copyOf(next.domainCapable());
+        if (next.equals(catalog) && capable.equals(domainCapable)) {
+            return Map.of();
+        }
+        logStandingChanges(catalog, next);
+        catalog = next;
+        domainCapable = capable;
+        return purgeInvalidated(nowMs);
+    }
+
+    /**
+     * Says when an egress a rule names starts or stops being refused because of the catalogue: the
+     * one line that explains why an online egress takes nothing. By client id and standing only.
+     */
+    private void logStandingChanges(PeerEgressCatalog.Snapshot before, PeerEgressCatalog.Snapshot after) {
+        Set<Long> named = new TreeSet<>();
+        for (PeerEgressRule rule : rules) {
+            if (rule.getEgressClientId() != null && rule.getEgressClientId() != 0L) {
+                named.add(rule.getEgressClientId());
+            }
+        }
+        for (long egress : named) {
+            PeerEgressCatalog.Standing was = before.standing(egress);
+            PeerEgressCatalog.Standing now = after.standing(egress);
+            if (was.blockedReason() == null && now.blockedReason() != null) {
+                log.warn("[peer-egress-consumer] egress {} is {} in the egress catalogue; its destinations are blocked",
+                        egress, now.wireName());
+            } else if (was.blockedReason() != null && now.blockedReason() == null) {
+                log.info("[peer-egress-consumer] egress {} no longer refused by the egress catalogue (standing {});"
+                        + " its destinations go to it again", egress, now.wireName());
+            }
+        }
+    }
+
+    /**
+     * Whether an egress can take a flow now: the mesh says it is online, and the catalogue neither
+     * leaves it out nor says its client cannot carry peer egress.
+     */
+    private boolean canTake(long egress) {
+        return Boolean.TRUE.equals(online.get(egress)) && catalog.standing(egress).blockedReason() == null;
+    }
+
     /** The pool phase two runs with, or null; the DNS responder answers from the same one. */
     PeerEgressFakeIpPool fakeIpPool() {
         return fakeIps;
@@ -401,7 +476,7 @@ final class PeerEgressConsumer {
                 stillOurs = rule != null
                         && PeerEgressRule.ACTION_EGRESS.equals(actionOf(rule))
                         && Long.valueOf(flow.egress).equals(rule.getEgressClientId())
-                        && Boolean.TRUE.equals(online.get(flow.egress))
+                        && canTake(flow.egress)
                         && domainCapable.contains(flow.egress);
             } else {
                 PeerEgressRules.Match match = PeerEgressRules.match(
@@ -409,7 +484,7 @@ final class PeerEgressConsumer {
                 stillOurs = PeerEgressRule.ACTION_EGRESS.equals(match.action())
                         && match.egressClientId() != null
                         && match.egressClientId() == flow.egress
-                        && Boolean.TRUE.equals(online.get(flow.egress));
+                        && canTake(flow.egress);
             }
             if (stillOurs) {
                 continue;
@@ -531,6 +606,16 @@ final class PeerEgressConsumer {
             // now and retry when the egress is back. A failed send, by contrast, stays silent:
             // the session may be re-establishing and the flow may yet recover.
             return refuseAnswered(packet, protocol, "egress-unavailable", Outcome.BLOCKED_NO_EGRESS);
+        }
+        String standingRefusal = catalog.standing(egress).blockedReason();
+        if (standingRefusal != null) {
+            // Online, but the catalogue does not offer it to this device, or says its client
+            // carries no peer egress: sent anyway, the flow would be dropped there without a word
+            // and the application would wait out its own timeout. Answered like an unavailable
+            // egress, and never let out locally. Offline is checked first because the catalogue
+            // cannot speak for a device that is not there; a domain rule's name capability after,
+            // because it means nothing for an egress that takes no flow at all.
+            return refuseAnswered(packet, protocol, standingRefusal, Outcome.BLOCKED_NO_EGRESS);
         }
         if (name != null && !domainCapable.contains(egress)) {
             // Online, but the catalogue does not say it resolves names: a name sent to it would be

@@ -407,6 +407,75 @@ class PeerEgressRuntimeTests {
     }
 
     /**
+     * New flows come out of a bucket of 128 per consumer, refused the way the concurrency caps refuse.
+     * Only a new flow everything else admitted takes a token: a retransmitted SYN, a frame racing the
+     * flow it belongs to and a refused attempt take nothing, and one consumer's burst leaves
+     * another's bucket alone.
+     */
+    @Test
+    void limitsHowFastAConsumerOpensFlows() {
+        Harness harness = new Harness();
+        // Concurrency caps above the bucket, so what refuses the 129th flow is the rate.
+        PeerEgressPolicy roomy = policy("203.0.113.0/24");
+        PeerEgressPolicy.PeerEgressLimits limits = new PeerEgressPolicy.PeerEgressLimits();
+        limits.setMaxFlowsPerConsumer(4 * PeerEgressFlowRate.CAPACITY);
+        limits.setMaxConcurrentFlows(8 * PeerEgressFlowRate.CAPACITY);
+        roomy.setLimits(limits);
+        harness.runtime.applyPolicy(roomy, PeerEgressAuthorization.Context.defaults(), EPOCH);
+        long[] now = {5_000};
+        harness.runtime.flowRateClock = () -> now[0];
+
+        PeerEgressSegment.Segment first = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(first)), EPOCH);
+        for (int port = 40001; port < 40000 + PeerEgressFlowRate.CAPACITY - 1; port++) {
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                    syn("100.96.0.1", port, "203.0.113.10", 443))), EPOCH);
+        }
+        assertEquals(PeerEgressFlowRate.CAPACITY - 1, harness.dialCount());
+
+        for (int retransmit = 0; retransmit < 3; retransmit++) {
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(first)), EPOCH);
+        }
+        harness.runtime.openTcpFlow(7, new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                first.sourceIp(), first.sourcePort(), first.destinationIp(), first.destinationPort()), first, EPOCH);
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 50000, "198.51.100.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY - 1, harness.dialCount());
+        assertEquals(List.of(PeerEgressCodes.DEST_DENIED), harness.rejectCodes());
+
+        harness.clearFrames();
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40127, "203.0.113.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY, harness.dialCount(),
+                "the 128th new flow was refused, so something other than a new flow took a token");
+        assertTrue(harness.rejectCodes().isEmpty());
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40128, "203.0.113.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY, harness.dialCount(), "the 129th new flow was dialled");
+        assertEquals(List.of(PeerEgressCodes.LIMIT_EXCEEDED), harness.rejectCodes());
+        assertTrue(harness.sawReset(), "the refused flow was not reset");
+        assertEquals(1L, harness.runtime.rejections().cumulativeCounts().get(PeerEgressCodes.LIMIT_EXCEEDED));
+
+        harness.runtime.handleFrame(9, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.2", 40000, "203.0.113.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY + 1, harness.dialCount(),
+                "one consumer's burst refused another's flow");
+
+        // A token takes 15.625 ms to come back.
+        now[0] += 15;
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40129, "203.0.113.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY + 1, harness.dialCount(), "a token came back within 15 ms");
+        now[0] += 1;
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40130, "203.0.113.10", 443))), EPOCH);
+        assertEquals(PeerEgressFlowRate.CAPACITY + 2, harness.dialCount(), "no token came back after 16 ms");
+
+        harness.runtime.shutdown(EPOCH);
+    }
+
+    /**
      * A connect that fails is not a refusal. Reporting it as one would send an operator hunting for
      * a policy rule that never fired, and would inflate the refusal counts the server aggregates.
      */

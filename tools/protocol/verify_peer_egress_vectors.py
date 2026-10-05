@@ -966,6 +966,19 @@ _report_module = importlib.util.module_from_spec(_report_spec)
 _report_spec.loader.exec_module(_report_module)
 if json.loads((VECTORS / "peer-egress-report-v1.json").read_text(encoding="utf-8")) != _report_module.build():
     failures.append("peer-egress-report-v1.json differs from what its generator produces; regenerate it")
+_standing_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_standing_vectors",
+    Path(__file__).with_name("generate_peer_egress_standing_vectors.py"))
+_standing_module = importlib.util.module_from_spec(_standing_spec)
+_standing_spec.loader.exec_module(_standing_module)
+if json.loads((VECTORS / "peer-egress-standing-v1.json").read_text(encoding="utf-8")) != _standing_module.build():
+    failures.append("peer-egress-standing-v1.json differs from what its generator produces; regenerate it")
+_rate_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_rate_vectors", Path(__file__).with_name("generate_peer_egress_rate_vectors.py"))
+_rate_module = importlib.util.module_from_spec(_rate_spec)
+_rate_spec.loader.exec_module(_rate_module)
+if json.loads((VECTORS / "peer-egress-rate-v1.json").read_text(encoding="utf-8")) != _rate_module.build():
+    failures.append("peer-egress-rate-v1.json differs from what its generator produces; regenerate it")
 _management_spec = importlib.util.spec_from_file_location(
     "generate_peer_egress_management_vectors", Path(__file__).with_name("generate_peer_egress_management_vectors.py"))
 _management_module = importlib.util.module_from_spec(_management_spec)

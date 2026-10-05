@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Specus.Protocol.PeerEgress;
@@ -129,6 +130,9 @@ internal sealed class PeerEgressRuntime
 
     private readonly PeerEgressFlowTable _flows = new(0);
 
+    private readonly PeerEgressFlowRate _rate = new();
+    private readonly Func<long> _rateClock;
+
     // Phase two: the names consumers bound to their fake addresses, how they are resolved, and which
     // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
     private readonly PeerEgressNameTable _names = new();
@@ -151,7 +155,8 @@ internal sealed class PeerEgressRuntime
         IPeerEgressDialer dialer,
         Action<Action>? executor = null,
         Func<long>? clock = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        Func<long>? rateClock = null)
     {
         _send = send;
         _dialer = dialer;
@@ -161,6 +166,10 @@ internal sealed class PeerEgressRuntime
         // including the work that would have closed those very flows.
         _executor = executor ?? (reader => new Thread(() => reader()) { IsBackground = true }.Start());
         _clock = clock ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // Monotonic, unlike the wall clock above and the times frames arrive with: the bucket refills
+        // by elapsed time, and a wall clock stepped forward would refill every consumer at once.
+        var started = Stopwatch.GetTimestamp();
+        _rateClock = rateClock ?? (() => (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         _logger = logger;
     }
 
@@ -897,9 +906,9 @@ internal sealed class PeerEgressRuntime
     }
 
     /// <summary>
-    /// Runs the judgment layer and, on approval, takes the quota slot. Called with the lock held.
-    /// The reservation exists before the socket does so that a slow or failing connect still counts
-    /// against the limits for its whole duration.
+    /// Runs the judgment layer and, on approval, takes the quota slot and a new-flow token. Called
+    /// with the lock held. The reservation exists before the socket does so that a slow or failing
+    /// connect still counts against the limits for its whole duration.
     /// </summary>
     /// <remarks>
     /// The third result says whether this call is the one that created the entry. A second frame for
@@ -921,6 +930,12 @@ internal sealed class PeerEgressRuntime
         if (AuthorizeTo(consumer, key, destination) is { } code)
         {
             return (null, code, false);
+        }
+        // Only a new flow takes a token, and only once everything else admitted it: a retransmitted
+        // SYN, or a frame racing the one that is opening the flow, finds the reservation already here.
+        if (_flows.Lookup(key) is null && !_rate.TryTake(consumer, _rateClock()))
+        {
+            return (null, PeerEgressCodes.LimitExceeded, false);
         }
         var opened = _flows.Open(key, consumer, nowMs);
         if (opened is not null)

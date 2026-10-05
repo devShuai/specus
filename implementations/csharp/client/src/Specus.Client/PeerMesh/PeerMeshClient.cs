@@ -218,6 +218,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     /// <summary>The egress section of the diagnostic snapshot. See <see cref="PeerEgressStatus"/>.</summary>
     internal Dictionary<string, object?> EgressStatus() => _egress.Status();
 
+    /// <summary>
+    /// The control session authenticated. A server that has sent no <c>egress-catalog</c> 30 seconds
+    /// from now is most likely too old to send one, and the egress status says so.
+    /// </summary>
+    internal void ControlAuthenticated() => _egress.ControlAuthenticated();
+
     /// <summary>What the egress plane needs from this client.</summary>
     private sealed class EgressHost(PeerMeshClient owner) : IPeerEgressMeshHost
     {
@@ -785,7 +791,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     _egress.ApplyEgressConfig(payload);
                     break;
                 case PeerEgressCatalogMessage.Type:
-                    // Raw for the same reason. The consumer reads which egresses resolve names.
+                    // Raw for the same reason. The consumer reads which egresses are offered to it,
+                    // the version each announced, and which resolve names.
                     _egress.ApplyEgressCatalog(payload);
                     break;
                 case TypeSessionGrant:
@@ -4718,7 +4725,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     internal void Suspend()
     {
         _egress.ShutdownServing();
-        // Revisions count within one control session; the next session's catalogue starts afresh.
+        // Revisions count within one control session; the next session's catalogue starts afresh,
+        // and until it arrives no egress is held to what the last one said.
         _egress.NewControlSession();
         lock (_sync)
         {

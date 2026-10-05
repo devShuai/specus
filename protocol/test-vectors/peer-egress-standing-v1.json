@@ -1,0 +1,65 @@
+{
+  "description": "What a consumer makes of an egress its rules name, from the roster and egress-catalog: the catalogue standing and whether a flow goes out. See protocol/spec/peer-egress.md.",
+  "catalogWaitSeconds": 30,
+  "cases": [
+    {
+      "name": "offered-and-capable",
+      "online": true,
+      "catalogReceived": true,
+      "listed": true,
+      "egressVersion": 1,
+      "standing": "offered",
+      "blocked": null
+    },
+    {
+      "name": "listed-by-an-older-server",
+      "online": true,
+      "catalogReceived": true,
+      "listed": true,
+      "standing": "offered",
+      "blocked": null
+    },
+    {
+      "name": "listed-but-announced-no-egress",
+      "online": true,
+      "catalogReceived": true,
+      "listed": true,
+      "egressVersion": 0,
+      "standing": "unsupported",
+      "blocked": "egress-unsupported"
+    },
+    {
+      "name": "not-in-the-catalogue",
+      "online": true,
+      "catalogReceived": true,
+      "listed": false,
+      "standing": "not-offered",
+      "blocked": "egress-not-offered"
+    },
+    {
+      "name": "no-catalogue-yet-or-older-server",
+      "online": true,
+      "catalogReceived": false,
+      "listed": false,
+      "standing": "unknown",
+      "blocked": null
+    },
+    {
+      "name": "offline-wins-over-everything",
+      "online": false,
+      "catalogReceived": true,
+      "listed": true,
+      "egressVersion": 1,
+      "standing": "offered",
+      "blocked": "egress-unavailable"
+    },
+    {
+      "name": "offline-and-not-offered",
+      "online": false,
+      "catalogReceived": true,
+      "listed": false,
+      "standing": "not-offered",
+      "blocked": "egress-unavailable"
+    }
+  ]
+}

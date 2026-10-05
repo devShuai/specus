@@ -1,0 +1,50 @@
+{
+  "description": "New flows an egress admits per consumer: a token bucket per consumer, taken only by a flow everything else admitted. A refusal is EGRESS_LIMIT_EXCEEDED. See protocol/spec/peer-egress.md.",
+  "capacity": 128,
+  "refillPerSecond": 64,
+  "refusalCode": "EGRESS_LIMIT_EXCEEDED",
+  "events": [
+    {
+      "atMs": 0,
+      "consumer": 1,
+      "flows": 130,
+      "admitted": 128,
+      "refused": 2
+    },
+    {
+      "atMs": 0,
+      "consumer": 2,
+      "flows": 3,
+      "admitted": 3,
+      "refused": 0
+    },
+    {
+      "atMs": 500,
+      "consumer": 1,
+      "flows": 40,
+      "admitted": 32,
+      "refused": 8
+    },
+    {
+      "atMs": 515,
+      "consumer": 1,
+      "flows": 1,
+      "admitted": 0,
+      "refused": 1
+    },
+    {
+      "atMs": 516,
+      "consumer": 1,
+      "flows": 1,
+      "admitted": 1,
+      "refused": 0
+    },
+    {
+      "atMs": 10516,
+      "consumer": 1,
+      "flows": 129,
+      "admitted": 128,
+      "refused": 1
+    }
+  ]
+}

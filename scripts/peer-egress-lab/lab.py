@@ -1092,9 +1092,20 @@ class Lab:
                                lambda: (lambda r: r if r["code"] != CURL_OK else None)(self.whoami(TARGET_URL)), 20, 1.0)
         self.check("ACL revoked: a new flow under the rule fails", bool(got),
                    self.describe(got) if got else "requests kept succeeding")
-        reject = consumer.wait_log(r"refused flow code=(EGRESS_[A-Z_]+)", 10, offset)
-        self.check("ACL revoked: the consumer receives flow-reject", bool(reject),
-                   f"consumer log: {reject.group(0)}" if reject else "no refusal logged by the consumer")
+        # The server pushes a catalogue without the egress as soon as the policy changes, so the
+        # consumer normally blocks the flow itself as not offered and the egress never sees it. A flow
+        # that beat the catalogue is refused by the egress instead. Either way the consumer knows why.
+        reject = consumer.wait_log(r"refused flow code=(EGRESS_[A-Z_]+)", 3, offset)
+        section, _ = self.wait_for("the consumer to see the egress as not offered",
+                                   lambda: (lambda c: c if self.standing_of(c, self.egress_id) == "not-offered" else None)(
+                                       self.consumer_section()), 10, 1.0)
+        blocked = ((section or {}).get("blocked") or {}).get("egress-not-offered", 0)
+        self.check("ACL revoked: the consumer is told, by the egress or by the catalogue",
+                   bool(reject) or blocked >= 1,
+                   f"consumer log: {reject.group(0)}" if reject
+                   else json.dumps({"blocked": (section or {}).get("blocked"), "peers": (section or {}).get("peers")}))
+        self.check("ACL revoked: the catalogue no longer offers the egress to the consumer", bool(section),
+                   json.dumps((section or {}).get("peers")) if section else "standing never became not-offered")
         self.leak_check("ACL revoked: nothing leaked to the target from the consumer's address", mark)
         self.policy([self.consumer_id])
         got, _ = self.wait_for("recovery after restoring the ACL", self.through_egress, 30, 1.0)
@@ -1352,6 +1363,21 @@ class Lab:
         body.unlink(missing_ok=True)
         return {"code": completed.returncode, "remote": completed.stdout.strip(), "src": src,
                 "stderr": completed.stderr.strip()}
+
+    def consumer_section(self):
+        status = self.client_status("consumer")
+        for instance in (status or {}).get("data", {}).get("instances", []):
+            consumer = (instance.get("egress") or {}).get("consumer")
+            if consumer is not None:
+                return consumer
+        return None
+
+    @staticmethod
+    def standing_of(consumer, client_id):
+        for peer in (consumer or {}).get("peers") or []:
+            if peer.get("clientId") == client_id:
+                return peer.get("standing")
+        return None
 
     def dns_section(self):
         status = self.client_status("consumer")

@@ -181,9 +181,16 @@ type peerMeshClient struct {
 	// egressCommander overrides the platform's routing table. Nil means the real one; tests set
 	// it so applying rules never runs a route command on the machine they run on.
 	egressCommander egressRouteCommander
-	// egressCatalog is what the server's egress-catalog said about which egresses resolve names.
-	// Kept across control sessions: a new session resets only its revision floor. Guarded by mu.
+	// egressCatalog is what the server's egress-catalog said about which egresses it lists, the
+	// version each announced, and which resolve names. Kept across control sessions: a new session
+	// resets only its revision floor and whether this session has accepted one. Guarded by mu.
 	egressCatalog *egressCatalogReader
+	// egressControlAuthAt is when the current control session authenticated, zero while there is
+	// none; the status says the server sent no catalogue once egressCatalogWait has passed since.
+	// egressClock is what that wait is measured with: nil means time.Now, and tests set it. Guarded
+	// by mu.
+	egressControlAuthAt time.Time
+	egressClock         func() time.Time
 	// egressPhase is phase two as the last reconcile found it, and egressPhaseEvaluated whether one
 	// has. Guarded by mu.
 	egressPhase          egressPhaseTwo
@@ -674,13 +681,16 @@ func (mesh *peerMeshClient) suspend() {
 	}
 	mesh.conn = nil
 	mesh.sender = nil
-	// Every control session ends here, so the next one numbers its catalogues afresh. What the
-	// last one said stays until a new catalogue replaces it.
-	mesh.newEgressCatalogSessionLocked()
+	// No control session, so no wait for its catalogue either: until the next one authenticates the
+	// status says it is waiting, not that the server sends none.
+	mesh.egressControlAuthAt = time.Time{}
 	// And the next one hears the egress's report at its first check, changed or not.
 	mesh.egressReportSend = nil
 	mesh.egressReport.newSession()
 	mesh.mu.Unlock()
+	// Every control session ends here, so the next one numbers its catalogues afresh and has accepted
+	// none yet. What the last one listed stays until a new catalogue replaces it.
+	mesh.newEgressCatalogSession()
 }
 
 func (mesh *peerMeshClient) stop() {

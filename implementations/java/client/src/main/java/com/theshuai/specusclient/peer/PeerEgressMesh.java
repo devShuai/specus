@@ -27,8 +27,9 @@ import lombok.extern.slf4j.Slf4j;
  *
  * <p>Three joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
  * {@code egress-config} becomes the policy the plane enforces, and a closing session revokes that
- * peer's flows. For the consumer's phase two it also reads the pushed {@code egress-catalog} and
- * owns the fake-IP pool, and for the egress role it sends the {@code egress-report}.
+ * peer's flows. For the consumer it also reads the pushed {@code egress-catalog} (which egresses
+ * can take a flow, and for phase two which resolve names) and owns the fake-IP pool,
+ * and for the egress role it sends the {@code egress-report}.
  *
  * <p>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and the
  * egress plane takes its own, and the plane holds its lock while emitting frames. So frames are
@@ -221,8 +222,16 @@ final class PeerEgressMesh implements AutoCloseable {
      */
     private volatile PeerEgressStatus.ApplyOutcome applied = PeerEgressStatus.ApplyOutcome.none();
 
-    /** What the server's egress-catalog said about which egresses resolve names. */
+    /**
+     * What the server's egress-catalog said: which egresses are offered to this device, the version
+     * each announced, and which resolve names.
+     */
     private final PeerEgressCatalog catalog = new PeerEgressCatalog();
+    /**
+     * The clock the catalogue's wait is measured on: from control authentication to the moment the
+     * status says the server sent none. Replaceable so a test can step past the 30 seconds.
+     */
+    java.util.function.LongSupplier catalogClock = System::currentTimeMillis;
     /**
      * The fake-IP pool while phase two runs and there is a consumer to steer by it; null
      * otherwise. Owned here rather than by the consumer so that the mappings outlive a
@@ -535,9 +544,11 @@ final class PeerEgressMesh implements AutoCloseable {
     }
 
     /**
-     * Takes a pushed {@code egress-catalog}: which egresses resolve names. A domain rule sends
-     * nothing to an egress that does not, so a change here can end flows to fake addresses, and
-     * their egresses are told to close their side.
+     * Takes a pushed {@code egress-catalog}: which egresses are offered to this device, whether
+     * each one's client carries peer egress, and which resolve names. Nothing is sent to an egress
+     * the catalogue leaves out or calls unsupported, and a domain rule sends nothing to one that
+     * does not resolve names, so a change here can end flows, and their egresses are told to close
+     * their side.
      *
      * <p>Kept even while no consumer exists, so the one built later starts from what the server
      * last said rather than from nothing.
@@ -547,8 +558,28 @@ final class PeerEgressMesh implements AutoCloseable {
             log.debug("[peer-egress-consumer] egress-catalog ignored: unreadable or not newer");
             return;
         }
-        log.info("[peer-egress-consumer] egress catalogue applied revision={} domainTargetCapable={}",
-                catalog.revision(), catalog.domainCapableIds());
+        log.info("[peer-egress-consumer] egress catalogue applied revision={} listed={} egressVersion={}"
+                        + " domainTargetCapable={}",
+                catalog.revision(), catalog.listedIds(), catalog.egressVersions(), catalog.domainCapableIds());
+        pushCatalogToConsumer();
+    }
+
+    /**
+     * A new control session: the server numbers its catalogues afresh, and until it sends one it
+     * has said nothing about which egresses it offers, so every egress is unknown again and none is
+     * refused on the catalogue's account. The wait after which the status says the server sent
+     * none starts now. What the last catalogue listed stays until the next one replaces it.
+     */
+    void newControlSession() {
+        catalog.newSession(catalogClock.getAsLong());
+        // The server behind the new session may have restarted, so the next report check sends
+        // whatever it finds.
+        reporter.newSession();
+        pushCatalogToConsumer();
+    }
+
+    /** Hands the consumer what the catalogue says now, and delivers the purges that produces. */
+    private void pushCatalogToConsumer() {
         PeerEgressConsumer consumerRole = consumer;
         if (consumerRole == null) {
             return;
@@ -556,19 +587,9 @@ final class PeerEgressMesh implements AutoCloseable {
         Map<Long, List<String>> purge;
         synchronized (consumerRole) {
             // Read inside the monitor, so of two racing updates the later one is the one applied.
-            purge = consumerRole.setDomainCapable(catalog.domainCapable(), System.currentTimeMillis());
+            purge = consumerRole.setCatalog(catalog.snapshot(), System.currentTimeMillis());
         }
         deliverPurges(purge);
-    }
-
-    /**
-     * A new control session: the server numbers its catalogues afresh. Only the revision floor is
-     * reset; what the last catalogue said stands until the next one replaces it. The server behind
-     * the session may also have restarted, so the next report check sends whatever it finds.
-     */
-    void newControlSession() {
-        catalog.newSession();
-        reporter.newSession();
     }
 
     /** The pool phase two answers from, or null while it does not run; for the DNS responder. */
@@ -821,7 +842,8 @@ final class PeerEgressMesh implements AutoCloseable {
             }
         }
         if (consumerSnapshot != null) {
-            consumerSnapshot = consumerSnapshot.withPaths(host.egressPaths());
+            consumerSnapshot = consumerSnapshot.withPaths(host.egressPaths())
+                    .withCatalog(catalog.state(catalogClock.getAsLong()));
         }
         PeerEgressStatus.Dns dns = null;
         if (host.dnsTakeover()) {
@@ -1068,7 +1090,7 @@ final class PeerEgressMesh implements AutoCloseable {
         synchronized (consumerRole) {
             // A consumer built after the catalogue arrived starts from it. Cheap when nothing
             // changed, and read inside the monitor like every other update of it.
-            Map<Long, List<String>> purge = consumerRole.setDomainCapable(catalog.domainCapable(), nowMs);
+            Map<Long, List<String>> purge = consumerRole.setCatalog(catalog.snapshot(), nowMs);
             if (key.toString().equals(consumerKey)) { return purge; }
             consumerKey = key.toString();
             return mergePurges(purge, consumerRole.configure(rules, meshCidr, virtualIp, pool, dns, nowMs));
