@@ -20,6 +20,7 @@ public record PeerMeshEgressPolicyView(
         List<Long> allowedConsumerClientIds,
         List<Long> effectiveConsumerClientIds,
         List<PeerEgressPolicy.PeerEgressDestinationRule> destinationRules,
+        List<PeerEgressPolicy.PeerEgressDomainRule> domainRules,
         int maxConcurrentFlows,
         int maxFlowsPerConsumer,
         int idleTimeoutSeconds,

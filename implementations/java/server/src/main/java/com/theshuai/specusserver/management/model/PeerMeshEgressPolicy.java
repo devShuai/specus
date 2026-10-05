@@ -8,6 +8,7 @@ import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.annotations.ColumnDefault;
 
 /**
  * Per-device egress authorization, stored separately from {@link PeerMeshAcl}.
@@ -33,6 +34,9 @@ public class PeerMeshEgressPolicy {
     public static final int MAX_DESTINATION_RULES_BYTES = 4096;
     public static final int MAX_DESTINATION_RULES = 64;
     public static final int MAX_PORT_RANGES_PER_RULE = 32;
+    /** Cap on the serialised domain rule list, counted apart from the destination rules. */
+    public static final int MAX_DOMAIN_RULES_BYTES = 4096;
+    public static final int MAX_DOMAIN_RULES = 64;
 
     @Id
     private Long id;
@@ -68,6 +72,17 @@ public class PeerMeshEgressPolicy {
      */
     @Column(name = "destination_rules", length = MAX_DESTINATION_RULES_BYTES)
     private String destinationRules = "[]";
+
+    /**
+     * Canonical JSON array of {@code {match, protocols, portRanges}} objects. Empty grants no name.
+     *
+     * <p>The column default matters: an existing policy table gets this column from Hibernate's
+     * schema update, and a NOT NULL column added without a default is refused by SQLite and by a
+     * non-empty PostgreSQL table. The startup migrator adds it the same way when Hibernate did not.
+     */
+    @ColumnDefault("'[]'")
+    @Column(name = "domain_rules", nullable = false, length = MAX_DOMAIN_RULES_BYTES)
+    private String domainRules = "[]";
 
     @Column(name = "max_concurrent_flows", nullable = false)
     private int maxConcurrentFlows = 256;

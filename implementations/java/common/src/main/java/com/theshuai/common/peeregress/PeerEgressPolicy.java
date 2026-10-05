@@ -49,6 +49,22 @@ public class PeerEgressPolicy {
         private List<List<Integer>> portRanges = List.of();
     }
 
+    /**
+     * One domain rule of an egress policy: it grants a name rather than an address.
+     * {@code example.com} covers that name only, {@code *.example.com} its subdomains but not itself.
+     * It only ever admits a flow that carries a name, and the address the name resolves to still has
+     * to pass the forced-deny list and the scope ({@code protocol/spec/peer-egress.md}, 按域名授权).
+     */
+    @Data
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class PeerEgressDomainRule {
+        private String match;
+        private List<String> protocols = List.of();
+        /** Inclusive {@code [low, high]} pairs. */
+        private List<List<Integer>> portRanges = List.of();
+    }
+
     @Data
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @JsonIgnoreProperties(ignoreUnknown = true)
