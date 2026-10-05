@@ -621,7 +621,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
       <div className="rounded-md border border-default-200 p-3">
         <h4 className="mb-2 text-small font-semibold text-default-600">出口活动</h4>
         {activity.length === 0 ? (
-          <p className="text-tiny text-default-500">尚无出口上报的活动。客户端目前不上报出口计数，出口是否在线以组网在线状态为准。</p>
+          <p className="text-tiny text-default-500">尚无出口上报的活动。出口运行后每 60 秒检查一次、有变化才上报；出口是否在线以组网在线状态为准。</p>
         ) : (
           <ul className="space-y-1 text-tiny text-default-600">
             {activity.map((item) => {

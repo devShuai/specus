@@ -55,23 +55,15 @@ internal sealed class PeerEgressRejectionLog
         public long Suppressed { get; set; }
     }
 
-    private Dictionary<string, long> _counts = [];
-
-    /// <summary>The same tally for the status surface, which nothing resets.</summary>
+    /// <summary>The per-code tally, which nothing resets.</summary>
     /// <remarks>
-    /// Separate from <c>_counts</c> on purpose. That one belongs to the periodic report and is
-    /// drained so consecutive reports describe consecutive intervals; a status reading it would
-    /// answer "since whenever the last report went out", which is not a question anybody asked and
-    /// changes meaning the day the report is wired up. Two counters cost a dictionary.
+    /// One tally for the status and the <c>egress-report</c> both. The server keeps only the latest
+    /// report, so the report carries running totals, not counts for an interval; a second tally
+    /// drained by each report would make the admin page describe "since the last report" and leave
+    /// that number standing whenever the reports stop.
     /// </remarks>
     private readonly Dictionary<string, long> _cumulative = [];
     private readonly Dictionary<Key, Bucket> _recent = [];
-
-    /// <summary>How many refusals the current interval has seen, across every code.</summary>
-    public long Total { get; private set; }
-
-    /// <summary>Whether the subject cap dropped a diagnostic line during this interval.</summary>
-    public bool Limited { get; private set; }
 
     /// <summary>How many subject-and-reason pairs the rate limiter is currently tracking.</summary>
     public int SubjectCount => _recent.Count;
@@ -86,9 +78,7 @@ internal sealed class PeerEgressRejectionLog
     /// </remarks>
     public Decision Record(long consumer, string code, long nowMs)
     {
-        _counts[code] = _counts.GetValueOrDefault(code) + 1;
         _cumulative[code] = _cumulative.GetValueOrDefault(code) + 1;
-        Total++;
 
         var key = new Key(consumer, code);
         if (!_recent.TryGetValue(key, out var bucket))
@@ -101,7 +91,6 @@ internal sealed class PeerEgressRejectionLog
             {
                 // At the cap with every window still live. The refusal stays in the aggregate, so
                 // nothing is lost from the report; only the diagnostic line is dropped.
-                Limited = true;
                 return Decision.Silent;
             }
             bucket = new Bucket(nowMs);
@@ -145,25 +134,9 @@ internal sealed class PeerEgressRejectionLog
     }
 
     /// <summary>
-    /// Returns the per-code totals for one <c>egress-report</c> and resets them, so consecutive
-    /// reports describe consecutive intervals rather than a running sum the server has to
-    /// difference.
+    /// The per-code totals since this runtime started, for the status and the <c>egress-report</c>.
+    /// A copy; this log goes on counting.
     /// </summary>
-    /// <summary>The per-code totals since this runtime started. A copy; this log goes on counting.</summary>
     public IReadOnlyDictionary<string, long> CumulativeCounts() =>
         new Dictionary<string, long>(_cumulative);
-
-    /// <summary>Drains the report's tally. The cumulative one above is deliberately left alone.</summary>
-    public IReadOnlyDictionary<string, long> DrainCounts()
-    {
-        if (_counts.Count == 0)
-        {
-            return new Dictionary<string, long>();
-        }
-        var drained = _counts;
-        _counts = [];
-        Total = 0;
-        Limited = false;
-        return drained;
-    }
 }

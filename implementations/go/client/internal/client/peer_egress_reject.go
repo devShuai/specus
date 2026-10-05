@@ -40,22 +40,18 @@ type egressRejectionBucket struct {
 }
 
 type egressRejectionLog struct {
-	counts map[string]int64
-	// cumulative is the same tally for the status surface, and nothing resets it.
-	//
-	// Separate from counts on purpose. counts belongs to the periodic report and is drained so
-	// that consecutive reports describe consecutive intervals; a status reading that same map
-	// would answer "since whenever the last report went out", which is not a question anybody
-	// asked and changes meaning the day the report is wired up. Two counters cost a map.
+	// cumulative counts refusals by code since this runtime started, and nothing resets it. The
+	// status surface and the egress-report both read it: the server keeps only the latest report,
+	// so a report carries running totals rather than counts for an interval.
 	cumulative map[string]int64
-	recent  map[egressRejectionKey]*egressRejectionBucket
-	total   int64
+	recent     map[egressRejectionKey]*egressRejectionBucket
+	// limited records that the subject table reached its cap, so some refusal went without a
+	// diagnostic line. Never that one went uncounted.
 	limited bool
 }
 
 func newEgressRejectionLog() *egressRejectionLog {
 	return &egressRejectionLog{
-		counts:     make(map[string]int64),
 		cumulative: make(map[string]int64),
 		recent:     make(map[egressRejectionKey]*egressRejectionBucket),
 	}
@@ -68,9 +64,7 @@ func newEgressRejectionLog() *egressRejectionLog {
 // what the report counts. A report that undercounted because logging was busy would be worse than
 // no report, since it would look like the refusals stopped.
 func (l *egressRejectionLog) record(consumer int64, code string, now time.Time) (bool, int64) {
-	l.counts[code]++
 	l.cumulative[code]++
-	l.total++
 
 	key := egressRejectionKey{consumer: consumer, code: code}
 	window, known := l.recent[key]
@@ -112,27 +106,14 @@ func (l *egressRejectionLog) sweep(now time.Time) {
 	}
 }
 
-// cumulativeCounts returns the per-code totals since this runtime started, for the status surface.
+// cumulativeCounts returns the per-code totals since this runtime started, for the status surface
+// and the egress-report that reports the same numbers.
 //
-// A copy, because the caller is a diagnostic reader and this log goes on counting.
+// A copy, because the callers only read and this log goes on counting.
 func (l *egressRejectionLog) cumulativeCounts() map[string]int64 {
 	counts := make(map[string]int64, len(l.cumulative))
 	for code, count := range l.cumulative {
 		counts[code] = count
 	}
 	return counts
-}
-
-// drainCounts returns the per-code totals for one egress-report and resets them, so consecutive
-// reports describe consecutive intervals rather than a running sum the server has to difference.
-// The cumulative tally above is deliberately not reset here.
-func (l *egressRejectionLog) drainCounts() map[string]int64 {
-	if len(l.counts) == 0 {
-		return nil
-	}
-	drained := l.counts
-	l.counts = make(map[string]int64)
-	l.total = 0
-	l.limited = false
-	return drained
 }
