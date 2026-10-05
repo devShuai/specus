@@ -11,7 +11,7 @@
 ## 待办与验收方向
 
 - [ ] 真实端到端连通性检查：区分已配置、设备在线、目标可达及访问成功；记录时间/失败阶段。只对用户显式选择的服务进行有界探测，不能由浏览器目录刷新冒充连接测试。
-  - 契约草案（仅 HTTP route，未实现，待维护者确认待定问题）：[service-connectivity-check.md](../../protocol/spec/service-connectivity-check.md)。
+  - 契约（v1 仅 HTTP route，实现进行中）：[service-connectivity-check.md](../../protocol/spec/service-connectivity-check.md)。
 - [ ] 临时 HTTP 分享：有效期、撤销、访问范围与权限变更审计；各 server 实现保持一致，禁止把长期公开路由当作临时邀请。
 - [ ] 大文件预检与离开提醒：前置 128 MiB 设备内存限制、可用传输方式、是否会上云、账号额度/有效期/一次性下载规则；待传内容存在时提醒离开，处理浏览器提醒能力限制。
 - [ ] 分块续传：偏移/完整性校验、断线重连、重复块幂等、过期清理与接收方同意；明确刷新恢复与会话内重试边界，并跨浏览器、跨 NAT 验收。

@@ -52,7 +52,8 @@ def access_code(status):
     if 200 <= status <= 399:
         return "passed", "ACCESS_OK"
     if status in (401, 403, 407):
-        return "failed", "ACCESS_AUTH_REQUIRED"
+        # The target answered but wants its own credentials; the check never sends any.
+        return "unverified", "ACCESS_AUTH_REQUIRED"
     if status in (404, 410):
         return "failed", "ACCESS_NOT_FOUND"
     if 400 <= status <= 499:
@@ -317,7 +318,7 @@ EXPECTED = {
     "head-405-get-timeout": (200, "failed", "access-succeeded", "ACCESS_NO_ANSWER", 10000, ["HEAD", "GET"]),
     "head-405-get-reset": (200, "failed", "access-succeeded", "ACCESS_NO_ANSWER", 40, ["HEAD", "GET"]),
     "head-404": (200, "failed", "access-succeeded", "ACCESS_NOT_FOUND", 18, ["HEAD"]),
-    "head-401": (200, "failed", "access-succeeded", "ACCESS_AUTH_REQUIRED", 18, ["HEAD"]),
+    "head-401": (200, "unverified", "access-succeeded", "ACCESS_AUTH_REQUIRED", 18, ["HEAD"]),
     "head-400": (200, "failed", "access-succeeded", "ACCESS_CLIENT_ERROR", 18, ["HEAD"]),
     "head-502-from-target": (200, "failed", "access-succeeded", "ACCESS_SERVER_ERROR", 18, ["HEAD"]),
     "route-disabled": (200, "failed", "configured", "ROUTE_DISABLED", 0, []),
