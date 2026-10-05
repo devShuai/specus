@@ -716,6 +716,251 @@ static int test_capabilities_never_contacts_object_storage(void)
     return configure() != 0 || failed ? -1 : 0;
 }
 
+/*
+ * Shared vector: protocol/test-vectors/transfer-capabilities-v1.json. Each case's rows go into the
+ * module's own SQLite schema, the snapshot is read at the case instant through the fixed-clock
+ * hook, and every field must match the vector, timestamps compared as instants.
+ */
+#ifndef ST_TRANSFER_VECTOR_DIR
+#define ST_TRANSFER_VECTOR_DIR "../../../protocol/test-vectors/"
+#endif
+#define CAP_VECTOR_MAX_ROWS 32U
+
+typedef struct {
+    char tenant[64];
+    char owner[64];
+    char status[32];
+    char upload_expires_at[32];
+    char expires_at[32];
+    char month[16];
+} cap_vector_text;
+
+static char *cap_read_vector(const char *name)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s%s", ST_TRANSFER_VECTOR_DIR, name);
+    size_t len = 0U;
+    unsigned char *data = cap_read_file(path, &len);
+    char *text = data == NULL ? NULL : (char *)realloc(data, len + 1U);
+    if (text == NULL) {
+        free(data);
+        perror(path);
+        return NULL;
+    }
+    text[len] = '\0';
+    return text;
+}
+
+/* Copies a top-level string member; an absent, non-string or oversized value is an error. */
+static int cap_member_text(const char *object, const char *key, char *out, size_t out_len)
+{
+    char *value = st_json_get_top_level_string(object, key);
+    int ok = value != NULL && strlen(value) < out_len;
+    if (ok) memcpy(out, value, strlen(value) + 1U);
+    else fprintf(stderr, "capabilities vector: bad %s\n", key);
+    free(value);
+    return ok ? 0 : -1;
+}
+
+/* Copies the raw JSON token of a top-level member, such as a number or a boolean. */
+static int cap_member_raw(const char *object, const char *key, char *out, size_t out_len)
+{
+    char *raw = object == NULL ? NULL : st_json_get_top_level_raw(object, key);
+    int ok = raw != NULL && strlen(raw) < out_len;
+    if (ok) memcpy(out, raw, strlen(raw) + 1U);
+    else fprintf(stderr, "capabilities vector: bad %s\n", key);
+    free(raw);
+    return ok ? 0 : -1;
+}
+
+static long long cap_days_from_civil(long long year, unsigned int month, unsigned int day)
+{
+    year -= month <= 2U;
+    long long era = (year >= 0 ? year : year - 399) / 400;
+    unsigned int year_of_era = (unsigned int)(year - era * 400);
+    unsigned int day_of_year = (153U * (month > 2U ? month - 3U : month + 9U) + 2U) / 5U + day - 1U;
+    unsigned int day_of_era = year_of_era * 365U + year_of_era / 4U - year_of_era / 100U + day_of_year;
+    return era * 146097 + (long long)day_of_era - 719468;
+}
+
+/* Parses a "YYYY-MM-DDTHH:MM:SSZ" instant into epoch seconds. */
+static int cap_instant(const char *text, long long *out)
+{
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    char zone = '\0';
+    if (text == NULL || strlen(text) != 20U
+        || sscanf(text, "%4d-%2d-%2dT%2d:%2d:%2d%c", &year, &month, &day, &hour, &minute, &second, &zone) != 7
+        || zone != 'Z' || month < 1 || month > 12 || day < 1 || day > 31) return -1;
+    *out = cap_days_from_civil(year, (unsigned int)month, (unsigned int)day) * 86400LL
+        + hour * 3600LL + minute * 60LL + second;
+    return 0;
+}
+
+static const char *cap_vector_scope(const char *scope)
+{
+    /* The vector's two scopes stand for two distinct attachment scopes: usage is account-wide. */
+    if (strcmp(scope, "ROOM") == 0) return "PUBLIC_TRANSFER";
+    if (strcmp(scope, "LINK") == 0) return "ADMIN_CLIENT_MESSAGE";
+    return NULL;
+}
+
+static int cap_vector_seed(const char *test_case)
+{
+    char **attachment_rows = NULL, **usage_rows = NULL;
+    size_t attachment_len = 0U, usage_len = 0U;
+    cap_attachment attachments[CAP_VECTOR_MAX_ROWS];
+    cap_usage usage[CAP_VECTOR_MAX_ROWS];
+    cap_vector_text attachment_text[CAP_VECTOR_MAX_ROWS], usage_text[CAP_VECTOR_MAX_ROWS];
+    int ok = st_json_get_raw_array(test_case, "attachments", &attachment_rows, &attachment_len) == 0
+        && st_json_get_raw_array(test_case, "downloadUsage", &usage_rows, &usage_len) == 0
+        && attachment_len <= CAP_VECTOR_MAX_ROWS && usage_len <= CAP_VECTOR_MAX_ROWS;
+    for (size_t i = 0U; ok && i < attachment_len; ++i) {
+        cap_vector_text *text = &attachment_text[i];
+        char scope[32], size[32];
+        ok = cap_member_text(attachment_rows[i], "tenantId", text->tenant, sizeof(text->tenant)) == 0
+            && cap_member_text(attachment_rows[i], "username", text->owner, sizeof(text->owner)) == 0
+            && cap_member_text(attachment_rows[i], "scope", scope, sizeof(scope)) == 0
+            && cap_member_text(attachment_rows[i], "status", text->status, sizeof(text->status)) == 0
+            && cap_member_raw(attachment_rows[i], "sizeBytes", size, sizeof(size)) == 0
+            && cap_member_text(attachment_rows[i], "uploadExpiresAt", text->upload_expires_at,
+                               sizeof(text->upload_expires_at)) == 0
+            && cap_member_text(attachment_rows[i], "expiresAt", text->expires_at, sizeof(text->expires_at)) == 0
+            && cap_vector_scope(scope) != NULL;
+        if (ok) {
+            attachments[i] = (cap_attachment){(long long)i + 1, text->tenant, text->owner, cap_vector_scope(scope),
+                                              text->status, strtoll(size, NULL, 10), text->upload_expires_at,
+                                              text->expires_at};
+        }
+    }
+    for (size_t i = 0U; ok && i < usage_len; ++i) {
+        cap_vector_text *text = &usage_text[i];
+        char size[32];
+        ok = cap_member_text(usage_rows[i], "tenantId", text->tenant, sizeof(text->tenant)) == 0
+            && cap_member_text(usage_rows[i], "username", text->owner, sizeof(text->owner)) == 0
+            && cap_member_text(usage_rows[i], "usageMonth", text->month, sizeof(text->month)) == 0
+            && cap_member_raw(usage_rows[i], "sizeBytes", size, sizeof(size)) == 0;
+        if (ok) {
+            usage[i] = (cap_usage){(long long)i + 1, text->tenant, text->owner, text->month,
+                                   strtoll(size, NULL, 10)};
+        }
+    }
+    st_json_free_string_array(attachment_rows, attachment_len);
+    st_json_free_string_array(usage_rows, usage_len);
+    if (!ok) {
+        fprintf(stderr, "capabilities vector: unreadable rows\n");
+        return -1;
+    }
+    return cap_create_database(CAP_DB, attachments, attachment_len, usage, usage_len);
+}
+
+/* The size limit and retention are effective values, so they pass through the loader unchanged. */
+static int cap_vector_configure(const char *config)
+{
+    char enabled[8], storage_quota[32], download_quota[32], max_bytes[32], retention[32];
+    if (config == NULL
+        || cap_member_raw(config, "storageEnabled", enabled, sizeof(enabled)) != 0
+        || cap_member_raw(config, "storageQuotaBytes", storage_quota, sizeof(storage_quota)) != 0
+        || cap_member_raw(config, "monthlyDownloadQuotaBytes", download_quota, sizeof(download_quota)) != 0
+        || cap_member_raw(config, "maxAttachmentBytes", max_bytes, sizeof(max_bytes)) != 0
+        || cap_member_raw(config, "retentionHours", retention, sizeof(retention)) != 0) return -1;
+    if (configure() != 0) return -1;
+    if (strcmp(enabled, "true") != 0 && setenv("SPECUS_OBJECT_STORAGE_PROVIDER", "disabled", 1) != 0) return -1;
+    cap_set_limits(storage_quota, download_quota, max_bytes, retention);
+    return 0;
+}
+
+static int cap_vector_compare(const char *name, const char *response, int len, const char *expect)
+{
+    static const char *const exact[] = {
+        "schemaVersion", "storageEnabled", "maxAttachmentBytes", "retentionHours", "storageQuotaBytes",
+        "storageUsedBytes", "storageRemainingBytes", "monthlyDownloadQuotaBytes", "monthlyDownloadUsedBytes",
+        "monthlyDownloadRemainingBytes", "downloadUsageMonth", "downloadGrantSingleUse"
+    };
+    static const char *const instants[] = {"checkedAt", "downloadResetsAt"};
+    const char *body = cap_body(response);
+    if (len <= 0 || strncmp(response, "HTTP/1.1 200 OK\r\n", 17U) != 0
+        || strstr(response, "\r\nCache-Control: private, no-store\r\n") == NULL
+        || body == NULL || !st_json_is_valid_object(body)) {
+        fprintf(stderr, "capabilities vector %s: not a private 200 JSON object: %s\n", name,
+                len <= 0 ? "(none)" : response);
+        return -1;
+    }
+    int failed = 0;
+    for (size_t i = 0U; i < sizeof(exact) / sizeof(exact[0]); ++i) {
+        char *want = st_json_get_top_level_raw(expect, exact[i]);
+        char *got = st_json_get_top_level_raw(body, exact[i]);
+        if (want == NULL || got == NULL || strcmp(want, got) != 0) {
+            fprintf(stderr, "capabilities vector %s: %s expected %s, got %s\n", name, exact[i],
+                    want == NULL ? "(missing)" : want, got == NULL ? "(missing)" : got);
+            failed = -1;
+        }
+        free(want);
+        free(got);
+    }
+    for (size_t i = 0U; i < sizeof(instants) / sizeof(instants[0]); ++i) {
+        char *want = st_json_get_top_level_string(expect, instants[i]);
+        char *got = st_json_get_top_level_string(body, instants[i]);
+        long long want_epoch = 0, got_epoch = 0;
+        if (cap_instant(want, &want_epoch) != 0 || cap_instant(got, &got_epoch) != 0 || want_epoch != got_epoch) {
+            fprintf(stderr, "capabilities vector %s: %s expected %s, got %s\n", name, instants[i],
+                    want == NULL ? "(missing)" : want, got == NULL ? "(missing)" : got);
+            failed = -1;
+        }
+        free(want);
+        free(got);
+    }
+    return failed;
+}
+
+static int cap_vector_case(const char *test_case)
+{
+    char name[128], now_text[32], tenant[64], username[64];
+    char *account = st_json_get_top_level_raw(test_case, "account");
+    char *config = st_json_get_top_level_raw(test_case, "config");
+    char *expect = st_json_get_top_level_raw(test_case, "expect");
+    long long now = 0;
+    int failed = cap_member_text(test_case, "name", name, sizeof(name)) != 0
+        || cap_member_text(test_case, "now", now_text, sizeof(now_text)) != 0
+        || cap_instant(now_text, &now) != 0
+        || account == NULL || expect == NULL
+        || cap_member_text(account, "tenantId", tenant, sizeof(tenant)) != 0
+        || cap_member_text(account, "username", username, sizeof(username)) != 0
+        || cap_vector_configure(config) != 0
+        || cap_vector_seed(test_case) != 0 ? -1 : 0;
+    if (failed == 0) {
+        const st_object_storage_identity identity = {tenant, username, 0, 1};
+        char response[4096];
+        int len = st_object_storage_capabilities_for_tests(&identity, now, response, sizeof(response));
+        failed = cap_vector_compare(name, response, len, expect);
+    } else {
+        fprintf(stderr, "capabilities vector: cannot set up a case\n");
+    }
+    free(account);
+    free(config);
+    free(expect);
+    cap_set_limits(NULL, NULL, NULL, NULL);
+    unlink(CAP_DB);
+    unsetenv("SPECUS_DATABASE_PATH");
+    return failed;
+}
+
+static int test_capabilities_shared_vector(void)
+{
+    char *document = cap_read_vector("transfer-capabilities-v1.json");
+    char **cases = NULL;
+    size_t case_len = 0U;
+    int failed = document == NULL || st_json_get_raw_array(document, "cases", &cases, &case_len) != 0
+        || case_len == 0U ? -1 : 0;
+    for (size_t i = 0U; i < case_len; ++i) {
+        failed |= cap_vector_case(cases[i]);
+    }
+    st_json_free_string_array(cases, case_len);
+    free(document);
+    if (configure() != 0) return -1;
+    if (failed == 0) printf("transfer capability vector: %zu cases passed\n", case_len);
+    return failed ? -1 : 0;
+}
+
 int main(void)
 {
     snprintf(cap_db_path, sizeof(cap_db_path), "/tmp/specus_c_capabilities_%ld.db", (long)getpid());
@@ -729,7 +974,8 @@ int main(void)
         || test_capabilities_month_and_expiry_boundaries() != 0
         || test_capabilities_storage_disabled() != 0
         || test_capabilities_read_failures() != 0
-        || test_capabilities_never_contacts_object_storage() != 0) {
+        || test_capabilities_never_contacts_object_storage() != 0
+        || test_capabilities_shared_vector() != 0) {
         fprintf(stderr, "transfer capability tests failed\n");
         return 1;
     }

@@ -158,7 +158,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private IPeerVirtualDevice? _device;
 	private ushort _nextTurnChannel = TurnChannelData.MinChannel;
 
-    public PeerMeshClient(SpecusClientConfig config, ILogger<PeerMeshClient> logger, ISpecusClientObserver? observer = null)
+    /// <param name="time">
+    /// The clock and timer of the egress-report, or null for the system's. For tests.
+    /// </param>
+    public PeerMeshClient(SpecusClientConfig config, ILogger<PeerMeshClient> logger, ISpecusClientObserver? observer = null,
+        TimeProvider? time = null)
     {
         _config = config;
         _logger = logger;
@@ -168,7 +172,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         // The rules are not applied here. The routes point into the virtual device, which does not
         // exist until the mesh starts; the plane applies them once it is up and keeps them true on
         // the maintenance tick from then on.
-        _egress = new PeerEgressMesh(new EgressHost(this), logger);
+        _egress = new PeerEgressMesh(new EgressHost(this), logger, time: time);
     }
 
     /// <summary>The egress data plane and its three joins with this client.</summary>
@@ -233,6 +237,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
         public async Task<bool> SendToPeerAsync(long peerId, byte[] frame) =>
             await owner.SendEncryptedPayloadAsync(peerId, frame).ConfigureAwait(false);
+
+        public Task<bool> SendToServerAsync(string message) => owner.SendToServerAsync(message);
 
         public async Task WriteToDeviceAsync(byte[] packet)
         {
@@ -5015,6 +5021,30 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             MessageType = MessageType.PeerControl,
             Message = json,
         }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Sends a PEER_CONTROL body addressed to the server itself, the way the service report goes:
+    /// no recipient, and the body passed through as given, so it carries no identity field the
+    /// caller did not write. The server binds the sender from this connection. False when there is
+    /// no control connection.
+    /// </summary>
+    private async Task<bool> SendToServerAsync(string message)
+    {
+        var runtime = Runtime();
+        var writer = Writer();
+        if (runtime is null || writer is null)
+        {
+            return false;
+        }
+        await writer.WriteAsync(new MessageRequestPacket
+        {
+            ClientName = runtime.ClientName,
+            ToClientName = "",
+            MessageType = MessageType.PeerControl,
+            Message = message,
+        }, CancellationToken.None).ConfigureAwait(false);
+        return true;
     }
 
     internal static UdpClient CreatePeerUdpClient()
