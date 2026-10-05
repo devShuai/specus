@@ -1585,6 +1585,18 @@ static int pm_append_egress_destination_rules(pm_builder *builder, const char *s
     return pm_append(builder, "]");
 }
 
+/*
+ * Always an array, [] when the policy has none. A stored list is canonical and normalises to itself;
+ * one that cannot be read grants no name rather than something permissive.
+ */
+static int pm_append_egress_domain_rules(pm_builder *builder, const char *stored)
+{
+    char *rules = NULL;
+    int rc = pm_append(builder, st_egress_normalize_domain_rules(stored, &rules) == 0 ? rules : "[]");
+    free(rules);
+    return rc;
+}
+
 static int pm_push_egress_config(const st_peer_mesh_runtime *runtime,
                                  const st_storage_client *client,
                                  const st_storage_client *clients,
@@ -1619,6 +1631,8 @@ static int pm_push_egress_config(const st_peer_mesh_runtime *runtime,
         if (rc == 0) {
             rc = pm_append(&message, "],\"destinationRules\":") == 0
                 && pm_append_egress_destination_rules(&message, policy.destination_rules) == 0
+                && pm_append(&message, ",\"domainRules\":") == 0
+                && pm_append_egress_domain_rules(&message, policy.domain_rules) == 0
                 && pm_appendf(&message,
                               ",\"limits\":{\"maxConcurrentFlows\":%d,\"maxFlowsPerConsumer\":%d,"
                               "\"idleTimeoutSeconds\":%d}",

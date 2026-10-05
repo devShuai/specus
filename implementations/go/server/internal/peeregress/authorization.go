@@ -41,6 +41,16 @@ type DestinationRule struct {
 	PortRanges [][]int  `json:"portRanges"`
 }
 
+// DomainRule is one entry of an egress policy's domain rules. It grants a name rather than an
+// address: example.com covers that name only, *.example.com its subdomains but not itself. It only
+// ever admits a flow that carries a name, and the address that name resolves to still has to pass
+// the forced-deny list and the scope (protocol/spec/peer-egress.md, 按域名授权).
+type DomainRule struct {
+	Match      string   `json:"match"`
+	Protocols  []string `json:"protocols"`
+	PortRanges [][]int  `json:"portRanges"`
+}
+
 // Limits keep an egress node from acting as an open proxy.
 type Limits struct {
 	MaxConcurrentFlows  int `json:"maxConcurrentFlows"`

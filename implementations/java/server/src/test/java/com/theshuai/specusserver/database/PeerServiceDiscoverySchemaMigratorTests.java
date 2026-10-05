@@ -63,4 +63,43 @@ class PeerServiceDiscoverySchemaMigratorTests {
         }
         assertThat(sharing).isNotEmpty();
     }
+
+    /**
+     * An egress policy table from before domain rules gains the column with an empty list, so a
+     * policy saved before them grants no name and a row written without it reads the same way.
+     */
+    @Test
+    void addsTheEgressDomainRulesColumnToAnExistingPolicyTable() {
+        SQLiteDataSource dataSource = new SQLiteDataSource();
+        dataSource.setUrl("jdbc:sqlite:" + temporaryDirectory.resolve("legacy-egress.db"));
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("create table specus_client_session (id integer primary key, tenant_id text not null)");
+        jdbc.execute("""
+                create table peer_mesh_egress_policy (
+                    id integer primary key,
+                    tenant_id text not null,
+                    egress_client_id integer not null,
+                    destination_rules text
+                )
+                """);
+        jdbc.execute("""
+                insert into peer_mesh_egress_policy(id, tenant_id, egress_client_id, destination_rules)
+                values (1, 'default', 2, '[{"cidr":"203.0.113.0/24","protocols":["tcp"],"portRanges":[[443,443]]}]')
+                """);
+
+        PeerServiceDiscoverySchemaMigrator migrator = new PeerServiceDiscoverySchemaMigrator(
+                jdbc, "org.hibernate.community.dialect.SQLiteDialect");
+        migrator.migrate();
+        migrator.migrate();
+
+        jdbc.execute("insert into peer_mesh_egress_policy(id, tenant_id, egress_client_id) values (3, 'default', 4)");
+        for (int id : new int[] {1, 3}) {
+            assertThat(jdbc.queryForObject(
+                    "select domain_rules from peer_mesh_egress_policy where id=?", String.class, id))
+                    .as("policy %d", id).isEqualTo("[]");
+        }
+        assertThat(jdbc.queryForObject(
+                "select destination_rules from peer_mesh_egress_policy where id=1", String.class))
+                .contains("203.0.113.0/24");
+    }
 }

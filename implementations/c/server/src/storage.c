@@ -433,6 +433,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "egress_client_id INTEGER NOT NULL,egress_client_name TEXT NOT NULL,"
         "enabled INTEGER NOT NULL DEFAULT 0,scope TEXT NOT NULL DEFAULT 'PUBLIC',"
         "allowed_consumer_client_ids TEXT,destination_rules TEXT,"
+        "domain_rules TEXT NOT NULL DEFAULT '[]',"
         "max_concurrent_flows INTEGER NOT NULL DEFAULT 256,"
         "max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,"
         "idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,"
@@ -696,6 +697,11 @@ int st_storage_init(const char *path, int seed_demo_client)
         /* Sessions stored before the catalog carried it never declared domain targets. */
         rc = add_column_if_missing(db, "specus_client_session", "client_egress_domain_targets",
                                    "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        /* Policies saved before domain rules grant no name. */
+        rc = add_column_if_missing(db, "peer_mesh_egress_policy", "domain_rules",
+                                   "TEXT NOT NULL DEFAULT '[]'");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
@@ -6131,7 +6137,7 @@ static const char *peer_mesh_egress_policy_select(void)
 {
     return "SELECT id,tenant_id,owner_username,egress_client_id,egress_client_name,enabled,scope,"
         "allowed_consumer_client_ids,destination_rules,max_concurrent_flows,max_flows_per_consumer,"
-        "idle_timeout_seconds,created_at,updated_at FROM peer_mesh_egress_policy";
+        "idle_timeout_seconds,created_at,updated_at,domain_rules FROM peer_mesh_egress_policy";
 }
 
 static int scan_peer_mesh_egress_policy(sqlite3_stmt *stmt, st_storage_peer_mesh_egress_policy *policy)
@@ -6151,7 +6157,8 @@ static int scan_peer_mesh_egress_policy(sqlite3_stmt *stmt, st_storage_peer_mesh
                             sizeof(policy->allowed_consumer_client_ids)) == 0
         && copy_text_column(stmt, 8, policy->destination_rules, sizeof(policy->destination_rules)) == 0
         && copy_text_column(stmt, 12, policy->created_at, sizeof(policy->created_at)) == 0
-        && copy_text_column(stmt, 13, policy->updated_at, sizeof(policy->updated_at)) == 0 ? 0 : -1;
+        && copy_text_column(stmt, 13, policy->updated_at, sizeof(policy->updated_at)) == 0
+        && copy_text_column(stmt, 14, policy->domain_rules, sizeof(policy->domain_rules)) == 0 ? 0 : -1;
 }
 
 int st_storage_list_peer_mesh_egress_policies(const char *path,
@@ -6243,12 +6250,14 @@ int st_storage_upsert_peer_mesh_egress_policy(const char *path,
     const char *sql = policy->id > 0
         ? "UPDATE peer_mesh_egress_policy SET owner_username=?,egress_client_name=?,enabled=?,scope=?,"
           "allowed_consumer_client_ids=?,destination_rules=?,max_concurrent_flows=?,"
-          "max_flows_per_consumer=?,idle_timeout_seconds=?,updated_at=CURRENT_TIMESTAMP "
+          "max_flows_per_consumer=?,idle_timeout_seconds=?,domain_rules=?,updated_at=CURRENT_TIMESTAMP "
           "WHERE id=? AND tenant_id=?"
         : "INSERT INTO peer_mesh_egress_policy(tenant_id,owner_username,egress_client_id,egress_client_name,"
           "enabled,scope,allowed_consumer_client_ids,destination_rules,max_concurrent_flows,"
-          "max_flows_per_consumer,idle_timeout_seconds,created_at,updated_at) "
-          "VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)";
+          "max_flows_per_consumer,idle_timeout_seconds,domain_rules,created_at,updated_at) "
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)";
+    /* The column is NOT NULL: a caller that left the rules unset stores none. */
+    const char *domain_rules = policy->domain_rules[0] == '\0' ? "[]" : policy->domain_rules;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK && policy->id > 0) {
         sqlite3_bind_text(stmt, 1, normalize_owner_username(policy->owner_username), -1, SQLITE_TRANSIENT);
@@ -6260,8 +6269,9 @@ int st_storage_upsert_peer_mesh_egress_policy(const char *path,
         sqlite3_bind_int(stmt, 7, policy->max_concurrent_flows);
         sqlite3_bind_int(stmt, 8, policy->max_flows_per_consumer);
         sqlite3_bind_int(stmt, 9, policy->idle_timeout_seconds);
-        sqlite3_bind_int64(stmt, 10, policy->id);
-        sqlite3_bind_text(stmt, 11, normalize_tenant_id(policy->tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 10, domain_rules, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 11, policy->id);
+        sqlite3_bind_text(stmt, 12, normalize_tenant_id(policy->tenant_id), -1, SQLITE_TRANSIENT);
     } else if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(policy->tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, normalize_owner_username(policy->owner_username), -1, SQLITE_TRANSIENT);
@@ -6274,6 +6284,7 @@ int st_storage_upsert_peer_mesh_egress_policy(const char *path,
         sqlite3_bind_int(stmt, 9, policy->max_concurrent_flows);
         sqlite3_bind_int(stmt, 10, policy->max_flows_per_consumer);
         sqlite3_bind_int(stmt, 11, policy->idle_timeout_seconds);
+        sqlite3_bind_text(stmt, 12, domain_rules, -1, SQLITE_TRANSIENT);
     }
     if (rc == SQLITE_OK) rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     else rc = -1;

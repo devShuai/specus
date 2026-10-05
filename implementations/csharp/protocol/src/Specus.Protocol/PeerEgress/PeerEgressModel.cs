@@ -15,13 +15,11 @@ public sealed record PeerEgressDestinationRule
     public IReadOnlyList<int[]> PortRanges { get; init; } = [];
 }
 
-/// <summary>
-/// One entry of an egress policy's domain rules: a grant by name rather than by address.
-/// </summary>
+/// <summary>One domain rule of an egress policy: it grants a name rather than an address.</summary>
 /// <remarks>
-/// <c>example.com</c> covers that name only, <c>*.example.com</c> its subdomains and not the name
-/// itself. It takes part only for a flow that carries a name (protocol/spec/peer-egress.md,
-/// 按域名授权); a flow that arrived by address is never granted by one.
+/// <c>example.com</c> covers that name only, <c>*.example.com</c> its subdomains but not itself. It
+/// only ever admits a flow that carries a name, and the address the name resolves to still has to
+/// pass the forced-deny list and the scope (protocol/spec/peer-egress.md, 按域名授权).
 /// </remarks>
 public sealed record PeerEgressDomainRule
 {

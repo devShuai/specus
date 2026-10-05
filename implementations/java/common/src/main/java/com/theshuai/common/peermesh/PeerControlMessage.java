@@ -83,6 +83,11 @@ public class PeerControlMessage {
     private List<Long> allowedConsumerClientIds;
     /** egress-config: empty denies everything; there is no unconfigured-therefore-open state. */
     private List<PeerEgressPolicy.PeerEgressDestinationRule> destinationRules;
+    /**
+     * egress-config: names granted to flows that carry one. An enabled push always carries the list,
+     * empty when there are none; the disabling push leaves it out.
+     */
+    private List<PeerEgressPolicy.PeerEgressDomainRule> domainRules;
     /** egress-config: concurrency, per-consumer and idle limits that keep the node from acting as an open proxy. */
     private PeerEgressPolicy.PeerEgressLimits limits;
     /** egress-catalog: egress nodes currently available to this consumer. */

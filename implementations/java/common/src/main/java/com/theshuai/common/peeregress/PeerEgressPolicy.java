@@ -57,8 +57,10 @@ public class PeerEgressPolicy {
     }
 
     /**
-     * One domain rule: {@code example.com} covers that name only, {@code *.example.com} its
-     * subdomains but not the apex. Protocols and port ranges read as a destination rule's do.
+     * One domain rule of an egress policy: it grants a name rather than an address.
+     * {@code example.com} covers that name only, {@code *.example.com} its subdomains but not itself.
+     * It only ever admits a flow that carries a name, and the address the name resolves to still has
+     * to pass the forced-deny list and the scope ({@code protocol/spec/peer-egress.md}, 按域名授权).
      */
     @Data
     @JsonInclude(JsonInclude.Include.NON_NULL)

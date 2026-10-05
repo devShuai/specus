@@ -2423,6 +2423,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     int policy_id = 0;
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
         || !contains(response, "\"maxConcurrentFlows\":10")
+        || !contains(response, "\"domainRules\":[]")
         || st_json_get_int(response, "id", &policy_id) != 0 || policy_id <= 0) {
         fprintf(stderr, "egress policy save did not store the normalised rules: %s\n", response);
         return 1;
@@ -2460,6 +2461,55 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
         || !contains(response, "\"maxConcurrentFlows\":30")) {
         fprintf(stderr, "null destinationRules did not keep the stored rules: %s\n", response);
+        return 1;
+    }
+
+    /*
+     * Domain rules: stored normalised next to the destination rules, which an update without them
+     * keeps; a refused rule refuses the whole request; null and an absent field keep them.
+     */
+    static const char *const stored_names =
+        "\"domainRules\":[{\"match\":\"*.cdn.example\",\"protocols\":[\"udp\"],\"portRanges\":[[443,443]]}]";
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"domainRules\":[{\"match\":\" *.CDN.Example. \","
+             "\"protocols\":[\" UDP \"],\"portRanges\":[[443,443]]}]}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":30")) {
+        fprintf(stderr, "egress policy save did not store the normalised domain rules: %s\n", response);
+        return 1;
+    }
+    static const char *const refused_names[] = {
+        "[{\"match\":\"203.0.113.5\"}]",
+        "[{\"match\":\"*.com\"}]",
+        "[{\"match\":\"localhost\"}]",
+        "[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
+        "{\"match\":\"example.com\"}",
+    };
+    for (size_t i = 0; i < sizeof(refused_names) / sizeof(refused_names[0]); ++i) {
+        snprintf(body, sizeof(body),
+                 "{\"egressClientId\":%d,\"maxConcurrentFlows\":50,\"domainRules\":%s}",
+                 egress_client_id, refused_names[i]);
+        len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "invalid domainRules")) {
+            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i], response);
+            return 1;
+        }
+    }
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"maxConcurrentFlows\":31,\"domainRules\":null}", egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, "\"maxConcurrentFlows\":31")) {
+        fprintf(stderr, "null domainRules did not keep the stored rules: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":31")) {
+        fprintf(stderr, "the policy list lost the domain rules: %s\n", response);
         return 1;
     }
 

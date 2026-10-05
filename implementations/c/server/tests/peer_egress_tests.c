@@ -981,15 +981,156 @@ static int run_management_edges(void)
     return failures;
 }
 
+/*
+ * Replays the management half of peer-egress-domain-policy-v1.json: every accepted list must
+ * normalise to exactly the stored form -- the bytes the size limit is counted on -- and normalising
+ * that again must give it back unchanged, since the push and the view read stored rows through the
+ * same normaliser. Every refused list must be refused as a whole with nothing to store.
+ */
+static int run_domain_policy_vector(const char *vector)
+{
+    int failures = 0;
+    char *limits = st_json_get_top_level_raw(vector, "limits");
+    failures += expect_limit(limits, "rules", ST_EGRESS_MAX_DOMAIN_RULES);
+    failures += expect_limit(limits, "portRangesPerRule", ST_EGRESS_MAX_PORT_RANGES);
+    failures += expect_limit(limits, "storedJsonBytes", ST_EGRESS_MAX_DOMAIN_RULES_BYTES);
+    free(limits);
+
+    char *management = st_json_get_top_level_raw(vector, "management");
+    char **accept = NULL;
+    size_t accept_len = 0U;
+    char **reject = NULL;
+    size_t reject_len = 0U;
+    if (management == NULL
+        || st_json_get_raw_array(management, "accept", &accept, &accept_len) != 0 || accept_len == 0U
+        || st_json_get_raw_array(management, "reject", &reject, &reject_len) != 0 || reject_len == 0U) {
+        fprintf(stderr, "domain policy vector carried no management cases\n");
+        st_json_free_string_array(accept, accept_len);
+        st_json_free_string_array(reject, reject_len);
+        free(management);
+        return failures + 1;
+    }
+    free(management);
+    for (size_t i = 0U; i < accept_len; i++) {
+        char *name = st_json_get_top_level_string(accept[i], "name");
+        char *rules_raw = st_json_get_top_level_raw(accept[i], "domainRules");
+        char *stored_raw = st_json_get_top_level_raw(accept[i], "stored");
+        char *want = stored_raw == NULL ? NULL : compact_json(stored_raw);
+        char *got = NULL;
+        char *again = NULL;
+        if (name == NULL || rules_raw == NULL || want == NULL) {
+            fprintf(stderr, "domain policy accept case %zu is incomplete\n", i);
+            failures++;
+        } else if (st_egress_normalize_domain_rules(rules_raw, &got) != 0 || got == NULL) {
+            fprintf(stderr, "%s: refused, want stored %s\n", name, want);
+            failures++;
+        } else if (strcmp(got, want) != 0) {
+            fprintf(stderr, "%s: stored %s, want %s\n", name, got, want);
+            failures++;
+        } else if (st_egress_normalize_domain_rules(got, &again) != 0 || again == NULL
+                   || strcmp(again, got) != 0) {
+            fprintf(stderr, "%s: stored %s reads back as %s\n", name, got, again == NULL ? "(refused)" : again);
+            failures++;
+        }
+        free(again);
+        free(got);
+        free(want);
+        free(stored_raw);
+        free(rules_raw);
+        free(name);
+    }
+    for (size_t i = 0U; i < reject_len; i++) {
+        char *name = st_json_get_top_level_string(reject[i], "name");
+        char *rules_raw = st_json_get_top_level_raw(reject[i], "domainRules");
+        char *got = NULL;
+        if (name == NULL || rules_raw == NULL) {
+            fprintf(stderr, "domain policy reject case %zu is incomplete\n", i);
+            failures++;
+        } else if (st_egress_normalize_domain_rules(rules_raw, &got) == 0 || got != NULL) {
+            fprintf(stderr, "%s: accepted as %s, want refused\n", name, got == NULL ? "(null)" : got);
+            failures++;
+        }
+        free(got);
+        free(rules_raw);
+        free(name);
+    }
+    st_json_free_string_array(accept, accept_len);
+    st_json_free_string_array(reject, reject_len);
+    return failures;
+}
+
+/*
+ * Domain-rule inputs the vector does not spell out but this parser could get wrong: a C string ends
+ * at an escaped NUL, and a reader that coerces types would turn 7 into a match.
+ */
+static int run_domain_policy_edges(void)
+{
+    static const char *const refused[] = {
+        "null",
+        "{\"match\":\"example.com\"}",
+        "[\"example.com\"]",
+        "[null]",
+        "[{\"match\":null}]",
+        "[{\"match\":7}]",
+        "[{\"match\":[\"example.com\"]}]",
+        "[{\"match\":\"example.com\\u0000.evil\"}]",
+        "[{\"match\":\"exa mple.com\"}]",
+        "[{\"match\":\"-a.example\"}]",
+        "[{\"match\":\"a-.example\"}]",
+        "[{\"match\":\"a..example\"}]",
+        "[{\"match\":\".example.com\"}]",
+        "[{\"match\":\"*.\"}]",
+        "[{\"match\":\"**.example.com\"}]",
+        "[{\"match\":\"1.2.3\"}]",
+        "[{\"match\":\"*.123.456\"}]",
+        "[{\"match\":\"example.com\",\"protocols\":\"tcp\"}]",
+        "[{\"match\":\"example.com\",\"portRanges\":[[443.0,443]]}]",
+        "[{\"match\":\"example.com\"}",
+    };
+    int failures = 0;
+    for (size_t i = 0U; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char *got = NULL;
+        if (st_egress_normalize_domain_rules(refused[i], &got) == 0 || got != NULL) {
+            fprintf(stderr, "domain edge %s: accepted as %s, want refused\n", refused[i],
+                    got == NULL ? "(null)" : got);
+            failures++;
+        }
+        free(got);
+    }
+
+    static const char *const accepted[][2] = {
+        {"[{\"match\":\"\\tExample.COM..\\n\",\"protocols\":null,\"portRanges\":null}]",
+         "[{\"match\":\"example.com\",\"protocols\":[],\"portRanges\":[]}]"},
+        {"  [ { \"match\" : \"*.A-1.example\" , \"protocols\" : [ \"TCP\" , \"tcp\" ] } ]  ",
+         "[{\"match\":\"*.a-1.example\",\"protocols\":[\"tcp\"],\"portRanges\":[]}]"},
+        {"[{\"match\":\"123.example\"}]",
+         "[{\"match\":\"123.example\",\"protocols\":[],\"portRanges\":[]}]"},
+        {"[]", "[]"},
+    };
+    for (size_t i = 0U; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        char *got = NULL;
+        if (st_egress_normalize_domain_rules(accepted[i][0], &got) != 0 || got == NULL
+            || strcmp(got, accepted[i][1]) != 0) {
+            fprintf(stderr, "domain edge %s: stored %s, want %s\n", accepted[i][0],
+                    got == NULL ? "(refused)" : got, accepted[i][1]);
+            failures++;
+        }
+        free(got);
+    }
+    return failures;
+}
+
 int main(void)
 {
     char *authz = read_vector("peer-egress-authz-v1.json");
     char *rules = read_vector("peer-egress-rules-v1.json");
     char *management = read_vector("peer-egress-management-v1.json");
-    if (authz == NULL || rules == NULL || management == NULL) {
+    char *domain_policy = read_vector("peer-egress-domain-policy-v1.json");
+    if (authz == NULL || rules == NULL || management == NULL || domain_policy == NULL) {
         free(authz);
         free(rules);
         free(management);
+        free(domain_policy);
         return 1;
     }
     int failures = 0;
@@ -1004,9 +1145,12 @@ int main(void)
     failures += run_domain_target_declaration();
     failures += run_management_vector(management);
     failures += run_management_edges();
+    failures += run_domain_policy_vector(domain_policy);
+    failures += run_domain_policy_edges();
     free(authz);
     free(rules);
     free(management);
+    free(domain_policy);
     if (failures != 0) {
         fprintf(stderr, "peer egress: %d assertion(s) failed\n", failures);
         return 1;
