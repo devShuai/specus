@@ -6,6 +6,7 @@ import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressConfigMessage;
 import com.theshuai.common.peeregress.PeerEgressDns;
 import com.theshuai.common.peeregress.PeerEgressFrame;
+import com.theshuai.common.peeregress.PeerEgressReportMessage;
 import com.theshuai.common.peeregress.PeerEgressRule;
 import com.theshuai.common.peeregress.PeerEgressRules;
 import java.io.IOException;
@@ -17,6 +18,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 
@@ -26,7 +28,7 @@ import lombok.extern.slf4j.Slf4j;
  * <p>Three joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
  * {@code egress-config} becomes the policy the plane enforces, and a closing session revokes that
  * peer's flows. For the consumer's phase two it also reads the pushed {@code egress-catalog} and
- * owns the fake-IP pool.
+ * owns the fake-IP pool, and for the egress role it sends the {@code egress-report}.
  *
  * <p>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and the
  * egress plane takes its own, and the plane holds its lock while emitting frames. So frames are
@@ -56,6 +58,14 @@ final class PeerEgressMesh implements AutoCloseable {
 
         /** Writes one packet to the local virtual device. */
         void writeToDevice(byte[] packet);
+
+        /**
+         * Sends one message to the server over the control connection, addressed to no client:
+         * the {@code egress-report}. Best effort; a message that cannot go is logged and dropped.
+         * Nothing by default, so a host built only to drive the plane reports to nobody.
+         */
+        default void sendControl(String message) {
+        }
 
         /** The tunnel interface name, for the route commander. */
         String tunName();
@@ -167,6 +177,11 @@ final class PeerEgressMesh implements AutoCloseable {
     private record Outbound(long consumer, byte[] frame) {
     }
 
+    /** Runs a task every so often until the mesh closes. */
+    interface Scheduler {
+        void every(long periodMs, Runnable task);
+    }
+
     private final Host host;
     /**
      * How the egress role opens its real sockets. Injected so this class can be driven without a
@@ -184,6 +199,17 @@ final class PeerEgressMesh implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private Thread sendLoop;
     private Thread tickLoop;
+    private Thread reportLoop;
+
+    /** Decides when this node, as an egress, reports to the server, and builds the report. */
+    private final PeerEgressReporter reporter = new PeerEgressReporter();
+    /**
+     * What runs the report check, or null for a thread of the plane's own. Replaceable before the
+     * first egress-config, so a test fires the check by hand instead of waiting a minute.
+     */
+    Scheduler reportScheduler;
+    /** The wall clock a report's revision is read from. Replaceable for the same reason. */
+    LongSupplier wallClock = System::currentTimeMillis;
 
     private volatile PeerEgressRuntime runtime;
     private volatile PeerEgressConsumer consumer;
@@ -336,6 +362,53 @@ final class PeerEgressMesh implements AutoCloseable {
                 plane.onTick(System.currentTimeMillis());
             }
         });
+        // Started with the plane, which exists only once an egress-config arrived: before that this
+        // node is no egress and has nothing to report. The Java client always announces egress
+        // capability at login, so a config is the only condition left to wait for.
+        Scheduler scheduler = reportScheduler;
+        if (scheduler != null) {
+            scheduler.every(PeerEgressReporter.INTERVAL_MS, this::checkReport);
+            return;
+        }
+        reportLoop = Thread.ofVirtual().name("peer-egress-report").start(() -> {
+            while (!closed.get()) {
+                try {
+                    Thread.sleep(PeerEgressReporter.INTERVAL_MS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                checkReport();
+            }
+        });
+    }
+
+    /**
+     * One report check: sends the {@code egress-report} when the reporter says one is due.
+     *
+     * <p>The numbers are the status snapshot's, so the admin page and {@code specus-client egress}
+     * on this device agree. A report that fails to go, or that the server refuses (it rate limits
+     * per control session), is only logged; the next check runs as usual, and it reports again if
+     * the numbers moved meanwhile. Called with no lock held.
+     */
+    void checkReport() {
+        PeerEgressRuntime plane = runtime;
+        if (plane == null || closed.get()) {
+            return;
+        }
+        PeerEgressReportMessage report;
+        try {
+            report = reporter.check(wallClock.getAsLong(), plane.statusSnapshot());
+            if (report == null) {
+                return;
+            }
+            host.sendControl(report.encode());
+        } catch (RuntimeException failed) {
+            log.warn("[peer-egress] egress-report not sent: {}", failed.getMessage());
+            return;
+        }
+        log.debug("[peer-egress] egress-report sent revision={} activeFlows={} totalFlows={}",
+                report.revision(), report.activeFlows(), report.totalFlows());
     }
 
     /**
@@ -490,10 +563,12 @@ final class PeerEgressMesh implements AutoCloseable {
 
     /**
      * A new control session: the server numbers its catalogues afresh. Only the revision floor is
-     * reset; what the last catalogue said stands until the next one replaces it.
+     * reset; what the last catalogue said stands until the next one replaces it. The server behind
+     * the session may also have restarted, so the next report check sends whatever it finds.
      */
     void newControlSession() {
         catalog.newSession();
+        reporter.newSession();
     }
 
     /** The pool phase two answers from, or null while it does not run; for the DNS responder. */
@@ -1209,6 +1284,9 @@ final class PeerEgressMesh implements AutoCloseable {
         }
         if (tickLoop != null) {
             tickLoop.interrupt();
+        }
+        if (reportLoop != null) {
+            reportLoop.interrupt();
         }
     }
 

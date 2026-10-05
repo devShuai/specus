@@ -420,7 +420,7 @@ class PeerEgressRuntimeTests {
 
         assertTrue(harness.sawReset(), "an unreachable target left the consumer without a reset");
         assertTrue(harness.rejectCodes().isEmpty(), "a network failure was reported as a refusal");
-        assertTrue(harness.runtime.rejections().drainCounts().isEmpty(),
+        assertTrue(harness.runtime.rejections().cumulativeCounts().isEmpty(),
                 "a network failure entered the refusal aggregate");
         // The reservation must come back, or a flapping destination would exhaust the quota.
         assertEquals(0, harness.runtime.flowCount(), "flows left after a failed connect");
@@ -652,7 +652,7 @@ class PeerEgressRuntimeTests {
         assertEquals(0, harness.runtime.flowCount(), "the session outlived its idle timeout");
         assertTrue(harness.socket(0).isClosed(), "an expired session left its socket open");
         // An expiring session is the normal end of life, not something to report as blocked traffic.
-        assertTrue(harness.runtime.rejections().drainCounts().isEmpty(),
+        assertTrue(harness.runtime.rejections().cumulativeCounts().isEmpty(),
                 "idle expiry entered the refusal aggregate");
     }
 
