@@ -13,6 +13,7 @@ import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
+import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshEgressActivity;
@@ -553,30 +554,46 @@ public class PeerEgressService {
             entry.setOnline(isDeviceEnabled(egress.get()));
             entry.setScope(policy.getScope());
             entry.setProtocols(protocolsOf(decodeDestinationRules(policy.getDestinationRules())));
-            entry.setDomainTargetCapable(entry.isOnline() && announcesDomainTargets(egress.get()));
+            EgressAnnouncement announced = entry.isOnline()
+                    ? announcementOf(egress.get())
+                    : EgressAnnouncement.NONE;
+            entry.setDomainTargetCapable(announced.domainTargets());
             // No client announces IPv6 targets yet.
             entry.setIpv6TargetCapable(false);
+            entry.setEgressVersion(announced.version());
             entries.add(entry);
         }
         message.setEgresses(entries);
         return message;
     }
 
+    /** What an egress's current online session announced at login, as the catalogue passes it on. */
+    private record EgressAnnouncement(int version, boolean domainTargets) {
+        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false);
+    }
+
     /**
-     * Whether the egress's current online session announced domain targets at login.
+     * The egress version and domain-target support the egress's current online session announced.
      *
      * <p>Read from the online session, like the egress version the signal path pushes with, rather
      * than from anything remembered about the device: an egress that went offline, or came back on
-     * a client without domain support, must not keep advertising it. Consumers rely on this to tell
-     * which egress can take a domain rule.
+     * an older client, must not keep advertising what it no longer offers. Consumers rely on the
+     * version to tell an egress that cannot take a flow at all (an old client, {@code 0}) and on
+     * domain targets to tell which egress can take a domain rule. Both come from one read so the two
+     * catalogue fields always describe the same sessions.
      */
-    private boolean announcesDomainTargets(ClientAccount egress) {
-        return clientSessionRepository
+    private EgressAnnouncement announcementOf(ClientAccount egress) {
+        List<ClientSession> online = clientSessionRepository
                 .findByTenantIdAndClientIdInAndStatus(egress.getTenantId(), List.of(egress.getId()),
-                        ClientAuthService.STATUS_NETTY_ONLINE)
-                .stream()
+                        ClientAuthService.STATUS_NETTY_ONLINE);
+        int version = online.stream()
+                .mapToInt(ClientSession::getClientEgressVersion)
+                .max()
+                .orElse(0);
+        boolean domainTargets = online.stream()
                 .anyMatch(session -> session.getClientEgressVersion() >= 1
                         && session.isClientEgressDomainTargets());
+        return new EgressAnnouncement(Math.max(version, 0), domainTargets);
     }
 
     /**

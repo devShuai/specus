@@ -104,18 +104,26 @@ function renderEgress(state) {
   } else {
     const rules = list(consumer.rules), routes = list(consumer.routes), peers = list(consumer.peers);
     const refused = rules.filter(rule => rule.inForce !== true), missing = routes.filter(route => route.installed !== true), offline = peers.filter(peer => peer.online !== true);
-    const relayed = peers.filter(peer => peer.path === "relay"), pathless = peers.filter(peer => peer.online === true && peer.path === "none");
+    // The catalogue's word on an online egress (protocol/spec/peer-egress.md, 能力不支持) comes
+    // after offline and before the path, one problem per peer.
+    const notOffered = peers.filter(peer => peer.online === true && peer.standing === "not-offered");
+    const unsupported = peers.filter(peer => peer.online === true && peer.standing === "unsupported");
+    const relayed = peers.filter(peer => peer.path === "relay"), pathless = peers.filter(peer => peer.online === true && peer.standing !== "not-offered" && peer.standing !== "unsupported" && peer.path === "none");
     $("egress-summary").textContent = rules.length + " 条规则，" + refused.length + " 条未生效 · " + routes.length + " 条路由，" + missing.length + " 条未安装 · " + count(consumer.flows) + " 个流 · " + peers.length + " 个出口设备，" + offline.length + " 个离线，" + relayed.length + " 个经中继";
     for (const rule of refused) issue(issues, "规则 #" + count(rule.index) + "「" + (rule.match || "—") + "」未生效", (egressRuleReasons[rule.code] || "规则被拒绝") + "；这条规则现在不引导任何流量。", rule.code);
     // Each problem says what to do about it, in the words the egress command uses.
     for (const route of missing) issue(issues, "路由 " + (route.cidr || "—") + " 未安装", "该前缀已被本功能之外的路由占用，本该进隧道的流量正从物理网卡出去：" + (route.conflict || "—") + "。处理：删除或缩小那条路由，或修改规则；客户端每 60 秒重试一次。", route.origin);
     for (const peer of offline) issue(issues, "出口设备 " + count(peer.clientId) + " 离线", "指向它的规则已经生效，但流量没有出口可发，会被阻断而不是改走本机。处理：启动该设备或恢复它的网络连接。");
+    for (const peer of notOffered) issue(issues, "出口设备 " + count(peer.clientId) + " 未向本机提供", "服务端的出口目录里没有它：它不是出口、出口策略未启用、没有允许本机，或基础 ACL、总开关不允许。指向它的流量被阻断而不是改走本机。处理：请管理员在出口策略里启用它并允许本机，同时确认基础 ACL 与总开关。", "egress-not-offered");
+    for (const peer of unsupported) issue(issues, "出口设备 " + count(peer.clientId) + " 的客户端不支持出口", "它在线，但当前客户端没有声明支持出口（旧版本），发给它的流量不会被处理。指向它的流量被阻断而不是改走本机。处理：把那台设备的客户端升级到支持出口的版本。", "egress-unsupported");
+    if (consumer.catalog === "none") issue(issues, "服务端没有下发出口目录", "控制连接认证后 30 秒内没有收到出口目录，服务端可能太旧、不支持出口。在此之前出口能否接流以出口的拒绝为准。处理：升级服务端。");
     for (const peer of pathless) issue(issues, "出口设备 " + count(peer.clientId) + " 在线但尚无路径", "直连与中继路径都还没建立，指向它的流量暂时发不出去。处理：稍候；持续如此时检查两台设备到服务端的 UDP 是否可达。");
     if (typeof consumer.routeError === "string" && consumer.routeError) issue(issues, "路由下发失败", consumer.routeError + (consumer.rolledBack === true ? "（本次下发已整体回滚）" : "") + "。处理：" + (/permission|denied|not permitted|elevat|access/i.test(consumer.routeError) ? "以管理员或 root 身份运行客户端，并把虚拟网卡模式设为私有组网（auto）。" : "客户端日志里记录了失败的路由命令，按其提示修正后重启客户端。"));
     for (const peer of relayed) issue(issues, "出口设备 " + count(peer.clientId) + " 经中继连接", "可用，但比直连慢；" + count(peer.flows) + " 个流。直连需要两台设备之间的 UDP 可达。", "", true);
-    problems = refused.length + missing.length + offline.length + pathless.length + (consumer.routeError ? 1 : 0);
+    problems = refused.length + missing.length + offline.length + notOffered.length + unsupported.length + pathless.length
+      + (consumer.catalog === "none" ? 1 : 0) + (consumer.routeError ? 1 : 0);
     if (!problems) issue(issues, "规则均已生效", "路由均已安装，指向的出口设备均在线。", "", true);
-    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，rejected- 开头为出口拒绝；域名分流另有 fake-ip-unmapped（发往 fake-IP 却没有映射）、fake-ip-stale（映射的名字已不归任何域名规则）、egress-no-domain（出口不支持域名目标）、dns-not-local（不是本机发来的 DNS 查询）。", blocked, !problems);
+    const blocked = counters(consumer.blocked); if (blocked) issue(issues, "拦截计数", "被丢弃、没有放行的包，按原因分别计数：rule 为阻断规则，unsupported-protocol 为不承载的协议（如 ICMP），egress-unavailable 为出口不可用，egress-not-offered 为出口未向本机提供，egress-unsupported 为出口客户端不支持，rejected- 开头为出口拒绝；域名分流另有 fake-ip-unmapped（发往 fake-IP 却没有映射）、fake-ip-stale（映射的名字已不归任何域名规则）、egress-no-domain（出口不支持域名目标）、dns-not-local（不是本机发来的 DNS 查询）。", blocked, !problems);
   }
   // Phase two, present only while peerEgressDnsTakeover is on. Not running, and running without the
   // system DNS pointed at it, both leave every domain rule matching nothing, so each is a problem.

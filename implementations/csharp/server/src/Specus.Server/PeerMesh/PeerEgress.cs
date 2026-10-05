@@ -137,24 +137,35 @@ public sealed partial class PeerMeshService
     }
 
     /// <summary>
-    /// Whether the egress's current online session announced <c>domainTargetCapable</c> at login.
+    /// What the egress's current online session announced at login: its
+    /// <c>clientEgressCapabilities.version</c> and whether it declared <c>domainTargetCapable</c>.
     /// </summary>
     /// <remarks>
     /// Read from the newest online session rather than any session the device ever had: a device
-    /// that reconnects with a build that cannot resolve names must stop being advertised as one
-    /// that can, or consumers would send it name-bind requests it can only refuse. No online
-    /// session means false, so an egress that has gone away is never advertised as capable.
+    /// that reconnects with a build that cannot resolve names, or that predates egress altogether,
+    /// must stop being advertised as one that can, or consumers would send it requests it can only
+    /// refuse. No online session means version 0 and no domain targets, so an egress that has gone
+    /// away is never advertised as capable. Both values come from the same row, so the two catalogue
+    /// fields always describe the same session.
     /// </remarks>
-    private async Task<bool> EgressDomainTargetsAsync(ClientAccount egress, CancellationToken cancellationToken) =>
+    private async Task<EgressAnnouncement> EgressAnnouncementAsync(ClientAccount egress,
+        CancellationToken cancellationToken) =>
         await _db.ClientSessions.AsNoTracking()
             .Where(row => row.TenantId == egress.TenantId
                 && row.ClientId == egress.Id
                 && row.Status == "NETTY_ONLINE")
             .OrderByDescending(row => row.NettyConnectedAt ?? row.HttpLoginAt)
             .ThenByDescending(row => row.Id)
-            .Select(row => row.ClientEgressDomainTargets)
+            .Select(row => new EgressAnnouncement(row.ClientEgressVersion, row.ClientEgressDomainTargets))
             .FirstOrDefaultAsync(cancellationToken)
-            .ConfigureAwait(false);
+            .ConfigureAwait(false)
+        ?? EgressAnnouncement.None;
+
+    /// <summary>What an egress's online session announced, as the catalogue passes it on.</summary>
+    private sealed record EgressAnnouncement(int Version, bool DomainTargets)
+    {
+        public static EgressAnnouncement None { get; } = new(0, false);
+    }
 
     /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
     internal const int MaxEgressReportBytes = 8 * 1024;
@@ -692,6 +703,11 @@ public sealed partial class PeerMeshService
                 .AnyAsync(device => device.TenantId == account.TenantId
                     && device.ClientId == policy.EgressClientId && device.Enabled, cancellationToken)
                 .ConfigureAwait(false);
+            // Nothing is announced while the entry itself reads offline, so a consumer is neither
+            // told an absent egress can resolve names nor given a version for it.
+            var announced = online
+                ? await EgressAnnouncementAsync(egress, cancellationToken).ConfigureAwait(false)
+                : EgressAnnouncement.None;
             entries.Add(new PeerEgressCatalogEntry
             {
                 ClientId = policy.EgressClientId,
@@ -699,12 +715,10 @@ public sealed partial class PeerMeshService
                 Online = online,
                 Scope = policy.Scope,
                 Protocols = EgressProtocols(DecodeEgressDestinationRules(policy.DestinationRules)),
-                // Never capable while the entry itself reads offline, so a consumer is not told an
-                // absent egress can resolve names.
-                DomainTargetCapable = online
-                    && await EgressDomainTargetsAsync(egress, cancellationToken).ConfigureAwait(false),
+                DomainTargetCapable = announced.DomainTargets,
                 // No client announces IPv6 targets yet, so there is nothing to carry.
                 Ipv6TargetCapable = false,
+                EgressVersion = announced.Version,
             });
         }
         return message;

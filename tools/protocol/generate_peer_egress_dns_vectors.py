@@ -273,7 +273,9 @@ def positive_int(value):
 
 
 class CatalogReader:
-    """What a consumer keeps from egress-catalog: which egress resolves names.
+    """What a consumer keeps from egress-catalog: which egresses it lists, the egressVersion each
+    one's online session announced (protocol/spec/peer-egress.md, 能力不支持), and which resolve
+    names.
 
     The revision works as for egress-config: rising within one control session, a snapshot at or
     below the last accepted one ignored, the floor reset by a new session. What was learned stays
@@ -282,6 +284,7 @@ class CatalogReader:
     def __init__(self):
         self.floor = None
         self.capable = {}
+        self.versions = {}  # client id -> egressVersion, or None when the entry carries no usable one
 
     def new_session(self):
         self.floor = None
@@ -303,15 +306,26 @@ class CatalogReader:
             return False
         self.floor = revision
         capable = {}
+        versions = {}
         for entry in egresses:
             if not isinstance(entry, dict) or not positive_int(entry.get("clientId")):
                 continue
             capable[entry["clientId"]] = entry.get("domainTargetCapable") is True
+            version = entry.get("egressVersion")
+            usable = isinstance(version, int) and not isinstance(version, bool) and version >= 0
+            versions[entry["clientId"]] = version if usable else None
         self.capable = capable
+        self.versions = versions
         return True
 
     def capable_ids(self):
         return sorted(client for client, able in self.capable.items() if able)
+
+    def listed_ids(self):
+        return sorted(self.versions)
+
+    def egress_versions(self):
+        return {str(client): version for client, version in sorted(self.versions.items()) if version is not None}
 
 
 def in_pool(network, destination):
@@ -856,6 +870,10 @@ CATALOG_EVENTS = [
         {"clientId": 0, "domainTargetCapable": True}, {"clientId": -3, "domainTargetCapable": True},
         {"clientId": "2", "domainTargetCapable": True}, {"clientId": True, "domainTargetCapable": True},
         "gateway", {"clientId": 4, "domainTargetCapable": True}])),
+    ("egress-versions-only-non-negative-integers", catalog_text(3, [
+        {"clientId": 2, "egressVersion": 1}, {"clientId": 3, "egressVersion": 0},
+        {"clientId": 4, "egressVersion": "1"}, {"clientId": 5, "egressVersion": -1},
+        {"clientId": 6, "egressVersion": True}, {"clientId": 7}])),
     ("not-json", "{\"type\":\"egress-catalog\","),
 ]
 
@@ -1059,15 +1077,19 @@ def build():
     for name, text in CATALOG_EVENTS:
         if text is None:
             reader.new_session()
-            catalog.append({"name": name, "newSession": True, "domainTargetCapable": reader.capable_ids()})
+            catalog.append({"name": name, "newSession": True, "domainTargetCapable": reader.capable_ids(),
+                            "listed": reader.listed_ids(), "egressVersion": reader.egress_versions()})
             continue
         accepted = reader.read(text)
         catalog.append({"name": name, "json": text, "accepted": accepted,
-                        "domainTargetCapable": reader.capable_ids()})
+                        "domainTargetCapable": reader.capable_ids(), "listed": reader.listed_ids(),
+                        "egressVersion": reader.egress_versions()})
     # Hand-checked, so the reference itself is pinned.
     assert [(case.get("accepted"), case["domainTargetCapable"]) for case in catalog] == [
         (True, [2]), (False, [2]), (False, [2]), (True, [3]), (False, [3]), (True, []), (True, []),
-        (False, []), (False, []), (None, []), (True, [2]), (True, [4]), (False, [4])], catalog
+        (False, []), (False, []), (None, []), (True, [2]), (True, [4]), (True, []), (False, [])], catalog
+    versions = catalog[-2]
+    assert (versions["listed"], versions["egressVersion"]) == ([2, 3, 4, 5, 6, 7], {"2": 1, "3": 0}), versions
     events = [{"at": index, **event} for index, event in enumerate(STEERING_EVENTS)]
     steering_case = {"name": "consumer-steering", "cidr": "198.18.0.0/29", "rules": STEERING_RULES,
                      "events": events}

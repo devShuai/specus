@@ -25,4 +25,12 @@ public class PeerEgressCatalogEntry {
     private List<String> protocols = List.of();
     private boolean domainTargetCapable;
     private boolean ipv6TargetCapable;
+    /**
+     * The {@code clientEgressCapabilities.version} the egress's current online session announced;
+     * {@code 0} when it is offline or announced none. A primitive so the server always writes it,
+     * {@code 0} included: a consumer reads an absent field as an old server and keeps routing, but
+     * reads {@code 0} as an egress that cannot take a flow. Decoding through this class cannot tell
+     * those two apart, so a consumer must read the raw field instead.
+     */
+    private int egressVersion;
 }

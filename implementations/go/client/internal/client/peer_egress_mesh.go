@@ -196,10 +196,11 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	consumer := newEgressConsumer(mesh.logger,
 		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
 		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
-	// A catalogue that arrived before the consumer was built still says which egresses resolve
-	// names; nothing else will repeat it until the server has a reason to.
+	// A catalogue that arrived before the consumer was built still says which egresses it lists and
+	// which resolve names; nothing else will repeat it until the server has a reason to. The consumer
+	// is not shared yet, so its lock is not needed.
 	if mesh.egressCatalog != nil {
-		consumer.capable = mesh.egressCatalog.domainCapable()
+		consumer.setCatalogLocked(mesh.egressCatalog.view())
 	}
 	consumer.dnsUpstreams = append([]string(nil), mesh.egressDNSUpstreams...)
 	mesh.egressConsumer = consumer
@@ -221,36 +222,105 @@ func (mesh *peerMeshClient) setEgressDNSUpstreams(upstreams []string) {
 	}
 }
 
-// applyEgressCatalog reads a pushed egress-catalog and gives the consumer the capabilities it lists.
-// A change can close flows: a flow to a name stops the moment its egress is no longer said to
-// resolve names. Called with no mesh lock held.
+// applyEgressCatalog reads a pushed egress-catalog and gives the consumer what it lists. A change can
+// close flows: those to an egress the catalogue no longer offers, or whose client announced no peer
+// egress, and a flow to a name whose egress is no longer said to resolve names. Called with no mesh
+// lock held.
 func (mesh *peerMeshClient) applyEgressCatalog(payload string) {
 	mesh.mu.Lock()
 	if mesh.egressCatalog == nil {
 		mesh.egressCatalog = newEgressCatalogReader()
 	}
 	accepted := mesh.egressCatalog.read([]byte(payload))
-	capable := mesh.egressCatalog.domainCapable()
-	ids := mesh.egressCatalog.capableIDs()
+	view := mesh.egressCatalog.view()
+	listed, capable := mesh.egressCatalog.listedIDs(), mesh.egressCatalog.capableIDs()
 	consumer := mesh.egressConsumer
 	mesh.mu.Unlock()
 	if !accepted {
 		// A stale revision is ordinary after a reorder and says nothing worth a line; a malformed
-		// catalogue is the server's to fix, and the known capabilities stand either way.
+		// catalogue is the server's to fix, and what is known stands either way.
 		return
 	}
-	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses resolving names: %v", ids)
+	var unsupported []int64
+	for _, id := range listed {
+		if listing := view.Listed[id]; listing.VersionKnown && listing.Version < 1 {
+			unsupported = append(unsupported, id)
+		}
+	}
+	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses listed: %v, "+
+		"resolving names: %v, announcing no peer egress: %v", listed, capable, unsupported)
 	if consumer != nil {
-		mesh.deliverEgressPurges(consumer.setDomainCapable(capable, time.Now()))
+		mesh.deliverEgressPurges(consumer.applyCatalog(view, time.Now()))
 	}
 }
 
-// newEgressCatalogSessionLocked resets the catalogue's revision floor for a new control session.
-// Called with the mesh lock held.
-func (mesh *peerMeshClient) newEgressCatalogSessionLocked() {
-	if mesh.egressCatalog != nil {
-		mesh.egressCatalog.newSession()
+// newEgressCatalogSession starts a new control session for the catalogue: its revision floor goes,
+// and every egress's standing is unknown again until this session's first catalogue arrives. Taken
+// at both ends of a session, when a control connection ends and when the next one authenticates,
+// so that nothing the last connection was still delivering counts for the new one. Called with no
+// mesh lock held.
+//
+// Unknown blocks nothing, so this closes no flow; the consumer's purge is delivered all the same
+// rather than assumed to be empty.
+func (mesh *peerMeshClient) newEgressCatalogSession() {
+	mesh.mu.Lock()
+	reader, consumer := mesh.egressCatalog, mesh.egressConsumer
+	var view egressCatalogView
+	if reader != nil {
+		reader.newSession()
+		view = reader.view()
 	}
+	mesh.mu.Unlock()
+	// Without a reader no catalogue was ever read, and the consumer's standings are unknown already.
+	if reader != nil && consumer != nil {
+		mesh.deliverEgressPurges(consumer.applyCatalog(view, time.Now()))
+	}
+}
+
+// noteControlAuthenticated marks the start of a control session: the catalogue numbering starts
+// afresh, and the wait for this session's first catalogue starts now. Called with no mesh lock held.
+func (mesh *peerMeshClient) noteControlAuthenticated() {
+	mesh.newEgressCatalogSession()
+	mesh.mu.Lock()
+	mesh.egressControlAuthAt = mesh.egressNow()
+	mesh.mu.Unlock()
+}
+
+// The status's catalog: what this control session has heard from the server's egress catalogue.
+const (
+	// egressCatalogWaiting: none accepted yet, and the session has not been up long enough to say
+	// the server sends none; also while there is no control session at all.
+	egressCatalogWaiting = "waiting"
+	// egressCatalogNone: none accepted in the egressCatalogWait after the control session
+	// authenticated, so the server is probably too old to send one.
+	egressCatalogNone = "none"
+	// egressCatalogReceived: one was accepted in this control session.
+	egressCatalogReceived = "received"
+)
+
+// egressCatalogWait is how long after control authentication a server that sends a catalogue will
+// have sent one (catalogWaitSeconds in protocol/test-vectors/peer-egress-standing-v1.json). Saying
+// "none" sooner would blame the server for an ordinary delay.
+const egressCatalogWait = 30 * time.Second
+
+// egressCatalogStateLocked is the status's catalog. Called with the mesh lock held.
+func (mesh *peerMeshClient) egressCatalogStateLocked() string {
+	switch {
+	case mesh.egressCatalog != nil && mesh.egressCatalog.received:
+		return egressCatalogReceived
+	case !mesh.egressControlAuthAt.IsZero() && mesh.egressNow().Sub(mesh.egressControlAuthAt) >= egressCatalogWait:
+		return egressCatalogNone
+	default:
+		return egressCatalogWaiting
+	}
+}
+
+// egressNow is the time the catalogue wait is measured with.
+func (mesh *peerMeshClient) egressNow() time.Time {
+	if mesh.egressClock != nil {
+		return mesh.egressClock()
+	}
+	return time.Now()
 }
 
 // egressPhaseTwoFor evaluates phase two against the mesh network the server gave, and, the first

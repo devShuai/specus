@@ -32,8 +32,9 @@ tell the consumer's own address from the egress's.
 - Concurrent downstream integrity: by default 16 parallel 1 MiB downloads must all match SHA-256
   and none may leave from the consumer's local address. Use `--concurrent-flows 64` for a larger
   run, `--concurrent-bytes` to change the per-flow size, or `--concurrent-flows 0` to skip it.
-- Fault injection, each with a leak check on the target's log: ACL revoked (flow-reject at the
-  consumer), tenant switch off (an established flow is cut, a new one refused), egress process
+- Fault injection, each with a leak check on the target's log: ACL revoked (the catalogue stops offering the
+  egress and the consumer blocks it as `not-offered`, or the egress refuses a flow that beat the
+  catalogue), tenant switch off (an established flow is cut, a new one refused), egress process
   stopped and restarted, rule changed to `block` across a consumer restart, consumer `kill -9`
   with a user route of its own in the table.
 - The consumer's routing table after a normal exit, after `kill -9`, after the restart, and at the

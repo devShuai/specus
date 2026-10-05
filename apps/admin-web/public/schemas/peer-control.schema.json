@@ -242,6 +242,11 @@
                   },
                   "ipv6TargetCapable": {
                     "type": "boolean"
+                  },
+                  "egressVersion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "出口当前在线会话登录时声明的 clientEgressCapabilities.version；不在线或未声明为 0。0 表示它接不了流量，缺失表示旧服务端、能力未知。"
                   }
                 }
               }

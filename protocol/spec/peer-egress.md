@@ -409,7 +409,38 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 `domainTargetCapable` 与 `ipv6TargetCapable` 独立于 `egressVersion`，这样二期上线时新旧客户端可以共存，不必靠版本号一刀切。
 
-消费端遇到不支持出口的对端或旧服务端时，**不降级、不静默直连**：出口侧不可用时命中规则的流量被阻断，状态查询里对应出口显示离线、拦截计数里记为 `egress-unavailable`。设计稿要求的「明确提示能力不支持」这一句提示尚未实现，见当前限制。升级默认关闭，不改变现有组网与服务共享行为。
+消费端遇到不支持出口的对端或旧服务端时，**不降级、不静默直连**，并说明原因，见下文「能力不支持」。升级默认关闭，不改变现有组网与服务共享行为。
+
+### 能力不支持
+
+规则只写出口的 `clientId`。在此之前，消费端判断出口能否接流只看 Peer Mesh 对端是否在线：一台在线、却运行着不支持出口的旧客户端的设备会照样收到流量，它不认识 SPEG1 帧，一言不发地丢掉，应用只能等到超时，状态里也看不出原因。
+
+消费端因此还要读 `egress-catalog`（下一节）。对每个被生效规则指向的出口，先得出它的**目录状态**（共享向量 `protocol/test-vectors/peer-egress-standing-v1.json`）：
+
+| 目录状态 | 何时 |
+| --- | --- |
+| `unknown` | 本控制 session 里还没有接受过目录。旧服务端从不下发目录，总是这个状态 |
+| `not-offered` | 接受过目录，目录里没有这个出口：它不是出口、策略未启用、未授权本机、基础 ACL 不允许，或总开关关闭 |
+| `unsupported` | 目录里有它，且 `egressVersion` 为 `0`：它当前在线的会话没有声明支持出口（旧客户端） |
+| `offered` | 目录里有它，`egressVersion` 至少为 `1`，或目录条目没有这个字段（旧服务端） |
+
+然后决定流量：出口离线时照旧阻断并计 `egress-unavailable`（目录说不了一台不在的设备）；在线时，`not-offered` 阻断并计 `egress-not-offered`，`unsupported` 阻断并计 `egress-unsupported`；`unknown` 与 `offered` 照常发往出口。`unknown` 不阻断，是为了不让旧服务端下已经可用的部署在升级客户端后失效。
+这两种新的阻断与 `egress-unavailable` 一样**应答**应用（TCP 回 RST、UDP 回 ICMP 不可达），并在目录状态变成阻断时像出口下线一样断开该出口上的流、发送 `flow-purge`。
+
+控制认证后 **30 秒**（向量里的 `catalogWaitSeconds`）仍没有接受过任何目录，状态里 `catalog` 记为 `none`，说明服务端可能太旧、不支持出口；在此之前为 `waiting`，接受过目录后为 `received`。还没有控制认证过、或控制连接断开到下一次认证之间，也是 `waiting`。`catalog` 与 `peers` 一样，只在消费端运行时出现。
+
+`egress` 命令面向人的输出给这三种情况各两行，三端逐字一致（`N` 是出口的 `clientId`）。出口仍按 `clientId` 逐个列出，每个出口按「离线、未提供、不支持、在线无路径」的顺序只报第一种成立的：
+
+```text
+    egress peer N: not offered to this device by the server's egress catalog
+      fix: ask an administrator to enable its egress policy and allow this device, and check the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally
+    egress peer N: online, but its client does not support peer egress
+      fix: upgrade the client on egress device N; until then its destinations are blocked, not sent locally
+    server: sent no egress catalog; it may be too old for peer egress
+      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself
+```
+
+最后一种只在 `catalog` 为 `none` 时出现一次，位于全部出口之后、路由下发失败之前。本地页面与 Windows 桌面端用同样的意思列出这些问题，顺序不作要求。
 
 ## 控制信令
 
@@ -464,11 +495,14 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
       "scope": "PUBLIC",
       "protocols": ["tcp", "udp"],
       "domainTargetCapable": false,
-      "ipv6TargetCapable": false
+      "ipv6TargetCapable": false,
+      "egressVersion": 1
     }
   ]
 }
 ```
+
+`egressVersion` 取该出口**当前在线会话**登录时声明的 `clientEgressCapabilities.version`（服务端归一化、已存在会话上的那个值），出口不在线或没有声明时为 `0`。消费端据此判断「能力不支持」（上一节）；旧服务端不发这个字段，消费端读作未知，不据此阻断。
 
 `domainTargetCapable` 取该出口**当前在线会话**登录时在 `clientEgressCapabilities` 里声明的值：服务端把它与 `version` 一起保存在会话上（会话表列 `client_egress_domain_targets`，布尔，默认 `false`，已有数据库在启动时补上）。出口不在线、或登录时没有声明，为 `false`。出口重新登录、声明变化时，随出口上线这一变化照常重新下发目录。此前四个服务端都固定写 `false`，消费端无从得知哪台出口能解析域名，二期的域名规则因此无法判断 `EGRESS_RULE_EGRESS_NO_DOMAIN`。`ipv6TargetCapable` 仍固定为 `false`：还没有客户端声明它。
 
@@ -476,7 +510,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 出口下线、设备停用、ACL 撤销或总开关关闭时立即下发 `egresses: []`。`egress-catalog` 只能由服务端发出；客户端上报该类型必须拒绝。
 
-**客户端只从这条消息里读 `domainTargetCapable`**，供二期的域名规则使用，解码规则见 [peer-egress-dns.md](peer-egress-dns.md#能力协商)（向量 `peer-egress-dns-v1.json` 的 `catalog`）。消费端判断出口是否可用，用的仍是 Peer Mesh 自己的对端在线状态，而不是目录的 `online`；目录里的 `scope`、`protocols` 等信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
+**客户端从这条消息里读三样东西**：哪些出口在目录里、各自的 `egressVersion`（上一节「能力不支持」），以及 `domainTargetCapable`（供二期的域名规则使用）。解码规则见 [peer-egress-dns.md](peer-egress-dns.md#能力协商)（向量 `peer-egress-dns-v1.json` 的 `catalog`）：`egressVersion` 只认非负整数，其他写法读作没有这个字段。消费端判断出口是否在线，用的仍是 Peer Mesh 自己的对端在线状态，而不是目录的 `online`；目录里的 `scope`、`protocols` 等信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
 
 ### `egress-report`
 
@@ -640,7 +674,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
       {"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24",
        "installed": false, "conflict": "203.0.113.0/24 via 192.0.2.1 dev eth0"}
     ],
-    "peers": [{"clientId": 42, "online": true, "path": "direct", "flows": 3}],
+    "peers": [{"clientId": 42, "online": true, "standing": "offered", "path": "direct", "flows": 3}],
+    "catalog": "received",
     "flows": 3,
     "blocked": {"egress-unavailable": 7},
     "routeError": "",
@@ -664,7 +699,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 **每个出口对端说明当前走哪条路径、承载多少流。** `path` 取 `direct`（发往对端的直连端点）、`relay`（经服务端中继）或 `none`（两者都还没有），按发送时的选择读取：已指定中继目标即为 `relay`，否则有直连端点即为 `direct`。`flows` 是本机发往该出口的活动流数。出口慢时人们先问的就是走的直连还是中继；在线却 `none` 的出口，规则已生效却无处可发，与离线同属问题。
 
-**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
+**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；出口未提供给本机（`standing` 为 `not-offered`）——请管理员在出口策略里启用它并允许本机，同时确认基础 ACL 与总开关；出口客户端不支持（`unsupported`）——把那台设备的客户端升级到支持出口的版本；服务端没有下发出口目录（`catalog` 为 `none`）——服务端可能太旧，升级服务端，在此之前出口能否使用以出口的拒绝为准；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
 
 **被拒的规则不贡献 `peers` 条目。** 否则状态会报告一个本节点永远不会发往的出口，看起来像一条生效规则有个健康的目的地。
 
@@ -677,6 +712,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `rule` | 命中 `action=block` 的规则 |
 | `unsupported-protocol` | 命中 `egress` 规则但协议不承载，如 ICMP |
 | `egress-unavailable` | 规则指向的出口当前不可用（离线或尚未在线） |
+| `egress-not-offered` | 规则指向的出口在线，但服务端的出口目录没有向本机提供它 |
+| `egress-unsupported` | 规则指向的出口在线，但它的客户端没有声明支持出口（旧版本） |
 | `send-failed` | 交给出口的帧没能发出 |
 | `return-mesh-source` | 回程包的源地址落在 Peer Mesh 网段内，拒收 |
 | `return-no-flow` | 回程包找不到本机发起过的存活流，拒收 |
@@ -751,8 +788,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 - **macOS 的旁路下一跳同样是逐条解析的，没有批量。** 与 Windows 同一个原因：批量需要改三端共享的安装器接口。这边代价更小，一次 `route -n get` 是 26 ms。
 - **Windows 的安装与撤销路径没有在真机上执行过。** 改路由表要管理员权限，开发机上跑不到。查询侧是跑通了的：三端各有一条用例真的启动 PowerShell、读回整张路由表、解析出默认路由并报告为冲突，每次 CI 在 windows runner 上都会跑。安装、撤销、回滚与旁路下一跳解析只有固定向量的覆盖。
 - **Windows 的旁路下一跳是逐条解析的，没有批量。** 冲突检查靠整表读取批量化了，旁路没有：批量需要安装器把即将到来的路由告诉命令执行器，而那是三端共享接口的改动。旁路条目是控制端点、STUN、TURN 与对端地址，实践中是个位数，每条解析一次之后缓存。如果这个列表将来随 mesh 规模增长，这里要重做。
-- **客户端只从 `egress-catalog` 里读 `domainTargetCapable`，也不发送 `egress-report`。** 出口可用性取自 Peer Mesh 对端在线状态；管理接口的出口活动页目前总是空的。
-- **遇到不支持出口的对端或旧服务端时，没有专门的「能力不支持」提示。** 流量照样被阻断而不是走本地，状态里表现为出口离线与 `egress-unavailable` 计数，但不会说明原因是对端版本太旧。
+- **客户端不发送 `egress-report`。** 管理接口的出口活动页目前总是空的。出口是否在线取自 Peer Mesh 对端在线状态，不读目录的 `online`。
 - **路由表被改后最多滞后一拍（5 秒）才补回，这 5 秒内命中规则的目标会从本机直连出去，而不是被阻断。** 路由不在时内核按普通路由送出；切网与休眠恢复正是路由消失的场景。缩短它需要监听路由表变化事件（Linux netlink、Windows `NotifyRouteChange2`、macOS `PF_ROUTE`），三端各不相同，未做。
 - **控制连接断开不再撤销路由。** 断开只挂起：虚拟网卡、路由与对端会话全部保留，只停掉「替别人出口」这一侧——收不到撤销的出口不该再接新流。对端流量走 UDP，本来就不依赖服务端，所以断开期间已有的流照常。命中规则的流量仍然进隧道，由出口承载或被明确拒绝，不会落到本机默认路由。真正退出时才撤回。此前重连走完整重启路径，撤回全部条目并关闭网卡，实测有约 2 秒的窗口让命中规则的请求从消费端自己的地址直达目标。
 - **漂移修复只看路由表，不看策略路由。** Linux 只读主表：另一个 VPN 用 `ip rule` 把流量导去别的表时，本功能的路由在主表里看起来完好，实际路径可能已变，修复发现不了。
