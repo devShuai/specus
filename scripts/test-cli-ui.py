@@ -190,7 +190,13 @@ def run(command, name, browser_enabled, output, peers=()):
                 assert change(on["revision"], op="takeover", enabled=True, confirmed=True)["saved"] is False
                 preview = request("/api/egress/test", dict(address="203.0.113.9"), token)
                 assert preview["matchedRuleIndex"] == 0 and preview["result"] == "egress" and preview["egressClientId"] == 42, preview
-                request("/api/egress/test", dict(address="example.com"), token, expected=422)
+                # A name is previewed as well (protocol/spec/peer-egress-dns.md, 预演一个域名); it is only
+                # never connected to from here, and a name no domain rule could match is refused.
+                named = request("/api/egress/test", dict(address="Example.COM."), token)
+                assert named["kind"] == "domain" and named["address"] == "example.com" and named["dns"] == "local", named
+                assert preview["kind"] == "address", preview
+                request("/api/egress/test", dict(address="bad_name.example"), token, expected=422)
+                request("/api/egress/test", dict(address="example.com", connect=443), token, expected=422)
                 # The connection test is a real connect from this device, told apart from the preview.
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))

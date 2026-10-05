@@ -138,8 +138,10 @@ func (u *localUI) egressTest(w http.ResponseWriter, r *http.Request) {
 	if !uiDecode(w, r, &body) {
 		return
 	}
-	address := strings.TrimSpace(body.Address)
-	if problem := egressAddressProblem(address); problem != "" {
+	// The same reading and the same preview as egress test, so a name is previewed here too and
+	// refused here for the same reasons.
+	kind, address, problem := egressTarget(strings.TrimSpace(body.Address))
+	if problem != "" {
 		uiError(w, 422, problem)
 		return
 	}
@@ -147,11 +149,15 @@ func (u *localUI) egressTest(w http.ResponseWriter, r *http.Request) {
 		uiError(w, 422, "connect must be a TCP port between 1 and 65535")
 		return
 	}
+	if body.Connect != nil && kind == egressTargetDomain {
+		uiError(w, 422, egressConnectNameRefusal)
+		return
+	}
 	_, _, config, ok := u.egressLoad(w)
 	if !ok {
 		return
 	}
-	data, _ := egressPreview(u.path, config, address)
+	data, _ := egressPreview(u.path, config, kind, address)
 	if body.Connect != nil {
 		data["connect"], _ = egressConnectProbe(address, *body.Connect)
 	}

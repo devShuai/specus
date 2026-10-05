@@ -2,6 +2,7 @@ using System.IO;
 using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Specus.Client.Desktop;
@@ -127,6 +128,33 @@ public class LayoutTests
                     Assert.StartsWith("本机正在作为出口 · 2 个流 · 累计 9 个 · 拒绝：EGRESS_DEST_DENIED=1", ((TextBlock)window.FindName("EgressRoleText")).Text);
                     root.UpdateLayout();
                     if (screenshots) Capture(root, size, Path.Combine(output, $"windows-egress-status-{theme}-{size.Width}"));
+
+                    // The rule tester previews a name through the same judgment as egress test: the
+                    // rule that would claim it is named, and since this page has no DNS takeover the
+                    // name is left to the system's DNS. A name no domain rule could match is refused,
+                    // and a name is never connected to.
+                    var testAddress = (TextBox)window.FindName("EgressTestAddressBox");
+                    var testResult = (TextBlock)window.FindName("EgressTestResultText");
+                    void Click(string name) => ((Button)window.FindName(name)).RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+                    testAddress.Text = "Example.COM.";
+                    Click("EgressPreviewButton");
+                    Assert.Equal("example.com：命中域名规则 #1；DNS 未接管（DNS 接管未开启），名字由系统 DNS 解析；"
+                        + "由系统 DNS 解析，之后的去向请用预演查看解析出的地址。仅按已保存的规则判断，未查询 DNS，也未建立连接。", testResult.Text);
+                    testAddress.Text = "www.example.com";
+                    Click("EgressPreviewButton");
+                    Assert.StartsWith("www.example.com：未命中任何域名规则；DNS 未接管", testResult.Text);
+                    foreach (var unusable in new[] { "bad_name.example", "*.example.com" })
+                    {
+                        testAddress.Text = unusable;
+                        Click("EgressPreviewButton");
+                        Assert.StartsWith("这个名字不是域名规则能匹配的写法", testResult.Text);
+                    }
+                    testAddress.Text = "example.com";
+                    Click("EgressConnectButton");
+                    Assert.StartsWith("连通测试只接受 IPv4 地址", testResult.Text);
+                    testAddress.Text = "203.0.113.9";
+                    Click("EgressPreviewButton");
+                    Assert.StartsWith("203.0.113.9：命中规则 #0，系统接管未开启", testResult.Text);
 
                     // An edit goes through the plan the commands use: a domain is refused with its
                     // reason, an address range is added and saved.

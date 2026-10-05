@@ -12,7 +12,7 @@ import (
 )
 
 // The egress editing commands: list the rules, add, remove, move and switch them, turn takeover on
-// and off, and preview what the rules do for one address.
+// and off, and preview what the rules do for one address or name.
 //
 // They edit the configuration file the way the local page does: the one top-level value they own is
 // replaced in place and everything else in the file is kept, the write is atomic and refused if the
@@ -309,29 +309,48 @@ func writeEgress(options cliOptions, path string, data []byte, revision string, 
 	return resultOutput(options.json, options.command, 0, listing, strings.Join(append(message, lines...), "\n"))
 }
 
-// egressAddressProblem says why an address cannot be previewed, or "" when it can.
-func egressAddressProblem(address string) string {
+// The kinds of destination egress test previews, as its JSON names them.
+const (
+	egressTargetAddress = "address"
+	egressTargetDomain  = "domain"
+)
+
+// egressConnectNameRefusal is why --connect takes no name: the name would be resolved on this
+// device, and whatever it connected to says nothing about what the egress resolves it to.
+const egressConnectNameRefusal = "--connect needs an IPv4 address: a name would be resolved here, not by the egress."
+
+// egressTarget reads what egress test was given: an IPv4 address, or a name a domain rule could
+// match, normalized the way rules compare names. problem says why it cannot be previewed, or is ""
+// when it can.
+func egressTarget(address string) (kind, target, problem string) {
 	valid, domain := client.ValidEgressAddress(address)
 	switch {
 	case valid:
-		return ""
-	case domain:
-		return "ADDRESS is a domain name; rules match IPv4 addresses only for now. Give the address it resolves to."
-	default:
-		return "ADDRESS must be an IPv4 address."
+		return egressTargetAddress, address, ""
+	case !domain:
+		return "", "", "ADDRESS must be an IPv4 address."
 	}
+	name, usable := client.EgressPreviewName(address)
+	if !usable {
+		return "", "", "ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, " +
+			"with punycode (xn--) for international names."
+	}
+	return egressTargetDomain, name, ""
 }
 
 func egressTest(options cliOptions, path string) int {
-	address := strings.TrimSpace(options.egressAddress)
-	if problem := egressAddressProblem(address); problem != "" {
+	kind, address, problem := egressTarget(strings.TrimSpace(options.egressAddress))
+	if problem == "" && kind == egressTargetDomain && options.egressConnect > 0 {
+		problem = egressConnectNameRefusal
+	}
+	if problem != "" {
 		return resultOutput(options.json, options.command, 2, nil, problem)
 	}
 	_, _, config, failed := loadEgressConfig(options, path)
 	if failed >= 0 {
 		return failed
 	}
-	data, lines := egressPreview(path, config, address)
+	data, lines := egressPreview(path, config, kind, address)
 	code := 0
 	if options.egressConnect > 0 {
 		probe, line := egressConnectProbe(address, options.egressConnect)
@@ -368,12 +387,21 @@ func egressConnectProbe(address string, port int) (map[string]any, string) {
 	return probe, fmt.Sprintf("Connection test to %s: connected in %d ms. This shows the address is reachable, not which path carried it.", target, elapsed)
 }
 
-// egressPreview is what the configured rules decide for one IPv4 address, and what takeover being
-// on would change. No connection is made.
-func egressPreview(path string, config client.Config, address string) (map[string]any, []string) {
+// egressPreview is what the configuration decides for one destination egress test was given, of
+// the kind egressTarget read it as. The command and the local page print and return the same.
+func egressPreview(path string, config client.Config, kind, target string) (map[string]any, []string) {
+	if kind == egressTargetDomain {
+		return egressNamePreview(path, config, target)
+	}
+	return egressAddressPreview(path, config, target)
+}
+
+// egressAddressPreview is what the configured rules decide for one IPv4 address, and what takeover
+// being on would change. No connection is made.
+func egressAddressPreview(path string, config client.Config, address string) (map[string]any, []string) {
 	preview := client.PreviewEgressDestination(config.PeerEgressRules, address)
 	data := map[string]any{
-		"configPath": path, "address": address, "takeover": config.PeerEgressEnabled,
+		"configPath": path, "address": address, "kind": egressTargetAddress, "takeover": config.PeerEgressEnabled,
 		"matchedRuleIndex": preview.MatchedRuleIndex,
 	}
 	lines := []string{"Preview for " + address + " from the configuration (no connection is made; --connect PORT tests one)"}
@@ -414,6 +442,89 @@ func egressPreview(path string, config client.Config, address string) (map[strin
 		data["resultWithTakeover"] = result
 	}
 	return data, lines
+}
+
+// egressNamePreview is what the configuration decides for one name (protocol/spec/peer-egress-dns.md,
+// 预演一个域名): the domain rule that claims it, what the DNS responder would answer for it, and where
+// it ends up, or why domain rules are not in force. Phase two is judged the way config validate
+// judges it. Nothing is connected to and nothing is resolved.
+func egressNamePreview(path string, config client.Config, name string) (map[string]any, []string) {
+	preview := client.PreviewEgressName(config, name)
+	data := map[string]any{
+		"configPath": path, "address": name, "kind": egressTargetDomain, "takeover": config.PeerEgressEnabled,
+		"dnsTakeover": config.PeerEgressDNSTakeover, "matchedRuleIndex": preview.MatchedRuleIndex,
+	}
+	lines := []string{
+		"Preview for " + name + " from the configuration (no connection is made)",
+		"  takeover: " + egressOnOff(config.PeerEgressEnabled) + " | dns takeover: " + egressOnOff(config.PeerEgressDNSTakeover),
+	}
+	// claimed is the action of a rule that has the name answered from the pool, egress or block,
+	// and would is where the name then goes; a direct rule and no rule leave the name to the system.
+	claimed, would := "", ""
+	if preview.MatchedRuleIndex < 0 {
+		lines = append(lines, "  rule: none")
+	} else {
+		rule := config.PeerEgressRules[preview.MatchedRuleIndex]
+		line := fmt.Sprintf("  rule: [%d] %s %s", preview.MatchedRuleIndex, strings.TrimSpace(rule.Match), preview.Action)
+		if preview.EgressClientID != 0 {
+			line += " " + strconv.FormatInt(preview.EgressClientID, 10)
+		}
+		lines = append(lines, line)
+		data["ruleAction"] = preview.Action
+		switch preview.Action {
+		case "egress":
+			claimed = "egress"
+			would = "through egress " + strconv.FormatInt(preview.EgressClientID, 10) + ", which resolves the name itself"
+			data["egressClientId"] = preview.EgressClientID
+		case "block":
+			claimed, would = "block", "blocked"
+		}
+	}
+	switch {
+	case !preview.PhaseTwo:
+		reason := "peerEgressDnsTakeover is off"
+		if config.PeerEgressDNSTakeover {
+			reason = "peerEgressFakeIpCidr is not usable"
+		}
+		lines = append(lines, "  dns: not taken over ("+reason+"), so the name is resolved by the system's DNS")
+		data["dns"] = "local"
+	case claimed == "egress":
+		lines = append(lines, "  dns: answered with a fake IP from "+preview.Pool+"; the egress resolves the name")
+		data["dns"] = "fake"
+	case claimed == "block":
+		lines = append(lines, "  dns: answered with a fake IP from "+preview.Pool)
+		data["dns"] = "fake"
+	default:
+		lines = append(lines, "  dns: forwarded to the system's DNS; the address it returns is then decided by the IPv4 rules")
+		data["dns"] = "forward"
+	}
+	switch {
+	case claimed == "":
+		lines = append(lines, "  result: resolved by the system's DNS; egress test <that address> previews where it goes")
+		data["result"] = "direct"
+	case config.PeerEgressEnabled && preview.PhaseTwo:
+		lines = append(lines, "  result: "+would)
+		data["result"] = claimed
+	default:
+		// The first of the reasons that holds, in this order.
+		reason := "peerEgressFakeIpCidr is not usable"
+		if !config.PeerEgressEnabled {
+			reason = "takeover is off"
+		} else if !config.PeerEgressDNSTakeover {
+			reason = "dns takeover is off"
+		}
+		lines = append(lines, "  result: domain rules are not in force ("+reason+"); with them on: "+would)
+		data["result"] = "direct"
+		data["resultWithTakeover"] = claimed
+	}
+	return data, lines
+}
+
+func egressOnOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // encodeEgressRules writes the rule list the same way in every runtime: one rule per line, fields in

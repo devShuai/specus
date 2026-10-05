@@ -363,6 +363,46 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
   - 成功：`System DNS given back (<platform>, taken over by PID <pid>); journal removed.`，以 0 退出。
   - `--json` 的 `data` 至少含 `journal`（路径）与 `restored`。
 
+### 预演一个域名
+
+`egress test ADDRESS --config PATH` 原来只接受 IPv4 地址。`ADDRESS` 是域名时，按配置预演这个名字会被怎样处理，不建连、不查询 DNS。
+三端输出逐字一致，由 `scripts/test-cli-matrix.py` 校验。
+
+- 名字按第二节的规则判断：末尾的 `.` 去掉、转小写；写成 Unicode、含下划线等第二节不接受的写法，报
+  `ADDRESS is not a name a domain rule can match: use labels of a-z, 0-9 and -, with punycode (xn--) for international names.`，以 2 退出。
+  既不是域名也不是 IPv4 地址的，仍报 `ADDRESS must be an IPv4 address.`。`*.example.com` 这样的写法是规则的模式，
+  不是一个名字，按不可用的名字拒绝。
+- 二期是否运行按离线校验的口径判断（第二节「离线校验」：`peerEgressDnsTakeover` 打开、池按默认 mesh 网段可用），
+  规则按 `select_domain_rule` 选（与应答时同一套）。出口是否声明 `domainTargetCapable` 要连上才知道，预演不判断。
+- 输出五行：
+
+  ```text
+  Preview for <名字> from the configuration (no connection is made)
+    takeover: on|off | dns takeover: on|off
+    rule: [<序号>] <match> <action> [<egressClientId>]    或    rule: none
+    dns: <见下>
+    result: <见下>
+  ```
+
+  `takeover` 照配置的 `peerEgressEnabled` 写，`dns takeover` 照 `peerEgressDnsTakeover` 写。
+  `dns` 一行：二期不运行时为 `not taken over (peerEgressDnsTakeover is off), so the name is resolved by the system's DNS`，
+  池不可用时括号里写 `peerEgressFakeIpCidr is not usable`；运行且规则是 `egress` 时为
+  `answered with a fake IP from <池>; the egress resolves the name`，是 `block` 时为 `answered with a fake IP from <池>`；
+  规则是 `direct` 或没有规则时为 `forwarded to the system's DNS; the address it returns is then decided by the IPv4 rules`。
+
+  `result` 一行：`egress` 为 `through egress <id>, which resolves the name itself`，`block` 为 `blocked`；
+  `direct` 或没有规则时为 `resolved by the system's DNS; egress test <that address> previews where it goes`。
+  规则是 `egress` 或 `block`、却因 `peerEgressEnabled` 关闭、DNS 接管关闭或池不可用而不生效时，写
+  `domain rules are not in force (<takeover is off | dns takeover is off | peerEgressFakeIpCidr is not usable>); with them on: <上面那句>`，
+  括号里按这个顺序取第一个成立的原因。
+- `--json` 的 `data`：`{"configPath", "address": <归一化后的名字>, "kind": "domain", "takeover", "dnsTakeover",
+  "matchedRuleIndex"（没有为 -1）, "ruleAction"?, "egressClientId"?, "dns": "local"|"fake"|"forward", "result": "egress"|"block"|"direct",
+  "resultWithTakeover"?}`。`dns` 为 `local` 表示二期不运行；`resultWithTakeover` 只在规则因开关或池而不生效时出现。
+  IPv4 地址的 `data` 增加 `"kind": "address"`，其余不变。
+- `--connect PORT` 只接受 IPv4 地址：名字在这里解析，结果不代表出口那边的解析，报
+  `--connect needs an IPv4 address: a name would be resolved here, not by the egress.`，以 2 退出。
+- 本地页面与 Windows 桌面端的预演走同一个判断，输入域名时显示同样的信息。
+
 ## 七、状态查询增量
 
 `consumer.dns`：
