@@ -276,6 +276,109 @@ static int test_egress_catalog_domain_targets(void)
     return 0;
 }
 
+/* The most recent egress-config pushed to the named device, or NULL. */
+static const char *last_egress_config(const peer_test_context *ctx, const char *target)
+{
+    const char *found = NULL;
+    for (size_t i = 0; i < ctx->count; ++i) {
+        if (strcmp(ctx->signals[i].target, target) == 0
+            && contains(ctx->signals[i].message, "\"type\":\"egress-config\"")) {
+            found = ctx->signals[i].message;
+        }
+    }
+    return found;
+}
+
+/*
+ * The egress-config an enabled egress receives carries the saved domain rules next to the
+ * destination rules, and [] when there are none. The disabling push keeps its shape.
+ */
+static int test_egress_config_domain_rules(void)
+{
+    char path[] = "/tmp/specus_c_peer_egress_domain_tests.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) return 1;
+
+    st_storage_client consumer;
+    st_storage_client egress;
+    st_storage_peer_mesh_device device;
+    long long consumer_session = 0;
+    long long egress_session = 0;
+    st_storage_peer_mesh_egress_switch egress_switch;
+    memset(&egress_switch, 0, sizeof(egress_switch));
+    snprintf(egress_switch.tenant_id, sizeof(egress_switch.tenant_id), "%s", "tenant-egress");
+    egress_switch.enabled = 1;
+    snprintf(egress_switch.updated_by, sizeof(egress_switch.updated_by), "%s", "admin");
+    if (st_storage_upsert_client(path, 0, "tenant-egress", "egress-consumer", "owner", 1, 60, &consumer) != 0
+        || st_storage_upsert_client(path, 0, "tenant-egress", "egress-plain", "owner", 1, 60, &egress) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &consumer, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &egress, 1, &device) != 0
+        || st_storage_upsert_peer_mesh_egress_switch(path, &egress_switch) != 0
+        || add_egress_policy(path, &egress, consumer.id) != 0
+        || open_egress_session(path, &consumer, 0, &consumer_session) != 0
+        || open_egress_session(path, &egress, 1, &egress_session) != 0) {
+        fprintf(stderr, "egress domain rules fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+
+    egress_test_context context;
+    memset(&context, 0, sizeof(context));
+    st_peer_mesh_runtime runtime = {path, capture_egress_signal, egress_is_online, &context, 0, 2};
+    const char *config = NULL;
+    if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0
+        || (config = last_egress_config(&context.capture, "egress-plain")) == NULL
+        || !contains(config, "\"enabled\":true")
+        || !contains(config, "\"portRanges\":[[443,443]]}],\"domainRules\":[],\"limits\":")) {
+        fprintf(stderr, "an enabled egress-config without domain rules lacked domainRules: []: %s\n",
+                config == NULL ? "(none)" : config);
+        unlink(path);
+        return 1;
+    }
+
+    st_storage_peer_mesh_egress_policy policy;
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "tenant-egress", egress.id, &policy) != 0) {
+        unlink(path);
+        return 1;
+    }
+    snprintf(policy.domain_rules, sizeof(policy.domain_rules),
+             "[{\"match\":\"*.cdn.example\",\"protocols\":[\"tcp\",\"udp\"],\"portRanges\":[[443,443]]}]");
+    context.capture.count = 0;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &policy, NULL) != 0
+        || st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0
+        || (config = last_egress_config(&context.capture, "egress-plain")) == NULL
+        || !contains(config, "\"domainRules\":[{\"match\":\"*.cdn.example\",\"protocols\":[\"tcp\",\"udp\"],"
+                             "\"portRanges\":[[443,443]]}]")) {
+        fprintf(stderr, "egress-config did not carry the saved domain rules: %s\n",
+                config == NULL ? "(none)" : config);
+        unlink(path);
+        return 1;
+    }
+    const char *catalog = last_egress_catalog(&context.capture, "egress-consumer");
+    if (catalog == NULL || contains(catalog, "domainRules") || contains(catalog, "cdn.example")) {
+        fprintf(stderr, "egress-catalog leaked the domain rules: %s\n", catalog == NULL ? "(none)" : catalog);
+        unlink(path);
+        return 1;
+    }
+
+    policy.enabled = 0;
+    context.capture.count = 0;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &policy, NULL) != 0
+        || st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0
+        || (config = last_egress_config(&context.capture, "egress-plain")) == NULL
+        || !contains(config, "\"enabled\":false,\"allowedConsumerClientIds\":[],\"destinationRules\":[],")
+        || contains(config, "domainRules")) {
+        fprintf(stderr, "the disabling egress-config changed shape: %s\n", config == NULL ? "(none)" : config);
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
+}
+
 int main(void)
 {
     char path[] = "/tmp/specus_c_peer_mesh_tests.XXXXXX";
@@ -570,6 +673,7 @@ int main(void)
 
     unlink(path);
     if (test_egress_catalog_domain_targets() != 0) return 1;
+    if (test_egress_config_domain_rules() != 0) return 1;
     printf("peer mesh tests passed\n");
     return 0;
 }

@@ -248,8 +248,18 @@ static int test_peer_mesh_egress_policy_round_trip(void)
     if (saved.id <= 0 || saved.egress_client_id != 2002 || !saved.enabled
         || strcmp(saved.scope, ST_EGRESS_SCOPE_PUBLIC) != 0
         || strcmp(saved.destination_rules, policy.destination_rules) != 0
+        || strcmp(saved.domain_rules, "[]") != 0
         || saved.max_flows_per_consumer != 64) {
         fprintf(stderr, "egress policy did not round trip\n");
+        failures++;
+    }
+    snprintf(saved.domain_rules, sizeof(saved.domain_rules),
+             "[{\"match\":\"*.cdn.example\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+    st_storage_peer_mesh_egress_policy with_names;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &saved, &with_names) != 0
+        || strcmp(with_names.domain_rules, saved.domain_rules) != 0
+        || strcmp(with_names.destination_rules, policy.destination_rules) != 0) {
+        fprintf(stderr, "egress policy domain rules did not round trip\n");
         failures++;
     }
 
@@ -297,6 +307,69 @@ static int test_peer_mesh_egress_policy_round_trip(void)
     }
     unlink(path);
     return failures;
+}
+
+/*
+ * An egress policy table from before domain rules. Startup must add the column rather than fail on
+ * the new SELECT/INSERT lists, and a policy already there must read as granting no name.
+ */
+static int test_peer_mesh_egress_domain_rules_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-egress-domain-migration-%ld.db", (long)getpid());
+    unlink(path);
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy_schema =
+        "CREATE TABLE peer_mesh_egress_policy ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,owner_username TEXT NOT NULL,"
+        "egress_client_id INTEGER NOT NULL,egress_client_name TEXT NOT NULL,"
+        "enabled INTEGER NOT NULL DEFAULT 0,scope TEXT NOT NULL DEFAULT 'PUBLIC',"
+        "allowed_consumer_client_ids TEXT,destination_rules TEXT,"
+        "max_concurrent_flows INTEGER NOT NULL DEFAULT 256,"
+        "max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,"
+        "idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE(tenant_id,egress_client_id));"
+        "INSERT INTO peer_mesh_egress_policy(tenant_id,owner_username,egress_client_id,egress_client_name,"
+        "enabled,scope,allowed_consumer_client_ids,destination_rules) "
+        "VALUES('default','owner',2002,'office-gateway',1,'PUBLIC','1001',"
+        "'[{\"cidr\":\"203.0.113.0/24\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]');";
+    if (sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_exec(db, legacy_schema, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "egress policy legacy schema setup failed: %s\n",
+                error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "egress policy domain rules migration failed\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_peer_mesh_egress_policy legacy;
+    if (st_storage_find_peer_mesh_egress_policy_by_client(path, "default", 2002, &legacy) != 0
+        || strcmp(legacy.domain_rules, "[]") != 0
+        || strstr(legacy.destination_rules, "203.0.113.0/24") == NULL) {
+        fprintf(stderr, "a migrated egress policy did not read as granting no name\n");
+        unlink(path);
+        return 1;
+    }
+    snprintf(legacy.domain_rules, sizeof(legacy.domain_rules),
+             "[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+    st_storage_peer_mesh_egress_policy saved;
+    if (st_storage_upsert_peer_mesh_egress_policy(path, &legacy, &saved) != 0
+        || strcmp(saved.domain_rules, legacy.domain_rules) != 0) {
+        fprintf(stderr, "domain rules could not be saved after the migration\n");
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
 }
 
 /*
@@ -404,6 +477,9 @@ int main(void)
         return 1;
     }
     if (test_peer_mesh_egress_policy_round_trip() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_egress_domain_rules_migration() != 0) {
         return 1;
     }
     if (test_peer_mesh_egress_activity_round_trip() != 0) {

@@ -89,6 +89,12 @@
 /* Matches the column width in every schema dialect. */
 #define ST_EGRESS_MAX_DESTINATION_RULES_BYTES 4096
 
+/* Domain rules of an egress policy, limited apart from the destination rules. */
+#define ST_EGRESS_MAX_DOMAIN_RULES 64
+#define ST_EGRESS_MAX_DOMAIN_RULES_BYTES 4096
+/* The longest stored match: "*." and a 253-byte name. */
+#define ST_EGRESS_MAX_DOMAIN_MATCH 255
+
 /*
  * An IPv4 prefix.
  *
@@ -315,6 +321,26 @@ int st_egress_normalize_destination_rules(const char *json, char **out_json);
  * list exceeds the stored limits.
  */
 char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules, size_t rules_len);
+
+/*
+ * Validates the domain rules of a policy saved through the management API and returns the form to
+ * store, as fixed by the management half of protocol/test-vectors/peer-egress-domain-policy-v1.json
+ * (protocol/spec/peer-egress.md, 按域名授权).
+ *
+ * A match is written the way a consumer writes a domain rule (protocol/spec/peer-egress-dns.md):
+ * name or *.name, punycode for IDN. It is stored trimmed, without its trailing dot and in lower case.
+ * What would grant more than a name -- an address or CIDR, which belongs in the destination rules,
+ * a single label, a bare * or a wildcard over one label -- refuses the whole list, as does anything
+ * the egress could not read. Protocols and port ranges follow the destination rules; at most
+ * ST_EGRESS_MAX_DOMAIN_RULES rules and ST_EGRESS_MAX_DOMAIN_RULES_BYTES stored bytes, counted apart
+ * from them. A top-level null is refused; whether it means "leave the rules as they are" is the
+ * caller's decision.
+ *
+ * Returns 0 and sets *out_json to a malloc'd compact JSON array the caller frees, or nonzero with
+ * *out_json NULL when the request must be refused. A stored list is canonical, so it normalises to
+ * itself.
+ */
+int st_egress_normalize_domain_rules(const char *json, char **out_json);
 
 /* Collects the distinct protocols an allowlist mentions, in first-seen order. */
 size_t st_egress_collect_protocols(const st_egress_destination_rule *rules,
