@@ -1683,6 +1683,14 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(4096)")
                         .HasColumnName("destination_rules");
 
+                    b.Property<string>("DomainRules")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(4096)
+                        .HasColumnType("character varying(4096)")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("domain_rules");
+
                     b.Property<long>("EgressClientId")
                         .HasColumnType("bigint")
                         .HasColumnName("egress_client_id");

@@ -49,13 +49,27 @@ type egressFlow struct {
 
 	// Name is the name the consumer had bound to the flow's address when the flow opened, and ""
 	// for a flow dialled to the address itself. A later name-bind for the address closes the flows
-	// not opened for that name.
+	// not opened for that name. A domain rule can grant the flow only through this name.
 	Name string
+
+	// Destination is the address the flow was authorized for and its socket dialled to. It differs
+	// from the key's remote address only for a flow opened for a name: the key keeps the consumer's
+	// fake address, so replies come back from it, while the socket goes to what the name resolved
+	// to. Zero, for an entry opened without one, stands for the key's address.
+	Destination uint32
 
 	// Handle is whatever the caller attached: a tcpConn, a UDP socket, a cancel function. The
 	// table stores it so that everything needed to tear a flow down travels with the entry that
 	// authorises it, and never reads it.
 	Handle any
+}
+
+// dialled is the address the flow's socket goes to.
+func (f *egressFlow) dialled() uint32 {
+	if f.Destination != 0 {
+		return f.Destination
+	}
+	return f.Key.remoteIP
 }
 
 // egressFlowTable holds every flow this node is currently forwarding.
@@ -257,6 +271,10 @@ func (t *egressFlowTable) drain() []*egressFlow {
 //
 // The limit fields are deliberately not re-checked here. Lowering a quota should stop the next
 // flow, not pick live ones to kill, and a limit breach is not a permission the flow lost.
+//
+// A flow opened for a name is judged as it was opened: the address its socket was dialled to, with
+// the name. Its key's fake address is not where it goes, and without the name a flow that only a
+// domain rule granted would be revoked by every push, the one that still grants it included.
 func (t *egressFlowTable) reauthorize(policy egressPolicy, peerACLAllows func(consumer int64) bool,
 	context egressContext, localInterfaceCIDRs []string) []egressRevocation {
 	codes := make(map[egressFlowKey]string)
@@ -267,9 +285,10 @@ func (t *egressFlowTable) reauthorize(policy egressPolicy, peerACLAllows func(co
 		}
 		decision := authorizeEgressFlow(egressRequest{
 			ConsumerClientID:    flow.Consumer,
-			DestinationIP:       formatEgressAddress(flow.Key.remoteIP),
+			DestinationIP:       formatEgressAddress(flow.dialled()),
 			DestinationPort:     int(flow.Key.remotePort),
 			Protocol:            flow.Key.protocolName(),
+			Name:                flow.Name,
 			LocalInterfaceCIDRs: localInterfaceCIDRs,
 		}, policy, allowed, context)
 		if decision.Allowed {

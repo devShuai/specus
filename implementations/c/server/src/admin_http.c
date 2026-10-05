@@ -4307,6 +4307,14 @@ static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
         const char *stored = policy->destination_rules[0] == '\0' ? "[]" : policy->destination_rules;
         rc = admin_sb_append(builder, stored);
     }
+    if (rc == 0) rc = admin_sb_append(builder, ",\"domainRules\":");
+    if (rc == 0) {
+        /* Read back through the normaliser, so a row that cannot be read shows as granting no name. */
+        char *domain_rules = NULL;
+        rc = admin_sb_append(builder,
+            st_egress_normalize_domain_rules(policy->domain_rules, &domain_rules) == 0 ? domain_rules : "[]");
+        free(domain_rules);
+    }
     if (rc == 0) rc = admin_sb_appendf(builder,
         ",\"maxConcurrentFlows\":%d,\"maxFlowsPerConsumer\":%d,\"idleTimeoutSeconds\":%d,\"createdAt\":",
         policy->max_concurrent_flows, policy->max_flows_per_consumer, policy->idle_timeout_seconds);
@@ -4551,6 +4559,7 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
         memset(&policy, 0, sizeof(policy));
         snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
         snprintf(policy.destination_rules, sizeof(policy.destination_rules), "[]");
+        snprintf(policy.domain_rules, sizeof(policy.domain_rules), "[]");
         policy.max_concurrent_flows = 256;
         policy.max_flows_per_consumer = 64;
         policy.idle_timeout_seconds = 60;
@@ -4612,6 +4621,25 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
         }
     } else {
         free(rules_raw);
+    }
+
+    char *domain_rules_raw = st_json_get_top_level_raw(body, "domainRules");
+    /* Like destinationRules, null leaves the stored rules as they are. */
+    if (domain_rules_raw != NULL && strcmp(domain_rules_raw, "null") != 0) {
+        char *normalized = NULL;
+        int rc = st_egress_normalize_domain_rules(domain_rules_raw, &normalized) != 0
+            || strlen(normalized) >= sizeof(policy.domain_rules);
+        if (rc == 0) snprintf(policy.domain_rules, sizeof(policy.domain_rules), "%s", normalized);
+        free(normalized);
+        free(domain_rules_raw);
+        if (rc != 0) {
+            return write_response(out, out_len, 400, "Bad Request",
+                "{\"error\":\"invalid domainRules: each rule needs a match written as name or *.name with "
+                "at least two labels, tcp or udp protocols and [low, high] port ranges within 0-65535; at most "
+                "64 rules, 32 ranges per rule and 4096 bytes stored\"}");
+        }
+    } else {
+        free(domain_rules_raw);
     }
 
     int value = 0;

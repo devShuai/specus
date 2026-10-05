@@ -117,6 +117,12 @@ public sealed class PeerMeshEgressPolicy
     /// state.
     /// </summary>
     public string DestinationRules { get; set; } = "[]";
+
+    /// <summary>
+    /// A canonical JSON array of <c>{match, protocols, portRanges}</c> objects. Empty grants no
+    /// name.
+    /// </summary>
+    public string DomainRules { get; set; } = "[]";
     public int MaxConcurrentFlows { get; set; } = 256;
     public int MaxFlowsPerConsumer { get; set; } = 64;
     public int IdleTimeoutSeconds { get; set; } = 60;

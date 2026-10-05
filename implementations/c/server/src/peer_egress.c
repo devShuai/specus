@@ -944,6 +944,61 @@ int st_egress_normalize_destination_rules(const char *json, char **out_json)
     return rc;
 }
 
+/* Appends text within capacity. Returns 0, or 1 when it does not fit. */
+static int append_text(char *out, size_t capacity, size_t *used, const char *text)
+{
+    size_t len = strlen(text);
+    if (len >= capacity - *used) {
+        return 1;
+    }
+    memcpy(out + *used, text, len + 1U);
+    *used += len;
+    return 0;
+}
+
+/* Appends a JSON string within capacity. Returns 0, or 1 when it does not fit. */
+static int append_json_string(char *out, size_t capacity, size_t *used, const char *value)
+{
+    char *escaped = st_json_escape(value);
+    if (escaped == NULL) {
+        return 1;
+    }
+    int rc = append_text(out, capacity, used, "\"") != 0
+        || append_text(out, capacity, used, escaped) != 0
+        || append_text(out, capacity, used, "\"") != 0 ? 1 : 0;
+    free(escaped);
+    return rc;
+}
+
+/*
+ * Appends the "protocols" and "portRanges" members a destination rule and a domain rule share.
+ * Returns 0, or 1 when they do not fit within capacity.
+ */
+static int append_rule_traffic(char *out, size_t capacity, size_t *used, const st_egress_destination_rule *rule)
+{
+    if (append_text(out, capacity, used, "\"protocols\":[") != 0) {
+        return 1;
+    }
+    for (size_t p = 0U; p < rule->protocols_len; p++) {
+        if ((p > 0U && append_text(out, capacity, used, ",") != 0)
+            || append_json_string(out, capacity, used, rule->protocols[p]) != 0) {
+            return 1;
+        }
+    }
+    if (append_text(out, capacity, used, "],\"portRanges\":[") != 0) {
+        return 1;
+    }
+    for (size_t r = 0U; r < rule->port_ranges_len; r++) {
+        char pair[32];
+        int written = snprintf(pair, sizeof(pair), "%s[%d,%d]", r == 0U ? "" : ",",
+                               rule->port_ranges[r][0], rule->port_ranges[r][1]);
+        if (written < 0 || (size_t)written >= sizeof(pair) || append_text(out, capacity, used, pair) != 0) {
+            return 1;
+        }
+    }
+    return append_text(out, capacity, used, "]");
+}
+
 char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules, size_t rules_len)
 {
     if (rules_len > ST_EGRESS_MAX_DESTINATION_RULES) {
@@ -954,69 +1009,199 @@ char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules
     if (out == NULL) {
         return NULL;
     }
+    out[0] = '\0';
     size_t used = 0U;
-    int written = snprintf(out, capacity, "[");
-    if (written < 0) {
-        free(out);
-        return NULL;
+    int rc = append_text(out, capacity, &used, "[");
+    for (size_t i = 0U; rc == 0 && i < rules_len; i++) {
+        rc = append_text(out, capacity, &used, i == 0U ? "{\"cidr\":" : ",{\"cidr\":") != 0
+            || append_json_string(out, capacity, &used, rules[i].cidr) != 0
+            || append_text(out, capacity, &used, ",") != 0
+            || append_rule_traffic(out, capacity, &used, &rules[i]) != 0
+            || append_text(out, capacity, &used, "}") != 0 ? 1 : 0;
     }
-    used = (size_t)written;
-    for (size_t i = 0U; i < rules_len; i++) {
-        char *escaped = st_json_escape(rules[i].cidr);
-        if (escaped == NULL) {
-            free(out);
-            return NULL;
-        }
-        written = snprintf(out + used, capacity - used, "%s{\"cidr\":\"%s\",\"protocols\":[",
-                           i == 0U ? "" : ",", escaped);
-        free(escaped);
-        if (written < 0 || (size_t)written >= capacity - used) {
-            free(out);
-            return NULL;
-        }
-        used += (size_t)written;
-        for (size_t p = 0U; p < rules[i].protocols_len; p++) {
-            char *protocol = st_json_escape(rules[i].protocols[p]);
-            if (protocol == NULL) {
-                free(out);
-                return NULL;
-            }
-            written = snprintf(out + used, capacity - used, "%s\"%s\"", p == 0U ? "" : ",", protocol);
-            free(protocol);
-            if (written < 0 || (size_t)written >= capacity - used) {
-                free(out);
-                return NULL;
-            }
-            used += (size_t)written;
-        }
-        written = snprintf(out + used, capacity - used, "],\"portRanges\":[");
-        if (written < 0 || (size_t)written >= capacity - used) {
-            free(out);
-            return NULL;
-        }
-        used += (size_t)written;
-        for (size_t r = 0U; r < rules[i].port_ranges_len; r++) {
-            written = snprintf(out + used, capacity - used, "%s[%d,%d]", r == 0U ? "" : ",",
-                               rules[i].port_ranges[r][0], rules[i].port_ranges[r][1]);
-            if (written < 0 || (size_t)written >= capacity - used) {
-                free(out);
-                return NULL;
-            }
-            used += (size_t)written;
-        }
-        written = snprintf(out + used, capacity - used, "]}");
-        if (written < 0 || (size_t)written >= capacity - used) {
-            free(out);
-            return NULL;
-        }
-        used += (size_t)written;
+    if (rc == 0) {
+        rc = append_text(out, capacity, &used, "]");
     }
-    written = snprintf(out + used, capacity - used, "]");
-    if (written < 0 || (size_t)written >= capacity - used) {
+    if (rc != 0) {
         free(out);
         return NULL;
     }
     return out;
+}
+
+/* One label of a name: 1-63 of a-z, 0-9 and -, not starting or ending with -. */
+static int valid_domain_label(const char *label, size_t len)
+{
+    if (len == 0U || len > 63U || label[0] == '-' || label[len - 1U] == '-') {
+        return 0;
+    }
+    for (size_t i = 0U; i < len; i++) {
+        char c = label[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * The consumer's domain-rule syntax (protocol/spec/peer-egress-dns.md): name or *.name, every label
+ * 1-63 of a-z, 0-9 and an inner -, at most 253 bytes after the *. part, at least two labels and not
+ * all of them digits, punycode for IDN. Text with neither a leading * nor a letter is an address,
+ * not a name. Writes the stored form -- trailing dots removed, lower case -- and returns 0.
+ */
+static int normalize_domain_match(const char *text, char *out, size_t out_len)
+{
+    size_t len = strlen(text);
+    if (len == 0U) {
+        return 1;
+    }
+    int letter = 0;
+    for (size_t i = 0U; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c > 0x7FU) {
+            /* Unicode has to be written as punycode; it is refused rather than read as an address. */
+            return 1;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            letter = 1;
+        }
+    }
+    if (!letter && text[0] != '*') {
+        return 1;
+    }
+    while (len > 0U && text[len - 1U] == '.') {
+        len--;
+    }
+    if (len >= out_len) {
+        return 1;
+    }
+    for (size_t i = 0U; i < len; i++) {
+        char c = text[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    out[len] = '\0';
+    const char *host = strncmp(out, "*.", 2U) == 0 ? out + 2 : out;
+    size_t host_len = strlen(host);
+    if (host_len == 0U || host_len > 253U || strchr(host, '*') != NULL) {
+        return 1;
+    }
+    size_t labels = 0U;
+    int all_digits = 1;
+    for (const char *label = host;;) {
+        const char *dot = strchr(label, '.');
+        size_t label_len = dot == NULL ? strlen(label) : (size_t)(dot - label);
+        if (!valid_domain_label(label, label_len)) {
+            return 1;
+        }
+        for (size_t i = 0U; i < label_len; i++) {
+            if (label[i] < '0' || label[i] > '9') {
+                all_digits = 0;
+            }
+        }
+        labels++;
+        if (dot == NULL) {
+            break;
+        }
+        label = dot + 1;
+    }
+    return labels < 2U || all_digits ? 1 : 0;
+}
+
+/* A domain rule while it is normalised; protocols and port ranges are read like a destination rule's. */
+typedef struct {
+    char match[ST_EGRESS_MAX_DOMAIN_MATCH + 1];
+    st_egress_destination_rule traffic;
+} egress_domain_rule;
+
+static int normalize_domain_rule(const char *raw, egress_domain_rule *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!st_json_is_valid_object(raw)) {
+        return 1;
+    }
+    char *field = st_json_get_top_level_raw(raw, "match");
+    /* Absent, null and non-string all fail here; an empty string fails the syntax check. */
+    char *text = decode_text(field);
+    free(field);
+    if (text == NULL) {
+        return 1;
+    }
+    int rc = normalize_domain_match(trim_in_place(text), out->match, sizeof(out->match));
+    free(text);
+    if (rc != 0) {
+        return 1;
+    }
+    return normalize_protocols(raw, &out->traffic) != 0 || normalize_port_ranges(raw, &out->traffic) != 0 ? 1 : 0;
+}
+
+/* Serialises normalised domain rules, or NULL when they exceed the stored byte limit. */
+static char *encode_domain_rules(const egress_domain_rule *rules, size_t rules_len)
+{
+    size_t capacity = ST_EGRESS_MAX_DOMAIN_RULES_BYTES + 1U;
+    char *out = (char *)malloc(capacity);
+    if (out == NULL) {
+        return NULL;
+    }
+    out[0] = '\0';
+    size_t used = 0U;
+    int rc = append_text(out, capacity, &used, "[");
+    for (size_t i = 0U; rc == 0 && i < rules_len; i++) {
+        rc = append_text(out, capacity, &used, i == 0U ? "{\"match\":" : ",{\"match\":") != 0
+            || append_json_string(out, capacity, &used, rules[i].match) != 0
+            || append_text(out, capacity, &used, ",") != 0
+            || append_rule_traffic(out, capacity, &used, &rules[i].traffic) != 0
+            || append_text(out, capacity, &used, "}") != 0 ? 1 : 0;
+    }
+    if (rc == 0) {
+        rc = append_text(out, capacity, &used, "]");
+    }
+    if (rc != 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+int st_egress_normalize_domain_rules(const char *json, char **out_json)
+{
+    if (out_json == NULL) {
+        return 1;
+    }
+    *out_json = NULL;
+    if (json == NULL || !st_json_is_valid(json)) {
+        return 1;
+    }
+    while (is_trim_space(*json)) {
+        json++;
+    }
+    char **items = NULL;
+    size_t items_len = 0U;
+    if (raw_array_items(json, &items, &items_len) != 0) {
+        return 1;
+    }
+    /* Counted before anything is parsed, so an oversized list is refused, never truncated. */
+    if (items_len > ST_EGRESS_MAX_DOMAIN_RULES) {
+        st_json_free_string_array(items, items_len);
+        return 1;
+    }
+    egress_domain_rule *rules = (egress_domain_rule *)calloc(items_len == 0U ? 1U : items_len, sizeof(*rules));
+    if (rules == NULL) {
+        st_json_free_string_array(items, items_len);
+        return 1;
+    }
+    int rc = 0;
+    for (size_t i = 0U; rc == 0 && i < items_len; i++) {
+        rc = normalize_domain_rule(items[i], &rules[i]);
+    }
+    st_json_free_string_array(items, items_len);
+    if (rc == 0) {
+        /* The encoder refuses a result over the stored byte limit, which is the last check. */
+        *out_json = encode_domain_rules(rules, items_len);
+        rc = *out_json == NULL ? 1 : 0;
+    }
+    free(rules);
+    return rc;
 }
 
 size_t st_egress_collect_protocols(const st_egress_destination_rule *rules,

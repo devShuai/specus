@@ -1,11 +1,13 @@
 package com.theshuai.specusserver.management.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
 import com.theshuai.common.peeregress.PeerEgressProtocol;
 import com.theshuai.common.peermesh.PeerControlMessage;
+import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
@@ -134,6 +136,50 @@ class PeerEgressServiceTests {
     }
 
     /**
+     * The egress-config an enabled egress receives carries the saved domain rules next to the
+     * destination rules, and an empty list when there are none. The disabling push keeps its shape.
+     */
+    @Test
+    void anEnabledPolicyPushesItsDomainRules() {
+        tenantEgressOn();
+        PeerMeshEgressPolicy policy = policy(List.of(1L));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT)).thenReturn(List.of(consumer, egress));
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(policyRepository.findByTenantIdAndEgressClientId(TENANT, 2L)).thenReturn(Optional.of(policy));
+
+        PeerControlMessage config = service.buildEgressConfig(egress, environment(1));
+        assertThat(config.getDomainRules()).isNotNull().isEmpty();
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(config)).contains("\"domainRules\":[]");
+
+        policy.setDomainRules(PeerEgressService.encodeDomainRules(PeerEgressService.normalizeDomainRules(List.of(
+                new PeerEgressService.DomainRuleMutation("*.CDN.example.", List.of("UDP", "tcp"),
+                        List.of(List.of(443, 443)))))));
+        config = service.buildEgressConfig(egress, environment(1));
+        assertThat(config.getDomainRules()).hasSize(1);
+        assertThat(config.getDomainRules().get(0).getMatch()).isEqualTo("*.cdn.example");
+        assertThat(config.getDomainRules().get(0).getProtocols()).containsExactly("udp", "tcp");
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(config)).contains(
+                "\"domainRules\":[{\"match\":\"*.cdn.example\",\"protocols\":[\"udp\",\"tcp\"],\"portRanges\":[[443,443]]}]");
+        assertThat(config.getDestinationRules()).hasSize(1);
+
+        policy.setEnabled(false);
+        PeerControlMessage disabled = service.buildEgressConfig(egress, environment(1));
+        assertThat(disabled.getEnabled()).isFalse();
+        assertThat(disabled.getDomainRules()).isNull();
+        assertThat(com.theshuai.common.util.JsonUtil.objectToString(disabled)).doesNotContain("domainRules");
+    }
+
+    /** An unreadable stored list grants no name rather than failing the push or the view. */
+    @Test
+    void unreadableStoredDomainRulesGrantNothing() {
+        assertThat(PeerEgressService.decodeDomainRules("{not json")).isEmpty();
+        assertThat(PeerEgressService.decodeDomainRules("")).isEmpty();
+        assertThat(PeerEgressService.decodeDomainRules(null)).isEmpty();
+        assertThat(PeerEgressService.encodeDomainRules(List.of())).isEqualTo("[]");
+    }
+
+    /**
      * A consumer learns which egress nodes exist, never what they are permitted to reach. Shipping
      * the destination allowlist would hand every peer a map of that node's network.
      */
@@ -157,6 +203,7 @@ class PeerEgressServiceTests {
         assertThat(catalog.getEgresses().get(0).getProtocols()).containsExactly("tcp");
         assertThat(catalog.getEgresses().get(0).isDomainTargetCapable()).isFalse();
         assertThat(catalog.getDestinationRules()).isNull();
+        assertThat(catalog.getDomainRules()).isNull();
     }
 
     @Test
@@ -218,12 +265,64 @@ class PeerEgressServiceTests {
         assertThat(catalog.getEgresses()).noneMatch(PeerEgressCatalogEntry::isIpv6TargetCapable);
     }
 
+    /**
+     * {@code egressVersion} is what each egress's current online session announced at login, and it
+     * is written even when it is {@code 0}: a consumer reads {@code 0} as an egress that cannot take
+     * a flow (an old client), but an absent field as an old server it cannot judge.
+     */
+    @Test
+    void theCatalogueCarriesTheEgressVersionEachOnlineEgressAnnounced() {
+        tenantEgressOn();
+        ClientAccount current = account(2, "office-gateway");
+        ClientAccount old = account(3, "home-gateway");
+        ClientAccount offline = account(4, "lab-gateway");
+        ClientAccount disabled = account(5, "spare-gateway");
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT))
+                .thenReturn(List.of(consumer, current, old, offline, disabled));
+        List<PeerMeshEgressPolicy> policies = new ArrayList<>();
+        for (ClientAccount egressAccount : List.of(current, old, offline, disabled)) {
+            when(clientAccountRepository.findByIdAndTenantId(egressAccount.getId(), TENANT))
+                    .thenReturn(Optional.of(egressAccount));
+            PeerMeshDevice device = new PeerMeshDevice();
+            device.setEnabled(egressAccount != disabled);
+            when(deviceRepository.findByTenantIdAndClientId(TENANT, egressAccount.getId()))
+                    .thenReturn(Optional.of(device));
+            PeerMeshEgressPolicy policy = policy(List.of(1L));
+            policy.setEgressClientId(egressAccount.getId());
+            policy.setEgressClientName(egressAccount.getClientName());
+            policies.add(policy);
+        }
+        when(policyRepository.findByTenantIdAndEnabledTrueOrderByEgressClientNameAsc(TENANT))
+                .thenReturn(policies);
+        onlineSession(current, 1, false);
+        // An old client is online but announced no clientEgressCapabilities.
+        onlineSession(old, 0, false);
+        // lab-gateway has no online session, whatever an earlier login announced. spare-gateway has
+        // one that announced version 1, but the catalogue lists the device as offline.
+        onlineSession(disabled, 1, false);
+
+        PeerControlMessage catalog = service.buildEgressCatalog(consumer, environment(1));
+
+        assertThat(catalog.getEgresses().stream().collect(Collectors.toMap(
+                PeerEgressCatalogEntry::getClientId, PeerEgressCatalogEntry::getEgressVersion)))
+                .containsExactlyInAnyOrderEntriesOf(Map.of(2L, 1, 3L, 0, 4L, 0, 5L, 0));
+        JsonNode wire = JsonUtil.readString(JsonUtil.objectToString(catalog)).get("egresses");
+        assertThat(wire).hasSize(4);
+        wire.forEach(entry -> assertThat(entry.has("egressVersion")).as(entry.toString()).isTrue());
+    }
+
     private void onlineSession(ClientAccount account, boolean domainTargets) {
+        onlineSession(account, 1, domainTargets);
+    }
+
+    private void onlineSession(ClientAccount account, int egressVersion, boolean domainTargets) {
         ClientSession session = new ClientSession();
         session.setTenantId(TENANT);
         session.setClientId(account.getId());
         session.setStatus(ClientAuthService.STATUS_NETTY_ONLINE);
-        session.setClientEgressVersion(1);
+        session.setClientEgressVersion(egressVersion);
         session.setClientEgressDomainTargets(domainTargets);
         when(clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
                 TENANT, List.of(account.getId()), ClientAuthService.STATUS_NETTY_ONLINE))

@@ -12,10 +12,11 @@ import (
 // The consumer data plane: packets leaving the TUN, and the replies coming back.
 //
 // The rule that shapes this file is that a destination matched by an egress rule must never quietly
-// go out locally. If the egress is offline, its authorization has been withdrawn, or the flow
-// cannot be opened, the packet is dropped. Falling back to the local stack would send the user's
-// traffic from the address they arranged for it not to come from, which is worse than the
-// connection failing, because it fails silently and in the direction they were guarding against.
+// go out locally. If the egress is offline, its authorization has been withdrawn, the server's
+// catalogue says it cannot take the flow, or the flow cannot be opened, the packet is dropped.
+// Falling back to the local stack would send the user's traffic from the address they arranged for
+// it not to come from, which is worse than the connection failing, because it fails silently and in
+// the direction they were guarding against.
 
 type egressConsumerOutcome int
 
@@ -97,6 +98,11 @@ type egressConsumer struct {
 	fakeIPCIDR string
 	fakeIP     *egressFakeIPPool
 	capable    map[int64]bool
+	// catalogReceived says a catalogue was accepted in this control session, and listed is what the
+	// last accepted one said about each egress it named. Together they give every egress a rule names
+	// its standing (egressCatalogStanding), which can block a flow the roster alone would let out.
+	catalogReceived bool
+	listed          map[int64]egressCatalogListing
 	// clock is what the status reads the pool's counts at, and what the responder's timers and
 	// forwards read when they fire; the data plane takes time as an argument, like everything else
 	// here.
@@ -144,6 +150,7 @@ func newEgressConsumer(logger *log.Logger, send func(int64, []byte) error, toTun
 		logger:   logger,
 		meshCIDR: egressDefaultMeshCIDR,
 		capable:  map[int64]bool{},
+		listed:   map[int64]egressCatalogListing{},
 		clock:    time.Now,
 
 		dnsForwardTimeout: egressDNSForwardTimeout,
@@ -199,8 +206,10 @@ func (c *egressConsumer) configureIn(rules []egressRule, meshCIDR, virtualIP, fa
 	return purge
 }
 
-// setDomainCapable replaces which egresses resolve names, from an accepted catalogue, and closes the
-// flows to names that an egress which no longer resolves them was carrying.
+// setDomainCapable replaces which egresses resolve names and closes the flows to names that an egress
+// which no longer resolves them was carrying. It leaves the standings as they are: it is the part of
+// a catalogue the steering vector models, and the mesh hands over a whole catalogue with
+// applyCatalog.
 func (c *egressConsumer) setDomainCapable(capable map[int64]bool, now time.Time) map[int64][]string {
 	c.mu.Lock()
 	c.capable = make(map[int64]bool, len(capable))
@@ -212,6 +221,31 @@ func (c *egressConsumer) setDomainCapable(capable map[int64]bool, now time.Time)
 	c.mu.Unlock()
 	c.writeResets(toTun, resets)
 	return purge
+}
+
+// applyCatalog takes what the catalogue now says: which egresses resolve names, which are listed and
+// the version each announced, and whether a catalogue was accepted in this control session. An
+// egress whose standing turns to one that blocks has its flows closed exactly as though it had gone
+// offline, and so does a flow to a name its egress no longer resolves.
+func (c *egressConsumer) applyCatalog(view egressCatalogView, now time.Time) map[int64][]string {
+	c.mu.Lock()
+	c.setCatalogLocked(view)
+	purge, resets := c.purgeInvalidatedLocked(now)
+	toTun := c.toTun
+	c.mu.Unlock()
+	c.writeResets(toTun, resets)
+	return purge
+}
+
+// setCatalogLocked stores a catalogue view without re-examining any flow.
+func (c *egressConsumer) setCatalogLocked(view egressCatalogView) {
+	c.catalogReceived = view.Received
+	c.listed = make(map[int64]egressCatalogListing, len(view.Listed))
+	c.capable = make(map[int64]bool, len(view.Listed))
+	for id, listing := range view.Listed {
+		c.listed[id] = listing
+		c.capable[id] = listing.DomainTargetCapable
+	}
 }
 
 // assignFakeIP hands out the pool address for a name the DNS responder is answering (step four of
@@ -293,7 +327,7 @@ func (c *egressConsumer) purgeInvalidatedLocked(now time.Time) (map[int64][]stri
 		steering := c.steerLocked(key.remoteIP, now, false)
 		stillOurs := steering.claimed && steering.blocked == "" &&
 			steering.egress == flow.Egress &&
-			c.online[flow.Egress] &&
+			c.egressBlockLocked(flow.Egress) == "" &&
 			(steering.name == "" || c.capable[flow.Egress])
 		if stillOurs {
 			continue
@@ -335,6 +369,65 @@ func sortedUniqueStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+// The catalogue standing of an egress a rule names (protocol/spec/peer-egress.md, 能力不支持;
+// protocol/test-vectors/peer-egress-standing-v1.json).
+const (
+	// egressStandingUnknown: no catalogue accepted in this control session. An older server never
+	// sends one, so this is not a reason to block.
+	egressStandingUnknown = "unknown"
+	// egressStandingNotOffered: a catalogue was accepted and does not list the egress. It is not an
+	// egress, its policy is off or does not allow this device, the mesh ACL does not allow it, or the
+	// tenant switch is off.
+	egressStandingNotOffered = "not-offered"
+	// egressStandingUnsupported: listed, with egressVersion 0. Its online session announced no peer
+	// egress, so its client is one that would drop every frame without a word.
+	egressStandingUnsupported = "unsupported"
+	// egressStandingOffered: listed with egressVersion 1 or more, or without the field, which is
+	// what an older server sends.
+	egressStandingOffered = "offered"
+)
+
+// egressCatalogStanding is what the catalogue says about one egress: received is whether a catalogue
+// was accepted in this control session, listed whether the last accepted one named the egress.
+func egressCatalogStanding(received, listed bool, listing egressCatalogListing) string {
+	switch {
+	case !received:
+		return egressStandingUnknown
+	case !listed:
+		return egressStandingNotOffered
+	case listing.VersionKnown && listing.Version < 1:
+		return egressStandingUnsupported
+	default:
+		return egressStandingOffered
+	}
+}
+
+// egressStandingBlock is the reason a flow to an egress a rule names is blocked, "" when it goes
+// out. Offline comes first: the catalogue cannot speak for a device that is not there. Each reason
+// is answered to the application in the same way, so it fails now rather than on its own timeout.
+func egressStandingBlock(online bool, standing string) string {
+	switch {
+	case !online:
+		return "egress-unavailable"
+	case standing == egressStandingNotOffered:
+		return "egress-not-offered"
+	case standing == egressStandingUnsupported:
+		return "egress-unsupported"
+	default:
+		return ""
+	}
+}
+
+func (c *egressConsumer) standingLocked(egress int64) string {
+	listing, listed := c.listed[egress]
+	return egressCatalogStanding(c.catalogReceived, listed, listing)
+}
+
+// egressBlockLocked is egressStandingBlock for one egress as this consumer knows it now.
+func (c *egressConsumer) egressBlockLocked(egress int64) string {
+	return egressStandingBlock(c.online[egress], c.standingLocked(egress))
 }
 
 // egressSteering is what the rules say about one destination, before anything about the packet
@@ -445,14 +538,15 @@ func (c *egressConsumer) handleOutbound(packet []byte, now time.Time) egressCons
 		c.mu.Unlock()
 		return egressOutcomeUnsupported
 	}
-	unavailable := ""
-	switch {
-	case !c.online[steering.egress]:
-		unavailable = "egress-unavailable"
-	case steering.name != "" && !c.capable[steering.egress]:
-		// Online, but the catalogue does not say it resolves names. Sending the name anyway would
-		// have it refused at the far end; resolving it here would send the traffic from the wrong
-		// network. Answered the same way as an egress that is not there.
+	// Offline, then what the catalogue says of the egress: not offered to this device, or running a
+	// client without peer egress. A flow sent to either is refused at the far end at best and
+	// dropped without a word at worst, so it is blocked here and counted under its own reason. The
+	// same holds for a rule by address and a rule by name.
+	unavailable := c.egressBlockLocked(steering.egress)
+	if unavailable == "" && steering.name != "" && !c.capable[steering.egress] {
+		// Online and not ruled out by the catalogue, but not said to resolve names. Sending the name
+		// anyway would have it refused at the far end; resolving it here would send the traffic
+		// from the wrong network. Answered the same way as an egress that is not there.
 		unavailable = "egress-no-domain"
 	}
 	if unavailable != "" {

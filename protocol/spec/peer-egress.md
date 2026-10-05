@@ -301,6 +301,7 @@ Linux 侧前缀与地址作为 argv 条目传给 `ip`，从来没有 shell 看�
 | `enabled` | 出口设备总开关，默认 `false` |
 | `allowedConsumerClientIds` | 允许使用该出口的设备 |
 | `destinationRules[]` | `cidr` + `protocols[]` + `portRanges[][]`。**默认空 = 全拒绝**，不存在「未配置即放行」 |
+| `domainRules[]` | `match` + `protocols[]` + `portRanges[][]`，按名字授权，只对带名字的流（二期 `name-bind`）起作用，见下文「按域名授权」。默认空 |
 | `scope` | `PUBLIC` 或 `LAN`。公网访问与对端局域网访问分开授权，互不隐含 |
 | `limits` | `maxConcurrentFlows`、`maxFlowsPerConsumer`、`idleTimeoutSeconds` 等 |
 
@@ -309,6 +310,22 @@ Linux 侧前缀与地址作为 argv 条目传给 `ip`，从来没有 shell 看�
 **服务端保存策略时校验目的规则**，与出口读取时的规则一致，不合格的整个请求以 400 拒绝、不做部分保存：`cidr` 去掉首尾空白后必须是出口能解析的 IPv4 地址或网段（点分十进制无前导零、前缀 0–32、主机位为零；单个地址即 `/32`，按原样保存）；`protocols` 去空白、转小写、按出现顺序去重后只能是 `tcp` 或 `udp`；`portRanges` 每项必须是 `[起, 止]` 两个整数、`0 ≤ 起 ≤ 止 ≤ 65535`，每条规则最多 32 段；最多 64 条规则，存储后的 JSON 不超过 4096 字节。空的 `protocols` 或 `portRanges` 仍然允许（等于全拒绝），缺省的列表按空列表保存。此前各服务端把这些输入原样保存，出口永远不会匹配它们。固定向量：`protocol/test-vectors/peer-egress-management-v1.json`。
 
 管理接口的错误状态码：请求体无法解析、字段不合法（包括开关请求缺少 `enabled`、部署端未启用 Peer Mesh 时开启）为 400，非租户 ADMIN 修改为 403，出口设备或策略不存在为 404。
+
+### 按域名授权
+
+目的规则授权的是地址。消费端用 `name-bind` 交给出口的名字，由出口自己解析，解析出的地址运维事先很难知道（CDN 会换），于是想放行一个站点的策略只能放行 `0.0.0.0/0`。`domainRules` 授权的是名字：一条带名字的流，除了包含其地址的目的规则，覆盖这个名字的域名规则也参与判定，用那条规则的协议与端口。
+
+- `match` 的写法与消费端的域名规则相同（[peer-egress-dns.md](peer-egress-dns.md#域名规则的写法与校验)）：`example.com` 只覆盖这个名字，`*.example.com` 覆盖它的任意子域、不含它本身；名字比较前去掉末尾的 `.` 并转小写。
+- 只有**带名字的流**看域名规则：名字是这条流按 `name-bind` 建立时绑定的那个。只按地址到达的流，域名规则一概不授权，哪怕它的地址恰好是某个被授权名字的解析结果——那样等于把名字授权变成了地址授权。
+- 解析出的地址照常先过**强制拒绝清单与 `scope`**，域名规则不能越过它们。名字解析到回环、云元数据、mesh 网段或（`PUBLIC` 下的）私有网段，仍在这两步被拒，DNS 重绑定的防线不变。
+- 策略刷新时，已有的带名字的流按**出口实际连接的地址**与它的名字重新判定，而不是流表键里的地址：键里存的是消费端的 fake-IP。
+- 目的、协议、端口三步看的是「包含地址的目的规则」与「覆盖名字的域名规则」的并集，错误码不变：两类规则都不命中为 `EGRESS_DEST_DENIED`，命中的规则都不允许该协议为 `EGRESS_PROTOCOL_DENIED`，允许该协议的都不允许该端口为 `EGRESS_PORT_DENIED`。域名规则只会多放行，不会收窄目的规则已经放行的流。
+
+服务端保存策略时校验 `domainRules`，规则不合格的整个请求以 400 拒绝：`match` 去掉首尾空白后必须是上述写法，按去掉末尾 `.`、转小写后的形式保存；看起来是地址或网段的写法（应写进 `destinationRules`）、单标签名字、单独的 `*` 与 `*.com` 这类只有一个标签的后缀都拒绝；`protocols` 与 `portRanges` 的规则与目的规则相同；最多 64 条，存储后的 JSON 不超过 4096 字节（与目的规则分别计算）。缺省按空列表保存。
+
+服务端在 `egress-config` 里随目的规则一起下发 `domainRules`，没有时为空数组。出口读这个字段：缺失或不是数组即没有域名规则；条目不是对象、`match` 不是合法写法、`protocols` 不是字符串数组、或 `portRanges` 不是由两个整数组成的数组的数组，跳过这一条，其余照常——读不懂的规则不能授权任何东西。缺省的 `protocols`、`portRanges` 按空列表读，这样的规则同样不放行任何流。旧出口不认识这个字段，照旧只看目的规则，结果只会更严。
+
+固定向量：`protocol/test-vectors/peer-egress-domain-policy-v1.json`，`management` 为服务端的保存与拒绝，`authorize` 为出口对带名字的流的判定。
 
 ### 强制拒绝清单
 
@@ -333,6 +350,8 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 ```
 
 `scope` 分类：`LAN` 为 RFC 1918 私有地址与 RFC 6598 共享地址空间；其余可路由地址为 `PUBLIC`。
+
+二期带名字的流，目的、协议、端口三步同时看覆盖其名字的 `domainRules`，见「按域名授权」；其余各步只看地址。
 
 授权撤销、出口关闭或设备停用时，**立即拒绝新流并清理受影响的已有流**，不等待空闲超时。
 
@@ -390,7 +409,38 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 `domainTargetCapable` 与 `ipv6TargetCapable` 独立于 `egressVersion`，这样二期上线时新旧客户端可以共存，不必靠版本号一刀切。
 
-消费端遇到不支持出口的对端或旧服务端时，**不降级、不静默直连**：出口侧不可用时命中规则的流量被阻断，状态查询里对应出口显示离线、拦截计数里记为 `egress-unavailable`。设计稿要求的「明确提示能力不支持」这一句提示尚未实现，见当前限制。升级默认关闭，不改变现有组网与服务共享行为。
+消费端遇到不支持出口的对端或旧服务端时，**不降级、不静默直连**，并说明原因，见下文「能力不支持」。升级默认关闭，不改变现有组网与服务共享行为。
+
+### 能力不支持
+
+规则只写出口的 `clientId`。在此之前，消费端判断出口能否接流只看 Peer Mesh 对端是否在线：一台在线、却运行着不支持出口的旧客户端的设备会照样收到流量，它不认识 SPEG1 帧，一言不发地丢掉，应用只能等到超时，状态里也看不出原因。
+
+消费端因此还要读 `egress-catalog`（下一节）。对每个被生效规则指向的出口，先得出它的**目录状态**（共享向量 `protocol/test-vectors/peer-egress-standing-v1.json`）：
+
+| 目录状态 | 何时 |
+| --- | --- |
+| `unknown` | 本控制 session 里还没有接受过目录。旧服务端从不下发目录，总是这个状态 |
+| `not-offered` | 接受过目录，目录里没有这个出口：它不是出口、策略未启用、未授权本机、基础 ACL 不允许，或总开关关闭 |
+| `unsupported` | 目录里有它，且 `egressVersion` 为 `0`：它当前在线的会话没有声明支持出口（旧客户端） |
+| `offered` | 目录里有它，`egressVersion` 至少为 `1`，或目录条目没有这个字段（旧服务端） |
+
+然后决定流量：出口离线时照旧阻断并计 `egress-unavailable`（目录说不了一台不在的设备）；在线时，`not-offered` 阻断并计 `egress-not-offered`，`unsupported` 阻断并计 `egress-unsupported`；`unknown` 与 `offered` 照常发往出口。`unknown` 不阻断，是为了不让旧服务端下已经可用的部署在升级客户端后失效。
+这两种新的阻断与 `egress-unavailable` 一样**应答**应用（TCP 回 RST、UDP 回 ICMP 不可达），并在目录状态变成阻断时像出口下线一样断开该出口上的流、发送 `flow-purge`。
+
+控制认证后 **30 秒**（向量里的 `catalogWaitSeconds`）仍没有接受过任何目录，状态里 `catalog` 记为 `none`，说明服务端可能太旧、不支持出口；在此之前为 `waiting`，接受过目录后为 `received`。还没有控制认证过、或控制连接断开到下一次认证之间，也是 `waiting`。`catalog` 与 `peers` 一样，只在消费端运行时出现。
+
+`egress` 命令面向人的输出给这三种情况各两行，三端逐字一致（`N` 是出口的 `clientId`）。出口仍按 `clientId` 逐个列出，每个出口按「离线、未提供、不支持、在线无路径」的顺序只报第一种成立的：
+
+```text
+    egress peer N: not offered to this device by the server's egress catalog
+      fix: ask an administrator to enable its egress policy and allow this device, and check the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally
+    egress peer N: online, but its client does not support peer egress
+      fix: upgrade the client on egress device N; until then its destinations are blocked, not sent locally
+    server: sent no egress catalog; it may be too old for peer egress
+      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself
+```
+
+最后一种只在 `catalog` 为 `none` 时出现一次，位于全部出口之后、路由下发失败之前。本地页面与 Windows 桌面端用同样的意思列出这些问题，顺序不作要求。
 
 ## 控制信令
 
@@ -409,6 +459,9 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
   "allowedConsumerClientIds": [1, 5],
   "destinationRules": [
     {"cidr": "203.0.113.0/24", "protocols": ["tcp"], "portRanges": [[80, 80], [443, 443]]}
+  ],
+  "domainRules": [
+    {"match": "*.example.com", "protocols": ["tcp"], "portRanges": [[443, 443]]}
   ],
   "limits": {"maxConcurrentFlows": 256, "maxFlowsPerConsumer": 64, "idleTimeoutSeconds": 60}
 }
@@ -442,11 +495,14 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
       "scope": "PUBLIC",
       "protocols": ["tcp", "udp"],
       "domainTargetCapable": false,
-      "ipv6TargetCapable": false
+      "ipv6TargetCapable": false,
+      "egressVersion": 1
     }
   ]
 }
 ```
+
+`egressVersion` 取该出口**当前在线会话**登录时声明的 `clientEgressCapabilities.version`（服务端归一化、已存在会话上的那个值），出口不在线或没有声明时为 `0`。消费端据此判断「能力不支持」（上一节）；旧服务端不发这个字段，消费端读作未知，不据此阻断。
 
 `domainTargetCapable` 取该出口**当前在线会话**登录时在 `clientEgressCapabilities` 里声明的值：服务端把它与 `version` 一起保存在会话上（会话表列 `client_egress_domain_targets`，布尔，默认 `false`，已有数据库在启动时补上）。出口不在线、或登录时没有声明，为 `false`。出口重新登录、声明变化时，随出口上线这一变化照常重新下发目录。此前四个服务端都固定写 `false`，消费端无从得知哪台出口能解析域名，二期的域名规则因此无法判断 `EGRESS_RULE_EGRESS_NO_DOMAIN`。`ipv6TargetCapable` 仍固定为 `false`：还没有客户端声明它。
 
@@ -454,7 +510,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 出口下线、设备停用、ACL 撤销或总开关关闭时立即下发 `egresses: []`。`egress-catalog` 只能由服务端发出；客户端上报该类型必须拒绝。
 
-**客户端只从这条消息里读 `domainTargetCapable`**，供二期的域名规则使用，解码规则见 [peer-egress-dns.md](peer-egress-dns.md#能力协商)（向量 `peer-egress-dns-v1.json` 的 `catalog`）。消费端判断出口是否可用，用的仍是 Peer Mesh 自己的对端在线状态，而不是目录的 `online`；目录里的 `scope`、`protocols` 等信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
+**客户端从这条消息里读三样东西**：哪些出口在目录里、各自的 `egressVersion`（上一节「能力不支持」），以及 `domainTargetCapable`（供二期的域名规则使用）。解码规则见 [peer-egress-dns.md](peer-egress-dns.md#能力协商)（向量 `peer-egress-dns-v1.json` 的 `catalog`）：`egressVersion` 只认非负整数，其他写法读作没有这个字段。消费端判断出口是否在线，用的仍是 Peer Mesh 自己的对端在线状态，而不是目录的 `online`；目录里的 `scope`、`protocols` 等信息目前不影响消费端行为，被出口拒绝的目标由 `flow-reject` 与状态里的 `rejected-<错误码>` 计数体现。
 
 ### `egress-report`
 
@@ -618,7 +674,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
       {"cidr": "203.0.113.0/24", "kind": "tun", "origin": "rule:203.0.113.0/24",
        "installed": false, "conflict": "203.0.113.0/24 via 192.0.2.1 dev eth0"}
     ],
-    "peers": [{"clientId": 42, "online": true, "path": "direct", "flows": 3}],
+    "peers": [{"clientId": 42, "online": true, "standing": "offered", "path": "direct", "flows": 3}],
+    "catalog": "received",
     "flows": 3,
     "blocked": {"egress-unavailable": 7},
     "routeError": "",
@@ -642,7 +699,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 
 **每个出口对端说明当前走哪条路径、承载多少流。** `path` 取 `direct`（发往对端的直连端点）、`relay`（经服务端中继）或 `none`（两者都还没有），按发送时的选择读取：已指定中继目标即为 `relay`，否则有直连端点即为 `direct`。`flows` 是本机发往该出口的活动流数。出口慢时人们先问的就是走的直连还是中继；在线却 `none` 的出口，规则已生效却无处可发，与离线同属问题。
 
-**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
+**面向人的输出在每个问题后给出处理办法**，三端与本地页面同一措辞：路由未装上——删除或缩小占用的路由、或修改规则，客户端每 60 秒重试；出口离线——启动该设备或恢复其连接，在此之前其目标被阻断而不是改走本机；在线但无路径——稍候，持续时检查两台设备到服务端的 UDP；出口未提供给本机（`standing` 为 `not-offered`）——请管理员在出口策略里启用它并允许本机，同时确认基础 ACL 与总开关；出口客户端不支持（`unsupported`）——把那台设备的客户端升级到支持出口的版本；服务端没有下发出口目录（`catalog` 为 `none`）——服务端可能太旧，升级服务端，在此之前出口能否使用以出口的拒绝为准；路由下发失败——错误含权限拒绝时以管理员或 root 运行并把 `peerMeshDevice` 设为 `auto`，否则按日志里失败的路由命令修正。经中继的出口可用，只计数不列为问题。
 
 **被拒的规则不贡献 `peers` 条目。** 否则状态会报告一个本节点永远不会发往的出口，看起来像一条生效规则有个健康的目的地。
 
@@ -655,6 +712,8 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | `rule` | 命中 `action=block` 的规则 |
 | `unsupported-protocol` | 命中 `egress` 规则但协议不承载，如 ICMP |
 | `egress-unavailable` | 规则指向的出口当前不可用（离线或尚未在线） |
+| `egress-not-offered` | 规则指向的出口在线，但服务端的出口目录没有向本机提供它 |
+| `egress-unsupported` | 规则指向的出口在线，但它的客户端没有声明支持出口（旧版本） |
 | `send-failed` | 交给出口的帧没能发出 |
 | `return-mesh-source` | 回程包的源地址落在 Peer Mesh 网段内，拒收 |
 | `return-no-flow` | 回程包找不到本机发起过的存活流，拒收 |
@@ -729,8 +788,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 - **macOS 的旁路下一跳同样是逐条解析的，没有批量。** 与 Windows 同一个原因：批量需要改三端共享的安装器接口。这边代价更小，一次 `route -n get` 是 26 ms。
 - **Windows 的安装与撤销路径没有在真机上执行过。** 改路由表要管理员权限，开发机上跑不到。查询侧是跑通了的：三端各有一条用例真的启动 PowerShell、读回整张路由表、解析出默认路由并报告为冲突，每次 CI 在 windows runner 上都会跑。安装、撤销、回滚与旁路下一跳解析只有固定向量的覆盖。
 - **Windows 的旁路下一跳是逐条解析的，没有批量。** 冲突检查靠整表读取批量化了，旁路没有：批量需要安装器把即将到来的路由告诉命令执行器，而那是三端共享接口的改动。旁路条目是控制端点、STUN、TURN 与对端地址，实践中是个位数，每条解析一次之后缓存。如果这个列表将来随 mesh 规模增长，这里要重做。
-- **客户端只从 `egress-catalog` 里读 `domainTargetCapable`，也不发送 `egress-report`。** 出口可用性取自 Peer Mesh 对端在线状态；管理接口的出口活动页目前总是空的。
-- **遇到不支持出口的对端或旧服务端时，没有专门的「能力不支持」提示。** 流量照样被阻断而不是走本地，状态里表现为出口离线与 `egress-unavailable` 计数，但不会说明原因是对端版本太旧。
+- **客户端不发送 `egress-report`。** 管理接口的出口活动页目前总是空的。出口是否在线取自 Peer Mesh 对端在线状态，不读目录的 `online`。
 - **路由表被改后最多滞后一拍（5 秒）才补回，这 5 秒内命中规则的目标会从本机直连出去，而不是被阻断。** 路由不在时内核按普通路由送出；切网与休眠恢复正是路由消失的场景。缩短它需要监听路由表变化事件（Linux netlink、Windows `NotifyRouteChange2`、macOS `PF_ROUTE`），三端各不相同，未做。
 - **控制连接断开不再撤销路由。** 断开只挂起：虚拟网卡、路由与对端会话全部保留，只停掉「替别人出口」这一侧——收不到撤销的出口不该再接新流。对端流量走 UDP，本来就不依赖服务端，所以断开期间已有的流照常。命中规则的流量仍然进隧道，由出口承载或被明确拒绝，不会落到本机默认路由。真正退出时才撤回。此前重连走完整重启路径，撤回全部条目并关闭网卡，实测有约 2 秒的窗口让命中规则的请求从消费端自己的地址直达目标。
 - **漂移修复只看路由表，不看策略路由。** Linux 只读主表：另一个 VPN 用 `ip rule` 把流量导去别的表时，本功能的路由在主表里看起来完好，实际路径可能已变，修复发现不了。

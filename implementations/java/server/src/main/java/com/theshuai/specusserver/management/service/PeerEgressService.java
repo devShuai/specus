@@ -13,6 +13,7 @@ import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerServiceDiscovery;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
+import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshEgressActivity;
@@ -51,6 +52,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -97,6 +99,7 @@ public class PeerEgressService {
                                  String scope,
                                  List<Long> allowedConsumerClientIds,
                                  List<DestinationRuleMutation> destinationRules,
+                                 List<DomainRuleMutation> domainRules,
                                  Integer maxConcurrentFlows,
                                  Integer maxFlowsPerConsumer,
                                  Integer idleTimeoutSeconds) {
@@ -112,6 +115,14 @@ public class PeerEgressService {
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record DestinationRuleMutation(String cidr, List<String> protocols, List<List<Object>> portRanges) {
+    }
+
+    /**
+     * One domain rule as the client sent it; {@link #normalizeDomainRules} turns it into what is
+     * stored. Port bounds are bound untyped for the same reason as in {@link DestinationRuleMutation}.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record DomainRuleMutation(String match, List<String> protocols, List<List<Object>> portRanges) {
     }
 
     /** Whether the tenant switch is on. Off by default: egress is opt-in for the tenant too. */
@@ -217,6 +228,9 @@ public class PeerEgressService {
             policy.setDestinationRules(encodeDestinationRules(
                     normalizeDestinationRules(mutation.destinationRules())));
         }
+        if (mutation.domainRules() != null) {
+            policy.setDomainRules(encodeDomainRules(normalizeDomainRules(mutation.domainRules())));
+        }
         if (mutation.maxConcurrentFlows() != null) {
             policy.setMaxConcurrentFlows(requirePositive(mutation.maxConcurrentFlows(), "maxConcurrentFlows"));
         }
@@ -255,6 +269,7 @@ public class PeerEgressService {
                 configured,
                 effective,
                 decodeDestinationRules(policy.getDestinationRules()),
+                decodeDomainRules(policy.getDomainRules()),
                 policy.getMaxConcurrentFlows(),
                 policy.getMaxFlowsPerConsumer(),
                 policy.getIdleTimeoutSeconds(),
@@ -488,6 +503,8 @@ public class PeerEgressService {
         message.setScope(policy.getScope());
         message.setAllowedConsumerClientIds(allowedConsumerIds(account, policy));
         message.setDestinationRules(decodeDestinationRules(policy.getDestinationRules()));
+        // Always present on an enabled push, empty when the policy has none.
+        message.setDomainRules(decodeDomainRules(policy.getDomainRules()));
 
         PeerEgressPolicy.PeerEgressLimits limits = new PeerEgressPolicy.PeerEgressLimits();
         limits.setMaxConcurrentFlows(policy.getMaxConcurrentFlows());
@@ -537,30 +554,46 @@ public class PeerEgressService {
             entry.setOnline(isDeviceEnabled(egress.get()));
             entry.setScope(policy.getScope());
             entry.setProtocols(protocolsOf(decodeDestinationRules(policy.getDestinationRules())));
-            entry.setDomainTargetCapable(entry.isOnline() && announcesDomainTargets(egress.get()));
+            EgressAnnouncement announced = entry.isOnline()
+                    ? announcementOf(egress.get())
+                    : EgressAnnouncement.NONE;
+            entry.setDomainTargetCapable(announced.domainTargets());
             // No client announces IPv6 targets yet.
             entry.setIpv6TargetCapable(false);
+            entry.setEgressVersion(announced.version());
             entries.add(entry);
         }
         message.setEgresses(entries);
         return message;
     }
 
+    /** What an egress's current online session announced at login, as the catalogue passes it on. */
+    private record EgressAnnouncement(int version, boolean domainTargets) {
+        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false);
+    }
+
     /**
-     * Whether the egress's current online session announced domain targets at login.
+     * The egress version and domain-target support the egress's current online session announced.
      *
      * <p>Read from the online session, like the egress version the signal path pushes with, rather
      * than from anything remembered about the device: an egress that went offline, or came back on
-     * a client without domain support, must not keep advertising it. Consumers rely on this to tell
-     * which egress can take a domain rule.
+     * an older client, must not keep advertising what it no longer offers. Consumers rely on the
+     * version to tell an egress that cannot take a flow at all (an old client, {@code 0}) and on
+     * domain targets to tell which egress can take a domain rule. Both come from one read so the two
+     * catalogue fields always describe the same sessions.
      */
-    private boolean announcesDomainTargets(ClientAccount egress) {
-        return clientSessionRepository
+    private EgressAnnouncement announcementOf(ClientAccount egress) {
+        List<ClientSession> online = clientSessionRepository
                 .findByTenantIdAndClientIdInAndStatus(egress.getTenantId(), List.of(egress.getId()),
-                        ClientAuthService.STATUS_NETTY_ONLINE)
-                .stream()
+                        ClientAuthService.STATUS_NETTY_ONLINE);
+        int version = online.stream()
+                .mapToInt(ClientSession::getClientEgressVersion)
+                .max()
+                .orElse(0);
+        boolean domainTargets = online.stream()
                 .anyMatch(session -> session.getClientEgressVersion() >= 1
                         && session.isClientEgressDomainTargets());
+        return new EgressAnnouncement(Math.max(version, 0), domainTargets);
     }
 
     /**
@@ -750,6 +783,138 @@ public class PeerEgressService {
         } catch (RuntimeException e) {
             // A row we cannot read must not widen access; treat it as deny-all and say so.
             log.warn("Peer egress destination rules are unreadable; treating the policy as deny-all");
+            return List.of();
+        }
+    }
+
+    /** Serialises domain rules for storage, enforcing their own stored limits. */
+    static String encodeDomainRules(List<PeerEgressPolicy.PeerEgressDomainRule> rules) {
+        if (rules == null || rules.isEmpty()) {
+            return "[]";
+        }
+        if (rules.size() > PeerMeshEgressPolicy.MAX_DOMAIN_RULES) {
+            throw new IllegalArgumentException("too many domain rules: " + rules.size()
+                    + " (at most " + PeerMeshEgressPolicy.MAX_DOMAIN_RULES + ")");
+        }
+        String json = JsonUtil.objectToString(rules);
+        if (json == null) {
+            throw new IllegalArgumentException("domain rules cannot be serialised");
+        }
+        if (json.getBytes(StandardCharsets.UTF_8).length > PeerMeshEgressPolicy.MAX_DOMAIN_RULES_BYTES) {
+            throw new IllegalArgumentException("domain rules exceed "
+                    + PeerMeshEgressPolicy.MAX_DOMAIN_RULES_BYTES + " bytes once stored");
+        }
+        return json;
+    }
+
+    /**
+     * The domain rules as they will be stored, or {@link IllegalArgumentException} for the whole
+     * list.
+     *
+     * <p>A match is written the way a consumer writes a domain rule
+     * ({@code protocol/spec/peer-egress-dns.md}) and stored trimmed, without its trailing dot and in
+     * lower case. What would grant more than a name refuses the whole request: an address or CIDR,
+     * which belongs in the destination rules, a single label, a bare {@code *} or a wildcard over
+     * one label. Protocols and port ranges follow the destination rules; the stored size is limited
+     * apart from them, in {@link #encodeDomainRules}.
+     *
+     * <p>Shared vector: {@code protocol/test-vectors/peer-egress-domain-policy-v1.json}
+     * ({@code management}).
+     */
+    static List<PeerEgressPolicy.PeerEgressDomainRule> normalizeDomainRules(List<DomainRuleMutation> rules) {
+        if (rules == null || rules.isEmpty()) {
+            return List.of();
+        }
+        if (rules.size() > PeerMeshEgressPolicy.MAX_DOMAIN_RULES) {
+            throw new IllegalArgumentException("too many domain rules: " + rules.size()
+                    + " (at most " + PeerMeshEgressPolicy.MAX_DOMAIN_RULES + ")");
+        }
+        List<PeerEgressPolicy.PeerEgressDomainRule> stored = new ArrayList<>(rules.size());
+        for (int index = 0; index < rules.size(); index++) {
+            DomainRuleMutation rule = rules.get(index);
+            String field = "domainRules[" + index + "]";
+            if (rule == null) {
+                throw new IllegalArgumentException(field + " must be an object");
+            }
+            PeerEgressPolicy.PeerEgressDomainRule normalized = new PeerEgressPolicy.PeerEgressDomainRule();
+            normalized.setMatch(normalizeDomainMatch(rule.match(), field));
+            normalized.setProtocols(normalizeProtocols(rule.protocols(), field));
+            normalized.setPortRanges(normalizePortRanges(rule.portRanges(), field));
+            stored.add(normalized);
+        }
+        return List.copyOf(stored);
+    }
+
+    private static final Pattern DOMAIN_LABEL = Pattern.compile("[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?");
+    private static final Pattern DIGITS = Pattern.compile("[0-9]+");
+
+    private static String normalizeDomainMatch(String raw, String field) {
+        String stored = domainMatchOrNull(raw == null ? "" : raw.strip());
+        if (stored == null) {
+            throw new IllegalArgumentException(field
+                    + ".match must be a name or *.name with at least two labels: " + raw);
+        }
+        return stored;
+    }
+
+    /**
+     * The consumer's domain-rule syntax: {@code name} or {@code *.name}, every label 1-63 of
+     * {@code a-z}, {@code 0-9} and an inner {@code -}, at most 253 bytes after the {@code *.} part,
+     * at least two labels and not all of them digits, punycode for IDN. Text with neither a leading
+     * {@code *} nor a letter is an address, not a name. Returns the stored form, or null.
+     */
+    private static String domainMatchOrNull(String text) {
+        if (text.isEmpty()) {
+            return null;
+        }
+        boolean letter = false;
+        for (int index = 0; index < text.length(); index++) {
+            char c = text.charAt(index);
+            if (c > 0x7F) {
+                // Unicode has to be written as punycode; it is refused rather than read as an address.
+                return null;
+            }
+            letter |= (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        }
+        if (!letter && !text.startsWith("*")) {
+            return null;
+        }
+        int end = text.length();
+        while (end > 0 && text.charAt(end - 1) == '.') {
+            end--;
+        }
+        String name = text.substring(0, end).toLowerCase(Locale.ROOT);
+        String host = name.startsWith("*.") ? name.substring(2) : name;
+        if (host.isEmpty() || host.length() > 253 || host.indexOf('*') >= 0) {
+            return null;
+        }
+        String[] labels = host.split("\\.", -1);
+        if (labels.length < 2) {
+            return null;
+        }
+        boolean allDigits = true;
+        for (String label : labels) {
+            if (!DOMAIN_LABEL.matcher(label).matches()) {
+                return null;
+            }
+            allDigits &= DIGITS.matcher(label).matches();
+        }
+        return allDigits ? null : name;
+    }
+
+    static List<PeerEgressPolicy.PeerEgressDomainRule> decodeDomainRules(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return List.of();
+        }
+        try {
+            List<PeerEgressPolicy.PeerEgressDomainRule> rules = JsonUtil.stringToObject(
+                    raw, new TypeReference<List<PeerEgressPolicy.PeerEgressDomainRule>>() {
+                    });
+            return rules == null ? List.of() : rules;
+        } catch (RuntimeException e) {
+            // A row we cannot read grants no name: a domain rule only ever adds to what the
+            // destination rules allow, so no rules is the narrow reading.
+            log.warn("Peer egress domain rules are unreadable; granting no names");
             return List.of();
         }
     }

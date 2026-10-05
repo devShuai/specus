@@ -58,7 +58,10 @@ type egressConfigMessage struct {
 	Scope                    string                  `json:"scope"`
 	AllowedConsumerClientIDs []int64                 `json:"allowedConsumerClientIds"`
 	DestinationRules         []egressDestinationRule `json:"destinationRules"`
-	Limits                   egressLimits            `json:"limits"`
+	// Raw, so that decodeEgressDomainRules decides what an entry it cannot read means rather than
+	// the JSON library refusing the whole push over it.
+	DomainRules json.RawMessage `json:"domainRules"`
+	Limits      egressLimits    `json:"limits"`
 }
 
 // ensureEgress lazily builds the plane and the goroutines that carry its frames and its clock.
@@ -193,10 +196,11 @@ func (mesh *peerMeshClient) ensureEgressConsumer() *egressConsumer {
 	consumer := newEgressConsumer(mesh.logger,
 		func(egress int64, frame []byte) error { return mesh.sendEgressFrameToPeer(egress, frame) },
 		func(packet []byte) error { return mesh.writeEgressPacketToDevice(packet) })
-	// A catalogue that arrived before the consumer was built still says which egresses resolve
-	// names; nothing else will repeat it until the server has a reason to.
+	// A catalogue that arrived before the consumer was built still says which egresses it lists and
+	// which resolve names; nothing else will repeat it until the server has a reason to. The consumer
+	// is not shared yet, so its lock is not needed.
 	if mesh.egressCatalog != nil {
-		consumer.capable = mesh.egressCatalog.domainCapable()
+		consumer.setCatalogLocked(mesh.egressCatalog.view())
 	}
 	consumer.dnsUpstreams = append([]string(nil), mesh.egressDNSUpstreams...)
 	mesh.egressConsumer = consumer
@@ -218,36 +222,105 @@ func (mesh *peerMeshClient) setEgressDNSUpstreams(upstreams []string) {
 	}
 }
 
-// applyEgressCatalog reads a pushed egress-catalog and gives the consumer the capabilities it lists.
-// A change can close flows: a flow to a name stops the moment its egress is no longer said to
-// resolve names. Called with no mesh lock held.
+// applyEgressCatalog reads a pushed egress-catalog and gives the consumer what it lists. A change can
+// close flows: those to an egress the catalogue no longer offers, or whose client announced no peer
+// egress, and a flow to a name whose egress is no longer said to resolve names. Called with no mesh
+// lock held.
 func (mesh *peerMeshClient) applyEgressCatalog(payload string) {
 	mesh.mu.Lock()
 	if mesh.egressCatalog == nil {
 		mesh.egressCatalog = newEgressCatalogReader()
 	}
 	accepted := mesh.egressCatalog.read([]byte(payload))
-	capable := mesh.egressCatalog.domainCapable()
-	ids := mesh.egressCatalog.capableIDs()
+	view := mesh.egressCatalog.view()
+	listed, capable := mesh.egressCatalog.listedIDs(), mesh.egressCatalog.capableIDs()
 	consumer := mesh.egressConsumer
 	mesh.mu.Unlock()
 	if !accepted {
 		// A stale revision is ordinary after a reorder and says nothing worth a line; a malformed
-		// catalogue is the server's to fix, and the known capabilities stand either way.
+		// catalogue is the server's to fix, and what is known stands either way.
 		return
 	}
-	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses resolving names: %v", ids)
+	var unsupported []int64
+	for _, id := range listed {
+		if listing := view.Listed[id]; listing.VersionKnown && listing.Version < 1 {
+			unsupported = append(unsupported, id)
+		}
+	}
+	mesh.logger.Printf("[peer-egress-consumer] egress catalogue applied; egresses listed: %v, "+
+		"resolving names: %v, announcing no peer egress: %v", listed, capable, unsupported)
 	if consumer != nil {
-		mesh.deliverEgressPurges(consumer.setDomainCapable(capable, time.Now()))
+		mesh.deliverEgressPurges(consumer.applyCatalog(view, time.Now()))
 	}
 }
 
-// newEgressCatalogSessionLocked resets the catalogue's revision floor for a new control session.
-// Called with the mesh lock held.
-func (mesh *peerMeshClient) newEgressCatalogSessionLocked() {
-	if mesh.egressCatalog != nil {
-		mesh.egressCatalog.newSession()
+// newEgressCatalogSession starts a new control session for the catalogue: its revision floor goes,
+// and every egress's standing is unknown again until this session's first catalogue arrives. Taken
+// at both ends of a session, when a control connection ends and when the next one authenticates,
+// so that nothing the last connection was still delivering counts for the new one. Called with no
+// mesh lock held.
+//
+// Unknown blocks nothing, so this closes no flow; the consumer's purge is delivered all the same
+// rather than assumed to be empty.
+func (mesh *peerMeshClient) newEgressCatalogSession() {
+	mesh.mu.Lock()
+	reader, consumer := mesh.egressCatalog, mesh.egressConsumer
+	var view egressCatalogView
+	if reader != nil {
+		reader.newSession()
+		view = reader.view()
 	}
+	mesh.mu.Unlock()
+	// Without a reader no catalogue was ever read, and the consumer's standings are unknown already.
+	if reader != nil && consumer != nil {
+		mesh.deliverEgressPurges(consumer.applyCatalog(view, time.Now()))
+	}
+}
+
+// noteControlAuthenticated marks the start of a control session: the catalogue numbering starts
+// afresh, and the wait for this session's first catalogue starts now. Called with no mesh lock held.
+func (mesh *peerMeshClient) noteControlAuthenticated() {
+	mesh.newEgressCatalogSession()
+	mesh.mu.Lock()
+	mesh.egressControlAuthAt = mesh.egressNow()
+	mesh.mu.Unlock()
+}
+
+// The status's catalog: what this control session has heard from the server's egress catalogue.
+const (
+	// egressCatalogWaiting: none accepted yet, and the session has not been up long enough to say
+	// the server sends none; also while there is no control session at all.
+	egressCatalogWaiting = "waiting"
+	// egressCatalogNone: none accepted in the egressCatalogWait after the control session
+	// authenticated, so the server is probably too old to send one.
+	egressCatalogNone = "none"
+	// egressCatalogReceived: one was accepted in this control session.
+	egressCatalogReceived = "received"
+)
+
+// egressCatalogWait is how long after control authentication a server that sends a catalogue will
+// have sent one (catalogWaitSeconds in protocol/test-vectors/peer-egress-standing-v1.json). Saying
+// "none" sooner would blame the server for an ordinary delay.
+const egressCatalogWait = 30 * time.Second
+
+// egressCatalogStateLocked is the status's catalog. Called with the mesh lock held.
+func (mesh *peerMeshClient) egressCatalogStateLocked() string {
+	switch {
+	case mesh.egressCatalog != nil && mesh.egressCatalog.received:
+		return egressCatalogReceived
+	case !mesh.egressControlAuthAt.IsZero() && mesh.egressNow().Sub(mesh.egressControlAuthAt) >= egressCatalogWait:
+		return egressCatalogNone
+	default:
+		return egressCatalogWaiting
+	}
+}
+
+// egressNow is the time the catalogue wait is measured with.
+func (mesh *peerMeshClient) egressNow() time.Time {
+	if mesh.egressClock != nil {
+		return mesh.egressClock()
+	}
+	return time.Now()
 }
 
 // egressPhaseTwoFor evaluates phase two against the mesh network the server gave, and, the first
@@ -843,8 +916,67 @@ func decodeEgressConfig(payload []byte) (egressPolicy, int64, bool) {
 		Scope:                    strings.ToUpper(strings.TrimSpace(message.Scope)),
 		AllowedConsumerClientIDs: message.AllowedConsumerClientIDs,
 		DestinationRules:         message.DestinationRules,
+		DomainRules:              decodeEgressDomainRules(message.DomainRules),
 		Limits:                   message.Limits,
 	}, message.Revision, true
+}
+
+// decodeEgressDomainRules reads the domainRules of an egress-config push (protocol/spec/peer-egress.md,
+// 按域名授权).
+//
+// A field that is absent, null or not an array is no domain rules. An entry is skipped, and the
+// rest kept, when it is not an object, when its match is not a name or *.name as a consumer's
+// domain rule is written, when its protocols is not an array of strings, or when its portRanges is
+// not an array of pairs of integers: a rule this node cannot read must grant nothing, and refusing
+// the whole push over it would also throw away the destination rules that came with it. Absent or
+// null lists are empty ones, so such a rule covers its names and allows no protocol. The match is
+// kept trimmed, without its trailing dot and in lower case, the form names are compared in.
+//
+// Shared vector: protocol/test-vectors/peer-egress-domain-policy-v1.json.
+func decodeEgressDomainRules(raw json.RawMessage) []egressDomainRule {
+	var entries []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil {
+		return nil
+	}
+	var rules []egressDomainRule
+	for _, entry := range entries {
+		if trimmed := strings.TrimSpace(string(entry)); !strings.HasPrefix(trimmed, "{") {
+			continue
+		}
+		// Pointers, because the JSON library reads a null element as the zero value: a protocol ""
+		// or a port 0 that nobody wrote.
+		var wire struct {
+			Match      string    `json:"match"`
+			Protocols  []*string `json:"protocols"`
+			PortRanges [][]*int  `json:"portRanges"`
+		}
+		if json.Unmarshal(entry, &wire) != nil {
+			continue
+		}
+		match := strings.TrimSpace(wire.Match)
+		if !looksLikeEgressDomainRule(match) || !validEgressDomainMatch(match) {
+			continue
+		}
+		rule, readable := egressDomainRule{Match: normalizeEgressName(match)}, true
+		for _, protocol := range wire.Protocols {
+			if protocol == nil {
+				readable = false
+				break
+			}
+			rule.Protocols = append(rule.Protocols, *protocol)
+		}
+		for _, pair := range wire.PortRanges {
+			if len(pair) != 2 || pair[0] == nil || pair[1] == nil {
+				readable = false
+				break
+			}
+			rule.PortRanges = append(rule.PortRanges, []int{*pair[0], *pair[1]})
+		}
+		if readable {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
 }
 
 // revokeEgressConsumer closes a peer's flows when its session ends. The plane cannot poll for this:

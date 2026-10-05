@@ -350,7 +350,7 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		r.mu.Unlock()
 		return
 	}
-	flow, code, opened := r.reserveTo(consumer, key, destination, now)
+	flow, code, opened := r.reserveTo(consumer, key, destination, name, now)
 	if code != egressCodeAllowed {
 		r.mu.Unlock()
 		r.refuse(consumer, key, code, now)
@@ -365,7 +365,6 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		r.mu.Unlock()
 		return
 	}
-	flow.Name = name
 	address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 	dial, mtu := r.dial, r.pathMTU
 	r.mu.Unlock()
@@ -531,7 +530,7 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 			r.mu.Unlock()
 			return
 		}
-		reserved, code, opened := r.reserveTo(consumer, key, destination, now)
+		reserved, code, opened := r.reserveTo(consumer, key, destination, name, now)
 		if code != egressCodeAllowed {
 			r.mu.Unlock()
 			r.refuse(consumer, key, code, now)
@@ -543,7 +542,6 @@ func (r *egressRuntime) handleDatagram(consumer int64, datagram udpDatagram, now
 			r.mu.Unlock()
 			return
 		}
-		reserved.Name = name
 		address := net.JoinHostPort(formatEgressAddress(destination), strconv.Itoa(int(key.remotePort)))
 		dial := r.dial
 		r.mu.Unlock()
@@ -684,14 +682,17 @@ func (r *egressRuntime) flowSnapshot() []*egressFlow {
 // same four-tuple arriving while the first is still connecting finds the reservation already there,
 // and must not dial again.
 func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time) (*egressFlow, string, bool) {
-	return r.reserveTo(consumer, key, key.remoteIP, now)
+	return r.reserveTo(consumer, key, key.remoteIP, "", now)
 }
 
 // reserveTo is reserve for a flow whose socket goes to destination, which differs from the key's
 // remote address only for a flow to a name: the key keeps the consumer's fake address, so replies
-// come back from it, and the authorization is of the address actually dialled.
-func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination uint32, now time.Time) (*egressFlow, string, bool) {
-	if code := r.authorizeTo(consumer, key, destination); code != egressCodeAllowed {
+// come back from it, and the authorization is of the address actually dialled together with the
+// name, "" for a flow to the address itself. The entry this call creates keeps both, so a later
+// policy change judges the flow the way it was opened.
+func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination uint32, name string,
+	now time.Time) (*egressFlow, string, bool) {
+	if code := r.authorizeTo(consumer, key, destination, name); code != egressCodeAllowed {
 		return nil, code, false
 	}
 	// The rate token comes last, so a flow any other check refused costs nothing, and only for an
@@ -701,11 +702,15 @@ func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination
 		return nil, egressCodeLimitExceeded, false
 	}
 	flow, opened := r.flows.open(key, consumer, now)
+	if opened {
+		flow.Name, flow.Destination = name, destination
+	}
 	return flow, egressCodeAllowed, opened
 }
 
-// authorizeTo runs the judgment layer for a flow dialled to destination. Called with the lock held.
-func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destination uint32) string {
+// authorizeTo runs the judgment layer for a flow dialled to destination and opened for name, "" for
+// a flow to the address itself. Called with the lock held.
+func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destination uint32, name string) string {
 	if r.closed || !r.enabled {
 		return egressCodeDisabled
 	}
@@ -719,6 +724,7 @@ func (r *egressRuntime) authorizeTo(consumer int64, key egressFlowKey, destinati
 		DestinationIP:          formatEgressAddress(destination),
 		DestinationPort:        int(key.remotePort),
 		Protocol:               key.protocolName(),
+		Name:                   name,
 		ActiveFlowsForConsumer: forConsumer,
 		ActiveFlowsTotal:       total,
 		LocalInterfaceCIDRs:    r.localInterfaceCIDRs(),
@@ -764,8 +770,10 @@ func (r *egressRuntime) resolveDestination(consumer int64, key egressFlowKey) (d
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Each address is judged with the name, so a domain rule covering the name can grant an address
+	// no destination rule names, while the forced-deny list and the scope still refuse a rebound one.
 	chosen, decision := chooseEgressAddress(addresses, func(address uint32) string {
-		return r.authorizeTo(consumer, key, address)
+		return r.authorizeTo(consumer, key, address, name)
 	})
 	if decision != egressCodeAllowed {
 		return 0, name, decision, true

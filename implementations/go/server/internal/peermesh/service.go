@@ -431,8 +431,11 @@ type ControlMessage struct {
 	AllowedConsumerClientIDs []int64 `json:"allowedConsumerClientIds,omitempty"`
 	// DestinationRules empty denies everything; there is no unconfigured-therefore-open state.
 	DestinationRules []peeregress.DestinationRule `json:"destinationRules,omitempty"`
-	Limits           *peeregress.Limits           `json:"limits,omitempty"`
-	Egresses         []EgressCatalogEntry         `json:"egresses,omitempty"`
+	// DomainRules grant names to flows that carry one. A pointer so an enabled egress-config carries
+	// [] when there are none, while every other message, the disabling push included, leaves it out.
+	DomainRules *[]peeregress.DomainRule `json:"domainRules,omitempty"`
+	Limits      *peeregress.Limits       `json:"limits,omitempty"`
+	Egresses    []EgressCatalogEntry     `json:"egresses,omitempty"`
 	// egress-report counters, for the management view only. Carries no destination or request
 	// content; refusals are aggregated by result code, never per destination.
 	ActiveFlows   *int64           `json:"activeFlows,omitempty"`

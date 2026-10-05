@@ -88,15 +88,37 @@ public static class PeerEgressAuthorization
             return Deny(PeerEgressCodes.ScopeDenied);
         }
 
-        var addressMatches = policy.DestinationRules
-            .Where(rule => Ipv4Cidr.TryParse(rule.Cidr, out var cidr) && cidr.Contains(destination))
-            .ToArray();
-        if (addressMatches.Length == 0)
+        // The destination, protocol and port steps look at one set of grants: the destination rules
+        // that contain the address and, for a flow that carries a name, the domain rules that cover
+        // it (protocol/spec/peer-egress.md, 按域名授权). The steps above stay on the address, so a
+        // name that resolves to loopback or the mesh is refused there whatever a domain rule says.
+        // A flow without a name is never granted by a domain rule, even one whose address happens
+        // to be what an allowed name resolves to: that would turn a grant of a name into a grant of
+        // an address.
+        var matches = new List<Grant>();
+        foreach (var rule in policy.DestinationRules)
+        {
+            if (Ipv4Cidr.TryParse(rule.Cidr, out var cidr) && cidr.Contains(destination))
+            {
+                matches.Add(new Grant(rule.Protocols, rule.PortRanges));
+            }
+        }
+        if (request.Name is not null)
+        {
+            foreach (var rule in policy.DomainRules)
+            {
+                if (PeerEgressNames.Covers(rule.Match, request.Name))
+                {
+                    matches.Add(new Grant(rule.Protocols, rule.PortRanges));
+                }
+            }
+        }
+        if (matches.Count == 0)
         {
             return Deny(PeerEgressCodes.DestinationDenied);
         }
 
-        var protocolMatches = addressMatches
+        var protocolMatches = matches
             .Where(rule => rule.Protocols.Contains(request.Protocol, StringComparer.Ordinal))
             .ToArray();
         if (protocolMatches.Length == 0)
@@ -137,7 +159,10 @@ public static class PeerEgressAuthorization
         return denied;
     }
 
-    private static bool PortAllowed(IEnumerable<PeerEgressDestinationRule> rules, int port) =>
+    private static bool PortAllowed(IEnumerable<Grant> rules, int port) =>
         rules.Any(rule => rule.PortRanges.Any(span =>
             span.Length == 2 && port >= span[0] && port <= span[1]));
+
+    /// <summary>What a matching rule of either kind contributes to the protocol and port steps.</summary>
+    private readonly record struct Grant(IReadOnlyList<string> Protocols, IReadOnlyList<int[]> PortRanges);
 }

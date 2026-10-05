@@ -720,3 +720,67 @@ func TestStartupMigrationAddsTheClientEgressColumns(t *testing.T) {
 		t.Fatalf("a session from before the upgrade must read as taking no part in egress: %+v err=%v", old, err)
 	}
 }
+
+// A database from before domain rules has an egress policy table without the column. The startup
+// pass has to add it, a policy saved before reads as granting no name, and saving works again.
+func TestStartupMigrationAddsTheEgressDomainRulesColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-egress.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE peer_mesh_egress_policy (
+		  id INTEGER PRIMARY KEY,
+		  tenant_id TEXT NOT NULL,
+		  owner_username TEXT NOT NULL,
+		  egress_client_id INTEGER NOT NULL,
+		  egress_client_name TEXT NOT NULL,
+		  enabled INTEGER NOT NULL DEFAULT 0,
+		  scope TEXT NOT NULL DEFAULT 'PUBLIC',
+		  allowed_consumer_client_ids TEXT,
+		  destination_rules TEXT,
+		  max_concurrent_flows INTEGER NOT NULL DEFAULT 256,
+		  max_flows_per_consumer INTEGER NOT NULL DEFAULT 64,
+		  idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+		  created_at TEXT NOT NULL,
+		  updated_at TEXT NOT NULL,
+		  UNIQUE (tenant_id, egress_client_id)
+		);`)
+	if err == nil {
+		_, err = legacy.Exec(`INSERT INTO peer_mesh_egress_policy
+			(id, tenant_id, owner_username, egress_client_id, egress_client_name, enabled, scope,
+			 allowed_consumer_client_ids, destination_rules, created_at, updated_at)
+			VALUES (9001, 'tenant-a', 'alice', 2002, 'office-gateway', 1, 'PUBLIC', '1001',
+			 '[{"cidr":"203.0.113.0/24","protocols":["tcp"],"portRanges":[[443,443]]}]',
+			 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+	}
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare legacy schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open and migrate legacy database: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	old, err := db.FindPeerMeshEgressPolicyByClient(ctx, "tenant-a", 2002)
+	if err != nil || old == nil {
+		t.Fatalf("read the legacy policy: %+v %v", old, err)
+	}
+	if old.DomainRules != "[]" || !strings.Contains(old.DestinationRules, "203.0.113.0/24") {
+		t.Errorf("legacy policy read as %+v, want its destination rules and domainRules []", *old)
+	}
+	old.DomainRules = `[{"match":"example.com","protocols":["tcp"],"portRanges":[[443,443]]}]`
+	old.UpdatedAt = time.Now().UTC()
+	if err := db.UpdatePeerMeshEgressPolicy(ctx, *old); err != nil {
+		t.Fatalf("save domain rules on a migrated database: %v", err)
+	}
+	saved, err := db.FindPeerMeshEgressPolicyByClient(ctx, "tenant-a", 2002)
+	if err != nil || saved == nil || saved.DomainRules != old.DomainRules {
+		t.Fatalf("domain rules did not round trip: %+v %v", saved, err)
+	}
+}

@@ -141,6 +141,16 @@ type egressDestinationRule struct {
 	PortRanges [][]int  `json:"portRanges"`
 }
 
+// egressDomainRule is one entry of the name allowlist pushed in egress-config. Match is a name or
+// *.name, kept the way normalizeEgressName leaves it; the protocols and ports read as a destination
+// rule's do. It grants only a flow opened for a name it covers (protocol/spec/peer-egress.md,
+// 按域名授权).
+type egressDomainRule struct {
+	Match      string
+	Protocols  []string
+	PortRanges [][]int
+}
+
 // egressLimits keep this node from acting as an open proxy.
 type egressLimits struct {
 	MaxConcurrentFlows  int `json:"maxConcurrentFlows"`
@@ -154,7 +164,11 @@ type egressPolicy struct {
 	Scope                    string                  `json:"scope"`
 	AllowedConsumerClientIDs []int64                 `json:"allowedConsumerClientIds"`
 	DestinationRules         []egressDestinationRule `json:"destinationRules"`
-	Limits                   egressLimits            `json:"limits"`
+	// DomainRules are read from egress-config by decodeEgressDomainRules only, never straight from
+	// JSON: an entry this node cannot read is skipped there, where a typed decode would refuse the
+	// whole push over it.
+	DomainRules []egressDomainRule `json:"-"`
+	Limits      egressLimits       `json:"limits"`
 }
 
 // egressRequest is one flow-open attempt, evaluated before any socket is created.
@@ -169,6 +183,9 @@ type egressRequest struct {
 	// LocalInterfaceCIDRs are networks owned by this node's own tunnel or virtual interfaces.
 	// Forwarding into one of them would loop back into this node's own capture path.
 	LocalInterfaceCIDRs []string
+	// Name is the name the flow was opened for, bound to its address with name-bind, and "" for a
+	// flow to the address itself. Only a flow with a name is granted by a domain rule.
+	Name string
 }
 
 type egressDecision struct {
@@ -230,20 +247,37 @@ func authorizeEgressFlow(request egressRequest, policy egressPolicy, peerACLAllo
 		return egressDeny(egressCodeScopeDenied)
 	}
 
+	// The destination, protocol and port steps read every rule that applies to the flow: the
+	// destination rules containing the address and, for a flow opened for a name, the domain rules
+	// covering that name. A domain rule only adds to what the address rules grant. It never stands
+	// in for the forced-deny list or the scope, which have already held the resolved address above,
+	// so a name that resolves to loopback, the mesh or a private network is refused as before.
 	addressMatched, protocolMatched, portMatched := false, false, false
-	for _, rule := range policy.DestinationRules {
-		cidr, ok := parseEgressCIDR(rule.CIDR)
-		if !ok || !cidr.contains(destination) {
-			continue
-		}
+	consider := func(protocols []string, portRanges [][]int) {
 		addressMatched = true
-		if !egressRuleAllowsProtocol(rule, request.Protocol) {
-			continue
+		if !egressRuleAllowsProtocol(protocols, request.Protocol) {
+			return
 		}
 		protocolMatched = true
-		if egressRuleAllowsPort(rule, request.DestinationPort) {
+		if egressRuleAllowsPort(portRanges, request.DestinationPort) {
 			portMatched = true
-			break
+		}
+	}
+	for _, rule := range policy.DestinationRules {
+		cidr, ok := parseEgressCIDR(rule.CIDR)
+		if ok && cidr.contains(destination) {
+			consider(rule.Protocols, rule.PortRanges)
+		}
+	}
+	// Only the name the flow was opened for counts. A flow that arrived by address is never granted
+	// by a domain rule, even when its address is what some granted name resolves to: that would turn
+	// a grant of a name into a grant of every address the name ever had.
+	if request.Name != "" {
+		name := normalizeEgressName(request.Name)
+		for _, rule := range policy.DomainRules {
+			if egressDomainRuleCovers(rule.Match, name) {
+				consider(rule.Protocols, rule.PortRanges)
+			}
 		}
 	}
 	if !addressMatched {
@@ -282,8 +316,16 @@ func egressForcedDenyFor(context egressContext, request egressRequest) []string 
 	return denied
 }
 
-func egressRuleAllowsProtocol(rule egressDestinationRule, protocol string) bool {
-	for _, candidate := range rule.Protocols {
+// egressDomainRuleCovers reports whether a domain rule's match covers a normalised name:
+// example.com covers only itself, *.example.com every name below it at a label boundary but not
+// example.com itself. The coverage a consumer's domain rule has.
+func egressDomainRuleCovers(match, name string) bool {
+	_, _, covers := egressDomainRank(match, name)
+	return covers
+}
+
+func egressRuleAllowsProtocol(protocols []string, protocol string) bool {
+	for _, candidate := range protocols {
 		if candidate == protocol {
 			return true
 		}
@@ -310,8 +352,8 @@ func egressProtocolName(protocol int) string {
 	}
 }
 
-func egressRuleAllowsPort(rule egressDestinationRule, port int) bool {
-	for _, span := range rule.PortRanges {
+func egressRuleAllowsPort(portRanges [][]int, port int) bool {
+	for _, span := range portRanges {
 		if len(span) == 2 && port >= span[0] && port <= span[1] {
 			return true
 		}

@@ -1,5 +1,6 @@
 import type {
   PeerEgressDestinationRule,
+  PeerEgressDomainRule,
   PeerEgressPolicy,
   PeerEgressPolicyMutation,
   PeerEgressSwitch,
@@ -7,11 +8,13 @@ import type {
 } from "../../api/types";
 
 // The rules an egress applies, as protocol/spec/peer-egress.md states them. The servers refuse a policy
-// whose destination rules the egress could not read (peer-egress-management-v1.json), one problem at a
-// time; the page checks first so every problem is listed at once, in words, with the hints a server
-// does not give. Policies stored before the servers checked can still hold such rules.
+// whose destination or domain rules the egress could not read (peer-egress-management-v1.json,
+// peer-egress-domain-policy-v1.json), one problem at a time; the page checks first so every problem is
+// listed at once, in words, with the hints a server does not give. Policies stored before the servers
+// checked can still hold such rules.
 
 export const MAX_DESTINATION_RULES = 64;
+export const MAX_DOMAIN_RULES = 64;
 export const MAX_CONSUMERS = 32;
 export const MAX_RULES_JSON_BYTES = 4096;
 export const MAX_PORT_RANGES = 32;
@@ -155,6 +158,18 @@ export function storedRuleProblem(rule: PeerEgressDestinationRule): string {
   if ("error" in cidr) {
     return "网段无效，不会匹配";
   }
+  return storedGrantProblem(rule);
+}
+
+/** The same for a stored domain rule; the egress skips one whose match it cannot read. */
+export function storedDomainRuleProblem(rule: PeerEgressDomainRule): string {
+  if ("error" in parseDomainMatch(rule.match ?? "")) {
+    return "域名写法无效，出口会跳过这条";
+  }
+  return storedGrantProblem(rule);
+}
+
+function storedGrantProblem(rule: Pick<PeerEgressDestinationRule, "protocols" | "portRanges">): string {
   const protocols = rule.protocols ?? [];
   if (!protocols.some((protocol) => protocol === "tcp" || protocol === "udp")) {
     return "没有可识别的协议（只认小写 tcp/udp），不会匹配";
@@ -163,6 +178,147 @@ export function storedRuleProblem(rule: PeerEgressDestinationRule): string {
     return "没有端口，所有端口都被拒绝";
   }
   return "";
+}
+
+const DOMAIN_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * A domain rule's match as the servers store it: trimmed, trailing dots removed, lower case. It is
+ * written like the consumer's domain rules (peer-egress-dns.md): "example.com" covers that name only,
+ * "*.example.com" covers its subdomains but not the name itself; at least two labels, punycode for an
+ * internationalised name. Anything else is refused with the hint a server does not give, an address
+ * or CIDR above all, which only a destination rule can grant.
+ */
+export function parseDomainMatch(input: string): { match: string } | { error: string } {
+  const text = input.trim();
+  if (!text) {
+    return { error: "请填写域名" };
+  }
+  if (/[^\x00-\x7f]/.test(text)) {
+    const ascii = punycodeHint(text);
+    return { error: `${text}：含非 ASCII 字符，国际化域名请写成 punycode${ascii ? `，应写作 ${ascii}` : "（xn--…）"}` };
+  }
+  // The servers read text with neither a leading * nor a letter as an address, never as a name.
+  if (!text.startsWith("*") && !/[a-z]/i.test(text)) {
+    return { error: `${text}：不是域名，按地址授权请写进目的规则` };
+  }
+  const match = text.replace(/\.+$/, "").toLowerCase();
+  const wildcard = match.startsWith("*.");
+  const name = wildcard ? match.slice(2) : match;
+  if (match === "*") {
+    return { error: "不能单独写 *：通配只能写在两级以上的名字前，如 *.example.com" };
+  }
+  if (!name || name.includes("*")) {
+    return { error: `${text}：* 只能写在开头，形如 *.example.com` };
+  }
+  if (name.length > 253) {
+    return { error: `${text}：域名超过 253 个字符` };
+  }
+  // Neither character is allowed in a label; these two only make the refusal say why.
+  if (name.includes("/")) {
+    return { error: `${text}：只填域名，不带协议或路径` };
+  }
+  if (name.includes(":")) {
+    return {
+      error: /^[^:]+:[0-9]*$/.test(name) ? `${text}：不能带端口，端口填在右侧` : `${text}：不是域名，按地址授权请写进目的规则`,
+    };
+  }
+  const labels = name.split(".");
+  if (labels.length < 2) {
+    return {
+      error: wildcard
+        ? `${text}：只有一级的后缀不能通配，至少写到两级，如 *.example.com`
+        : `${text}：单标签名字不能授权，至少写到两级，如 example.com`,
+    };
+  }
+  if (labels.every((label) => /^[0-9]+$/.test(label))) {
+    return { error: `${text}：不是域名，按地址授权请写进目的规则` };
+  }
+  const bad = labels.find((label) => !DOMAIN_LABEL.test(label));
+  if (bad !== undefined) {
+    return {
+      error: bad
+        ? `${text}：「${bad}」无效，每一级只能用字母、数字与连字符，不以连字符开头或结尾，最长 63 个字符`
+        : `${text}：有空的一级（连续的点）`,
+    };
+  }
+  return { match };
+}
+
+/** The punycode spelling of a name typed in Unicode, when the browser can produce a valid one. */
+function punycodeHint(text: string): string {
+  const wildcard = text.startsWith("*.");
+  try {
+    const host = new URL(`http://${wildcard ? text.slice(2) : text}/`).hostname;
+    const candidate = `${wildcard ? "*." : ""}${host}`;
+    return "match" in parseDomainMatch(candidate) ? candidate : "";
+  } catch {
+    return "";
+  }
+}
+
+export interface DomainRuleInput {
+  match?: unknown;
+  protocols?: readonly unknown[] | null;
+  portRanges?: readonly unknown[] | null;
+}
+
+export type StoredDomainRule = NonNullable<PeerEgressPolicyMutation["domainRules"]>[number];
+
+/**
+ * Domain rules as a server stores them, or every reason it answers 400 instead (the management half
+ * of peer-egress-domain-policy-v1.json). Protocols are trimmed, lower-cased and de-duplicated in order
+ * and port ranges are [low, high] within 0-65535, as for destination rules; an absent list is stored
+ * empty. The count and the stored size are limited apart from the destination rules.
+ */
+export function normalizeDomainRules(rules: ReadonlyArray<DomainRuleInput>): { stored: StoredDomainRule[]; errors: string[] } {
+  const errors: string[] = [];
+  if (rules.length > MAX_DOMAIN_RULES) {
+    errors.push(`域名规则最多 ${MAX_DOMAIN_RULES} 条`);
+  }
+  const stored: StoredDomainRule[] = [];
+  rules.forEach((rule, index) => {
+    const label = `域名规则 ${index + 1}`;
+    const problems: string[] = [];
+    const match = typeof rule.match === "string" ? parseDomainMatch(rule.match) : { error: "请填写域名" };
+    if ("error" in match) {
+      problems.push(match.error);
+    }
+    const protocols: string[] = [];
+    for (const protocol of rule.protocols ?? []) {
+      const value = String(protocol).trim().toLowerCase();
+      if (value !== "tcp" && value !== "udp") {
+        problems.push(`协议「${String(protocol)}」无效，只能是 tcp 或 udp`);
+      } else if (!protocols.includes(value)) {
+        protocols.push(value);
+      }
+    }
+    const portRanges: number[][] = [];
+    for (const pair of rule.portRanges ?? []) {
+      if (!Array.isArray(pair) || pair.length !== 2 || !pair.every((port) => Number.isInteger(port))) {
+        problems.push("端口范围应为 [起, 止] 两个整数");
+      } else if (pair[0] < 0 || pair[1] > 65535 || pair[0] > pair[1]) {
+        problems.push(`端口范围 ${pair[0]}-${pair[1]} 无效：应为 0–65535，起不大于止`);
+      } else {
+        portRanges.push([pair[0], pair[1]]);
+      }
+    }
+    if ((rule.portRanges ?? []).length > MAX_PORT_RANGES) {
+      problems.push(`端口范围最多 ${MAX_PORT_RANGES} 段`);
+    }
+    errors.push(...problems.map((problem) => `${label}：${problem}`));
+    if (problems.length === 0 && "match" in match) {
+      stored.push({ match: match.match, protocols, portRanges });
+    }
+  });
+  if (jsonBytes(stored) > MAX_RULES_JSON_BYTES) {
+    errors.push(`域名规则合计超过 ${MAX_RULES_JSON_BYTES} 字节，请合并规则或减少端口段`);
+  }
+  return { stored, errors };
+}
+
+function jsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
 }
 
 export function scopeLabel(scope: string): string {
@@ -205,12 +361,20 @@ export interface EgressRuleDraft {
   ports: string;
 }
 
+export interface EgressDomainRuleDraft {
+  match: string;
+  tcp: boolean;
+  udp: boolean;
+  ports: string;
+}
+
 export interface EgressPolicyDraft {
   egressClientId: string;
   enabled: boolean;
   scope: "PUBLIC" | "LAN";
   consumers: string[];
   rules: EgressRuleDraft[];
+  domainRules: EgressDomainRuleDraft[];
   maxConcurrentFlows: string;
   maxFlowsPerConsumer: string;
   idleTimeoutSeconds: string;
@@ -220,6 +384,10 @@ export function emptyRuleDraft(): EgressRuleDraft {
   return { cidr: "", tcp: true, udp: false, ports: "443" };
 }
 
+export function emptyDomainRuleDraft(): EgressDomainRuleDraft {
+  return { match: "", tcp: true, udp: false, ports: "443" };
+}
+
 export function emptyPolicyDraft(): EgressPolicyDraft {
   return {
     egressClientId: "",
@@ -227,9 +395,20 @@ export function emptyPolicyDraft(): EgressPolicyDraft {
     scope: "PUBLIC",
     consumers: [],
     rules: [emptyRuleDraft()],
+    domainRules: [],
     maxConcurrentFlows: String(DEFAULT_LIMITS.maxConcurrentFlows),
     maxFlowsPerConsumer: String(DEFAULT_LIMITS.maxFlowsPerConsumer),
     idleTimeoutSeconds: String(DEFAULT_LIMITS.idleTimeoutSeconds),
+  };
+}
+
+/** A stored rule's protocols and ports as the editor's checkboxes and port text. */
+function grantDraft(rule: Pick<PeerEgressDestinationRule, "protocols" | "portRanges">): Omit<EgressRuleDraft, "cidr"> {
+  const ports = formatPorts(rule.portRanges);
+  return {
+    tcp: (rule.protocols ?? []).includes("tcp"),
+    udp: (rule.protocols ?? []).includes("udp"),
+    ports: (rule.portRanges ?? []).length === 0 ? "" : ports === "全部端口" ? "全部" : ports,
   };
 }
 
@@ -239,12 +418,8 @@ export function draftFromPolicy(policy: PeerEgressPolicy): EgressPolicyDraft {
     enabled: policy.enabled,
     scope: policy.scope === "LAN" ? "LAN" : "PUBLIC",
     consumers: (policy.allowedConsumerClientIds ?? []).map(String),
-    rules: (policy.destinationRules ?? []).map((rule) => ({
-      cidr: rule.cidr,
-      tcp: (rule.protocols ?? []).includes("tcp"),
-      udp: (rule.protocols ?? []).includes("udp"),
-      ports: (rule.portRanges ?? []).length === 0 ? "" : formatPorts(rule.portRanges) === "全部端口" ? "全部" : formatPorts(rule.portRanges),
-    })),
+    rules: (policy.destinationRules ?? []).map((rule) => ({ cidr: rule.cidr, ...grantDraft(rule) })),
+    domainRules: (policy.domainRules ?? []).map((rule) => ({ match: rule.match, ...grantDraft(rule) })),
     maxConcurrentFlows: String(policy.maxConcurrentFlows),
     maxFlowsPerConsumer: String(policy.maxFlowsPerConsumer),
     idleTimeoutSeconds: String(policy.idleTimeoutSeconds),
@@ -312,10 +487,38 @@ export function checkPolicyDraft(draft: EgressPolicyDraft, meshCidr: string): Eg
     }
   });
   if (draft.rules.length === 0) {
-    warnings.push("没有目的规则：所有目标都会被拒绝");
+    warnings.push(draft.domainRules.length === 0
+      ? "没有目的规则：所有目标都会被拒绝"
+      : "没有目的规则：只按地址发出的流都会被拒绝，只有消费端按域名发出的流可能经域名规则放行");
   }
-  if (new TextEncoder().encode(JSON.stringify(rules)).length > MAX_RULES_JSON_BYTES) {
+  if (jsonBytes(rules) > MAX_RULES_JSON_BYTES) {
     errors.push(`目的规则合计超过 ${MAX_RULES_JSON_BYTES} 字节，请合并网段或减少端口段`);
+  }
+  // The editor also refuses a rule without protocols or ports, which a server would store but which
+  // grants nothing; the rules it lets through then go through the servers' own normalisation.
+  const domainInputs: DomainRuleInput[] = [];
+  draft.domainRules.forEach((rule, index) => {
+    const label = `域名规则 ${index + 1}`;
+    const match = parseDomainMatch(rule.match);
+    if ("error" in match) {
+      errors.push(`${label}：${match.error}`);
+    }
+    const protocols = [rule.tcp ? "tcp" : "", rule.udp ? "udp" : ""].filter(Boolean);
+    if (protocols.length === 0) {
+      errors.push(`${label}：至少选择一个协议`);
+    }
+    const ports = parsePorts(rule.ports);
+    if ("error" in ports) {
+      errors.push(`${label}：${ports.error}`);
+    }
+    if (!("error" in match) && protocols.length > 0 && !("error" in ports)) {
+      domainInputs.push({ match: rule.match, protocols, portRanges: ports });
+    }
+  });
+  const domainRules = normalizeDomainRules(domainInputs);
+  errors.push(...domainRules.errors);
+  if (draft.domainRules.length > 0 && draft.scope === "LAN") {
+    warnings.push("范围为「局域网」：域名规则只放行解析到局域网地址的名字，解析到公网地址的仍被拒绝");
   }
   const maxConcurrentFlows = positive(draft.maxConcurrentFlows, "最大并发流", errors);
   const maxFlowsPerConsumer = positive(draft.maxFlowsPerConsumer, "每台消费设备最大流数", errors);
@@ -332,6 +535,7 @@ export function checkPolicyDraft(draft: EgressPolicyDraft, meshCidr: string): Eg
       scope: draft.scope,
       allowedConsumerClientIds: consumers,
       destinationRules: rules,
+      domainRules: domainRules.stored,
       maxConcurrentFlows,
       maxFlowsPerConsumer,
       idleTimeoutSeconds,
@@ -403,13 +607,16 @@ export function policyState(
     }
     return { label: "无设备可用", color: "warning", detail: "授权的消费设备都不能与出口通信：须启用组网，且同属一个用户或有 Peer ACL 放行" };
   }
-  if ((policy.destinationRules ?? []).length === 0) {
+  // Domain rules grant only flows sent by name, so a policy with nothing else still forwards those.
+  const domainOnly = (policy.destinationRules ?? []).length === 0;
+  if (domainOnly && (policy.domainRules ?? []).length === 0) {
     return { label: "无目的规则", color: "warning", detail: "没有目的规则，所有目标都会被拒绝" };
   }
+  const consumers = effective.length < allowed.length ? `${effective.length}/${allowed.length} 台消费设备经 ACL 放行` : `${effective.length} 台消费设备`;
   return {
     label: "生效中",
     color: "success",
-    detail: effective.length < allowed.length ? `${effective.length}/${allowed.length} 台消费设备经 ACL 放行` : `${effective.length} 台消费设备`,
+    detail: domainOnly ? `${consumers}；只有域名规则，只放行按域名发出的流` : consumers,
   };
 }
 

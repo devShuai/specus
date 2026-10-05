@@ -353,6 +353,8 @@ typedef struct {
     char allowed_consumer_client_ids[512];
     /* Canonical JSON. Empty denies everything; there is no unconfigured-therefore-open state. */
     char destination_rules[4097];
+    /* Canonical JSON array of {match, protocols, portRanges}. Empty grants no name. */
+    char domain_rules[4097];
     int max_concurrent_flows;
     int max_flows_per_consumer;
     int idle_timeout_seconds;

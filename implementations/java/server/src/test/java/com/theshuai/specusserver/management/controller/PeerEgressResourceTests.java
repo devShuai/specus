@@ -59,6 +59,7 @@ class PeerEgressResourceTests {
     private static final String BASE = "/api/admin/peer-mesh/egress";
     private static final long EGRESS_ID = 2L;
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final String DOMAIN_POLICY_VECTOR = "peer-egress-domain-policy-v1.json";
 
     private final PeerMeshEgressPolicyRepository policyRepository = mock(PeerMeshEgressPolicyRepository.class);
     private final PeerMeshEgressSwitchRepository switchRepository = mock(PeerMeshEgressSwitchRepository.class);
@@ -131,6 +132,86 @@ class PeerEgressResourceTests {
         }
         verify(policyRepository, never()).save(any());
         verify(peerSignalService, never()).pushTenantEgress(any());
+    }
+
+    /**
+     * Every accepted case of the domain-policy vector stores, byte for byte (the size limit is
+     * counted on that form), and answers with exactly the vector's {@code stored} rules.
+     */
+    @Test
+    void acceptCasesOfTheDomainPolicyVectorAreStoredNormalised() throws Exception {
+        JsonNode vector = readVector(DOMAIN_POLICY_VECTOR);
+        assertThat(vector.path("limits").path("rules").asInt()).isEqualTo(PeerMeshEgressPolicy.MAX_DOMAIN_RULES);
+        assertThat(vector.path("limits").path("portRangesPerRule").asInt())
+                .isEqualTo(PeerMeshEgressPolicy.MAX_PORT_RANGES_PER_RULE);
+        assertThat(vector.path("limits").path("storedJsonBytes").asInt())
+                .isEqualTo(PeerMeshEgressPolicy.MAX_DOMAIN_RULES_BYTES);
+        JsonNode cases = vector.path("management").path("accept");
+        assertThat(cases.size()).as("accept cases").isPositive();
+        ArgumentCaptor<PeerMeshEgressPolicy> saved = ArgumentCaptor.forClass(PeerMeshEgressPolicy.class);
+        for (JsonNode node : cases) {
+            String name = node.path("name").asText();
+            clearInvocations(policyRepository, peerSignalService);
+
+            MvcResult result = mvc.perform(json(post(BASE + "/policies"), domainPolicyBody(node)))
+                    .andReturn();
+
+            assertThat(result.getResponse().getStatus()).as(name).isEqualTo(200);
+            JsonNode returned = JSON.readTree(result.getResponse().getContentAsString(StandardCharsets.UTF_8));
+            assertThat(returned.path("domainRules")).as(name + " response").isEqualTo(node.path("stored"));
+            verify(policyRepository).save(saved.capture());
+            assertThat(saved.getValue().getDomainRules())
+                    .as(name + " persisted").isEqualTo(JSON.writeValueAsString(node.path("stored")));
+            assertThat(saved.getValue().getDestinationRules()).as(name + " destination rules").isEqualTo("[]");
+            verify(peerSignalService).pushTenantEgress(TENANT);
+        }
+    }
+
+    /** A refused domain rule list is refused whole: 400, nothing saved or pushed. */
+    @Test
+    void rejectCasesOfTheDomainPolicyVectorAreRefusedWithoutSaving() throws Exception {
+        JsonNode cases = readVector(DOMAIN_POLICY_VECTOR).path("management").path("reject");
+        assertThat(cases.size()).as("reject cases").isPositive();
+        for (JsonNode node : cases) {
+            String name = node.path("name").asText();
+
+            MvcResult result = mvc.perform(json(post(BASE + "/policies"), domainPolicyBody(node)))
+                    .andReturn();
+
+            assertThat(result.getResponse().getStatus()).as(name).isEqualTo(400);
+            JsonNode body = JSON.readTree(result.getResponse().getContentAsString(StandardCharsets.UTF_8));
+            assertThat(body.path("error").asText()).as(name + " error").isNotBlank();
+        }
+        verify(policyRepository, never()).save(any());
+        verify(peerSignalService, never()).pushTenantEgress(any());
+    }
+
+    /**
+     * Omitted fields keep their stored value, domain rules included; a policy created without them
+     * stores an empty list.
+     */
+    @Test
+    void domainRulesAreKeptWhenOmittedAndEmptyOnANewPolicy() throws Exception {
+        ArgumentCaptor<PeerMeshEgressPolicy> saved = ArgumentCaptor.forClass(PeerMeshEgressPolicy.class);
+        mvc.perform(json(post(BASE + "/policies"), "{\"egressClientId\":2}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.domainRules").isArray())
+                .andExpect(jsonPath("$.domainRules").isEmpty());
+        verify(policyRepository).save(saved.capture());
+        assertThat(saved.getValue().getDomainRules()).isEqualTo("[]");
+
+        PeerMeshEgressPolicy existing = saved.getValue();
+        existing.setDomainRules("[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+        when(policyRepository.findByTenantIdAndEgressClientId(TENANT, EGRESS_ID)).thenReturn(Optional.of(existing));
+        clearInvocations(policyRepository);
+
+        mvc.perform(json(post(BASE + "/policies"), "{\"egressClientId\":2,\"scope\":\"LAN\",\"domainRules\":null}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.domainRules[0].match").value("example.com"));
+        verify(policyRepository).save(saved.capture());
+        assertThat(saved.getValue().getDomainRules())
+                .isEqualTo("[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]");
+        assertThat(saved.getValue().getScope()).isEqualTo("LAN");
     }
 
     /**
@@ -240,18 +321,29 @@ class PeerEgressResourceTests {
         return body.toString();
     }
 
+    private static String domainPolicyBody(JsonNode vectorCase) {
+        ObjectNode body = JSON.createObjectNode();
+        body.put("egressClientId", EGRESS_ID);
+        body.set("domainRules", vectorCase.path("domainRules"));
+        return body.toString();
+    }
+
     private static MockHttpServletRequestBuilder json(MockHttpServletRequestBuilder request, String body) {
         return request.contentType(MediaType.APPLICATION_JSON).content(body);
     }
 
     private static JsonNode readVector() throws IOException {
+        return readVector("peer-egress-management-v1.json");
+    }
+
+    private static JsonNode readVector(String name) throws IOException {
         Path current = Path.of("").toAbsolutePath();
         for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
-            Path candidate = current.resolve("protocol/test-vectors/peer-egress-management-v1.json");
+            Path candidate = current.resolve("protocol/test-vectors/" + name);
             if (Files.isRegularFile(candidate)) {
                 return JSON.readTree(Files.readString(candidate));
             }
         }
-        throw new IllegalStateException("cannot locate peer-egress-management-v1.json");
+        throw new IllegalStateException("cannot locate " + name);
     }
 }

@@ -15,6 +15,24 @@ public sealed record PeerEgressDestinationRule
     public IReadOnlyList<int[]> PortRanges { get; init; } = [];
 }
 
+/// <summary>One domain rule of an egress policy: it grants a name rather than an address.</summary>
+/// <remarks>
+/// <c>example.com</c> covers that name only, <c>*.example.com</c> its subdomains but not itself. It
+/// only ever admits a flow that carries a name, and the address the name resolves to still has to
+/// pass the forced-deny list and the scope (protocol/spec/peer-egress.md, 按域名授权).
+/// </remarks>
+public sealed record PeerEgressDomainRule
+{
+    [JsonPropertyName("match")]
+    public string Match { get; init; } = string.Empty;
+
+    [JsonPropertyName("protocols")]
+    public IReadOnlyList<string> Protocols { get; init; } = [];
+
+    [JsonPropertyName("portRanges")]
+    public IReadOnlyList<int[]> PortRanges { get; init; } = [];
+}
+
 /// <summary>Limits that keep an egress node from acting as an open proxy.</summary>
 public sealed record PeerEgressLimits
 {
@@ -51,6 +69,10 @@ public sealed record PeerEgressPolicy
     [JsonPropertyName("destinationRules")]
     public IReadOnlyList<PeerEgressDestinationRule> DestinationRules { get; init; } = [];
 
+    /// <remarks>Empty by default: a policy that names no domain rule grants nothing by name.</remarks>
+    [JsonPropertyName("domainRules")]
+    public IReadOnlyList<PeerEgressDomainRule> DomainRules { get; init; } = [];
+
     [JsonPropertyName("limits")]
     public PeerEgressLimits Limits { get; init; } = new();
 }
@@ -69,6 +91,15 @@ public sealed record PeerEgressRequest
 
     [JsonPropertyName("protocol")]
     public string Protocol { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The name the flow was opened for, when the consumer bound one to the address with
+    /// <c>name-bind</c>; null for a flow that arrived by address. Only a flow with a name is looked
+    /// at by the policy's domain rules, and <see cref="DestinationIp"/> is then the address the name
+    /// resolved to, which the forced-deny list and the scope still judge on their own.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public string? Name { get; init; }
 
     [JsonPropertyName("hop")]
     public bool Hop { get; init; }
@@ -129,4 +160,16 @@ public sealed record PeerEgressCatalogEntry
 
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; init; }
+
+    /// <summary>
+    /// The <c>clientEgressCapabilities.version</c> the egress's current online session announced;
+    /// 0 when it is offline or announced none.
+    /// </summary>
+    /// <remarks>
+    /// Always written, 0 included: a consumer reads an absent field as an old server and keeps
+    /// routing, but reads 0 as an egress that cannot take a flow. Deserialising through this record
+    /// cannot tell those two apart, so a consumer reads the raw field instead.
+    /// </remarks>
+    [JsonPropertyName("egressVersion")]
+    public int EgressVersion { get; init; }
 }

@@ -228,10 +228,12 @@ internal sealed class PeerEgressConsumer(
     private readonly Dictionary<long, bool> _online = [];
 
     /// <summary>
-    /// Which egress peers resolve names, from the last <c>egress-catalog</c>. Absent means no: an
-    /// egress the catalogue does not list is not sent names.
+    /// What <c>egress-catalog</c> says: whether one arrived in this control session, which egresses
+    /// the last one listed, the version each announced, and which resolve names. An egress the
+    /// catalogue does not list is not sent names, and once a catalogue has arrived in this session it
+    /// is not sent flows either (protocol/spec/peer-egress.md, 能力不支持).
     /// </summary>
-    private readonly Dictionary<long, bool> _capable = [];
+    private PeerEgressCatalogSnapshot _catalog = PeerEgressCatalogSnapshot.None;
 
     /// <summary>The fake-IP pool while phase two runs; null otherwise, which is phase one exactly.</summary>
     private PeerEgressFakeIpPool? _pool;
@@ -280,7 +282,8 @@ internal sealed class PeerEgressConsumer(
             new Dictionary<string, long>(_blocked),
             _flows.Values.GroupBy(flow => flow.Egress).ToDictionary(group => group.Key, group => group.Count()))
         {
-            Capable = new Dictionary<long, bool>(_capable),
+            Capable = _catalog.Listed.ToDictionary(entry => entry.Key, entry => entry.Value.DomainTargetCapable),
+            Catalog = _catalog,
             FakeIpPool = _pool?.Cidr,
         };
     }
@@ -313,23 +316,35 @@ internal sealed class PeerEgressConsumer(
     }
 
     /// <summary>
-    /// Records which egresses resolve names, as the last accepted <c>egress-catalog</c> says, and
-    /// closes the flows to pool addresses that an egress can no longer take.
+    /// Records what the catalogue says -- whether one arrived in this control session, which
+    /// egresses the last one listed, their versions and which resolve names -- and closes the flows
+    /// an egress can no longer take.
     /// </summary>
     /// <remarks>
-    /// The whole set is replaced, the way the catalogue replaces it. A flow to an address outside
-    /// the pool does not depend on this and is left alone.
+    /// The whole picture is replaced, the way the catalogue replaces it. A standing that turns to
+    /// not-offered or unsupported closes every flow to that egress, as its going offline does; an
+    /// egress that stops resolving names loses only its flows to pool addresses.
     /// </remarks>
-    public IReadOnlyDictionary<long, IReadOnlyList<string>> SetEgressCapabilities(
-        IReadOnlyDictionary<long, bool> domainTargetCapable, long nowMs)
+    public IReadOnlyDictionary<long, IReadOnlyList<string>> SetCatalog(PeerEgressCatalogSnapshot catalog, long nowMs)
     {
-        _capable.Clear();
-        foreach (var (egress, capable) in domainTargetCapable)
-        {
-            _capable[egress] = capable;
-        }
+        _catalog = catalog;
         return PurgeInvalidated(nowMs);
     }
+
+    /// <summary>The catalogue standing of one egress (<see cref="PeerEgressStanding"/>).</summary>
+    public string StandingOf(long egress) => _catalog.StandingOf(egress);
+
+    /// <summary>Whether the last catalogue says this egress resolves names. Not listed means no.</summary>
+    private bool Capable(long egress) =>
+        _catalog.Listed.TryGetValue(egress, out var listing) && listing.DomainTargetCapable;
+
+    /// <summary>
+    /// Whether the egress can take a flow at all: online, and not stopped by its catalogue standing.
+    /// One decision for the flows a change re-examines; a new packet reaches the same answer step by
+    /// step, because each step is counted under its own reason.
+    /// </summary>
+    private bool CanTake(long egress) =>
+        _online.GetValueOrDefault(egress) && PeerEgressStanding.BlockedReason(StandingOf(egress)) is null;
 
     /// <summary>
     /// Records whether an egress peer can take flows.
@@ -427,13 +442,13 @@ internal sealed class PeerEgressConsumer(
             var rule = _rules[index];
             return (rule.Action?.Trim() ?? string.Empty) == PeerEgressRules.ActionEgress
                 && rule.EgressClientId == egress
-                && _online.GetValueOrDefault(egress)
-                && _capable.GetValueOrDefault(egress);
+                && CanTake(egress)
+                && Capable(egress);
         }
         var match = PeerEgressRules.Match(_rules, Ipv4Cidr.FormatAddress(remote), _meshCidr, _pool?.Cidr);
         return match.Action == PeerEgressRules.ActionEgress
             && match.EgressClientId == egress
-            && _online.GetValueOrDefault(egress);
+            && CanTake(egress);
     }
 
     /// <summary>
@@ -543,7 +558,15 @@ internal sealed class PeerEgressConsumer(
             // the session may be re-establishing and the flow may yet recover.
             return Refuse(packet, protocol, "egress-unavailable", PeerEgressConsumerOutcome.BlockedNoEgress);
         }
-        if (name is not null && !_capable.GetValueOrDefault(egress))
+        if (PeerEgressStanding.BlockedReason(StandingOf(egress)) is { } standingReason)
+        {
+            // Online, but the catalogue says it will not take this device's flows: it is not offered
+            // here, or its client does not support peer egress and would drop the frame unread.
+            // Answered like an offline egress, for the same reason -- the application fails now
+            // instead of at its timeout -- and the destination still does not go out locally.
+            return Refuse(packet, protocol, standingReason, PeerEgressConsumerOutcome.BlockedNoEgress);
+        }
+        if (name is not null && !Capable(egress))
         {
             // Online, but the catalogue does not say it resolves names: sending it a name-bind
             // would be refused, and the packet would open a flow to the fake address itself.
@@ -605,9 +628,9 @@ internal sealed class PeerEgressConsumer(
 
     /// <summary>
     /// Counts a refusal and answers the application with <see cref="FailurePacket"/>, so it fails
-    /// now rather than at its own timeout. The four refusals that are answered -- no egress, an
-    /// egress that does not resolve names, an unmapped and a stale pool address -- all come here and
-    /// are answered alike.
+    /// now rather than at its own timeout. The refusals that are answered -- no egress, an egress not
+    /// offered to this device or whose client does not support peer egress, an egress that does not
+    /// resolve names, an unmapped and a stale pool address -- all come here and are answered alike.
     /// </summary>
     private PeerEgressConsumerOutcome Refuse(byte[] packet, int protocol, string reason, PeerEgressConsumerOutcome outcome)
     {

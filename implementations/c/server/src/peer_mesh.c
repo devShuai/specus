@@ -1585,6 +1585,18 @@ static int pm_append_egress_destination_rules(pm_builder *builder, const char *s
     return pm_append(builder, "]");
 }
 
+/*
+ * Always an array, [] when the policy has none. A stored list is canonical and normalises to itself;
+ * one that cannot be read grants no name rather than something permissive.
+ */
+static int pm_append_egress_domain_rules(pm_builder *builder, const char *stored)
+{
+    char *rules = NULL;
+    int rc = pm_append(builder, st_egress_normalize_domain_rules(stored, &rules) == 0 ? rules : "[]");
+    free(rules);
+    return rc;
+}
+
 static int pm_push_egress_config(const st_peer_mesh_runtime *runtime,
                                  const st_storage_client *client,
                                  const st_storage_client *clients,
@@ -1619,6 +1631,8 @@ static int pm_push_egress_config(const st_peer_mesh_runtime *runtime,
         if (rc == 0) {
             rc = pm_append(&message, "],\"destinationRules\":") == 0
                 && pm_append_egress_destination_rules(&message, policy.destination_rules) == 0
+                && pm_append(&message, ",\"domainRules\":") == 0
+                && pm_append_egress_domain_rules(&message, policy.domain_rules) == 0
                 && pm_appendf(&message,
                               ",\"limits\":{\"maxConcurrentFlows\":%d,\"maxFlowsPerConsumer\":%d,"
                               "\"idleTimeoutSeconds\":%d}",
@@ -1683,14 +1697,18 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
                                                                policy->egress_client_id, &device) == 0
             && device.enabled;
         /*
-         * domainTargetCapable is what the egress declared on its current online session: the
-         * client row carries it from the latest NETTY_ONLINE session, so a device with none reads
-         * as 0. The live check covers the departure window, where the logout push runs before that
-         * session is marked disconnected and the row would still show the old declaration.
+         * egressVersion and domainTargetCapable are what the egress announced on its current online
+         * session: the client row carries both from the latest NETTY_ONLINE session, so a device
+         * with none reads as 0. The live check covers the departure window, where the logout push
+         * runs before that session is marked disconnected and the row would still show the old
+         * announcement. A version-0 row has nothing to announce, so it needs no live check; the
+         * stored domain flag is already 0 for such a login.
          */
-        int domain_targets = online && egress->client_egress_domain_targets
+        int announced = online && egress->client_egress_version >= 1
             && runtime->online != NULL
             && runtime->online(runtime->ctx, egress->id, egress->client_name);
+        int egress_version = announced ? egress->client_egress_version : 0;
+        int domain_targets = announced && egress->client_egress_domain_targets;
 
         st_egress_destination_rule rules[ST_EGRESS_MAX_DESTINATION_RULES];
         size_t rules_len = 0U;
@@ -1711,9 +1729,14 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
                   || pm_append_json_string(&message, protocols[p]) != 0) ? -1 : 0;
         }
         if (rc == 0) {
-            /* ipv6TargetCapable stays false: no client declares it yet. */
-            rc = pm_appendf(&message, "],\"domainTargetCapable\":%s,\"ipv6TargetCapable\":false}",
-                            domain_targets ? "true" : "false");
+            /*
+             * ipv6TargetCapable stays false: no client declares it yet. egressVersion is written
+             * even when 0, because a consumer reads 0 as an egress that cannot take a flow but an
+             * absent field as an old server it cannot judge.
+             */
+            rc = pm_appendf(&message,
+                            "],\"domainTargetCapable\":%s,\"ipv6TargetCapable\":false,\"egressVersion\":%d}",
+                            domain_targets ? "true" : "false", egress_version);
         }
         first = 0;
     }
