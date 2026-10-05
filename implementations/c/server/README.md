@@ -476,7 +476,11 @@ bash implementations/c/server/scripts/nat_e2e_smoke.sh
 
 The script starts local TCP/HTTP/WebSocket upstreams, this C server, and the existing Java client.
 It verifies TCP small payloads, 1 MiB transfer and reconnect, Direct HTTP POST/path/query, plus
-WebSocket/SWS2 text, continuation, ping/pong and close handling.
+WebSocket/SWS2 text, continuation, ping/pong and close handling. It then runs the server with a
+10 s `SPECUS_CONTROL_READ_IDLE_SECONDS` (`CONTROL_READ_IDLE_SECONDS` overrides it), leaves the
+session idle for 22 s, and requires the server's `first heartbeat answered` log line for both the
+control and the data connection, no read-idle close and no second login, and working TCP and Direct
+HTTP afterwards.
 
 To validate database-backed Java startup login and live configuration changes without reconnecting:
 
@@ -488,9 +492,24 @@ This second script creates a SQLite credential, starts the Java client, waits fo
 online/version projection, then creates, deletes, and recreates a TCP mapping and a Direct HTTP
 route while the client remains connected.
 
-When WSL runs the C server but `java.exe` runs the client in the Windows network namespace, both
-scripts automatically advertise the WSL interface address for upstream targets instead of assuming
-that Windows `127.0.0.1` reaches a WSL listener.
+Direct HTTP and Direct WebSocket get their own end-to-end run:
+
+```bash
+bash implementations/c/server/scripts/direct_route_e2e.sh
+```
+
+The client publishes one local app (HTTP and a WebSocket endpoint on the same port) as the route
+`app`. curl checks GET with request/response headers, a percent-encoded path and query, a 404 from
+the app, a 6 MiB download, a streamed response, POST, a 2 MiB upload and a chunked upload, each
+byte-for-byte; a small RFC 6455 client checks the app's greeting, UTF-8 text, binary, a 1.5 MiB
+binary frame, a fragmented message with a ping between its fragments, and a close handshake started
+from each side.
+
+Every script takes `SPECUS_CLIENT_COMMAND` (another client binary, for example the Go client or
+`dotnet specus-client.dll`), `SPECUS_CLIENT_LABEL`, and `SPECUS_SMOKE_REUSE_BUILD=1` to reuse a server
+an earlier run built and unit-tested. When WSL runs the C server but `java.exe` runs the client in the
+Windows network namespace, the scripts automatically advertise the WSL interface address for upstream
+targets instead of assuming that Windows `127.0.0.1` reaches a WSL listener.
 
 ## Release Build
 
