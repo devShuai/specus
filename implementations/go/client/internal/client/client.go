@@ -616,6 +616,9 @@ func (client *Client) handleLoginResponse(connection net.Conn, packet protocol.P
 		if previous := client.resetReconnectBackoff(); previous > 0 {
 			client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
 		}
+		// Before anything this session pushes: its egress catalogues are numbered afresh, and the
+		// wait for the first one starts here.
+		client.peerMesh.noteControlAuthenticated()
 		client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
 	} else {
 		client.registerConfiguredSpecusMappings(connection)
