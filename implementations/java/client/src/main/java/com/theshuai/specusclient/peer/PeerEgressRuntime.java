@@ -167,6 +167,15 @@ final class PeerEgressRuntime {
 
     private final PeerEgressFlowTable flows = new PeerEgressFlowTable(0);
 
+    private final PeerEgressFlowRate flowRate = new PeerEgressFlowRate();
+
+    /**
+     * The clock new-flow tokens refill against, in milliseconds. Monotonic rather than the wall
+     * clock the frames carry: a wall clock stepped forward would hand every consumer a full bucket.
+     * Replaceable for tests.
+     */
+    LongSupplier flowRateClock = () -> System.nanoTime() / 1_000_000L;
+
     // Phase two: the names consumers bound to their fake addresses, how they are resolved, and which
     // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
     private final PeerEgressNameTable names = new PeerEgressNameTable();
@@ -844,9 +853,9 @@ final class PeerEgressRuntime {
     }
 
     /**
-     * Runs the judgment layer and, on approval, takes the quota slot. Called with the lock held. The
-     * reservation exists before the socket does so that a slow or failing connect still counts
-     * against the limits for its whole duration.
+     * Runs the judgment layer and, on approval, takes the quota slot and the consumer's new-flow
+     * token. Called with the lock held. The reservation exists before the socket does so that a slow
+     * or failing connect still counts against the limits for its whole duration.
      *
      * <p>{@link Reservation#opened()} says whether this call is the one that created the entry. A
      * second frame for the same four-tuple arriving while the first is still connecting finds the
@@ -865,6 +874,11 @@ final class PeerEgressRuntime {
         String code = authorizeTo(consumer, key, destination);
         if (code != null) {
             return new Reservation(null, code, false);
+        }
+        // Last, and only for a four-tuple with no flow yet: a refused attempt costs no token, and
+        // neither does a retransmitted SYN or a frame racing the one that is opening its flow.
+        if (flows.lookup(key) == null && !flowRate.tryTake(consumer, flowRateClock.getAsLong())) {
+            return new Reservation(null, PeerEgressCodes.LIMIT_EXCEEDED, false);
         }
         PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
         return opened != null
