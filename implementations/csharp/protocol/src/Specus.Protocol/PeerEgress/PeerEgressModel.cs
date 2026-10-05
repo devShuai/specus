@@ -129,4 +129,16 @@ public sealed record PeerEgressCatalogEntry
 
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; init; }
+
+    /// <summary>
+    /// The <c>clientEgressCapabilities.version</c> the egress's current online session announced;
+    /// 0 when it is offline or announced none.
+    /// </summary>
+    /// <remarks>
+    /// Always written, 0 included: a consumer reads an absent field as an old server and keeps
+    /// routing, but reads 0 as an egress that cannot take a flow. Deserialising through this record
+    /// cannot tell those two apart, so a consumer reads the raw field instead.
+    /// </remarks>
+    [JsonPropertyName("egressVersion")]
+    public int EgressVersion { get; init; }
 }

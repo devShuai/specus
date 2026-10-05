@@ -11,9 +11,9 @@ import java.util.TreeMap;
  *
  * <p>The JSON form carries everything; this decides what a person is shown. The rule it follows is
  * to print the problems and count the rest: a rule that is configured but not in force, a route
- * this feature wanted and did not get, an egress peer a rule names that is offline. Those are the
- * three ways the feature can be doing nothing while every other surface looks healthy, and they are
- * the reason the section exists.
+ * this feature wanted and did not get, an egress peer a rule names that is offline or that the
+ * server's egress catalogue says cannot take a flow. Those are the ways the feature can be doing
+ * nothing while every other surface looks healthy, and they are the reason the section exists.
  *
  * <p>So a working node prints two lines and a broken one prints those two plus exactly what is
  * wrong. Listing the healthy rules too would push the one line that matters off the screen on any
@@ -90,17 +90,36 @@ public final class EgressView {
         }
         // Each problem is followed by what to do about it, in the same words in every runtime and
         // on the local page. A peer that is online with no path yet is a problem too: its rules are
-        // in force and have nowhere to send.
+        // in force and have nowhere to send. So is one the server's egress catalogue does not offer
+        // to this device, or whose client cannot carry peer egress: online, and every flow to it
+        // refused here (protocol/spec/peer-egress.md, 能力不支持). One line per peer, the first that
+        // holds, in the order the consumer decides a flow by.
         for (JsonNode peer : peers) {
             long id = peer.path("clientId").asLong(0);
+            String standing = peer.path("standing").asText("");
             if (!peer.path("online").asBoolean(false)) {
                 lines.add(String.format("    egress peer %d: offline, so its rules have nowhere to send", id));
                 lines.add(String.format("      fix: start egress device %d or restore its connection;"
+                        + " until then its destinations are blocked, not sent locally", id));
+            } else if ("not-offered".equals(standing)) {
+                lines.add(String.format("    egress peer %d: not offered to this device by the server's egress catalog", id));
+                lines.add("      fix: ask an administrator to enable its egress policy and allow this device, and check"
+                        + " the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally");
+            } else if ("unsupported".equals(standing)) {
+                lines.add(String.format("    egress peer %d: online, but its client does not support peer egress", id));
+                lines.add(String.format("      fix: upgrade the client on egress device %d;"
                         + " until then its destinations are blocked, not sent locally", id));
             } else if ("none".equals(peer.path("path").asText(""))) {
                 lines.add(String.format("    egress peer %d: online but no path to it yet", id));
                 lines.add("      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP");
             }
+        }
+        // Once, after the peers: no catalogue this session means none of the lines above could
+        // have said not offered or unsupported, and an egress that cannot take a flow is found out
+        // only from its own refusal. A state file from a build without the field says nothing.
+        if ("none".equals(consumer.path("catalog").asText(""))) {
+            lines.add("    server: sent no egress catalog; it may be too old for peer egress");
+            lines.add("      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself");
         }
         String error = consumer.path("routeError").asText("");
         if (!error.isEmpty()) {
