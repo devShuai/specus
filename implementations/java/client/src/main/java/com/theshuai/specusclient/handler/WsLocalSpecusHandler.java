@@ -3,6 +3,7 @@ package com.theshuai.specusclient.handler;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.websocketx.*;
@@ -40,6 +41,8 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
     private final AtomicBoolean terminationStarted = new AtomicBoolean();
     private final StreamReceiveWindow receiveWindow = new StreamReceiveWindow();
     private volatile boolean registered;
+    /** The latest frame handed to the local socket; written and read on the control event loop. */
+    private volatile ChannelFuture lastLocalWrite;
 
     public WsLocalSpecusHandler(NatClientHandler specusHandler, int streamId, String remoteChannelId) {
         this(specusHandler, streamId, remoteChannelId, CLOSE_CREDIT_TIMEOUT_MILLIS);
@@ -155,7 +158,9 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
                 }
                 default -> throw new IllegalArgumentException("unsupported SWS2 opcode");
             };
-            localCtx.writeAndFlush(frame).addListener(future -> {
+            ChannelFuture write = localCtx.writeAndFlush(frame);
+            lastLocalWrite = write;
+            write.addListener(future -> {
                 if (!future.isSuccess()) {
                     localCtx.close();
                     return;
@@ -165,6 +170,19 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
             });
         } catch (RuntimeException error) {
             localCtx.close();
+        }
+    }
+
+    /**
+     * Closes the local socket on the server's FIN once every frame already relayed to it is written,
+     * so a CLOSE reply sent just ahead of the FIN (or as DATA|END_STREAM) still reaches the app.
+     */
+    void closeAfterPendingWrites(ChannelHandlerContext localCtx) {
+        ChannelFuture pending = lastLocalWrite;
+        if (pending == null) {
+            localCtx.close();
+        } else {
+            pending.addListener(ignored -> localCtx.close());
         }
     }
 
@@ -211,10 +229,26 @@ public class WsLocalSpecusHandler extends ChannelInboundHandlerAdapter {
                         ? "websocket close credit timeout"
                         : "websocket close send failed";
                 flow.reset(streamId, 8, reason);
+                specusHandler.removeWsLocalHandler(streamId, this);
+                localCtx.close();
+                return;
             }
+            awaitCloseReply(controlCtx, localCtx);
+        });
+    }
+
+    /**
+     * The app started the close handshake, so it waits for the peer's CLOSE, which the server
+     * relays ahead of its FIN (http-route.md section 7). The local socket therefore stays open
+     * until that FIN or the app's own disconnect; the same bound as the CLOSE credit (the Go
+     * client's cleanup timeout) only covers a peer that never answers.
+     */
+    private void awaitCloseReply(ChannelHandlerContext controlCtx, ChannelHandlerContext localCtx) {
+        var deadline = controlCtx.executor().schedule(() -> {
             specusHandler.removeWsLocalHandler(streamId, this);
             localCtx.close();
-        });
+        }, closeCreditTimeoutMillis, TimeUnit.MILLISECONDS);
+        localCtx.channel().closeFuture().addListener(ignored -> deadline.cancel(false));
     }
 
     private static Throwable unwrap(Throwable error) {
