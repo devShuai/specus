@@ -23,6 +23,13 @@ internal interface IPeerEgressMeshHost
     /// <summary>Encrypts and sends one frame to a peer.</summary>
     Task<bool> SendToPeerAsync(long peerId, byte[] frame);
 
+    /// <summary>
+    /// Sends one PEER_CONTROL body to the server itself rather than to a peer: no recipient, and
+    /// none of the identity the server binds from the control connection. False when there is no
+    /// control connection to send it on.
+    /// </summary>
+    Task<bool> SendToServerAsync(string message) => Task.FromResult(false);
+
     /// <summary>Writes one packet to the local virtual device.</summary>
     Task WriteToDeviceAsync(byte[] packet);
 
@@ -123,7 +130,8 @@ internal interface IPeerEgressMeshHost
 /// Four joins. SPEG1 frames are demultiplexed out of the decrypted payload stream, the pushed
 /// <c>egress-config</c> becomes the policy the plane enforces, the pushed <c>egress-catalog</c>
 /// says which egresses the consumer may send names to, and a closing session revokes that peer's
-/// flows.
+/// flows. The other direction is the <c>egress-report</c>: what the plane counted, checked once a
+/// minute while it serves and sent to the server when it changed.
 ///
 /// <para>Lock ordering is the constraint that shapes this class. The mesh takes its own lock and
 /// the egress plane takes its own, and the plane holds its lock while emitting frames. So frames
@@ -146,13 +154,18 @@ internal interface IPeerEgressMeshHost
 /// How the DNS responder reaches its upstreams, or null for real sockets. Injected so a test can
 /// answer in place of a resolver.
 /// </param>
+/// <param name="time">
+/// The wall clock and the timer of the <c>egress-report</c>, or null for the system's. Injected so a
+/// test can step both instead of waiting a minute per check.
+/// </param>
 internal sealed class PeerEgressMesh(
     IPeerEgressMeshHost host,
     ILogger? logger = null,
     IPeerEgressDialer? dialer = null,
     IPeerEgressRouteCommander? commander = null,
     Func<string, IPAddress[]>? lookup = null,
-    IPeerEgressDnsForwarder? dnsForwarder = null) : IDisposable
+    IPeerEgressDnsForwarder? dnsForwarder = null,
+    TimeProvider? time = null) : IDisposable
 {
     /// <summary>
     /// Drives the DNS responder's TCP retransmission and idle close. Well under the one-second
@@ -225,6 +238,16 @@ internal sealed class PeerEgressMesh(
 
     /// <summary>Which egresses resolve names, from <c>egress-catalog</c>; locked on its own.</summary>
     private readonly PeerEgressCatalog _catalog = new();
+
+    /// <summary>
+    /// When the <c>egress-report</c> goes out; locked on its own. Kept for the life of the process
+    /// rather than of a plane, so its revision keeps increasing across control reconnects.
+    /// </summary>
+    private readonly PeerEgressReporter _reporter = new();
+    private readonly TimeProvider _time = time ?? TimeProvider.System;
+
+    /// <summary>Runs the report's check; started with the first plane, guarded by <see cref="_gate"/>.</summary>
+    private ITimer? _reportTimer;
 
     /// <summary>
     /// Guards phase two's state below. Never held while anything that can wait on the mesh runs.
@@ -308,7 +331,57 @@ internal sealed class PeerEgressMesh(
                     built.OnTick(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 }
             });
+            // From the first policy on, whatever it says: a check while the egress is switched off
+            // sends nothing, and the first one after it is switched on reports.
+            _reportTimer ??= _time.CreateTimer(_ => CheckReport(), null,
+                PeerEgressReporter.Interval, PeerEgressReporter.Interval);
             return built;
+        }
+    }
+
+    /// <summary>
+    /// One <c>egress-report</c> check (protocol/spec/peer-egress.md, <c>egress-report</c>).
+    /// </summary>
+    /// <remarks>
+    /// The values are the plane's own status snapshot, the one the local status prints, so the admin
+    /// page and <c>status</c> cannot disagree. The plane is looked up at each check rather than
+    /// captured when the timer started: every control reconnect replaces it with a new one.
+    /// </remarks>
+    internal void CheckReport()
+    {
+        var status = _runtime?.StatusSnapshot();
+        PeerEgressReportMessage? report;
+        lock (_reporter)
+        {
+            report = _reporter.Check(_time.GetUtcNow().ToUnixTimeMilliseconds(), status);
+        }
+        if (report is not null)
+        {
+            _ = SendReportAsync(report);
+        }
+    }
+
+    /// <summary>
+    /// Sends one report. A failure is logged and left there: no retry, and the next check goes ahead
+    /// as usual. The server answers a report it refuses (one over its rate limit, say) with nothing
+    /// this side could act on, so there is nothing to wait for either.
+    /// </summary>
+    private async Task SendReportAsync(PeerEgressReportMessage report)
+    {
+        try
+        {
+            if (await host.SendToServerAsync(report.Encode()).ConfigureAwait(false))
+            {
+                logger?.LogDebug("[peer-egress] report sent revision={Revision}", report.Revision);
+            }
+            else
+            {
+                logger?.LogInformation("[peer-egress] report not sent: no control connection");
+            }
+        }
+        catch (Exception ex) when (ex is not (OutOfMemoryException or StackOverflowException))
+        {
+            logger?.LogWarning("[peer-egress] report not sent: {Reason}", ex.Message);
         }
     }
 
@@ -574,9 +647,18 @@ internal sealed class PeerEgressMesh(
 
     /// <summary>
     /// A new control session is starting: the next <c>egress-catalog</c> is accepted whatever its
-    /// revision, since the revision counts within one session. What the last one said is kept.
+    /// revision, since the revision counts within one session. What the last one said is kept. The
+    /// next <c>egress-report</c> check reports whether or not anything changed, since the server may
+    /// have restarted in between.
     /// </summary>
-    public void NewControlSession() => _catalog.NewSession();
+    public void NewControlSession()
+    {
+        _catalog.NewSession();
+        lock (_reporter)
+        {
+            _reporter.NewSession();
+        }
+    }
 
     /// <summary>The egress section of the diagnostic snapshot.</summary>
     /// <remarks>
@@ -1379,6 +1461,7 @@ internal sealed class PeerEgressMesh(
     /// </summary>
     public void Dispose()
     {
+        ITimer? reportTimer;
         lock (_gate)
         {
             if (_closed)
@@ -1386,7 +1469,10 @@ internal sealed class PeerEgressMesh(
                 return;
             }
             _closed = true;
+            reportTimer = _reportTimer;
+            _reportTimer = null;
         }
+        reportTimer?.Dispose();
         _runtime?.Shutdown(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         lock (_phaseLock)
         {

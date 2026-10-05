@@ -430,7 +430,7 @@ public class PeerEgressRuntimeTests
 
         Assert.True(harness.SawReset(), "an unreachable target left the consumer without a reset");
         Assert.Empty(harness.RejectCodes());
-        Assert.Empty(harness.Runtime.Rejections.DrainCounts());
+        Assert.Empty(harness.Runtime.Rejections.CumulativeCounts());
         // The reservation must come back, or a flapping destination would exhaust the quota.
         Assert.True(harness.Runtime.FlowCount == 0, "flows left after a failed connect");
     }
@@ -662,7 +662,7 @@ public class PeerEgressRuntimeTests
         Assert.True(harness.Runtime.FlowCount == 0, "the session outlived its idle timeout");
         Assert.True(harness.Socket(0).IsClosed, "an expired session left its socket open");
         // An expiring session is the normal end of life, not something to report as blocked traffic.
-        Assert.Empty(harness.Runtime.Rejections.DrainCounts());
+        Assert.Empty(harness.Runtime.Rejections.CumulativeCounts());
     }
 
     /// <summary>
