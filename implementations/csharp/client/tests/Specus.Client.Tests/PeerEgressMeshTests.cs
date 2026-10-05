@@ -410,6 +410,54 @@ public class PeerEgressMeshTests : IDisposable
         }));
     }
 
+    /// <summary>
+    /// A control reconnect shuts the plane down and the next policy builds another. The tick has to
+    /// follow: bound to the plane it started with, it ticked the shut-down one, and on the new one
+    /// retransmission and idle expiry never ran again, so a UDP session there was never closed.
+    /// </summary>
+    [Fact]
+    public void TheTickFollowsThePlaneAcrossAReconnect()
+    {
+        var wiring = NewMesh();
+        wiring.ApplyEgressConfig(ConfigWithIdle(1, idleTimeoutSeconds: 1));
+        var first = Plane(wiring);
+        WaitFor("the first plane to be ticked", () => first.Ticks > 0);
+
+        // What Suspend does when the control connection drops, then the next session's policy.
+        wiring.ShutdownServing();
+        wiring.NewControlSession();
+        wiring.ApplyEgressConfig(ConfigWithIdle(1, idleTimeoutSeconds: 1));
+        var second = Plane(wiring);
+        Assert.NotSame(first, second);
+        // The loop is one thread, so once it has ticked the new plane no tick of the old one is
+        // still on its way.
+        WaitFor("the new plane to be ticked", () => second.Ticks > 0);
+        var firstTicks = first.Ticks;
+
+        wiring.HandleInboundFrame(7, UdpTo("203.0.113.53"));
+        WaitFor("the session to open on the new plane", () => second.FlowCount == 1);
+        // Only a tick ends a UDP session: one second idle, and the tick closes it.
+        WaitFor("the new plane's idle session to expire", () => second.FlowCount == 0);
+        Assert.True(first.Ticks == firstTicks,
+            $"the shut-down plane was ticked {first.Ticks - firstTicks} more times after the reconnect");
+    }
+
+    private static PeerEgressRuntime Plane(PeerEgressMesh wiring) =>
+        (PeerEgressRuntime)typeof(PeerEgressMesh)
+            .GetField("_runtime", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(wiring)!;
+
+    private static byte[] UdpTo(string destination) =>
+        PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false,
+            PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(
+                Address(VirtualIp), Address(destination), 51000, 53, "query"u8.ToArray())));
+
+    private static string ConfigWithIdle(long revision, int idleTimeoutSeconds) => Json(
+        "{QtypeQ:Qegress-configQ,QenabledQ:true,QrevisionQ:" + revision
+        + ",QscopeQ:QPUBLICQ,QallowedConsumerClientIdsQ:[7],QdestinationRulesQ:[{QcidrQ:Q203.0.113.0/24Q,"
+        + "QprotocolsQ:[QtcpQ,QudpQ],QportRangesQ:[[1,65535]]}],"
+        + "QlimitsQ:{QmaxConcurrentFlowsQ:8,QmaxFlowsPerConsumerQ:4,QidleTimeoutSecondsQ:" + idleTimeoutSeconds + "}}");
+
     /// <summary>Closing has to stop forwarding, not merely ask it to stop.</summary>
     [Fact]
     public void ClosingStopsForwarding()

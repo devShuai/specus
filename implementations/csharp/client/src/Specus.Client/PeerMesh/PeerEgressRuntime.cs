@@ -43,9 +43,6 @@ internal interface IPeerEgressDialer
     IPeerEgressSocket Dial(string protocol, string host, int port, long timeoutMs);
 }
 
-/// <summary>What the periodic egress-report carries, alongside the per-code refusal counts.</summary>
-internal readonly record struct PeerEgressStats(long TotalFlows, long BytesIn, long BytesOut);
-
 /// <summary>
 /// The egress data plane: the only place authorization turns into a connect.
 /// </summary>
@@ -141,6 +138,13 @@ internal sealed class PeerEgressRuntime
     private long _bytesIn;
     private long _bytesOut;
     private bool _closed;
+    private long _ticks;
+
+    /// <summary>
+    /// Visible for tests: how many ticks have reached this plane, a shut-down one included, so a test
+    /// can tell a plane nobody ticks from one whose ticks find nothing to do.
+    /// </summary>
+    internal long Ticks => Interlocked.Read(ref _ticks);
 
     public PeerEgressRuntime(
         Action<long, byte[]>? send,
@@ -162,21 +166,10 @@ internal sealed class PeerEgressRuntime
 
     public PeerEgressRejectionLog Rejections { get; } = new();
 
-    public PeerEgressStats Stats
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return new PeerEgressStats(_totalFlows, _bytesIn, _bytesOut);
-            }
-        }
-    }
-
     /// <summary>What an operator can read about this node serving as an egress.</summary>
     /// <remarks>
-    /// The refusal counts come from the cumulative tally rather than the one the periodic report
-    /// drains, so the numbers do not start shrinking on their own the day that report is wired up.
+    /// Read by the local status and by the periodic <c>egress-report</c> alike, so the admin page and
+    /// <c>status</c> show the same running totals. Nothing here is reset by being read.
     /// </remarks>
     public PeerEgressRuntimeStatus StatusSnapshot()
     {
@@ -840,6 +833,7 @@ internal sealed class PeerEgressRuntime
     /// </summary>
     public void OnTick(long nowMs)
     {
+        Interlocked.Increment(ref _ticks);
         lock (_lock)
         {
             if (_closed)
