@@ -551,6 +551,17 @@ export interface PeerEgressDestinationRule {
   portRanges: number[][] | null;
 }
 
+/**
+ * One name the egress may reach, for a flow the consumer sent by name (phase two name-bind) only:
+ * "example.com" covers that name, "*.example.com" its subdomains but not the name itself. The
+ * address the egress resolves still goes through the forced-deny list and the scope first.
+ */
+export interface PeerEgressDomainRule {
+  match: string;
+  protocols: ("tcp" | "udp" | string)[] | null;
+  portRanges: number[][] | null;
+}
+
 /** A device authorised as an egress, as the management API returns it. Limits are flat fields. */
 export interface PeerEgressPolicy {
   id: number;
@@ -564,6 +575,8 @@ export interface PeerEgressPolicy {
   /** The configured consumers the Peer ACL also allows; empty while the policy is off. */
   effectiveConsumerClientIds: number[] | null;
   destinationRules: PeerEgressDestinationRule[] | null;
+  /** Absent from servers that predate domain rules; read as none. */
+  domainRules?: PeerEgressDomainRule[] | null;
   maxConcurrentFlows: number;
   maxFlowsPerConsumer: number;
   idleTimeoutSeconds: number;
@@ -578,6 +591,7 @@ export interface PeerEgressPolicyMutation {
   scope?: "PUBLIC" | "LAN";
   allowedConsumerClientIds?: number[];
   destinationRules?: { cidr: string; protocols: string[]; portRanges: number[][] }[];
+  domainRules?: { match: string; protocols: string[]; portRanges: number[][] }[];
   maxConcurrentFlows?: number;
   maxFlowsPerConsumer?: number;
   idleTimeoutSeconds?: number;

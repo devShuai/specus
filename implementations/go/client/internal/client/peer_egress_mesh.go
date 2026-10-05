@@ -58,7 +58,10 @@ type egressConfigMessage struct {
 	Scope                    string                  `json:"scope"`
 	AllowedConsumerClientIDs []int64                 `json:"allowedConsumerClientIds"`
 	DestinationRules         []egressDestinationRule `json:"destinationRules"`
-	Limits                   egressLimits            `json:"limits"`
+	// Raw, so that decodeEgressDomainRules decides what an entry it cannot read means rather than
+	// the JSON library refusing the whole push over it.
+	DomainRules json.RawMessage `json:"domainRules"`
+	Limits      egressLimits    `json:"limits"`
 }
 
 // ensureEgress lazily builds the plane and the goroutines that carry its frames and its clock.
@@ -913,8 +916,67 @@ func decodeEgressConfig(payload []byte) (egressPolicy, int64, bool) {
 		Scope:                    strings.ToUpper(strings.TrimSpace(message.Scope)),
 		AllowedConsumerClientIDs: message.AllowedConsumerClientIDs,
 		DestinationRules:         message.DestinationRules,
+		DomainRules:              decodeEgressDomainRules(message.DomainRules),
 		Limits:                   message.Limits,
 	}, message.Revision, true
+}
+
+// decodeEgressDomainRules reads the domainRules of an egress-config push (protocol/spec/peer-egress.md,
+// 按域名授权).
+//
+// A field that is absent, null or not an array is no domain rules. An entry is skipped, and the
+// rest kept, when it is not an object, when its match is not a name or *.name as a consumer's
+// domain rule is written, when its protocols is not an array of strings, or when its portRanges is
+// not an array of pairs of integers: a rule this node cannot read must grant nothing, and refusing
+// the whole push over it would also throw away the destination rules that came with it. Absent or
+// null lists are empty ones, so such a rule covers its names and allows no protocol. The match is
+// kept trimmed, without its trailing dot and in lower case, the form names are compared in.
+//
+// Shared vector: protocol/test-vectors/peer-egress-domain-policy-v1.json.
+func decodeEgressDomainRules(raw json.RawMessage) []egressDomainRule {
+	var entries []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil {
+		return nil
+	}
+	var rules []egressDomainRule
+	for _, entry := range entries {
+		if trimmed := strings.TrimSpace(string(entry)); !strings.HasPrefix(trimmed, "{") {
+			continue
+		}
+		// Pointers, because the JSON library reads a null element as the zero value: a protocol ""
+		// or a port 0 that nobody wrote.
+		var wire struct {
+			Match      string    `json:"match"`
+			Protocols  []*string `json:"protocols"`
+			PortRanges [][]*int  `json:"portRanges"`
+		}
+		if json.Unmarshal(entry, &wire) != nil {
+			continue
+		}
+		match := strings.TrimSpace(wire.Match)
+		if !looksLikeEgressDomainRule(match) || !validEgressDomainMatch(match) {
+			continue
+		}
+		rule, readable := egressDomainRule{Match: normalizeEgressName(match)}, true
+		for _, protocol := range wire.Protocols {
+			if protocol == nil {
+				readable = false
+				break
+			}
+			rule.Protocols = append(rule.Protocols, *protocol)
+		}
+		for _, pair := range wire.PortRanges {
+			if len(pair) != 2 || pair[0] == nil || pair[1] == nil {
+				readable = false
+				break
+			}
+			rule.PortRanges = append(rule.PortRanges, []int{*pair[0], *pair[1]})
+		}
+		if readable {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
 }
 
 // revokeEgressConsumer closes a peer's flows when its session ends. The plane cannot poll for this:

@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Specus.Protocol.Packets;
@@ -397,6 +399,203 @@ public sealed class PeerEgressServiceTests
         Assert.Equal(before.UpdatedAt, after.UpdatedAt);
     }
 
+    public static TheoryData<string> AcceptedDomainRuleCases => PeerEgressDomainPolicyVector.Names("accept");
+
+    public static TheoryData<string> RefusedDomainRuleCases => PeerEgressDomainPolicyVector.Names("reject");
+
+    [Fact]
+    public void DomainRuleLimitsMatchTheSharedVector()
+    {
+        var limits = PeerEgressDomainPolicyVector.Limits;
+        Assert.Equal(PeerMeshService.MaxEgressDomainRules, limits.GetProperty("rules").GetInt32());
+        Assert.Equal(PeerMeshService.MaxEgressPortRangesPerRule, limits.GetProperty("portRangesPerRule").GetInt32());
+        Assert.Equal(PeerMeshService.MaxEgressDomainRulesBytes, limits.GetProperty("storedJsonBytes").GetInt32());
+    }
+
+    /// <summary>
+    /// The shared domain-policy vector: what a policy saved through the management API stores. The
+    /// stored column is compared byte for byte with the reference, the form the 4096-byte limit is
+    /// measured on.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AcceptedDomainRuleCases))]
+    public async Task SavedDomainRulesAreStoredAsTheSharedVectorSays(string name)
+    {
+        var vectorCase = PeerEgressDomainPolicyVector.Case("accept", name);
+        await using var fixture = await EgressFixture.CreateAsync();
+        fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        await fixture.SaveChangesAsync();
+
+        var view = await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            DomainRules: VectorDomainRules(vectorCase)), default);
+
+        var expected = PeerEgressManagementVector.Compact(vectorCase.GetProperty("stored"));
+        Assert.Equal(expected, JsonSerializer.Serialize(view.DomainRules, WebJson));
+        fixture.Db.ChangeTracker.Clear();
+        var row = await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync();
+        Assert.Equal(expected, row.DomainRules);
+        Assert.Equal("[]", row.DestinationRules);
+    }
+
+    /// <summary>
+    /// A refused domain rule list refuses the whole request: neither the update of an existing
+    /// policy nor the creation of a new one saves anything.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RefusedDomainRuleCases))]
+    public async Task RefusedDomainRulesSaveNothing(string name)
+    {
+        var vectorCase = PeerEgressDomainPolicyVector.Case("reject", name);
+        await using var fixture = await EgressFixture.CreateAsync();
+        fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AddClient(OutsiderId, "outsider-owner", "phone");
+        await fixture.SaveChangesAsync();
+        await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            Enabled: false,
+            DomainRules: [DomainRule("example.com", "tcp", 443)]), default);
+        fixture.Db.ChangeTracker.Clear();
+        var before = await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync();
+
+        foreach (var egressClientId in new[] { EgressId, OutsiderId })
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.UpsertEgressPolicyAsync(
+                fixture.Admin,
+                new PeerEgressPolicyMutation(
+                    EgressClientId: egressClientId,
+                    Enabled: true,
+                    DestinationRules: [Rule("203.0.113.0/24", "tcp", 443)],
+                    DomainRules: VectorDomainRules(vectorCase)),
+                default));
+        }
+
+        Assert.False(fixture.Db.ChangeTracker.HasChanges());
+        var after = Assert.Single(await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().ToListAsync());
+        Assert.Equal(before.Id, after.Id);
+        Assert.False(after.Enabled);
+        Assert.Equal(before.DomainRules, after.DomainRules);
+        Assert.Equal(before.DestinationRules, after.DestinationRules);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    /// <summary>
+    /// Omitted fields keep their stored value, domain rules included; a policy created without them
+    /// stores and returns an empty list.
+    /// </summary>
+    [Fact]
+    public async Task DomainRulesAreKeptWhenOmittedAndEmptyOnANewPolicy()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        await fixture.SaveChangesAsync();
+
+        var created = await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin,
+            new PeerEgressPolicyMutation(EgressClientId: EgressId), default);
+        Assert.Empty(created.DomainRules);
+        Assert.Contains("\"domainRules\":[]", JsonSerializer.Serialize(created), StringComparison.Ordinal);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal("[]", (await fixture.Db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync()).DomainRules);
+
+        await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            DomainRules: [new PeerEgressDomainRule { Match = " *.CDN.Example. ", Protocols = ["UDP"], PortRanges = [[443, 443]] }]),
+            default);
+        var kept = await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId, Scope: PeerEgressAuthorization.ScopeLan), default);
+        var rule = Assert.Single(kept.DomainRules);
+        Assert.Equal("*.cdn.example", rule.Match);
+        Assert.Equal(["udp"], rule.Protocols);
+
+        var cleared = await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId, DomainRules: []), default);
+        Assert.Empty(cleared.DomainRules);
+    }
+
+    /// <summary>
+    /// The egress-config an enabled egress receives carries the saved domain rules next to the
+    /// destination rules, and an empty list when there are none, as serialised for the control
+    /// channel. The disabling push keeps its shape, and the catalogue never carries them.
+    /// </summary>
+    [Fact]
+    public async Task AnEnabledPolicyPushesItsDomainRules()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId],
+            rules: [Rule("203.0.113.0/24", "tcp", 443)]);
+
+        var config = await fixture.Service.BuildEgressConfigAsync(egress, Capable(), default);
+        Assert.NotNull(config);
+        Assert.NotNull(config.DomainRules);
+        Assert.Empty(config.DomainRules);
+        Assert.Contains("\"domainRules\":[]", JsonSerializer.Serialize(config), StringComparison.Ordinal);
+
+        await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin, new PeerEgressPolicyMutation(
+            EgressClientId: EgressId,
+            DomainRules: [DomainRule("example.com", "tcp", 443)]), default);
+        config = await fixture.Service.BuildEgressConfigAsync(egress, Capable(), default);
+        Assert.NotNull(config);
+        var rule = Assert.Single(config.DomainRules!);
+        Assert.Equal("example.com", rule.Match);
+        Assert.Single(config.DestinationRules!);
+        Assert.Contains(
+            "\"domainRules\":[{\"match\":\"example.com\",\"protocols\":[\"tcp\"],\"portRanges\":[[443,443]]}]",
+            JsonSerializer.Serialize(config), StringComparison.Ordinal);
+
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+        Assert.NotNull(catalog);
+        Assert.DoesNotContain("domainRules", JsonSerializer.Serialize(catalog), StringComparison.Ordinal);
+
+        await fixture.Service.UpsertEgressPolicyAsync(fixture.Admin,
+            new PeerEgressPolicyMutation(EgressClientId: EgressId, Enabled: false), default);
+        var disabled = await fixture.Service.BuildEgressConfigAsync(egress, Capable(), default);
+        Assert.NotNull(disabled);
+        Assert.False(disabled.Enabled);
+        Assert.Null(disabled.DomainRules);
+        Assert.DoesNotContain("domainRules", JsonSerializer.Serialize(disabled), StringComparison.Ordinal);
+    }
+
+    /// <summary>An unreadable stored list grants no name rather than failing the push.</summary>
+    [Fact]
+    public async Task UnreadableStoredDomainRulesGrantNothing()
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        Assert.Empty(fixture.Service.DecodeEgressDomainRules("not json at all"));
+        Assert.Empty(fixture.Service.DecodeEgressDomainRules(""));
+        Assert.Empty(fixture.Service.DecodeEgressDomainRules(null));
+    }
+
+    /// <summary>
+    /// A database from before domain rules: the migration adds the column with an empty list, so a
+    /// policy saved before reads as granting no name.
+    /// </summary>
+    [Fact]
+    public async Task TheMigrationGivesExistingPoliciesNoDomainRules()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = new SpecusDbContext(new DbContextOptionsBuilder<SpecusDbContext>()
+            .UseSqlite(connection)
+            .Options);
+        var migrator = db.GetService<IMigrator>();
+        await migrator.MigrateAsync("20260929152403_AddClientEgressDomainTargets");
+        await db.Database.ExecuteSqlRawAsync(
+            "INSERT INTO peer_mesh_egress_policy (id, tenant_id, owner_username, egress_client_id, "
+            + "egress_client_name, enabled, scope, allowed_consumer_client_ids, destination_rules, "
+            + "max_concurrent_flows, max_flows_per_consumer, idle_timeout_seconds, created_at, updated_at) "
+            + "VALUES (9001, 'default', 'admin', 2002, 'office-gateway', 1, 'PUBLIC', '', '[]', 256, 64, 60, "
+            + "'2026-01-01T00:00:00.0000000+00:00', '2026-01-01T00:00:00.0000000+00:00')");
+
+        await migrator.MigrateAsync();
+
+        var policy = await db.PeerMeshEgressPolicies.AsNoTracking().SingleAsync();
+        Assert.Equal("[]", policy.DomainRules);
+    }
+
     /// <summary>
     /// A switch request without <c>enabled</c> used to be read as "off", turning a malformed body
     /// into the most disruptive change available. It is refused instead.
@@ -688,6 +887,17 @@ public sealed class PeerEgressServiceTests
     /// <summary>The vector's request rules, read the way the management endpoint binds its body.</summary>
     private static List<PeerEgressDestinationRule> VectorRules(JsonElement vectorCase) =>
         vectorCase.GetProperty("destinationRules").Deserialize<List<PeerEgressDestinationRule>>(WebJson)!;
+
+    private static PeerEgressDomainRule DomainRule(string match, string protocol, int port) => new()
+    {
+        Match = match,
+        Protocols = [protocol],
+        PortRanges = [[port, port]],
+    };
+
+    /// <summary>The vector's request domain rules, read the way the management endpoint binds its body.</summary>
+    private static List<PeerEgressDomainRule> VectorDomainRules(JsonElement vectorCase) =>
+        vectorCase.GetProperty("domainRules").Deserialize<List<PeerEgressDomainRule>>(WebJson)!;
 
     private sealed class EgressFixture : IAsyncDisposable
     {

@@ -17,6 +17,13 @@ public class PeerEgressRequest {
     /** {@code tcp} or {@code udp}. */
     private String protocol;
 
+    /**
+     * The name the flow was opened under, as the consumer bound it with name-bind, or null for a
+     * flow to the address itself. Only a flow that carries a name can be admitted by a domain rule;
+     * the address is still the one judged by every other step.
+     */
+    private String name;
+
     /** Set when the SPEG1 frame already carried the hop marker; egress chaining is not supported. */
     private boolean hop;
 

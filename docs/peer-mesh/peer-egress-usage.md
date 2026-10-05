@@ -60,6 +60,9 @@ Content-Type: application/json
   "destinationRules": [
     {"cidr": "203.0.113.0/24", "protocols": ["tcp"], "portRanges": [[443, 443]]}
   ],
+  "domainRules": [
+    {"match": "*.example.com", "protocols": ["tcp"], "portRanges": [[443, 443]]}
+  ],
   "maxConcurrentFlows": 256,
   "maxFlowsPerConsumer": 64,
   "idleTimeoutSeconds": 60
@@ -69,6 +72,7 @@ Content-Type: application/json
 几点要注意：
 
 - **`destinationRules` 为空等于全部拒绝**，没有「不配置即放行」。
+- `domainRules` 按名字放行，只对消费端按域名规则发来的流（见第五节）起作用：`example.com` 只放行这个名字，`*.example.com` 放行它的子域、不含它本身。出口自己解析名字，解析出的地址仍要过下面的永远拒绝清单与 `scope`，所以一个解析到回环或内网的名字照样被拒。只按地址到达的流不看它。站点用 CDN、地址不固定时用它，不必为此放行 `0.0.0.0/0`。
 - `scope` 取 `PUBLIC`（公网地址）或 `LAN`（RFC 1918 私有地址与 RFC 6598 共享地址），两者互不隐含。
 - 实际允许的消费端是 `allowedConsumerClientIds` 与基础 Peer ACL 的**交集**，出口在每次建立连接前还会再校验一次。
 - 回环、链路本地与云元数据地址、组播广播、Peer Mesh 网段、本部署的控制与 STUN/TURN 端点、出口本机虚拟网卡网段**永远拒绝**，写 `0.0.0.0/0` 也不会放行它们。
