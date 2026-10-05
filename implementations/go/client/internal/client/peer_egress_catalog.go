@@ -3,8 +3,10 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // What a consumer reads from egress-catalog: which egresses it lists, the egressVersion each one's
@@ -116,7 +118,7 @@ func (r *egressCatalogReader) read(payload []byte) bool {
 		}
 		// Only a non-negative integer is a version. Anything else reads as no field at all, which is
 		// what an older server sends, so a server that got the type wrong blocks nothing.
-		listing.Version, listing.VersionKnown = nonNegativeJSONInteger(entry["egressVersion"])
+		listing.Version, listing.VersionKnown = egressVersionJSON(entry["egressVersion"])
 		listed[clientID] = listing
 	}
 	r.listed = listed
@@ -195,11 +197,20 @@ func positiveJSONInteger(raw json.RawMessage) (int64, bool) {
 	return value, err == nil
 }
 
-// nonNegativeJSONInteger is positiveJSONInteger that also takes zero, which JSON may write as -0
-// and a decoder that reads numbers reads as 0 all the same.
-func nonNegativeJSONInteger(raw json.RawMessage) (int64, bool) {
-	if text := string(bytes.TrimSpace(raw)); text == "0" || text == "-0" {
+// egressVersionJSON reads an egressVersion: a JSON integer of zero or more. Zero may be written -0,
+// which a decoder that reads numbers reads as 0 all the same. One too large for int64 is clamped
+// rather than refused: it is still a version of 1 or more, and reading it as absent would only be
+// right by accident.
+func egressVersionJSON(raw json.RawMessage) (int64, bool) {
+	text := string(bytes.TrimSpace(raw))
+	if text == "0" || text == "-0" {
 		return 0, true
 	}
-	return positiveJSONInteger(raw)
+	if value, ok := positiveJSONInteger(raw); ok {
+		return value, true
+	}
+	if len(text) == 0 || text[0] < '1' || text[0] > '9' || strings.Trim(text, "0123456789") != "" {
+		return 0, false
+	}
+	return math.MaxInt64, true
 }

@@ -99,39 +99,38 @@ func consumerLines(consumer map[string]any) []string {
 }
 
 // egressPeerProblemLines says what keeps each egress peer from taking a flow, and what to do about
-// it, in the same words in every runtime (protocol/spec/peer-egress.md, 能力不支持).
+// it, in the same words in every runtime and on the local page (protocol/spec/peer-egress.md,
+// 能力不支持).
 //
-// An egress is reported once, by the first of these that holds, and the kinds come in this order
-// whatever order the peers are in: offline; online but not offered to this device by the
-// catalogue; online but running a client without peer egress; and online with no path yet. The
-// server sending no catalogue at all is said once, after the egresses that cannot take a flow and
-// before the ones that only have no path. An egress with no path is a problem too: its rules are in
-// force and have nowhere to send.
+// The peers keep the status's client-id order, and each is reported once, by the first of these
+// that holds: offline; online but not offered to this device by the catalogue; online but running a
+// client without peer egress; online with no path yet. An egress with no path is a problem too: its
+// rules are in force and have nowhere to send. A server that sent no catalogue at all is not about
+// any one egress, so it is said once, after them.
 func egressPeerProblemLines(peers []map[string]any, catalog string) []string {
-	var offline, notOffered, unsupported, noPath []string
+	var lines []string
 	for _, peer := range peers {
 		id := intAt(peer, "clientId")
 		switch {
 		case !boolAt(peer, "online"):
-			offline = append(offline, fmt.Sprintf("    egress peer %d: offline, so its rules have nowhere to send", id),
+			lines = append(lines, fmt.Sprintf("    egress peer %d: offline, so its rules have nowhere to send", id),
 				fmt.Sprintf("      fix: start egress device %d or restore its connection; until then its destinations are blocked, not sent locally", id))
 		case stringAt(peer, "standing") == "not-offered":
-			notOffered = append(notOffered, fmt.Sprintf("    egress peer %d: not offered to this device by the server's egress catalog", id),
+			lines = append(lines, fmt.Sprintf("    egress peer %d: not offered to this device by the server's egress catalog", id),
 				"      fix: ask an administrator to enable its egress policy and allow this device, and check the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally")
 		case stringAt(peer, "standing") == "unsupported":
-			unsupported = append(unsupported, fmt.Sprintf("    egress peer %d: online, but its client does not support peer egress", id),
+			lines = append(lines, fmt.Sprintf("    egress peer %d: online, but its client does not support peer egress", id),
 				fmt.Sprintf("      fix: upgrade the client on egress device %d; until then its destinations are blocked, not sent locally", id))
 		case stringAt(peer, "path") == "none":
-			noPath = append(noPath, fmt.Sprintf("    egress peer %d: online but no path to it yet", id),
+			lines = append(lines, fmt.Sprintf("    egress peer %d: online but no path to it yet", id),
 				"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP")
 		}
 	}
-	lines := append(append(offline, notOffered...), unsupported...)
 	if catalog == "none" {
 		lines = append(lines, "    server: sent no egress catalog; it may be too old for peer egress",
 			"      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself")
 	}
-	return append(lines, noPath...)
+	return lines
 }
 
 // routeErrorFix names what to do about a failed route install. A refused permission is the common

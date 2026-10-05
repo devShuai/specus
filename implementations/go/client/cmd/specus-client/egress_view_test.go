@@ -245,9 +245,9 @@ func egressProblemLines(t *testing.T, peers string, catalog string) []string {
 	return lines[1 : len(lines)-1]
 }
 
-// Why an online egress cannot take a flow is said, with what to do about it, and each egress is
-// reported once by the first of: offline, not offered by the catalogue, a client without peer
-// egress, no path. The kinds come in that order whatever order the peers are in.
+// Why an online egress cannot take a flow is said, with what to do about it. The peers keep their
+// client-id order and each is reported once, by the first of: offline, not offered by the
+// catalogue, a client without peer egress, no path.
 func TestEgressViewSaysWhyAnOnlineEgressCannotTakeAFlow(t *testing.T) {
 	got := egressProblemLines(t, `[
 		{"clientId": 40, "online": true, "standing": "unknown", "path": "none", "flows": 0},
@@ -257,37 +257,54 @@ func TestEgressViewSaysWhyAnOnlineEgressCannotTakeAFlow(t *testing.T) {
 		{"clientId": 44, "online": true, "standing": "offered", "path": "relay", "flows": 2},
 		{"clientId": 45, "online": true, "standing": "offered", "path": "direct", "flows": 1}]`, "received")
 	want := []string{
+		"    egress peer 40: online but no path to it yet",
+		"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP",
 		"    egress peer 41: offline, so its rules have nowhere to send",
 		"      fix: start egress device 41 or restore its connection; until then its destinations are blocked, not sent locally",
 		"    egress peer 42: not offered to this device by the server's egress catalog",
 		"      fix: ask an administrator to enable its egress policy and allow this device, and check the mesh ACL and the tenant switch; until then its destinations are blocked, not sent locally",
 		"    egress peer 43: online, but its client does not support peer egress",
 		"      fix: upgrade the client on egress device 43; until then its destinations are blocked, not sent locally",
-		"    egress peer 40: online but no path to it yet",
-		"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("problems:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
 
-// A server that sent no catalogue is said once, after the egresses that cannot take a flow and
-// before the ones that only have no path; while the wait is still on, or once one came, nothing.
+// A server that sent no catalogue is said once, after every egress peer's lines and before the
+// route error and the blocked counts; while the wait is still on, or once one came, nothing.
 func TestEgressViewSaysOnceThatTheServerSentNoCatalogue(t *testing.T) {
 	peers := `[{"clientId": 41, "online": true, "standing": "unknown", "path": "none", "flows": 0},
 		{"clientId": 42, "online": false, "standing": "unknown", "path": "none", "flows": 0},
 		{"clientId": 43, "online": true, "standing": "unknown", "path": "direct", "flows": 0}]`
 	got := egressProblemLines(t, peers, "none")
 	want := []string{
+		"    egress peer 41: online but no path to it yet",
+		"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP",
 		"    egress peer 42: offline, so its rules have nowhere to send",
 		"      fix: start egress device 42 or restore its connection; until then its destinations are blocked, not sent locally",
 		"    server: sent no egress catalog; it may be too old for peer egress",
 		"      fix: upgrade the server; until then whether an egress takes a flow is up to the egress itself",
-		"    egress peer 41: online but no path to it yet",
-		"      fix: wait for a direct or relay path; if it lasts, check that both devices reach the server over UDP",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("problems:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	whole := egressLines(egressSection(t, `{"consumer": {"active": true, "flows": 0, "rules": [], "routes": [],
+		"peers": `+peers+`, "catalog": "none", "blocked": {"egress-unavailable": 3},
+		"routeError": "install 203.0.113.0/24: permission denied", "rolledBack": true}, "egress": {"active": false}}`))
+	server, routeError, blocked := -1, -1, -1
+	for index, line := range whole {
+		switch {
+		case strings.HasPrefix(line, "    server: "):
+			server = index
+		case strings.HasPrefix(line, "    route install failed: "):
+			routeError = index
+		case strings.HasPrefix(line, "    blocked: "):
+			blocked = index
+		}
+	}
+	if server < 0 || !(server < routeError && routeError < blocked) {
+		t.Errorf("the server line is not between the peers and the route error:\n%s", strings.Join(whole, "\n"))
 	}
 	// Said even with no egress peer: the server's silence is not about any one of them.
 	if got := egressProblemLines(t, `[]`, "none"); len(got) != 2 || !strings.HasPrefix(got[0], "    server: ") {

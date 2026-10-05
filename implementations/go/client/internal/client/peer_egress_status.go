@@ -159,11 +159,8 @@ func (mesh *peerMeshClient) egressStatusJSON() map[string]any {
 	mesh.mu.Unlock()
 
 	status := map[string]any{}
-	section := consumerStatusJSON(consumer, installer, outcome, paths)
+	section := consumerStatusJSON(consumer, installer, outcome, paths, catalog)
 	section["enabled"] = mesh.config.PeerEgressEnabled
-	// Whether this control session has heard the server's egress catalogue: a server too old to send
-	// one leaves every standing unknown, and only this says why.
-	section["catalog"] = catalog
 	if !mesh.config.PeerEgressEnabled && len(mesh.config.PeerEgressRules) > 0 {
 		// The switch off builds no consumer, so the rules come from the configuration. They are
 		// listed all the same: "kept but not taking anything over" is a state to show, not to hide.
@@ -263,7 +260,7 @@ const (
 )
 
 func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstaller,
-	outcome egressApplyOutcome, paths map[int64]string) map[string]any {
+	outcome egressApplyOutcome, paths map[int64]string, catalog string) map[string]any {
 	section := map[string]any{
 		"active": consumer != nil,
 		"rules":  []map[string]any{},
@@ -314,6 +311,10 @@ func consumerStatusJSON(consumer *egressConsumer, installer *egressRouteInstalle
 	}
 	section["rules"] = rules
 	section["peers"] = egressPeersJSON(peers, snapshot.Standing, snapshot.FlowsByEgress, paths)
+	// Whether this control session has heard the server's egress catalogue: a server too old to send
+	// one leaves every standing unknown, and only this says why. Only while the consumer is active,
+	// the one time a standing decides anything.
+	section["catalog"] = catalog
 	section["flows"] = snapshot.Flows
 	section["blocked"] = snapshot.Blocked
 	section["routes"] = routesStatusJSON(installer, outcome)

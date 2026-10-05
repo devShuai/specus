@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -175,6 +176,28 @@ func TestConsumerStandingMatchesTheSharedVector(t *testing.T) {
 	}
 }
 
+// An egressVersion past int64 is still a version of 1 or more: clamped, and offered. A fraction, an
+// exponent or null reads as no field, which offers as well; zero written as -0 is still 0.
+func TestEgressCatalogReadsEgressVersionEdges(t *testing.T) {
+	reader := newEgressCatalogReader()
+	if !reader.read([]byte(`{"type":"egress-catalog","revision":1,"egresses":[
+		{"clientId":2,"egressVersion":99999999999999999999},{"clientId":3,"egressVersion":-0},
+		{"clientId":4,"egressVersion":1.0},{"clientId":5,"egressVersion":1e2},{"clientId":6,"egressVersion":null}]}`)) {
+		t.Fatal("the catalogue was refused")
+	}
+	want := map[int64]int64{2: math.MaxInt64, 3: 0}
+	if got := reader.egressVersions(); !reflect.DeepEqual(got, want) {
+		t.Errorf("egressVersion %v, want %v", got, want)
+	}
+	view := reader.view()
+	for id, standing := range map[int64]string{2: "offered", 3: "unsupported", 4: "offered", 5: "offered", 6: "offered"} {
+		listing, listed := view.Listed[id]
+		if got := egressCatalogStanding(view.Received, listed, listing); got != standing {
+			t.Errorf("egress %d: standing %q, want %q", id, got, standing)
+		}
+	}
+}
+
 func derefInt64(value *int64) int64 {
 	if value == nil {
 		return 0
@@ -209,6 +232,17 @@ func TestConsumerChecksTheDomainCapabilityAfterTheStanding(t *testing.T) {
 			expectStandingDecision(t, c.name+", tcp to an address", harness, packets["tcp to an address"], &want)
 		}
 	}
+
+	// With no catalogue yet in this session the standing is unknown, and a name goes to the egress
+	// the last session's catalogue said resolves names; one never said to is still egress-no-domain.
+	reader := newEgressCatalogReader()
+	reader.read([]byte(standingCatalogue(7, true, int64Pointer(1), true)))
+	reader.newSession()
+	harness := newStandingHarness(t, true, reader.view())
+	expectStandingDecision(t, "learned last session, tcp to a name", harness, standingPackets(t, harness)["tcp to a name"], nil)
+	harness = newStandingHarness(t, true, newEgressCatalogReader().view())
+	noDomain := "egress-no-domain"
+	expectStandingDecision(t, "never learned, tcp to a name", harness, standingPackets(t, harness)["tcp to a name"], &noDomain)
 }
 
 // A standing that turns to one that blocks closes the egress's flows as its going offline does: each
@@ -348,7 +382,8 @@ func TestMeshCatalogueStandingFollowsTheControlSession(t *testing.T) {
 
 // consumer.catalog says whether this control session has heard the catalogue: waiting until 30 s
 // after control authentication, none after that, received once one was accepted. A control
-// connection that ends goes back to waiting rather than blaming the server.
+// connection that ends goes back to waiting rather than blaming the server, and so does a clock
+// that steps back. Like peers, it is there only while the consumer is active.
 func TestEgressStatusSaysWhetherTheServerSentACatalogue(t *testing.T) {
 	mesh := newEgressMeshHarness(t)
 	defer mesh.shutdownEgress()
@@ -360,15 +395,36 @@ func TestEgressStatusSaysWhetherTheServerSentACatalogue(t *testing.T) {
 	}
 	wait := time.Duration(loadEgressStandingVector(t).CatalogWaitSeconds) * time.Second
 
+	// No consumer: no catalog, whatever the control session has heard.
+	mesh.noteControlAuthenticated()
+	now = now.Add(time.Hour)
+	if value, present := mapSection(t, mesh.egressStatusJSON(), "consumer")["catalog"]; present {
+		t.Errorf("an inactive consumer reports catalog %v", value)
+	}
+	mesh.config.PeerEgressRules = []egressRule{{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42}}
+	if value, present := mapSection(t, mesh.egressStatusJSON(), "consumer")["catalog"]; present {
+		t.Errorf("a consumer with the master switch off reports catalog %v", value)
+	}
+	mesh.suspend()
+
+	mesh.egressRoutes = newEgressRouteInstaller(newFakeRouteCommander(), journalPath(t))
+	applyEgressRulesForTest(t, mesh, []egressRule{
+		{Match: "203.0.113.0/24", Action: egressActionEgress, EgressClientID: 42},
+	}, statusRuntimeConfig())
 	if got := catalog(); got != "waiting" {
-		t.Errorf("before any control session: %q", got)
+		t.Errorf("an active consumer with no control session: %q", got)
 	}
 	now = now.Add(time.Hour)
 	if got := catalog(); got != "waiting" {
 		t.Errorf("an hour with no control session: %q", got)
 	}
 	mesh.noteControlAuthenticated()
-	now = now.Add(wait - time.Millisecond)
+	// A clock that steps back is not time waited.
+	now = now.Add(-time.Hour)
+	if got := catalog(); got != "waiting" {
+		t.Errorf("with the clock stepped back: %q", got)
+	}
+	now = now.Add(time.Hour + wait - time.Millisecond)
 	if got := catalog(); got != "waiting" {
 		t.Errorf("just short of the wait: %q", got)
 	}
