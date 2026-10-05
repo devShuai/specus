@@ -73,7 +73,7 @@ Content-Type: application/json
 - 实际允许的消费端是 `allowedConsumerClientIds` 与基础 Peer ACL 的**交集**，出口在每次建立连接前还会再校验一次。
 - 回环、链路本地与云元数据地址、组播广播、Peer Mesh 网段、本部署的控制与 STUN/TURN 端点、出口本机虚拟网卡网段**永远拒绝**，写 `0.0.0.0/0` 也不会放行它们。
 
-其余接口：`GET /api/admin/peer-mesh/egress/switch` 查看开关，`GET /api/admin/peer-mesh/egress/policies` 列出策略（含与 ACL 取交集后的实际消费端），`DELETE /api/admin/peer-mesh/egress/policies/{id}` 删除策略。`GET /api/admin/peer-mesh/egress/activity` 设计为展示出口上报的计数，但客户端目前还不上报，**这个接口现在总是空的**；出口侧计数请在出口设备上用 `specus-client egress` 查看。
+其余接口：`GET /api/admin/peer-mesh/egress/switch` 查看开关，`GET /api/admin/peer-mesh/egress/policies` 列出策略（含与 ACL 取交集后的实际消费端），`DELETE /api/admin/peer-mesh/egress/policies/{id}` 删除策略。`GET /api/admin/peer-mesh/egress/activity` 展示每台出口最近一次上报的计数：出口运行时每 60 秒检查一次，有变化才上报，数字是自出口进程启动以来的累计值（活动流数除外），与出口设备上 `specus-client egress` 看到的相同。
 
 ## 二、消费端：写规则
 
@@ -353,7 +353,7 @@ specus-client egress dns restore
 完整列表见规范的[当前限制](../../protocol/spec/peer-egress.md#当前限制)。影响使用的几条：
 
 - **下行只有有界发送窗口，没有自适应拥塞控制。** 此前经出口下载大响应会被复位的问题已修复（#74）：出口按消费端通告的窗口发送，并对目标 socket 施加背压。Linux 上三种语言两两组合的 9 种组合在每次 PR 上用真 TUN 验证 8 MiB 上下行、64 条并发流与 2% 丢包下的完整性（见[真机实验室](../../scripts/peer-egress-lab/README.md)）；Windows 与 macOS 的真 TUN 验收仍在 #50 中进行。
-- **客户端只从服务端下发的出口目录里读出口是否支持域名，也不上报出口计数。** 出口是否可用取自组网在线状态；管理接口的活动页现在总是空的。
+- **客户端只从服务端下发的出口目录里读出口是否支持域名。** 出口是否可用取自组网在线状态。
 - **遇到版本过旧的对端时没有专门提示**，只会表现为出口离线。
 - **出口侧没有字节速率限制**，只有并发数与空闲超时上限。
 - **切网或休眠恢复后，路由最多在 5 秒内补回；这 5 秒内命中规则的目标会从本机直连出去，而不是被阻断。** 日志里的 `route … put back` 说明发生过一次补回；如果它频繁出现，说明有别的东西在反复改路由表。Linux 上只对照主表，另一个 VPN 用策略路由把流量导走时发现不了。
