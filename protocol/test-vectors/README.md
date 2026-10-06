@@ -54,6 +54,10 @@ Java、Go、.NET、Android 使用相同字段和字节序；Java、Go、.NET 服
 - `public-transfer-cluster-v2.json`：跨 Java/Go/.NET 服务端的 Redis STCE v2 discovery/management Pub/Sub 帧，
   房间 groupId 与 tenant managementGroupId 派生。
 
+- `chunked-resume-v1.json`（契约已定）：浏览器直连文件分块续传的清单摘要、STFR1 帧、位图、接收方状态机、同意、续传握手、
+  清理与发送计划，由 `tools/protocol/generate_chunked_resume_vectors.py` 生成，语义见
+  [`protocol/spec/chunked-resume.md`](../spec/chunked-resume.md)。尚无实现读取。
+
 Java、Go、.NET 与 Android 直接读取 SWS2/STMSG2 向量；管理前端直接读取
 STAP2/STWR2/STCLIP2 向量；Java 独立 STUN 服务直接读取 STFWD2 向量。随机 message id、sender epoch
 等运行时字段必须在测试里注入固定值，不能复制向量后只做语义相似断言。
