@@ -2,12 +2,14 @@ package com.theshuai.specusserver.http;
 
 import com.theshuai.specusserver.handler.NatServerHandler;
 import com.theshuai.specusserver.handler.SpecusStreamIds;
+import com.theshuai.specusserver.httpshare.HttpShareRules;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.HttpRouteMapping;
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.service.ClientAccountService;
 import com.theshuai.specusserver.management.service.HttpMediaCaptureService;
 import com.theshuai.specusserver.management.service.HttpMediaCaptureService.CaptureSession;
+import com.theshuai.specusserver.management.service.HttpShareService;
 import com.theshuai.specusserver.management.service.TrafficInspectionService;
 import com.theshuai.specusserver.management.service.TrafficUsageService;
 import com.theshuai.specusserver.session.SessionUtil;
@@ -93,8 +95,30 @@ public class HttpSpecusController {
                         @PathVariable String route,
                         HttpServletRequest request,
                         HttpServletResponse response) throws IOException {
+        relay(new RouteRelay(clientName, route, relativePath(request)), request, response);
+    }
+
+    /**
+     * Forwards a request that {@link HttpShareService#authorizeVisitor} admitted under
+     * {@code /http-share/{shareId}/}: route semantics without the route's Basic gate, the share
+     * cookie stripped, the share-path rewrite prefix, and the share response rules. When the share
+     * ends mid-stream the response is aborted instead of being completed.
+     */
+    public void forwardShare(HttpShareService.Admission admission,
+                             HttpServletRequest request,
+                             HttpServletResponse response) throws IOException {
+        ShareRelay relay = new ShareRelay(admission);
+        relay(relay, request, response);
+        if (relay.cut() && response.isCommitted()) {
+            throw new HttpShareStreamCutException(admission.shareId());
+        }
+    }
+
+    private void relay(Relay relay, HttpServletRequest request, HttpServletResponse response) throws IOException {
+        String clientName = relay.clientName;
+        String route = relay.route;
+        String relativePath = relay.relativePath;
         long startedAt = System.currentTimeMillis();
-        String relativePath = relativePath(request);
         List<String> forwardedHeaders = List.of();
         FullCapture requestCapture = new FullCapture(false);
         FullCapture responseCapture = new FullCapture(false);
@@ -109,30 +133,10 @@ public class HttpSpecusController {
         boolean responseBodyExternalized = false;
         boolean opened = false;
         try {
-            HttpRouteAuthenticationService.Decision access = routeAuthenticationService.authorize(
-                    clientName, route, request.getHeader(HttpHeaders.AUTHORIZATION));
-            switch (access.outcome()) {
-                case UNAUTHORIZED -> {
-                    response.setHeader(HttpHeaders.WWW_AUTHENTICATE,
-                            HttpRouteAuthenticationService.BASIC_CHALLENGE);
-                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-                    throw new HttpForwardFailure(401, "需要 HTTP Basic 认证");
-                }
-                case NOT_FOUND -> {
-                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-                    throw new HttpForwardFailure(404, "HTTP 路由不存在或未启用");
-                }
-                case UNAVAILABLE -> {
-                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-                    throw new HttpForwardFailure(503, "HTTP 路由认证暂不可用");
-                }
-                default -> {
-                    // PUBLIC and AUTHENTICATED continue into the data plane.
-                }
-            }
+            boolean credentialsConsumed = relay.authorize(request, response);
             forwardedHeaders = UpstreamBrowserHeaders.rewrite(
-                    requestHeaders(request, access.credentialsConsumed()),
-                    targetBaseUrl(clientName, route));
+                    relay.requestHeaders(request, credentialsConsumed),
+                    relay.targetBaseUrl());
             boolean detailCaptureEnabled = trafficInspectionService.shouldCaptureHttpExchange(clientName, route);
             requestCapture = new FullCapture(detailCaptureEnabled);
             responseCapture = new FullCapture(detailCaptureEnabled);
@@ -154,7 +158,7 @@ public class HttpSpecusController {
             metadata.put("rawQuery", HttpQueryStringCodec.encodeForForwarding(request.getQueryString()));
             metadata.put("headers", forwardedHeaders);
             List<String> requestTrailerNames = declaredTrailerNames(
-                    request.getHeaders("Trailer"), access.credentialsConsumed());
+                    request.getHeaders("Trailer"), credentialsConsumed);
             if (!requestTrailerNames.isEmpty()) {
                 metadata.put("trailerNames", requestTrailerNames);
             }
@@ -165,6 +169,7 @@ public class HttpSpecusController {
                 throw new HttpForwardFailure(502, "HTTP 流创建失败");
             }
             opened = true;
+            relay.onStreamOpened(natHandler, streamId);
 
             byte[] chunk = new byte[64 * 1024];
             try (InputStream input = request.getInputStream()) {
@@ -180,12 +185,12 @@ public class HttpSpecusController {
                 }
             }
             natHandler.finishHttpRequest(streamId, flattenTrailers(
-                    request.getTrailerFields(), access.credentialsConsumed(), requestTrailerNames))
+                    request.getTrailerFields(), credentialsConsumed, requestTrailerNames))
                     .get(timeoutMillis, TimeUnit.MILLISECONDS);
 
             HttpStreamExchange.ResponseHead head = exchange.awaitResponseHead(timeoutMillis);
             statusCode = head.statusCode();
-            responseHeaders = head.headers();
+            responseHeaders = relay.responseHeaders(statusCode, head.headers());
             mediaCapture = mediaCaptureService.open(
                     clientName,
                     route,
@@ -203,7 +208,7 @@ public class HttpSpecusController {
             }
 
             boolean rewriteBuffered = responseRewriter.isRewritableContentType(responseHeaders)
-                    && isPathRewriteEnabled(clientName, route)
+                    && relay.pathRewriteEnabled()
                     && responseRewriter.maxBodyBytes() > 0;
             ByteArrayOutputStream rewriteBuffer = rewriteBuffered
                     ? new ByteArrayOutputStream(Math.min(64 * 1024, responseRewriter.maxBodyBytes())) : null;
@@ -248,7 +253,7 @@ public class HttpSpecusController {
             mediaCapture.complete();
             if (rewriteBuffer != null && !headRequest) {
                 byte[] original = rewriteBuffer.toByteArray();
-                Optional<byte[]> rewritten = responseRewriter.rewrite(original, clientName, route, responseHeaders);
+                Optional<byte[]> rewritten = relay.rewrite(original, responseHeaders);
                 List<String> finalHeaders = rewritten.isPresent()
                         ? stripEncodingHeaders(responseHeaders) : responseHeaders;
                 copyHeaders(finalHeaders, response);
@@ -274,7 +279,7 @@ public class HttpSpecusController {
             boolean clientDisconnected = streamReset == null
                     && response.isCommitted() && isClientDisconnect(cause);
             mediaCapture.fail(diagnostic);
-            if (opened && natHandler != null && exchange != null) {
+            if (opened && natHandler != null && exchange != null && !relay.cut()) {
                 natHandler.cancelHttpStream(exchange.streamId(), errorMessage);
             }
             if (clientDisconnected) {
@@ -654,6 +659,195 @@ public class HttpSpecusController {
     }
 
     private record RewriteDecision(boolean enabled, long expiresAtMillis) {
+    }
+
+    /** What differs between the route entry and the share entry around one forwarded exchange. */
+    private abstract static class Relay {
+        final String clientName;
+        final String route;
+        final String relativePath;
+
+        Relay(String clientName, String route, String relativePath) {
+            this.clientName = clientName;
+            this.route = route;
+            this.relativePath = relativePath;
+        }
+
+        /** The entry's own gate; returns whether it consumed the request's Authorization header. */
+        abstract boolean authorize(HttpServletRequest request, HttpServletResponse response) throws HttpForwardFailure;
+
+        abstract List<String> requestHeaders(HttpServletRequest request, boolean credentialsConsumed);
+
+        abstract String targetBaseUrl();
+
+        abstract boolean pathRewriteEnabled();
+
+        abstract Optional<byte[]> rewrite(byte[] body, List<String> headers);
+
+        List<String> responseHeaders(int statusCode, List<String> headers) {
+            return headers;
+        }
+
+        void onStreamOpened(NatServerHandler natHandler, int streamId) {
+        }
+
+        /** Whether the stream was torn down from outside (a share that ended mid-stream). */
+        boolean cut() {
+            return false;
+        }
+    }
+
+    /** {@code /http/{clientName}/{route}/**}: the route's Basic gate and the route's own prefix. */
+    private final class RouteRelay extends Relay {
+        RouteRelay(String clientName, String route, String relativePath) {
+            super(clientName, route, relativePath);
+        }
+
+        @Override
+        boolean authorize(HttpServletRequest request, HttpServletResponse response) throws HttpForwardFailure {
+            HttpRouteAuthenticationService.Decision access = routeAuthenticationService.authorize(
+                    clientName, route, request.getHeader(HttpHeaders.AUTHORIZATION));
+            switch (access.outcome()) {
+                case UNAUTHORIZED -> {
+                    response.setHeader(HttpHeaders.WWW_AUTHENTICATE,
+                            HttpRouteAuthenticationService.BASIC_CHALLENGE);
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(401, "需要 HTTP Basic 认证");
+                }
+                case NOT_FOUND -> {
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(404, "HTTP 路由不存在或未启用");
+                }
+                case UNAVAILABLE -> {
+                    response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                    throw new HttpForwardFailure(503, "HTTP 路由认证暂不可用");
+                }
+                default -> {
+                    // PUBLIC and AUTHENTICATED continue into the data plane.
+                }
+            }
+            return access.credentialsConsumed();
+        }
+
+        @Override
+        List<String> requestHeaders(HttpServletRequest request, boolean credentialsConsumed) {
+            return HttpSpecusController.this.requestHeaders(request, credentialsConsumed);
+        }
+
+        @Override
+        String targetBaseUrl() {
+            return HttpSpecusController.this.targetBaseUrl(clientName, route);
+        }
+
+        @Override
+        boolean pathRewriteEnabled() {
+            return isPathRewriteEnabled(clientName, route);
+        }
+
+        @Override
+        Optional<byte[]> rewrite(byte[] body, List<String> headers) {
+            return responseRewriter.rewrite(body, clientName, route, headers);
+        }
+    }
+
+    /**
+     * {@code /http-share/{shareId}/**}: already authorized by the share (which read the route fresh
+     * from the database), no Basic gate, Authorization relayed as is, the share cookie never leaves
+     * the server, and the share's own path prefix and response rules.
+     */
+    private final class ShareRelay extends Relay {
+        private final HttpShareService.Admission admission;
+
+        ShareRelay(HttpShareService.Admission admission) {
+            super(admission.clientName(), admission.routeName(), admission.relativePath());
+            this.admission = admission;
+        }
+
+        @Override
+        boolean authorize(HttpServletRequest request, HttpServletResponse response) throws HttpForwardFailure {
+            if (request.getContentLengthLong() > maxRequestBodySize) {
+                throw new HttpForwardFailure(413, "HTTP 请求体超过限制");
+            }
+            return false;
+        }
+
+        @Override
+        List<String> requestHeaders(HttpServletRequest request, boolean credentialsConsumed) {
+            return withoutShareCookie(HttpSpecusController.this.requestHeaders(request, false));
+        }
+
+        @Override
+        String targetBaseUrl() {
+            return admission.targetBaseUrl();
+        }
+
+        @Override
+        boolean pathRewriteEnabled() {
+            return admission.pathRewriteEnabled();
+        }
+
+        @Override
+        Optional<byte[]> rewrite(byte[] body, List<String> headers) {
+            return responseRewriter.rewriteWithPrefix(body, HttpShareRules.SHARE_ROOT + admission.shareId(), headers);
+        }
+
+        @Override
+        List<String> responseHeaders(int statusCode, List<String> headers) {
+            return HttpShareRules.responseHeaders(statusCode, headers, admission.shareId());
+        }
+
+        @Override
+        void onStreamOpened(NatServerHandler natHandler, int streamId) {
+            admission.stream().attach(() -> natHandler.cancelHttpStream(streamId, "HTTP share ended"));
+        }
+
+        @Override
+        boolean cut() {
+            return admission.stream().isCut();
+        }
+    }
+
+    /**
+     * Request headers of a share visitor as the device receives them: every share-cookie pair is
+     * removed and the remaining pairs are joined, in order, into one Cookie header at the place of
+     * the first one; with nothing left there is no Cookie header at all. The token therefore never
+     * reaches the device.
+     */
+    static List<String> withoutShareCookie(List<String> collected) {
+        List<String> cookieHeaders = new ArrayList<>();
+        List<String> headers = new ArrayList<>(collected.size());
+        int cookieIndex = -1;
+        for (String header : collected) {
+            int separator = header.indexOf(':');
+            if (separator > 0 && header.substring(0, separator).trim().equalsIgnoreCase(HttpHeaders.COOKIE)) {
+                cookieHeaders.add(header.substring(separator + 1));
+                if (cookieIndex < 0) {
+                    cookieIndex = headers.size();
+                }
+                continue;
+            }
+            headers.add(header);
+        }
+        String forwardedCookie = HttpShareRules.forwardedCookie(cookieHeaders);
+        if (forwardedCookie != null) {
+            headers.add(cookieIndex, HttpHeaders.COOKIE + ":" + forwardedCookie);
+        }
+        return headers;
+    }
+
+    /**
+     * Thrown after a committed share response was cut, so the container aborts the connection
+     * instead of completing a truncated response. An expected outcome: it carries no stack trace.
+     */
+    static final class HttpShareStreamCutException extends IOException {
+        HttpShareStreamCutException(String shareId) {
+            super("HTTP share " + shareId + " ended while its response was streaming");
+        }
+
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            return this;
+        }
     }
 
     private static final class FullCapture {

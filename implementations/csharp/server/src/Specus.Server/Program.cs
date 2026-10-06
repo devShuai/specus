@@ -148,6 +148,16 @@ builder.Services.AddSingleton<PublicTransferRateLimiter>();
 builder.Services.AddHostedService<PublicTransferRateLimiterCleanupService>();
 builder.Services.AddScoped<TransferAttachmentService>();
 builder.Services.AddHostedService<TransferAttachmentExpirationService>();
+// Temporary HTTP shares: the clock and random source are injectable so the shared vectors can be
+// replayed at fixed instants with fixed bytes.
+builder.Services.AddSingleton(sp => new HttpShareClock(sp.GetRequiredService<TimeProvider>()));
+builder.Services.AddSingleton<IHttpShareRandom, CryptoHttpShareRandom>();
+builder.Services.AddSingleton<HttpShareStreamRegistry>();
+builder.Services.AddSingleton<HttpShareExchangeRateLimiter>();
+builder.Services.AddSingleton<HttpShareRequestRateLimiter>();
+builder.Services.AddScoped<HttpShareService>();
+builder.Services.AddHostedService<HttpShareSweeper>();
+builder.Services.AddHostedService<HttpShareStreamMonitor>();
 builder.Services.AddSingleton<TrafficInspectionService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficInspectionService>());
 builder.Services.AddHttpClient();

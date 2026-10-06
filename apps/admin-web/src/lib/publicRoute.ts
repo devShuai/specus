@@ -1,4 +1,4 @@
-export type PublicRoute = "nat-detect" | "transfer" | "diagram-embed" | "diagram" | "download";
+export type PublicRoute = "nat-detect" | "transfer" | "diagram-embed" | "diagram" | "download" | "http-share";
 
 export interface PublicRouteLocation {
   hash: string;
@@ -12,6 +12,8 @@ const PUBLIC_ROUTES: readonly PublicRoute[] = [
   "diagram-embed",
   "diagram",
   "download",
+  // The temporary HTTP share landing page: #/http-share/<token>. The token is in the fragment only.
+  "http-share",
 ];
 
 function readFirstSegment(value: string, prefix: RegExp) {

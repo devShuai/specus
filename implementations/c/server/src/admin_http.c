@@ -9,6 +9,7 @@
 #include "decompression_limits.h"
 #include "github_release.h"
 #include "http_client.h"
+#include "http_share.h"
 #include "json.h"
 #include "peer_egress.h"
 #include "login_rate_limiter.h"
@@ -75,6 +76,7 @@
 #define ST_ADMIN_WS_CLOSE_GOING_AWAY 1001U
 #define ST_ADMIN_WS_CLOSE_PROTOCOL_ERROR 1002U
 #define ST_ADMIN_WS_CLOSE_INVALID_PAYLOAD 1007U
+#define ST_ADMIN_WS_CLOSE_POLICY_VIOLATION 1008U
 #define ST_ADMIN_WS_CLOSE_TOO_BIG 1009U
 #define ST_ADMIN_WS_CLOSE_INTERNAL_ERROR 1011U
 
@@ -186,9 +188,45 @@ struct st_admin_direct_ws_stream {
     int flow_closed;
     /* The socket must not be touched any more (aborted, or the admin thread is done with it). */
     int closed;
+    /* The temporary HTTP share it was opened through ended: the NAT stream ends with RST. */
+    int share_ended;
     /* The admin thread and the NAT stream map each hold one; see admin_direct_ws_ref_lock. */
     unsigned int refs;
 };
+
+/*
+ * One stream of a temporary HTTP share in flight on this instance (spec 6.6): an HTTP exchange or
+ * a WebSocket. The registry doubles as the 64-per-share admission limit. Cutting a stream runs
+ * under admin_share_streams_lock, which the forwarder's cancel binding also takes, so a canceller
+ * is never called after its forwarder let go of it; fd stays open while the entry is registered.
+ */
+typedef struct admin_share_stream {
+    char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
+    long long expires_at;
+    int fd;
+    int cut;
+    void (*cancel)(void *cancel_ctx);
+    void *cancel_ctx;
+    st_admin_direct_ws_stream *ws;
+    struct admin_share_stream *next;
+} admin_share_stream;
+
+/* A request under /http-share/ that passed every check of spec 6.1 steps 1-11. */
+typedef struct {
+    char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
+    char client_name[256];
+    char route[128];
+    char rewrite_prefix[64];
+    char *relative_path;
+    const char *raw_query;
+    int upgrade;
+    admin_share_stream stream;
+} admin_share_admission;
+
+static pthread_mutex_t admin_share_streams_lock = PTHREAD_MUTEX_INITIALIZER;
+static admin_share_stream *admin_share_streams = NULL;
+static long long admin_share_next_recheck_ms = 0;
+static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 
 /* Guards st_admin_direct_ws_stream.refs; the stream's own locks die with its last reference. */
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -6275,6 +6313,256 @@ static int build_tcp_stream_response(const st_admin_context *context, const char
     return response_len;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Temporary HTTP shares: this instance's streams in flight (protocol/spec/temporary-http-share.md)
+ */
+
+/* The built-in admin has no user row; it counts as an ADMIN of its tenant while it may sign in. */
+static st_storage_share_builtin_admin admin_share_builtin_admin(void)
+{
+    st_storage_share_builtin_admin builtin = {
+        env_text("SPECUS_AUTH_USERNAME", "admin"),
+        env_text("SPECUS_AUTH_TENANT_ID", "default"),
+        management_password_login_enabled()
+    };
+    return builtin;
+}
+
+/* Placeholder entries of st_admin_http_share_occupy_for_testing carry this fd. */
+#define ST_ADMIN_SHARE_PLACEHOLDER_FD (-2)
+
+static int admin_share_stream_register(admin_share_stream *stream)
+{
+    size_t active = 0U;
+    pthread_mutex_lock(&admin_share_streams_lock);
+    for (admin_share_stream *entry = admin_share_streams; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->share_id, stream->share_id) == 0) {
+            ++active;
+        }
+    }
+    if (active >= ST_HTTP_SHARE_MAX_CONCURRENT) {
+        pthread_mutex_unlock(&admin_share_streams_lock);
+        return -1;
+    }
+    stream->next = admin_share_streams;
+    admin_share_streams = stream;
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    return 0;
+}
+
+static void admin_share_stream_unregister(admin_share_stream *stream)
+{
+    pthread_mutex_lock(&admin_share_streams_lock);
+    for (admin_share_stream **link = &admin_share_streams; *link != NULL; link = &(*link)->next) {
+        if (*link == stream) {
+            *link = stream->next;
+            break;
+        }
+    }
+    st_admin_direct_ws_stream *ws = stream->ws;
+    stream->ws = NULL;
+    stream->cancel = NULL;
+    stream->cancel_ctx = NULL;
+    stream->next = NULL;
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    st_admin_direct_ws_release(ws);
+}
+
+/*
+ * Cuts the matching streams once: one share's (share_id), or every stream whose share has expired
+ * (share_id NULL). HTTP gets its NAT stream reset and its socket shut; a WebSocket is closed with
+ * 1008 outside the lock, since that writes to a browser that may be slow to read.
+ */
+static void admin_share_cut_matching(const char *share_id, long long now_ms)
+{
+    st_admin_direct_ws_stream **sockets = NULL;
+    size_t socket_count = 0U;
+    size_t socket_capacity = 0U;
+    pthread_mutex_lock(&admin_share_streams_lock);
+    for (admin_share_stream *entry = admin_share_streams; entry != NULL; entry = entry->next) {
+        int match = share_id != NULL
+            ? strcmp(entry->share_id, share_id) == 0
+            : entry->expires_at * 1000LL <= now_ms;
+        if (!match || entry->cut) {
+            continue;
+        }
+        entry->cut = 1;
+        if (entry->ws != NULL) {
+            if (socket_count == socket_capacity) {
+                size_t next = socket_capacity == 0U ? 8U : socket_capacity * 2U;
+                st_admin_direct_ws_stream **grown =
+                    (st_admin_direct_ws_stream **)realloc(sockets, next * sizeof(*grown));
+                if (grown == NULL) {
+                    if (entry->fd >= 0) {
+                        (void)shutdown(entry->fd, SHUT_RDWR);
+                    }
+                    continue;
+                }
+                sockets = grown;
+                socket_capacity = next;
+            }
+            st_admin_direct_ws_retain(entry->ws);
+            sockets[socket_count++] = entry->ws;
+            continue;
+        }
+        if (entry->cancel != NULL) {
+            entry->cancel(entry->cancel_ctx);
+        }
+        if (entry->fd >= 0) {
+            (void)shutdown(entry->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    for (size_t i = 0U; i < socket_count; ++i) {
+        admin_direct_ws_share_cut(sockets[i]);
+        st_admin_direct_ws_release(sockets[i]);
+    }
+    free(sockets);
+}
+
+void st_admin_http_share_cut(const char *share_id)
+{
+    if (share_id != NULL) {
+        admin_share_cut_matching(share_id, 0);
+    }
+}
+
+static void admin_share_cut_revoked(const st_storage_share_ids *revoked)
+{
+    for (size_t i = 0U; revoked != NULL && i < revoked->len; ++i) {
+        admin_share_cut_matching(revoked->ids[i], 0);
+    }
+}
+
+size_t st_admin_http_share_stream_count(const char *share_id)
+{
+    size_t count = 0U;
+    pthread_mutex_lock(&admin_share_streams_lock);
+    for (admin_share_stream *entry = admin_share_streams; entry != NULL; entry = entry->next) {
+        if (share_id == NULL || strcmp(entry->share_id, share_id) == 0) {
+            ++count;
+        }
+    }
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    return count;
+}
+
+int st_admin_http_share_occupy_for_testing(const char *share_id, size_t count)
+{
+    for (size_t i = 0U; i < count; ++i) {
+        admin_share_stream *entry = (admin_share_stream *)calloc(1U, sizeof(*entry));
+        if (entry == NULL) {
+            return -1;
+        }
+        snprintf(entry->share_id, sizeof(entry->share_id), "%s", share_id);
+        entry->expires_at = LLONG_MAX / 2000LL;
+        entry->fd = ST_ADMIN_SHARE_PLACEHOLDER_FD;
+        if (admin_share_stream_register(entry) != 0) {
+            free(entry);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void st_admin_http_share_release_for_testing(void)
+{
+    pthread_mutex_lock(&admin_share_streams_lock);
+    admin_share_stream **link = &admin_share_streams;
+    while (*link != NULL) {
+        admin_share_stream *entry = *link;
+        if (entry->fd == ST_ADMIN_SHARE_PLACEHOLDER_FD) {
+            *link = entry->next;
+            free(entry);
+        } else {
+            link = &entry->next;
+        }
+    }
+    pthread_mutex_unlock(&admin_share_streams_lock);
+}
+
+/* Re-reads one share with streams here; ended or lapsed (then revoked in place) means cut. */
+static void admin_share_recheck(const char *share_id, long long now_ms)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return;
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_http_share_resolution resolution;
+    if (st_storage_http_share_resolve(database_path, &builtin, share_id, now_ms, &resolution) != 0) {
+        return; /* unreadable: the next recheck decides */
+    }
+    if (!resolution.found || resolution.share.revoked || now_ms >= resolution.share.expires_at * 1000LL) {
+        admin_share_cut_matching(share_id, now_ms);
+        return;
+    }
+    if (resolution.lapse_reason != NULL) {
+        int changed = 0;
+        (void)st_storage_http_share_revoke_lapsed(database_path, share_id, resolution.lapse_reason,
+                                                  now_ms, &changed);
+        admin_share_cut_matching(share_id, now_ms);
+    }
+}
+
+void st_admin_http_share_tick(void)
+{
+    long long now_ms = st_http_share_now_ms();
+    admin_share_cut_matching(NULL, now_ms);
+    char (*ids)[ST_HTTP_SHARE_ID_LEN + 1U] = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    pthread_mutex_lock(&admin_share_streams_lock);
+    if (now_ms >= admin_share_next_recheck_ms) {
+        admin_share_next_recheck_ms = now_ms + ST_HTTP_SHARE_RECHECK_INTERVAL_MS;
+        for (admin_share_stream *entry = admin_share_streams; entry != NULL; entry = entry->next) {
+            if (entry->cut || entry->fd == ST_ADMIN_SHARE_PLACEHOLDER_FD) {
+                continue;
+            }
+            int seen = 0;
+            for (size_t i = 0U; i < count && !seen; ++i) {
+                seen = strcmp(ids[i], entry->share_id) == 0;
+            }
+            if (seen) {
+                continue;
+            }
+            if (count == capacity) {
+                size_t next = capacity == 0U ? 8U : capacity * 2U;
+                char (*grown)[ST_HTTP_SHARE_ID_LEN + 1U] = realloc(ids, next * sizeof(*grown));
+                if (grown == NULL) {
+                    break;
+                }
+                ids = grown;
+                capacity = next;
+            }
+            snprintf(ids[count++], sizeof(ids[0]), "%s", entry->share_id);
+        }
+    }
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    /* One query per share, outside the lock. */
+    for (size_t i = 0U; i < count; ++i) {
+        admin_share_recheck(ids[i], now_ms);
+    }
+    free(ids);
+}
+
+int st_admin_http_share_sweep(void)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return 0;
+    }
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        return -1;
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_share_ids revoked = {0};
+    int rc = st_storage_http_share_sweep(database_path, &builtin, st_http_share_now_ms(), &revoked);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    return rc;
+}
+
 static int handle_client_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -6332,15 +6620,20 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     int rate_limit = existing.connection_rate_limit_per_minute;
     (void)st_json_get_int(body, "connectionRateLimitPerMinute", &rate_limit);
     st_storage_client updated;
-    int rc = st_storage_upsert_client(database_path,
-                                      id,
-                                      existing.tenant_id,
-                                      next_client_name,
-                                      existing.owner_username,
-                                      enabled,
-                                      rate_limit,
-                                      &updated);
+    st_storage_share_ids revoked = {0};
+    /* Disabling the client ends the shares of all its routes in the same transaction. */
+    int rc = st_storage_update_client_audited(database_path,
+                                              id,
+                                              next_client_name,
+                                              enabled,
+                                              rate_limit,
+                                              context->username,
+                                              st_http_share_now_ms(),
+                                              &updated,
+                                              &revoked);
     free(client_name);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
     }
@@ -6359,7 +6652,13 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     if (st_storage_get_client(database_path, id, &existing) != 0 || !admin_can_access_client(context, &existing)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    if (st_storage_delete_client(database_path, id) != 0) {
+    /* Its routes go with it, audited as route.deleted, and their shares end. */
+    st_storage_share_ids revoked = {0};
+    int rc = st_storage_delete_client_audited(database_path, id, context->username, st_http_share_now_ms(),
+                                              &revoked);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
     admin_notify_peer_mesh_refresh(existing.tenant_id);
@@ -6725,23 +7024,31 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and authPassword are required when authentication is enabled\"}");
     }
     st_storage_http_route route;
-    int rc = st_storage_create_http_route_for_client(database_path,
-                                                     client_id,
-                                                     route_name,
-                                                     target_base_url,
-                                                     enabled,
-                                                     detail_capture_enabled,
-                                                     media_capture_enabled,
-                                                     path_rewrite_enabled,
-                                                     insecure_skip_verify,
-                                                     auth_enabled,
-                                                     auth_username,
-                                                     auth_password_hash,
-                                                     &route);
+    st_storage_share_ids revoked = {0};
+    /* route.created (or, for a name that exists, the update's audit and share hooks) in one go. */
+    int rc = st_storage_create_http_route_audited(database_path,
+                                                  client_id,
+                                                  route_name,
+                                                  target_base_url,
+                                                  enabled,
+                                                  detail_capture_enabled,
+                                                  media_capture_enabled,
+                                                  path_rewrite_enabled,
+                                                  insecure_skip_verify,
+                                                  auth_enabled,
+                                                  auth_username,
+                                                  auth_password_hash,
+                                                  http_route_auth_text_present(auth_password),
+                                                  context->username,
+                                                  st_http_share_now_ms(),
+                                                  &route,
+                                                  &revoked);
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
@@ -6803,23 +7110,34 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and a configured authPassword are required when authentication is enabled\"}");
     }
     st_storage_http_route route;
-    int rc = st_storage_update_http_route_by_id(database_path,
-                                                id,
-                                                next_route,
-                                                next_target,
-                                                enabled,
-                                                detail_capture_enabled,
-                                                media_capture_enabled,
-                                                path_rewrite_enabled,
-                                                insecure_skip_verify,
-                                                auth_enabled,
-                                                next_auth_username,
-                                                auth_password_hash,
-                                                &route);
+    st_storage_share_ids revoked = {0};
+    /*
+     * Exposure and credential changes are audited and a route that is no longer protected ends
+     * its shares, all in the transaction of the update.
+     */
+    int rc = st_storage_update_http_route_audited(database_path,
+                                                  id,
+                                                  next_route,
+                                                  next_target,
+                                                  enabled,
+                                                  detail_capture_enabled,
+                                                  media_capture_enabled,
+                                                  path_rewrite_enabled,
+                                                  insecure_skip_verify,
+                                                  auth_enabled,
+                                                  next_auth_username,
+                                                  auth_password_hash,
+                                                  http_route_auth_text_present(auth_password),
+                                                  context->username,
+                                                  st_http_share_now_ms(),
+                                                  &route,
+                                                  &revoked);
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
@@ -6974,11 +7292,694 @@ static int handle_http_route_delete(const st_admin_context *context, long long i
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
-    if (st_storage_delete_http_route_by_id(database_path, id) != 0) {
+    st_storage_share_ids revoked = {0};
+    int rc = st_storage_delete_http_route_audited(database_path, id, context->username, st_http_share_now_ms(),
+                                                  &revoked);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
     admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Temporary HTTP shares: management endpoints and the anonymous exchange
+ * (protocol/spec/temporary-http-share.md sections 4 and 5.2)
+ */
+
+static int write_share_response(char *out,
+                                size_t out_len,
+                                int status,
+                                const char *cache_control,
+                                const char *body,
+                                const char *extra_headers)
+{
+    if (body == NULL) {
+        body = "";
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: %s\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "%s"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           status,
+                           admin_reason_phrase(status),
+                           cache_control,
+                           extra_headers == NULL ? "" : extra_headers,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/* Every management answer is private, no-store; a refusal carries {"code": ...}. */
+static int write_share_code(char *out, size_t out_len, int status, const char *code)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"code\":\"%s\"}", code);
+    return write_share_response(out, out_len, status, "private, no-store", body, NULL);
+}
+
+static const char *admin_share_status(const st_storage_http_share *share, long long now_ms)
+{
+    if (share->revoked) {
+        return "revoked";
+    }
+    return now_ms >= share->expires_at * 1000LL ? "expired" : "active";
+}
+
+static int append_http_share_view(st_admin_string_builder *builder,
+                                  const st_storage_http_share *share,
+                                  long long now_ms)
+{
+    char created_at[32];
+    char expires_at[32];
+    char revoked_at[32];
+    st_http_share_format_time(share->created_at, created_at);
+    st_http_share_format_time(share->expires_at, expires_at);
+    st_http_share_format_time(share->revoked_at, revoked_at);
+    int ok = admin_sb_append(builder, "{\"shareId\":") == 0
+        && admin_sb_append_json_string(builder, share->share_id) == 0
+        && admin_sb_appendf(builder, ",\"routeId\":%lld,\"label\":", share->route_id) == 0
+        && (share->has_label ? admin_sb_append_json_string(builder, share->label)
+                             : admin_sb_append(builder, "null")) == 0
+        && admin_sb_append(builder, ",\"access\":") == 0
+        && admin_sb_append_json_string(builder, share->access) == 0
+        && admin_sb_append(builder, ",\"pathPrefix\":") == 0
+        && admin_sb_append_json_string(builder, share->path_prefix) == 0
+        && admin_sb_appendf(builder, ",\"sharePath\":\"%s%s/\",\"createdAt\":\"%s\",\"createdBy\":",
+                            ST_HTTP_SHARE_PATH_ROOT, share->share_id, created_at) == 0
+        && admin_sb_append_json_string(builder, share->created_by) == 0
+        && admin_sb_appendf(builder, ",\"expiresAt\":\"%s\",\"status\":\"%s\",\"revokedAt\":",
+                            expires_at, admin_share_status(share, now_ms)) == 0;
+    if (ok && share->revoked) {
+        ok = admin_sb_appendf(builder, "\"%s\"", revoked_at) == 0;
+    } else if (ok) {
+        ok = admin_sb_append(builder, "null") == 0;
+    }
+    ok = ok && admin_sb_append(builder, ",\"revokedBy\":") == 0
+        && (share->has_revoked_by ? admin_sb_append_json_string(builder, share->revoked_by)
+                                  : admin_sb_append(builder, "null")) == 0
+        && admin_sb_append(builder, ",\"revokeReason\":") == 0
+        && (share->revoke_reason[0] != '\0' ? admin_sb_append_json_string(builder, share->revoke_reason)
+                                            : admin_sb_append(builder, "null")) == 0
+        && admin_sb_append(builder, "}") == 0;
+    return ok ? 0 : -1;
+}
+
+static int write_share_view_response(char *out,
+                                     size_t out_len,
+                                     int status,
+                                     const char *prefix,
+                                     const st_storage_http_share *share,
+                                     long long now_ms,
+                                     const char *suffix)
+{
+    st_admin_string_builder builder = {0};
+    int ok = admin_sb_append(&builder, prefix) == 0
+        && append_http_share_view(&builder, share, now_ms) == 0
+        && admin_sb_append(&builder, suffix) == 0;
+    int written = ok ? write_share_response(out, out_len, status, "private, no-store", builder.data, NULL) : -1;
+    free(builder.data);
+    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+}
+
+typedef enum {
+    ADMIN_SHARE_PATH_NONE = 0,
+    ADMIN_SHARE_PATH_SHARES,
+    ADMIN_SHARE_PATH_SHARE,
+    ADMIN_SHARE_PATH_REVOKE,
+    ADMIN_SHARE_PATH_AUDIT
+} admin_share_path_kind;
+
+typedef struct {
+    admin_share_path_kind kind;
+    int route_valid;
+    long long route_id;
+    int share_id_valid;
+    char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
+} admin_share_path;
+
+/* /api/admin/http-routes/{routeId}/shares[/{shareId}[/revoke]] and .../access-audit */
+static void admin_parse_share_path(const char *path, admin_share_path *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *prefix = "/api/admin/http-routes/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return;
+    }
+    const char *end = path + admin_path_len_no_query(path);
+    const char *segment = path + prefix_len;
+    const char *slash = memchr(segment, '/', (size_t)(end - segment));
+    if (slash == NULL) {
+        return;
+    }
+    size_t rest_len = (size_t)(end - slash);
+    if (rest_len == 7U && memcmp(slash, "/shares", 7U) == 0) {
+        out->kind = ADMIN_SHARE_PATH_SHARES;
+    } else if (rest_len == 13U && memcmp(slash, "/access-audit", 13U) == 0) {
+        out->kind = ADMIN_SHARE_PATH_AUDIT;
+    } else if (rest_len > 8U && memcmp(slash, "/shares/", 8U) == 0) {
+        const char *id = slash + 8;
+        const char *id_end = memchr(id, '/', (size_t)(end - id));
+        if (id_end == NULL) {
+            out->kind = ADMIN_SHARE_PATH_SHARE;
+            id_end = end;
+        } else if (end - id_end == 7 && memcmp(id_end, "/revoke", 7U) == 0) {
+            out->kind = ADMIN_SHARE_PATH_REVOKE;
+        } else {
+            return;
+        }
+        out->share_id_valid = st_http_share_valid_id(id, (size_t)(id_end - id));
+        if (out->share_id_valid) {
+            memcpy(out->share_id, id, ST_HTTP_SHARE_ID_LEN);
+            out->share_id[ST_HTTP_SHARE_ID_LEN] = '\0';
+        }
+    } else {
+        return;
+    }
+    /* A route id that is not a positive integer names no route the caller can manage. */
+    long long route_id = 0;
+    int digits = slash > segment && slash - segment <= 18;
+    for (const char *p = segment; digits && p < slash; ++p) {
+        digits = *p >= '0' && *p <= '9';
+        route_id = digits ? route_id * 10 + (*p - '0') : 0;
+    }
+    out->route_valid = digits && route_id > 0;
+    out->route_id = out->route_valid ? route_id : 0;
+}
+
+/* A query parameter as a positive integer: 1 when present and valid, 0 when absent, -1 otherwise. */
+static int admin_share_query_number(const char *path, const char *key, long long *value)
+{
+    const char *query = strchr(path, '?');
+    if (query == NULL) {
+        return 0;
+    }
+    ++query;
+    size_t key_len = strlen(key);
+    int found = 0;
+    while (*query != '\0') {
+        const char *next = strchr(query, '&');
+        size_t part_len = next == NULL ? strlen(query) : (size_t)(next - query);
+        if (part_len >= key_len + 1U && memcmp(query, key, key_len) == 0 && query[key_len] == '=') {
+            const char *digits = query + key_len + 1U;
+            size_t digits_len = part_len - key_len - 1U;
+            long long parsed = 0;
+            int valid = digits_len > 0U && digits_len <= 18U;
+            for (size_t i = 0U; valid && i < digits_len; ++i) {
+                valid = digits[i] >= '0' && digits[i] <= '9';
+                parsed = valid ? parsed * 10 + (digits[i] - '0') : 0;
+            }
+            if (!valid || parsed <= 0) {
+                return -1;
+            }
+            *value = parsed;
+            found = 1;
+        }
+        if (next == NULL) {
+            break;
+        }
+        query = next + 1;
+    }
+    return found;
+}
+
+static const char *admin_share_database(void)
+{
+    const char *database_path = admin_database_path();
+    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        return NULL;
+    }
+    return database_path;
+}
+
+static int handle_http_share_create(const st_admin_context *context,
+                                    long long route_id,
+                                    const char *body,
+                                    size_t body_len,
+                                    char *out,
+                                    size_t out_len)
+{
+    st_http_share_create_fields fields;
+    if (st_http_share_parse_create_body(body, body_len, &fields) != 0) {
+        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+    }
+    const char *database_path = admin_share_database();
+    if (database_path == NULL) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    long long now_ms = st_http_share_now_ms();
+    st_storage_http_share draft;
+    memset(&draft, 0, sizeof(draft));
+    draft.created_at = now_ms / 1000LL;
+    draft.expires_at = draft.created_at + fields.expires_in_seconds;
+    snprintf(draft.access, sizeof(draft.access), "%s", fields.access);
+    snprintf(draft.path_prefix, sizeof(draft.path_prefix), "%s", fields.path_prefix);
+    if (fields.has_label) {
+        snprintf(draft.label, sizeof(draft.label), "%s", fields.label);
+        draft.has_label = 1;
+    }
+    char token[ST_HTTP_SHARE_TOKEN_LEN + 1U] = {0};
+    st_storage_http_share share;
+    int rc = ST_STORAGE_SHARE_ID_TAKEN;
+    /* A share id clash is retried with fresh randomness; the primary key decides. */
+    for (int attempt = 0; attempt < 5 && rc == ST_STORAGE_SHARE_ID_TAKEN; ++attempt) {
+        if (st_http_share_new_token(draft.share_id, token) != 0) {
+            rc = -1;
+            break;
+        }
+        st_http_share_token_hash(token, strlen(token), draft.token_sha256);
+        rc = st_storage_http_share_create(database_path, &builtin, context->username, context->tenant_id,
+                                          route_id, &draft, ST_HTTP_SHARE_MAX_ACTIVE_PER_ROUTE, now_ms, &share);
+    }
+    int written;
+    if (rc == ST_STORAGE_SHARE_OK) {
+        /* The token appears here once and in no other answer. */
+        char suffix[ST_HTTP_SHARE_TOKEN_LEN * 2U + 64U];
+        snprintf(suffix, sizeof(suffix), ",\"token\":\"%s\",\"linkPath\":\"%s%s\"}",
+                 token, ST_HTTP_SHARE_LINK_ROOT, token);
+        written = write_share_view_response(out, out_len, 201, "{\"share\":", &share, now_ms, suffix);
+        memset(suffix, 0, sizeof(suffix));
+    } else if (rc == ST_STORAGE_SHARE_ROUTE_NOT_FOUND) {
+        written = write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+    } else if (rc == ST_STORAGE_SHARE_ROUTE_DISABLED) {
+        written = write_share_code(out, out_len, 409, "SHARE_ROUTE_DISABLED");
+    } else if (rc == ST_STORAGE_SHARE_CLIENT_DISABLED) {
+        written = write_share_code(out, out_len, 409, "SHARE_CLIENT_DISABLED");
+    } else if (rc == ST_STORAGE_SHARE_ROUTE_PUBLIC) {
+        written = write_share_code(out, out_len, 409, "SHARE_ROUTE_PUBLIC");
+    } else if (rc == ST_STORAGE_SHARE_LIMIT_REACHED) {
+        written = write_share_code(out, out_len, 409, "SHARE_LIMIT_REACHED");
+    } else {
+        written = write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    memset(token, 0, sizeof(token));
+    return written;
+}
+
+/* Whether the caller may manage the route: 0 when yes, else the refusal already written. */
+static int admin_share_check_route(const st_admin_context *context,
+                                   const char *database_path,
+                                   long long route_id,
+                                   char *out,
+                                   size_t out_len,
+                                   int *written)
+{
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    int allowed = 0;
+    if (st_storage_http_share_caller_can_manage(database_path, &builtin, context->username, context->tenant_id,
+                                                route_id, &allowed) != 0) {
+        *written = write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+        return -1;
+    }
+    if (!allowed) {
+        *written = write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+        return -1;
+    }
+    return 0;
+}
+
+static int handle_http_share_list(const st_admin_context *context,
+                                  const admin_share_path *share_path,
+                                  char *out,
+                                  size_t out_len)
+{
+    const char *database_path = admin_share_database();
+    if (database_path == NULL) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    int written = 0;
+    if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
+        return written;
+    }
+    int single = share_path->kind == ADMIN_SHARE_PATH_SHARE;
+    if (single && !share_path->share_id_valid) {
+        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    long long now_ms = st_http_share_now_ms();
+    st_storage_http_share *shares = NULL;
+    size_t count = 0U;
+    st_storage_share_ids revoked = {0};
+    int rc = st_storage_http_share_list(database_path, &builtin, share_path->route_id,
+                                        single ? share_path->share_id : NULL, now_ms, &shares, &count, &revoked);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    if (rc != 0) {
+        free(shares);
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    if (single) {
+        written = count == 0U
+            ? write_share_code(out, out_len, 404, "SHARE_NOT_FOUND")
+            : write_share_view_response(out, out_len, 200, "{\"share\":", &shares[0], now_ms, "}");
+        free(shares);
+        return written;
+    }
+    st_admin_string_builder builder = {0};
+    int ok = admin_sb_append(&builder, "{\"shares\":[") == 0;
+    for (size_t i = 0U; ok && i < count; ++i) {
+        ok = (i == 0U || admin_sb_append(&builder, ",") == 0)
+            && append_http_share_view(&builder, &shares[i], now_ms) == 0;
+    }
+    ok = ok && admin_sb_append(&builder, "]}") == 0;
+    written = ok ? write_share_response(out, out_len, 200, "private, no-store", builder.data, NULL) : -1;
+    free(builder.data);
+    free(shares);
+    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+}
+
+/* The revoke body is empty or {} (spec 4.3). */
+static int admin_share_empty_body(const char *body, size_t body_len)
+{
+    size_t start = 0U;
+    while (start < body_len && isspace((unsigned char)body[start])) {
+        ++start;
+    }
+    if (start == body_len) {
+        return 1;
+    }
+    if (body[start] != '{') {
+        return 0;
+    }
+    size_t next = start + 1U;
+    while (next < body_len && isspace((unsigned char)body[next])) {
+        ++next;
+    }
+    if (next == body_len || body[next] != '}') {
+        return 0;
+    }
+    for (size_t i = next + 1U; i < body_len; ++i) {
+        if (!isspace((unsigned char)body[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int handle_http_share_revoke(const st_admin_context *context,
+                                    const admin_share_path *share_path,
+                                    const char *body,
+                                    size_t body_len,
+                                    char *out,
+                                    size_t out_len)
+{
+    if (!admin_share_empty_body(body == NULL ? "" : body, body == NULL ? 0U : body_len)) {
+        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+    }
+    const char *database_path = admin_share_database();
+    if (database_path == NULL) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    if (!share_path->share_id_valid) {
+        int written = 0;
+        if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
+            return written;
+        }
+        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    long long now_ms = st_http_share_now_ms();
+    st_storage_http_share share;
+    int changed = 0;
+    int rc = st_storage_http_share_revoke(database_path, &builtin, context->username, context->tenant_id,
+                                          share_path->route_id, share_path->share_id, now_ms, &share, &changed);
+    if (rc == ST_STORAGE_SHARE_ROUTE_NOT_FOUND) {
+        return write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+    }
+    if (rc == ST_STORAGE_SHARE_NOT_FOUND) {
+        return write_share_code(out, out_len, 404, "SHARE_NOT_FOUND");
+    }
+    if (rc != ST_STORAGE_SHARE_OK) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    /* Whatever this instance carries of the share stops now (spec 6.6). */
+    admin_share_cut_matching(share.share_id, now_ms);
+    return write_share_view_response(out, out_len, 200, "{\"share\":", &share, now_ms, "}");
+}
+
+static int append_access_audit_view(st_admin_string_builder *builder, const st_storage_http_access_audit *entry)
+{
+    char at[32];
+    st_http_share_format_time(entry->occurred_at, at);
+    int ok = admin_sb_appendf(builder, "{\"auditId\":%lld,\"at\":\"%s\",\"actor\":", entry->id, at) == 0
+        && (entry->has_actor ? admin_sb_append_json_string(builder, entry->actor) : admin_sb_append(builder, "null")) == 0
+        && admin_sb_append(builder, ",\"action\":") == 0
+        && admin_sb_append_json_string(builder, entry->action) == 0
+        && admin_sb_appendf(builder, ",\"routeId\":%lld,\"shareId\":", entry->route_id) == 0
+        && (entry->has_share_id ? admin_sb_append_json_string(builder, entry->share_id)
+                                : admin_sb_append(builder, "null")) == 0
+        && admin_sb_append(builder, ",\"detail\":") == 0
+        && admin_sb_append(builder, st_json_is_valid_object(entry->detail_json) ? entry->detail_json : "{}") == 0
+        && admin_sb_append(builder, "}") == 0;
+    return ok ? 0 : -1;
+}
+
+static int build_access_audit_response(const char *database_path,
+                                       const char *tenant_id,
+                                       long long route_id,
+                                       const char *path,
+                                       char *out,
+                                       size_t out_len)
+{
+    long long limit = ST_HTTP_SHARE_AUDIT_DEFAULT_LIMIT;
+    long long before = 0;
+    int limit_state = admin_share_query_number(path, "limit", &limit);
+    int before_state = admin_share_query_number(path, "before", &before);
+    if (limit_state < 0 || before_state < 0 || limit < 1 || limit > ST_HTTP_SHARE_AUDIT_MAX_LIMIT) {
+        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+    }
+    st_storage_http_access_audit *entries = NULL;
+    size_t count = 0U;
+    int more = 0;
+    if (st_storage_http_access_audit_list(database_path, tenant_id, route_id, before, (int)limit,
+                                          &entries, &count, &more) != 0) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    st_admin_string_builder builder = {0};
+    int ok = admin_sb_append(&builder, "{\"entries\":[") == 0;
+    for (size_t i = 0U; ok && i < count; ++i) {
+        ok = (i == 0U || admin_sb_append(&builder, ",") == 0)
+            && append_access_audit_view(&builder, &entries[i]) == 0;
+    }
+    if (ok && more && count > 0U) {
+        ok = admin_sb_appendf(&builder, "],\"nextBefore\":%lld}", entries[count - 1U].id) == 0;
+    } else if (ok) {
+        ok = admin_sb_append(&builder, "],\"nextBefore\":null}") == 0;
+    }
+    int written = ok ? write_share_response(out, out_len, 200, "private, no-store", builder.data, NULL) : -1;
+    free(builder.data);
+    free(entries);
+    return written > 0 ? written : write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+}
+
+static int handle_http_route_access_audit(const st_admin_context *context,
+                                          const admin_share_path *share_path,
+                                          const char *path,
+                                          char *out,
+                                          size_t out_len)
+{
+    const char *database_path = admin_share_database();
+    if (database_path == NULL) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    int written = 0;
+    if (admin_share_check_route(context, database_path, share_path->route_id, out, out_len, &written) != 0) {
+        return written;
+    }
+    return build_access_audit_response(database_path, context->tenant_id, share_path->route_id, path, out, out_len);
+}
+
+/* Tenant admins only; it can name a route that no longer exists. */
+static int handle_tenant_access_audit(const st_admin_context *context, const char *path, char *out, size_t out_len)
+{
+    const char *database_path = admin_share_database();
+    if (database_path == NULL) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    int admin = 0;
+    char tenant_id[128];
+    if (st_storage_http_share_caller_is_admin(database_path, &builtin, context->username, context->tenant_id,
+                                              &admin, tenant_id) != 0) {
+        return write_share_code(out, out_len, 503, "SHARE_UNAVAILABLE");
+    }
+    if (!admin) {
+        return write_share_code(out, out_len, 403, "SHARE_FORBIDDEN");
+    }
+    long long route_id = 0;
+    if (admin_share_query_number(path, "routeId", &route_id) < 0) {
+        return write_share_code(out, out_len, 400, "SHARE_REQUEST_INVALID");
+    }
+    return build_access_audit_response(database_path, tenant_id, route_id, path, out, out_len);
+}
+
+/* Exchange answers are anonymous: no-store, and nothing about the route or the device. */
+static int write_exchange_code(char *out, size_t out_len, int status, const char *code, long long retry_after)
+{
+    char body[96];
+    char extra[64] = "";
+    snprintf(body, sizeof(body), "{\"code\":\"%s\"}", code);
+    if (retry_after > 0) {
+        snprintf(extra, sizeof(extra), "Retry-After: %lld\r\n", retry_after);
+    }
+    return write_share_response(out, out_len, status, "no-store", body, extra);
+}
+
+static int admin_share_media_type_is_json(const char *content_type)
+{
+    if (content_type == NULL) {
+        return 0;
+    }
+    const char *start = content_type;
+    const char *end = strchr(content_type, ';');
+    if (end == NULL) {
+        end = content_type + strlen(content_type);
+    }
+    while (start < end && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    while (end > start && isspace((unsigned char)end[-1])) {
+        --end;
+    }
+    return (size_t)(end - start) == strlen("application/json")
+        && admin_ascii_ncasecmp(start, "application/json", (size_t)(end - start)) == 0;
+}
+
+/* POST /api/public/http-shares/exchange: the landing page trades the fragment token for the cookie. */
+static int handle_http_share_exchange(const char *content_type,
+                                      const char *body,
+                                      size_t body_len,
+                                      const char *remote_address,
+                                      char *out,
+                                      size_t out_len)
+{
+    if (!admin_share_media_type_is_json(content_type)) {
+        return write_exchange_code(out, out_len, 415, "SHARE_REQUEST_INVALID", 0);
+    }
+    char *token = NULL;
+    size_t token_len = 0U;
+    if (st_http_share_parse_exchange_body(body == NULL ? "" : body, body == NULL ? 0U : body_len,
+                                          &token, &token_len) != 0) {
+        return write_exchange_code(out, out_len, 400, "SHARE_REQUEST_INVALID", 0);
+    }
+    /* From here on every attempt is charged to the source address, whatever its outcome. */
+    long long now_ms = st_http_share_now_ms();
+    const char *source = remote_address != NULL && *remote_address != '\0' ? remote_address : "unknown";
+    long long retry_after = st_http_share_gcra_take(st_http_share_exchange_limiter(), source, now_ms);
+    if (retry_after > 0) {
+        free(token);
+        return write_exchange_code(out, out_len, 429, "SHARE_RATE_LIMITED", retry_after);
+    }
+    char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
+    if (st_http_share_parse_token(token, token_len, share_id) != 0) {
+        free(token);
+        return write_exchange_code(out, out_len, 404, "SHARE_NOT_FOUND", 0);
+    }
+    const char *database_path = admin_share_database();
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_http_share_resolution resolution;
+    if (database_path == NULL
+        || st_storage_http_share_resolve(database_path, &builtin, share_id, now_ms, &resolution) != 0) {
+        free(token);
+        return write_exchange_code(out, out_len, 503, "SHARE_UNAVAILABLE", 0);
+    }
+    if (!resolution.found || !st_http_share_hash_matches(token, resolution.share.token_sha256)) {
+        free(token);
+        return write_exchange_code(out, out_len, 404, "SHARE_NOT_FOUND", 0);
+    }
+    const st_storage_http_share *share = &resolution.share;
+    if (share->revoked) {
+        free(token);
+        return write_exchange_code(out, out_len, 410, "SHARE_REVOKED", 0);
+    }
+    if (now_ms >= share->expires_at * 1000LL) {
+        free(token);
+        return write_exchange_code(out, out_len, 410, "SHARE_EXPIRED", 0);
+    }
+    if (resolution.lapse_reason != NULL) {
+        /* Revoked in place, so the share cannot come back when its route does. */
+        int changed = 0;
+        (void)st_storage_http_share_revoke_lapsed(database_path, share_id, resolution.lapse_reason, now_ms,
+                                                  &changed);
+        admin_share_cut_matching(share_id, now_ms);
+        free(token);
+        return write_exchange_code(out, out_len, 410, "SHARE_REVOKED", 0);
+    }
+    /* The cookie and the share end together. */
+    long long max_age = (share->expires_at * 1000LL - now_ms + 999LL) / 1000LL;
+    char expires_at[32];
+    st_http_share_format_time(share->expires_at, expires_at);
+    st_admin_string_builder builder = {0};
+    int ok = admin_sb_appendf(&builder, "{\"shareId\":\"%s\",\"location\":", share_id) == 0;
+    char location[ST_HTTP_SHARE_PREFIX_MAX_BYTES + 64U];
+    snprintf(location, sizeof(location), "%s%s%s", ST_HTTP_SHARE_PATH_ROOT, share_id, share->path_prefix);
+    ok = ok && admin_sb_append_json_string(&builder, location) == 0
+        && admin_sb_appendf(&builder, ",\"expiresAt\":\"%s\",\"access\":", expires_at) == 0
+        && admin_sb_append_json_string(&builder, share->access) == 0
+        && admin_sb_append(&builder, ",\"pathPrefix\":") == 0
+        && admin_sb_append_json_string(&builder, share->path_prefix) == 0
+        && admin_sb_append(&builder, "}") == 0;
+    char headers[512];
+    int headers_len = snprintf(headers,
+                               sizeof(headers),
+                               "Referrer-Policy: no-referrer\r\n"
+                               "Set-Cookie: %s=%s; Path=%s%s/; Max-Age=%lld; HttpOnly; Secure; SameSite=Strict\r\n",
+                               ST_HTTP_SHARE_COOKIE_NAME, token, ST_HTTP_SHARE_PATH_ROOT, share_id, max_age);
+    int written = ok && headers_len > 0 && (size_t)headers_len < sizeof(headers)
+        ? write_share_response(out, out_len, 200, "no-store", builder.data, headers)
+        : -1;
+    memset(headers, 0, sizeof(headers));
+    memset(token, 0, token_len);
+    free(token);
+    free(builder.data);
+    return written > 0 ? written : write_exchange_code(out, out_len, 503, "SHARE_UNAVAILABLE", 0);
+}
+
+/* Dispatches the share endpoints; 0 when the request is not one of them. */
+static int handle_http_share_management(const st_admin_context *context,
+                                        const char *method,
+                                        const char *path,
+                                        const char *body,
+                                        size_t body_len,
+                                        char *out,
+                                        size_t out_len)
+{
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/http-access-audit")) {
+        return handle_tenant_access_audit(context, path, out, out_len);
+    }
+    admin_share_path share_path;
+    admin_parse_share_path(path, &share_path);
+    int supported = (share_path.kind == ADMIN_SHARE_PATH_SHARES
+                     && (strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0))
+        || ((share_path.kind == ADMIN_SHARE_PATH_SHARE || share_path.kind == ADMIN_SHARE_PATH_AUDIT)
+            && strcmp(method, "GET") == 0)
+        || (share_path.kind == ADMIN_SHARE_PATH_REVOKE && strcmp(method, "POST") == 0);
+    if (!supported) {
+        return 0;
+    }
+    if (!share_path.route_valid) {
+        return write_share_code(out, out_len, 404, "SHARE_ROUTE_NOT_FOUND");
+    }
+    if (share_path.kind == ADMIN_SHARE_PATH_SHARES && strcmp(method, "POST") == 0) {
+        return handle_http_share_create(context, share_path.route_id, body, body_len, out, out_len);
+    }
+    if (share_path.kind == ADMIN_SHARE_PATH_REVOKE) {
+        return handle_http_share_revoke(context, &share_path, body, body_len, out, out_len);
+    }
+    if (share_path.kind == ADMIN_SHARE_PATH_AUDIT) {
+        return handle_http_route_access_audit(context, &share_path, path, out, out_len);
+    }
+    return handle_http_share_list(context, &share_path, out, out_len);
 }
 
 static const char *normalize_management_role(const char *role)
@@ -8546,16 +9547,25 @@ static int handle_management_user_update(const st_admin_context *context,
         hash_ptr = hash;
     }
     st_storage_management_user user;
-    int rc = st_storage_update_management_user(database_path,
-                                               context->tenant_id,
-                                               username,
-                                               hash_ptr,
-                                               role == NULL ? NULL : normalize_management_role(role),
-                                               enabled,
-                                               &user);
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_share_ids revoked = {0};
+    /* Disabling or demoting the user ends the shares it created and may no longer grant. */
+    int rc = st_storage_update_management_user_audited(database_path,
+                                                       &builtin,
+                                                       context->tenant_id,
+                                                       username,
+                                                       hash_ptr,
+                                                       role == NULL ? NULL : normalize_management_role(role),
+                                                       enabled,
+                                                       context->username,
+                                                       st_http_share_now_ms(),
+                                                       &user,
+                                                       &revoked);
     free(username);
     free(password);
     free(role);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user update failed\"}");
     }
@@ -8588,7 +9598,13 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
     }
-    int rc = st_storage_delete_management_user(database_path, context->tenant_id, username);
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_share_ids revoked = {0};
+    /* Deleting the user ends its shares in the same transaction, so a later namesake never inherits them. */
+    int rc = st_storage_delete_management_user_audited(database_path, &builtin, context->tenant_id, username,
+                                                       context->username, st_http_share_now_ms(), &revoked);
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     int response_len = rc != 0
         ? write_management_user_not_found(context, "delete", username, out, out_len)
         : write_response(out, out_len, 204, "No Content", "");
@@ -9017,6 +10033,9 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/health")) {
         return write_response(out, out_len, 200, "OK", "{\"status\":\"ok\"}");
     }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/public/http-shares/exchange")) {
+        return handle_http_share_exchange(content_type, body, body_len, remote_address, out, out_len);
+    }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/peer-mesh/stun-config")) {
         return build_public_stun_config_response(host_header, out, out_len);
     }
@@ -9196,6 +10215,10 @@ static int st_admin_build_response_internal(const char *method,
         if (strcmp(method, "DELETE") == 0) {
             return handle_specus_delete(&context, path_id, out, out_len);
         }
+    }
+    int share_response = handle_http_share_management(&context, method, path, body, body_len, out, out_len);
+    if (share_response != 0) {
+        return share_response;
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/http-routes")) {
         return build_http_routes_response(&context, path, out, out_len);
@@ -10621,9 +11644,16 @@ static void admin_remove_response_header(st_direct_http_response *response, cons
     }
 }
 
-int st_admin_rewrite_direct_http_response(const char *client_name,
-                                          const char *route,
-                                          st_direct_http_response *response)
+/*
+ * The response rewrite of a route with pathRewriteEnabled. prefix is what the visitor's paths
+ * start with: NULL means the route's own /http/{client}/{route}; a temporary HTTP share passes
+ * /http-share/{shareId}, so neither the device nor the route name shows and no link leads to the
+ * route's Basic-protected entry.
+ */
+static int admin_rewrite_direct_http_response_with_prefix(const char *client_name,
+                                                          const char *route,
+                                                          const char *share_prefix,
+                                                          st_direct_http_response *response)
 {
     if (client_name == NULL || route == NULL || response == NULL || response->body == NULL || response->body_len == 0
         || (response->error != NULL && *response->error != '\0')) {
@@ -10650,7 +11680,9 @@ int st_admin_rewrite_direct_http_response(const char *client_name,
         return 0;
     }
     char prefix[512];
-    int prefix_len = snprintf(prefix, sizeof(prefix), "/http/%s/%s", client_name, route);
+    int prefix_len = share_prefix != NULL
+        ? snprintf(prefix, sizeof(prefix), "%s", share_prefix)
+        : snprintf(prefix, sizeof(prefix), "/http/%s/%s", client_name, route);
     if (prefix_len <= 0 || (size_t)prefix_len >= sizeof(prefix)) {
         return 0;
     }
@@ -10681,6 +11713,13 @@ int st_admin_rewrite_direct_http_response(const char *client_name,
     return 1;
 }
 
+int st_admin_rewrite_direct_http_response(const char *client_name,
+                                          const char *route,
+                                          st_direct_http_response *response)
+{
+    return admin_rewrite_direct_http_response_with_prefix(client_name, route, NULL, response);
+}
+
 static const char *admin_reason_phrase(int status)
 {
     switch (status) {
@@ -10690,12 +11729,18 @@ static const char *admin_reason_phrase(int status)
         case 301: return "Moved Permanently";
         case 302: return "Found";
         case 304: return "Not Modified";
+        case 308: return "Permanent Redirect";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";
         case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 410: return "Gone";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
         case 426: return "Upgrade Required";
+        case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 502: return "Bad Gateway";
@@ -11062,6 +12107,10 @@ typedef struct {
     st_direct_http_response response;
     char **trailer_names;
     size_t trailer_names_len;
+    /* Set for a request through a temporary HTTP share (spec 6.4 to 6.6), NULL for /http/. */
+    const char *share_id;
+    const char *rewrite_prefix;
+    admin_share_stream *share_stream;
 } admin_direct_http_sink_state;
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
@@ -11355,6 +12404,19 @@ static int direct_sink_on_headers(void *ctx,
                                &state->trailer_names, &state->trailer_names_len) != 0) {
         return -1;
     }
+    if (state->share_id != NULL) {
+        /* Cookies confined to the share path, no Clear-Site-Data, private revalidated caching. */
+        char **scoped = NULL;
+        size_t scoped_len = 0U;
+        if (st_http_share_rewrite_response_headers(status_code, state->response.headers,
+                                                   state->response.headers_len, state->share_id,
+                                                   &scoped, &scoped_len) != 0) {
+            return -1;
+        }
+        direct_free_strings(state->response.headers, state->response.headers_len);
+        state->response.headers = scoped;
+        state->response.headers_len = scoped_len;
+    }
     state->response.status_code = status_code;
     state->media_capture = st_media_capture_open(admin_database_path(),
                                                 state->client_name,
@@ -11411,7 +12473,8 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
         return -1;
     }
     if (state->buffer_for_rewrite) {
-        (void)st_admin_rewrite_direct_http_response(state->client_name, state->route, &state->response);
+        (void)admin_rewrite_direct_http_response_with_prefix(state->client_name, state->route,
+                                                             state->rewrite_prefix, &state->response);
         if (send_direct_http_response(state->fd, &state->response, state->include_body) < 0) {
             return -1;
         }
@@ -11441,6 +12504,23 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     state->ended = 1;
     st_media_capture_complete(state->media_capture);
     return 0;
+}
+
+/* The forwarder's canceller of a share stream; a share cut before it was bound cancels at once. */
+static void direct_sink_bind_cancel(void *ctx, void (*cancel)(void *cancel_ctx), void *cancel_ctx)
+{
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    admin_share_stream *stream = state->share_stream;
+    if (stream == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&admin_share_streams_lock);
+    stream->cancel = cancel;
+    stream->cancel_ctx = cancel_ctx;
+    if (cancel != NULL && stream->cut) {
+        cancel(cancel_ctx);
+    }
+    pthread_mutex_unlock(&admin_share_streams_lock);
 }
 
 static void admin_fd_remote_text(int fd, char out[128])
@@ -12197,6 +13277,18 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
 {
     admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
+}
+
+/* The share this WebSocket was opened through ended: 1008 to the browser, RST to the client. */
+static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&stream->send_lock);
+    stream->share_ended = 1;
+    pthread_mutex_unlock(&stream->send_lock);
+    admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_POLICY_VIOLATION, ST_ADMIN_HTTP_SHARE_RESET_REASON);
 }
 
 void st_admin_direct_ws_retain(st_admin_direct_ws_stream *stream)
@@ -13515,6 +14607,135 @@ static uint32_t admin_drain_direct_websocket(st_admin_server *server,
     return result;
 }
 
+/* The registry keeps a WebSocket of a share so an ended share can close it; a cut that came first applies now. */
+static void admin_share_stream_attach_ws(admin_share_stream *entry, st_admin_direct_ws_stream *ws)
+{
+    st_admin_direct_ws_retain(ws);
+    pthread_mutex_lock(&admin_share_streams_lock);
+    entry->ws = ws;
+    int cut = entry->cut;
+    pthread_mutex_unlock(&admin_share_streams_lock);
+    if (cut) {
+        admin_direct_ws_share_cut(ws);
+    }
+}
+
+/*
+ * Bridges one upgraded browser socket to a NAT stream until either side ends it. accept_key is
+ * freed here; the request strings stay the caller's. share is the registry entry of a temporary
+ * HTTP share (NULL on /http/): it holds the stream, so an ended share closes it with 1008.
+ */
+static void admin_direct_ws_run(st_admin_server *server,
+                                int fd,
+                                char *accept_key,
+                                const char *client_name,
+                                const char *route,
+                                const char *relative_path,
+                                const char *raw_query,
+                                char **headers,
+                                size_t headers_len,
+                                admin_share_stream *share)
+{
+    st_admin_direct_ws_stream *stream = (st_admin_direct_ws_stream *)calloc(1, sizeof(*stream));
+    if (stream == NULL) {
+        free(accept_key);
+        send_text_http_error(fd, 500, "direct websocket stream build failed");
+        return;
+    }
+    stream->fd = fd;
+    stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
+    stream->handshake_pending = 1;
+    stream->refs = 1U;
+    admin_utf8_reset(&stream->outbound_utf8);
+    pthread_mutex_init(&stream->send_lock, NULL);
+    pthread_cond_init(&stream->handshake_cond, NULL);
+    pthread_mutex_init(&stream->flow_lock, NULL);
+    /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
+    pthread_condattr_t flow_cond_attr;
+    pthread_condattr_init(&flow_cond_attr);
+    pthread_condattr_setclock(&flow_cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
+    pthread_condattr_destroy(&flow_cond_attr);
+
+    char channel_id[37];
+    admin_generate_request_id(channel_id);
+    static const uint8_t empty_body[] = {0};
+    st_admin_direct_ws_request direct = {
+        .channel_id = channel_id,
+        .client_name = client_name,
+        .route = route,
+        .relative_path = relative_path,
+        .raw_query = raw_query,
+        .headers = headers,
+        .headers_len = headers_len,
+        .body = empty_body,
+        .body_len = 0,
+        .stream = stream
+    };
+    int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
+    if (open_rc != 0) {
+        st_admin_direct_ws_release(stream);
+        free(accept_key);
+        if (open_rc == -3) {
+            send_text_http_error(fd, 404, "direct websocket route is not configured");
+        } else if (open_rc == -1) {
+            send_text_http_error(fd, 502, "direct websocket target client is offline");
+        } else {
+            send_text_http_error(fd, 500, "direct websocket open failed");
+        }
+        return;
+    }
+    if (share != NULL) {
+        admin_share_stream_attach_ws(share, stream);
+    }
+
+    char response[512];
+    int response_len = snprintf(response,
+                                sizeof(response),
+                                "HTTP/1.1 101 Switching Protocols\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Accept: %s\r\n"
+                                "\r\n",
+                                accept_key);
+    free(accept_key);
+    /*
+     * The client may already be answering the OPEN. Its frames wait on handshake_pending, and the
+     * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
+     */
+    pthread_mutex_lock(&stream->send_lock);
+    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
+        && send_all(fd, response, (size_t)response_len) == 0;
+    stream->handshake_pending = 0;
+    if (!upgraded) {
+        admin_direct_ws_abort_locked(stream);
+    }
+    pthread_cond_broadcast(&stream->handshake_cond);
+    pthread_mutex_unlock(&stream->send_lock);
+
+    const char *reset_reason = "WebSocket handshake failed";
+    uint32_t reset_code = upgraded
+        ? admin_drain_direct_websocket(server, stream, channel_id, &reset_reason)
+        : ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
+    pthread_mutex_lock(&stream->send_lock);
+    int abort_result = stream->abort_result;
+    int share_ended = stream->share_ended;
+    pthread_mutex_unlock(&stream->send_lock);
+    if (share_ended) {
+        /* The share ended: the client hears RST whatever the browser did meanwhile. */
+        reset_code = ST_ADMIN_HTTP_SHARE_RESET_CODE;
+        reset_reason = ST_ADMIN_HTTP_SHARE_RESET_REASON;
+    } else if (abort_result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
+        /* A client-side violation dropped the socket: if the stream is still mapped, reset it. */
+        reset_code = st_admin_direct_ws_reset_code(abort_result, &reset_reason);
+    }
+    /* After this no thread writes to the fd, which handle_client closes once we return. */
+    admin_direct_ws_mark_closed(stream);
+    server->direct_ws_close(server->direct_ws_ctx, channel_id, reset_code, reset_reason);
+    st_admin_direct_ws_release(stream);
+    admin_direct_ws_linger(fd);
+}
+
 static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  int fd,
                                                  const char *method,
@@ -13597,113 +14818,108 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct websocket header capture failed");
         return 1;
     }
-
-    st_admin_direct_ws_stream *stream = (st_admin_direct_ws_stream *)calloc(1, sizeof(*stream));
-    if (stream == NULL) {
-        free(accept_key);
-        free_header_array(headers, headers_len);
-        free(client_name);
-        free(route);
-        free(relative_path);
-        free(raw_query);
-        send_text_http_error(fd, 500, "direct websocket stream build failed");
-        return 1;
-    }
-    stream->fd = fd;
-    stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
-    stream->handshake_pending = 1;
-    stream->refs = 1U;
-    admin_utf8_reset(&stream->outbound_utf8);
-    pthread_mutex_init(&stream->send_lock, NULL);
-    pthread_cond_init(&stream->handshake_cond, NULL);
-    pthread_mutex_init(&stream->flow_lock, NULL);
-    /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
-    pthread_condattr_t flow_cond_attr;
-    pthread_condattr_init(&flow_cond_attr);
-    pthread_condattr_setclock(&flow_cond_attr, CLOCK_MONOTONIC);
-    pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
-    pthread_condattr_destroy(&flow_cond_attr);
-
-    char channel_id[37];
-    admin_generate_request_id(channel_id);
-    static const uint8_t empty_body[] = {0};
-    st_admin_direct_ws_request direct = {
-        .channel_id = channel_id,
-        .client_name = client_name,
-        .route = route,
-        .relative_path = relative_path,
-        .raw_query = raw_query,
-        .headers = headers,
-        .headers_len = headers_len,
-        .body = empty_body,
-        .body_len = 0,
-        .stream = stream
-    };
-    int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
-    if (open_rc != 0) {
-        st_admin_direct_ws_release(stream);
-        free(accept_key);
-        free_header_array(headers, headers_len);
-        free(client_name);
-        free(route);
-        free(relative_path);
-        free(raw_query);
-        if (open_rc == -3) {
-            send_text_http_error(fd, 404, "direct websocket route is not configured");
-        } else if (open_rc == -1) {
-            send_text_http_error(fd, 502, "direct websocket target client is offline");
-        } else {
-            send_text_http_error(fd, 500, "direct websocket open failed");
-        }
-        return 1;
-    }
-
-    char response[512];
-    int response_len = snprintf(response,
-                                sizeof(response),
-                                "HTTP/1.1 101 Switching Protocols\r\n"
-                                "Upgrade: websocket\r\n"
-                                "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Accept: %s\r\n"
-                                "\r\n",
-                                accept_key);
-    free(accept_key);
-    /*
-     * The client may already be answering the OPEN. Its frames wait on handshake_pending, and the
-     * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
-     */
-    pthread_mutex_lock(&stream->send_lock);
-    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
-        && send_all(fd, response, (size_t)response_len) == 0;
-    stream->handshake_pending = 0;
-    if (!upgraded) {
-        admin_direct_ws_abort_locked(stream);
-    }
-    pthread_cond_broadcast(&stream->handshake_cond);
-    pthread_mutex_unlock(&stream->send_lock);
-
-    const char *reset_reason = "WebSocket handshake failed";
-    uint32_t reset_code = upgraded
-        ? admin_drain_direct_websocket(server, stream, channel_id, &reset_reason)
-        : ST_ADMIN_DIRECT_WS_RST_BROWSER_GONE;
-    pthread_mutex_lock(&stream->send_lock);
-    int abort_result = stream->abort_result;
-    pthread_mutex_unlock(&stream->send_lock);
-    if (abort_result != ST_ADMIN_DIRECT_WS_ACCEPTED) {
-        /* A client-side violation dropped the socket: if the stream is still mapped, reset it. */
-        reset_code = st_admin_direct_ws_reset_code(abort_result, &reset_reason);
-    }
-    /* After this no thread writes to the fd, which handle_client closes once we return. */
-    admin_direct_ws_mark_closed(stream);
-    server->direct_ws_close(server->direct_ws_ctx, channel_id, reset_code, reset_reason);
-    st_admin_direct_ws_release(stream);
-    admin_direct_ws_linger(fd);
+    admin_direct_ws_run(server, fd, accept_key, client_name, route, relative_path, raw_query,
+                        headers, headers_len, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);
     free(relative_path);
     free(raw_query);
     return 1;
+}
+
+/*
+ * Relays one Direct HTTP exchange through the client and answers the public caller. share is set
+ * for a request through a temporary HTTP share: its response headers are rewritten, the path
+ * rewrite uses the share prefix, and an ended share can cancel the stream.
+ */
+static void admin_forward_direct_http(st_admin_server *server,
+                                      int fd,
+                                      const char *method,
+                                      const char *client_name,
+                                      const char *route,
+                                      const char *relative_path,
+                                      const char *raw_query,
+                                      char **headers,
+                                      size_t headers_len,
+                                      const uint8_t *body,
+                                      size_t body_len,
+                                      admin_share_admission *share)
+{
+    st_direct_http_request direct = {
+        .request_method = (char *)method,
+        .route = (char *)route,
+        .relative_path = (char *)relative_path,
+        .raw_query = (char *)raw_query,
+        .headers = headers,
+        .headers_len = headers_len,
+        .body = body,
+        .body_len = body_len
+    };
+    size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
+    char *source_url = (char *)malloc(source_len);
+    if (source_url == NULL) {
+        send_text_http_error(fd, 500, "direct http media source build failed");
+        return;
+    }
+    snprintf(source_url, source_len, "%s%s%s", relative_path,
+             *raw_query == '\0' ? "" : "?", raw_query);
+    admin_direct_http_sink_state sink_state = {
+        .fd = fd,
+        .include_body = admin_ascii_casecmp(method, "HEAD") != 0,
+        .client_name = client_name,
+        .route = route,
+        .method = method,
+        .source_url = source_url,
+        .share_id = share == NULL ? NULL : share->share_id,
+        .rewrite_prefix = share == NULL ? NULL : share->rewrite_prefix,
+        .share_stream = share == NULL ? NULL : &share->stream
+    };
+    st_admin_direct_http_sink sink = {
+        .ctx = &sink_state,
+        .on_headers = direct_sink_on_headers,
+        .on_data = direct_sink_on_data,
+        .on_end = direct_sink_on_end,
+        .on_reset = direct_sink_on_reset,
+        .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel
+    };
+    char remote_address[128];
+    admin_fd_remote_text(fd, remote_address);
+    long long started_ms = admin_now_ms();
+    int rc = server->direct_http_forward(server->direct_http_ctx, client_name, &direct, &sink);
+    long long elapsed_ms = admin_now_ms() - started_ms;
+    if (elapsed_ms < 0) {
+        elapsed_ms = 0;
+    }
+    if (rc == 0) {
+        record_direct_http_traffic(client_name, route, (long long)body_len,
+                                   (long long)sink_state.response_bytes);
+        record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                    sink_state.response_bytes, remote_address, elapsed_ms);
+    } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
+        /* The share ended mid-exchange: the public connection was already shut down. */
+    } else if (!sink_state.started && rc == -2) {
+        send_text_http_error(fd, 504, "direct http response timeout");
+    } else if (!sink_state.started && rc == -3) {
+        send_text_http_error(fd, 404, "direct http route is not configured");
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
+        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
+        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
+        /* The stream could not be created, answered as Java HttpSpecusController does. */
+        send_text_http_error(fd, 502, "HTTP 流创建失败");
+    } else if (!sink_state.started) {
+        send_text_http_error(fd, 502, "direct http target client is offline");
+    }
+
+    if (rc != 0) {
+        st_media_capture_fail(sink_state.media_capture, "媒体响应中断");
+    }
+    st_media_capture_free(sink_state.media_capture);
+
+    st_direct_http_response_free(&sink_state.response);
+    direct_free_strings(sink_state.trailer_names, sink_state.trailer_names_len);
+    free(source_url);
 }
 
 static int handle_direct_http_request(st_admin_server *server,
@@ -13771,85 +14987,367 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct http header capture failed");
         return 1;
     }
-    st_direct_http_request direct = {
-        .request_method = (char *)method,
-        .route = route,
-        .relative_path = relative_path,
-        .raw_query = raw_query,
-        .headers = headers,
-        .headers_len = headers_len,
-        .body = body,
-        .body_len = body_len
-    };
-    size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
-    char *source_url = (char *)malloc(source_len);
-    if (source_url == NULL) {
-        free_header_array(headers, headers_len);
-        free(client_name);
-        free(route);
-        free(relative_path);
-        free(raw_query);
-        send_text_http_error(fd, 500, "direct http media source build failed");
-        return 1;
-    }
-    snprintf(source_url, source_len, "%s%s%s", relative_path,
-             *raw_query == '\0' ? "" : "?", raw_query);
-    admin_direct_http_sink_state sink_state = {
-        .fd = fd,
-        .include_body = admin_ascii_casecmp(method, "HEAD") != 0,
-        .client_name = client_name,
-        .route = route,
-        .method = method,
-        .source_url = source_url
-    };
-    st_admin_direct_http_sink sink = {
-        .ctx = &sink_state,
-        .on_headers = direct_sink_on_headers,
-        .on_data = direct_sink_on_data,
-        .on_end = direct_sink_on_end,
-        .on_reset = direct_sink_on_reset
-    };
-    char remote_address[128];
-    admin_fd_remote_text(fd, remote_address);
-    long long started_ms = admin_now_ms();
-    int rc = server->direct_http_forward(server->direct_http_ctx, client_name, &direct, &sink);
-    long long elapsed_ms = admin_now_ms() - started_ms;
-    if (elapsed_ms < 0) {
-        elapsed_ms = 0;
-    }
-    if (rc == 0) {
-        record_direct_http_traffic(client_name, route, (long long)body_len,
-                                   (long long)sink_state.response_bytes);
-        record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, remote_address, elapsed_ms);
-    } else if (!sink_state.started && rc == -2) {
-        send_text_http_error(fd, 504, "direct http response timeout");
-    } else if (!sink_state.started && rc == -3) {
-        send_text_http_error(fd, 404, "direct http route is not configured");
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
-        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
-        /* The stream could not be created, answered as Java HttpSpecusController does. */
-        send_text_http_error(fd, 502, "HTTP 流创建失败");
-    } else if (!sink_state.started) {
-        send_text_http_error(fd, 502, "direct http target client is offline");
-    }
-
-    if (rc != 0) {
-        st_media_capture_fail(sink_state.media_capture, "媒体响应中断");
-    }
-    st_media_capture_free(sink_state.media_capture);
-
-    st_direct_http_response_free(&sink_state.response);
-    direct_free_strings(sink_state.trailer_names, sink_state.trailer_names_len);
+    admin_forward_direct_http(server, fd, method, client_name, route, relative_path, raw_query,
+                              headers, headers_len, body, body_len, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);
     free(relative_path);
     free(raw_query);
-    free(source_url);
     return 1;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Requests under /http-share/{shareId}/ (protocol/spec/temporary-http-share.md section 6)
+ */
+
+/* Every refusal of spec 6.1 steps 1-11: {"code"}, no-store, decided before any body or stream. */
+static void send_share_refusal(int fd,
+                               int status,
+                               const char *code,
+                               const char *clear_share_id,
+                               const char *allow,
+                               long long retry_after)
+{
+    char body[96];
+    int body_len = snprintf(body, sizeof(body), "{\"code\":\"%s\"}", code);
+    char extra[320];
+    size_t used = 0U;
+    extra[0] = '\0';
+    if (clear_share_id != NULL) {
+        /* An ended share clears its cookie so the browser stops presenting it. */
+        int written = snprintf(extra + used, sizeof(extra) - used,
+                               "Set-Cookie: %s=; Path=%s%s/; Max-Age=0; HttpOnly; Secure; SameSite=Strict\r\n",
+                               ST_HTTP_SHARE_COOKIE_NAME, ST_HTTP_SHARE_PATH_ROOT, clear_share_id);
+        used += written > 0 && (size_t)written < sizeof(extra) - used ? (size_t)written : 0U;
+    }
+    if (allow != NULL) {
+        int written = snprintf(extra + used, sizeof(extra) - used, "Allow: %s\r\n", allow);
+        used += written > 0 && (size_t)written < sizeof(extra) - used ? (size_t)written : 0U;
+    }
+    if (retry_after > 0) {
+        int written = snprintf(extra + used, sizeof(extra) - used, "Retry-After: %lld\r\n", retry_after);
+        used += written > 0 && (size_t)written < sizeof(extra) - used ? (size_t)written : 0U;
+    }
+    char header[640];
+    int header_len = snprintf(header,
+                              sizeof(header),
+                              "HTTP/1.1 %d %s\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Cache-Control: no-store\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "%s"
+                              "Content-Length: %d\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              status,
+                              admin_reason_phrase(status),
+                              extra,
+                              body_len);
+    if (body_len > 0 && (size_t)body_len < sizeof(body) && header_len > 0 && (size_t)header_len < sizeof(header)
+        && send_all(fd, header, (size_t)header_len) == 0) {
+        (void)send_all(fd, body, (size_t)body_len);
+    }
+}
+
+/* The values of every header called name, in order, trimmed of space and tab. */
+static int admin_collect_header_values(const char *request, const char *name, char ***values, size_t *count)
+{
+    *values = NULL;
+    *count = 0U;
+    const char *line = strstr(request, "\r\n");
+    if (line == NULL) {
+        return 0;
+    }
+    line += 2;
+    size_t name_len = strlen(name);
+    size_t capacity = 0U;
+    while (*line != '\0' && !(line[0] == '\r' && line[1] == '\n')) {
+        const char *next = strstr(line, "\r\n");
+        if (next == NULL) {
+            break;
+        }
+        const char *colon = memchr(line, ':', (size_t)(next - line));
+        if (colon != NULL && (size_t)(colon - line) == name_len && admin_ascii_ncasecmp(line, name, name_len) == 0) {
+            const char *value = colon + 1;
+            const char *end = next;
+            while (value < end && (*value == ' ' || *value == '\t')) ++value;
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) --end;
+            if (*count == capacity) {
+                size_t grown_capacity = capacity == 0U ? 4U : capacity * 2U;
+                char **grown = (char **)realloc(*values, grown_capacity * sizeof(*grown));
+                if (grown == NULL) {
+                    free_header_array(*values, *count);
+                    *values = NULL;
+                    *count = 0U;
+                    return -1;
+                }
+                *values = grown;
+                capacity = grown_capacity;
+            }
+            (*values)[*count] = admin_dup_range(value, (size_t)(end - value));
+            if ((*values)[*count] == NULL) {
+                free_header_array(*values, *count);
+                *values = NULL;
+                *count = 0U;
+                return -1;
+            }
+            ++*count;
+        }
+        line = next + 2;
+    }
+    return 0;
+}
+
+/*
+ * The headers relayed to the device: every Cookie header becomes the one Cookie without the share
+ * cookie (omitted when nothing is left), so the token reaches the device in no header at all.
+ */
+static int admin_share_forward_headers(const char *raw_request, char ***headers, size_t *headers_len)
+{
+    char **cookies = NULL;
+    size_t cookie_count = 0U;
+    char *forwarded = NULL;
+    if (admin_collect_header_values(raw_request, "Cookie", &cookies, &cookie_count) != 0
+        || st_http_share_forwarded_cookie(cookies, cookie_count, &forwarded) != 0) {
+        free_header_array(cookies, cookie_count);
+        return -1;
+    }
+    free_header_array(cookies, cookie_count);
+    if (admin_collect_headers(raw_request, 0, headers, headers_len) != 0) {
+        free(forwarded);
+        return -1;
+    }
+    size_t kept = 0U;
+    int rc = 0;
+    for (size_t i = 0U; i < *headers_len; ++i) {
+        char *header = (*headers)[i];
+        if (header == NULL || !admin_header_name_equals(header, "Cookie")) {
+            (*headers)[kept++] = header;
+            continue;
+        }
+        free(header);
+        if (forwarded != NULL) {
+            size_t line_len = strlen("Cookie:") + strlen(forwarded) + 1U;
+            char *line = (char *)malloc(line_len);
+            if (line == NULL) {
+                rc = -1;
+            } else {
+                snprintf(line, line_len, "Cookie:%s", forwarded);
+                (*headers)[kept++] = line;
+            }
+            free(forwarded);
+            forwarded = NULL;
+        }
+    }
+    free(forwarded);
+    *headers_len = kept;
+    if (rc != 0) {
+        free_header_array(*headers, *headers_len);
+        *headers = NULL;
+        *headers_len = 0U;
+    }
+    return rc;
+}
+
+/*
+ * Spec 6.1 steps 1-11 for one request: 1 when it may be forwarded (its stream is then registered
+ * and must be unregistered), 0 once the refusal or redirect went out. The share, its route, client
+ * and creator are read from the database for this very request; nothing is cached.
+ */
+static int admit_http_share_request(int fd,
+                                    const char *method,
+                                    const char *path,
+                                    const char *raw_request,
+                                    admin_share_admission *admission)
+{
+    memset(admission, 0, sizeof(*admission));
+    admission->stream.fd = fd;
+    const char *query = strchr(path, '?');
+    const char *path_end = query == NULL ? path + strlen(path) : query;
+    const char *id = path + strlen(ST_HTTP_SHARE_PATH_ROOT);
+    const char *slash = memchr(id, '/', (size_t)(path_end - id));
+    size_t id_len = (size_t)((slash == NULL ? path_end : slash) - id);
+    if (!st_http_share_valid_id(id, id_len)) {
+        send_share_refusal(fd, 404, "SHARE_NOT_FOUND", NULL, NULL, 0);
+        return 0;
+    }
+    memcpy(admission->share_id, id, ST_HTTP_SHARE_ID_LEN);
+    admission->share_id[ST_HTTP_SHARE_ID_LEN] = '\0';
+    if (slash == NULL) {
+        /* The cookie path ends with a slash; without it the browser would not send the cookie. */
+        char response[1536];
+        int len = snprintf(response,
+                           sizeof(response),
+                           "HTTP/1.1 308 Permanent Redirect\r\n"
+                           "Location: %s%s/%s%s\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Content-Length: 0\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           ST_HTTP_SHARE_PATH_ROOT,
+                           admission->share_id,
+                           query != NULL && query[1] != '\0' ? "?" : "",
+                           query != NULL && query[1] != '\0' ? query + 1 : "");
+        if (len > 0 && (size_t)len < sizeof(response)) {
+            (void)send_all(fd, response, (size_t)len);
+        }
+        return 0;
+    }
+    snprintf(admission->rewrite_prefix, sizeof(admission->rewrite_prefix), "%s%s",
+             ST_HTTP_SHARE_PATH_ROOT, admission->share_id);
+    admission->relative_path = admin_dup_range(slash, (size_t)(path_end - slash));
+    admission->raw_query = query == NULL ? "" : query + 1;
+    const char *database_path = admin_database_path();
+    long long now_ms = st_http_share_now_ms();
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    st_storage_http_share_resolution resolution;
+    if (admission->relative_path == NULL || database_path == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_http_share_resolve(database_path, &builtin, admission->share_id, now_ms, &resolution) != 0) {
+        send_share_refusal(fd, 503, "SHARE_UNAVAILABLE", NULL, NULL, 0);
+        return 0;
+    }
+    /* No share, no cookie and a wrong cookie are one answer: the share id alone tells nothing. */
+    int credential = 0;
+    if (resolution.found) {
+        char **cookies = NULL;
+        size_t cookie_count = 0U;
+        char candidates[ST_HTTP_SHARE_MAX_COOKIE_CANDIDATES][ST_HTTP_SHARE_TOKEN_LEN + 1U];
+        if (admin_collect_header_values(raw_request, "Cookie", &cookies, &cookie_count) != 0) {
+            send_share_refusal(fd, 503, "SHARE_UNAVAILABLE", NULL, NULL, 0);
+            return 0;
+        }
+        size_t candidate_count = st_http_share_credential_candidates(cookies, cookie_count, admission->share_id,
+                                                                     candidates);
+        free_header_array(cookies, cookie_count);
+        for (size_t i = 0U; i < candidate_count; ++i) {
+            credential |= st_http_share_hash_matches(candidates[i], resolution.share.token_sha256);
+        }
+        memset(candidates, 0, sizeof(candidates));
+    }
+    if (!credential) {
+        send_share_refusal(fd, 404, "SHARE_NOT_FOUND", NULL, NULL, 0);
+        return 0;
+    }
+    const st_storage_http_share *share = &resolution.share;
+    if (share->revoked) {
+        send_share_refusal(fd, 410, "SHARE_REVOKED", admission->share_id, NULL, 0);
+        return 0;
+    }
+    if (now_ms >= share->expires_at * 1000LL) {
+        send_share_refusal(fd, 410, "SHARE_EXPIRED", admission->share_id, NULL, 0);
+        return 0;
+    }
+    if (resolution.lapse_reason != NULL) {
+        /* Revoked in place: a share never comes back, even if its route does. */
+        int changed = 0;
+        (void)st_storage_http_share_revoke_lapsed(database_path, admission->share_id, resolution.lapse_reason,
+                                                  now_ms, &changed);
+        admin_share_cut_matching(admission->share_id, now_ms);
+        send_share_refusal(fd, 410, "SHARE_REVOKED", admission->share_id, NULL, 0);
+        return 0;
+    }
+    admission->upgrade = admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
+        && admin_header_value_equals_ci(raw_request, "Upgrade", "websocket");
+    if (strcmp(share->access, "read") == 0) {
+        if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+            send_share_refusal(fd, 405, "SHARE_METHOD_NOT_ALLOWED", NULL, "GET, HEAD", 0);
+            return 0;
+        }
+        if (admission->upgrade) {
+            /* A WebSocket can carry data to the target: never read-only. */
+            send_share_refusal(fd, 403, "SHARE_SCOPE_DENIED", NULL, NULL, 0);
+            return 0;
+        }
+    }
+    if (!st_http_share_path_in_scope(share->path_prefix, admission->relative_path,
+                                     strlen(admission->relative_path))) {
+        send_share_refusal(fd, 403, "SHARE_SCOPE_DENIED", NULL, NULL, 0);
+        return 0;
+    }
+    /* The budgets are spent only once credential and scope passed. */
+    snprintf(admission->stream.share_id, sizeof(admission->stream.share_id), "%s", admission->share_id);
+    admission->stream.expires_at = share->expires_at;
+    if (admin_share_stream_register(&admission->stream) != 0) {
+        send_share_refusal(fd, 429, "SHARE_BUSY", NULL, NULL, 1);
+        return 0;
+    }
+    long long retry_after = st_http_share_gcra_take(st_http_share_request_limiter(), admission->share_id, now_ms);
+    if (retry_after > 0) {
+        admin_share_stream_unregister(&admission->stream);
+        send_share_refusal(fd, 429, "SHARE_RATE_LIMITED", NULL, NULL, retry_after);
+        return 0;
+    }
+    snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
+    snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    return 1;
+}
+
+static void forward_http_share_websocket(st_admin_server *server,
+                                         int fd,
+                                         const char *method,
+                                         const char *raw_request,
+                                         admin_share_admission *admission)
+{
+    if (strcmp(method, "GET") != 0) {
+        send_text_http_error(fd, 400, "websocket upgrade only supports GET");
+        return;
+    }
+    if (server->direct_ws_open == NULL || server->direct_ws_data == NULL || server->direct_ws_close == NULL) {
+        send_text_http_error(fd, 501, "direct websocket dispatch is not wired yet");
+        return;
+    }
+    char *client_key = admin_extract_header_value(raw_request, "Sec-WebSocket-Key");
+    if (client_key == NULL || *client_key == '\0') {
+        free(client_key);
+        send_text_http_error(fd, 400, "Sec-WebSocket-Key is required");
+        return;
+    }
+    char *accept_key = admin_websocket_accept_key(client_key);
+    free(client_key);
+    char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
+    char **headers = NULL;
+    size_t headers_len = 0U;
+    if (accept_key == NULL || raw_query == NULL
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        free(accept_key);
+        free(raw_query);
+        send_text_http_error(fd, 500, "direct websocket request build failed");
+        return;
+    }
+    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->route,
+                        admission->relative_path, raw_query, headers, headers_len, &admission->stream);
+    free_header_array(headers, headers_len);
+    free(raw_query);
+}
+
+static void forward_http_share_request(st_admin_server *server,
+                                       int fd,
+                                       const char *method,
+                                       const char *raw_request,
+                                       const uint8_t *body,
+                                       size_t body_len,
+                                       admin_share_admission *admission)
+{
+    if (server->direct_http_forward == NULL) {
+        send_text_http_error(fd, 501, "direct http dispatch is not wired yet");
+        return;
+    }
+    char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
+    char **headers = NULL;
+    size_t headers_len = 0U;
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        free(raw_query);
+        send_text_http_error(fd, 500, "direct http request build failed");
+        return;
+    }
+    /* No Basic gate: Authorization belongs to the target and is relayed as it came. */
+    admin_forward_direct_http(server, fd, method, admission->client_name, admission->route,
+                              admission->relative_path, raw_query, headers, headers_len, body, body_len,
+                              admission);
+    free_header_array(headers, headers_len);
+    free(raw_query);
 }
 
 static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
@@ -13899,6 +15397,129 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     return 1;
 }
 
+/*
+ * Reads the body that follows the header block in request (len bytes received so far), by
+ * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
+ * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out.
+ */
+static int admin_read_request_body(int fd,
+                                   const char *request,
+                                   size_t len,
+                                   const char *path,
+                                   const char **body_out,
+                                   size_t *body_len_out,
+                                   char **body_buffer_out)
+{
+    const char *body = strstr(request, "\r\n\r\n");
+    size_t available_body_len = 0;
+    size_t content_length = 0;
+    char *body_buffer = NULL;
+    if (body != NULL) {
+        body += 4;
+        available_body_len = (size_t)(request + len - body);
+        size_t max_content_length = admin_path_equals(path, "/api/admin/client-packages")
+            ? st_client_package_max_request_bytes() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
+        char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
+        if (transfer_encoding != NULL) {
+            /*
+             * A body sent without a length up front. It used to be taken as is, chunk framing
+             * included, so a chunked upload reached the Direct HTTP target corrupted. A
+             * Content-Length next to it makes the message ambiguous (RFC 9112 section 6.3), and
+             * codings other than chunked are not implemented.
+             */
+            char *declared_length = admin_extract_header_value(request, "Content-Length");
+            int ambiguous = declared_length != NULL;
+            int chunked = admin_ascii_casecmp(transfer_encoding, "chunked") == 0;
+            free(declared_length);
+            free(transfer_encoding);
+            if (ambiguous || !chunked) {
+                send_text_http_error(fd, ambiguous ? 400 : 501,
+                                     ambiguous ? "Content-Length 与 Transfer-Encoding 不能同时出现"
+                                               : "仅支持 chunked Transfer-Encoding");
+                return -1;
+            }
+            int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
+                                                     &body_buffer, &content_length);
+            if (chunked_rc != 0) {
+                send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
+                                     chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
+                return -1;
+            }
+            body = body_buffer;
+            available_body_len = content_length;
+        } else {
+            int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
+            if (length_rc == -2) {
+                send_text_http_error(fd, 413, "HTTP 请求体超过限制");
+                return -1;
+            }
+            if (length_rc != 0) {
+                send_text_http_error(fd, 400, "Content-Length 无效");
+                return -1;
+            }
+            if (content_length > available_body_len) {
+                body_buffer = (char *)malloc(content_length + 1U);
+                if (body_buffer == NULL) {
+                    send_text_http_error(fd, 500, "HTTP 请求体读取失败");
+                    return -1;
+                }
+                memcpy(body_buffer, body, available_body_len);
+                size_t offset = available_body_len;
+                while (offset < content_length) {
+                    ssize_t read_len = recv(fd, body_buffer + offset, content_length - offset, 0);
+                    if (read_len <= 0) {
+                        free(body_buffer);
+                        send_text_http_error(fd, 400, "HTTP 请求体不完整");
+                        return -1;
+                    }
+                    offset += (size_t)read_len;
+                }
+                body_buffer[content_length] = '\0';
+                body = body_buffer;
+                available_body_len = content_length;
+            } else if (content_length > 0) {
+                available_body_len = content_length;
+            }
+        }
+    }
+    if (body == NULL) {
+        body = "";
+    }
+    *body_out = body;
+    *body_len_out = available_body_len;
+    *body_buffer_out = body_buffer;
+    return 0;
+}
+
+/* One request under /http-share/: admission, then the body, then the route's forwarding. */
+static void handle_http_share_client(st_admin_server *server,
+                                     int fd,
+                                     const char *method,
+                                     const char *path,
+                                     const char *request,
+                                     size_t len)
+{
+    admin_share_admission admission;
+    if (!admit_http_share_request(fd, method, path, request, &admission)) {
+        free(admission.relative_path);
+        return;
+    }
+    if (admission.upgrade) {
+        forward_http_share_websocket(server, fd, method, request, &admission);
+    } else {
+        const char *body = NULL;
+        size_t body_len = 0U;
+        char *body_buffer = NULL;
+        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer) == 0) {
+            forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
+                                       &admission);
+        }
+        free(body_buffer);
+    }
+    admin_share_stream_unregister(&admission.stream);
+    free(admission.relative_path);
+}
+
 static void handle_client(st_admin_server *server, int fd)
 {
     char request[8192];
@@ -13932,6 +15553,11 @@ static void handle_client(st_admin_server *server, int fd)
         strcpy(method, "");
         strcpy(path, "");
     }
+    if (strncmp(path, ST_HTTP_SHARE_PATH_ROOT, strlen(ST_HTTP_SHARE_PATH_ROOT)) == 0) {
+        handle_http_share_client(server, fd, method, path, request, (size_t)len);
+        close(fd);
+        return;
+    }
     int strip_direct_authorization = 0;
     if (strncmp(path, "/http/", 6) == 0) {
         int auth_result = authorize_direct_http_route(fd, path, request);
@@ -13941,86 +15567,13 @@ static void handle_client(st_admin_server *server, int fd)
         }
         strip_direct_authorization = auth_result > 0;
     }
-    const char *body = strstr(request, "\r\n\r\n");
+    const char *body = NULL;
     size_t available_body_len = 0;
-    size_t content_length = 0;
     char *body_buffer = NULL;
-    if (body != NULL) {
-        body += 4;
-        available_body_len = (size_t)(request + len - body);
-        size_t max_content_length = admin_path_equals(path, "/api/admin/client-packages")
-            ? st_client_package_max_request_bytes() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
-        char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
-        if (transfer_encoding != NULL) {
-            /*
-             * A body sent without a length up front. It used to be taken as is, chunk framing
-             * included, so a chunked upload reached the Direct HTTP target corrupted. A
-             * Content-Length next to it makes the message ambiguous (RFC 9112 section 6.3), and
-             * codings other than chunked are not implemented.
-             */
-            char *declared_length = admin_extract_header_value(request, "Content-Length");
-            int ambiguous = declared_length != NULL;
-            int chunked = admin_ascii_casecmp(transfer_encoding, "chunked") == 0;
-            free(declared_length);
-            free(transfer_encoding);
-            if (ambiguous || !chunked) {
-                send_text_http_error(fd, ambiguous ? 400 : 501,
-                                     ambiguous ? "Content-Length 与 Transfer-Encoding 不能同时出现"
-                                               : "仅支持 chunked Transfer-Encoding");
-                close(fd);
-                return;
-            }
-            int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
-                                                     &body_buffer, &content_length);
-            if (chunked_rc != 0) {
-                send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
-                                     chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
-                close(fd);
-                return;
-            }
-            body = body_buffer;
-            available_body_len = content_length;
-        } else {
-            int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
-            if (length_rc == -2) {
-                send_text_http_error(fd, 413, "HTTP 请求体超过限制");
-                close(fd);
-                return;
-            }
-            if (length_rc != 0) {
-                send_text_http_error(fd, 400, "Content-Length 无效");
-                close(fd);
-                return;
-            }
-            if (content_length > available_body_len) {
-                body_buffer = (char *)malloc(content_length + 1U);
-                if (body_buffer == NULL) {
-                    send_text_http_error(fd, 500, "HTTP 请求体读取失败");
-                    close(fd);
-                    return;
-                }
-                memcpy(body_buffer, body, available_body_len);
-                size_t offset = available_body_len;
-                while (offset < content_length) {
-                    ssize_t read_len = recv(fd, body_buffer + offset, content_length - offset, 0);
-                    if (read_len <= 0) {
-                        free(body_buffer);
-                        send_text_http_error(fd, 400, "HTTP 请求体不完整");
-                        close(fd);
-                        return;
-                    }
-                    offset += (size_t)read_len;
-                }
-                body_buffer[content_length] = '\0';
-                body = body_buffer;
-                available_body_len = content_length;
-            } else if (content_length > 0) {
-                available_body_len = content_length;
-            }
-        }
-    }
-    if (body == NULL) {
-        body = "";
+    if (admin_read_request_body(fd, request, (size_t)len, path, &body, &available_body_len,
+                                &body_buffer) != 0) {
+        close(fd);
+        return;
     }
 
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
@@ -14124,6 +15677,23 @@ static void handle_client(st_admin_server *server, int fd)
             free(host_header);
             free(body_buffer);
             send_text_http_error(fd, 500, "HTTP media response allocation failed");
+            close(fd);
+            return;
+        }
+    }
+    if (strncmp(path, "/api/admin/http-routes/", strlen("/api/admin/http-routes/")) == 0
+        || admin_path_equals(path, "/api/admin/http-access-audit")) {
+        /* A route keeps its ended shares for 30 days and an audit page holds up to 200 entries. */
+        response_capacity = 2U * 1024U * 1024U;
+        response = (char *)malloc(response_capacity);
+        if (response == NULL) {
+            free(authorization);
+            free(oss_public_key_url);
+            free(range_header);
+            free(content_type);
+            free(host_header);
+            free(body_buffer);
+            send_text_http_error(fd, 500, "HTTP response allocation failed");
             close(fd);
             return;
         }

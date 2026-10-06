@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/devShuai/specus/implementations/go/server/internal/httpshare"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
@@ -105,6 +106,44 @@ type Service struct {
 	logger         *slog.Logger
 	routeCacheMu   sync.Mutex
 	routeCache     map[string]cachedRoutePolicy
+	shares         *httpshare.Service
+}
+
+// forwardTarget is where one public request goes and how it is shaped on the way.
+type forwardTarget struct {
+	clientName   string
+	route        string
+	relativePath string
+	// protected strips the route's Basic credentials (Authorization) before forwarding.
+	protected   bool
+	pathRewrite bool
+	// rewritePrefix is the public prefix of rewritten paths; empty means the route's own entry.
+	rewritePrefix string
+	// shareID is set for /http-share/ requests: the Cookie header is replaced by cookie (absent
+	// when hasCookie is false) and responses get the share rewriting.
+	shareID   string
+	cookie    string
+	hasCookie bool
+}
+
+func (t forwardTarget) requestHeaders(header http.Header, skipped map[string]struct{}) []string {
+	if t.shareID == "" {
+		return collectHeaders(header, skipped, t.protected)
+	}
+	headers := collectHeaders(header, withCookieSkipped(skipped), false)
+	if t.hasCookie {
+		headers = append(headers, "Cookie:"+t.cookie)
+	}
+	return headers
+}
+
+func withCookieSkipped(skipped map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(skipped)+1)
+	for name := range skipped {
+		out[name] = struct{}{}
+	}
+	out["cookie"] = struct{}{}
+	return out
 }
 
 type cachedRoutePolicy struct {
@@ -178,14 +217,26 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	target := forwardTarget{clientName: clientName, route: route, relativePath: relativePath(r), protected: protected,
+		pathRewrite: policy.PathRewriteEnabled}
 	// 带 Upgrade: websocket 的 /http/** 请求走 WS 隧道（对齐 Java WebSocketSpecusConfig 的路由分流）。
-	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		s.serveWebSocket(w, r, protected)
+	if isWebSocketUpgrade(r) {
+		s.serveWebSocket(w, r, target)
 		return
 	}
+	s.forward(w, r, target)
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+// forward streams one admitted request to the client and relays the response.
+func (s *Service) forward(w http.ResponseWriter, r *http.Request, target forwardTarget) {
+	clientName, route, protected := target.clientName, target.route, target.protected
 	startedAt := time.Now()
-	path := relativePath(r)
-	requestHeaders := collectHeaders(r.Header, skippedHeaders, protected)
+	path := target.relativePath
+	requestHeaders := target.requestHeaders(r.Header, skippedHeaders)
 	requestCapture := &limitedCapture{limit: detailCaptureBytes}
 
 	failWithDetail := func(status int, message, detail string) {
@@ -272,11 +323,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responseHeaders := metadataStrings(head, "headers")
+	if target.shareID != "" {
+		responseHeaders = httpshare.ResponseHeaders(status, responseHeaders, target.shareID)
+	}
 	responseTrailerNames := validTrailerNames(metadataStrings(head, "trailerNames"), false)
 	declareTrailers(w, responseTrailerNames)
 
-	rewrite := policy != nil && policy.PathRewriteEnabled &&
-		isRewritableContentType(responseHeaders)
+	rewrite := target.pathRewrite && isRewritableContentType(responseHeaders)
 	var mediaCapture MediaCaptureSession
 	if s.openMedia != nil {
 		sourceURL := path
@@ -387,7 +440,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if rewrite {
 		body := rewriteBuffer.Bytes()
-		if rewritten, changed := s.rewriter.rewrite(body, clientName, route, responseHeaders); changed {
+		prefix := target.rewritePrefix
+		if prefix == "" {
+			prefix = routePrefix(clientName, route)
+		}
+		rewritten, changed := s.rewriter.rewriteWithPrefix(body, prefix, responseHeaders)
+		if changed {
 			body = rewritten
 			responseHeaders = stripRewriteHeaders(responseHeaders)
 		}
@@ -414,14 +472,21 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveWebSocket 处理 /http/{clientName}/{route}/** 的 WS 升级请求（对齐 Java WebSocketSpecusHandler）：
 // 握手成功后发送带 source=ws metadata 的 OPEN 帧，随后进入浏览器消息的读循环。
-func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, protected bool) {
-	clientName := r.PathValue("clientName")
-	route := r.PathValue("route")
+func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, target forwardTarget) {
+	s.serveWebSocketWith(w, r, target, nil)
+}
+
+func (s *Service) serveWebSocketWith(w http.ResponseWriter, r *http.Request, target forwardTarget,
+	onUpgrade func(*websocket.Conn)) {
+	clientName, route := target.clientName, target.route
 	// CheckOrigin mirrors Java setAllowedOriginPatterns("*"); route authentication remains the
 	// authorization boundary for protected tunnels.
 	conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
 	if err != nil {
 		return
+	}
+	if onUpgrade != nil {
+		onUpgrade(conn)
 	}
 	fail := func(reason string) {
 		_ = closeWebSocket(conn, r.Context(), websocket.CloseInternalServerErr, reason)
@@ -437,8 +502,8 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request, protect
 
 	metadata := map[string]any{
 		"source": "ws", "channelId": newWSChannelID(), "clientName": clientName,
-		"route": route, "relativePath": relativePath(r), "rawQuery": r.URL.RawQuery,
-		"headers": collectHeaders(r.Header, wsSkippedHeaders, protected), "body": []byte{},
+		"route": route, "relativePath": target.relativePath, "rawQuery": r.URL.RawQuery,
+		"headers": target.requestHeaders(r.Header, wsSkippedHeaders), "body": []byte{},
 	}
 	specus, err := s.openWS(clientName, metadata, conn)
 	if err != nil {

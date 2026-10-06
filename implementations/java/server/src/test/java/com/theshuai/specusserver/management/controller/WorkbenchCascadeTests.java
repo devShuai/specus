@@ -82,11 +82,11 @@ class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
     void deletingAClientRemovesTheReferencesToEverythingItCarries() {
         assertThat(send("DELETE", "/api/admin/clients/" + aliceClient.getId(), root).statusCode()).isEqualTo(204);
 
-        // Java keeps the client's route and mapping rows; the workbench forgets them anyway.
-        assertThat(httpRouteMappingRepository.findById(11L)).isPresent();
+        // The client's routes go with it, its mapping rows stay; the workbench forgets all of them.
+        assertThat(httpRouteMappingRepository.findById(11L)).isEmpty();
         assertThat(rows()).extracting(Row::id).containsOnly(21L, 22L, 23L);
         assertThat(rows()).hasSize(6);
-        // The orphaned route cannot be added back: its client is gone.
+        // The deleted route cannot be added back.
         var orphan = send("PUT", BASE + "/favorites/http-route/11", root);
         assertThat(orphan.statusCode()).isEqualTo(404);
         assertThat(json(orphan).path("code").asText()).isEqualTo("WORKBENCH_TARGET_NOT_FOUND");
