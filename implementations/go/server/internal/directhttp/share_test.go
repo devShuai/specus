@@ -30,8 +30,8 @@ type shareFixture struct {
 	service *Service
 	server  *httptest.Server
 
-	mu       sync.Mutex
-	opened   []map[string]any
+	mu        sync.Mutex
+	opened    []map[string]any
 	newStream func() Stream
 }
 
@@ -81,6 +81,15 @@ func (f *shareFixture) lastOpened() map[string]any {
 	return f.opened[len(f.opened)-1]
 }
 
+// waitOpened gives the server time to reach the device: it answers a WebSocket handshake before it
+// opens the stream, so the client can see the 101 first.
+func (f *shareFixture) waitOpened(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for f.lastOpened() == nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func headerValues(metadata map[string]any, name string) []string {
 	var values []string
 	for _, header := range metadataStrings(metadata, "headers") {
@@ -113,6 +122,7 @@ func (f *shareFixture) do(t *testing.T, method, path, rawQuery string, cookies [
 		}
 		conn, response, err := dialer.Dial("ws"+strings.TrimPrefix(target, "http"), header)
 		if err == nil {
+			f.waitOpened(5 * time.Second)
 			_ = conn.Close()
 			return shareResponse{status: http.StatusSwitchingProtocols, header: response.Header}
 		}
