@@ -323,7 +323,7 @@ func TestServeHTTPClientResetKeepsReasonOutOfPublicResponse(t *testing.T) {
 		"connection refused\r\nX-Forged: yes"
 	cases := map[string]func(*fakeStream){
 		"before response headers": func(stream *fakeStream) {
-			stream.headErr = &StreamResetError{Code: 1, Reason: reason}
+			stream.headErr = &StreamResetError{Code: 1, Reason: reason, Failure: "connect-refused"}
 		},
 		"while buffering for rewrite": func(stream *fakeStream) {
 			stream.head = map[string]any{"statusCode": 200, "headers": []string{"Content-Type:text/html"}}

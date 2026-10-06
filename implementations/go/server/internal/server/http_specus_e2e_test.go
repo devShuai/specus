@@ -189,7 +189,20 @@ func loginHTTPTestChannels(
 	port int,
 ) (net.Conn, net.Conn, *bufio.Reader) {
 	t.Helper()
+	return loginHTTPTestChannelsWithCapability(t, app, port, 0)
+}
+
+// loginHTTPTestChannelsWithCapability logs the demo client in as a session that announced
+// clientHttpRouteCapabilities.version = httpRouteCapability.
+func loginHTTPTestChannelsWithCapability(
+	t *testing.T,
+	app *App,
+	port int,
+	httpRouteCapability int,
+) (net.Conn, net.Conn, *bufio.Reader) {
+	t.Helper()
 	session := issueClientSession(t, app, DemoClientName)
+	app.clientAuth.SetHTTPRouteCapability(session.ID, httpRouteCapability)
 	login := protocol.LoginRequest{
 		ClientName:      DemoClientName,
 		ClientSessionID: session.ID,
