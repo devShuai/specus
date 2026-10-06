@@ -35,6 +35,13 @@ int st_object_storage_capabilities_for_tests(const st_object_storage_identity *i
                                              char *out,
                                              size_t out_len);
 
+/*
+ * Serves this PEM public key for every valid OSS callback key URL instead of fetching it from
+ * gosspublic.alicdn.com, so callback signature verification can be tested offline. NULL restores
+ * the real fetch.
+ */
+int st_object_storage_set_callback_key_for_tests(const char *pem);
+
 /* Deterministic OSS V4 vector hook. Returned strings are owned by the caller. */
 char *st_object_storage_presign_for_tests(const char *method,
                                           const char *object_key,

@@ -1295,6 +1295,11 @@ static int object_public_room_access(const char *room_id,
     return 0;
 }
 
+/*
+ * 0 grants access, 1 means no valid identity (401), 2 a room credential that does not grant it
+ * (403), and 3 an administration attachment of another tenant or of a client the caller cannot
+ * access, which public-transfer.md section 5 and Java answer as a bad request (400).
+ */
 static int object_attachment_access(const st_attachment *attachment,
                                     const st_object_storage_identity *identity,
                                     const char *room_token,
@@ -1302,8 +1307,8 @@ static int object_attachment_access(const st_attachment *attachment,
 {
     if (!object_identity_valid(identity)) return 1;
     if (strcmp(attachment->scope, "ADMIN_CLIENT_MESSAGE") == 0) {
-        if (strcmp(attachment->tenant_id, identity->tenant_id) != 0) return 2;
-        return object_admin_client_access(identity, attachment->target_client_id) ? 0 : 2;
+        if (strcmp(attachment->tenant_id, identity->tenant_id) != 0) return 3;
+        return object_admin_client_access(identity, attachment->target_client_id) ? 0 : 3;
     }
     long long room_id = 0;
     char token_hash[65];
@@ -1404,13 +1409,15 @@ static int object_create_upload(const st_object_config *config,
         }
     }
     long long public_room_id = 0;
+    int viewer = 0;
     if (public_scope) {
         if (object_normalize_room(raw_room, attachment.room_id) != 0) request_ok = 0;
         if (request_ok) {
             int room_rc = object_public_room_access(attachment.room_id, room_token, identity->username,
                                                     1, &public_room_id, attachment.room_token_hash);
-            if (room_rc == 3) request_ok = 0;
-            else if (room_rc != 0) request_ok = 0;
+            /* A valid VIEWER credential is a permission refusal (403 in Java and Go), not a bad request. */
+            viewer = room_rc == 3;
+            if (room_rc != 0) request_ok = 0;
         }
         attachment.public_room_id = public_room_id;
     } else {
@@ -1419,6 +1426,10 @@ static int object_create_upload(const st_object_config *config,
         attachment.target_client_id = target_client_id;
     }
     free(raw_filename); free(raw_mime); free(raw_sha); free(raw_room);
+    if (viewer) {
+        free(room_token);
+        return object_error(out, out_len, 403, "room viewers cannot upload attachments");
+    }
     if (!request_ok) {
         free(room_token);
         return object_error(out, out_len, 400, public_scope
@@ -1508,13 +1519,14 @@ static int object_complete(const st_object_config *config,
         public_scope ? "PUBLIC_TRANSFER" : "ADMIN_CLIENT_MESSAGE", &attachment);
     if (found != 0) {
         sqlite3_close(db); free(room_token);
-        return object_error(out, out_len, found == 1 ? 404 : 500, "attachment not found");
+        return object_error(out, out_len, found == 1 ? 400 : 500, "attachment not found");
     }
     int access = object_attachment_access(&attachment, identity, room_token, 1);
     free(room_token);
     if (access != 0) {
         sqlite3_close(db);
-        return object_error(out, out_len, access == 1 ? 401 : 403, "attachment access is forbidden");
+        return object_error(out, out_len, access == 1 ? 401 : access == 2 ? 403 : 400,
+                            "attachment access is forbidden");
     }
     if (strcmp(attachment.status, "UPLOADED") == 0) {
         sqlite3_close(db);
@@ -1632,14 +1644,16 @@ static int object_create_download(const st_object_config *config,
         public_scope ? "PUBLIC_TRANSFER" : "ADMIN_CLIENT_MESSAGE", &attachment);
     if (found != 0) {
         sqlite3_close(db); free(room_token);
-        return object_error(out, out_len, found == 1 ? 404 : 500, "attachment not found");
+        return object_error(out, out_len, found == 1 ? 400 : 500, "attachment not found");
     }
     int access = object_attachment_access(&attachment, identity, room_token, 0);
     free(room_token);
     char now[41], month[8];
     if (access != 0 || object_iso_time(time(NULL), now) != 0 || object_month(time(NULL), month) != 0) {
         sqlite3_close(db);
-        return object_error(out, out_len, access == 1 ? 401 : access == 2 ? 403 : 500, "attachment access is forbidden");
+        return object_error(out, out_len,
+                            access == 1 ? 401 : access == 2 ? 403 : access == 3 ? 400 : 500,
+                            "attachment access is forbidden");
     }
     if (strcmp(attachment.status, "UPLOADED") != 0 || strcmp(attachment.expires_at, now) <= 0) {
         sqlite3_close(db);
@@ -1877,10 +1891,31 @@ static char *object_callback_key_url(const char *encoded)
     return secure;
 }
 
+static pthread_mutex_t object_callback_key_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *object_callback_key_for_tests = NULL;
+
+static EVP_PKEY *object_parse_callback_key(const char *pem, size_t len)
+{
+    BIO *bio = len > (size_t)INT_MAX ? NULL : BIO_new_mem_buf(pem, (int)len);
+    EVP_PKEY *key = bio == NULL ? NULL : PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    return key;
+}
+
 static EVP_PKEY *object_load_callback_key(const char *encoded_url)
 {
     char *url = object_callback_key_url(encoded_url);
     if (url == NULL) return NULL;
+    /* Test seam: the URL is still validated, only the HTTPS fetch is replaced. */
+    pthread_mutex_lock(&object_callback_key_lock);
+    EVP_PKEY *pinned = object_callback_key_for_tests == NULL ? NULL
+        : object_parse_callback_key(object_callback_key_for_tests, strlen(object_callback_key_for_tests));
+    int use_pinned = object_callback_key_for_tests != NULL;
+    pthread_mutex_unlock(&object_callback_key_lock);
+    if (use_pinned) {
+        free(url);
+        return pinned;
+    }
     (void)pthread_once(&object_curl_once, object_curl_init);
     CURL *curl = object_curl_init_result == CURLE_OK ? curl_easy_init() : NULL;
     st_object_bytes pem = {0};
@@ -1896,9 +1931,7 @@ static EVP_PKEY *object_load_callback_key(const char *encoded_url)
     curl_easy_cleanup(curl);
     free(url);
     if (rc != CURLE_OK || status != 200 || pem.data == NULL) { free(pem.data); return NULL; }
-    BIO *bio = BIO_new_mem_buf(pem.data, (int)pem.len);
-    EVP_PKEY *key = bio == NULL ? NULL : PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
+    EVP_PKEY *key = object_parse_callback_key((const char *)pem.data, pem.len);
     free(pem.data);
     return key;
 }
@@ -1972,12 +2005,16 @@ static int object_complete_callback(const st_object_config *config,
     char *bucket = st_json_get_top_level_string(body, "bucket");
     char *key = st_json_get_top_level_string(body, "object");
     long long size = -1;
-    int valid = bucket != NULL && strcmp(bucket, config->bucket) == 0 && key != NULL
-        && object_validate_key(config, key) == 0 && st_json_get_i64(body, "size", &size) == 0 && size >= 0;
+    int complete = bucket != NULL && *bucket != '\0' && key != NULL && *key != '\0'
+        && st_json_get_i64(body, "size", &size) == 0 && size >= 0;
+    /* A signed callback for another bucket is a mismatch (403), as in Java, Go and section 5. */
+    int foreign_bucket = complete && strcmp(bucket, config->bucket) != 0;
+    int valid = complete && !foreign_bucket && object_validate_key(config, key) == 0;
     free(bucket);
     if (!valid) {
         free(key);
-        return object_error(out, out_len, 400, "invalid OSS upload callback body");
+        return foreign_bucket ? object_error(out, out_len, 403, "OSS callback bucket mismatch")
+                              : object_error(out, out_len, 400, "invalid OSS upload callback body");
     }
     sqlite3 *db = NULL;
     if (object_open(&db) != 0) { free(key); return object_error(out, out_len, 503, "attachment persistence is unavailable"); }
@@ -1985,7 +2022,7 @@ static int object_complete_callback(const st_object_config *config,
     int found = object_find_attachment_by_key(db, key, &attachment);
     if (found != 0) {
         sqlite3_close(db); free(key);
-        return object_error(out, out_len, found == 1 ? 404 : 500, "attachment object was not allocated");
+        return object_error(out, out_len, found == 1 ? 400 : 500, "attachment object was not allocated");
     }
     if (strcmp(attachment.status, "UPLOADED") == 0) {
         sqlite3_close(db); free(key);
@@ -2226,6 +2263,18 @@ void st_object_storage_reset_for_tests(void)
         object_rate_windows = next;
     }
     pthread_mutex_unlock(&object_rate_lock);
+}
+
+int st_object_storage_set_callback_key_for_tests(const char *pem)
+{
+    char *copy = NULL;
+    if (pem != NULL && (copy = (char *)malloc(strlen(pem) + 1U)) == NULL) return -1;
+    if (copy != NULL) memcpy(copy, pem, strlen(pem) + 1U);
+    pthread_mutex_lock(&object_callback_key_lock);
+    free(object_callback_key_for_tests);
+    object_callback_key_for_tests = copy;
+    pthread_mutex_unlock(&object_callback_key_lock);
+    return 0;
 }
 
 int st_object_storage_capabilities_for_tests(const st_object_storage_identity *identity,
