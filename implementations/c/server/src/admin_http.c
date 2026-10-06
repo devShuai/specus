@@ -10546,19 +10546,47 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
     return st_constant_time_eq(left_hash, right_hash, sizeof(left_hash));
 }
 
-/* Returns 1 when Basic credentials were consumed, 0 for a public/env-only route, and -1 after an error response. */
+/* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
+static int admin_env_http_route_configured(const char *route_name)
+{
+    st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
+    size_t route_count = 0;
+    int configured = 0;
+    if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
+        for (size_t i = 0; i < route_count && !configured; ++i) {
+            configured = strcmp(routes[i].route, route_name) == 0;
+        }
+    }
+    free(routes);
+    return configured;
+}
+
+static int send_http_route_not_found(int fd)
+{
+    send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
+    return -1;
+}
+
+/*
+ * Returns 1 when Basic credentials were consumed, 0 for a public route, and -1 after an error
+ * response. It fails closed: a request enters the tunnel only for a route the server itself
+ * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
+ * definition). A client may still forward a route it was told about earlier, such as one deleted
+ * since, so what the client holds never makes a route reachable.
+ */
 static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
 {
     char *client_name = NULL;
     char *route_name = NULL;
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
-        return 0;
+        return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
+        int configured = admin_env_http_route_configured(route_name);
         free(client_name);
         free(route_name);
-        return 0;
+        return configured ? 0 : send_http_route_not_found(fd);
     }
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(client_name);
@@ -10573,18 +10601,26 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
                                                                route_name,
                                                                &route,
                                                                &found);
-    free(client_name);
-    free(route_name);
     if (lookup_rc != 0) {
+        free(client_name);
+        free(route_name);
         send_http_route_policy_unavailable(fd);
         return -1;
     }
+    /* Unknown and disabled clients have no reachable routes, environment ones included: with a
+     * database a client cannot log in without an enabled account either. */
+    int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
+    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    free(client_name);
+    free(route_name);
+    if (!client_enabled) {
+        return send_http_route_not_found(fd);
+    }
     if (!found) {
-        return 0;
+        return env_configured ? 0 : send_http_route_not_found(fd);
     }
     if (!route.enabled) {
-        send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
-        return -1;
+        return send_http_route_not_found(fd);
     }
     if (!route.auth_enabled) {
         return 0;
@@ -13413,6 +13449,9 @@ static int handle_direct_http_request(st_admin_server *server,
     } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
         /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
         send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
+        /* The stream could not be created, answered as Java HttpSpecusController does. */
+        send_text_http_error(fd, 502, "HTTP 流创建失败");
     } else if (!sink_state.started) {
         send_text_http_error(fd, 502, "direct http target client is offline");
     }

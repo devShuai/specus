@@ -9,6 +9,7 @@ using Specus.Client.Control;
 using Specus.Client.DirectHttp;
 using Specus.Protocol;
 using Specus.Protocol.Flow;
+using Specus.Protocol.HttpRoute;
 using Specus.Protocol.Packets;
 
 namespace Specus.Client.Nat;
@@ -29,6 +30,8 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     private readonly RequestTrailerState? _requestTrailers;
     private readonly StreamSendWindow _responseWindow = new();
     private int _closed;
+    // Why the stream failed before its response OPEN, when that is known; carried on the RST.
+    private string? _failureBeforeResponse;
 
     public HttpStreamChannel(uint streamId, Dictionary<string, object?> metadata,
         DirectHttpHandler routes, string targetBaseUrl, FrameWriter writer, ILogger logger,
@@ -81,7 +84,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "HTTP stream {StreamId} failed", _streamId);
-            await SendResetAsync(26, ex.Message).ConfigureAwait(false);
+            await SendResetAsync(26, ex.Message, _failureBeforeResponse).ConfigureAwait(false);
         }
         finally
         {
@@ -95,6 +98,9 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
         if (!DirectHttpForwarder.TryBuildTarget(_targetBaseUrl, AsString(_metadata, "relativePath"),
                 AsString(_metadata, "rawQuery"), out var target, out var error))
         {
+            _failureBeforeResponse = string.IsNullOrWhiteSpace(_targetBaseUrl)
+                ? HttpRouteFailure.RouteNotLoaded
+                : HttpRouteFailure.TargetInvalid;
             throw new InvalidOperationException(error);
         }
 
@@ -122,10 +128,8 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
         }
 
         using var requestTrailerTransport = trailerTransport;
-        using var response = trailerTransport is null
-            ? await _routes.Forwarder.SendAsync(
-                request, _insecureSkipVerify, cancellationToken).ConfigureAwait(false)
-            : await trailerTransport.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendUpstreamAsync(request, trailerTransport, cancellationToken)
+            .ConfigureAwait(false);
         var trailerNames = DeclaredResponseTrailers(response);
         await _writer.WriteAsync(new NatMessagePacket
         {
@@ -180,6 +184,30 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Sends the request upstream. Nothing has been answered when this fails, so the failure is
+    /// classified for the RST where the runtime's error types say why.
+    /// </summary>
+    private async Task<HttpResponseMessage> SendUpstreamAsync(HttpRequestMessage request,
+        TrailerHttpTransport? trailerTransport, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return trailerTransport is null
+                ? await _routes.Forwarder.SendAsync(
+                    request, _insecureSkipVerify, cancellationToken).ConfigureAwait(false)
+                : await trailerTransport.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The trailer transport's client has no overall timeout; the shared one says whether it has.
+            var timeoutIsConnectTimeout = trailerTransport is not null
+                || !_routes.Forwarder.HasRequestTimeout(_insecureSkipVerify);
+            _failureBeforeResponse = HttpRouteFailureClassifier.Classify(ex, timeoutIsConnectTimeout);
+            throw;
+        }
+    }
+
     private ValueTask ReturnRequestCreditAsync(int bytes, CancellationToken cancellationToken) =>
         _writer.WritePriorityAsync(new NatMessagePacket
         {
@@ -188,7 +216,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
             Value = checked((uint)bytes),
         }, cancellationToken);
 
-    private async ValueTask SendResetAsync(uint code, string reason)
+    private async ValueTask SendResetAsync(uint code, string reason, string? failure)
     {
         if (Volatile.Read(ref _closed) != 0)
         {
@@ -201,7 +229,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
                 NatMessageType = NatMessageType.Rst,
                 StreamId = _streamId,
                 Value = code,
-                MetaData = new Dictionary<string, object?> { ["reason"] = reason },
+                MetaData = HttpRouteFailureClassifier.ResetMetadata(reason, failure),
             }, CancellationToken.None).ConfigureAwait(false);
         }
         catch

@@ -349,14 +349,6 @@ func (db *DB) ListEnabledSpecusMappings(ctx context.Context, clientID int64) ([]
 	return mappings, rows.Err()
 }
 
-// CountHTTPRoutes returns the number of HTTP route mappings for a client (any enabled state).
-func (db *DB) CountHTTPRoutes(ctx context.Context, clientID int64) (int, error) {
-	query := db.rebind(`SELECT COUNT(*) FROM http_route_mapping WHERE client_id = ?`)
-	var count int
-	err := db.sql.QueryRowContext(ctx, query, clientID).Scan(&count)
-	return count, err
-}
-
 // ListEnabledHTTPRoutes returns enabled HTTP route mappings for a client, ordered by id.
 func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTPRouteMapping, error) {
 	query := db.rebind(`SELECT id, client_id, client_name, route, target_base_url, enabled,
@@ -406,25 +398,26 @@ func (db *DB) HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route
 	return policy.PathRewriteEnabled, nil
 }
 
-// HTTPRouteAccessPolicy returns the server-managed access policy for a client route. A nil
-// result is intentional: clients may still own routes in their local configuration when the
-// server has no corresponding row, and those legacy routes remain public.
+// HTTPRouteAccessPolicy returns the server-managed access policy for a client route, or nil
+// when the server has no row for it. Clients only learn routes from the server, so nil means
+// the route does not exist (or was deleted) and the public entry must refuse it.
 func (db *DB) HTTPRouteAccessPolicy(ctx context.Context, clientName, route string) (*HTTPRouteAccessPolicy, error) {
-	query := db.rebind(`SELECT COALESCE(c.tenant_id, 'default'), r.client_id, r.id,
+	query := db.rebind(`SELECT COALESCE(c.tenant_id, 'default'), r.client_id, r.id, c.enabled,
 		r.enabled, r.path_rewrite_enabled, r.media_capture_enabled, r.auth_enabled,
 		COALESCE(r.auth_username, ''), COALESCE(r.auth_password_hash, '')
 		FROM http_route_mapping r
 		JOIN specus_client_account c ON c.id = r.client_id
 		WHERE c.client_name = ? AND r.route = ?`)
 	var (
-		policy       HTTPRouteAccessPolicy
-		enabled      databaseBoolean
-		pathRewrite  databaseBoolean
-		mediaCapture databaseBoolean
-		authEnabled  databaseBoolean
+		policy        HTTPRouteAccessPolicy
+		clientEnabled databaseBoolean
+		enabled       databaseBoolean
+		pathRewrite   databaseBoolean
+		mediaCapture  databaseBoolean
+		authEnabled   databaseBoolean
 	)
 	err := db.sql.QueryRowContext(ctx, query, clientName, route).Scan(
-		&policy.TenantID, &policy.ClientID, &policy.ResourceID, &enabled, &pathRewrite,
+		&policy.TenantID, &policy.ClientID, &policy.ResourceID, &clientEnabled, &enabled, &pathRewrite,
 		&mediaCapture, &authEnabled, &policy.AuthUsername, &policy.AuthPasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -432,6 +425,7 @@ func (db *DB) HTTPRouteAccessPolicy(ctx context.Context, clientName, route strin
 	if err != nil {
 		return nil, err
 	}
+	policy.ClientEnabled = bool(clientEnabled)
 	policy.Enabled = bool(enabled)
 	policy.PathRewriteEnabled = bool(pathRewrite)
 	policy.MediaCaptureEnabled = bool(mediaCapture)

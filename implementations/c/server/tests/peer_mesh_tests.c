@@ -51,6 +51,20 @@ static int contains(const char *value, const char *needle)
     return value != NULL && strstr(value, needle) != NULL;
 }
 
+/* The session expiry is an RFC 3339 UTC instant on the wire, "YYYY-MM-DDTHH:MM:SSZ", whatever
+ * format the database keeps it in. */
+static int has_wire_expiry(const char *message)
+{
+    const char *value = message == NULL ? NULL : strstr(message, "\"expiresAt\":\"");
+    if (value == NULL) return 0;
+    value += strlen("\"expiresAt\":\"");
+    static const char shape[] = "dddd-dd-ddTdd:dd:ddZ\"";
+    for (size_t i = 0; shape[i] != '\0'; ++i) {
+        if (shape[i] == 'd' ? (value[i] < '0' || value[i] > '9') : value[i] != shape[i]) return 0;
+    }
+    return 1;
+}
+
 /* The catalogue fixture: the consumer and the plain egress stay up, the DNS egress comes and goes. */
 typedef struct {
     peer_test_context capture;
@@ -680,6 +694,11 @@ int main(void)
         || !contains(context.signals[1].message, "\"candidates\":[")
         || !contains(context.signals[1].message, "\"sourceKeyEpoch\":\"epoch-a\"")) {
         fprintf(stderr, "peer mesh candidate/session forwarding mismatch\n");
+        return 1;
+    }
+    if (!has_wire_expiry(context.signals[0].message) || !has_wire_expiry(context.signals[1].message)) {
+        fprintf(stderr, "peer mesh session expiry is not an RFC 3339 UTC instant: %s | %s\n",
+                context.signals[0].message, context.signals[1].message);
         return 1;
     }
 

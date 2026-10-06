@@ -18,6 +18,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [chunked-resume.md](chunked-resume.md) | 草案：浏览器直连文件的分块续传（清单与 STFR1 帧、续传握手、接收方同意、存储与清理），尚未实现 |
 | [public-transfer-cluster.md](public-transfer-cluster.md) | 公共互传多实例 Redis presence、修订、共享限流、管理事件恢复与 STCE v2 内部 Pub/Sub 帧 |
 | [client-messages.md](client-messages.md) | 管理端与客户端消息 WebSocket、一次性 ticket、能力判断和服务端备用投递 |
+| [service-connectivity-check.md](service-connectivity-check.md) | 对单条 HTTP route 的有界端到端检查，四阶段结果码、客户端 RST 分类与限流；实现进行中 |
 
 ## 参考实现入口
 
