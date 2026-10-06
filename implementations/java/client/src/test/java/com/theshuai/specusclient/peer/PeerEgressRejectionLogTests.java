@@ -34,7 +34,7 @@ class PeerEgressRejectionLogTests {
         }
         assertEquals(PeerEgressRejectionLog.PER_WINDOW, emitted, "emitted lines");
 
-        Map<String, Long> counts = log.drainCounts();
+        Map<String, Long> counts = log.cumulativeCounts();
         assertEquals((long) PeerEgressRejectionLog.PER_WINDOW * 3, counts.get(PeerEgressCodes.DEST_DENIED),
                 "the aggregate must count every refusal");
     }
@@ -99,7 +99,7 @@ class PeerEgressRejectionLogTests {
         assertTrue(log.limited(), "hitting the cap was not recorded");
 
         // Reaching the cap costs diagnostic lines, never accuracy.
-        assertEquals(attempts, log.drainCounts().get(PeerEgressCodes.CONSUMER_DENIED),
+        assertEquals(attempts, log.cumulativeCounts().get(PeerEgressCodes.CONSUMER_DENIED),
                 "the aggregate must count every refusal even at the cap");
     }
 
@@ -119,23 +119,25 @@ class PeerEgressRejectionLogTests {
     }
 
     /**
-     * Consecutive reports have to describe consecutive intervals. A running total would leave the
-     * server differencing values it was never told were cumulative.
+     * The status and the report read running totals. The server keeps only the latest report, so a
+     * tally that reading reset would have the admin page describe "since the last report", and the
+     * status would start shrinking on its own.
      */
     @Test
-    void drainResetsTheInterval() {
+    void readingTheCountsLeavesThemAlone() {
         PeerEgressRejectionLog log = new PeerEgressRejectionLog();
         log.record(7, PeerEgressCodes.DEST_DENIED, EPOCH);
         log.record(7, PeerEgressCodes.PORT_DENIED, EPOCH);
 
-        Map<String, Long> first = log.drainCounts();
+        Map<String, Long> first = log.cumulativeCounts();
         assertEquals(1L, first.get(PeerEgressCodes.DEST_DENIED));
         assertEquals(1L, first.get(PeerEgressCodes.PORT_DENIED));
-        assertTrue(log.drainCounts().isEmpty(), "an interval with no refusals had something to send");
+        assertEquals(first, log.cumulativeCounts(), "reading the counts changed them");
 
         log.record(7, PeerEgressCodes.DEST_DENIED, EPOCH);
-        Map<String, Long> third = log.drainCounts();
-        assertEquals(1, third.size(), "the third interval carried more than its own refusal");
-        assertEquals(1L, third.get(PeerEgressCodes.DEST_DENIED));
+        Map<String, Long> third = log.cumulativeCounts();
+        assertEquals(2L, third.get(PeerEgressCodes.DEST_DENIED), "a later refusal did not add to the total");
+        assertEquals(1L, third.get(PeerEgressCodes.PORT_DENIED));
+        assertEquals(1L, first.get(PeerEgressCodes.DEST_DENIED), "a copy handed out went on counting");
     }
 }

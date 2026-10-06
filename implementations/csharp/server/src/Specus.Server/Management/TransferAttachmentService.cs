@@ -219,16 +219,26 @@ public sealed class TransferAttachmentService
     private readonly ObjectStorageOptions _options;
     private readonly PublicTransferOptions _publicOptions;
     private readonly PublicTransferRoomService _rooms;
+    // The clock the capability snapshot reads; tests pin it to replay a fixed instant.
+    private readonly TimeProvider _timeProvider;
 
     public TransferAttachmentService(SpecusDbContext db, IObjectStorageService storage,
         IOptions<ObjectStorageOptions> options, IOptions<PublicTransferOptions> publicOptions,
         PublicTransferRoomService rooms)
+        : this(db, storage, options, publicOptions, rooms, TimeProvider.System)
+    {
+    }
+
+    internal TransferAttachmentService(SpecusDbContext db, IObjectStorageService storage,
+        IOptions<ObjectStorageOptions> options, IOptions<PublicTransferOptions> publicOptions,
+        PublicTransferRoomService rooms, TimeProvider timeProvider)
     {
         _db = db;
         _storage = storage;
         _options = options.Value;
         _publicOptions = publicOptions.Value;
         _rooms = rooms;
+        _timeProvider = timeProvider;
     }
 
     // Advisory snapshot: no rooms, object-store requests, grants or quota reservations.
@@ -240,7 +250,7 @@ public sealed class TransferAttachmentService
         await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = _timeProvider.GetUtcNow();
             var month = now.ToString("yyyy-MM", CultureInfo.InvariantCulture);
             var used = Math.Max(0L, await _db.TransferAttachments.AsNoTracking()
                 .Where(a => a.TenantId == tenant && a.OwnerUsername == username

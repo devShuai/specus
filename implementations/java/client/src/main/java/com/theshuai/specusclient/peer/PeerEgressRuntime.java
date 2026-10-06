@@ -124,7 +124,7 @@ final class PeerEgressRuntime {
     private record UdpFlow(Socket socket) {
     }
 
-    /** What the periodic egress-report carries, alongside the per-code refusal counts. */
+    /** What the status and the periodic egress-report carry, alongside the per-code refusal counts. */
     record Stats(long totalFlows, long bytesIn, long bytesOut) {
     }
 
@@ -208,10 +208,9 @@ final class PeerEgressRuntime {
     }
 
     /**
-     * What an operator can read about this node serving as an egress.
-     *
-     * <p>The refusal counts come from the cumulative tally rather than the one the periodic report
-     * drains, so the numbers do not start shrinking on their own the day that report is wired up.
+     * What an operator can read about this node serving as an egress: the status's egress section,
+     * and the {@code egress-report} built from the same snapshot, so the admin page and this
+     * device say the same thing. Every count runs from the start of this runtime.
      */
     PeerEgressStatus.RuntimeSnapshot statusSnapshot() {
         lock.lock();
