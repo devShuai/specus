@@ -2103,7 +2103,8 @@
       },
       "expect": {
         "httpStatus": 503,
-        "code": "CHECK_UNAVAILABLE"
+        "code": "CHECK_UNAVAILABLE",
+        "retryAfterSeconds": 1
       }
     },
     {

@@ -76,6 +76,8 @@ typedef struct {
     char client_name[128];
     int64_t client_session_id;
     int peer_service_discovery_version;
+    /* clientHttpRouteCapabilities.version of the login session; RST failure is trusted from 1. */
+    int client_http_route_version;
     uint8_t access_token_hash[ST_SHA256_LEN];
     int port;
     char bind_address[128];
@@ -169,6 +171,8 @@ typedef struct direct_http_pending {
     /* Set when error holds the client's RST reason rather than a server-side failure. */
     int client_reset;
     uint32_t reset_code;
+    /* metadata.failure of the client's RST, for the connectivity check; "" when absent. */
+    char failure[32];
     char *error;
     direct_http_event *events_head;
     direct_http_event *events_tail;
@@ -1365,6 +1369,11 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
             pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
             pending->client_reset = 1;
             pending->reset_code = message->value;
+            /* Only the connectivity check reads it, and only from a session that announced it. */
+            char *failure = st_json_get_top_level_string(metadata, "failure");
+            snprintf(pending->failure, sizeof(pending->failure), "%s",
+                     failure == NULL ? "" : strlen(failure) < sizeof(pending->failure) ? failure : "?");
+            free(failure);
         }
         pending->done = 1;
         pending->reset = 1;
@@ -2000,6 +2009,130 @@ failed:
     return failed_result;
 }
 
+/* Connectivity check presence: a bound control connection and data connection, no grace wait. */
+static void connectivity_presence(void *ctx, const char *client_name, int *control_online, int *data_online)
+{
+    (void)ctx;
+    pthread_mutex_lock(&active_session_lock);
+    *control_online = active_session_find_role_locked(client_name, 0) != NULL;
+    *data_online = active_session_find_role_locked(client_name, 1) != NULL;
+    pthread_mutex_unlock(&active_session_lock);
+}
+
+static long long connectivity_now_ms(void *ctx)
+{
+    (void)ctx;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+/*
+ * One connectivity check probe (protocol/spec/service-connectivity-check.md section 5): the same
+ * HTTP stream as a public request, minus the public entry -- no route Basic auth, no server-side
+ * route lookup (the device answers for its own configuration), no traffic accounting or detail.
+ * OPEN with the fixed metadata and the request FIN go out at once; the first answer within
+ * timeout_ms decides. A response head ends the exchange: the stream is reset unless it already
+ * ended both ways, and its body is dropped without WINDOW_UPDATE.
+ */
+static void connectivity_probe(void *ctx,
+                               const char *client_name,
+                               const char *metadata_json,
+                               long long timeout_ms,
+                               st_connectivity_probe_answer *answer)
+{
+    (void)ctx;
+    memset(answer, 0, sizeof(*answer));
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *session = active_data_session_acquire_locked(client_name);
+    pthread_mutex_unlock(&active_session_lock);
+    if (session == NULL) {
+        /* The data connection went away between the presence check and the open. */
+        answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+        return;
+    }
+    answer->capability = session->config.client_http_route_version;
+
+    direct_http_pending pending;
+    memset(&pending, 0, sizeof(pending));
+    pending.send_credit = ST_STREAM_INITIAL_WINDOW;
+    pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
+    pthread_cond_init(&pending.cond, NULL);
+    pthread_mutex_lock(&session->map_lock);
+    pending.stream_id = session->next_stream_id++;
+    if (session->next_stream_id == 0U) {
+        session->next_stream_id = 1U;
+    }
+    pthread_mutex_unlock(&session->map_lock);
+
+    pthread_mutex_lock(&session->direct_lock);
+    if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        answer->kind = ST_CONNECTIVITY_PROBE_STREAM_LIMIT;
+        return;
+    }
+    pending.next = session->direct_pending;
+    session->direct_pending = &pending;
+    pthread_mutex_unlock(&session->direct_lock);
+
+    st_buffer packet = st_protocol_encode_nat_message(ST_NAT_OPEN, 0U, pending.stream_id, 0U,
+                                                       metadata_json, NULL, 0U);
+    int written = packet.data != NULL && session_send_packet(session, &packet) == 0;
+    if (written) {
+        packet = st_protocol_encode_nat_message(ST_NAT_FIN, 0U, pending.stream_id, 0U, NULL, NULL, 0U);
+        written = packet.data != NULL && session_send_packet(session, &packet) == 0;
+    }
+    if (!written) {
+        answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+    } else {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        long long wait_ms = timeout_ms < 0 ? 0 : timeout_ms;
+        deadline.tv_sec += (time_t)(wait_ms / 1000LL);
+        deadline.tv_nsec += (long)(wait_ms % 1000LL) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_mutex_lock(&session->direct_lock);
+        while (pending.events_head == NULL && pending.error == NULL) {
+            if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
+                break;
+            }
+        }
+        if (pending.events_head != NULL && pending.events_head->type == ST_NAT_OPEN) {
+            int status = 0;
+            (void)st_json_get_int(pending.events_head->meta_json, "statusCode", &status);
+            answer->kind = ST_CONNECTIVITY_PROBE_RESPONSE;
+            answer->status_code = status;
+        } else if (pending.error != NULL && pending.client_reset) {
+            answer->kind = ST_CONNECTIVITY_PROBE_RESET;
+            snprintf(answer->failure, sizeof(answer->failure), "%s", pending.failure);
+        } else if (pending.error != NULL) {
+            /* The data connection closed or was replaced, which fails every pending stream. */
+            answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
+        } else {
+            answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
+        }
+        int ended = pending.done;
+        pthread_mutex_unlock(&session->direct_lock);
+        if (!ended) {
+            (void)send_reset(session, pending.stream_id, ST_CONNECTIVITY_PROBE_RESET_CODE,
+                             "connectivity check finished");
+        }
+    }
+
+    pthread_mutex_lock(&session->direct_lock);
+    direct_pending_remove(session, &pending);
+    direct_pending_free_events(&pending);
+    pthread_mutex_unlock(&session->direct_lock);
+    free(pending.error);
+    pthread_cond_destroy(&pending.cond);
+    session_reference_release(session);
+}
+
 static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
 {
     (void)ctx;
@@ -2187,6 +2320,7 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     config->client_id = client_session->client_id;
     config->client_session_id = client_session->id;
     config->peer_service_discovery_version = client_session->peer_service_discovery_version;
+    config->client_http_route_version = client_session->client_http_route_version;
     config->client_session_db_backed = 1;
     if (load_database_config(config, database_path) != 0
         || parse_tcp_mappings(config) != 0
@@ -4594,6 +4728,35 @@ static int start_shutdown_signal_thread(void)
     return 0;
 }
 
+/*
+ * Opens the pipe that carries a SIGTERM/SIGINT to the serving loop. main does this before the
+ * control listener opens: once a port accepts connections a readiness probe may call the server
+ * up, and a signal from then on has to reach the graceful shutdown (the loop finds the byte on its
+ * first poll) instead of the "outside the serving loop" exit, even while startup is still opening
+ * the admin port.
+ */
+static int shutdown_wake_open(int shutdown_pipe[2])
+{
+    if (pipe(shutdown_pipe) != 0) {
+        shutdown_pipe[0] = -1;
+        shutdown_pipe[1] = -1;
+        return -1;
+    }
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = shutdown_pipe[1];
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    return 0;
+}
+
+static void shutdown_wake_close(int shutdown_pipe[2])
+{
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = -1;
+    close(shutdown_pipe[1]);
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    close(shutdown_pipe[0]);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -4652,8 +4815,18 @@ int main(void)
         return 1;
     }
 
+    int shutdown_pipe[2] = {-1, -1};
+    if (shutdown_wake_open(shutdown_pipe) != 0) {
+        perror("shutdown pipe");
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
+        free(config.nat_control_json);
+        st_public_discovery_shutdown();
+        return 1;
+    }
     int listener = create_listener_on(config.bind_address, config.port);
     if (listener < 0) {
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4672,6 +4845,14 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    const st_connectivity_device connectivity_device = {
+        .presence = connectivity_presence,
+        .probe = connectivity_probe,
+        .now_ms = connectivity_now_ms,
+        .log = NULL,
+        .ctx = NULL,
+    };
+    st_admin_set_connectivity_device(&connectivity_device);
     if (config.admin_port > 0
         && st_admin_server_start_with_handlers(&admin_server,
                                                config.admin_port,
@@ -4688,6 +4869,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         close(listener);
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4701,6 +4883,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         close(listener);
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4708,18 +4891,12 @@ int main(void)
         return 1;
     }
 
-    int shutdown_pipe[2] = {-1, -1};
     int listener_flags = fcntl(listener, F_GETFL, 0);
     /* Nonblocking, so a connection that vanishes between poll() and accept() cannot park the loop
      * where it would no longer notice a shutdown request. */
-    if (pipe(shutdown_pipe) != 0
-        || listener_flags < 0
-        || fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) != 0) {
-        perror("shutdown pipe");
-        if (shutdown_pipe[0] >= 0) {
-            close(shutdown_pipe[0]);
-            close(shutdown_pipe[1]);
-        }
+    if (listener_flags < 0 || fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) != 0) {
+        perror("control listener");
+        shutdown_wake_close(shutdown_pipe);
         peer_mesh_maintenance_stop();
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
@@ -4732,9 +4909,6 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    pthread_mutex_lock(&shutdown_signal_lock);
-    shutdown_wake_fd = shutdown_pipe[1];
-    pthread_mutex_unlock(&shutdown_signal_lock);
 
     for (;;) {
         struct pollfd ready[2];
@@ -4824,11 +4998,7 @@ int main(void)
                    unfinished, swept);
         }
     }
-    pthread_mutex_lock(&shutdown_signal_lock);
-    shutdown_wake_fd = -1;
-    close(shutdown_pipe[1]);
-    pthread_mutex_unlock(&shutdown_signal_lock);
-    close(shutdown_pipe[0]);
+    shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);

@@ -210,15 +210,15 @@ try {
   await b.page.screenshot({ path: `${output}/mobile-received.png`, fullPage: true });
   pass("real WebRTC file, receiver-first layout, truthful download and no invite fallback");
   await a.page.locator("#public-transfer-file-input").evaluate((input) => {
-    // Metadata-only oversize fixture: no 129 MiB buffer or real file is read.
+    // Metadata-only oversize fixture: no 2 GiB buffer or real file is read.
     const file = new File(["fixture"], "oversize.bin");
-    Object.defineProperty(file, "size", { value: 128 * 1024 * 1024 + 1 });
+    Object.defineProperty(file, "size", { value: 2 * 1024 * 1024 * 1024 + 1 });
     const files = new DataTransfer(); files.items.add(file);
     input.files = files.files; input.dispatchEvent(new Event("change", { bubbles: true }));
   });
   await a.page.getByRole("dialog").waitFor();
   assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
-  assert.match(await a.page.getByRole("dialog").innerText(), /超过设备传输的单文件内存上限/);
+  assert.match(await a.page.getByRole("dialog").innerText(), /超过设备传输的单文件上限/);
   await a.page.getByRole("button", { name: "移除 oversize.bin", exact: true }).click();
   assert.equal(await a.page.getByRole("button", { name: "确认发送", exact: true }).isDisabled(), true);
   await a.page.getByRole("button", { name: "取消发送", exact: true }).click();

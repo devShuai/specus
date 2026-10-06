@@ -62,6 +62,8 @@ type Conn struct {
 	recordID       atomic.Int64
 	sessionID      atomic.Int64
 	connectionRole atomic.Value // string
+	// httpRouteCapability is clientHttpRouteCapabilities.version of the login session.
+	httpRouteCapability atomic.Int32
 
 	lastReadUnixNano  atomic.Int64
 	lastWriteUnixNano atomic.Int64
@@ -151,6 +153,21 @@ func (c *Conn) OnLoginSuccess(clientName string, tenantID string, clientSessionI
 	c.loginTime.Store(loginTimeMs)
 	c.connectionRole.Store(connectionRole)
 }
+
+// SetHTTPRouteCapability records the clientHttpRouteCapabilities.version the login session announced.
+func (c *Conn) SetHTTPRouteCapability(version int) {
+	if version < 0 {
+		version = 0
+	}
+	if version > 1<<30 {
+		version = 1 << 30
+	}
+	c.httpRouteCapability.Store(int32(version))
+}
+
+// HTTPRouteCapability is the clientHttpRouteCapabilities.version of the login session; 0 for an
+// older client, whose RST classification the connectivity check never trusts.
+func (c *Conn) HTTPRouteCapability() int { return int(c.httpRouteCapability.Load()) }
 
 // MarkReason records the disconnect reason; only the first call wins.
 func (c *Conn) MarkReason(reason string) {

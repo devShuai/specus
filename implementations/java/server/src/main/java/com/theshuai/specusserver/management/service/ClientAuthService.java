@@ -26,6 +26,7 @@ import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.security.TlsContextFactory;
 import com.theshuai.specusserver.security.TlsProperties;
+import com.theshuai.specusserver.session.ClientHttpRouteCapabilities;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
@@ -66,6 +67,7 @@ public class ClientAuthService {
     private final ClientAuthProperties properties;
     private final NettyServerProperties nettyProperties;
     private final TlsProperties tlsProperties;
+    private final ClientHttpRouteCapabilities httpRouteCapabilities;
     private final String publicAddress;
     private final TransactionTemplate transactionTemplate;
 
@@ -81,6 +83,7 @@ public class ClientAuthService {
                              ClientAuthProperties properties,
                              NettyServerProperties nettyProperties,
                              TlsProperties tlsProperties,
+                             ClientHttpRouteCapabilities httpRouteCapabilities,
                              PlatformTransactionManager transactionManager,
                              @Value("${specus.public-address:}") String publicAddress) {
         this.credentialRepository = credentialRepository;
@@ -95,6 +98,7 @@ public class ClientAuthService {
         this.properties = properties;
         this.nettyProperties = nettyProperties;
         this.tlsProperties = tlsProperties;
+        this.httpRouteCapabilities = httpRouteCapabilities;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : "";
     }
@@ -147,8 +151,13 @@ public class ClientAuthService {
         session.setStatus(STATUS_HTTP_AUTHENTICATED);
         applyEnvironment(session, environment);
         session.setHttpLoginAt(now.toString());
-        session.setExpiresAt(now.plusSeconds(properties.getTokenTtlSeconds()).toString());
+        Instant expiresAt = now.plusSeconds(properties.getTokenTtlSeconds());
+        session.setExpiresAt(expiresAt.toString());
         sessionRepository.save(session);
+        // Kept in memory with the session, not in its row: the connectivity check reads it through
+        // the session id its data connection carries.
+        httpRouteCapabilities.remember(session.getId(),
+                environment.getClientHttpRouteCapabilities().getVersion(), expiresAt);
 
         ClientAuthLoginResponse response = new ClientAuthLoginResponse();
         response.setTenantId(credential.getTenantId());
@@ -444,6 +453,10 @@ public class ClientAuthService {
         if (environment.getClientEgressCapabilities() == null) {
             // An explicit null reads as "no egress", like an absent object, instead of failing login.
             environment.setClientEgressCapabilities(new ClientEnvironmentInfo.ClientEgressCapabilities());
+        }
+        if (environment.getClientHttpRouteCapabilities() == null) {
+            // Likewise an explicit null is an older client, whose resets are never classified.
+            environment.setClientHttpRouteCapabilities(new ClientEnvironmentInfo.ClientHttpRouteCapabilities());
         }
         return environment;
     }

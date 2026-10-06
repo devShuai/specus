@@ -203,9 +203,10 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 	}
 }
 
-// errTooManyNatStreams is returned to the HTTP/WebSocket entry point when the session already holds
+// ErrTooManyNatStreams is returned to the HTTP/WebSocket entry point when the session already holds
 // its budget of NAT streams; the caller answers the visitor rather than queueing unbounded work.
-var errTooManyNatStreams = errors.New("client has too many concurrent NAT streams")
+// The connectivity check reports it as DEVICE_BUSY.
+var ErrTooManyNatStreams = errors.New("client has too many concurrent NAT streams")
 
 func (s *clientSession) protocolViolation(message protocol.NatMessage, detail string) error {
 	if s.logger != nil && s.conn != nil {
@@ -382,7 +383,7 @@ func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, er
 	if s.natStreamLimitReachedLocked() {
 		s.mu.Unlock()
 		stream.Close()
-		return nil, errTooManyNatStreams
+		return nil, ErrTooManyNatStreams
 	}
 	s.httpStreams[streamID] = stream
 	s.mu.Unlock()
@@ -451,6 +452,7 @@ func (s *clientSession) handleHTTPEnd(message protocol.NatMessage) bool {
 	if message.Type == protocol.NatRST {
 		stream.onReset(&directhttp.StreamResetError{
 			Code: message.Value, Reason: asString(message.Metadata, "reason"),
+			Failure: asString(message.Metadata, "failure"),
 		})
 		return true
 	}
@@ -521,7 +523,7 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 	s.mu.Lock()
 	if s.natStreamLimitReachedLocked() {
 		s.mu.Unlock()
-		return nil, errTooManyNatStreams
+		return nil, ErrTooManyNatStreams
 	}
 	s.wsStreams[streamID] = specus
 	s.mu.Unlock()

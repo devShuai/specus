@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.http;
 
 import com.theshuai.common.handler.StreamFlowController;
+import com.theshuai.common.protocol.HttpRouteFailure;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,7 @@ public final class HttpStreamExchange {
     private long queuedDataBytes;
     private boolean responseOpened;
     private boolean terminalQueued;
+    private boolean responseEnded;
 
     public HttpStreamExchange(int streamId) {
         this.streamId = streamId;
@@ -71,21 +73,39 @@ public final class HttpStreamExchange {
             return false;
         }
         terminalQueued = true;
+        responseEnded = true;
         trailers = HttpSpecusController.validTrailerLines(
                 stringList(metadata == null ? null : metadata.get("trailers")), responseTrailerNames);
         events.offer(new End(trailers));
         return true;
     }
 
-    public synchronized void onReset(long errorCode, Map<String, Object> metadata) {
+    /** An RST the client sent for this stream. */
+    public void onReset(long errorCode, Map<String, Object> metadata) {
+        onReset(errorCode, metadata, ResetOrigin.PEER);
+    }
+
+    /**
+     * Ends the exchange with a reset. Only a {@link ResetOrigin#PEER} reset keeps the client's
+     * {@code metadata.failure}, the classification the connectivity check reads; the public path
+     * keeps its fixed body and never shows the reason or the failure.
+     */
+    public synchronized void onReset(long errorCode, Map<String, Object> metadata, ResetOrigin origin) {
         String reason = metadata == null ? null : text(metadata.get("reason"));
+        String failure = origin == ResetOrigin.PEER && metadata != null
+                ? text(metadata.get(HttpRouteFailure.METADATA_KEY)) : null;
         Reset reset = new Reset(errorCode, reason == null || reason.isBlank() ? "HTTP stream reset" : reason);
-        responseHead.completeExceptionally(new HttpStreamException(reset.reason(), errorCode));
+        responseHead.completeExceptionally(new HttpStreamException(reset.reason(), errorCode, origin, failure));
         if (terminalQueued) {
             return;
         }
         terminalQueued = true;
         events.offer(reset);
+    }
+
+    /** Whether the client ended its response with FIN, so the response direction is closed. */
+    public synchronized boolean responseEnded() {
+        return responseEnded;
     }
 
     public ResponseHead awaitResponseHead(long timeoutMillis) throws Exception {
@@ -122,16 +142,46 @@ public final class HttpStreamExchange {
     public record ResponseHead(int statusCode, List<String> headers, List<String> trailerNames) {
     }
 
+    /** Who ended a stream with a reset. */
+    public enum ResetOrigin {
+        /** The client sent RST; its metadata may classify why the target could not be used. */
+        PEER,
+        /** This server cancelled the stream, for example for an invalid response head. */
+        LOCAL,
+        /** The data connection closed, or the OPEN could not be written to it. */
+        CONNECTION
+    }
+
     public static final class HttpStreamException extends Exception {
         private final long errorCode;
+        private final ResetOrigin origin;
+        private final String failure;
 
         public HttpStreamException(String message, long errorCode) {
+            this(message, errorCode, ResetOrigin.PEER, null);
+        }
+
+        public HttpStreamException(String message, long errorCode, ResetOrigin origin, String failure) {
             super(message);
             this.errorCode = errorCode;
+            this.origin = origin;
+            this.failure = failure;
         }
 
         public long errorCode() {
             return errorCode;
+        }
+
+        public ResetOrigin origin() {
+            return origin;
+        }
+
+        /**
+         * The client's {@code metadata.failure}, verbatim and unvalidated, or null. Only a peer reset
+         * carries one; whether to trust it depends on the capability of the session it came from.
+         */
+        public String failure() {
+            return failure;
         }
     }
 

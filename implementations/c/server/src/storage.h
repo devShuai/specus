@@ -153,6 +153,11 @@ typedef struct {
     int client_egress_version;
     /* domainTargetCapable as declared at login; 0 when absent or when the version is 0. */
     int client_egress_domain_targets;
+    /*
+     * environment.clientHttpRouteCapabilities.version; from 1 the client classifies an HTTP stream
+     * RST in metadata.failure, which the connectivity check trusts only then.
+     */
+    int client_http_route_version;
 } st_storage_client_session;
 
 typedef struct {
@@ -522,6 +527,13 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
 int st_storage_client_has_online_receive_capability(const char *path,
                                                     long long client_id,
                                                     int *capable);
+/*
+ * Usernames are a global key, so a lookup by name alone (login, registration, create conflicts and
+ * token resolution) finds a user of any tenant. Listing, reading on behalf of an administrator,
+ * updating and deleting are scoped to one tenant instead (NULL or empty means the default tenant):
+ * a user of another tenant is simply not found there, as Java's
+ * ManagementUserService.requireMutableUserInTenant has it.
+ */
 int st_storage_list_management_users(const char *path,
                                      const char *tenant_id,
                                      st_storage_management_user *users,
@@ -530,6 +542,10 @@ int st_storage_list_management_users(const char *path,
 int st_storage_get_management_user(const char *path,
                                    const char *username,
                                    st_storage_management_user *user);
+int st_storage_get_management_user_in_tenant(const char *path,
+                                             const char *tenant_id,
+                                             const char *username,
+                                             st_storage_management_user *user);
 /* Read-only lookup: 0 when found, 1 when there is no such user, -1 when the store cannot be read. */
 int st_storage_find_management_user(const char *path,
                                     const char *username,
@@ -541,13 +557,15 @@ int st_storage_create_management_user(const char *path,
                                       const char *role,
                                       int enabled,
                                       st_storage_management_user *out_user);
+/* -1 when the user is not in tenant_id, as when there is no such user at all. */
 int st_storage_update_management_user(const char *path,
+                                      const char *tenant_id,
                                       const char *username,
                                       const char *password_hash,
                                       const char *role,
                                       int enabled,
                                       st_storage_management_user *out_user);
-int st_storage_delete_management_user(const char *path, const char *username);
+int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username);
 int st_storage_management_email_exists(const char *path, const char *email);
 int st_storage_get_registration_challenge(const char *path,
                                           const char *registration_id,
@@ -777,6 +795,8 @@ int st_storage_list_http_routes(const char *path,
                                 size_t max_routes,
                                 size_t *route_count);
 int st_storage_get_http_route(const char *path, long long id, st_storage_http_route *route);
+/* -1 when the records could not be read; otherwise 0 with *found telling whether the route exists. */
+int st_storage_find_http_route_by_id(const char *path, long long id, st_storage_http_route *route, int *found);
 int st_storage_get_http_route_by_client_route(const char *path,
                                               const char *client_name,
                                               const char *route_name,
