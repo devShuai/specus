@@ -8298,6 +8298,35 @@ static char *admin_parse_user_path_username(const char *path)
     return admin_url_decode(cursor, len);
 }
 
+/*
+ * Updates and deletes look the target up inside the caller's tenant only, like Java's
+ * ManagementUserService.requireMutableUserInTenant: a user of another tenant answers exactly like
+ * one that does not exist, so a tenant administrator can neither change nor probe another tenant's
+ * users. The refused attempt is still logged for auditing, as Java does.
+ */
+static int write_management_user_not_found(const st_admin_context *context,
+                                           const char *action,
+                                           const char *target,
+                                           char *out,
+                                           size_t out_len)
+{
+    char safe_actor[512];
+    char safe_tenant[512];
+    char safe_target[512];
+    (void)st_admin_log_safe_reason(context->username, safe_actor, sizeof(safe_actor));
+    (void)st_admin_log_safe_reason(context->tenant_id, safe_tenant, sizeof(safe_tenant));
+    (void)st_admin_log_safe_reason(target, safe_target, sizeof(safe_target));
+    fprintf(stderr,
+            "[admin] management user %s refused: actor=%s tenant=%s target=%s "
+            "reason=not in the caller's tenant or missing\n",
+            action,
+            safe_actor,
+            safe_tenant,
+            safe_target);
+    fflush(stderr);
+    return write_response(out, out_len, 404, "Not Found", "{\"error\":\"user not found\"}");
+}
+
 static int handle_management_user_update(const st_admin_context *context,
                                          const char *path,
                                          const char *body,
@@ -8325,9 +8354,10 @@ static int handle_management_user_update(const st_admin_context *context,
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be updated\"}");
     }
     st_storage_management_user existing;
-    if (st_storage_get_management_user(database_path, username, &existing) != 0) {
+    if (st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username, &existing) != 0) {
+        int response_len = write_management_user_not_found(context, "update", username, out, out_len);
         free(username);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"user not found\"}");
+        return response_len;
     }
     char *password = st_json_get_string(body, "password");
     char *role = st_json_get_string(body, "role");
@@ -8346,6 +8376,7 @@ static int handle_management_user_update(const st_admin_context *context,
     }
     st_storage_management_user user;
     int rc = st_storage_update_management_user(database_path,
+                                               context->tenant_id,
                                                username,
                                                hash_ptr,
                                                role == NULL ? NULL : normalize_management_role(role),
@@ -8386,12 +8417,12 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
     }
-    int rc = st_storage_delete_management_user(database_path, username);
+    int rc = st_storage_delete_management_user(database_path, context->tenant_id, username);
+    int response_len = rc != 0
+        ? write_management_user_not_found(context, "delete", username, out, out_len)
+        : write_response(out, out_len, 204, "No Content", "");
     free(username);
-    if (rc != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"user not found\"}");
-    }
-    return write_response(out, out_len, 204, "No Content", "");
+    return response_len;
 }
 
 static int write_management_token_response(const char *username,
@@ -8503,6 +8534,7 @@ static int handle_management_auth_login(const char *body,
             if (ok) {
                 if (verification.needs_upgrade) {
                     (void)st_storage_update_management_user(database_path,
+                                                            user.tenant_id,
                                                             user.username,
                                                             verification.upgraded_hash,
                                                             NULL,
