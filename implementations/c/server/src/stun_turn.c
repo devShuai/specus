@@ -395,6 +395,25 @@ static int validate_integrity(const uint8_t *packet, size_t len, char username[1
     return st_constant_time_eq(mac, integrity.value, sizeof(mac)) ? 0 : -1;
 }
 
+/*
+ * RFC 5389 section 10.2.2 and Java StunTurnServer.authenticate: a request that names this realm
+ * and a user but carries a nonce other than the current one gets 438 with a fresh nonce, so the
+ * client retries once instead of treating its credential as wrong. Anything else stays 401.
+ */
+static int request_nonce_is_stale(const uint8_t *packet, size_t len)
+{
+    stun_attribute user;
+    stun_attribute realm;
+    stun_attribute nonce;
+    const char *current = st_turn_auth_nonce();
+    return find_attribute(packet, len, ATTR_USERNAME, &user) == 0 && user.length > 0U
+        && find_attribute(packet, len, ATTR_REALM, &realm) == 0
+        && realm.length == strlen(st_turn_auth_realm())
+        && memcmp(realm.value, st_turn_auth_realm(), realm.length) == 0
+        && find_attribute(packet, len, ATTR_NONCE, &nonce) == 0 && nonce.length > 0U
+        && (nonce.length != strlen(current) || memcmp(nonce.value, current, nonce.length) != 0);
+}
+
 static uint16_t stun_error_type(uint16_t request_type)
 {
     switch (request_type) {
@@ -514,11 +533,16 @@ static void close_stun_endpoints(st_stun_turn_server *server, int use_shutdown)
     if (!use_shutdown) server->endpoint_count = 0U;
 }
 
+/*
+ * An allocation whose lifetime has passed is gone even before the periodic sweep closes it, so a
+ * request that arrives in between is answered like Java and Go do (437) instead of reviving it.
+ */
 static turn_allocation *find_allocation_by_client(st_stun_turn_server *server,
                                                    const struct sockaddr_storage *client)
 {
+    time_t now = time(NULL);
     for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used
+        if (server->allocations[i].used && server->allocations[i].expires_at > now
             && sockaddr_equal(&server->allocations[i].client, client, 1)) return &server->allocations[i];
     }
     return NULL;
@@ -527,8 +551,9 @@ static turn_allocation *find_allocation_by_client(st_stun_turn_server *server,
 static turn_allocation *find_allocation_by_relay(st_stun_turn_server *server,
                                                   const struct sockaddr_storage *relay)
 {
+    time_t now = time(NULL);
     for (size_t i = 0; i < TURN_MAX_ALLOCATIONS; ++i) {
-        if (server->allocations[i].used
+        if (server->allocations[i].used && server->allocations[i].expires_at > now
             && sockaddr_equal(&server->allocations[i].relay, relay, 1)) return &server->allocations[i];
     }
     return NULL;
@@ -651,17 +676,36 @@ static void close_allocation(turn_allocation *allocation)
     allocation->relay_fd = -1;
 }
 
+static int ipv4_peer_relayable(uint32_t ip)
+{
+    return !((ip & 0xff000000U) == 0x7f000000U || (ip & 0xff000000U) == 0x0a000000U
+             || (ip & 0xfff00000U) == 0xac100000U || (ip & 0xffff0000U) == 0xc0a80000U
+             || (ip & 0xffff0000U) == 0xa9fe0000U || (ip & 0xf0000000U) == 0xe0000000U
+             || ip == 0U);
+}
+
+/*
+ * General relay destinations come from the browser, so only public unicast peers are allowed, as
+ * in Java isRelayableDestination: IPv6 unspecified, loopback, link-local, site-local, multicast
+ * and ULA (fc00::/7) are refused like their IPv4 counterparts, an IPv4-mapped address is judged
+ * as the IPv4 address it carries, and port 0 is never a valid peer.
+ */
 static int peer_address_allowed(st_stun_turn_server *server,
                                 const struct sockaddr_storage *peer)
 {
     if (server->allow_private_peers) return 1;
-    if (peer->ss_family != AF_INET) return peer->ss_family == AF_INET6;
-    uint32_t ip = ntohl(((const struct sockaddr_in *)peer)->sin_addr.s_addr);
-    if ((ip & 0xff000000U) == 0x7f000000U || (ip & 0xff000000U) == 0x0a000000U
-        || (ip & 0xfff00000U) == 0xac100000U || (ip & 0xffff0000U) == 0xc0a80000U
-        || (ip & 0xffff0000U) == 0xa9fe0000U || (ip & 0xf0000000U) == 0xe0000000U
-        || ip == 0U) return 0;
-    return 1;
+    if (peer->ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)peer;
+        return ipv4->sin_port != 0 && ipv4_peer_relayable(ntohl(ipv4->sin_addr.s_addr));
+    }
+    if (peer->ss_family != AF_INET6) return 0;
+    const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)peer;
+    const struct in6_addr *address = &ipv6->sin6_addr;
+    if (ipv6->sin6_port == 0) return 0;
+    if (IN6_IS_ADDR_V4MAPPED(address)) return ipv4_peer_relayable(read_u32(address->s6_addr + 12U));
+    return !IN6_IS_ADDR_UNSPECIFIED(address) && !IN6_IS_ADDR_LOOPBACK(address)
+        && !IN6_IS_ADDR_LINKLOCAL(address) && !IN6_IS_ADDR_SITELOCAL(address)
+        && !IN6_IS_ADDR_MULTICAST(address) && (address->s6_addr[0] & 0xfeU) != 0xfcU;
 }
 
 static turn_allocation *create_allocation(st_stun_turn_server *server,
@@ -772,6 +816,8 @@ static int bind_channel(turn_allocation *allocation,
                         int ttl)
 {
     turn_channel *slot = find_channel_by_number(allocation, number);
+    /* RFC 5766 section 11.2: a live channel number may only be refreshed for the same peer. */
+    if (slot != NULL && !sockaddr_equal(&slot->peer, peer, 1)) return -1;
     if (slot == NULL) {
         for (size_t i = 0; i < TURN_MAX_CHANNELS; ++i) {
             if (!allocation->channels[i].used) {
@@ -811,8 +857,10 @@ static int authenticate_request(st_stun_turn_server *server,
         return 0;
     }
     if (validate_integrity(packet, len, username) == 0) return 0;
+    int stale = request_nonce_is_stale(packet, len);
     stun_builder error;
-    builder_error(&error, read_u16(packet), packet + 8U, 401, "Unauthorized", 1);
+    builder_error(&error, read_u16(packet), packet + 8U,
+                  stale ? 438 : 401, stale ? "Stale Nonce" : "Unauthorized", 1);
     send_builder(fd, &error, client, client_len);
     return -1;
 }
@@ -1028,7 +1076,7 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         send_builder(fd, &error, client, client_len);
         return;
     }
-    int rc = add_permission(allocation, &peer, peer_len, server->permission_ttl);
+    int rc = 0;
     uint16_t success_type = TURN_CREATE_PERMISSION_SUCCESS;
     if (message_type == TURN_CHANNEL_BIND_REQUEST) {
         stun_attribute channel;
@@ -1038,6 +1086,8 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         else rc = bind_channel(allocation, number, &peer, peer_len, server->channel_ttl);
         success_type = TURN_CHANNEL_BIND_SUCCESS;
     }
+    /* A refused ChannelBind must not leave the permission it would have installed behind. */
+    if (rc == 0) rc = add_permission(allocation, &peer, peer_len, server->permission_ttl);
     stun_builder response;
     if (rc != 0) {
         builder_error(&response, message_type, packet + 8U, 400, "Bad Request", 0);

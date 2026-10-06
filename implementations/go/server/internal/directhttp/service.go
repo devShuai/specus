@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -101,6 +102,7 @@ type Service struct {
 	rewriter       responseRewriter
 	reconnectGrace time.Duration
 	routeCacheTTL  time.Duration
+	logger         *slog.Logger
 	routeCacheMu   sync.Mutex
 	routeCache     map[string]cachedRoutePolicy
 }
@@ -111,6 +113,9 @@ type cachedRoutePolicy struct {
 }
 
 func (s *Service) SetMediaCapture(opener OpenMediaCaptureFunc) { s.openMedia = opener }
+
+// SetLogger sets where server-side diagnostics such as client RST reasons are logged.
+func (s *Service) SetLogger(logger *slog.Logger) { s.logger = logger }
 
 func NewService(sessions *session.Registry, openStream OpenStreamFunc, openWS OpenWSStreamFunc,
 	timeout time.Duration, maxBodySize int, rewriteMaxBodyBytes int, traffic TrafficRecorder,
@@ -180,12 +185,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestHeaders := collectHeaders(r.Header, skippedHeaders, protected)
 	requestCapture := &limitedCapture{limit: detailCaptureBytes}
 
-	fail := func(status int, message string) {
+	failWithDetail := func(status int, message, detail string) {
 		writeTextError(w, status, message)
 		s.recordHTTPDetail(r.Context(), clientName, route, r.Method, path, r.URL.RawQuery,
-			requestHeaders, requestCapture.Bytes(), status, plainErrorHeaders(), []byte(message), message,
+			requestHeaders, requestCapture.Bytes(), status, plainErrorHeaders(), []byte(message), detail,
 			startedAt, r.RemoteAddr)
 	}
+	fail := func(status int, message string) { failWithDetail(status, message, message) }
 	if r.ContentLength > int64(s.maxBodySize) && s.maxBodySize >= 0 {
 		captureSize := min(detailCaptureBytes, s.maxBodySize+1)
 		if captureSize > 0 {
@@ -246,6 +252,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			fail(http.StatusGatewayTimeout, errTimeout.Error())
+			return
+		}
+		if reason, ok := s.logStreamReset(err, clientName, route, r.Method, startedAt); ok {
+			failWithDetail(http.StatusBadGateway, errForwardFailed.Error(), reason)
 			return
 		}
 		fail(http.StatusBadGateway, errorText(err))
@@ -323,8 +333,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data, endMetadata, end, readErr := stream.ReadResponse(r.Context())
 		if readErr != nil {
 			stream.Reset(3, "HTTP response stream failed")
+			reason, reset := s.logStreamReset(readErr, clientName, route, r.Method, startedAt)
 			if !responseStarted {
-				fail(http.StatusBadGateway, errorText(readErr))
+				if reset {
+					failWithDetail(http.StatusBadGateway, errForwardFailed.Error(), reason)
+				} else {
+					fail(http.StatusBadGateway, errorText(readErr))
+				}
 			}
 			return
 		}
@@ -790,9 +805,27 @@ func receivePumpResult(result <-chan error) error {
 
 func errorText(err error) string {
 	if err == nil || strings.TrimSpace(err.Error()) == "" {
-		return "HTTP 转发请求失败"
+		return errForwardFailed.Error()
 	}
 	return err.Error()
+}
+
+// logStreamReset logs the escaped, truncated reason of a client RST and returns it for the
+// admin traffic detail. The public response must use errForwardFailed instead of the reason.
+func (s *Service) logStreamReset(err error, clientName, route, method string,
+	startedAt time.Time) (string, bool) {
+	var reset *StreamResetError
+	if !errors.As(err, &reset) {
+		return "", false
+	}
+	reason := logSafeReason(reset.Reason)
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("http stream reset by client", "client", clientName, "route", route, "method", method,
+		"errorCode", reset.Code, "reason", reason, "elapsedMs", time.Since(startedAt).Milliseconds())
+	return reason, true
 }
 
 func writeBufferedWithoutCredit(w http.ResponseWriter, buffer *bytes.Buffer, capture *limitedCapture,

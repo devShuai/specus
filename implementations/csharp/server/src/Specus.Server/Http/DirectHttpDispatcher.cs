@@ -66,5 +66,19 @@ public sealed class DirectHttpSpecusException : Exception
         StatusCode = statusCode;
     }
 
+    public DirectHttpSpecusException(int statusCode, string message, string diagnostic,
+        Exception innerException)
+        : base(message, innerException)
+    {
+        StatusCode = statusCode;
+        Diagnostic = diagnostic;
+    }
+
     public int StatusCode { get; }
+
+    /// <summary>
+    /// Server-side failure detail for logs and the admin traffic record. <see cref="Exception.Message"/>
+    /// is the public response body and must not carry peer-supplied text.
+    /// </summary>
+    public string? Diagnostic { get; }
 }

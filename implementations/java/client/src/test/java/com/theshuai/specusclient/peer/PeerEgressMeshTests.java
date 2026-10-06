@@ -279,6 +279,36 @@ class PeerEgressMeshTests {
         }));
     }
 
+    /**
+     * Revisions count within one control session, and a restarted server numbers its pushes from 1
+     * again. The last session's revision held every push of the next one back until the count caught
+     * up, and the egress went on enforcing the policy it had before the restart (the peer egress lab,
+     * #42).
+     */
+    @Test
+    void aNewControlSessionTakesPushesNumberedAfresh() {
+        PeerEgressMesh wiring = newMesh();
+        wiring.applyEgressConfig(configFor(40, "198.51.100.0/24"));
+        wiring.newControlSession();
+        wiring.applyEgressConfig(configFor(1, "203.0.113.0/24"));
+
+        wiring.handleInboundFrame(7, synTo("203.0.113.10"));
+        waitFor("the SYN-ACK of the new session's policy", () -> frames().stream().anyMatch(raw -> {
+            PeerEgressFrame.Decoded frame = PeerEgressFrame.parse(raw);
+            return frame.accepted() && frame.type() == PeerEgressFrame.TYPE_IP_PACKET;
+        }));
+        assertTrue(frames().stream().noneMatch(raw -> PeerEgressFrame.parse(raw).type() == PeerEgressFrame.TYPE_CONTROL),
+                "the flow was refused under the previous session's policy");
+
+        // Within the session the guard holds as before.
+        wiring.applyEgressConfig(configFor(1, "198.51.100.0/24"));
+        wiring.handleInboundFrame(7, synTo("203.0.113.11"));
+        waitFor("a second SYN-ACK", () -> frames().stream().filter(raw ->
+                PeerEgressFrame.parse(raw).type() == PeerEgressFrame.TYPE_IP_PACKET).count() >= 2);
+        assertTrue(frames().stream().noneMatch(raw -> PeerEgressFrame.parse(raw).type() == PeerEgressFrame.TYPE_CONTROL),
+                "a replayed revision of the same session took effect");
+    }
+
     /** A message that is not an egress-config must not configure anything. */
     @Test
     void anUnreadableConfigChangesNothing() {

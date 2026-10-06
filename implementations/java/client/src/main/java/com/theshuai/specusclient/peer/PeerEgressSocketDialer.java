@@ -18,10 +18,9 @@ import java.nio.channels.SocketChannel;
  * sockets are NIO channels rather than {@code java.net.Socket} because a channel's handle can be
  * reached to bind it, and they are opened as IPv4 so the IPv4 option applies to them.
  *
- * <p>On Linux nothing is bound, which is recorded in {@code protocol/spec/peer-egress.md} under
- * current limitations: the forced-deny list refuses this node's own tunnel and virtual interface
- * networks before any connect, which covers the loop, but a Java egress on a node whose tunnel has
- * claimed the default route will send forwarded traffic into the tunnel.
+ * <p>On Linux nothing is bound. Each socket is marked instead, before it connects, for a policy
+ * routing rule to steer to the physical interface, as the Go and .NET egresses mark theirs. That
+ * one is best-effort; see {@link PeerEgressSocketBinder.Linux}.
  */
 final class PeerEgressSocketDialer implements PeerEgressRuntime.Dialer {
 

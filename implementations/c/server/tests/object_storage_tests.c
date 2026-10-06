@@ -4,18 +4,24 @@
 
 #include "admin_http.h"
 #include "json.h"
+#include "public_room.h"
 #include "security.h"
+#include "storage.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <pthread.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -990,6 +996,622 @@ static int test_capabilities_shared_vector(void)
     return failed ? -1 : 0;
 }
 
+/*
+ * Attachment negative paths, mirroring Java TransferAttachmentServiceTests through the module's
+ * request entry point. A local fake object store answers the HEAD and DELETE requests the server
+ * signs, and records which objects were deleted.
+ */
+
+#define ATT_REMOTE "198.51.100.7"
+#define ATT_ROOM "attachment-room"
+#define ATT_OWNER_TOKEN "attachment-room-owner-token"
+#define ATT_QUOTA_ROOM "attachment-quota-room"
+#define ATT_QUOTA_TOKEN "attachment-quota-owner-token"
+#define ATT_CALLBACK_ROOM "attachment-callback-room"
+#define ATT_CALLBACK_TOKEN "attachment-callback-owner-token"
+#define ATT_CALLBACK_PATH "/api/public/transfer/oss-callback"
+#define ATT_MAX_OBJECTS 32U
+#define ATT_STEP(expr) do { if (!failed && (expr) != 0) failed = 1; } while (0)
+
+typedef struct {
+    int listener;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    char keys[ATT_MAX_OBJECTS][256];
+    long long sizes[ATT_MAX_OBJECTS];
+    char deleted[ATT_MAX_OBJECTS][256];
+    size_t deleted_count;
+    int requests;
+} att_fake_oss;
+
+static att_fake_oss att_oss;
+static char att_db_path[96];
+
+static int att_oss_slot(const char *path)
+{
+    for (size_t i = 0; i < ATT_MAX_OBJECTS; ++i)
+        if (att_oss.keys[i][0] != '\0' && strcmp(att_oss.keys[i], path) == 0) return (int)i;
+    return -1;
+}
+
+/* Stores an object of the given size under "/<object key>", the path the server signs. */
+static void att_oss_put(const char *object_key, long long size)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/%s", object_key);
+    pthread_mutex_lock(&att_oss.lock);
+    int slot = att_oss_slot(path);
+    for (size_t i = 0; slot < 0 && i < ATT_MAX_OBJECTS; ++i)
+        if (att_oss.keys[i][0] == '\0') slot = (int)i;
+    if (slot >= 0) {
+        snprintf(att_oss.keys[slot], sizeof(att_oss.keys[slot]), "%s", path);
+        att_oss.sizes[slot] = size;
+    }
+    pthread_mutex_unlock(&att_oss.lock);
+}
+
+static int att_oss_deleted(const char *object_key)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/%s", object_key);
+    pthread_mutex_lock(&att_oss.lock);
+    int found = 0;
+    for (size_t i = 0; i < att_oss.deleted_count; ++i) found |= strcmp(att_oss.deleted[i], path) == 0;
+    found = found && att_oss_slot(path) < 0;
+    pthread_mutex_unlock(&att_oss.lock);
+    return found;
+}
+
+static int att_oss_requests(void)
+{
+    pthread_mutex_lock(&att_oss.lock);
+    int requests = att_oss.requests;
+    pthread_mutex_unlock(&att_oss.lock);
+    return requests;
+}
+
+static void att_oss_serve(int fd)
+{
+    char request[8192];
+    size_t len = 0U;
+    while (len + 1U < sizeof(request)) {
+        ssize_t got = recv(fd, request + len, sizeof(request) - 1U - len, 0);
+        if (got <= 0) break;
+        len += (size_t)got;
+        request[len] = '\0';
+        if (strstr(request, "\r\n\r\n") != NULL) break;
+    }
+    request[len] = '\0';
+    char method[16] = {0};
+    char target[1024] = {0};
+    if (sscanf(request, "%15s %1023s", method, target) != 2) return;
+    char *query = strchr(target, '?');
+    if (query != NULL) *query = '\0';
+    char reply[256];
+    snprintf(reply, sizeof(reply), "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    pthread_mutex_lock(&att_oss.lock);
+    ++att_oss.requests;
+    int slot = att_oss_slot(target);
+    if (strcmp(method, "HEAD") == 0) {
+        if (slot >= 0) snprintf(reply, sizeof(reply), "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nConnection: close\r\n\r\n",
+                                att_oss.sizes[slot]);
+        else snprintf(reply, sizeof(reply), "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if (strcmp(method, "DELETE") == 0) {
+        if (slot >= 0) att_oss.keys[slot][0] = '\0';
+        if (att_oss.deleted_count < ATT_MAX_OBJECTS)
+            snprintf(att_oss.deleted[att_oss.deleted_count++], sizeof(att_oss.deleted[0]), "%s", target);
+        snprintf(reply, sizeof(reply), "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+    }
+    pthread_mutex_unlock(&att_oss.lock);
+    (void)send(fd, reply, strlen(reply), MSG_NOSIGNAL);
+}
+
+static void *att_oss_thread(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        int fd = accept(att_oss.listener, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        struct timeval timeout = {2, 0};
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        att_oss_serve(fd);
+        close(fd);
+    }
+    return NULL;
+}
+
+static int att_oss_start(int *port)
+{
+    memset(&att_oss, 0, sizeof(att_oss));
+    pthread_mutex_init(&att_oss.lock, NULL);
+    att_oss.listener = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    if (att_oss.listener < 0 || bind(att_oss.listener, (struct sockaddr *)&address, sizeof(address)) != 0
+        || listen(att_oss.listener, 16) != 0
+        || getsockname(att_oss.listener, (struct sockaddr *)&address, &address_len) != 0
+        || pthread_create(&att_oss.thread, NULL, att_oss_thread, NULL) != 0) {
+        if (att_oss.listener >= 0) close(att_oss.listener);
+        return -1;
+    }
+    *port = ntohs(address.sin_port);
+    return 0;
+}
+
+static void att_oss_stop(void)
+{
+    (void)shutdown(att_oss.listener, SHUT_RDWR);
+    pthread_join(att_oss.thread, NULL);
+    close(att_oss.listener);
+    pthread_mutex_destroy(&att_oss.lock);
+}
+
+static int att_status(int len, const char *response)
+{
+    return len > 12 && strncmp(response, "HTTP/1.1 ", 9U) == 0 ? atoi(response + 9) : -1;
+}
+
+static int att_expect(int len, const char *response, int status, const char *needle, const char *label)
+{
+    int ok = att_status(len, response) == status && (needle == NULL || strstr(response, needle) != NULL);
+    if (!ok) fprintf(stderr, "%s: expected %d%s%s, got %s\n", label, status, needle == NULL ? "" : " with ",
+                     needle == NULL ? "" : needle, len > 0 ? response : "(none)");
+    return ok ? 0 : -1;
+}
+
+static int att_post(const char *path, const char *body, const st_object_storage_identity *identity,
+                    char *out, size_t out_len)
+{
+    return st_object_storage_build_response("POST", path, body, ATT_REMOTE, NULL, NULL, identity, out, out_len);
+}
+
+/* Presigns an upload; on 200 also returns the attachment ID and object key. */
+static int att_upload(const st_object_storage_identity *identity, const char *body, int status,
+                      const char *needle, long long *id, char key[256], const char *label)
+{
+    static const char public_path[] = "/api/public/transfer/attachments/presign-upload";
+    static const char admin_path[] = "/api/admin/client-messages/attachments/presign-upload";
+    char response[16384];
+    int len = att_post(strstr(body, "targetClientId") != NULL ? admin_path : public_path, body, identity,
+                       response, sizeof(response));
+    if (att_expect(len, response, status, needle, label) != 0) return -1;
+    if (status != 200) return 0;
+    const char *json = cap_body(response);
+    char *object_key = st_json_get_top_level_string(json, "objectKey");
+    int ok = object_key != NULL && strlen(object_key) < 256U && st_json_get_i64(json, "attachmentId", id) == 0;
+    if (ok) snprintf(key, 256U, "%s", object_key);
+    else fprintf(stderr, "%s: upload response without ID or key\n", label);
+    free(object_key);
+    return ok ? 0 : -1;
+}
+
+static int att_public_upload(const st_object_storage_identity *identity, const char *room, const char *token,
+                             long long size, int status, const char *needle, long long *id, char key[256],
+                             const char *label)
+{
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"fileName\":\"demo.txt\",\"mimeType\":\"text/plain\",\"sizeBytes\":%lld,"
+             "\"roomId\":\"%s\",\"roomToken\":\"%s\"}", size, room, token);
+    return att_upload(identity, body, status, needle, id, key, label);
+}
+
+/* POSTs {complete|presign-download} for an attachment in either scope. */
+static int att_action(const st_object_storage_identity *identity, int public_scope, long long id,
+                      const char *action, const char *room_token, int status, const char *needle,
+                      char *response, size_t response_len, const char *label)
+{
+    char path[160];
+    char body[256];
+    snprintf(path, sizeof(path), "%s%lld/%s", public_scope ? "/api/public/transfer/attachments/"
+             : "/api/admin/client-messages/attachments/", id, action);
+    snprintf(body, sizeof(body), "{\"roomToken\":\"%s\"}", room_token == NULL ? "" : room_token);
+    int len = att_post(path, room_token == NULL ? NULL : body, identity, response, response_len);
+    return att_expect(len, response, status, needle, label);
+}
+
+static int att_row(long long id, const char *status, long long size, const char *label)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int ok = sqlite3_open(att_db_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT status,size_bytes FROM transfer_attachment WHERE id=?", -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_bind_int64(stmt, 1, id) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW
+        && strcmp((const char *)sqlite3_column_text(stmt, 0), status) == 0
+        && sqlite3_column_int64(stmt, 1) == size;
+    sqlite3_finalize(stmt);
+    if (db != NULL) sqlite3_close(db);
+    if (!ok) fprintf(stderr, "%s: attachment %lld is not %s with %lld bytes\n", label, id, status, size);
+    return ok ? 0 : -1;
+}
+
+static long long att_count(const char *sql)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(att_db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    if (db != NULL) sqlite3_close(db);
+    return count;
+}
+
+static int att_room_token(const char *role, char out[128])
+{
+    char body[512];
+    char response[4096];
+    snprintf(body, sizeof(body), "{\"roomId\":\"%s\",\"roomToken\":\"%s\",\"role\":\"%s\"}",
+             ATT_ROOM, ATT_OWNER_TOKEN, role);
+    int len = st_public_room_build_response("POST", "/api/public/transfer/rooms/access-tokens", body,
+                                            ATT_REMOTE, response, sizeof(response));
+    char *token = att_status(len, response) == 200 ? st_json_get_top_level_string(cap_body(response), "token") : NULL;
+    int ok = token != NULL && strlen(token) < 128U;
+    if (ok) snprintf(out, 128U, "%s", token);
+    else fprintf(stderr, "room %s token creation failed: %s\n", role, len > 0 ? response : "(none)");
+    free(token);
+    return ok ? 0 : -1;
+}
+
+static char *att_base64(const unsigned char *data, size_t len)
+{
+    char *out = (char *)malloc(4U * ((len + 2U) / 3U) + 1U);
+    if (out != NULL) EVP_EncodeBlock((unsigned char *)out, data, (int)len);
+    return out;
+}
+
+static EVP_PKEY *att_callback_key(char **pem_out)
+{
+    EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    EVP_PKEY *key = NULL;
+    if (context == NULL || EVP_PKEY_keygen_init(context) <= 0
+        || EVP_PKEY_CTX_set_rsa_keygen_bits(context, 2048) <= 0 || EVP_PKEY_keygen(context, &key) <= 0) {
+        EVP_PKEY_CTX_free(context);
+        return NULL;
+    }
+    EVP_PKEY_CTX_free(context);
+    BIO *bio = BIO_new(BIO_s_mem());
+    char *data = NULL;
+    long len = bio != NULL && PEM_write_bio_PUBKEY(bio, key) == 1 ? BIO_get_mem_data(bio, &data) : -1;
+    *pem_out = len > 0 ? (char *)malloc((size_t)len + 1U) : NULL;
+    if (*pem_out != NULL) {
+        memcpy(*pem_out, data, (size_t)len);
+        (*pem_out)[len] = '\0';
+    }
+    BIO_free(bio);
+    if (*pem_out == NULL) {
+        EVP_PKEY_free(key);
+        return NULL;
+    }
+    return key;
+}
+
+/* OSS callback signature: base64(RSA-MD5(url_decode(path) + query + "\n" + body)). */
+static char *att_sign_callback(EVP_PKEY *key, const char *body)
+{
+    size_t signed_len = strlen(ATT_CALLBACK_PATH) + 1U + strlen(body);
+    char *text = (char *)malloc(signed_len + 1U);
+    EVP_MD_CTX *context = EVP_MD_CTX_new();
+    unsigned char *signature = NULL;
+    size_t signature_len = 0U;
+    char *encoded = NULL;
+    if (text != NULL) snprintf(text, signed_len + 1U, "%s\n%s", ATT_CALLBACK_PATH, body);
+    if (text != NULL && context != NULL && EVP_DigestSignInit(context, NULL, EVP_md5(), NULL, key) == 1
+        && EVP_DigestSignUpdate(context, text, signed_len) == 1
+        && EVP_DigestSignFinal(context, NULL, &signature_len) == 1
+        && (signature = (unsigned char *)malloc(signature_len)) != NULL
+        && EVP_DigestSignFinal(context, signature, &signature_len) == 1) {
+        encoded = att_base64(signature, signature_len);
+    }
+    EVP_MD_CTX_free(context);
+    free(signature);
+    free(text);
+    return encoded;
+}
+
+static int att_callback(const char *body, const char *authorization, const char *key_url,
+                        int status, const char *needle, const char *label)
+{
+    char response[4096];
+    int len = st_object_storage_build_response("POST", ATT_CALLBACK_PATH, body, ATT_REMOTE, authorization,
+                                               key_url, NULL, response, sizeof(response));
+    return att_expect(len, response, status, needle, label);
+}
+
+static int att_signed_callback(EVP_PKEY *key, const char *key_url, const char *bucket, const char *object_key,
+                               long long size, int status, const char *needle, const char *label)
+{
+    char body[512];
+    snprintf(body, sizeof(body), "{\"bucket\":\"%s\",\"object\":\"%s\",\"size\":%lld,\"mimeType\":\"text/plain\"}",
+             bucket, object_key, size);
+    char *signature = att_sign_callback(key, body);
+    int rc = signature == NULL ? -1 : att_callback(body, signature, key_url, status, needle, label);
+    free(signature);
+    return rc;
+}
+
+static int att_configure(int oss_port)
+{
+    char endpoint[96];
+    snprintf(endpoint, sizeof(endpoint), "http://oss-cn-hangzhou.aliyuncs.com:%d", oss_port);
+    snprintf(att_db_path, sizeof(att_db_path), "/tmp/specus_c_attachments_%ld.db", (long)getpid());
+    unlink(att_db_path);
+    cap_set_limits("100", "50", "64", NULL);
+    st_object_storage_reset_for_tests();
+    st_storage_client client;
+    return configure() != 0 || setenv("SPECUS_OBJECT_STORAGE_ENDPOINT", endpoint, 1) != 0
+        || setenv("SPECUS_OBJECT_STORAGE_TEST_RESOLVE_ADDRESS", "127.0.0.1", 1) != 0
+        || setenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL",
+                  "https://specus.example/api/public/transfer/oss-callback", 1) != 0
+        || setenv("SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "2", 1) != 0
+        || setenv("SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP", "1000", 1) != 0
+        || setenv("SPECUS_DATABASE_PATH", att_db_path, 1) != 0
+        || st_storage_init(att_db_path, 0) != 0
+        || st_storage_upsert_client(att_db_path, 0, "t1", "erin-device", "erin", 1, 60, &client) != 0
+        || st_storage_upsert_client(att_db_path, 0, "t1", "frank-device", "frank", 1, 60, &client) != 0
+        || st_object_storage_cleanup_expired() != 0
+        || cap_exec(att_db_path,
+               "INSERT INTO transfer_attachment(id,tenant_id,scope,owner_username,object_key,file_name,"
+               "mime_type,size_bytes,status,created_at,updated_at,upload_expires_at,expires_at) VALUES("
+               "9001,'t1','PUBLIC_TRANSFER','dave','prefix/seed/9001.bin','seed.bin','application/octet-stream',"
+               "50,'UPLOADED','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z',"
+               "'2999-01-01T00:00:00Z')") != 0 ? -1 : 0;
+}
+
+static void att_unconfigure(void)
+{
+    static const char *const names[] = {
+        "SPECUS_OBJECT_STORAGE_TEST_RESOLVE_ADDRESS", "SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL",
+        "SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP",
+        "SPECUS_DATABASE_PATH"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) unsetenv(names[i]);
+    cap_set_limits(NULL, NULL, NULL, NULL);
+    (void)st_object_storage_set_callback_key_for_tests(NULL);
+    st_object_storage_reset_for_tests();
+    unlink(att_db_path);
+    (void)configure();
+}
+
+static long long att_client_id(const char *name)
+{
+    st_storage_client client;
+    return st_storage_get_client_by_name(att_db_path, name, &client) == 0 ? client.id : -1;
+}
+
+/* Room roles, the room PENDING limit, HEAD verification at complete and both account quotas. */
+static int att_public_paths(void)
+{
+    const st_object_storage_identity alice = {"t1", "alice", 0, 1};
+    const st_object_storage_identity carol = {"t1", "carol", 0, 1};
+    const st_object_storage_identity dave = {"t1", "dave", 0, 1};
+    char viewer_token[128];
+    char response[16384];
+    char key1[256], key2[256], key3[256], ignored_key[256];
+    long long id1 = 0, id2 = 0, id3 = 0, ignored = 0;
+    char previous[8], month[8], next[8], resets_at[41];
+    int failed = 0;
+    ATT_STEP(cap_current_months(previous, month, next, resets_at));
+    ATT_STEP(att_public_upload(&alice, ATT_ROOM, ATT_OWNER_TOKEN, 10, 200, NULL, &id1, key1, "first upload"));
+    ATT_STEP(att_room_token("VIEWER", viewer_token));
+
+    /* A VIEWER credential resolves the room but must not upload (403, nothing reserved). */
+    long long rows = att_count("SELECT COUNT(*) FROM transfer_attachment");
+    ATT_STEP(att_public_upload(&carol, ATT_ROOM, viewer_token, 10, 403, NULL, &ignored, ignored_key, "VIEWER upload"));
+    if (!failed && att_count("SELECT COUNT(*) FROM transfer_attachment") != rows) {
+        fprintf(stderr, "a refused VIEWER upload reserved an attachment\n");
+        failed = 1;
+    }
+    /* Two PENDING uploads fill the room; a third is rate limited. */
+    ATT_STEP(att_public_upload(&alice, ATT_ROOM, ATT_OWNER_TOKEN, 10, 200, NULL, &id2, key2, "second upload"));
+    ATT_STEP(att_public_upload(&alice, ATT_ROOM, ATT_OWNER_TOKEN, 10, 429, "pending uploads", &ignored,
+                               ignored_key, "room PENDING limit"));
+    /* Complete without the object: refused, still PENDING, nothing deleted. */
+    ATT_STEP(att_action(&alice, 1, id1, "complete", ATT_OWNER_TOKEN, 409, "not uploaded", response,
+                        sizeof(response), "complete without object"));
+    ATT_STEP(att_row(id1, "PENDING", 10, "after complete without object"));
+    if (!failed && att_oss_deleted(key1)) {
+        fprintf(stderr, "a missing object was deleted\n");
+        failed = 1;
+    }
+    /* An object larger than max-attachment-bytes is deleted and the complete is refused. */
+    att_oss_put(key1, 65);
+    ATT_STEP(att_action(&alice, 1, id1, "complete", ATT_OWNER_TOKEN, 400, "too large", response,
+                        sizeof(response), "complete of an oversized object"));
+    ATT_STEP(att_row(id1, "PENDING", 10, "after oversized complete"));
+    if (!failed && !att_oss_deleted(key1)) {
+        fprintf(stderr, "the oversized object was not deleted\n");
+        failed = 1;
+    }
+    /* The actual HEAD size replaces the declared one. */
+    att_oss_put(key1, 9);
+    ATT_STEP(att_action(&alice, 1, id1, "complete", ATT_OWNER_TOKEN, 200, "\"sizeBytes\":9", response,
+                        sizeof(response), "complete with the actual size"));
+    ATT_STEP(att_row(id1, "UPLOADED", 9, "after complete"));
+    /* The limit counts PENDING only, so the room has room again. */
+    ATT_STEP(att_public_upload(&alice, ATT_ROOM, ATT_OWNER_TOKEN, 10, 200, NULL, &id3, key3, "upload after complete"));
+
+    /* VIEWER may not complete, but may download a finished attachment. */
+    ATT_STEP(att_action(&carol, 1, id2, "complete", viewer_token, 403, NULL, response, sizeof(response),
+                        "VIEWER complete"));
+    ATT_STEP(att_action(&carol, 1, id1, "presign-download", viewer_token, 200, "/api/public/transfer/downloads/",
+                        response, sizeof(response), "VIEWER download"));
+    char *grant = failed ? NULL : st_json_get_top_level_string(cap_body(response), "downloadUrl");
+    int len = grant == NULL ? -1 : st_object_storage_build_response("GET", grant, NULL, ATT_REMOTE, NULL, NULL,
+                                                                     NULL, response, sizeof(response));
+    ATT_STEP(att_expect(len, response, 302, "x-st-grant=", "first grant consume"));
+    free(grant);
+    /* Download quota (50): 9 charged so far, another grant passes the precheck at 18 bytes... */
+    ATT_STEP(att_action(&carol, 1, id1, "presign-download", viewer_token, 200, NULL, response, sizeof(response),
+                        "second download grant"));
+    grant = failed ? NULL : st_json_get_top_level_string(cap_body(response), "downloadUrl");
+    /* ...but if the month's usage grows to 44 first, consuming it would exceed the quota. */
+    char usage[512];
+    snprintf(usage, sizeof(usage),
+             "INSERT INTO transfer_attachment_download_usage(id,tenant_id,username,attachment_id,size_bytes,"
+             "usage_month,created_at) VALUES(9101,'t1','carol',9001,35,'%s','2000-01-01T00:00:00Z')", month);
+    ATT_STEP(cap_exec(att_db_path, usage));
+    len = grant == NULL ? -1 : st_object_storage_build_response("GET", grant, NULL, ATT_REMOTE, NULL, NULL,
+                                                                 NULL, response, sizeof(response));
+    ATT_STEP(att_expect(len, response, 429, "download quota", "grant consume over the download quota"));
+    free(grant);
+    if (!failed && att_count("SELECT COUNT(*) FROM transfer_attachment_download_grant WHERE consumed_at IS NOT NULL") != 1) {
+        fprintf(stderr, "a grant refused by the download quota was consumed\n");
+        failed = 1;
+    }
+    ATT_STEP(att_action(&carol, 1, id1, "presign-download", viewer_token, 429, "download quota", response,
+                        sizeof(response), "download grant over the download quota"));
+
+    /* Storage quota (100) for dave, who already stores 50 bytes. */
+    long long dave_id = 0;
+    char dave_key[256];
+    ATT_STEP(att_public_upload(&dave, ATT_QUOTA_ROOM, ATT_QUOTA_TOKEN, 65, 400, NULL, &ignored, ignored_key,
+                               "declared size over max-attachment-bytes"));
+    ATT_STEP(att_public_upload(&dave, ATT_QUOTA_ROOM, ATT_QUOTA_TOKEN, 51, 429, "storage quota", &ignored,
+                               ignored_key, "upload over the storage quota"));
+    ATT_STEP(att_public_upload(&dave, ATT_QUOTA_ROOM, ATT_QUOTA_TOKEN, 50, 200, NULL, &dave_id, dave_key,
+                               "upload filling the storage quota"));
+    ATT_STEP(att_public_upload(&dave, ATT_QUOTA_ROOM, ATT_QUOTA_TOKEN, 1, 429, "storage quota", &ignored,
+                               ignored_key, "upload past a full storage quota"));
+    /* The actual size (51) would exceed the quota at complete: the object is deleted. */
+    att_oss_put(dave_key, 51);
+    ATT_STEP(att_action(&dave, 1, dave_id, "complete", ATT_QUOTA_TOKEN, 429, "storage quota", response,
+                        sizeof(response), "complete over the storage quota"));
+    ATT_STEP(att_row(dave_id, "PENDING", 50, "after complete over the storage quota"));
+    if (!failed && !att_oss_deleted(dave_key)) {
+        fprintf(stderr, "the object over the storage quota was not deleted\n");
+        failed = 1;
+    }
+    return failed ? -1 : 0;
+}
+
+/* ADMIN_CLIENT_MESSAGE uploads: target access, tenant isolation and scope separation. */
+static int att_admin_paths(void)
+{
+    const st_object_storage_identity erin = {"t1", "erin", 0, 1};
+    const st_object_storage_identity frank = {"t1", "frank", 0, 1};
+    const st_object_storage_identity root = {"t1", "root", 1, 1};
+    const st_object_storage_identity stranger = {"t2", "erin", 0, 1};
+    long long erin_client = att_client_id("erin-device");
+    long long frank_client = att_client_id("frank-device");
+    char body[256], response[16384], key[256], ignored_key[256];
+    long long id = 0, ignored = 0;
+    int failed = erin_client <= 0 || frank_client <= 0;
+    snprintf(body, sizeof(body), "{\"fileName\":\"note.txt\",\"sizeBytes\":5,\"targetClientId\":%lld}", erin_client);
+    ATT_STEP(att_upload(&erin, body, 200, "/admin-client-message/", &id, key, "admin upload to own client"));
+    ATT_STEP(att_upload(&stranger, body, 400, NULL, &ignored, ignored_key, "admin upload from another tenant"));
+    ATT_STEP(att_upload(&erin, "{\"fileName\":\"note.txt\",\"sizeBytes\":5,\"targetClientId\":0}", 400, NULL,
+                        &ignored, ignored_key, "admin upload without a target"));
+    snprintf(body, sizeof(body), "{\"fileName\":\"note.txt\",\"sizeBytes\":5,\"targetClientId\":%lld}", frank_client);
+    ATT_STEP(att_upload(&erin, body, 400, NULL, &ignored, ignored_key, "admin upload to another owner's client"));
+    ATT_STEP(att_upload(&root, body, 200, NULL, &ignored, ignored_key, "tenant administrator upload"));
+
+    /* Another owner or tenant gets 400, as for an unknown attachment (section 5, Java). */
+    ATT_STEP(att_action(&frank, 0, id, "complete", NULL, 400, NULL, response, sizeof(response),
+                        "admin complete by another owner"));
+    ATT_STEP(att_action(&stranger, 0, id, "complete", NULL, 400, NULL, response, sizeof(response),
+                        "admin complete from another tenant"));
+    ATT_STEP(att_action(&erin, 0, id, "complete", NULL, 409, "not uploaded", response, sizeof(response),
+                        "admin complete without object"));
+    att_oss_put(key, 5);
+    ATT_STEP(att_action(&erin, 0, id, "complete", NULL, 200, "\"status\":\"UPLOADED\"", response, sizeof(response),
+                        "admin complete"));
+    ATT_STEP(att_action(&erin, 0, id, "presign-download", NULL, 200, "/api/public/transfer/downloads/", response,
+                        sizeof(response), "admin download"));
+    ATT_STEP(att_action(&frank, 0, id, "presign-download", NULL, 400, NULL, response, sizeof(response),
+                        "admin download by another owner"));
+    ATT_STEP(att_action(&root, 0, id, "presign-download", NULL, 200, NULL, response, sizeof(response),
+                        "admin download by the tenant administrator"));
+    /* Scopes never resolve each other's IDs, and an unknown ID is a bad request. */
+    ATT_STEP(att_action(&erin, 1, id, "complete", ATT_OWNER_TOKEN, 400, "not found", response, sizeof(response),
+                        "public complete of an admin attachment"));
+    ATT_STEP(att_action(&erin, 0, 1, "presign-download", NULL, 400, "not found", response, sizeof(response),
+                        "admin download of an unknown attachment"));
+    return failed ? -1 : 0;
+}
+
+/* POST /api/public/transfer/oss-callback: RSA-MD5 signature, key URL pinning and body checks. */
+static int att_callback_paths(void)
+{
+    const st_object_storage_identity alice = {"t1", "alice", 0, 1};
+    char *pem = NULL;
+    EVP_PKEY *key = att_callback_key(&pem);
+    static const char key_location[] = "http://gosspublic.alicdn.com/callback_pub_key_v1.pem";
+    static const char foreign_location[] = "https://keys.example/callback_pub_key_v1.pem";
+    char *key_url = att_base64((const unsigned char *)key_location, strlen(key_location));
+    char *foreign_url = att_base64((const unsigned char *)foreign_location, strlen(foreign_location));
+    char response[16384], key1[256], key2[256], body[512];
+    long long id1 = 0, id2 = 0;
+    int failed = key == NULL || key_url == NULL || foreign_url == NULL
+        || st_object_storage_set_callback_key_for_tests(pem) != 0;
+    ATT_STEP(att_public_upload(&alice, ATT_CALLBACK_ROOM, ATT_CALLBACK_TOKEN, 10, 200, NULL, &id1, key1,
+                               "callback upload"));
+    ATT_STEP(att_public_upload(&alice, ATT_CALLBACK_ROOM, ATT_CALLBACK_TOKEN, 10, 200, NULL, &id2, key2,
+                               "oversized callback upload"));
+    snprintf(body, sizeof(body), "{\"bucket\":\"examplebucket\",\"object\":\"%s\",\"size\":12}", key1);
+    char *signature = failed ? NULL : att_sign_callback(key, body);
+    failed = failed || signature == NULL;
+
+    /* Invalid signatures: none, one over another body, and a valid one under a foreign key URL. */
+    ATT_STEP(att_callback(body, NULL, key_url, 403, "signature", "callback without signature"));
+    char *other = failed ? NULL : att_sign_callback(key, "{\"bucket\":\"examplebucket\"}");
+    ATT_STEP(other == NULL ? -1 : att_callback(body, other, key_url, 403, "signature", "callback signed over another body"));
+    free(other);
+    ATT_STEP(att_callback(body, signature, foreign_url, 403, "signature", "callback key outside gosspublic"));
+    ATT_STEP(att_row(id1, "PENDING", 10, "after refused callbacks"));
+    /* A valid signature for another bucket or for an object the server never allocated. */
+    ATT_STEP(att_signed_callback(key, key_url, "otherbucket", key1, 12, 403, "bucket", "callback for another bucket"));
+    ATT_STEP(att_signed_callback(key, key_url, "examplebucket", "prefix/public-transfer/20260101/1/none.txt", 12,
+                                 400, "not allocated", "callback for an unallocated object"));
+    /* An oversized object reported by a valid callback is deleted and refused. */
+    ATT_STEP(att_signed_callback(key, key_url, "examplebucket", key2, 65, 400, "too large", "oversized callback"));
+    if (!failed && !att_oss_deleted(key2)) {
+        fprintf(stderr, "the oversized callback object was not deleted\n");
+        failed = 1;
+    }
+    ATT_STEP(att_row(id2, "PENDING", 10, "after oversized callback"));
+
+    /* A valid callback completes the upload with the signed size, without a HEAD request... */
+    int requests = att_oss_requests();
+    ATT_STEP(att_callback(body, signature, key_url, 200, "\"Status\":\"OK\"", "valid callback"));
+    ATT_STEP(att_row(id1, "UPLOADED", 12, "after valid callback"));
+    ATT_STEP(att_callback(body, signature, key_url, 200, "\"Status\":\"OK\"", "replayed callback"));
+    /* ...and the client's complete is idempotent on top of it. */
+    ATT_STEP(att_action(&alice, 1, id1, "complete", ATT_CALLBACK_TOKEN, 200, "\"sizeBytes\":12", response,
+                        sizeof(response), "complete after callback"));
+    if (!failed && att_oss_requests() != requests) {
+        fprintf(stderr, "a callback-completed upload was still verified with HEAD\n");
+        failed = 1;
+    }
+    /* Without a configured callback URL every callback is refused. */
+    unsetenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL");
+    ATT_STEP(att_callback(body, signature, key_url, 403, "signature", "callback with callbacks disabled"));
+    free(signature);
+    free(foreign_url);
+    free(key_url);
+    free(pem);
+    EVP_PKEY_free(key);
+    return failed ? -1 : 0;
+}
+
+static int test_attachment_negative_paths(void)
+{
+    int port = 0;
+    if (att_oss_start(&port) != 0) return -1;
+    int failed = att_configure(port) != 0;
+    if (failed) fprintf(stderr, "attachment fixture setup failed\n");
+    failed = failed || att_public_paths() != 0 || att_admin_paths() != 0 || att_callback_paths() != 0;
+    att_oss_stop();
+    att_unconfigure();
+    return failed ? -1 : 0;
+}
+
 int main(void)
 {
     snprintf(cap_db_path, sizeof(cap_db_path), "/tmp/specus_c_capabilities_%ld.db", (long)getpid());
@@ -1006,6 +1628,10 @@ int main(void)
         || test_capabilities_never_contacts_object_storage() != 0
         || test_capabilities_shared_vector() != 0) {
         fprintf(stderr, "transfer capability tests failed\n");
+        return 1;
+    }
+    if (test_attachment_negative_paths() != 0) {
+        fprintf(stderr, "attachment negative path tests failed\n");
         return 1;
     }
     puts("object storage tests passed");
