@@ -153,7 +153,7 @@ import time
 
 
 def request(port, method, path, body=None, token=None):
-    connection = http.client.HTTPConnection(sys_server_ip(), port, timeout=10)
+    connection = http.client.HTTPConnection(SERVER_IP, port, timeout=10)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -165,10 +165,6 @@ def request(port, method, path, body=None, token=None):
     finally:
         connection.close()
     return response.status, json.loads(payload) if payload else None
-
-
-def sys_server_ip():
-    return SERVER_IP
 
 
 def wait(what, probe, timeout):
@@ -208,7 +204,7 @@ def online_clients(port, token):
 
 def wait_client(port, token, expected_name, state):
     """Waits for one client to be online (state=online) or offline; with expected_name "-" it
-    waits for exactly one online client not listed in the known file and prints its name."""
+    waits for exactly one online client not among the known ones and prints its name."""
     want_online = state == "online"
 
     def probe():
@@ -258,8 +254,8 @@ def roster(config, peer_name, state, *command):
 
 
 def session(port, token, name_a, name_b, path_type, min_id):
-    """Waits for a Peer Mesh session between the two clients, newer than min_id, whose reported path
-    is path_type, and prints its id."""
+    """Waits for an ACTIVE Peer Mesh session between the two clients, newer than min_id, whose
+    reported path is path_type, and prints it."""
     pair = {name_a, name_b}
     last = {}
 
