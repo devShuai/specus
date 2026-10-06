@@ -48,13 +48,47 @@ class HttpRouteAuthenticationServiceTests {
     }
 
     @Test
-    void unmanagedRouteRemainsPublicForClientLocalCompatibility() {
-        when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 42L, "legacy"))
+    void routeWithoutServerRecordFailsClosed() {
+        when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 42L, "never-created"))
                 .thenReturn(Optional.empty());
 
-        assertThat(service.authorize("client-a", "legacy", null).outcome())
-                .isEqualTo(HttpRouteAuthenticationService.Outcome.PUBLIC);
-        assertThat(service.authorize("missing-client", "legacy", null).outcome())
+        assertThat(service.authorize("client-a", "never-created", null).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.NOT_FOUND);
+        assertThat(service.authorize("missing-client", "never-created", null).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.NOT_FOUND);
+    }
+
+    @Test
+    void deletedProtectedRouteIsNotFoundEvenWithoutCredentials() {
+        assertThat(service.authorize("client-a", "private", null).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.UNAUTHORIZED);
+
+        // The client may still forward "private" from its old route list; the server must not.
+        when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 42L, "private"))
+                .thenReturn(Optional.empty());
+
+        HttpRouteAuthenticationService.Decision deleted = service.authorize("client-a", "private", null);
+        assertThat(deleted.outcome()).isEqualTo(HttpRouteAuthenticationService.Outcome.NOT_FOUND);
+        assertThat(deleted.allowed()).isFalse();
+    }
+
+    @Test
+    void routesOfDisabledClientAreNotFound() {
+        account.setEnabled(false);
+        HttpRouteMapping open = new HttpRouteMapping();
+        open.setRoute("open");
+        open.setEnabled(true);
+        open.setAuthEnabled(false);
+        when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 42L, "open"))
+                .thenReturn(Optional.of(open));
+
+        assertThat(service.authorize("client-a", "open", null).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.NOT_FOUND);
+        assertThat(service.authorize("client-a", "private", basic("viewer", "secret:tail")).outcome())
+                .isEqualTo(HttpRouteAuthenticationService.Outcome.NOT_FOUND);
+
+        account.setEnabled(true);
+        assertThat(service.authorize("client-a", "open", null).outcome())
                 .isEqualTo(HttpRouteAuthenticationService.Outcome.PUBLIC);
     }
 
