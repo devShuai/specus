@@ -710,7 +710,33 @@ int main(void)
         unlink(path);
         return 1;
     }
-    if (st_storage_update_management_user(path, "ALICE", NULL, "ADMIN", 0, &created_user) != 0
+    /* Another tenant neither lists, reads, updates nor deletes alice, under any spelling. */
+    st_storage_management_user foreign_view;
+    if (st_storage_list_management_users(path, "tenant-other", users, 4, &user_count) != 0
+        || user_count != 0U
+        || st_storage_get_management_user_in_tenant(path, "tenant-other", "alice", &foreign_view) == 0
+        || st_storage_update_management_user(path, "tenant-other", "ALICE", "taken-over", "ADMIN", 0,
+                                             &foreign_view) == 0
+        || st_storage_delete_management_user(path, "tenant-other", "alice") == 0
+        || st_storage_get_management_user(path, "alice", &created_user) != 0
+        || strcmp(created_user.tenant_id, "default") != 0
+        || strcmp(created_user.password_hash, "hash-value") != 0
+        || strcmp(created_user.role, "USER") != 0
+        || created_user.enabled != 1) {
+        fprintf(stderr, "management user crossed its tenant\n");
+        unlink(path);
+        return 1;
+    }
+    /* No tenant is the default tenant, never "every tenant". */
+    if (st_storage_list_management_users(path, NULL, users, 4, &user_count) != 0
+        || user_count != 1U
+        || st_storage_get_management_user_in_tenant(path, "", "ALICE", &created_user) != 0
+        || strcmp(created_user.username, "alice") != 0) {
+        fprintf(stderr, "management user default tenant scope mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_update_management_user(path, "default", "ALICE", NULL, "ADMIN", 0, &created_user) != 0
         || strcmp(created_user.role, "ADMIN") != 0
         || strcmp(created_user.password_hash, "hash-value") != 0
         || created_user.enabled != 0) {
@@ -725,7 +751,7 @@ int main(void)
         unlink(path);
         return 1;
     }
-    if (st_storage_delete_management_user(path, "alice") != 0
+    if (st_storage_delete_management_user(path, "default", "alice") != 0
         || st_storage_get_management_user(path, "alice", &created_user) == 0) {
         fprintf(stderr, "management user delete mismatch\n");
         unlink(path);

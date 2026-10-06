@@ -2766,6 +2766,267 @@ static int test_admin_endpoint_contracts(void)
     return failed ? 1 : 0;
 }
 
+/* Like endpoint_call, with a request body. */
+static int tenant_scope_call(const char *method, const char *path, const char *username, const char *tenant,
+                             const char *role, const char *body, char *out, size_t out_len)
+{
+    char authorization[2300];
+    if (connection_events_bearer(username, tenant, role, authorization, sizeof(authorization)) != 0) {
+        return -1;
+    }
+    return st_admin_build_response_with_auth(method, path, authorization, body, out, out_len);
+}
+
+/* The fixture users are stored by connection_events_ensure_user and must still look exactly like that. */
+static int tenant_scope_user_unchanged(const char *database_path, const char *username, const char *tenant,
+                                       const char *role, const char *label)
+{
+    st_storage_management_user user;
+    int ok = st_storage_get_management_user(database_path, username, &user) == 0
+        && strcmp(user.tenant_id, tenant) == 0
+        && strcmp(user.role, role) == 0
+        && user.enabled
+        && strcmp(user.password_hash, "unused-password-hash") == 0;
+    if (!ok) fprintf(stderr, "%s: %s/%s was changed or removed\n", label, tenant, username);
+    return ok ? 0 : -1;
+}
+
+/*
+ * An administrator manages the users of its own tenant only. Like Java's
+ * ManagementUserService.requireMutableUserInTenant, the target is looked up inside the caller's
+ * tenant, so another tenant's user answers exactly like one that does not exist (404) and its row
+ * is left as it was; the built-in administrator belongs to its configured tenant and is scoped the
+ * same way. Credentials, TCP mappings, HTTP routes and peer services are resolved through their
+ * owning client or tenant and must answer another tenant's administrator the same way.
+ */
+static int test_tenant_scoped_admin_mutations(void)
+{
+    char db_path[256];
+    char path[160];
+    char response[32768];
+    char missing[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-tenant-scope-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-tenant-scope-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    const char *not_found = "{\"error\":\"user not found\"}";
+    const char *takeover = "{\"password\":\"taken-over\",\"role\":\"ADMIN\",\"enabled\":false}";
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("carol", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0
+        || connection_events_ensure_user("dave", "tenant-b", "USER") != 0;
+    if (failed) fprintf(stderr, "tenant scope fixture setup failed\n");
+    int len = 0;
+
+    /* Another tenant's user cannot be re-passworded, promoted, disabled or deleted, in any spelling. */
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", takeover,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "PUT of another tenant's user") != 0
+            || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER", "PUT of another tenant's user") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/%20DAVE%20", "root-a", "tenant-a", "ADMIN", takeover,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+                                 "PUT of another tenant's user, other spelling") != 0
+            || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
+                                           "PUT of another tenant's user, other spelling") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/root-b", "root-a", "tenant-a", "ADMIN",
+                                "{\"role\":\"USER\",\"enabled\":false}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+                                 "PUT of another tenant's administrator") != 0
+            || tenant_scope_user_unchanged(db_path, "root-b", "tenant-b", "ADMIN",
+                                           "PUT of another tenant's administrator") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("DELETE", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "DELETE of another tenant's user") != 0
+            || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER", "DELETE of another tenant's user") != 0;
+    }
+    /* Another tenant's user and a user nobody has are indistinguishable, byte for byte. */
+    if (!failed) {
+        int missing_len = tenant_scope_call("DELETE", "/api/admin/users/ghost", "root-a", "tenant-a", "ADMIN",
+                                            NULL, missing, sizeof(missing));
+        len = tenant_scope_call("DELETE", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = missing_len <= 0 || len != missing_len || strcmp(response, missing) != 0;
+        if (failed) fprintf(stderr, "another tenant's user answered unlike a missing one: %s / %s\n",
+                            len > 0 ? response : "(none)", missing_len > 0 ? missing : "(none)");
+        missing_len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/ghost", "root-a", "tenant-a",
+                                                      "ADMIN", takeover, missing, sizeof(missing));
+        len = failed ? -1 : tenant_scope_call("PUT", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN",
+                                              takeover, response, sizeof(response));
+        if (!failed && (missing_len <= 0 || len != missing_len || strcmp(response, missing) != 0)) {
+            fprintf(stderr, "another tenant's user was updated unlike a missing one: %s / %s\n",
+                    len > 0 ? response : "(none)", missing_len > 0 ? missing : "(none)");
+            failed = 1;
+        }
+    }
+    /* Reads: there is no single-user endpoint, and the list holds the caller's tenant only. */
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/users/dave", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "GET of another tenant's user") != 0
+            || contains(response, "tenant-b");
+        if (failed && len > 0) fprintf(stderr, "GET of another tenant's user leaked it: %s\n", response);
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/users", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"username\":\"carol\"", "tenant user list") != 0
+            || contains(response, "\"username\":\"dave\"") || contains(response, "\"username\":\"root-b\"")
+            || contains(response, "tenant-b");
+        if (failed && len > 0) fprintf(stderr, "tenant user list leaked another tenant: %s\n", response);
+    }
+    /* The built-in administrator's tenant is the default one; tenant-b is not its to manage. */
+    if (!failed) {
+        len = st_admin_build_response_with_body("PUT", "/api/admin/users/dave", takeover, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+                                 "built-in admin PUT of another tenant's user") != 0
+            || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
+                                           "built-in admin PUT of another tenant's user") != 0;
+    }
+    if (!failed) {
+        len = st_admin_build_response("DELETE", "/api/admin/users/dave", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found,
+                                 "built-in admin DELETE of another tenant's user") != 0
+            || tenant_scope_user_unchanged(db_path, "dave", "tenant-b", "USER",
+                                           "built-in admin DELETE of another tenant's user") != 0;
+    }
+    /* An ordinary user manages no one, not even inside its tenant. */
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/carol", "carol", "tenant-a", "USER",
+                                "{\"role\":\"ADMIN\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 403 ", NULL, "ordinary user PUT") != 0
+            || tenant_scope_user_unchanged(db_path, "carol", "tenant-a", "USER", "ordinary user PUT") != 0;
+    }
+    /* Inside their own tenants both administrators still manage their users. */
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/carol", "root-a", "tenant-a", "ADMIN",
+                                "{\"role\":\"ADMIN\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"tenantId\":\"tenant-a\"", "own tenant PUT") != 0
+            || !contains(response, "\"role\":\"ADMIN\"");
+    }
+    if (!failed) {
+        st_storage_management_user gone;
+        len = tenant_scope_call("DELETE", "/api/admin/users/carol", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "own tenant DELETE") != 0
+            || st_storage_get_management_user(db_path, "carol", &gone) == 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
+                                "{\"enabled\":false}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
+                                              NULL, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0;
+    }
+
+    /* Tenant-b's credential, mapping, route and peer service, as tenant-a's administrator sees them. */
+    st_storage_client bravo;
+    st_storage_client_credential credential;
+    st_storage_mapping mapping;
+    st_storage_http_route route;
+    st_storage_peer_mesh_service definition;
+    st_storage_peer_mesh_service service;
+    memset(&bravo, 0, sizeof(bravo));
+    memset(&credential, 0, sizeof(credential));
+    memset(&mapping, 0, sizeof(mapping));
+    memset(&route, 0, sizeof(route));
+    memset(&definition, 0, sizeof(definition));
+    memset(&service, 0, sizeof(service));
+    if (!failed) {
+        failed = st_storage_upsert_client(db_path, 0, "tenant-b", "scope-bravo", "root-b", 1, 60, &bravo) != 0
+            || st_storage_upsert_client_credential(db_path, 0, "tenant-b", "root-b", "ck-scope-bravo",
+                   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1, 3, &credential) != 0
+            || st_storage_create_mapping_for_client(db_path, bravo.id, 18090, "127.0.0.1", 8090, 1, 0, &mapping) != 0
+            || st_storage_create_http_route_for_client(db_path, bravo.id, "scope-api", "http://127.0.0.1:8090",
+                                                       1, 0, 0, 0, 0, 0, NULL, NULL, &route) != 0;
+        if (!failed) {
+            snprintf(definition.tenant_id, sizeof(definition.tenant_id), "tenant-b");
+            definition.client_id = bravo.id;
+            snprintf(definition.client_name, sizeof(definition.client_name), "%s", bravo.client_name);
+            snprintf(definition.service_id, sizeof(definition.service_id), "svc-scope-bravo");
+            snprintf(definition.name, sizeof(definition.name), "bravo-ssh");
+            snprintf(definition.transport, sizeof(definition.transport), "tcp");
+            snprintf(definition.application, sizeof(definition.application), "ssh");
+            snprintf(definition.target_host, sizeof(definition.target_host), "127.0.0.1");
+            definition.target_port = 22;
+            definition.published_port = 2222;
+            definition.enabled = 1;
+            snprintf(definition.visibility, sizeof(definition.visibility), "OWNER");
+            failed = st_storage_upsert_peer_mesh_service(db_path, &definition, &service) != 0;
+        }
+        if (failed) fprintf(stderr, "tenant scope resource fixture setup failed\n");
+    }
+    struct {
+        const char *prefix;
+        long long id;
+        const char *body;
+        const char *label;
+    } resources[] = {
+        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential"},
+        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping"},
+        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route"},
+        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service"},
+    };
+    resources[0].id = credential.id;
+    resources[1].id = mapping.id;
+    resources[2].id = route.id;
+    resources[3].id = service.id;
+    for (size_t i = 0; !failed && i < sizeof(resources) / sizeof(resources[0]); ++i) {
+        char label[96];
+        snprintf(path, sizeof(path), "%s%lld", resources[i].prefix, resources[i].id);
+        snprintf(label, sizeof(label), "PUT of another tenant's %s", resources[i].label);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN", resources[i].body,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        snprintf(label, sizeof(label), "DELETE of another tenant's %s", resources[i].label);
+        len = failed ? -1 : tenant_scope_call("DELETE", path, "root-a", "tenant-a", "ADMIN", NULL,
+                                              response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+    }
+    if (!failed) {
+        st_storage_client_credential stored_credential;
+        st_storage_mapping stored_mapping;
+        st_storage_http_route stored_route;
+        st_storage_peer_mesh_service stored_service;
+        failed = st_storage_get_client_credential(db_path, credential.id, &stored_credential) != 0
+            || !stored_credential.enabled
+            || strcmp(stored_credential.secret_hash, credential.secret_hash) != 0
+            || st_storage_get_mapping(db_path, mapping.id, &stored_mapping) != 0
+            || stored_mapping.target_port != 8090
+            || st_storage_get_http_route(db_path, route.id, &stored_route) != 0
+            || strcmp(stored_route.target_base_url, "http://127.0.0.1:8090") != 0
+            || st_storage_get_peer_mesh_service_visible(db_path, service.id, "tenant-b", "", 1,
+                                                        &stored_service) != 0
+            || strcmp(stored_service.name, "bravo-ssh") != 0
+            || !stored_service.enabled;
+        if (failed) fprintf(stderr, "another tenant's administrator changed tenant-b resources\n");
+    }
+    /* The fixture is real: tenant-b's own administrator reaches every one of them. */
+    for (size_t i = 0; !failed && i < sizeof(resources) / sizeof(resources[0]); ++i) {
+        char label[96];
+        snprintf(path, sizeof(path), "%s%lld", resources[i].prefix, resources[i].id);
+        snprintf(label, sizeof(label), "own tenant DELETE of the %s", resources[i].label);
+        len = tenant_scope_call("DELETE", path, "root-b", "tenant-b", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, label) != 0;
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -5981,6 +6242,9 @@ int main(void)
         return 1;
     }
     if (test_admin_endpoint_contracts() != 0) {
+        return 1;
+    }
+    if (test_tenant_scoped_admin_mutations() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");
