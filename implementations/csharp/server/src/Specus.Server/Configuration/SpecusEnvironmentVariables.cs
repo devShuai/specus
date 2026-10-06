@@ -191,6 +191,15 @@ public static class SpecusEnvironmentVariables
         }
 
         if (parts.Length >= 2
+            && parts[0].Equals("PRODUCT", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("METRICS", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts.Length == 2
+                ? "Specus:ProductMetrics"
+                : $"Specus:ProductMetrics:{ToPascal(parts[2..])}";
+        }
+
+        if (parts.Length >= 2
             && parts[0].Equals("PUBLIC", StringComparison.OrdinalIgnoreCase)
             && parts[1].Equals("TRANSFER", StringComparison.OrdinalIgnoreCase))
         {

@@ -61,6 +61,10 @@ SQLite、PostgreSQL、MySQL 都有对应的 `AddClientMessagingAndTransfer` migr
 密钥派生的 HMAC-SHA256 摘要。SQLite、PostgreSQL、MySQL 三套迁移和快照保持同步。
 Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补齐，缺省 `OUTBOUND`；启动兼容 SQL
 也会为旧库幂等补列并回填空值，保证正向/反向 ACL 判定可直接使用。
+`AddProductMetrics` 增加可选产品指标（protocol/spec/product-metrics.md）的四张表：`product_metrics_switch`、
+`product_metrics_onboarding_progress`、`product_metrics_onboarding_daily`、`product_metrics_transfer_daily`。
+时间列是 epoch 毫秒，日期列是 UTC `yyyy-MM-dd` 文本，计数表没有任何用户列；表名与列名和 Go、Java、C 服务端一致，
+启动兼容 SQL 也会幂等建表。三套迁移和快照保持同步。
 
 Provider-specific EF migrations for these tables are committed for SQLite, PostgreSQL, and MySQL.
 Runtime startup also creates the tables and Java-aligned query indexes idempotently so deployments

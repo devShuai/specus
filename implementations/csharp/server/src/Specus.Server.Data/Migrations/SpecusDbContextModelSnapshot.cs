@@ -2027,6 +2027,145 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("peer_mesh_shared_service", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsOnboardingDaily", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("CohortDay")
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("cohort_day");
+
+                    b.Property<string>("ReachedStep")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("reached_step");
+
+                    b.Property<string>("DurationBucket")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("duration_bucket");
+
+                    b.Property<long>("Users")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("users");
+
+                    b.HasKey("TenantId", "CohortDay", "ReachedStep", "DurationBucket");
+
+                    b.ToTable("product_metrics_onboarding_daily", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsOnboardingProgress", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.Property<long?>("ClientOnlineAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_online_at");
+
+                    b.Property<long?>("CredentialCreatedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("credential_created_at");
+
+                    b.Property<long?>("SignedInAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("signed_in_at");
+
+                    b.Property<long>("StartedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("started_at");
+
+                    b.HasKey("TenantId", "Username");
+
+                    b.ToTable("product_metrics_onboarding_progress", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsSwitch", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<long?>("PurgedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("purged_at");
+
+                    b.Property<long?>("UpdatedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("TenantId");
+
+                    b.ToTable("product_metrics_switch", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsTransferDaily", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Day")
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("day");
+
+                    b.Property<string>("Mode")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("mode");
+
+                    b.Property<string>("Path")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("path");
+
+                    b.Property<string>("SizeBucket")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("size_bucket");
+
+                    b.Property<string>("Attempt")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("attempt");
+
+                    b.Property<string>("Outcome")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("outcome");
+
+                    b.Property<long>("Count")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("count");
+
+                    b.HasKey("TenantId", "Day", "Mode", "Path", "SizeBucket", "Attempt", "Outcome");
+
+                    b.ToTable("product_metrics_transfer_daily", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferDiagramVersion", b =>
                 {
                     b.Property<long>("Id")

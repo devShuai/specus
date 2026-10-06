@@ -10,6 +10,7 @@ using Specus.Server.Http;
 using Specus.Server.Management;
 using Specus.Server.Nat;
 using Specus.Server.PeerMesh;
+using Specus.Server.ProductMetrics;
 using Specus.Server.Security;
 using Specus.Server.Services;
 using Specus.Server.Sessions;
@@ -56,6 +57,8 @@ builder.Services.Configure<OidcOptions>(
     builder.Configuration.GetSection(OidcOptions.SectionName));
 builder.Services.Configure<TlsOptions>(
     builder.Configuration.GetSection(TlsOptions.SectionName));
+builder.Services.Configure<ProductMetricsOptions>(
+    builder.Configuration.GetSection(ProductMetricsOptions.SectionName));
 
 builder.WebHost.ConfigureKestrel((context, kestrel) =>
 {
@@ -182,6 +185,10 @@ builder.Services.AddSingleton<ConnectivityCheckAdmission>();
 builder.Services.AddSingleton<IConnectivityDeviceGateway, NatConnectivityDeviceGateway>();
 builder.Services.AddScoped<IConnectivityRouteSource, DbConnectivityRouteSource>();
 builder.Services.AddScoped<ConnectivityCheckService>();
+builder.Services.AddSingleton<ProductMetricsClock>();
+builder.Services.AddSingleton<ProductMetricsRateLimiter>();
+builder.Services.AddSingleton<ProductMetricsService>();
+builder.Services.AddHostedService<ProductMetricsSweepService>();
 builder.Services.AddSingleton<ConnectionEventsHub>();
 builder.Services.AddSingleton<ClientMessagesHub>();
 builder.Services.AddSingleton<PublicTransferDiscoveryHub>();
@@ -225,6 +232,7 @@ using (var scope = app.Services.CreateScope())
 
 app.UseManagementSecurityHeaders();
 app.UseAdminApiExceptionHandling();
+app.UseProductMetricsNoStore();
 app.UseAdminApiAuthentication();
 app.UseWebSockets();
 
@@ -235,6 +243,7 @@ app.MapStaticAssets();
 
 app.MapAdminApi();
 app.MapClientAuthApi();
+app.MapProductMetricsApi();
 app.MapTransferAttachmentApi();
 app.MapHttpMediaApi();
 app.MapWebSocketTicketApi();
