@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 
+#include "connectivity_check.h"
 #include "protocol.h"
 #include "storage.h"
 
@@ -185,6 +186,12 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+/*
+ * The device side of POST /api/admin/http-routes/{id}/connectivity-check: presence and the probe
+ * through the client's data connection (service-connectivity-check.md). Without it the endpoint
+ * answers 503 CHECK_UNAVAILABLE. Replaces any earlier device and its rate-limit state.
+ */
+void st_admin_set_connectivity_device(const st_connectivity_device *device);
 int st_admin_deliver_client_message_to_admin(const char *tenant_id,
                                              const char *from_client_name,
                                              const char *to_admin_name,

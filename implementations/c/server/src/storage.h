@@ -153,6 +153,11 @@ typedef struct {
     int client_egress_version;
     /* domainTargetCapable as declared at login; 0 when absent or when the version is 0. */
     int client_egress_domain_targets;
+    /*
+     * environment.clientHttpRouteCapabilities.version; from 1 the client classifies an HTTP stream
+     * RST in metadata.failure, which the connectivity check trusts only then.
+     */
+    int client_http_route_version;
 } st_storage_client_session;
 
 typedef struct {
@@ -773,6 +778,8 @@ int st_storage_list_http_routes(const char *path,
                                 size_t max_routes,
                                 size_t *route_count);
 int st_storage_get_http_route(const char *path, long long id, st_storage_http_route *route);
+/* -1 when the records could not be read; otherwise 0 with *found telling whether the route exists. */
+int st_storage_find_http_route_by_id(const char *path, long long id, st_storage_http_route *route, int *found);
 int st_storage_get_http_route_by_client_route(const char *path,
                                               const char *client_name,
                                               const char *route_name,

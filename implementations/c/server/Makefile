@@ -4,11 +4,12 @@ CPPFLAGS ?= -Isrc
 LDFLAGS ?= -lpthread -lz -lsqlite3 -lssl -lcrypto -lcurl -lhiredis -lutf8proc
 
 BUILD_DIR := build
-CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/turn_auth.o
+CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/turn_auth.o
 SERVER := $(BUILD_DIR)/specus-server-c
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
+CONNECTIVITY_CHECK_TESTS := $(BUILD_DIR)/specus_c_connectivity_check_tests
 CRYPTO_TESTS := $(BUILD_DIR)/specus_c_crypto_tests
 DECOMPRESSION_LIMITS_TESTS := $(BUILD_DIR)/specus_c_decompression_limits_tests
 ELASTICSEARCH_TRAFFIC_TESTS := $(BUILD_DIR)/specus_c_elasticsearch_traffic_tests
@@ -29,7 +30,7 @@ SESSION_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_session_lifecycle_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
 TLS_TRANSPORT_TESTS := $(BUILD_DIR)/specus_c_tls_transport_tests
-TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS)
+TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS)
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS)
 
 .PHONY: all test release clean
@@ -83,6 +84,9 @@ $(OBJECT_STORAGE_TESTS): $(CORE_OBJS) tests/object_storage_tests.c | $(BUILD_DIR
 
 $(PASSWORD_HASH_TESTS): $(CORE_OBJS) tests/password_hash_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/password_hash_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_CHECK_TESTS): $(CORE_OBJS) tests/connectivity_check_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_check_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PEER_EGRESS_TESTS): $(CORE_OBJS) tests/peer_egress_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_egress_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@

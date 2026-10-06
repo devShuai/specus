@@ -2525,6 +2525,148 @@ static int test_admin_endpoint_contracts(void)
     return failed ? 1 : 0;
 }
 
+/* The connectivity check device for the endpoint test: online and refused by its target, or offline. */
+static int connectivity_test_online;
+
+static void connectivity_test_presence(void *ctx, const char *client_name, int *control_online, int *data_online)
+{
+    (void)ctx;
+    (void)client_name;
+    *control_online = connectivity_test_online;
+    *data_online = connectivity_test_online;
+}
+
+static void connectivity_test_probe(void *ctx, const char *client_name, const char *metadata_json,
+                                    long long timeout_ms, st_connectivity_probe_answer *answer)
+{
+    (void)ctx;
+    (void)client_name;
+    (void)metadata_json;
+    (void)timeout_ms;
+    memset(answer, 0, sizeof(*answer));
+    answer->kind = ST_CONNECTIVITY_PROBE_RESET;
+    answer->capability = 1;
+    snprintf(answer->failure, sizeof(answer->failure), "connect-refused");
+}
+
+static void connectivity_test_log(void *ctx, const char *line)
+{
+    (void)ctx;
+    (void)line;
+}
+
+static int connectivity_call(const char *path, const char *username, const char *tenant, const char *role,
+                             const char *body, char *out, size_t out_len)
+{
+    char authorization[2300];
+    if (username != NULL
+        && connection_events_bearer(username, tenant, role, authorization, sizeof(authorization)) != 0) {
+        return -1;
+    }
+    return st_admin_build_response_with_auth("POST", path, username == NULL ? NULL : authorization, body,
+                                             out, out_len);
+}
+
+/*
+ * POST /api/admin/http-routes/{id}/connectivity-check: unknown, foreign and not-owned routes all
+ * answer the same 404, the body is checked first, every answer is private and uncacheable, and a
+ * result never names the target.
+ */
+static int test_connectivity_check_endpoint(void)
+{
+    char db_path[256];
+    char path[160];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-connectivity-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-admin-endpoint-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    st_storage_client alpha, bravo, charlie;
+    st_storage_http_route offline_route, refused_route;
+    int failed = st_storage_init(db_path, 0) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "check-alpha", "alice", 1, 60, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "check-bravo", "bob", 1, 60, &bravo) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "check-charlie", "alice", 1, 60, &charlie) != 0
+        || st_storage_create_http_route_for_client(db_path, alpha.id, "offline", "http://10.20.30.40:8080/base",
+                                                   1, 0, 0, 0, 0, 0, "", "", &offline_route) != 0
+        || st_storage_create_http_route_for_client(db_path, alpha.id, "refused", "http://10.20.30.40:9/",
+                                                   1, 0, 0, 0, 0, 0, "", "", &refused_route) != 0;
+    if (failed) fprintf(stderr, "connectivity fixture setup failed\n");
+    st_connectivity_device device = {connectivity_test_presence, connectivity_test_probe, NULL,
+                                     connectivity_test_log, NULL};
+    st_admin_set_connectivity_device(&device);
+    connectivity_test_online = 0;
+    int len = 0;
+    const char *not_found = "{\"code\":\"CHECK_TARGET_NOT_FOUND\"}";
+
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/connectivity-check", offline_route.id);
+    if (!failed) {
+        len = connectivity_call(path, NULL, NULL, NULL, "{}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", "Cache-Control: private, no-store",
+                                 "connectivity check without token") != 0;
+    }
+    if (!failed) {
+        len = connectivity_call(path, "alice", "tenant-a", "USER", "{\"path\":\"/../etc\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "{\"code\":\"CHECK_REQUEST_INVALID\"}",
+                                 "connectivity check invalid path") != 0;
+    }
+    if (!failed) {
+        len = connectivity_call(path, "alice", "tenant-a", "USER", "{\"tenantId\":\"tenant-b\"}", response,
+                                sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", NULL, "connectivity check unknown field") != 0;
+    }
+    /* Not the owner, another tenant's admin, an unknown id and a malformed id: one answer. */
+    if (!failed) {
+        len = connectivity_call(path, "bob", "tenant-a", "USER", "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "connectivity check not owner") != 0;
+    }
+    if (!failed) {
+        len = connectivity_call(path, "root", "tenant-b", "ADMIN", "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "connectivity check other tenant") != 0;
+    }
+    if (!failed) {
+        len = connectivity_call("/api/admin/http-routes/987654321/connectivity-check", "alice", "tenant-a", "USER",
+                                "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "connectivity check unknown route") != 0;
+    }
+    if (!failed) {
+        len = connectivity_call("/api/admin/http-routes/abc/connectivity-check", "alice", "tenant-a", "USER",
+                                "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", not_found, "connectivity check malformed id") != 0;
+    }
+    /* The owner's check of an offline device runs and stops at the device stage. */
+    if (!failed) {
+        len = connectivity_call(path, "alice", "tenant-a", "USER", "{\"path\":\"/healthz\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"code\":\"DEVICE_OFFLINE\"", "connectivity check offline") != 0
+            || endpoint_expect(len, response, "HTTP/1.1 200 ", "Cache-Control: private, no-store", "connectivity cache") != 0
+            || endpoint_expect(len, response, "HTTP/1.1 200 ", "\"stoppedAt\":\"device-online\"", "connectivity stage") != 0
+            || contains(response, "10.20.30.40") || contains(response, "healthz");
+    }
+    /* The route key is shared by every caller: an admin of the tenant waits as well. */
+    if (!failed) {
+        len = connectivity_call(path, "root", "tenant-a", "ADMIN", "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 429 ", "Retry-After: 10\r\n", "connectivity rate limit") != 0
+            || endpoint_expect(len, response, "HTTP/1.1 429 ", "{\"code\":\"CHECK_RATE_LIMITED\"}", "connectivity rate code") != 0;
+    }
+    /* A capable device's classified reset decides the target stage; nothing of its reason leaks. */
+    if (!failed) {
+        connectivity_test_online = 1;
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/connectivity-check", refused_route.id);
+        len = connectivity_call(path, "alice", "tenant-a", "USER", "", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"code\":\"TARGET_CONNECT_REFUSED\"",
+                                 "connectivity check refused target") != 0
+            || endpoint_expect(len, response, "HTTP/1.1 200 ", "\"requests\":[\"HEAD\"]", "connectivity requests") != 0;
+    }
+    st_admin_set_connectivity_device(NULL);
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    (void)bravo;
+    (void)charlie;
+    return failed ? 1 : 0;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -5685,6 +5827,9 @@ int main(void)
         return 1;
     }
     if (test_admin_endpoint_contracts() != 0) {
+        return 1;
+    }
+    if (test_connectivity_check_endpoint() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");
