@@ -309,6 +309,8 @@ static int peer_mesh_relay_tests(const struct sockaddr_in *server)
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(path);
     return failed;
+}
+
 /* ---- RFC 5766 / RFC 8656 behaviour beyond Allocate, CreatePermission and Send ------------- */
 
 #define STALE_NONCE "stale-nonce-from-a-previous-server-run"
