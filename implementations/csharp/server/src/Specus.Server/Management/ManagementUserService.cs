@@ -13,13 +13,15 @@ public sealed class ManagementUserService
 {
     private readonly SpecusDbContext _db;
     private readonly AuthOptions _auth;
+    private readonly HttpShareService _shares;
     private readonly ILogger<ManagementUserService>? _logger;
 
-    public ManagementUserService(SpecusDbContext db, IOptions<AuthOptions> auth,
+    public ManagementUserService(SpecusDbContext db, IOptions<AuthOptions> auth, HttpShareService shares,
         ILogger<ManagementUserService>? logger = null)
     {
         _db = db;
         _auth = auth.Value;
+        _shares = shares;
         _logger = logger;
     }
 
@@ -388,7 +390,18 @@ public sealed class ManagementUserService
             user.Enabled = request.Enabled.Value;
         }
         user.UpdatedAt = DateTimeOffset.UtcNow;
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        // Disabling a user or changing its role ends the shares it created that it could no longer
+        // create now, in the same transaction.
+        List<string> revokedShares;
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            revokedShares = await _shares.OnUserChangedAsync(context.Username, user.Username, user.TenantId,
+                cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        _shares.CutStreams(revokedShares);
         return ToView(user);
     }
 
@@ -409,8 +422,16 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("用户不存在: " + normalized);
         }
+        // The user's shares end with it: a share records its creator by name, and a later user of
+        // the same name must not inherit them.
+        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        var revokedShares = await _shares.OnUserChangedAsync(context.Username, user.Username, user.TenantId,
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _shares.CutStreams(revokedShares);
     }
 
     public static void RequireAdmin(ManagementContext context)

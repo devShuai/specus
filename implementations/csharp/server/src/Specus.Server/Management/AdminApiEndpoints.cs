@@ -672,6 +672,8 @@ public static class AdminApiEndpoints
                 return Results.NoContent();
             });
 
+        app.MapHttpShareApi();
+
         app.MapGet("/api/admin/connections",
             (long? clientId, bool? success, string? from, string? to, int? page, int? size,
                 HttpContext context, IOptions<AuthOptions> authOptions,

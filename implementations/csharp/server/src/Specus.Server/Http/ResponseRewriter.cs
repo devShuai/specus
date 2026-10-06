@@ -18,6 +18,19 @@ internal static partial class ResponseRewriter
     };
 
     public static bool TryRewrite(byte[] body, string clientName, string route, IReadOnlyList<string>? headers,
+        int maxBodyBytes, out byte[] rewritten) =>
+        TryRewriteWithPrefix(body, RoutePrefix(clientName, route), headers, maxBodyBytes, out rewritten);
+
+    /// <summary>The public prefix of a route: <c>/http/{clientName}/{route}</c>.</summary>
+    public static string RoutePrefix(string clientName, string route) =>
+        $"/http/{Uri.EscapeDataString(clientName)}/{Uri.EscapeDataString(route)}";
+
+    /// <summary>
+    /// Rewrites root-relative links under <paramref name="prefix"/>: the route's own prefix, or
+    /// <c>/http-share/{shareId}</c> for a temporary share so visitors never reach the route's
+    /// Basic-protected entry or learn the device and route names.
+    /// </summary>
+    public static bool TryRewriteWithPrefix(byte[] body, string prefix, IReadOnlyList<string>? headers,
         int maxBodyBytes, out byte[] rewritten)
     {
         rewritten = Array.Empty<byte>();
@@ -38,7 +51,6 @@ internal static partial class ResponseRewriter
             return false;
         }
 
-        var prefix = $"/http/{Uri.EscapeDataString(clientName)}/{Uri.EscapeDataString(route)}";
         var text = Encoding.UTF8.GetString(plain);
         var next = text;
         if (contentType.Equals("text/html", StringComparison.OrdinalIgnoreCase))
