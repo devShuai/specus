@@ -179,7 +179,10 @@ make -C implementations/c/server test
 **任务**：
 
 - HTTP `/api/client/auth/login` 按 `apiKey + timestamp + nonce + machineFingerprint + osUser` 验证
-  HMAC-SHA256，默认接受 `±60s`，并签发 `clientSessionId + accessToken`。
+  HMAC-SHA256，默认接受 `±60s`，并签发 `clientSessionId + accessToken`。签名通过后原子消费
+  `(apiKey, nonce)`，摘要保留 120 s（进程内有界存储，上限 65536，满时 503 而不驱逐），重放返回与 Java
+  相同的 `400 {"error":"客户端签名 nonce 已使用"}`；响应带 `nettyTls`（TLS 模式非 disabled 或
+  `SPECUS_TLS_TERMINATED_UPSTREAM=true`）。
 - 控制连接使用上述 runtime token 登录；SQLite 模式校验 session、客户端/凭证启用状态、过期时间、同机实例数
   和凭证最大在线数。仅无匹配数据库凭证时保留环境 token 兼容路径用于 smoke test。
 - 校验控制端口、client identity、session id 和 token/hash 配置；部分环境认证配置返回 `503`，不静默降级。
@@ -491,7 +494,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 | 管理页面 | 静态文件服务 + 浏览器手测/API E2E | 静态文件服务已接线；浏览器完整流程待验收 |
 | Direct HTTP | 协议/改写测试 + `direct_websocket_tests.c` + Java/Go/.NET client E2E | POST/path/query 与 WebSocket/SWS2 text/continuation/ping/pong/close 已通过；SWS2 中央向量全部样例重放与严格消息/关闭状态机（双向分片、控制帧穿插、两向 close 握手与终止态、超时、16 MiB 上限、RSV/opcode/close code/UTF-8 违规）由真实监听端口单测覆盖 |
 | OIDC | `admin_http_tests.c`（明文 HTTP mock token endpoint）+ `http_client_tests.c`（共用 HTTPS 客户端） | `/oidc-config` 形状、code 交换代理、未配置 503 已通过；共用 HTTPS 客户端的证书链/主机名/私有 CA 正反例已通过，但没有经 HTTPS token endpoint 的 OIDC 交换测试；Java 的 ID Token issuer/audience/nonce 校验、本地用户解析与本地 token 签发 C 未实现，无对应测试 |
-| TLS | `tls_transport_tests.c` | 部署门禁矩阵（prod 公网明文/未知环境/自签拒绝，dev 明文与自签、显式要求加密、受信 L4 终止的 loopback/私网放行与公网拒绝）、环境变量解析、socketpair 上的自签 TLS 1.2+ 往返、PKCS#12 bundle 加载已通过；PEM 证书/私钥加载没有测试，没有任何客户端连 C TLS listener 的 E2E |
+| TLS | `tls_transport_tests.c` + `tls_deployment_e2e.sh` + `tls_client_e2e.sh`（Java/Go/.NET client） | 单测：PKCS#12 装载、PEM（分离证书/私钥、链文件、合并 PEM keystore、加密私钥）装载并由校验链与主机名的 OpenSSL 客户端握手，错 CA/错主机名被拒，错私钥口令/不匹配私钥/缺私钥装载失败；自签握手。进程级：prod、未设或未知 `SPECUS_ENV`、`SPECUS_TLS_REQUIRE_ENCRYPTION` 下公网明文监听退出码 1 并输出拒绝原因、从不监听，上游终止声明配公网绑定/自签/缺私钥同样拒绝；PEM 监听由 `openssl s_client` 验证链与主机名。真实客户端：测试 CA 签发 `specus-c.test` 证书，登录返回 `nettyTls:true`，未配 TLS 的客户端跟随 `nettyTls` 走 TLS 并因不信任而失败，错 CA、错主机名被拒且无登录到达，正确 CA + `serverName` 时 control/data 经 TLS 登录并完成 256 KiB TCP 往返；Go 与自包含 .NET 已在 Ubuntu 24.04 WSL 通过，Java 由 CI 运行。未覆盖：PKCS#12/自签监听配真实客户端、公网 CA 生产证书、真实 L4 TLS 终止 |
 | 公共 ICE / 对象存储附件 | `admin_http_tests.c` + `object_storage_tests.c` + `object_storage_e2e.sh` | 内置 STUN/TURN 配置、临时 credential、storage-disabled 失败关闭；`aliyun-oss` provider 对本地 fake OSS 端点的公开互传 presign/直传/HEAD complete/download grant（302/410/HEAD 405）、presign 限流、下载计费与 capabilities 快照通过；签名向量、callback header 与过期清理由单测覆盖。管理端附件路径只测了未配置时的 `409`，真实私有 OSS 未验证 |
 | Elasticsearch 明细 | `elasticsearch_traffic_tests.c` + `elasticsearch_traffic_test.sh` | HTTP/TCP index 初始化、批量写入、分页查询与容量清理通过 fake ES 真实 HTTP 门禁 |
 | HTTP 媒体采集 | `media_capture_tests.c` + `media_capture_test.sh` | multipart、HLS/DASH/渐进式、Range 去重/拼接/稀疏回放/回源、ticket/manifest/asset 和过期清理通过 fake S3 门禁 |

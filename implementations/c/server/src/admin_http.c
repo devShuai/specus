@@ -3,6 +3,7 @@
 #include "admin_http.h"
 
 #include "client_address.h"
+#include "client_auth_nonce.h"
 #include "client_package.h"
 #include "crypto.h"
 #include "decompression_limits.h"
@@ -21,6 +22,7 @@
 #include "security.h"
 #include "security_baseline.h"
 #include "storage.h"
+#include "tls_transport.h"
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
@@ -733,6 +735,61 @@ static void admin_context_from_env(st_admin_context *context)
     context->authenticated = 1;
 }
 
+static const char *normalize_management_role(const char *role);
+
+/*
+ * A valid signature only says which account the token was issued to. Like Java's
+ * ManagementContextResolver (ManagementUserService.resolveLocalTokenUser) every request re-reads
+ * that account: the built-in admin must still be allowed to log in with its password, and a stored
+ * user must still exist, be enabled and belong to the token's tenant. Tenant, role and admin rights
+ * come from the record as it is now, so disabling, deleting or demoting a user takes effect on the
+ * next request rather than when the token expires. This is one SQLite read per authenticated
+ * request, the counterpart of Java's repository lookup; nothing is cached. Returns 0 when the
+ * account resolves, -1 when it does not, and -2 when the user store cannot be read.
+ */
+static int admin_resolve_token_user(const st_security_token_claims *claims, st_admin_context *context)
+{
+    memset(context, 0, sizeof(*context));
+    const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    if (admin_ascii_casecmp(claims->username, builtin_username) == 0
+        && (claims->tenant_id[0] == '\0' || admin_ascii_casecmp(claims->tenant_id, default_tenant) == 0)) {
+        if (!management_password_login_enabled()) {
+            return -1;
+        }
+        snprintf(context->username, sizeof(context->username), "%s", builtin_username);
+        snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", default_tenant);
+        snprintf(context->role, sizeof(context->role), "%s", "ADMIN");
+        context->admin = 1;
+        context->authenticated = 1;
+        return 0;
+    }
+    /* Without a database there are no stored users, so only the built-in admin can resolve. */
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return -1;
+    }
+    st_storage_management_user user;
+    int found = st_storage_find_management_user(database_path, claims->username, &user);
+    if (found < 0) {
+        return -2;
+    }
+    if (found != 0
+        || !user.enabled
+        || (claims->tenant_id[0] != '\0' && strcmp(user.tenant_id, claims->tenant_id) != 0)) {
+        return -1;
+    }
+    snprintf(context->username, sizeof(context->username), "%s", user.username);
+    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
+    snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+    context->admin = strcmp(context->role, "ADMIN") == 0;
+    context->authenticated = 1;
+    return 0;
+}
+
+/* 0 when the bearer token is valid and its account still resolves, -1 for an invalid token, -2 for
+ * a valid token whose account is gone, disabled, moved to another tenant or no longer allowed, and
+ * -3 when the account cannot be checked because the user store is unreadable. */
 static int admin_context_from_authorization(const char *authorization, st_admin_context *context)
 {
     memset(context, 0, sizeof(*context));
@@ -758,13 +815,8 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
                                          &claims) != 0) {
         return -1;
     }
-    snprintf(context->username, sizeof(context->username), "%s", claims.username);
-    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", claims.tenant_id);
-    snprintf(context->role, sizeof(context->role), "%s", claims.role);
-    context->admin = admin_ascii_casecmp(claims.role, "ADMIN") == 0
-        || admin_ascii_casecmp(claims.username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0;
-    context->authenticated = 1;
-    return 0;
+    int resolved = admin_resolve_token_user(&claims, context);
+    return resolved == 0 ? 0 : (resolved == -2 ? -3 : -2);
 }
 
 static int admin_path_requires_auth(const char *method, const char *path)
@@ -1158,6 +1210,54 @@ static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
     return 0;
 }
 
+/*
+ * protocol/spec/client-auth.md: a login whose signature verified consumes its (apiKey, nonce)
+ * pair, and the pair again within 120 s is refused. Java answers a replay with 400 and this body;
+ * a full in-memory store answers 503 with Retry-After so the client retries rather than gives up.
+ * Returns 0 when the pair was fresh, else the length of the response written to out.
+ */
+static int consume_client_auth_nonce(const char *api_key, const char *nonce, char *out, size_t out_len)
+{
+    int64_t retry_after_seconds = 0;
+    st_client_auth_nonce_result result = st_client_auth_nonce_consume(api_key,
+                                                                      nonce,
+                                                                      current_time_millis(),
+                                                                      &retry_after_seconds);
+    if (result == ST_CLIENT_AUTH_NONCE_ACCEPTED) {
+        return 0;
+    }
+    if (result == ST_CLIENT_AUTH_NONCE_REPLAYED) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端签名 nonce 已使用\"}");
+    }
+    const char *body = "{\"error\":\"客户端认证暂时不可用\"}";
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 503 Service Unavailable\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Retry-After: %lld\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           (long long)(retry_after_seconds < 1 ? 1 : retry_after_seconds),
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * nettyTls tells clients whose controlTls.enabled is unset whether the raw control/data endpoint
+ * speaks TLS. Like Java and Go it is the listener's TLS mode, or TLS terminated by a trusted L4
+ * proxy in front of it; main() builds the listener from the same SPECUS_TLS_* settings.
+ */
+static int client_auth_netty_tls(void)
+{
+    st_tls_config tls;
+    st_tls_config_from_env(&tls);
+    return tls.mode != ST_TLS_DISABLED || tls.terminated_upstream;
+}
+
 static int validate_client_api_login(const char *body, char *out, size_t out_len)
 {
     if (body == NULL || *body == '\0') {
@@ -1249,6 +1349,8 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     memset(key, 0, sizeof(key));
     memset(actual_signature, 0, sizeof(actual_signature));
     memset(expected_signature, 0, sizeof(expected_signature));
+    /* Only a request whose signature verified may consume its nonce. */
+    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(api_key, nonce, out, out_len);
     free(api_key);
     free(timestamp);
     free(nonce);
@@ -1259,7 +1361,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     if (invalid) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
     }
-    return 0;
+    return nonce_rc;
 }
 
 static int build_client_auth_login_success_response(char *out, size_t out_len)
@@ -1316,7 +1418,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     int build_rc = admin_sb_appendf(&builder,
                                     "{\"tenantId\":\"%s\",\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":%lld,"
-                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":%d,"
+                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"nettyTls\":%s,\"maxOnlineInstances\":%d,"
                                     "\"policy\":{\"enabled\":%s,\"billingStatus\":\"%s\",\"retryAfterSeconds\":%lld},"
                                     "\"peerMesh\":{\"enabled\":false,\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"virtualIp\":\"\",\"cidr\":\"\",\"stunHost\":\"\",\"stunPort\":0,"
@@ -1331,6 +1433,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     token_ttl_seconds,
                                     netty_host,
                                     env_int("SPECUS_NETTY_PORT", 7010),
+                                    client_auth_netty_tls() ? "true" : "false",
                                     max_online_instances,
                                     policy_enabled ? "true" : "false",
                                     billing_status,
@@ -2015,7 +2118,7 @@ static int append_db_client_auth_response(char *out,
     int build_rc = admin_sb_appendf(&builder,
                                     "{\"tenantId\":\"%s\",\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":%lld,"
-                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":%d,"
+                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"nettyTls\":%s,\"maxOnlineInstances\":%d,"
                                     "\"policy\":{\"enabled\":true,\"billingStatus\":\"ACTIVE\",\"retryAfterSeconds\":0},"
                                     "\"peerMesh\":",
                                     tenant_id,
@@ -2026,6 +2129,7 @@ static int append_db_client_auth_response(char *out,
                                     token_ttl_seconds,
                                     netty_host,
                                     env_int("SPECUS_NETTY_PORT", 7010),
+                                    client_auth_netty_tls() ? "true" : "false",
                                     credential->max_online_instances <= 0
                                         ? client_auth_default_max_online_instances()
                                         : credential->max_online_instances);
@@ -2244,6 +2348,22 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(client_version);
         free(java_version);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
+    }
+    int nonce_rc = consume_client_auth_nonce(api_key, nonce, out, out_len);
+    if (nonce_rc != 0) {
+        free(api_key);
+        free(timestamp);
+        free(nonce);
+        free(signature);
+        free(machine_fingerprint);
+        free(os_user);
+        free(hostname);
+        free(os_name);
+        free(os_version);
+        free(os_arch);
+        free(client_version);
+        free(java_version);
+        return nonce_rc;
     }
 
     st_storage_client_identity identity;
@@ -8406,6 +8526,7 @@ static int handle_management_auth_login(const char *body,
     return write_management_token_response(token_username, token_tenant, token_role, out, out_len);
 }
 
+/* The context was re-read from the user record, so the new token carries today's tenant and role. */
 static int handle_management_auth_refresh(const st_admin_context *context, char *out, size_t out_len)
 {
     if (context == NULL || !context->authenticated) {
@@ -8496,7 +8617,22 @@ static int st_admin_build_response_internal(const char *method,
     admin_context_from_env(&context);
     if (admin_path_requires_auth(method, path)) {
         if (authorization != NULL) {
-            if (admin_context_from_authorization(authorization, &context) != 0) {
+            int auth_rc = admin_context_from_authorization(authorization, &context);
+            /* Java's answers: refresh says 401 so the SPA signs in again, any other request 403. */
+            if (auth_rc == -2 && admin_path_equals(path, "/auth/refresh")) {
+                return write_response(out, out_len, 401, "Unauthorized",
+                                      "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}");
+            }
+            if (auth_rc == -2) {
+                return write_response(out, out_len, 403, "Forbidden",
+                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+            }
+            /* Fail closed, as Java's repository error would surface as a 500. */
+            if (auth_rc == -3) {
+                return write_response(out, out_len, 500, "Internal Server Error",
+                                      "{\"error\":\"management user store unavailable\"}");
+            }
+            if (auth_rc != 0) {
                 return write_admin_unauthorized(out, out_len);
             }
         } else if (!allow_default_admin) {
