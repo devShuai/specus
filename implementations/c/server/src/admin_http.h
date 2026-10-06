@@ -38,10 +38,18 @@ typedef struct {
     int (*on_end)(void *ctx, char *const *trailers, size_t trailers_len);
 } st_admin_direct_http_sink;
 
+/*
+ * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head
+ * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT
+ * when the client's data connection already holds its maximum of pending HTTP streams, and any
+ * other negative value when the client is offline or the stream failed.
+ */
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
                                               const st_direct_http_request *request,
                                               const st_admin_direct_http_sink *sink);
+
+#define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-5)
 
 typedef struct st_admin_direct_ws_stream st_admin_direct_ws_stream;
 

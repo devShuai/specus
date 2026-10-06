@@ -11,6 +11,7 @@
 #include "public_discovery.h"
 #include "security_baseline.h"
 #include "storage.h"
+#include "stream_tombstones.h"
 #include "stun_turn.h"
 #include "tls_transport.h"
 
@@ -163,6 +164,8 @@ typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
     int response_started;
+    /* The server reset the stream; frames the client sent before it saw the RST are dropped. */
+    int reset;
     char *error;
     direct_http_event *events_head;
     direct_http_event *events_tail;
@@ -200,6 +203,8 @@ struct specus_session {
     int replaced;
     size_t references;
     uint32_t next_stream_id;
+    /* Recently closed NAT streams of this data connection, guarded by map_lock. */
+    st_stream_tombstones closed_streams;
     char remote[128];
     long long connection_record_id;
     long long connected_since_ms;
@@ -1325,6 +1330,17 @@ static direct_http_event *direct_pending_pop(direct_http_pending *pending)
     return event;
 }
 
+/*
+ * A frame for a pending Direct HTTP stream. Returns 0 when the stream id is not one, 1 when the
+ * frame was handled and -1 for a data-connection protocol violation.
+ *
+ * As in Java NatServerHandler and Go clientSession, a frame the stream state refuses (a second
+ * response head, DATA before the head or after the end, DATA beyond the receive window, a second
+ * FIN) resets only this stream with RST 8, and a response beyond 64 MiB with RST 4 as Go does; the
+ * other streams of the data connection carry on. Only a WINDOW_UPDATE that overflows the send
+ * window closes the data connection, which is what Java StreamFlowController and Go do.
+ * DATA|END_STREAM is that DATA followed by a FIN (protocol/spec/control-protocol.md).
+ */
 static int process_direct_http_message(specus_session *session, const st_nat_message *message)
 {
     pthread_mutex_lock(&session->direct_lock);
@@ -1334,13 +1350,33 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         return 0;
     }
 
-    int invalid = 0;
+    int violation = 0;
+    uint32_t reset_code = 0U;
+    const char *reset_reason = NULL;
     const char *metadata = message->meta_json == NULL ? "{}" : message->meta_json;
-    if (message->type == ST_NAT_OPEN) {
+    if (message->type == ST_NAT_RST) {
+        if (!pending->reset) {
+            char *reason = st_json_get_string(metadata, "reason");
+            free(pending->error);
+            pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+        }
+        pending->done = 1;
+        pending->reset = 1;
+        pthread_cond_broadcast(&pending->cond);
+    } else if (message->type == ST_NAT_WINDOW_UPDATE) {
+        violation = message->value > ST_STREAM_MAX_WINDOW
+            || pending->send_credit > ST_STREAM_MAX_WINDOW - message->value;
+        if (!violation) {
+            pending->send_credit += message->value;
+            pthread_cond_broadcast(&pending->cond);
+        }
+    } else if (pending->reset) {
+        /* Already reset by the server: in flight before the client saw the RST, dropped. */
+    } else if (message->type == ST_NAT_OPEN) {
         char *source = st_json_get_string(metadata, "source");
         char *phase = st_json_get_string(metadata, "phase");
         int status = 0;
-        invalid = pending->response_started
+        int invalid = pending->response_started
             || source == NULL || strcmp(source, "http") != 0
             || phase == NULL || strcmp(phase, "response") != 0
             || st_json_get_int(metadata, "statusCode", &status) != 0
@@ -1348,47 +1384,65 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
             || direct_pending_enqueue(pending, ST_NAT_OPEN, message->meta_json, NULL, 0U) != 0;
         free(source);
         free(phase);
-        if (!invalid) {
+        if (invalid) {
+            reset_code = 8U;
+            reset_reason = "invalid HTTP response headers";
+        } else {
             pending->response_started = 1;
         }
     } else if (message->type == ST_NAT_DATA) {
-        invalid = !pending->response_started || pending->done
+        if (!pending->response_started || pending->done
             || message->data_len == 0U
             || message->data_len > ST_MAX_DATA_FRAME_BYTES
-            || message->data_len > pending->receive_credit
-            || message->data_len > ST_HTTP_MAX_RESPONSE_BODY
-            || pending->response_bytes > ST_HTTP_MAX_RESPONSE_BODY - message->data_len
-            || direct_pending_enqueue(pending, ST_NAT_DATA, NULL,
-                                      message->data, message->data_len) != 0;
-        if (!invalid) {
+            || message->data_len > pending->receive_credit) {
+            reset_code = 8U;
+            reset_reason = "HTTP DATA is invalid for the stream state";
+        } else if (pending->response_bytes > ST_HTTP_MAX_RESPONSE_BODY - message->data_len) {
+            reset_code = 4U;
+            reset_reason = "HTTP response body exceeds limit";
+        } else if (direct_pending_enqueue(pending, ST_NAT_DATA, NULL,
+                                          message->data, message->data_len) != 0) {
+            reset_code = 8U;
+            reset_reason = "HTTP response queue exceeded";
+        } else {
             pending->receive_credit -= message->data_len;
             pending->receive_outstanding += message->data_len;
             pending->response_bytes += message->data_len;
+            if ((message->flags & ST_NAT_FLAG_END_STREAM) != 0U) {
+                if (direct_pending_enqueue(pending, ST_NAT_FIN, NULL, NULL, 0U) != 0) {
+                    reset_code = 8U;
+                    reset_reason = "HTTP response queue exceeded";
+                } else {
+                    pending->done = 1;
+                }
+            }
         }
     } else if (message->type == ST_NAT_FIN) {
-        invalid = !pending->response_started || pending->done
-            || direct_pending_enqueue(pending, ST_NAT_FIN, message->meta_json, NULL, 0U) != 0;
-        if (!invalid) {
+        if (!pending->response_started || pending->done
+            || direct_pending_enqueue(pending, ST_NAT_FIN, message->meta_json, NULL, 0U) != 0) {
+            reset_code = 8U;
+            reset_reason = pending->done ? "duplicate HTTP FIN" : "invalid HTTP terminal frame";
+        } else {
             pending->done = 1;
         }
-    } else if (message->type == ST_NAT_RST) {
-        char *reason = st_json_get_string(metadata, "reason");
-        free(pending->error);
-        pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
-        pending->done = 1;
-        pthread_cond_broadcast(&pending->cond);
-    } else if (message->type == ST_NAT_WINDOW_UPDATE) {
-        invalid = message->value == 0U
-            || pending->send_credit > ST_STREAM_MAX_WINDOW - message->value;
-        if (!invalid) {
-            pending->send_credit += message->value;
-            pthread_cond_broadcast(&pending->cond);
-        }
     } else {
-        invalid = 1;
+        violation = 1;
+    }
+    if (reset_code != 0U) {
+        free(pending->error);
+        pending->error = dup_string(reset_reason);
+        pending->done = 1;
+        pending->reset = 1;
+        pthread_cond_broadcast(&pending->cond);
     }
     pthread_mutex_unlock(&session->direct_lock);
-    return invalid ? -1 : 1;
+
+    if (reset_code != 0U) {
+        fprintf(stderr, "[nat] HTTP stream reset stream=%u client=%s code=%u reason=%s\n",
+                message->stream_id, session->config.client_name, (unsigned)reset_code, reset_reason);
+        (void)send_reset(session, message->stream_id, reset_code, reset_reason);
+    }
+    return violation ? -1 : 1;
 }
 
 static int config_has_http_route(const server_config *config, const char *route)
@@ -1684,6 +1738,40 @@ static size_t close_live_connections_and_wait(int timeout_seconds)
     return remaining;
 }
 
+/*
+ * An optional string-array field: absent reads as empty, as Java HttpStreamExchange reads the
+ * response head's trailerNames ("trailerNames?" in protocol/spec/control-protocol.md).
+ */
+static int optional_string_array(const char *json, const char *key, char ***out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    char *raw = st_json_get_top_level_raw(json, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    free(raw);
+    return st_json_get_string_array(json, key, out, out_len);
+}
+
+/*
+ * Retires a finished Direct HTTP stream. It is tombstoned before it leaves the pending list, so a
+ * late client RST always finds one of the two and is never mistaken for a never-opened stream.
+ */
+static void direct_pending_retire(specus_session *session, direct_http_pending *pending)
+{
+    pthread_mutex_lock(&session->map_lock);
+    st_stream_tombstones_add(&session->closed_streams, pending->stream_id);
+    pthread_mutex_unlock(&session->map_lock);
+    pthread_mutex_lock(&session->direct_lock);
+    direct_pending_remove(session, pending);
+    direct_pending_free_events(pending);
+    pthread_mutex_unlock(&session->direct_lock);
+    free(pending->error);
+    pending->error = NULL;
+    pthread_cond_destroy(&pending->cond);
+}
+
 static int direct_http_forward(void *ctx,
                                const char *client_name,
                                const st_direct_http_request *request,
@@ -1722,6 +1810,7 @@ static int direct_http_forward(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
+    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -1729,7 +1818,7 @@ static int direct_http_forward(void *ctx,
         pthread_mutex_unlock(&session->direct_lock);
         pthread_cond_destroy(&pending.cond);
         session_reference_release(session);
-        return -2;
+        return ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT;
     }
     pending.next = session->direct_pending;
     session->direct_pending = &pending;
@@ -1825,8 +1914,8 @@ static int direct_http_forward(void *ctx,
             int valid = st_json_get_int(event->meta_json, "statusCode", &status_code) == 0
                 && st_json_get_string_array(event->meta_json, "headers",
                                             &headers, &headers_len) == 0
-                && st_json_get_string_array(event->meta_json, "trailerNames",
-                                            &trailer_names, &trailer_names_len) == 0;
+                && optional_string_array(event->meta_json, "trailerNames",
+                                         &trailer_names, &trailer_names_len) == 0;
             if (!valid || sink->on_headers(sink->ctx, status_code,
                                             headers, headers_len,
                                             trailer_names, trailer_names_len) != 0) {
@@ -1876,22 +1965,12 @@ static int direct_http_forward(void *ctx,
         }
     }
 
-    pthread_mutex_lock(&session->direct_lock);
-    direct_pending_remove(session, &pending);
-    direct_pending_free_events(&pending);
-    pthread_mutex_unlock(&session->direct_lock);
-    free(pending.error);
-    pthread_cond_destroy(&pending.cond);
+    direct_pending_retire(session, &pending);
     session_reference_release(session);
     return result;
 
 failed:
-    pthread_mutex_lock(&session->direct_lock);
-    direct_pending_remove(session, &pending);
-    direct_pending_free_events(&pending);
-    pthread_mutex_unlock(&session->direct_lock);
-    free(pending.error);
-    pthread_cond_destroy(&pending.cond);
+    direct_pending_retire(session, &pending);
     session_reference_release(session);
     return -1;
 }
@@ -1929,6 +2008,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
+    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
     conn->next = session->ws_conns;
     session->ws_conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -3129,6 +3209,7 @@ static ws_conn *find_ws_stream_locked(specus_session *session, uint32_t stream_i
     return NULL;
 }
 
+/* Unmapping a WebSocket stream tombstones it in the same map_lock section. */
 static ws_conn *remove_ws_conn_locked(specus_session *session, const char *channel_id)
 {
     ws_conn **cursor = &session->ws_conns;
@@ -3137,6 +3218,7 @@ static ws_conn *remove_ws_conn_locked(specus_session *session, const char *chann
             ws_conn *removed = *cursor;
             *cursor = removed->next;
             removed->next = NULL;
+            st_stream_tombstones_add(&session->closed_streams, removed->stream_id);
             return removed;
         }
         cursor = &(*cursor)->next;
@@ -3152,6 +3234,7 @@ static ws_conn *remove_ws_stream_locked(specus_session *session, uint32_t stream
             ws_conn *removed = *cursor;
             *cursor = removed->next;
             removed->next = NULL;
+            st_stream_tombstones_add(&session->closed_streams, removed->stream_id);
             return removed;
         }
         cursor = &(*cursor)->next;
@@ -3270,8 +3353,12 @@ static void release_external_count(external_conn *conn)
     pthread_mutex_unlock(&global_external_lock);
 }
 
+/* Closes a TCP stream and, the first time, tombstones it in the same map_lock section. */
 static void close_conn_locked(external_conn *conn)
 {
+    if (!conn->done) {
+        st_stream_tombstones_add(&conn->session->closed_streams, conn->stream_id);
+    }
     pthread_mutex_lock(&conn->flow_lock);
     conn->flow_closed = 1;
     pthread_cond_broadcast(&conn->flow_cond);
@@ -3303,33 +3390,42 @@ static void free_external_write_queue(external_conn *conn)
     conn->queued_write_bytes = 0U;
 }
 
+/* Results of queueing client data for the public socket, each answered with its own RST code. */
+#define ST_EXTERNAL_WRITE_AFTER_FIN (-1) /* the client's direction already ended: RST 7 */
+#define ST_EXTERNAL_WRITE_REFUSED (-2)   /* frame too large, 4 MiB queue full or no memory: RST 6 */
+
 static int enqueue_external_write(external_conn *conn,
                                   const uint8_t *data,
                                   size_t data_len,
                                   int end_stream)
 {
     if (data == NULL || data_len == 0U || data_len > ST_MAX_DATA_FRAME_BYTES) {
-        return -1;
+        return ST_EXTERNAL_WRITE_REFUSED;
     }
     external_write_chunk *chunk = (external_write_chunk *)calloc(1, sizeof(*chunk));
     if (chunk == NULL) {
-        return -1;
+        return ST_EXTERNAL_WRITE_REFUSED;
     }
     chunk->data = (uint8_t *)malloc(data_len);
     if (chunk->data == NULL) {
         free(chunk);
-        return -1;
+        return ST_EXTERNAL_WRITE_REFUSED;
     }
     memcpy(chunk->data, data, data_len);
     chunk->len = data_len;
 
     pthread_mutex_lock(&conn->write_lock);
-    if (conn->write_closed || conn->client_finished
-        || conn->queued_write_bytes > ST_STREAM_MAX_PENDING_BYTES - data_len) {
+    int refused = 0;
+    if (conn->write_closed || conn->client_finished) {
+        refused = ST_EXTERNAL_WRITE_AFTER_FIN;
+    } else if (conn->queued_write_bytes > ST_STREAM_MAX_PENDING_BYTES - data_len) {
+        refused = ST_EXTERNAL_WRITE_REFUSED;
+    }
+    if (refused != 0) {
         pthread_mutex_unlock(&conn->write_lock);
         free(chunk->data);
         free(chunk);
-        return -1;
+        return refused;
     }
     if (conn->write_tail == NULL) {
         conn->write_head = chunk;
@@ -3351,7 +3447,7 @@ static int finish_external_write(external_conn *conn)
     pthread_mutex_lock(&conn->write_lock);
     if (conn->write_closed || conn->client_finished) {
         pthread_mutex_unlock(&conn->write_lock);
-        return -1;
+        return ST_EXTERNAL_WRITE_AFTER_FIN;
     }
     conn->client_finished = 1;
     pthread_cond_broadcast(&conn->write_cond);
@@ -3475,7 +3571,14 @@ static void *external_writer_thread(void *arg)
                         errno);
                 free(chunk->data);
                 free(chunk);
-                mark_conn_done(conn);
+                /* A stream the server closed on its own is reset, as Java and Go do (RST 9). */
+                pthread_mutex_lock(&session->map_lock);
+                int already_closed = conn->done;
+                close_conn_locked(conn);
+                pthread_mutex_unlock(&session->map_lock);
+                if (!already_closed) {
+                    (void)send_reset(session, conn->stream_id, 9U, "write to external TCP stream failed");
+                }
                 break;
             }
             record_tcp_traffic(session, conn->port, 0, (long long)chunk->len);
@@ -3545,7 +3648,14 @@ static void *external_conn_thread(void *arg)
         break;
     }
 
-    send_fin(session, conn->stream_id);
+    /* A stream already closed (reset by either side, or its connection shutting down) is over;
+     * a FIN after its RST would name a stream the client has already dropped. */
+    pthread_mutex_lock(&session->map_lock);
+    int closed = conn->done;
+    pthread_mutex_unlock(&session->map_lock);
+    if (!closed) {
+        send_fin(session, conn->stream_id);
+    }
     pthread_mutex_lock(&session->map_lock);
     conn->public_finished = 1;
     if (conn->client_write_drained) {
@@ -3601,6 +3711,7 @@ static int start_external_conn(specus_session *session,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
+    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
     conn->next = session->conns;
     session->conns = conn;
@@ -3778,54 +3889,129 @@ static void process_register(specus_session *session, const st_nat_message *mess
     free(client_name);
 }
 
+/*
+ * A server-side RST for a stream the client named but that is not (or no longer) open here. As
+ * Java resetTcpStream and Go resetTCPStream do, the id is tombstoned so the client's own RST for
+ * it, should one cross this one, is taken as late rather than as a never-opened stream.
+ */
+static void reset_unknown_stream(specus_session *session, uint32_t stream_id,
+                                 uint32_t code, const char *reason)
+{
+    pthread_mutex_lock(&session->map_lock);
+    st_stream_tombstones_add(&session->closed_streams, stream_id);
+    pthread_mutex_unlock(&session->map_lock);
+    fprintf(stderr, "[nat] stream reset stream=%u client=%s code=%u reason=%s\n",
+            stream_id, session->config.client_name, (unsigned)code, reason);
+    (void)send_reset(session, stream_id, code, reason);
+}
+
+/*
+ * DATA or DATA|END_STREAM for an ordinary TCP stream; an empty DATA|END_STREAM is a bare FIN. A
+ * frame the stream cannot take resets only this stream (protocol/spec/control-protocol.md): DATA
+ * for an unknown stream or after the client's FIN with RST 7 as in Java and Go, a frame the 4 MiB
+ * client-to-public queue cannot hold with RST 6 like Java StreamFlowController's queue overflow.
+ */
 static void process_control_data(specus_session *session, const st_nat_message *message)
 {
     if (process_ws_data(session, message)) {
         return;
     }
-    if (message->data == NULL || message->data_len == 0) {
-        return;
-    }
+    int end_stream = (message->flags & ST_NAT_FLAG_END_STREAM) != 0U;
+    uint32_t reset_code = 0U;
+    const char *reset_reason = NULL;
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
-    int reset_overflow = 0;
-    if (conn != NULL && conn->fd >= 0) {
-        if (enqueue_external_write(conn,
-                                   message->data,
-                                   message->data_len,
-                                   (message->flags & ST_NAT_FLAG_END_STREAM) != 0U) != 0) {
+    int unknown = conn == NULL || conn->fd < 0;
+    if (!unknown) {
+        int rc = 0;
+        if (message->data_len > 0U) {
+            rc = enqueue_external_write(conn, message->data, message->data_len, end_stream);
+        } else if (end_stream) {
+            rc = finish_external_write(conn);
+        }
+        if (rc == ST_EXTERNAL_WRITE_AFTER_FIN) {
+            reset_code = 7U;
+            reset_reason = "client TCP DATA after FIN";
+        } else if (rc != 0) {
+            reset_code = 6U;
+            reset_reason = "stream send queue exceeded";
+        }
+        if (reset_code != 0U) {
             close_conn_locked(conn);
-            reset_overflow = 1;
-            fprintf(stderr,
-                    "[nat] client-to-public queue rejected stream=%u client=%s bytes=%zu\n",
-                    message->stream_id,
-                    session->config.client_name,
-                    message->data_len);
         }
     }
     pthread_mutex_unlock(&session->map_lock);
-    if (reset_overflow) {
-        (void)send_reset(session, message->stream_id, 6U, "stream send queue exceeded");
+    if (unknown) {
+        reset_unknown_stream(session, message->stream_id, 7U, "DATA for unknown TCP stream");
+    } else if (reset_code != 0U) {
+        fprintf(stderr, "[nat] TCP stream reset stream=%u client=%s code=%u reason=%s bytes=%zu\n",
+                message->stream_id, session->config.client_name, (unsigned)reset_code,
+                reset_reason, message->data_len);
+        (void)send_reset(session, message->stream_id, reset_code, reset_reason);
     }
 }
 
-static void process_control_closed(specus_session *session, const st_nat_message *message)
+/*
+ * FIN or RST for a WebSocket or ordinary TCP stream. Returns -1 for an RST naming a stream that
+ * was never opened, which the spec makes a data-connection protocol violation; an RST for a
+ * recently closed stream is late and ignored. A FIN for an unknown stream or a second FIN resets
+ * only that stream with RST 7, as Java and Go do.
+ */
+static int process_control_closed(specus_session *session, const st_nat_message *message)
 {
     if (process_ws_closed(session, message)) {
-        return;
+        return 0;
     }
+    int unknown = 0;
+    int never_opened = 0;
+    int duplicate_fin = 0;
+    pthread_mutex_lock(&session->map_lock);
+    external_conn *conn = find_conn_locked(session, message->stream_id);
+    if (conn == NULL || conn->fd < 0) {
+        unknown = 1;
+        never_opened = message->type == ST_NAT_RST
+            && !st_stream_tombstones_contains(&session->closed_streams, message->stream_id);
+    } else if (message->type == ST_NAT_RST) {
+        close_conn_locked(conn);
+    } else if (finish_external_write(conn) != 0) {
+        close_conn_locked(conn);
+        duplicate_fin = 1;
+    }
+    pthread_mutex_unlock(&session->map_lock);
+    if (never_opened) {
+        fprintf(stderr, "[nat] RST for never-opened stream=%u client=%s\n",
+                message->stream_id, session->config.client_name);
+        return -1;
+    }
+    if (unknown && message->type == ST_NAT_FIN) {
+        reset_unknown_stream(session, message->stream_id, 7U, "FIN for unknown TCP stream");
+    } else if (duplicate_fin) {
+        fprintf(stderr, "[nat] TCP stream reset stream=%u client=%s code=7 reason=duplicate client TCP FIN\n",
+                message->stream_id, session->config.client_name);
+        (void)send_reset(session, message->stream_id, 7U, "duplicate client TCP FIN");
+    }
+    return 0;
+}
+
+/*
+ * A client OPEN is only valid as the response head of a pending Direct HTTP stream. Any other one
+ * resets just that stream with RST 8, as in Java and Go; a TCP or WebSocket stream with that id is
+ * torn down with it, since the client drops a stream once it has seen its RST.
+ */
+static void process_unexpected_open(specus_session *session, const st_nat_message *message)
+{
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
     if (conn != NULL) {
-        if (message->type == ST_NAT_RST) {
-            close_conn_locked(conn);
-        } else {
-            if (finish_external_write(conn) != 0) {
-                close_conn_locked(conn);
-            }
-        }
+        close_conn_locked(conn);
     }
+    ws_conn *ws = remove_ws_stream_locked(session, message->stream_id);
     pthread_mutex_unlock(&session->map_lock);
+    if (ws != NULL) {
+        st_admin_direct_ws_peer_reset(ws->stream);
+        free_ws_conn(ws);
+    }
+    reset_unknown_stream(session, message->stream_id, 8U, "invalid HTTP response headers");
 }
 
 static void process_unregister(specus_session *session, const st_nat_message *message)
@@ -3837,51 +4023,62 @@ static void process_unregister(specus_session *session, const st_nat_message *me
     }
 }
 
-static void process_nat_message(specus_session *session, const st_nat_message *message)
+/*
+ * Returns -1 for a data-connection protocol violation, after which the caller closes the data
+ * connection: an RST for a never-opened stream, a WINDOW_UPDATE that overflows a stream's send
+ * window (Java StreamFlowController.onWindowUpdate and Go handleWindowUpdate close the connection
+ * too) and a NAT type a client never sends. Everything that concerns a single stream is answered
+ * on that stream only.
+ */
+static int process_nat_message(specus_session *session, const st_nat_message *message)
 {
     int direct_result = process_direct_http_message(session, message);
     if (direct_result != 0) {
         if (direct_result < 0) {
-            printf("[nat] invalid HTTP stream frame stream=%u client=%s\n",
-                   message->stream_id, session->config.client_name);
-            session->active = 0;
+            fprintf(stderr, "[nat] protocol violation on HTTP stream=%u type=%d client=%s\n",
+                    message->stream_id, message->type, session->config.client_name);
+            return -1;
         }
-        return;
+        return 0;
     }
     switch (message->type) {
         case ST_NAT_REGISTER:
             process_register(session, message);
-            break;
+            return 0;
         case ST_NAT_UNREGISTER:
             process_unregister(session, message);
-            break;
+            return 0;
+        case ST_NAT_OPEN:
+            process_unexpected_open(session, message);
+            return 0;
         case ST_NAT_DATA:
             process_control_data(session, message);
-            break;
+            return 0;
         case ST_NAT_FIN:
         case ST_NAT_RST:
-            process_control_closed(session, message);
-            break;
+            return process_control_closed(session, message);
         case ST_NAT_WINDOW_UPDATE: {
+            /* Credit for a stream that is not open any more is late and ignored. */
             pthread_mutex_lock(&session->map_lock);
             external_conn *conn = find_conn_locked(session, message->stream_id);
             ws_conn *ws = conn == NULL ? find_ws_stream_locked(session, message->stream_id) : NULL;
-            int invalid = conn != NULL
+            int overflow = conn != NULL
                 ? add_send_credit(conn, message->value) != 0
                 : ws != NULL && st_admin_direct_ws_add_send_credit(ws->stream, message->value) != 0;
             pthread_mutex_unlock(&session->map_lock);
-            if (invalid) {
-                session->active = 0;
+            if (overflow) {
+                fprintf(stderr, "[nat] WINDOW_UPDATE overflows the send window stream=%u client=%s\n",
+                        message->stream_id, session->config.client_name);
+                return -1;
             }
-            break;
+            return 0;
         }
         case ST_NAT_KEEPALIVE:
-            break;
+            return 0;
         default:
-            printf("[nat] protocol violation type=%d client=%s\n",
-                   message->type, session->config.client_name);
-            session->active = 0;
-            break;
+            fprintf(stderr, "[nat] protocol violation type=%d client=%s\n",
+                    message->type, session->config.client_name);
+            return -1;
     }
 }
 
@@ -4146,6 +4343,13 @@ static void *client_thread(void *arg)
             continue;
         }
 
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            /* Heartbeats are allowed on both roles (protocol/spec/control-protocol.md); a response
+             * needs no answer and, as in Java ConnectionRoleHandler and Go, is simply accepted. */
+            free(body);
+            continue;
+        }
+
         if (header.command == ST_CMD_LOGOUT_REQUEST) {
             free(body);
             st_buffer response = st_protocol_encode_empty_packet(ST_CMD_LOGOUT_RESPONSE);
@@ -4226,8 +4430,12 @@ static void *client_thread(void *arg)
                 break;
             }
             free(body);
-            process_nat_message(session, &message);
+            int nat_rc = process_nat_message(session, &message);
             st_nat_message_free(&message);
+            if (nat_rc != 0) {
+                disconnect_reason = "PROTOCOL_VIOLATION";
+                break;
+            }
             continue;
         }
 

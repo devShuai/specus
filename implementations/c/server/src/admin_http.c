@@ -13157,6 +13157,9 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 504, "direct http response timeout");
     } else if (!sink_state.started && rc == -3) {
         send_text_http_error(fd, 404, "direct http route is not configured");
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
+        /* The stream could not be created, answered as Java HttpSpecusController does. */
+        send_text_http_error(fd, 502, "HTTP 流创建失败");
     } else if (!sink_state.started) {
         send_text_http_error(fd, 502, "direct http target client is offline");
     }
