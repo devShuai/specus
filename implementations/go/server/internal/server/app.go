@@ -506,6 +506,7 @@ func (a *App) Run(ctx context.Context) error {
 	launch(a.attachments.RunExpiration)
 	launch(a.mediaCapture.Run)
 	launch(a.api.RunRegistrationCleanup)
+	launch(a.api.RunWorkbenchSweep)
 	launch(func(ctx context.Context) { runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord) })
 
 	errc := make(chan error, 2)
