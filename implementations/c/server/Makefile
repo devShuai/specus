@@ -123,6 +123,7 @@ test: all
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
 	bash scripts/object_storage_e2e.sh $(SERVER)
+	bash scripts/tls_deployment_e2e.sh $(SERVER)
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)

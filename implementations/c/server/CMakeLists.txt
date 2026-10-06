@@ -198,3 +198,9 @@ add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME tls_transport_tests COMMAND specus_c_tls_transport_tests)
+# The production TLS rule on the real binary: refusal of a public plaintext control listener, PEM
+# file TLS verified with openssl s_client.
+add_test(NAME tls_deployment_e2e
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tls_deployment_e2e.sh
+                 $<TARGET_FILE:specus-server-c>)
+set_tests_properties(tls_deployment_e2e PROPERTIES TIMEOUT 90)
