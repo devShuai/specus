@@ -4594,6 +4594,35 @@ static int start_shutdown_signal_thread(void)
     return 0;
 }
 
+/*
+ * Opens the pipe that carries a SIGTERM/SIGINT to the serving loop. main does this before the
+ * control listener opens: once a port accepts connections a readiness probe may call the server
+ * up, and a signal from then on has to reach the graceful shutdown (the loop finds the byte on its
+ * first poll) instead of the "outside the serving loop" exit, even while startup is still opening
+ * the admin port.
+ */
+static int shutdown_wake_open(int shutdown_pipe[2])
+{
+    if (pipe(shutdown_pipe) != 0) {
+        shutdown_pipe[0] = -1;
+        shutdown_pipe[1] = -1;
+        return -1;
+    }
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = shutdown_pipe[1];
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    return 0;
+}
+
+static void shutdown_wake_close(int shutdown_pipe[2])
+{
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = -1;
+    close(shutdown_pipe[1]);
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    close(shutdown_pipe[0]);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -4652,8 +4681,18 @@ int main(void)
         return 1;
     }
 
+    int shutdown_pipe[2] = {-1, -1};
+    if (shutdown_wake_open(shutdown_pipe) != 0) {
+        perror("shutdown pipe");
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
+        free(config.nat_control_json);
+        st_public_discovery_shutdown();
+        return 1;
+    }
     int listener = create_listener_on(config.bind_address, config.port);
     if (listener < 0) {
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4688,6 +4727,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         close(listener);
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4701,6 +4741,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         close(listener);
+        shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
         free(config.nat_control_json);
@@ -4708,18 +4749,12 @@ int main(void)
         return 1;
     }
 
-    int shutdown_pipe[2] = {-1, -1};
     int listener_flags = fcntl(listener, F_GETFL, 0);
     /* Nonblocking, so a connection that vanishes between poll() and accept() cannot park the loop
      * where it would no longer notice a shutdown request. */
-    if (pipe(shutdown_pipe) != 0
-        || listener_flags < 0
-        || fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) != 0) {
-        perror("shutdown pipe");
-        if (shutdown_pipe[0] >= 0) {
-            close(shutdown_pipe[0]);
-            close(shutdown_pipe[1]);
-        }
+    if (listener_flags < 0 || fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) != 0) {
+        perror("control listener");
+        shutdown_wake_close(shutdown_pipe);
         peer_mesh_maintenance_stop();
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
@@ -4732,9 +4767,6 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    pthread_mutex_lock(&shutdown_signal_lock);
-    shutdown_wake_fd = shutdown_pipe[1];
-    pthread_mutex_unlock(&shutdown_signal_lock);
 
     for (;;) {
         struct pollfd ready[2];
@@ -4824,11 +4856,7 @@ int main(void)
                    unfinished, swept);
         }
     }
-    pthread_mutex_lock(&shutdown_signal_lock);
-    shutdown_wake_fd = -1;
-    close(shutdown_pipe[1]);
-    pthread_mutex_unlock(&shutdown_signal_lock);
-    close(shutdown_pipe[0]);
+    shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);
