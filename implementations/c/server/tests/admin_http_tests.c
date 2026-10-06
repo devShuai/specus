@@ -2602,7 +2602,12 @@ static int test_admin_endpoint_contracts(void)
         || st_storage_upsert_client(db_path, 0, "tenant-a", "endpoint-bravo", "bob", 1, 60, &bravo) != 0
         || st_storage_upsert_client(db_path, 0, "tenant-b", "endpoint-charlie", "alice", 1, 60, &charlie) != 0
         || st_storage_create_mapping_for_client(db_path, alpha.id, 18080, "127.0.0.1", 8080, 1, 0, &mapping) != 0
-        || st_storage_create_mapping_for_client(db_path, alpha.id, 18081, "127.0.0.1", 8081, 0, 0, &mapping) != 0;
+        || st_storage_create_mapping_for_client(db_path, alpha.id, 18081, "127.0.0.1", 8081, 0, 0, &mapping) != 0
+        /* Tokens are re-resolved against the user table, so the callers below have to exist. */
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
     if (failed) fprintf(stderr, "admin endpoint fixture setup failed\n");
     int len = 0;
 
@@ -2638,7 +2643,7 @@ static int test_admin_endpoint_contracts(void)
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh of another owner's client") != 0;
     }
     if (!failed) {
-        len = endpoint_call("POST", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        len = endpoint_call("POST", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
             || endpoint_push_calls != 2;
     }
@@ -2708,7 +2713,7 @@ static int test_admin_endpoint_contracts(void)
                                  "exchange detail for another owner") != 0;
     }
     if (!failed) {
-        len = endpoint_call("GET", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        len = endpoint_call("GET", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "exchange detail from another tenant") != 0;
     }
     if (!failed) {
@@ -2747,7 +2752,7 @@ static int test_admin_endpoint_contracts(void)
         failed = endpoint_body_equals(len, response, expected, "egress activity of the tenant") != 0;
     }
     if (!failed) {
-        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "root", "tenant-b", "ADMIN",
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "root-b", "tenant-b", "ADMIN",
                             response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"egressClientName\":\"endpoint-charlie\"",
                                  "egress activity of another tenant") != 0
