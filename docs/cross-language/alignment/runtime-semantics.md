@@ -74,8 +74,10 @@
 - Go server、.NET server 与 C server 已接入 HTTP 响应路径改写行为：当 `pathRewriteEnabled=true` 时，服务端会在回写浏览器前尝试改写 `text/html` / `text/css` 中的绝对路径，并在 HTML 中注入 Java 对齐、同源外链的 `/specus-http-route-runtime.js?v=4`，避免上游 CSP 阻止 inline script；runtime 覆盖 `fetch`、`XMLHttpRequest`、`history.pushState/replaceState`、动态 DOM/CSS、`EventSource` 和 `WebSocket`，并处理同源双斜线与 query 裸大括号。改写后返回给浏览器的响应会剥离失效的 `Content-Encoding` / `Content-Length`，但 HTTP 明细采集仍保留客户端原始响应头，便于排查上游真实行为；C server 当前支持 `gzip`、zlib `deflate` 与 raw `deflate` 解码后改写。
 - Java、Go、.NET 与 C server 的持久化 HTTP route 已对齐可选 Basic 入口认证：管理 API 使用
   `authEnabled/authUsername/authPassword` 写入，只返回 `authPasswordConfigured`；密码只保存哈希。HTTP 与支持
-  WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细，
-  未持久化的 legacy 客户端本地 route 仍保持公开兼容。
+  WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细。
+  四个 server 的入口都 fail closed：没有服务端记录的 route（含已删除但客户端仍在转发的 route）、未启用的 route
+  与已停用客户端的 route 一律 `404`，不再按"未持久化即公开"放行；C server 的 `SPECUS_HTTP_ROUTES` 作为服务端
+  配置的公开 route 保留。`NAT_CONTROL` 始终携带完整 `httpSpecusConfigList`，删除最后一条 route 时下发空数组。
 - Go server 与 .NET server 已补齐数据库版 HTTP/TCP 明细采集链路：
   - 新增 `specus_resource_traffic_usage`，并按 TCP 映射 / HTTP route 聚合资源级每日流量。
   - 资源级流量和每日总流量均带 `tenant_id`，管理查询按当前租户和可见客户端收敛。
