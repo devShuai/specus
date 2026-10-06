@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "crypto.h"
+#include "storage.h"
 #include "stun_turn.h"
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +150,164 @@ static void add_xor_peer(packet_builder *request, const struct sockaddr_in *peer
     u16(encoded + 2U, ntohs(peer->sin_port) ^ (COOKIE >> 16U));
     u32(encoded + 4U, ntohl(peer->sin_addr.s_addr) ^ COOKIE);
     attr(request, 0x0012U, encoded, sizeof(encoded));
+}
+
+/* Allocates a relay for one Peer Mesh client, authenticated as the control channel would issue it
+ * (subject pm-<clientId>), and returns the relayed address. */
+static int allocate_peer_relay(int fd,
+                               const struct sockaddr_in *server,
+                               long long client_id,
+                               unsigned seed,
+                               char username[192],
+                               unsigned char key[16],
+                               struct sockaddr_in *relay)
+{
+    char subject[64];
+    char credential[64];
+    snprintf(subject, sizeof(subject), "pm-%lld", client_id);
+    if (st_turn_auth_issue(subject, username, 192U, credential, sizeof(credential)) != 0
+        || st_turn_auth_long_term_key(username, key) != 0) return -1;
+    packet_builder request;
+    unsigned char response[2048];
+    size_t value_len = 0;
+    start(&request, 0x0003U, seed);
+    add_auth(&request, username, key);
+    int received = exchange(fd, server, &request, response, sizeof(response));
+    const unsigned char *relayed = received > 0
+        ? find_attr(response, (size_t)received, 0x0016U, &value_len) : NULL;
+    if (received < 20 || r16(response) != 0x0103U || relayed == NULL || value_len != 8U) return -1;
+    memset(relay, 0, sizeof(*relay));
+    relay->sin_family = AF_INET;
+    relay->sin_port = htons((unsigned short)(r16(relayed + 2U) ^ (COOKIE >> 16U)));
+    relay->sin_addr.s_addr = htonl(r32(relayed + 4U) ^ COOKIE);
+    return 0;
+}
+
+static int permit_peer(int fd,
+                       const struct sockaddr_in *server,
+                       const char *username,
+                       const unsigned char key[16],
+                       const struct sockaddr_in *peer,
+                       unsigned seed)
+{
+    packet_builder request;
+    unsigned char response[2048];
+    start(&request, 0x0008U, seed);
+    add_xor_peer(&request, peer);
+    attr(&request, 0x0006U, username, strlen(username));
+    attr(&request, 0x0014U, st_turn_auth_realm(), strlen(st_turn_auth_realm()));
+    attr(&request, 0x0015U, st_turn_auth_nonce(), strlen(st_turn_auth_nonce()));
+    integrity(&request, key);
+    int received = exchange(fd, server, &request, response, sizeof(response));
+    return received >= 20 && r16(response) == 0x0108U ? 0 : -1;
+}
+
+/* Sends payload from one allocation to another's relayed address with a Send indication and reports
+ * whether it arrived, intact, as a Data indication at the other client. */
+static int relayed(int from_fd,
+                   const struct sockaddr_in *server,
+                   const struct sockaddr_in *to_relay,
+                   int to_fd,
+                   const char *payload,
+                   unsigned seed)
+{
+    packet_builder request;
+    unsigned char response[2048];
+    size_t value_len = 0;
+    start(&request, 0x0016U, seed);
+    add_xor_peer(&request, to_relay);
+    attr(&request, 0x0013U, payload, strlen(payload));
+    if (sendto(from_fd, request.bytes, request.len, 0,
+               (const struct sockaddr *)server, sizeof(*server)) != (ssize_t)request.len) return 0;
+    int received = (int)recvfrom(to_fd, response, sizeof(response), 0, NULL, NULL);
+    const unsigned char *data = received > 0
+        ? find_attr(response, (size_t)received, 0x0013U, &value_len) : NULL;
+    return received >= 20 && r16(response) == 0x0017U && data != NULL
+        && value_len == strlen(payload) && memcmp(data, payload, value_len) == 0;
+}
+
+/* Peer Mesh relaying is authorized per datagram against the session the control channel granted:
+ * a connectivity check crosses only with that session's token. The session lives in the server's
+ * database, SPECUS_DATABASE_PATH, so this is also what proves the relay reads the same database as
+ * the rest of the server. */
+static int peer_mesh_relay_tests(const struct sockaddr_in *server)
+{
+    char path[] = "/tmp/specus_c_stun_turn_peer_mesh.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    st_storage_client source;
+    st_storage_client target;
+    st_storage_peer_mesh_device source_device;
+    st_storage_peer_mesh_device target_device;
+    st_storage_peer_mesh_session session;
+    const char *token = "stun-turn-test-session-token";
+    uint8_t token_digest[ST_SHA256_LEN];
+    char token_hash[ST_SHA256_HEX_LEN + 1U];
+    st_sha256((const uint8_t *)token, strlen(token), token_digest);
+    st_hex_encode(token_digest, sizeof(token_digest), token_hash);
+    if (st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-relay", "relay-source", "owner", 1, 60, &source) != 0
+        || st_storage_upsert_client(path, 0, "tenant-relay", "relay-target", "owner", 1, 60, &target) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &source, 1, &source_device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &target, 1, &target_device) != 0
+        || st_storage_create_peer_mesh_session(path, &source, &target, "RELAY", token_hash, 3600,
+                                               &session) != 0) {
+        fprintf(stderr, "Peer Mesh relay test database setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    setenv("SPECUS_DATABASE_PATH", path, 1);
+
+    struct sockaddr_in source_address;
+    struct sockaddr_in target_address;
+    struct sockaddr_in source_relay;
+    struct sockaddr_in target_relay;
+    char source_user[192];
+    char target_user[192];
+    unsigned char source_key[16];
+    unsigned char target_key[16];
+    int source_fd = udp_socket(&source_address);
+    int target_fd = udp_socket(&target_address);
+    int failed = source_fd < 0 || target_fd < 0
+        || allocate_peer_relay(source_fd, server, source.id, 200U, source_user, source_key, &source_relay) != 0
+        || allocate_peer_relay(target_fd, server, target.id, 210U, target_user, target_key, &target_relay) != 0
+        || permit_peer(source_fd, server, source_user, source_key, &target_relay, 220U) != 0
+        || permit_peer(target_fd, server, target_user, target_key, &source_relay, 230U) != 0;
+    if (failed) fprintf(stderr, "Peer Mesh relay allocation/permission mismatch\n");
+
+    char check[512];
+    char forged[512];
+    char reply[512];
+    snprintf(check, sizeof(check),
+             "{\"magic\":\"specus-peer-mesh\",\"type\":\"check\",\"sessionId\":%lld,"
+             "\"fromClientId\":%lld,\"toClientId\":%lld,\"nonce\":\"n1\",\"token\":\"%s\"}",
+             session.id, source.id, target.id, token);
+    snprintf(forged, sizeof(forged),
+             "{\"magic\":\"specus-peer-mesh\",\"type\":\"check\",\"sessionId\":%lld,"
+             "\"fromClientId\":%lld,\"toClientId\":%lld,\"nonce\":\"n2\",\"token\":\"not-the-token\"}",
+             session.id, source.id, target.id);
+    snprintf(reply, sizeof(reply),
+             "{\"magic\":\"specus-peer-mesh\",\"type\":\"check-response\",\"sessionId\":%lld,"
+             "\"fromClientId\":%lld,\"toClientId\":%lld,\"nonce\":\"n1\",\"token\":\"%s\"}",
+             session.id, target.id, source.id, token);
+    if (!failed && !relayed(source_fd, server, &target_relay, target_fd, check, 240U)) {
+        fprintf(stderr, "Peer Mesh check with the session token was not relayed\n");
+        failed = 1;
+    }
+    if (!failed && !relayed(target_fd, server, &source_relay, source_fd, reply, 250U)) {
+        fprintf(stderr, "Peer Mesh check-response with the session token was not relayed\n");
+        failed = 1;
+    }
+    if (!failed && relayed(source_fd, server, &target_relay, target_fd, forged, 260U)) {
+        fprintf(stderr, "Peer Mesh check with a forged token was relayed\n");
+        failed = 1;
+    }
+    if (source_fd >= 0) close(source_fd);
+    if (target_fd >= 0) close(target_fd);
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(path);
+    return failed;
 }
 
 int main(void)
@@ -333,6 +493,7 @@ int main(void)
     close(peer);
     close(client2);
     close(client);
+    if (peer_mesh_relay_tests(&server_address) != 0) return 1;
     st_stun_turn_server_stop(server);
 
     struct sockaddr_in reserved_primary;

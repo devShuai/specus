@@ -206,6 +206,25 @@ static int pm_append_named_string(pm_builder *builder,
     return pm_append_json_string(builder, value);
 }
 
+/* A session expiry as the wire carries it: an RFC 3339 UTC instant, which is what Java's
+ * Instant.toString() writes and protocol/spec/peer-mesh.md shows. SQLite keeps the expiry as
+ * "YYYY-MM-DD HH:MM:SS" in UTC; sent as stored, a .NET client reads it as local time (an expired
+ * session east of UTC) and a Go client cannot parse it at all. */
+static int pm_append_session_expiry(pm_builder *builder, const char *stored)
+{
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    char trailing = '\0';
+    char instant[32];
+    if (stored != NULL
+        && sscanf(stored, "%4d-%2d-%2d %2d:%2d:%2d%c",
+                  &year, &month, &day, &hour, &minute, &second, &trailing) == 6) {
+        snprintf(instant, sizeof(instant), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                 year, month, day, hour, minute, second);
+        stored = instant;
+    }
+    return pm_append_named_string(builder, "expiresAt", stored);
+}
+
 static int pm_append_input_string(pm_builder *builder,
                                   const char *input,
                                   const char *name)
@@ -253,7 +272,7 @@ static char *pm_build_signal(const char *input,
     if (session_id > 0 && pm_appendf(&builder, ",\"sessionId\":%lld", session_id) != 0) goto failed;
     if (opened_token != NULL) {
         if (pm_append_named_string(&builder, "token", opened_token) != 0
-            || pm_append_named_string(&builder, "expiresAt", opened_session->expires_at) != 0) goto failed;
+            || pm_append_session_expiry(&builder, opened_session->expires_at) != 0) goto failed;
     } else if (pm_append_input_string(&builder, input, "token") != 0
                || pm_append_input_string(&builder, input, "expiresAt") != 0) goto failed;
 
@@ -310,7 +329,7 @@ static char *pm_build_grant(const st_storage_client *source,
         || pm_append_named_string(&builder, "targetVirtualIp", target_device->virtual_ip) != 0
         || pm_append_named_string(&builder, "targetPublicKey", target_device->public_key) != 0
         || pm_append_named_string(&builder, "token", token) != 0
-        || pm_append_named_string(&builder, "expiresAt", session->expires_at) != 0
+        || pm_append_session_expiry(&builder, session->expires_at) != 0
         || pm_append_named_string(&builder, "pathType", session->path_type) != 0
         || pm_append_named_string(&builder, "status", session->status) != 0
         || pm_appendf(&builder, ",\"dataFrameVersion\":2,\"createdAtMillis\":%lld}",
