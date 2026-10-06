@@ -367,7 +367,7 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 | --- | --- |
 | Windows | `IP_UNICAST_IF`（`IPPROTO_IP`，31）。值为接口索引的**网络字节序**，传主机序时 setsockopt 直接报错；读回时却是主机序 |
 | macOS | `IP_BOUND_IF`（`IPPROTO_IP`，25）。值为接口索引的主机序 |
-| Linux | 不绑定接口。Go 与 .NET 给 socket 打 `SO_MARK 0x5350`，由运维添加策略路由，见[对系统的改动](#对系统的改动)；Java 不打，见当前限制 |
+| Linux | 不绑定接口。三端都给 socket 打 `SO_MARK 0x5350`（`SOL_SOCKET`，36），由运维添加策略路由，见[对系统的改动](#对系统的改动)。打标记要 `CAP_NET_ADMIN`，打不上时忽略，照常 connect |
 
 这两个选项都不需要提权，也都由协议栈强制执行：绑到一个没有路由通往目标的接口上，流量不会换个接口出去，而是失败。失败发生在哪一步因平台和协议而异，都是实测的：
 
@@ -386,9 +386,9 @@ hop → enabled → peerAcl → consumer → forcedDeny → scope
 
 **读表。** Windows 每次 connect 用 `GetIpForwardTable2` 与 `GetIpInterfaceTable` 原生读取，不经 PowerShell：一次 `Get-NetRoute` 要 419 ms，这两个调用是微秒级，不需要缓存，切网之后下一次 connect 就能看到。macOS 读 `netstat -rn -f inet`，与路由接管同一套读取与归一，25 ms 一次，结果保留 2 秒：隧道自己的路由本来就不参与选择，缓存能错过的只有物理网络的变化，而错过的后果是 connect 失败，不是泄漏。
 
-**Java 的前提。** JDK 不提供这两个选项，也不暴露 socket 句柄。Java 客户端经 `sun.nio.ch.SelChImpl.getFDVal()` 取句柄，再用 JNA 调 setsockopt，这要求 JVM 带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`。发布的 jar 在清单里声明了 `Add-Exports`，`java -jar` 启动时自动生效，Spring Boot 嵌套加载的类同样适用；以其他方式启动又缺这个选项时，Windows 与 macOS 上的每次出口建流都会被拒绝，日志写明缺的是哪个选项。
+**Java 的前提。** JDK 不提供这两个选项，也不提供 `SO_MARK`，更不暴露 socket 句柄。Java 客户端经 `sun.nio.ch.SelChImpl.getFDVal()` 取句柄，再用 JNA 调 setsockopt，这要求 JVM 带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`。发布的 jar 在清单里声明了 `Add-Exports`，`java -jar` 启动时自动生效，Spring Boot 嵌套加载的类同样适用；以其他方式启动又缺这个选项时，Windows 与 macOS 上的每次出口建流都会被拒绝，日志写明缺的是哪个选项。Linux 上不拒绝：标记本来就是尽力而为，拿不到句柄时 socket 不打标记、照常 connect，日志只在第一次写明原因。
 
-固定向量：`protocol/test-vectors/peer-egress-socket-binding-v1.json`，覆盖接口选择、Windows 两张表的二进制布局、macOS 的候选路由与两个选项的编码。Windows 表布局按 SDK 结构体用 ctypes 生成，偏移在 Windows 11 26200 上与 `Get-NetRoute`、`Get-NetIPInterface` 逐行比对过，三端测试在每次 Windows CI 上重做这一比对。三端另有真实 socket 测试：连 127.0.0.1 时读回绑定的是回环接口；把回环接口当作隧道时拒绝建流；给绑定器一张声称 `127.0.0.0/8` 在物理接口上的表时，TCP 连不上、UDP 数据报送不到。UDP 那一半真的发包并在监听端等待，先用正确绑定发一次、必须收到，因为 macOS 上错误绑定的 UDP socket 能连接成功，只看 connect 会误判。最后这条在不设选项时会通过，所以它证明的是选项真的起了作用。Windows 部分在 CLI 矩阵的 windows runner 上运行，macOS 部分在 `peer-egress-macos.yml` 的 macOS runner 上运行。
+固定向量：`protocol/test-vectors/peer-egress-socket-binding-v1.json`，覆盖接口选择、Windows 两张表的二进制布局、macOS 的候选路由与两个选项的编码。Windows 表布局按 SDK 结构体用 ctypes 生成，偏移在 Windows 11 26200 上与 `Get-NetRoute`、`Get-NetIPInterface` 逐行比对过，三端测试在每次 Windows CI 上重做这一比对。三端另有真实 socket 测试：连 127.0.0.1 时读回绑定的是回环接口；把回环接口当作隧道时拒绝建流；给绑定器一张声称 `127.0.0.0/8` 在物理接口上的表时，TCP 连不上、UDP 数据报送不到。UDP 那一半真的发包并在监听端等待，先用正确绑定发一次、必须收到，因为 macOS 上错误绑定的 UDP socket 能连接成功，只看 connect 会误判。最后这条在不设选项时会通过，所以它证明的是选项真的起了作用。Windows 部分在 CLI 矩阵的 windows runner 上运行，macOS 部分在 `peer-egress-macos.yml` 的 macOS runner 上运行。Linux 上 Java 另有一条真实 socket 测试：进程有 `CAP_NET_ADMIN` 时，读回 TCP 与 UDP socket 的标记必须是 `0x5350`；两种能力（`CAP_NET_ADMIN`、`CAP_NET_RAW`）都没有时，标记读回为 0，连接仍要成功，证明设不上标记不影响建流。CLI 矩阵的 ubuntu runner 以普通用户运行，跑的是后一半。
 
 ## 能力协商
 
@@ -763,7 +763,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 拒绝日志按相同主体和原因限频，审计缓存设进程级硬上限。日志默认不记录请求正文、凭据或完整访问历史，诊断信息脱敏。具体到三端的出口日志：
 
 - 出口拒绝一条流：`[peer-egress] refused consumer=<id> protocol=<tcp|udp> code=<码>`（限频时附 `suppressed=<n>`），不写目标地址与端口；目标随拒绝控制消息告诉消费端本身。
-- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。
+- 出口建连失败：`[peer-egress] connect failed consumer=<id> protocol=<tcp|udp> reason=<原因>`，原因取 `refused`、`timed out`、`unreachable`、`no route outside the tunnel`、`error`、`no socket` 之一。系统错误文本里常夹带目标地址，因此不原样写入。Java 客户端因缺 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED` 拿不到 socket 句柄时（Windows 与 macOS 上每次建流都会这样失败，见[出站 socket](#出站-socket)），原因仍为 `error`，其后附 `missing="--add-exports java.base/sun.nio.ch=ALL-UNNAMED"`。
 - 消费端运行时跳过被拒的规则：`[peer-egress-consumer] rule <序号> refused: <码>`，不写 `match`，与离线校验的告警同一约定。
 
 ## 对系统的改动
@@ -776,7 +776,7 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 | 持久路由（Windows PersistentStore、Linux 与 macOS 的开机配置） | 不写 |
 | 运行期路由表 | 会添加：规则需要的前缀与旁路条目。Windows 写入 ActiveStore，Linux 用 `ip route add`，macOS 用 `route add`，三者都不跨重启存在。正常退出时撤回；崩溃后，下次启动时按安装记录先全部收回，再按当前计划重装，规则已删空也照样收回 |
 | 防火墙、NAT、`ip_forward` 等内核参数 | 不改。出口用用户态栈终结连接、用普通 socket 连目标，不做内核转发 |
-| Linux 策略路由规则 | 不装。Go 与 .NET 出口给出站 socket 打 `SO_MARK 0x5350`，但把这个标记接到物理接口的 `ip rule` 由运维按需自己添加；没有这条规则时，只要隧道没有接管默认路由，行为照常 |
+| Linux 策略路由规则 | 不装。三端出口都给出站 socket 打 `SO_MARK 0x5350`，但把这个标记接到物理接口的 `ip rule` 由运维按需自己添加；没有这条规则时，只要隧道没有接管默认路由，行为照常 |
 | 出站 socket 的接口绑定（Windows、macOS） | 不改系统配置。`IP_UNICAST_IF` 与 `IP_BOUND_IF` 是单个 socket 的选项，随 socket 关闭消失，见[出站 socket](#出站-socket) |
 | 本机文件 | 路由安装记录 `~/.specus/egress-routes.json` 与 CLI 状态文件，均在当前用户目录下 |
 
@@ -799,5 +799,4 @@ RST 到达。Peer UDP 通道可能让拒绝消息先到、RST 后到或丢失，
 - **对端端点变化后旁路最多晚 5 秒跟上。** 旁路随组网的保活节拍重算，不随会话建立事件立即应用；这 5 秒内一条覆盖了新端点的规则会把该对端的传输送进隧道，对端会话会因此重建。
 - **出口侧没有字节速率（带宽）限制。** 并发流数、每消费端流数、新建流速率与空闲超时有上限，带宽没有。
 - **消费端桌面图形界面没有出口分流页面。** 状态可以通过 `specus-client egress` 与本地管理页查看。
-- **Java 出口端在 Linux 上不给出站 socket 打标记。** Go 与 .NET 在 Linux 上用 `SO_MARK`（`0x5350`）让策略路由把转发流量固定在物理接口上。Java 在 Windows 与 macOS 上已经能拿到 socket 句柄来绑定接口（见[出站 socket](#出站-socket)），同一个句柄在 Linux 上也能打标记，但这一步没有做，单独跟进。在那之前，Java 出口端在 Linux 上靠强制拒绝清单挡住回环——本机 TUN 与虚拟接口网段在 connect 前就被拒绝——但那挡的是回环，不是路由：如果这台机器的隧道抢走了默认路由，Java 出口会把转发流量送进隧道而不是物理接口。一期不接管默认路由，所以这个状态不会由本功能自己造成，但运维用别的方式抢了默认路由就会看到。
-- **Java 客户端不经 `java -jar` 启动时需要自己带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`**，否则 Windows 与 macOS 上的出口建流全部被拒绝。jar 清单里的声明只对 `java -jar` 生效。
+- **Java 客户端不经 `java -jar` 启动时需要自己带 `--add-exports java.base/sun.nio.ch=ALL-UNNAMED`**，否则 Windows 与 macOS 上的出口建流全部被拒绝，Linux 上建流照常但出站 socket 不带 `SO_MARK`。jar 清单里的声明只对 `java -jar` 生效。
