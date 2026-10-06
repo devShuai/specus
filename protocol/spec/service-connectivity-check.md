@@ -280,7 +280,7 @@ OPEN 的 metadata 固定如下：
 | `route-not-loaded` | 当前配置快照里没有这条 route，或者它的 `targetBaseUrl` 为空 | `device-online` / `DEVICE_ROUTE_NOT_LOADED` |
 | `target-invalid` | 有这条 route，但拼出的目标地址不能用（scheme 非法、地址非法、路径非法） | `target-reachable` / `TARGET_ADDRESS_INVALID` |
 | `connect-refused` | TCP 连接被拒绝（`ECONNREFUSED` 等价物） | `TARGET_CONNECT_REFUSED` |
-| `connect-timeout` | 客户端自己的连接超时到期 | `TARGET_CONNECT_TIMEOUT` |
+| `connect-timeout` | 客户端自己的 5 s 连接时限到期。这个时限覆盖 DNS 解析、TCP 连接与 TLS 握手三段，所以解析途中或握手途中到期也报它；只有解析器自己放弃才报 `dns-failed` | `TARGET_CONNECT_TIMEOUT` |
 | `dns-failed` | 目标主机名解析失败或没有可用地址 | `TARGET_DNS_FAILED` |
 | `tls-failed` | TLS 握手失败，或证书或主机名校验失败 | `TARGET_TLS_FAILED` |
 | `unreachable` | 主机或网络不可达，没有路由，连接阶段被重置 | `TARGET_UNREACHABLE` |
@@ -290,6 +290,8 @@ OPEN 的 metadata 固定如下：
 - 分类必须基于运行时给出的错误类型或错误码，例如 Go 的 `*net.OpError`/`*net.DNSError`/`x509` 错误、Java 的 `ConnectException`/`ConnectTimeoutException`/`UnknownHostException`/`SSLException`、.NET 的 `SocketError` 与 `AuthenticationException`、Android 上 Netty 的对应类型。不能基于消息文本。
 - `value` 维持各语言现有的数字不变（服务端不读它），`reason` 也照旧。响应 `OPEN` 之后的失败（响应体超限、读取失败）与本检查无关，不加 `failure`。
 - 服务端**只采信声明了 `version >= 1` 的会话发来的 `failure`**。旧会话的 RST 即使碰巧带了同名键，也按 `TARGET_UNVERIFIED` 处理，见向量 `legacy-client-reset-ignores-failure`。
+
+- 各语言能分出的类别不完全相同，分不出的就不带 `failure`：Java 的 NIO 对网络不可达与连接阶段被重置都只给普通 `SocketException`，所以 Java 客户端不报 `unreachable`，服务端据此判 `TARGET_UNVERIFIED`；.NET 只有在所用 HttpClient 没有整体超时时才把超时归为 `connect-timeout`。
 
 ### 6.3 兼容矩阵
 
