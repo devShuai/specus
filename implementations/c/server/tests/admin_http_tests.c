@@ -9,6 +9,7 @@
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
+#include "security.h"
 #include "storage.h"
 
 #include <arpa/inet.h>
@@ -60,6 +61,164 @@ static void sign_client_auth(const char *api_key,
 static int contains(const char *haystack, const char *needle)
 {
     return strstr(haystack, needle) != NULL;
+}
+
+/* Logs a stored management user in and returns "Bearer <token>" in authorization. */
+static int management_login(const char *username, const char *password, char *authorization, size_t len)
+{
+    static char response[65536];
+    char body[256];
+    snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+    int written = st_admin_build_response_with_body("POST", "/auth/login", body, response, sizeof(response));
+    char *token = written > 0 && contains(response, "200 OK") ? st_json_get_string(response, "accessToken") : NULL;
+    if (token == NULL) {
+        fprintf(stderr, "management login for %s failed: %s\n", username, response);
+        return -1;
+    }
+    snprintf(authorization, len, "Bearer %s", token);
+    free(token);
+    return 0;
+}
+
+static int expect_with_token(const char *what, const char *method, const char *path,
+                             const char *authorization, const char *status, const char *needle)
+{
+    static char response[65536];
+    int len = st_admin_build_response_with_auth(method, path, authorization, NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, status) || (needle != NULL && !contains(response, needle))) {
+        fprintf(stderr, "%s: expected %s%s%s, got: %.300s\n", what, status,
+                needle == NULL ? "" : " with ", needle == NULL ? "" : needle, response);
+        return 1;
+    }
+    return 0;
+}
+
+static int update_management_user(const char *username, const char *body)
+{
+    static char response[65536];
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/users/%s", username);
+    int len = body == NULL
+        ? st_admin_build_response("DELETE", path, response, sizeof(response))
+        : st_admin_build_response_with_body("PUT", path, body, response, sizeof(response));
+    if (len <= 0 || (!contains(response, "200 OK") && !contains(response, "204 No Content"))) {
+        fprintf(stderr, "management user change for %s failed: %s\n", username, response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * A management token names an account; it does not freeze the account's rights. Like Java's
+ * ManagementContextResolver every request and every refresh re-reads the user: a disabled or
+ * deleted user is refused at once (403 on requests, 401 on refresh, with Java's bodies), and a
+ * demoted admin loses the admin endpoints on its next request and is refreshed as USER.
+ * Expects SPECUS_DATABASE_PATH to be set.
+ */
+static int test_management_token_follows_user_record(void)
+{
+    static char response[65536];
+    const char *gone = "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}";
+    const char *refresh_gone = "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}";
+    if (st_admin_build_response_with_body("POST", "/api/admin/users",
+            "{\"username\":\"dora\",\"password\":\"dora-secret\",\"role\":\"ADMIN\",\"enabled\":true}",
+            response, sizeof(response)) <= 0 || !contains(response, "201 Created")
+        || st_admin_build_response_with_body("POST", "/api/admin/users",
+            "{\"username\":\"evan\",\"password\":\"evan-secret\",\"role\":\"USER\",\"enabled\":true}",
+            response, sizeof(response)) <= 0 || !contains(response, "201 Created")) {
+        fprintf(stderr, "management token test users could not be created: %s\n", response);
+        return 1;
+    }
+    char dora[2300];
+    char evan[2300];
+    if (management_login("dora", "dora-secret", dora, sizeof(dora)) != 0
+        || management_login("evan", "evan-secret", evan, sizeof(evan)) != 0
+        || expect_with_token("admin before demotion", "GET", "/api/admin/users", dora, "200 OK", NULL)
+        || expect_with_token("user before disable", "GET", "/api/admin/me", evan, "200 OK", "\"admin\":false")) {
+        return 1;
+    }
+
+    /* Demoted: the old ADMIN token loses the admin endpoints, and refresh issues a USER token. */
+    if (update_management_user("dora", "{\"role\":\"USER\"}")
+        || expect_with_token("demoted admin, admin endpoint", "GET", "/api/admin/users", dora,
+                             "403 Forbidden", "需要 admin 权限")
+        || expect_with_token("demoted admin, me", "GET", "/api/admin/me", dora, "200 OK", "\"admin\":false")) {
+        return 1;
+    }
+    int len = st_admin_build_response_with_auth("POST", "/auth/refresh", dora, NULL, response, sizeof(response));
+    char *refreshed = len > 0 && contains(response, "200 OK") ? st_json_get_string(response, "accessToken") : NULL;
+    st_security_token_claims claims;
+    int refreshed_as_user = refreshed != NULL
+        && st_security_validate_local_token(refreshed, getenv("SPECUS_AUTH_JWT_SECRET"),
+                                            "default", "admin-user", &claims) == 0
+        && strcmp(claims.role, "USER") == 0;
+    free(refreshed);
+    if (!refreshed_as_user) {
+        fprintf(stderr, "demoted admin was not refreshed as USER: %.300s\n", response);
+        return 1;
+    }
+
+    /* Disabled: every request is refused, and so is refresh. */
+    if (update_management_user("evan", "{\"enabled\":false}")
+        || expect_with_token("disabled user, me", "GET", "/api/admin/me", evan, "403 Forbidden", gone)
+        || expect_with_token("disabled user, clients", "GET", "/api/admin/clients", evan, "403 Forbidden", gone)
+        || expect_with_token("disabled user, refresh", "POST", "/auth/refresh", evan, "401 Unauthorized",
+                             refresh_gone)) {
+        return 1;
+    }
+    /* Re-enabled, the same token works again: nothing about the account was frozen into it. */
+    if (update_management_user("evan", "{\"enabled\":true}")
+        || expect_with_token("re-enabled user", "GET", "/api/admin/me", evan, "200 OK", "\"username\":\"evan\"")) {
+        return 1;
+    }
+
+    /* Deleted: refused, refresh included. */
+    if (update_management_user("dora", NULL)
+        || update_management_user("evan", NULL)
+        || expect_with_token("deleted user, me", "GET", "/api/admin/me", dora, "403 Forbidden", gone)
+        || expect_with_token("deleted user, refresh", "POST", "/auth/refresh", dora, "401 Unauthorized",
+                             refresh_gone)
+        || expect_with_token("deleted user, me", "GET", "/api/admin/me", evan, "403 Forbidden", gone)) {
+        return 1;
+    }
+
+    /* A token that names a user the server never had, signed with the server's key. */
+    char token[2048];
+    char ghost[2300];
+    if (st_security_issue_local_token("ghost", "tenant-admin", "ADMIN", getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      600, token, sizeof(token)) != 0) {
+        return 1;
+    }
+    snprintf(ghost, sizeof(ghost), "Bearer %s", token);
+    if (expect_with_token("unknown user with an ADMIN claim", "GET", "/api/admin/users", ghost,
+                          "403 Forbidden", gone)) {
+        return 1;
+    }
+
+    /* The built-in admin keeps its rights only while it may still sign in with its password. */
+    char builtin[2300];
+    if (st_security_issue_local_token("admin-user", "tenant-admin", "ADMIN", getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      600, token, sizeof(token)) != 0) {
+        return 1;
+    }
+    snprintf(builtin, sizeof(builtin), "Bearer %s", token);
+    char *saved_password = getenv("SPECUS_AUTH_PASSWORD") == NULL ? NULL : strdup(getenv("SPECUS_AUTH_PASSWORD"));
+    setenv("SPECUS_AUTH_PASSWORD", "builtin-admin-password", 1);
+    int failed = expect_with_token("built-in admin", "GET", "/api/admin/users", builtin, "200 OK", NULL);
+    setenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", "false", 1);
+    failed = failed
+        || expect_with_token("built-in admin, password login off", "GET", "/api/admin/users", builtin,
+                             "403 Forbidden", gone)
+        || expect_with_token("built-in admin, password login off, refresh", "POST", "/auth/refresh", builtin,
+                             "401 Unauthorized", refresh_gone);
+    unsetenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED");
+    if (saved_password == NULL) {
+        unsetenv("SPECUS_AUTH_PASSWORD");
+    } else {
+        setenv("SPECUS_AUTH_PASSWORD", saved_password, 1);
+        free(saved_password);
+    }
+    return failed;
 }
 
 /*
@@ -3815,6 +3974,9 @@ int main(void)
         return 1;
     }
     free(alice_token);
+    if (test_management_token_follows_user_record() != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_body("PUT",
                                             "/api/admin/users/alice",
                                             "{\"role\":\"ADMIN\",\"enabled\":false}",

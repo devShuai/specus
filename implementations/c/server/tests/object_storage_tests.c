@@ -237,6 +237,21 @@ static int cap_create_database(const char *path,
             && sqlite3_step(stmt) == SQLITE_DONE;
         sqlite3_finalize(stmt);
     }
+    /* The admin entry point re-reads the account a bearer token names (as Java's
+     * ManagementContextResolver does), so the accounts the HTTP checks use must exist. Usernames
+     * are unique across tenants in the C store, so t2/alice is checked on the module directly. */
+    if (ok) {
+        ok = sqlite3_exec(db,
+                "CREATE TABLE IF NOT EXISTS specus_management_user(username TEXT PRIMARY KEY,"
+                "tenant_id TEXT NOT NULL DEFAULT 'default',password_hash TEXT NOT NULL,"
+                "role TEXT NOT NULL DEFAULT 'USER',enabled INTEGER NOT NULL DEFAULT 1,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+                "INSERT OR REPLACE INTO specus_management_user(username,tenant_id,password_hash,role,enabled) "
+                "VALUES('alice','t1','unused','USER',1),('bob','t1','unused','USER',1),"
+                "('root','t1','unused','ADMIN',1);",
+                NULL, NULL, NULL) == SQLITE_OK;
+    }
     if (!ok) fprintf(stderr, "capabilities seed failed: %s\n", db == NULL ? "open" : sqlite3_errmsg(db));
     if (db != NULL) sqlite3_close(db);
     return ok ? 0 : -1;
@@ -312,6 +327,20 @@ static int cap_get(const char *path,
     char authorization[2300];
     if (cap_bearer(username, tenant, role, CAP_SECRET, authorization, sizeof(authorization)) != 0) return -1;
     return st_admin_build_response_with_auth("GET", path, authorization, NULL, out, out_len);
+}
+
+/*
+ * The route itself with an identity, bypassing the admin entry point. Used where the database is
+ * missing or broken on purpose: through HTTP the account lookup would answer before the route.
+ */
+static int cap_get_module(const char *path,
+                          const char *username,
+                          const char *tenant,
+                          char *out,
+                          size_t out_len)
+{
+    const st_object_storage_identity identity = {tenant, username, 0, 1};
+    return st_object_storage_build_response("GET", path, NULL, "", NULL, NULL, &identity, out, out_len);
 }
 
 static const char *cap_body(const char *response)
@@ -489,7 +518,7 @@ static int cap_account_snapshots(const char *previous, const char *current, cons
     len = cap_get(CAP_ROUTE, "bob", "t1", "USER", response, sizeof(response));
     failed |= cap_expect_snapshot(len, response, &bob);
     const cap_expected other_tenant = {"true", 4096, 5, 1000, 7000, 0, 50, 9200, 0};
-    len = cap_get(CAP_ROUTE, "alice", "t2", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t2", response, sizeof(response));
     failed |= cap_expect_snapshot(len, response, &other_tenant);
     /* An administrator still gets only its own account, never the tenant total. */
     const cap_expected administrator = {"true", 4096, 5, 1000, 0, 1000, 50, 0, 50};
@@ -616,13 +645,13 @@ static int test_capabilities_read_failures(void)
     if (configure() != 0) return -1;
     char response[4096];
     unsetenv("SPECUS_DATABASE_PATH");
-    int len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    int len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     int failed = cap_expect_failure(len, response, "HTTP/1.1 503 ", "without a database");
 
     /* A missing file is unavailable persistence, and the read-only open must not create it. */
     unlink(CAP_MISSING_DB);
     setenv("SPECUS_DATABASE_PATH", CAP_MISSING_DB, 1);
-    len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     failed |= cap_expect_failure(len, response, "HTTP/1.1 503 ", "with a missing database file");
     if (access(CAP_MISSING_DB, F_OK) == 0) {
         fprintf(stderr, "capabilities created a database file\n");
@@ -635,18 +664,18 @@ static int test_capabilities_read_failures(void)
     for (int i = 0; i < 64; ++i) fputs("not a sqlite database page ", garbage);
     fclose(garbage);
     setenv("SPECUS_DATABASE_PATH", CAP_DB, 1);
-    len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     failed |= cap_expect_failure(len, response, "HTTP/1.1 500 ", "with a corrupt database");
 
     /* Attachment rows that cannot be read, then download usage that cannot be read. */
     unlink(CAP_DB);
     if (cap_exec(CAP_DB, "CREATE TABLE transfer_attachment(id INTEGER PRIMARY KEY);") != 0) return -1;
-    len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     failed |= cap_expect_failure(len, response, "HTTP/1.1 500 ", "with an unreadable attachment table");
     if (cap_seed_single_account() != 0
         || cap_exec(CAP_DB, "DROP TABLE transfer_attachment_download_usage;"
                             "CREATE TABLE transfer_attachment_download_usage(id INTEGER PRIMARY KEY);") != 0) return -1;
-    len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     failed |= cap_expect_failure(len, response, "HTTP/1.1 500 ", "with an unreadable download usage table");
 
     /* No attachment was ever allocated, so the tables were never bootstrapped: that is a
@@ -658,7 +687,7 @@ static int test_capabilities_read_failures(void)
     if (before == NULL) return -1;
     cap_set_limits("1000", "50", NULL, NULL);
     const cap_expected fresh = {"true", CAP_DEFAULT_MAX, 72, 1000, 0, 1000, 50, 0, 50};
-    len = cap_get(CAP_ROUTE, "alice", "t1", "USER", response, sizeof(response));
+    len = cap_get_module(CAP_ROUTE, "alice", "t1", response, sizeof(response));
     failed |= cap_expect_snapshot(len, response, &fresh);
     failed |= cap_file_unchanged(CAP_DB, before, before_len);
     free(before);

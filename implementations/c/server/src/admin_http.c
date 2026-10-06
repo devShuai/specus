@@ -735,6 +735,61 @@ static void admin_context_from_env(st_admin_context *context)
     context->authenticated = 1;
 }
 
+static const char *normalize_management_role(const char *role);
+
+/*
+ * A valid signature only says which account the token was issued to. Like Java's
+ * ManagementContextResolver (ManagementUserService.resolveLocalTokenUser) every request re-reads
+ * that account: the built-in admin must still be allowed to log in with its password, and a stored
+ * user must still exist, be enabled and belong to the token's tenant. Tenant, role and admin rights
+ * come from the record as it is now, so disabling, deleting or demoting a user takes effect on the
+ * next request rather than when the token expires. This is one SQLite read per authenticated
+ * request, the counterpart of Java's repository lookup; nothing is cached. Returns 0 when the
+ * account resolves, -1 when it does not, and -2 when the user store cannot be read.
+ */
+static int admin_resolve_token_user(const st_security_token_claims *claims, st_admin_context *context)
+{
+    memset(context, 0, sizeof(*context));
+    const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    if (admin_ascii_casecmp(claims->username, builtin_username) == 0
+        && (claims->tenant_id[0] == '\0' || admin_ascii_casecmp(claims->tenant_id, default_tenant) == 0)) {
+        if (!management_password_login_enabled()) {
+            return -1;
+        }
+        snprintf(context->username, sizeof(context->username), "%s", builtin_username);
+        snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", default_tenant);
+        snprintf(context->role, sizeof(context->role), "%s", "ADMIN");
+        context->admin = 1;
+        context->authenticated = 1;
+        return 0;
+    }
+    /* Without a database there are no stored users, so only the built-in admin can resolve. */
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        return -1;
+    }
+    st_storage_management_user user;
+    int found = st_storage_find_management_user(database_path, claims->username, &user);
+    if (found < 0) {
+        return -2;
+    }
+    if (found != 0
+        || !user.enabled
+        || (claims->tenant_id[0] != '\0' && strcmp(user.tenant_id, claims->tenant_id) != 0)) {
+        return -1;
+    }
+    snprintf(context->username, sizeof(context->username), "%s", user.username);
+    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
+    snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+    context->admin = strcmp(context->role, "ADMIN") == 0;
+    context->authenticated = 1;
+    return 0;
+}
+
+/* 0 when the bearer token is valid and its account still resolves, -1 for an invalid token, -2 for
+ * a valid token whose account is gone, disabled, moved to another tenant or no longer allowed, and
+ * -3 when the account cannot be checked because the user store is unreadable. */
 static int admin_context_from_authorization(const char *authorization, st_admin_context *context)
 {
     memset(context, 0, sizeof(*context));
@@ -760,13 +815,8 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
                                          &claims) != 0) {
         return -1;
     }
-    snprintf(context->username, sizeof(context->username), "%s", claims.username);
-    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", claims.tenant_id);
-    snprintf(context->role, sizeof(context->role), "%s", claims.role);
-    context->admin = admin_ascii_casecmp(claims.role, "ADMIN") == 0
-        || admin_ascii_casecmp(claims.username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0;
-    context->authenticated = 1;
-    return 0;
+    int resolved = admin_resolve_token_user(&claims, context);
+    return resolved == 0 ? 0 : (resolved == -2 ? -3 : -2);
 }
 
 static int admin_path_requires_auth(const char *method, const char *path)
@@ -8475,6 +8525,7 @@ static int handle_management_auth_login(const char *body,
     return write_management_token_response(token_username, token_tenant, token_role, out, out_len);
 }
 
+/* The context was re-read from the user record, so the new token carries today's tenant and role. */
 static int handle_management_auth_refresh(const st_admin_context *context, char *out, size_t out_len)
 {
     if (context == NULL || !context->authenticated) {
@@ -8565,7 +8616,22 @@ static int st_admin_build_response_internal(const char *method,
     admin_context_from_env(&context);
     if (admin_path_requires_auth(method, path)) {
         if (authorization != NULL) {
-            if (admin_context_from_authorization(authorization, &context) != 0) {
+            int auth_rc = admin_context_from_authorization(authorization, &context);
+            /* Java's answers: refresh says 401 so the SPA signs in again, any other request 403. */
+            if (auth_rc == -2 && admin_path_equals(path, "/auth/refresh")) {
+                return write_response(out, out_len, 401, "Unauthorized",
+                                      "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}");
+            }
+            if (auth_rc == -2) {
+                return write_response(out, out_len, 403, "Forbidden",
+                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+            }
+            /* Fail closed, as Java's repository error would surface as a 500. */
+            if (auth_rc == -3) {
+                return write_response(out, out_len, 500, "Internal Server Error",
+                                      "{\"error\":\"management user store unavailable\"}");
+            }
+            if (auth_rc != 0) {
                 return write_admin_unauthorized(out, out_len);
             }
         } else if (!allow_default_admin) {
