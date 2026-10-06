@@ -68,6 +68,13 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
   判定时刻；另有 GCRA 限流事件序列。由 `tools/protocol/generate_service_connectivity_vectors.py` 生成，语义见
   [`protocol/spec/service-connectivity-check.md`](../spec/service-connectivity-check.md)。尚无实现读取它。
 
+## 产品指标（草案）
+
+- `product-metrics-v1.json`：租户显式开启的产品指标。含封闭取值与区间边界、基点舍入、44 个原样上报请求体的
+  接受/拒绝期望，以及按时刻回放的场景（开关与说明确认、服务端接入里程碑与 14 天窗口、传输计数、限流、保存期
+  清理、清除和汇总），每个 `checkpoint` 给出四张表的期望内容。由 `tools/protocol/generate_product_metrics_vectors.py`
+  生成，语义见 [`protocol/spec/product-metrics.md`](../spec/product-metrics.md)。尚无实现读取它。
+
 ## 拒绝规则
 
 每种实现至少覆盖：错误版本、错误 magic/type、截断、尾随字节、越界长度、错误 GCM tag/HMAC、重复
