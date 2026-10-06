@@ -52,6 +52,7 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<TransferAttachmentDownloadGrant> TransferAttachmentDownloadGrants =>
         Set<TransferAttachmentDownloadGrant>();
     public DbSet<UserDiagramDocument> UserDiagramDocuments => Set<UserDiagramDocument>();
+    public DbSet<ManagementWorkbenchItem> ManagementWorkbenchItems => Set<ManagementWorkbenchItem>();
     public DbSet<PublicTransferRoom> PublicTransferRooms => Set<PublicTransferRoom>();
     public DbSet<PublicTransferRoomAccess> PublicTransferRoomAccesses => Set<PublicTransferRoomAccess>();
     public DbSet<PublicTransferRoomPairingCode> PublicTransferRoomPairingCodes =>
@@ -964,6 +965,22 @@ public sealed class SpecusDbContext : DbContext
             b.HasIndex(x => new { x.TenantId, x.OwnerUsername })
                 .HasDatabaseName("idx_user_diagram_owner");
             b.HasIndex(x => x.UpdatedAt).HasDatabaseName("idx_user_diagram_updated");
+        });
+
+        modelBuilder.Entity<ManagementWorkbenchItem>(b =>
+        {
+            b.ToTable("management_workbench_item");
+            // One row per reference and list: the natural key is the uniqueness the upserts rely on.
+            b.HasKey(x => new { x.TenantId, x.Username, x.List, x.Kind, x.ObjectId });
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.List).HasColumnName("list").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Kind).HasColumnName("kind").HasMaxLength(32).IsRequired();
+            b.Property(x => x.ObjectId).HasColumnName("object_id").ValueGeneratedNever().IsRequired();
+            b.Property(x => x.AtMs).HasColumnName("at_ms").IsRequired();
+            // Object deletions cascade by (kind, id); the retention sweep scans recents by time.
+            b.HasIndex(x => new { x.TenantId, x.Kind, x.ObjectId }).HasDatabaseName("idx_mwi_object");
+            b.HasIndex(x => new { x.List, x.AtMs }).HasDatabaseName("idx_mwi_list_at");
         });
 
         modelBuilder.Entity<PublicTransferRoom>(b =>

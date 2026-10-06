@@ -510,6 +510,7 @@ func (a *App) Run(ctx context.Context) error {
 	launch(a.attachments.RunExpiration)
 	launch(a.mediaCapture.Run)
 	launch(a.api.RunRegistrationCleanup)
+	launch(a.api.RunWorkbenchSweep)
 	launch(a.api.HTTPShares().RunSweeper)
 	launch(a.api.HTTPShares().RunStreamWatch)
 	launch(func(ctx context.Context) { runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord) })

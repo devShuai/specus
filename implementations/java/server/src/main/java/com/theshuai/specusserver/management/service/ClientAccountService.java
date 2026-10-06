@@ -52,19 +52,22 @@ public class ClientAccountService {
     private final ClientNameReferenceRepository clientNameReferenceRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final HttpShareService httpShareService;
+    private final WorkbenchReferences workbenchReferences;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
                                 ClientSessionRepository clientSessionRepository,
                                 ClientNameReferenceRepository clientNameReferenceRepository,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
-                                HttpShareService httpShareService) {
+                                HttpShareService httpShareService,
+                                WorkbenchReferences workbenchReferences) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
         this.clientNameReferenceRepository = clientNameReferenceRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.httpShareService = httpShareService;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -241,6 +244,9 @@ public class ClientAccountService {
      * shared later. Each route is audited as deleted and its shares end, all in this transaction.
      */
     private void deleteClient(ClientAccount account, String actor) {
+        // Every identity's workbench reference to the client's services goes in this transaction,
+        // looked up by client id while the route rows still exist.
+        workbenchReferences.forgetClientServices(account.getId());
         List<HttpRouteMapping> routes = httpRouteMappingRepository.findByClientIdOrderByIdDesc(account.getId());
         httpShareService.onClientDeleted(actor, routes);
         httpRouteMappingRepository.deleteAll(routes);

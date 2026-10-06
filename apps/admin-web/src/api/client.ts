@@ -74,9 +74,13 @@ import type {
   UserDiagramDocumentDetail,
   UserDiagramDocumentMutation,
   WebSocketTicket,
+  WorkbenchDocument,
+  WorkbenchKind,
+  WorkbenchRef,
 } from "./types";
 import type { CreateShareBody, CreatedHttpShare, HttpAccessAuditPage, HttpShare } from "../lib/httpShare";
 import { shareManagementMessage } from "../lib/httpShare";
+import { recordWorkbenchOpen, type WorkbenchOpenAction } from "../lib/workbenchRecording";
 import {
   fetchLatestGithubClientDownloads,
   hasCompleteGithubClientDownloadSet,
@@ -139,11 +143,14 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandled = false;
 }
 
+/**
+ * An admin API refusal; status is the HTTP status (0 when the request never got an answer) and code
+ * the machine-readable code of a `{"code": ...}` error body, when the server sent one.
+ */
 export class ApiError extends Error {
-  /** The machine-readable code of a `{"code": ...}` error body, when the server sent one. */
   readonly code?: string;
 
-  constructor(message: string, code?: string) {
+  constructor(message: string, readonly status = 0, code?: string) {
     super(message);
     this.code = code;
   }
@@ -164,17 +171,35 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       unauthorizedHandled = true;
       unauthorizedHandler?.();
     }
-    throw new ApiError("登录已过期");
+    throw new ApiError("登录已过期", 401);
   }
   if (response.status === 204) {
     return null as T;
   }
   const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new ApiError(body?.error || shareManagementMessage(body?.code) || body?.message || response.statusText, body?.code);
+    // An error page from a proxy or an older server is not JSON; keep the status either way.
+    let body: { error?: string; code?: string; message?: string } | null = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    throw new ApiError(body?.error || shareManagementMessage(body?.code) || body?.message || response.statusText,
+      response.status, body?.code);
   }
-  return body as T;
+  return (text ? JSON.parse(text) : null) as T;
+}
+
+/**
+ * Records an open of one service for the signed-in identity, after the action already happened.
+ * Never throws and never notifies: a failure only means the entry is missing from 「最近打开」.
+ */
+export function recordWorkbenchOpenAsCaller(
+  action: WorkbenchOpenAction,
+  ref: WorkbenchRef,
+): Promise<WorkbenchDocument | null> {
+  return recordWorkbenchOpen(action, ref, { token: tokenStore.get() });
 }
 
 // checkHttpRouteConnectivity runs one connectivity check of a route. It is a POST with a JSON body so
@@ -360,6 +385,18 @@ export const adminApi = {
   updateUser: (username: string, body: ManagementUserMutation) =>
     request<ManagementUser>(`/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteUser: (username: string) => request<null>(`/users/${encodeURIComponent(username)}`, { method: "DELETE" }),
+
+  // Service workbench: the caller's own favourites and recent opens. Every write answers the whole
+  // document. Recording an open is not here: it goes through recordWorkbenchOpen (keepalive).
+  workbench: () => request<WorkbenchDocument>("/workbench"),
+  addWorkbenchFavorite: (kind: WorkbenchKind, id: number) =>
+    request<WorkbenchDocument>(`/workbench/favorites/${kind}/${id}`, { method: "PUT" }),
+  removeWorkbenchFavorite: (kind: WorkbenchKind, id: number) =>
+    request<WorkbenchDocument>(`/workbench/favorites/${kind}/${id}`, { method: "DELETE" }),
+  clearWorkbenchFavorites: () => request<WorkbenchDocument>("/workbench/favorites", { method: "DELETE" }),
+  removeWorkbenchRecent: (kind: WorkbenchKind, id: number) =>
+    request<WorkbenchDocument>(`/workbench/recents/${kind}/${id}`, { method: "DELETE" }),
+  clearWorkbenchRecents: () => request<WorkbenchDocument>("/workbench/recents", { method: "DELETE" }),
 
   listDiagrams: () => request<UserDiagramDocument[]>("/diagrams"),
   getDiagram: (id: number) => request<UserDiagramDocumentDetail>(`/diagrams/${id}`),

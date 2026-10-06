@@ -465,6 +465,9 @@ func (db *DB) DeleteHTTPRouteAudited(ctx context.Context, r HTTPRouteMapping, ex
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := deleteWorkbenchReferences(ctx, db, tx, WorkbenchKindHTTPRoute, r.ID); err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM http_route_mapping WHERE id = ?`), r.ID); err != nil {
 		return nil, err
 	}
@@ -554,6 +557,10 @@ func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, n
 			return nil, err
 		}
 	}
+	// Every workbench reference to a service the client carries goes while its rows still exist.
+	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
+		return nil, err
+	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
 			return nil, err
@@ -598,6 +605,11 @@ func (db *DB) DeleteManagementUserAudited(ctx context.Context, username, actor s
 		return nil, err
 	}
 	defer tx.Rollback()
+	// The account's workbench lists are personal history and go with it.
+	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM management_workbench_item WHERE username IN
+		(SELECT username FROM specus_management_user WHERE LOWER(username) = LOWER(?))`), username); err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx,
 		db.rebind(`DELETE FROM specus_management_user WHERE LOWER(username) = LOWER(?)`), username); err != nil {
 		return nil, err

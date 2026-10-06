@@ -142,15 +142,26 @@ func (db *DB) updateClientAndRenameReferences(ctx context.Context, tx sqlRunner,
 	return nil
 }
 
-// DeleteClient removes a client account and its specus/http-route mappings.
+// DeleteClient removes a client account and its specus/http-route mappings, together with every
+// workbench reference to a service the client carries (its Peer services included).
 func (db *DB) DeleteClient(ctx context.Context, id int64) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
+		return err
+	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
-		if _, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
+		if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
 			return err
 		}
 	}
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_account WHERE id = ?`), id)
-	return err
+	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_account WHERE id = ?`), id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- client credentials --------------------------------------------------------------
@@ -526,10 +537,10 @@ func (db *DB) UpdateSpecus(ctx context.Context, m SpecusMapping) error {
 	return err
 }
 
-// DeleteSpecus removes a specus mapping.
+// DeleteSpecus removes a specus mapping and every workbench reference to it.
 func (db *DB) DeleteSpecus(ctx context.Context, id int64) error {
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_mapping WHERE id = ?`), id)
-	return err
+	return db.deleteWithWorkbenchReferences(ctx, WorkbenchKindTCPMapping, id,
+		`DELETE FROM specus_mapping WHERE id = ?`, id)
 }
 
 // ---- http routes ---------------------------------------------------------------------
@@ -633,10 +644,28 @@ func (db *DB) updateHTTPRoute(ctx context.Context, runner sqlRunner, r HTTPRoute
 	return err
 }
 
-// DeleteHTTPRoute removes an HTTP route mapping.
+// DeleteHTTPRoute removes an HTTP route mapping and every workbench reference to it.
 func (db *DB) DeleteHTTPRoute(ctx context.Context, id int64) error {
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM http_route_mapping WHERE id = ?`), id)
-	return err
+	return db.deleteWithWorkbenchReferences(ctx, WorkbenchKindHTTPRoute, id,
+		`DELETE FROM http_route_mapping WHERE id = ?`, id)
+}
+
+// deleteWithWorkbenchReferences runs one delete statement and removes every identity's workbench
+// references to the deleted object in the same transaction.
+func (db *DB) deleteWithWorkbenchReferences(ctx context.Context, kind string, objectID int64,
+	query string, args ...any) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := deleteWorkbenchReferences(ctx, db, tx, kind, objectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, db.rebind(query), args...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---- connections / traffic / stats ---------------------------------------------------

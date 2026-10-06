@@ -44,7 +44,8 @@ class PeerServiceDiscoveryServiceTests {
     private final HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
     private final PeerServiceDiscoveryService service = new PeerServiceDiscoveryService(
             peerMeshService, sharingRepository, serviceRepository, deviceRepository, clientAccountRepository,
-            clientSessionRepository, specusMappingRepository, httpRouteMappingRepository);
+            clientSessionRepository, specusMappingRepository, httpRouteMappingRepository,
+            mock(WorkbenchReferences.class));
 
     {
         when(specusMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(any(), any())).thenReturn(List.of());

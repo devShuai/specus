@@ -100,6 +100,10 @@ public sealed class ManagementMutationService
         // shares of those routes end, all in one transaction.
         await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        // Its mapping and Peer service rows outlive it here, but no workbench reference to any of
+        // its objects may: they go with the client, for every identity.
+        await WorkbenchService.DeleteClientReferencesAsync(_db, account.Id, cancellationToken)
+            .ConfigureAwait(false);
         var revokedShares = await _shares.OnClientDeletedAsync(context.Username, account.Id, cancellationToken)
             .ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
@@ -320,8 +324,15 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
         await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = mapping.ClientId;
-        _db.SpecusMappings.Remove(mapping);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.TcpMapping, mapping.Id,
+                cancellationToken).ConfigureAwait(false);
+            _db.SpecusMappings.Remove(mapping);
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -457,6 +468,8 @@ public sealed class ManagementMutationService
         await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
                          .ConfigureAwait(false))
         {
+            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.HttpRoute, row.Id,
+                cancellationToken).ConfigureAwait(false);
             _db.HttpRouteMappings.Remove(row);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             revokedShares = await _shares.OnRouteDeletedAsync(context.Username, row, exposureBefore,

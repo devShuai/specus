@@ -40,15 +40,18 @@ public class HttpRouteService {
     private final ClientAccountRepository clientAccountRepository;
     private final NatControlService natControlService;
     private final HttpShareService httpShareService;
+    private final WorkbenchReferences workbenchReferences;
 
     public HttpRouteService(HttpRouteMappingRepository httpRouteMappingRepository,
                             ClientAccountRepository clientAccountRepository,
                             NatControlService natControlService,
-                            HttpShareService httpShareService) {
+                            HttpShareService httpShareService,
+                            WorkbenchReferences workbenchReferences) {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.clientAccountRepository = clientAccountRepository;
         this.natControlService = natControlService;
         this.httpShareService = httpShareService;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -248,6 +251,8 @@ public class HttpRouteService {
     }
 
     private void deleteRoute(TenantContext tenant, HttpRouteMapping row, String actor) {
+        // Same transaction: no workbench favourite or recent open outlives the route.
+        workbenchReferences.forgetObject(WorkbenchReferences.HTTP_ROUTE, row.getId());
         httpRouteMappingRepository.delete(row);
         httpRouteMappingRepository.flush();
         // Same transaction: route.deleted is audited and every active share of the route ends.

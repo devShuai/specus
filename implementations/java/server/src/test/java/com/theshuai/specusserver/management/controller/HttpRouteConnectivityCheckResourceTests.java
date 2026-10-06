@@ -14,6 +14,7 @@ import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.HttpRouteService;
 import com.theshuai.specusserver.management.service.HttpShareService;
 import com.theshuai.specusserver.management.service.NatControlService;
+import com.theshuai.specusserver.management.service.WorkbenchReferences;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.session.ClientHttpRouteCapabilities;
 import org.junit.jupiter.api.BeforeEach;
@@ -223,7 +224,7 @@ class HttpRouteConnectivityCheckResourceTests {
 
     private MockMvc newEndpoint() {
         HttpRouteService routes = new HttpRouteService(routeRepository, accountRepository, mock(NatControlService.class),
-                mock(HttpShareService.class));
+                mock(HttpShareService.class), mock(WorkbenchReferences.class));
         HttpRouteConnectivityCheckService service = new HttpRouteConnectivityCheckService(
                 new HttpRouteConnectivityTargets(routes, accountRepository),
                 new NatConnectivityProbe(new ClientHttpRouteCapabilities()));

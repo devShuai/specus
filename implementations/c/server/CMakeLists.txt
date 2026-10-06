@@ -45,6 +45,7 @@ add_library(specus_c_core
     src/stun_turn.c
     src/tls_transport.c
     src/turn_auth.c
+    src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
@@ -218,6 +219,13 @@ add_executable(specus_c_stun_turn_tests tests/stun_turn_tests.c)
 target_link_libraries(specus_c_stun_turn_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_stun_turn_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME stun_turn_tests COMMAND specus_c_stun_turn_tests)
+
+add_executable(specus_c_workbench_tests tests/workbench_tests.c)
+target_link_libraries(specus_c_workbench_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_workbench_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_workbench_tests PRIVATE
+    ST_WORKBENCH_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/service-workbench-v1.json")
+add_test(NAME workbench_tests COMMAND specus_c_workbench_tests)
 
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
