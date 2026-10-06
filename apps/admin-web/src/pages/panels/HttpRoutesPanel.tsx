@@ -47,6 +47,8 @@ import {
 } from "./httpRouteAuth";
 import { findHttpRouteClient } from "./httpRouteClient";
 import { HttpRouteSharesModal } from "./HttpRouteSharesModal";
+import { ConnectivityCheckModal, RouteCheckButtons, useRouteConnectivityChecks } from "./HttpRouteConnectivityCheck";
+import { NOT_A_CHECK_NOTE } from "../../lib/connectivityCheck";
 
 const PAGE_SIZE = 10;
 type RouteToggleField = "enabled" | "detailCaptureEnabled" | "mediaCaptureEnabled" | "pathRewriteEnabled";
@@ -77,6 +79,7 @@ export function HttpRoutesPanel() {
   const [confirm, setConfirm] = useState<{ title: string; description: string; confirmLabel?: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
   const editModal = useDisclosure();
+  const connectivityChecks = useRouteConnectivityChecks();
 
   const load = useCallback(async () => {
     setRoutesLoading(true);
@@ -355,6 +358,8 @@ export function HttpRoutesPanel() {
         </Button>
       </div>
 
+      <p className="text-tiny text-default-500">{NOT_A_CHECK_NOTE}</p>
+
       {/* mobile: 卡片堆叠 */}
       <div className="xl:hidden">
         <MobileListCardList
@@ -452,6 +457,7 @@ export function HttpRoutesPanel() {
                 ]}
                 actions={
                   <>
+                    <RouteCheckButtons route={item} checks={connectivityChecks} />
                     <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                       编辑
                     </Button>
@@ -478,7 +484,7 @@ export function HttpRoutesPanel() {
           removeWrapper
         >
         <TableHeader>
-          <TableColumn className="w-[5%]">ID</TableColumn>
+          <TableColumn className="w-[4%]">ID</TableColumn>
           <TableColumn className="w-[10%]">
             <ClientFilterHeader
               clients={clients}
@@ -487,15 +493,15 @@ export function HttpRoutesPanel() {
             />
           </TableColumn>
           <TableColumn className="w-[7%]">路由名</TableColumn>
-          <TableColumn className="w-[12%]">目标地址</TableColumn>
-          <TableColumn className="w-[14%]">访问链接</TableColumn>
-          <TableColumn className="w-[8%]">认证</TableColumn>
-          <TableColumn className="w-[6%]">启用</TableColumn>
-          <TableColumn className="w-[6%]">明细</TableColumn>
-          <TableColumn className="w-[6%]">媒体</TableColumn>
-          <TableColumn className="w-[6%]">改写</TableColumn>
-          <TableColumn className="w-[10%]">更新时间</TableColumn>
-          <TableColumn className="w-[10%]">操作</TableColumn>
+          <TableColumn className="w-[11%]">目标地址</TableColumn>
+          <TableColumn className="w-[12%]">访问链接</TableColumn>
+          <TableColumn className="w-[7%]">认证</TableColumn>
+          <TableColumn className="w-[5%]">启用</TableColumn>
+          <TableColumn className="w-[5%]">明细</TableColumn>
+          <TableColumn className="w-[5%]">媒体</TableColumn>
+          <TableColumn className="w-[5%]">改写</TableColumn>
+          <TableColumn className="w-[9%]">更新时间</TableColumn>
+          <TableColumn className="w-[20%]">操作</TableColumn>
         </TableHeader>
         <TableBody items={displayedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
           {(item) => {
@@ -584,7 +590,8 @@ export function HttpRoutesPanel() {
                 </span>
               </TableCell>
               <TableCell>
-                <div className="flex gap-1">
+                <div className="flex flex-wrap gap-1">
+                  <RouteCheckButtons route={item} checks={connectivityChecks} compact />
                   <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                     编辑
                   </Button>
@@ -616,6 +623,7 @@ export function HttpRoutesPanel() {
         isOpen={sharing != null}
         onClose={() => setSharing(null)}
       />
+      <ConnectivityCheckModal checks={connectivityChecks} />
       <ConfirmModal
         isOpen={confirm != null}
         onClose={() => setConfirm(null)}

@@ -1,18 +1,26 @@
 package com.theshuai.specusserver.management.controller;
 
 import com.theshuai.specusserver.httpshare.HttpShareRules;
+import com.theshuai.specusserver.connectivity.HttpRouteConnectivityCheckService;
 import com.theshuai.specusserver.management.model.HttpRouteView;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.HttpRouteService;
 import com.theshuai.specusserver.management.service.HttpShareService;
 import com.theshuai.specusserver.management.service.HttpRouteService.RouteMutation;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 /**
  * HTTP 路由（{@code httpSpecusConfigList}）管理资源。服务端持久化为权威来源，每次
@@ -25,6 +33,7 @@ import java.util.List;
  *   <li>{@code PUT    /api/admin/http-routes/{routeId}}          编辑/启停</li>
  *   <li>{@code DELETE /api/admin/http-routes/{routeId}}          删除</li>
  *   <li>{@code POST   /api/admin/http-routes/{routeId}/shares}   签发临时 HTTP 分享（及列表、查看、撤销、审计）</li>
+ *   <li>{@code POST   /api/admin/http-routes/{routeId}/connectivity-check} 连通性检查</li>
  * </ul>
  *
  * <p>手动下发复用现有的 {@code POST /api/admin/clients/{id}/nat-control}（同时下发
@@ -34,16 +43,21 @@ import java.util.List;
 @RequestMapping("/api/admin")
 public class HttpRouteResource {
 
+    static final String CHECK_CACHE_CONTROL = "private, no-store";
+
     private final HttpRouteService httpRouteService;
     private final HttpShareService httpShareService;
     private final ManagementContextResolver contextResolver;
+    private final HttpRouteConnectivityCheckService connectivityCheckService;
 
     public HttpRouteResource(HttpRouteService httpRouteService,
                              HttpShareService httpShareService,
-                             ManagementContextResolver contextResolver) {
+                             ManagementContextResolver contextResolver,
+                             HttpRouteConnectivityCheckService connectivityCheckService) {
         this.httpRouteService = httpRouteService;
         this.httpShareService = httpShareService;
         this.contextResolver = contextResolver;
+        this.connectivityCheckService = connectivityCheckService;
     }
 
     @GetMapping("/http-routes")
@@ -123,5 +137,35 @@ public class HttpRouteResource {
                                                     @RequestParam(required = false) String before) {
         return HttpShareResponses.management(contextResolver, jwt, 403, HttpShareRules.CODE_FORBIDDEN,
                 context -> httpShareService.tenantAudit(context, routeId, limit, before));
+    }
+
+    /**
+     * One end-to-end connectivity check of one route (protocol/spec/service-connectivity-check.md).
+     * The route id stays text here: a malformed id is an unknown route (404), not a binding error.
+     * Any Content-Type is accepted; the body is read by the check itself, at most 4 KiB.
+     */
+    @PostMapping("/http-routes/{routeId}/connectivity-check")
+    public ResponseEntity<?> checkHttpRouteConnectivity(@AuthenticationPrincipal Jwt jwt,
+                                                        @PathVariable String routeId,
+                                                        HttpServletRequest request) throws IOException {
+        HttpRouteConnectivityCheckService.Response result;
+        try {
+            result = connectivityCheckService.check(() -> contextResolver.resolve(jwt), routeId,
+                    request.getInputStream());
+        } catch (ResponseStatusException unauthenticated) {
+            // The usual answer of the management API for a missing or revoked session.
+            String message = StringUtils.hasText(unauthenticated.getReason())
+                    ? unauthenticated.getReason() : "请求失败";
+            return ResponseEntity.status(unauthenticated.getStatusCode())
+                    .header(HttpHeaders.CACHE_CONTROL, CHECK_CACHE_CONTROL)
+                    .body(Map.of("error", message));
+        }
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(result.status())
+                .header(HttpHeaders.CACHE_CONTROL, CHECK_CACHE_CONTROL)
+                .contentType(MediaType.APPLICATION_JSON);
+        if (result.retryAfterSeconds() != null) {
+            response.header(HttpHeaders.RETRY_AFTER, Long.toString(result.retryAfterSeconds()));
+        }
+        return response.body(result.body());
     }
 }

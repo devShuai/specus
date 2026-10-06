@@ -83,7 +83,8 @@ def check(case):
     if not case.get("requestValid", True):
         return refuse(400, "CHECK_REQUEST_INVALID")
     if not case.get("configReadable", True):
-        return refuse(503, "CHECK_UNAVAILABLE")
+        # Every 503 carries Retry-After (section 3.2); a store that cannot be read may recover at once.
+        return refuse(503, "CHECK_UNAVAILABLE", 1000)
     if not case.get("routeVisible", True):
         return refuse(404, "CHECK_TARGET_NOT_FOUND")
     admission = case.get("admission", "admitted")

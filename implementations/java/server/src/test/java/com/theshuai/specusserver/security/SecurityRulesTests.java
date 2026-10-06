@@ -182,6 +182,8 @@ class SecurityRulesTests {
         // /api/admin/http-routes 走同一套 Spring Security 规则——确保新加的 HttpRouteResource
         // 没有被意外标记为 permitAll
         assertThat(get("/api/admin/http-routes", null).statusCode()).isEqualTo(401);
+        // The connectivity check sends traffic to the route's target: never without a session.
+        assertThat(postJson("/api/admin/http-routes/1/connectivity-check", "{}").statusCode()).isEqualTo(401);
     }
 
     @Test

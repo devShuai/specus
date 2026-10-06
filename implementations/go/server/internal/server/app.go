@@ -18,6 +18,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/connectivity"
 	"github.com/devShuai/specus/implementations/go/server/internal/control"
 	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"
 	"github.com/devShuai/specus/implementations/go/server/internal/management"
@@ -268,6 +269,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
 	directHTTP.SetHTTPShares(api.HTTPShares())
+	api.SetConnectivityChecker(connectivity.NewChecker(
+		connectivity.NatDevice{Sessions: sessions, Coordinator: coordinator}, logger))
 	dataDirectory := strings.TrimSpace(cfg.DataDirectory)
 	if dataDirectory == "" {
 		dataDirectory = "./data"

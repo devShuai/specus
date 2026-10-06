@@ -39,8 +39,16 @@ type clientEnvironmentInfo struct {
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
 	ClientEgressCapabilities      clientEgressCapabilities      `json:"clientEgressCapabilities"`
+	ClientHTTPRouteCapabilities   clientHTTPRouteCapabilities   `json:"clientHttpRouteCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
 	StartedAt                     string                        `json:"startedAt"`
+}
+
+// clientHTTPRouteCapabilities: from version 1 an HTTP route stream that fails before its response
+// OPEN carries metadata.failure on its RST, and the client never makes up a response head. The
+// connectivity check trusts failure only from such a session (service-connectivity-check.md 6).
+type clientHTTPRouteCapabilities struct {
+	Version int `json:"version"`
 }
 
 type clientMessageCapabilities struct {
@@ -171,6 +179,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		machineFingerprint,
 		osUser,
 		ttl)
+	a.clientAuth.SetHTTPRouteCapability(session.ID, request.Environment.ClientHTTPRouteCapabilities.Version)
 	now := time.Now()
 	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
 		ID:                          session.ID,

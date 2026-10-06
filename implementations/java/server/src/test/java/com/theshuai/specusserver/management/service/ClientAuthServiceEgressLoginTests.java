@@ -19,6 +19,7 @@ import com.theshuai.specusserver.management.repository.HttpRouteMappingRepositor
 import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.security.TlsProperties;
+import com.theshuai.specusserver.session.ClientHttpRouteCapabilities;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -38,7 +39,8 @@ import static org.mockito.Mockito.when;
 /**
  * What a login's {@code clientEgressCapabilities} leaves on the session. The egress-catalog reads
  * {@code domainTargetCapable} back from there, so a claim stored wrongly here is advertised to every
- * consumer of that egress.
+ * consumer of that egress. The same holds for {@code clientHttpRouteCapabilities}, which decides
+ * whether the connectivity check trusts the failure classification of the session's resets.
  */
 class ClientAuthServiceEgressLoginTests {
     private static final String TENANT = "t1";
@@ -50,6 +52,7 @@ class ClientAuthServiceEgressLoginTests {
     private final ClientSessionRepository sessionRepository = mock(ClientSessionRepository.class);
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
     private final ClientAuthNonceService nonceService = mock(ClientAuthNonceService.class);
+    private final ClientHttpRouteCapabilities httpRouteCapabilities = new ClientHttpRouteCapabilities();
 
     private final ClientAuthService service = new ClientAuthService(
             credentialRepository,
@@ -64,6 +67,7 @@ class ClientAuthServiceEgressLoginTests {
             new ClientAuthProperties(),
             new NettyServerProperties(),
             new TlsProperties(),
+            httpRouteCapabilities,
             mock(PlatformTransactionManager.class),
             "");
 
@@ -138,15 +142,40 @@ class ClientAuthServiceEgressLoginTests {
         assertThat(session.isClientEgressDomainTargets()).isFalse();
     }
 
+    /**
+     * The HTTP route capability is kept in memory under the session id, where the connectivity check
+     * reads it through the data connection; absent, null and negative all read as an older client.
+     */
+    @Test
+    void theHttpRouteCapabilityIsKeptWithTheSession() {
+        ClientSession capable = loginWithEnvironment("\"clientHttpRouteCapabilities\": {\"version\": 1}");
+        assertThat(httpRouteCapabilities.versionOf(capable.getId())).isEqualTo(1);
+
+        for (String older : new String[]{
+                "\"clientHttpRouteCapabilities\": {\"version\": 0}",
+                "\"clientHttpRouteCapabilities\": {\"version\": -3}",
+                "\"clientHttpRouteCapabilities\": null",
+                "\"clientHttpRouteCapabilities\": {}",
+                "\"clientVersion\": \"0.9.0\""}) {
+            ClientSession session = loginWithEnvironment(older);
+            assertThat(httpRouteCapabilities.versionOf(session.getId())).as(older).isZero();
+        }
+        assertThat(httpRouteCapabilities.versionOf(capable.getId())).isEqualTo(1);
+    }
+
     private ClientSession loginWith(String egressCapabilitiesJson) {
+        return loginWithEnvironment("\"clientEgressCapabilities\": " + egressCapabilitiesJson);
+    }
+
+    private ClientSession loginWithEnvironment(String environmentFields) {
         ClientEnvironmentInfo environment = JsonUtil.stringToObject("""
                 {
                   "machineFingerprint": "fp-office",
                   "osUser": "ops",
                   "hostname": "office",
-                  "clientEgressCapabilities": %s
+                  %s
                 }
-                """.formatted(egressCapabilitiesJson), ClientEnvironmentInfo.class);
+                """.formatted(environmentFields), ClientEnvironmentInfo.class);
         assertThat(environment).isNotNull();
 
         ClientAuthLoginRequest request = new ClientAuthLoginRequest();

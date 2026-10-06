@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Specus.Protocol;
+using Specus.Protocol.HttpRoute;
 using Specus.Protocol.Packets;
 using Specus.Server.Configuration;
 using Specus.Server.ControlChannel;
@@ -119,7 +120,8 @@ internal sealed class NatClientSession : IAsyncDisposable
                 if (_httpStreams.TryGetValue(packet.StreamId, out var httpEnd))
                 {
                     var valid = packet.NatMessageType == NatMessageType.Rst
-                        ? httpEnd.OnReset(packet.Value, AsString(packet.MetaData, "reason"))
+                        ? httpEnd.OnReset(packet.Value, AsString(packet.MetaData, "reason"),
+                            AsFailure(packet.MetaData))
                         : httpEnd.OnResponseEnd(packet.MetaData);
                     if (!valid)
                     {
@@ -271,7 +273,7 @@ internal sealed class NatClientSession : IAsyncDisposable
         _externalChannels.Clear();
         foreach (var stream in _httpStreams.Values)
         {
-            stream.OnReset(0, "control channel closed");
+            stream.OnLinkLost();
         }
         _httpStreams.Clear();
         foreach (var stream in _webSocketStreams.Values)
@@ -707,6 +709,24 @@ internal sealed class NatClientSession : IAsyncDisposable
                 _ => element.ToString(),
             },
             _ => value.ToString(),
+        };
+    }
+
+    /// <summary>
+    /// RST <c>metadata.failure</c> (service-connectivity-check.md section 6.2). Only a JSON string
+    /// counts: the set is closed and named, so a number or object is no classification at all.
+    /// </summary>
+    private static string? AsFailure(Dictionary<string, object?>? meta)
+    {
+        if (meta is null || !meta.TryGetValue(HttpRouteFailure.MetadataKey, out var value))
+        {
+            return null;
+        }
+        return value switch
+        {
+            string s => s,
+            JsonElement { ValueKind: JsonValueKind.String } element => element.GetString(),
+            _ => null,
         };
     }
 

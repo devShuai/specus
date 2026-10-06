@@ -51,6 +51,10 @@ public class NatServerHandler extends NatCommonHandler {
     private final Map<Integer, HttpStreamExchange> httpStreams = new ConcurrentHashMap<>();
     private final RecentStreamTombstones recentlyClosedStreams =
             new RecentStreamTombstones(RECENTLY_CLOSED_STREAM_LIMIT);
+    // HTTP streams this server walked away from (see abandonHttpStream): frames the client had
+    // already sent for them are dropped instead of being answered as frames of an unknown stream.
+    private final RecentStreamTombstones abandonedHttpStreams =
+            new RecentStreamTombstones(RECENTLY_CLOSED_STREAM_LIMIT);
 
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
@@ -97,13 +101,17 @@ public class NatServerHandler extends NatCommonHandler {
         } else if (type == NatMessageType.UNREGISTER) {
             processUnregister(natMessagePacket);
         } else if (type == NatMessageType.OPEN) {
-            processHttpResponseHead(natMessagePacket);
+            if (!isAbandonedHttpStream(natMessagePacket.getStreamId())) {
+                processHttpResponseHead(natMessagePacket);
+            }
         } else if (type == NatMessageType.DATA) {
             int streamId = natMessagePacket.getStreamId();
             if (httpStreams.containsKey(streamId)) {
                 processHttpData(natMessagePacket);
             } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
                 processWsData(natMessagePacket);
+            } else if (isAbandonedHttpStream(streamId)) {
+                // Response body of a stream this server already reset: dropped, no WINDOW_UPDATE.
             } else {
                 // An unclassified DATA frame must belong to an active ordinary TCP stream.
                 // processData resets unknown IDs instead of silently accepting an illegal state.
@@ -115,6 +123,8 @@ public class NatServerHandler extends NatCommonHandler {
                 processHttpClosed(natMessagePacket);
             } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
                 processWsClosed(natMessagePacket);
+            } else if (isAbandonedHttpStream(streamId)) {
+                // The client's FIN or RST crossed the RST of an abandoned stream: nothing to answer.
             } else {
                 processClosed(natMessagePacket);
             }
@@ -161,7 +171,8 @@ public class NatServerHandler extends NatCommonHandler {
                 markStreamClosed(exchange.streamId());
                 HttpStreamExchange removed = httpStreams.remove(exchange.streamId());
                 if (removed != null) {
-                    removed.onReset(7, Map.of("reason", "HTTP OPEN write failed"));
+                    removed.onReset(7, Map.of("reason", "HTTP OPEN write failed"),
+                            HttpStreamExchange.ResetOrigin.CONNECTION);
                 }
             }
         });
@@ -199,7 +210,32 @@ public class NatServerHandler extends NatCommonHandler {
             StreamFlowController.get(ctx.channel()).reset(streamId, 8, reason);
         }
         if (exchange != null) {
-            exchange.onReset(8, Map.of("reason", reason));
+            exchange.onReset(8, Map.of("reason", reason), HttpStreamExchange.ResetOrigin.LOCAL);
+        }
+    }
+
+    /**
+     * Ends an HTTP stream whose response this server no longer wants: a connectivity probe that has
+     * its response head, or whose budget ran out. It sends RST unless both directions have already
+     * ended ({@code requestFinished} and a response FIN), and from then on drops whatever response
+     * OPEN, DATA or FIN of the stream still arrives, without WINDOW_UPDATE and without answering it
+     * with another RST.
+     */
+    public void abandonHttpStream(int streamId, boolean requestFinished, String reason) {
+        abandonedHttpStreams.add(streamId);
+        markStreamClosed(streamId);
+        HttpStreamExchange exchange = httpStreams.remove(streamId);
+        if (ctx != null) {
+            boolean closedBothWays = requestFinished && exchange != null && exchange.responseEnded();
+            // No exchange left means the client's RST or the connection loss already ended it.
+            if (exchange == null || closedBothWays || !ctx.channel().isActive()) {
+                StreamFlowController.get(ctx.channel()).remove(streamId);
+            } else {
+                StreamFlowController.get(ctx.channel()).reset(streamId, 8, reason);
+            }
+        }
+        if (exchange != null) {
+            exchange.onReset(8, Map.of("reason", reason), HttpStreamExchange.ResetOrigin.LOCAL);
         }
     }
 
@@ -487,7 +523,8 @@ public class NatServerHandler extends NatCommonHandler {
         remoteConnectionServerMap.clear();
         externalChannels.values().forEach(Channel::close);
         httpStreams.values().forEach(exchange ->
-                exchange.onReset(9, Map.of("reason", "control channel closed")));
+                exchange.onReset(9, Map.of("reason", "control channel closed"),
+                        HttpStreamExchange.ResetOrigin.CONNECTION));
         httpStreams.clear();
         StreamFlowController.get(ctx.channel()).closeAll();
         externalChannelPorts.clear();
@@ -599,6 +636,11 @@ public class NatServerHandler extends NatCommonHandler {
     /** Register a stream created outside this handler, such as a tunneled WebSocket. */
     public void markStreamOpened(int streamId) {
         recentlyClosedStreams.remove(streamId);
+        abandonedHttpStreams.remove(streamId);
+    }
+
+    private boolean isAbandonedHttpStream(int streamId) {
+        return !httpStreams.containsKey(streamId) && abandonedHttpStreams.contains(streamId);
     }
 
     /** Register a completed stream so a late peer RST remains idempotent. */

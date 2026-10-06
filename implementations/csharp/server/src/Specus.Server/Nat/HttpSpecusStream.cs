@@ -13,12 +13,26 @@ internal readonly record struct HttpStreamReadResult(
 /// client RST supplied by the client, and can carry the target URL, internal hosts or the raw
 /// query; the exception message therefore omits it so it cannot reach a public response.
 /// </summary>
-internal sealed class HttpStreamResetException(uint code, string? reason)
+internal sealed class HttpStreamResetException(uint code, string? reason, string? failure = null,
+    bool linkLost = false)
     : IOException("HTTP stream reset")
 {
     public uint Code { get; } = code;
 
     public string Reason { get; } = reason ?? string.Empty;
+
+    /// <summary>
+    /// RST <c>metadata.failure</c> as the client sent it, null when absent or not a string. It is
+    /// only meaningful on a connection whose session announced the HTTP route capability, and only
+    /// the connectivity check reads it; the public path answers its fixed 502 either way.
+    /// </summary>
+    public string? Failure { get; } = failure;
+
+    /// <summary>
+    /// True when the data connection closed or was replaced before an answer, rather than the
+    /// client resetting this stream.
+    /// </summary>
+    public bool LinkLost { get; } = linkLost;
 }
 
 /// <summary>One mandatory NAT stream v2 HTTP exchange.</summary>
@@ -44,6 +58,7 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
     private long _receiveOutstanding;
     private bool _responseHead;
     private bool _responseEnded;
+    private bool _discardBody;
     private int _closed;
 
     public HttpSpecusStream(SpecusConnectionContext context, uint streamId,
@@ -55,6 +70,21 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
     }
 
     public uint StreamId { get; }
+
+    /// <summary>Client session that owns the data connection this stream runs on.</summary>
+    public long? ConnectionSessionId => _context.ClientSessionId;
+
+    /// <summary>True once the response FIN (or DATA with END_STREAM) has been accepted.</summary>
+    public bool ResponseEnded
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _responseEnded;
+            }
+        }
+    }
 
     public async ValueTask SendDataAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
@@ -189,6 +219,10 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
                 return false;
             }
             _receiveCredit -= data.Length;
+            if (_discardBody)
+            {
+                return true;
+            }
             _receiveOutstanding += data.Length;
             if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Data, null, data.ToArray(), null)))
             {
@@ -209,7 +243,8 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
                 return false;
             }
             _responseEnded = true;
-            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null)))
+            if (_discardBody
+                || Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null)))
             {
                 return true;
             }
@@ -218,12 +253,37 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
         }
     }
 
-    public bool OnReset(uint code, string? reason)
+    public bool OnReset(uint code, string? reason, string? failure = null)
     {
-        var error = new HttpStreamResetException(code, reason);
+        var error = new HttpStreamResetException(code, reason, failure);
         var written = Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null, error));
         Close();
         return written;
+    }
+
+    /// <summary>
+    /// Ends the stream because its data connection is gone. Readers see the same reset as before,
+    /// marked <see cref="HttpStreamResetException.LinkLost"/> so it is not mistaken for a client RST.
+    /// </summary>
+    public void OnLinkLost()
+    {
+        Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null,
+            new HttpStreamResetException(0, "control channel closed", linkLost: true)));
+        Close();
+    }
+
+    /// <summary>
+    /// For a reader that only wants the response head (the connectivity check): response DATA and
+    /// FIN are accepted but never queued, so a body relayed before the server's RST lands can
+    /// neither fill the event queue nor earn WINDOW_UPDATE credit. DATA is still charged against
+    /// the receive window, so a peer overrunning it remains a protocol violation.
+    /// </summary>
+    public void DiscardResponseBody()
+    {
+        lock (_stateLock)
+        {
+            _discardBody = true;
+        }
     }
 
     public bool AddSendCredit(uint credit) => _sendWindow.Add(credit);

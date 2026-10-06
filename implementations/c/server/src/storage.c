@@ -241,7 +241,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "channel_id TEXT,"
         "remote_address TEXT,"
         "client_egress_version INTEGER NOT NULL DEFAULT 0,"
-        "client_egress_domain_targets INTEGER NOT NULL DEFAULT 0"
+        "client_egress_domain_targets INTEGER NOT NULL DEFAULT 0,"
+        "client_http_route_version INTEGER NOT NULL DEFAULT 0"
         ");");
     }
     if (rc == 0) {
@@ -702,6 +703,11 @@ int st_storage_init(const char *path, int seed_demo_client)
                                    "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
+        /* Sessions stored before the connectivity check are older clients: their RSTs stay unclassified. */
+        rc = add_column_if_missing(db, "specus_client_session", "client_http_route_version",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
         /* Policies saved before domain rules grant no name. */
         rc = add_column_if_missing(db, "peer_mesh_egress_policy", "domain_rules",
                                    "TEXT NOT NULL DEFAULT '[]'");
@@ -1049,6 +1055,7 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
     session->peer_service_discovery_version = sqlite3_column_int(stmt, 22);
     session->client_egress_version = sqlite3_column_int(stmt, 30);
     session->client_egress_domain_targets = sqlite3_column_int(stmt, 31) != 0;
+    session->client_http_route_version = sqlite3_column_int(stmt, 32);
     return 0;
 }
 
@@ -2872,7 +2879,7 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets "
+        "client_egress_domain_targets, client_http_route_version "
         "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -2903,8 +2910,8 @@ int st_storage_create_client_session(const char *path,
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, peer_service_discovery_version, peer_service_applications, "
-        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "http_login_at, expires_at, client_egress_version, client_egress_domain_targets, client_http_route_version) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -2936,6 +2943,7 @@ int st_storage_create_client_session(const char *path,
         sqlite3_bind_text(stmt, 25, session->expires_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 26, session->client_egress_version);
         sqlite3_bind_int(stmt, 27, session->client_egress_domain_targets ? 1 : 0);
+        sqlite3_bind_int(stmt, 28, session->client_http_route_version < 0 ? 0 : session->client_http_route_version);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -2966,7 +2974,7 @@ int st_storage_get_client_session_for_login(const char *path,
         "message_media_preview_capable, message_max_attachment_bytes, peer_service_discovery_version, "
         "peer_service_applications, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address, client_egress_version, "
-        "client_egress_domain_targets "
+        "client_egress_domain_targets, client_http_route_version "
         "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,
@@ -3760,8 +3768,10 @@ int st_storage_list_http_routes(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static int load_http_route_by_id(const char *path, long long id, st_storage_http_route *route)
+/* Returns -1 when the row could not be read, otherwise 0 with *found telling whether it exists. */
+static int find_http_route_by_id(const char *path, long long id, st_storage_http_route *route, int *found)
 {
+    *found = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -3782,10 +3792,30 @@ static int load_http_route_by_id(const char *path, long long id, st_storage_http
     }
     sqlite3_bind_int64(stmt, 1, id);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_http_route(stmt, route) == 0;
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        result = scan_http_route(stmt, route) == 0 ? 0 : -1;
+        *found = result == 0;
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result;
+}
+
+static int load_http_route_by_id(const char *path, long long id, st_storage_http_route *route)
+{
+    int found = 0;
+    return find_http_route_by_id(path, id, route, &found) == 0 && found ? 0 : -1;
+}
+
+int st_storage_find_http_route_by_id(const char *path, long long id, st_storage_http_route *route, int *found)
+{
+    if (route == NULL || found == NULL) {
+        return -1;
+    }
+    return find_http_route_by_id(path, id, route, found);
 }
 
 int st_storage_get_http_route(const char *path, long long id, st_storage_http_route *route)

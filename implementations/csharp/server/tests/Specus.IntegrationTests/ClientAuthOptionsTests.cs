@@ -135,6 +135,27 @@ public sealed class ClientAuthOptionsTests
         Assert.False(absent.ClientEgressDomainTargets);
     }
 
+    /// <summary>
+    /// The connectivity check trusts RST metadata.failure only from a session that announced
+    /// clientHttpRouteCapabilities.version >= 1, so the login keeps that version with the session.
+    /// </summary>
+    [Fact]
+    public async Task ClientAuthLoginKeepsTheAnnouncedHttpRouteCapability()
+    {
+        await using var server = await TestServerFixture.StartAsync();
+        using var client = server.CreateClient();
+        var sessions = server.HostServices.GetRequiredService<ClientAuthSessionStore>();
+
+        var capable = await LoginWithHttpRouteCapabilitiesAsync(client, "machine-route-v1", new { version = 1 });
+        Assert.Equal(1, sessions.FindById(capable)!.HttpRouteCapabilityVersion);
+
+        var negative = await LoginWithHttpRouteCapabilitiesAsync(client, "machine-route-negative", new { version = -4 });
+        Assert.Equal(0, sessions.FindById(negative)!.HttpRouteCapabilityVersion);
+
+        var absent = await LoginWithHttpRouteCapabilitiesAsync(client, "machine-route-absent", null);
+        Assert.Equal(0, sessions.FindById(absent)!.HttpRouteCapabilityVersion);
+    }
+
     [Fact]
     public async Task CredentialCreateUsesClientAuthDefaultMaxOnlineInstances()
     {
@@ -203,6 +224,38 @@ public sealed class ClientAuthOptionsTests
         var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
         return await db.ClientSessions.AsNoTracking()
             .FirstAsync(row => row.Id == body!.ClientSessionId);
+    }
+
+    /// <summary>Logs in from a fresh machine and returns the client session id.</summary>
+    private static async Task<long> LoginWithHttpRouteCapabilitiesAsync(HttpClient client, string machine,
+        object? httpRouteCapabilities)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        var nonce = "nonce-" + Guid.NewGuid().ToString("N");
+        const string osUser = "alice";
+        var environment = new Dictionary<string, object?>
+        {
+            ["machineFingerprint"] = machine,
+            ["hostname"] = "route-host",
+            ["osUser"] = osUser,
+        };
+        if (httpRouteCapabilities is not null)
+        {
+            environment["clientHttpRouteCapabilities"] = httpRouteCapabilities;
+        }
+        var response = await client.PostAsJsonAsync("/api/client/auth/login", new
+        {
+            apiKey = DatabaseInitializer.DemoCredentialApiKey,
+            timestamp,
+            nonce,
+            signature = Sign(DatabaseInitializer.DemoCredentialApiKey, timestamp, nonce, machine, osUser,
+                DatabaseInitializer.DemoCredentialSecret),
+            environment,
+        });
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<ClientAuthLoginBody>();
+        Assert.NotNull(body);
+        return body!.ClientSessionId;
     }
 
     private static string Sign(string apiKey, string timestamp, string nonce, string machineFingerprint,

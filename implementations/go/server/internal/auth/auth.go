@@ -47,6 +47,9 @@ type Session struct {
 	TokenHash          string
 	ExpiresAt          time.Time
 	Status             string
+	// HTTPRouteCapability is environment.clientHttpRouteCapabilities.version from the login. It
+	// stays in memory only: the connectivity check runs where the connection is held.
+	HTTPRouteCapability int
 }
 
 type SessionStore struct {
@@ -87,6 +90,22 @@ func (s *SessionStore) CreateForClient(account store.ClientAccount, credentialID
 	s.tokenHashBySessionID[session.ID] = session.TokenHash
 	s.mu.Unlock()
 	return session
+}
+
+// SetHTTPRouteCapability records the clientHttpRouteCapabilities.version a login announced, before
+// its token is handed out; a negative version is an older client (0).
+func (s *SessionStore) SetHTTPRouteCapability(sessionID int64, version int) {
+	if version < 0 {
+		version = 0
+	}
+	s.mu.Lock()
+	if hash, ok := s.tokenHashBySessionID[sessionID]; ok {
+		if session, found := s.byTokenHash[hash]; found {
+			session.HTTPRouteCapability = version
+			s.byTokenHash[hash] = session
+		}
+	}
+	s.mu.Unlock()
 }
 
 // Discard removes a session that was registered in memory but whose persistence failed. Without it
