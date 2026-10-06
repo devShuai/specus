@@ -667,6 +667,17 @@ static char *admin_dup_string(const char *value)
     return copy;
 }
 
+static char *admin_dup_range(const char *value, size_t len)
+{
+    char *copy = (char *)malloc(len + 1U);
+    if (copy == NULL) {
+        return NULL;
+    }
+    memcpy(copy, value, len);
+    copy[len] = '\0';
+    return copy;
+}
+
 static char *admin_trim(char *value)
 {
     while (*value != '\0' && isspace((unsigned char)*value)) {
@@ -9206,6 +9217,157 @@ static char *admin_extract_header_value(const char *request, const char *name)
     return NULL;
 }
 
+/* Request bytes that follow the header block: what the header read already took, then the socket. */
+typedef struct {
+    int fd;
+    char buffer[16384];
+    size_t start;
+    size_t end;
+} admin_wire_reader;
+
+static int admin_wire_fill(admin_wire_reader *reader)
+{
+    if (reader->start < reader->end) {
+        return 0;
+    }
+    ssize_t got = recv(reader->fd, reader->buffer, sizeof(reader->buffer), 0);
+    if (got <= 0) {
+        return -1;
+    }
+    reader->start = 0;
+    reader->end = (size_t)got;
+    return 0;
+}
+
+/* One line without its line ending; a line that does not fit in line_cap is malformed. */
+static int admin_wire_read_line(admin_wire_reader *reader, char *line, size_t line_cap)
+{
+    size_t len = 0;
+    for (;;) {
+        if (admin_wire_fill(reader) != 0) {
+            return -1;
+        }
+        char value = reader->buffer[reader->start++];
+        if (value == '\n') {
+            if (len > 0 && line[len - 1U] == '\r') {
+                --len;
+            }
+            line[len] = '\0';
+            return 0;
+        }
+        if (len + 1U >= line_cap) {
+            return -1;
+        }
+        line[len++] = value;
+    }
+}
+
+static int admin_wire_read(admin_wire_reader *reader, char *out, size_t len)
+{
+    while (len > 0) {
+        if (admin_wire_fill(reader) != 0) {
+            return -1;
+        }
+        size_t available = reader->end - reader->start;
+        size_t take = available < len ? available : len;
+        memcpy(out, reader->buffer + reader->start, take);
+        reader->start += take;
+        out += take;
+        len -= take;
+    }
+    return 0;
+}
+
+/*
+ * Reads a chunked request body (RFC 9112 section 7.1) into one malloc'd, NUL-terminated buffer,
+ * the way a Content-Length body is read. Chunk extensions and trailer fields are read and
+ * dropped. Returns 0, -1 for a malformed or truncated body, or -2 once it outgrows max_len.
+ */
+static int admin_read_chunked_body(int fd,
+                                   const char *received,
+                                   size_t received_len,
+                                   size_t max_len,
+                                   char **out,
+                                   size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0;
+    admin_wire_reader *reader = (admin_wire_reader *)malloc(sizeof(*reader));
+    if (reader == NULL || received_len > sizeof(reader->buffer)) {
+        free(reader);
+        return -1;
+    }
+    reader->fd = fd;
+    reader->start = 0;
+    reader->end = received_len;
+    memcpy(reader->buffer, received, received_len);
+
+    char *body = (char *)malloc(1U);
+    size_t len = 0;
+    int rc = body == NULL ? -1 : 0;
+    char line[1024];
+    while (rc == 0) {
+        if (admin_wire_read_line(reader, line, sizeof(line)) != 0) {
+            rc = -1;
+            break;
+        }
+        size_t size = 0;
+        const char *cursor = line;
+        while (hex_nibble(*cursor) >= 0) {
+            if (size > (SIZE_MAX >> 4U)) {
+                rc = -1;
+                break;
+            }
+            size = (size << 4U) | (size_t)hex_nibble(*cursor++);
+        }
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (rc != 0 || cursor == line || (*cursor != '\0' && *cursor != ';')) {
+            rc = -1;
+            break;
+        }
+        if (size == 0) {
+            break;
+        }
+        if (size > max_len - len) {
+            rc = -2;
+            break;
+        }
+        char *grown = (char *)realloc(body, len + size + 1U);
+        if (grown == NULL) {
+            rc = -1;
+            break;
+        }
+        body = grown;
+        char crlf[2];
+        if (admin_wire_read(reader, body + len, size) != 0
+            || admin_wire_read(reader, crlf, sizeof(crlf)) != 0
+            || crlf[0] != '\r' || crlf[1] != '\n') {
+            rc = -1;
+            break;
+        }
+        len += size;
+    }
+    /* The trailer section ends at an empty line. */
+    for (int fields = 0; rc == 0; ++fields) {
+        if (fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
+            rc = -1;
+        } else if (line[0] == '\0') {
+            break;
+        }
+    }
+    free(reader);
+    if (rc != 0) {
+        free(body);
+        return rc;
+    }
+    body[len] = '\0';
+    *out = body;
+    *out_len = len;
+    return 0;
+}
+
 static int admin_header_name_equals(const char *line, const char *name)
 {
     const char *colon = strchr(line, ':');
@@ -12741,8 +12903,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char *client_name = admin_url_decode(cursor, (size_t)(client_end - cursor));
     char *route = admin_url_decode(route_start, (size_t)(route_end - route_start));
+    /* The rest of the path keeps its original percent-encoding (http-route.md section 1). */
     char *relative_path = route_end < path + path_len
-        ? admin_url_decode(route_end, (size_t)(path + path_len - route_end))
+        ? admin_dup_range(route_end, (size_t)(path + path_len - route_end))
         : admin_dup_string("/");
     char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
     if (client_name == NULL || route == NULL || relative_path == NULL || raw_query == NULL) {
@@ -12914,7 +13077,9 @@ static int handle_direct_http_request(st_admin_server *server,
     char *route = admin_url_decode(route_start, (size_t)(route_end - route_start));
     char *relative_path = NULL;
     if (route_end < path + path_len) {
-        relative_path = admin_url_decode(route_end, (size_t)(path + path_len - route_end));
+        /* Forwarded raw, as the spec requires: decoding here turned "+" into a space and "%2F"
+         * into a path separator, so the app received a different path than the caller sent. */
+        relative_path = admin_dup_range(route_end, (size_t)(path + path_len - route_end));
     } else {
         relative_path = admin_dup_string("/");
     }
@@ -13110,41 +13275,73 @@ static void handle_client(st_admin_server *server, int fd)
         available_body_len = (size_t)(request + len - body);
         size_t max_content_length = admin_path_equals(path, "/api/admin/client-packages")
             ? st_client_package_max_request_bytes() : ST_ADMIN_MAX_DIRECT_HTTP_BODY;
-        int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
-        if (length_rc == -2) {
-            send_text_http_error(fd, 413, "HTTP 请求体超过限制");
-            close(fd);
-            return;
-        }
-        if (length_rc != 0) {
-            send_text_http_error(fd, 400, "Content-Length 无效");
-            close(fd);
-            return;
-        }
-        if (content_length > available_body_len) {
-            body_buffer = (char *)malloc(content_length + 1U);
-            if (body_buffer == NULL) {
-                send_text_http_error(fd, 500, "HTTP 请求体读取失败");
+        char *transfer_encoding = admin_extract_header_value(request, "Transfer-Encoding");
+        if (transfer_encoding != NULL) {
+            /*
+             * A body sent without a length up front. It used to be taken as is, chunk framing
+             * included, so a chunked upload reached the Direct HTTP target corrupted. A
+             * Content-Length next to it makes the message ambiguous (RFC 9112 section 6.3), and
+             * codings other than chunked are not implemented.
+             */
+            char *declared_length = admin_extract_header_value(request, "Content-Length");
+            int ambiguous = declared_length != NULL;
+            int chunked = admin_ascii_casecmp(transfer_encoding, "chunked") == 0;
+            free(declared_length);
+            free(transfer_encoding);
+            if (ambiguous || !chunked) {
+                send_text_http_error(fd, ambiguous ? 400 : 501,
+                                     ambiguous ? "Content-Length 与 Transfer-Encoding 不能同时出现"
+                                               : "仅支持 chunked Transfer-Encoding");
                 close(fd);
                 return;
             }
-            memcpy(body_buffer, body, available_body_len);
-            size_t offset = available_body_len;
-            while (offset < content_length) {
-                ssize_t read_len = recv(fd, body_buffer + offset, content_length - offset, 0);
-                if (read_len <= 0) {
-                    free(body_buffer);
-                    send_text_http_error(fd, 400, "HTTP 请求体不完整");
+            int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
+                                                     &body_buffer, &content_length);
+            if (chunked_rc != 0) {
+                send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
+                                     chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
+                close(fd);
+                return;
+            }
+            body = body_buffer;
+            available_body_len = content_length;
+        } else {
+            int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
+            if (length_rc == -2) {
+                send_text_http_error(fd, 413, "HTTP 请求体超过限制");
+                close(fd);
+                return;
+            }
+            if (length_rc != 0) {
+                send_text_http_error(fd, 400, "Content-Length 无效");
+                close(fd);
+                return;
+            }
+            if (content_length > available_body_len) {
+                body_buffer = (char *)malloc(content_length + 1U);
+                if (body_buffer == NULL) {
+                    send_text_http_error(fd, 500, "HTTP 请求体读取失败");
                     close(fd);
                     return;
                 }
-                offset += (size_t)read_len;
+                memcpy(body_buffer, body, available_body_len);
+                size_t offset = available_body_len;
+                while (offset < content_length) {
+                    ssize_t read_len = recv(fd, body_buffer + offset, content_length - offset, 0);
+                    if (read_len <= 0) {
+                        free(body_buffer);
+                        send_text_http_error(fd, 400, "HTTP 请求体不完整");
+                        close(fd);
+                        return;
+                    }
+                    offset += (size_t)read_len;
+                }
+                body_buffer[content_length] = '\0';
+                body = body_buffer;
+                available_body_len = content_length;
+            } else if (content_length > 0) {
+                available_body_len = content_length;
             }
-            body_buffer[content_length] = '\0';
-            body = body_buffer;
-            available_body_len = content_length;
-        } else if (content_length > 0) {
-            available_body_len = content_length;
         }
     }
     if (body == NULL) {

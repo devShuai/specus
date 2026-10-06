@@ -25,11 +25,12 @@ PUBLIC_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_public_coordination_tests
 PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
 SECURITY_TESTS := $(BUILD_DIR)/specus_c_security_tests
 SECURITY_BASELINE_TESTS := $(BUILD_DIR)/specus_c_security_baseline_tests
+SESSION_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_session_lifecycle_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
 TLS_TRANSPORT_TESTS := $(BUILD_DIR)/specus_c_tls_transport_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS)
-ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS)
+ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS)
 
 .PHONY: all test release clean
 
@@ -101,6 +102,9 @@ $(SECURITY_TESTS): $(CORE_OBJS) tests/security_tests.c | $(BUILD_DIR)
 $(SECURITY_BASELINE_TESTS): $(CORE_OBJS) tests/security_baseline_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/security_baseline_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(SESSION_LIFECYCLE_TESTS): $(CORE_OBJS) tests/session_lifecycle_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_lifecycle_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(STORAGE_TESTS): $(CORE_OBJS) tests/storage_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/storage_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -117,6 +121,7 @@ test: all
 	bash scripts/object_storage_e2e.sh $(SERVER)
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
+	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)
