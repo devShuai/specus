@@ -80,8 +80,15 @@ public sealed class ManagementMutationService
     {
         var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
+        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        // The client's route, mapping and Peer service rows outlive it here, but no workbench
+        // reference to them may: they go with the client, for every identity.
+        await WorkbenchService.DeleteClientReferencesAsync(_db, account.Id, cancellationToken)
+            .ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ClientNameAvailability> ClientNameAvailabilityAsync(ManagementContext context,
@@ -296,8 +303,15 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
         await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = mapping.ClientId;
-        _db.SpecusMappings.Remove(mapping);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.TcpMapping, mapping.Id,
+                cancellationToken).ConfigureAwait(false);
+            _db.SpecusMappings.Remove(mapping);
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -406,8 +420,15 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
         await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = row.ClientId;
-        _db.HttpRouteMappings.Remove(row);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.HttpRoute, row.Id,
+                cancellationToken).ConfigureAwait(false);
+            _db.HttpRouteMappings.Remove(row);
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
